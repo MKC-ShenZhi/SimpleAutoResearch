@@ -2,6 +2,8 @@
 import json
 import unittest
 
+from tests.report_review_fixtures import document_review_inputs, prompt_payload
+
 from simple_ar.integrations.llm import LLMError, LLMResponseError
 from simple_ar.report.editor import review_document
 from simple_ar.report.agent import _review_section_with_recovery
@@ -22,8 +24,7 @@ class ReviewEvidenceTests(unittest.TestCase):
                 captured.append(json.loads(prompt))
                 return {"section_reviews": []}
         evidence = {"rows": ["complete recorded evidence " * 5000]}
-        review_document(client=Client(), template=load_report_template_bundle(report_mode="experiment", config=config),
-            memory=memory, sections=[draft], config=config, execution_summary={}, metric_summary=evidence)
+        review_document(client=Client(), **document_review_inputs(memory, config, [draft], metric_summary=evidence))
         self.assertGreater(len(json.dumps(captured[0])), 90_000)
         self.assertEqual(captured[0]["metric_sources"], evidence)
         self.assertEqual(captured[0]["sections"][0]["markdown"], draft.draft_markdown)
@@ -31,8 +32,7 @@ class ReviewEvidenceTests(unittest.TestCase):
             def ask_json(self, *args, **ignored):
                 raise LLMError("existing client/session capacity exhausted")
         with self.assertRaisesRegex(LLMError, "capacity exhausted"):
-            review_document(client=BudgetClient(), template=load_report_template_bundle(report_mode="experiment", config=config),
-                memory=memory, sections=[draft], config=config, execution_summary={}, metric_summary=evidence)
+            review_document(client=BudgetClient(), **document_review_inputs(memory, config, [draft], metric_summary=evidence))
 
     def test_source_passage_layout_whitespace_is_not_a_changed_scientific_quote(self):
         view = {"source_evidence": [{"metadata": {"evidence_passages": [
@@ -177,8 +177,7 @@ class ReviewEvidenceTests(unittest.TestCase):
             def ask_json(self, system, prompt, **ignored):
                 captured.append((prompt, json.loads(prompt)))
                 return {"section_reviews": []}
-        kwargs = dict(client=Client(), template=load_report_template_bundle(report_mode="experiment", config=config),
-            memory=memory, sections=[draft], config=config, execution_summary={}, metric_summary={})
+        kwargs = dict(client=Client(), **document_review_inputs(memory, config, [draft]))
         review_document(**kwargs)
         original = dict(captured[-1][1])
         original.pop("evidence_locator")
@@ -205,8 +204,7 @@ class ReviewEvidenceTests(unittest.TestCase):
                 return {"section_reviews": [{"section_id": "setup", "verdict": "warning", "findings": [{
                     "finding_id": "heading", "type": "style", "severity": "minor", "required_action": "revise",
                     "message": "Fix the current heading.", "draft_quotes": [quote]}]}]}
-        common = dict(client=Client(), template=load_report_template_bundle(report_mode="experiment", config=config),
-            memory=memory, sections=[draft], config=config, execution_summary={}, metric_summary={})
+        common = dict(client=Client(), **document_review_inputs(memory, config, [draft]))
         self.assertEqual(review_document(**common)[0].findings[0].draft_quotes[0].quote, draft.heading)
         for absent in ("Setup", "Current Misspelled", draft.heading + "\n" + draft.draft_markdown, "A superseded heading"):
             quote["quote"] = absent
@@ -224,8 +222,7 @@ class ReviewEvidenceTests(unittest.TestCase):
                 return {"section_reviews": [{"section_id": "setup", "verdict": "pass", "finding_checks": [{
                     "finding_id": old.finding_id, "status": "resolved", "explanation": "The current title is corrected.",
                     "draft_quotes": quoted}]}]}
-        common = dict(client=Client(), template=load_report_template_bundle(report_mode="experiment", config=config),
-            memory=memory, sections=[draft], config=config, execution_summary={}, metric_summary={}, historical_findings=[old])
+        common = dict(client=Client(), **document_review_inputs(memory, config, [draft], historical_findings=[old]))
         self.assertEqual(review_document(**common)[0].finding_checks[0].draft_quotes, quoted)
         quoted[0] = draft.draft_markdown
         self.assertEqual(len(review_document(**common)), 1)
@@ -392,8 +389,7 @@ class ReviewEvidenceTests(unittest.TestCase):
         class Client:
             def ask_json(self, *args, **kwargs):
                 return {"section_reviews": [{"section_id": "setup", "verdict": "revise_required", "findings": [finding]}]}
-        common = dict(client=Client(), template=load_report_template_bundle(report_mode="experiment", config=config),
-            memory=memory, sections=[draft], config=config, execution_summary={}, metric_summary={})
+        common = dict(client=Client(), **document_review_inputs(memory, config, [draft]))
         with self.assertRaisesRegex(LLMResponseError, "current-draft quotation"):
             review_document(**common)
         finding["draft_quotes"] = [{"section_id": "setup", "quote": draft.draft_markdown}]
@@ -418,9 +414,8 @@ class ReviewEvidenceTests(unittest.TestCase):
                     "finding_id": old.finding_id, "status": "not_applicable", "explanation": "The literal role differs.",
                     "draft_quotes": [draft.draft_markdown], "evidence_quotes": [reference]}]}]}
         from simple_ar.report.execution_evidence import report_execution_evidence
-        common = dict(client=Client(), template=load_report_template_bundle(report_mode="experiment", config=config),
-            memory=memory, sections=[draft], config=config, execution_summary={}, metric_summary={},
-            execution_evidence=report_execution_evidence(context), historical_findings=[old])
+        common = dict(client=Client(), **document_review_inputs(memory, config, [draft],
+            execution_evidence=report_execution_evidence(context), historical_findings=[old]))
         with self.assertRaisesRegex(LLMResponseError, "declaration, not executor_record"):
             review_document(**common)
         reference.update(pointer="/execution_evidence/execution_records/0/cwd", quote="/actual-copy")
@@ -462,8 +457,7 @@ class ReviewEvidenceTests(unittest.TestCase):
             def ask_json(self, system, prompt, **ignored):
                 captured.append(json.loads(prompt))
                 return {"section_reviews": []}
-        review_document(client=Client(), template=load_report_template_bundle(report_mode="experiment", config=config),
-            memory=memory, sections=[draft], config=config, execution_summary={}, metric_summary={}, source_evidence=[source])
+        review_document(client=Client(), **document_review_inputs(memory, config, [draft], source_evidence=[source]))
         metadata = captured[0]["source_evidence"][0]["metadata"]
         self.assertNotIn("reading_notes", metadata)
         self.assertEqual(metadata["evidence_passages"], original["metadata"]["evidence_passages"])
@@ -485,9 +479,8 @@ class ReviewEvidenceTests(unittest.TestCase):
                 captured.append(json.loads(prompt))
                 return {"section_reviews": []}
         for requested in (None, [brief]):
-            review_document(client=Client(), template=load_report_template_bundle(report_mode="experiment", config=config),
-                memory=memory, sections=[draft], config=config, execution_summary={}, metric_summary={},
-                supplementary_evidence=[brief], requested_context=requested)
+            review_document(client=Client(), **document_review_inputs(memory, config, [draft],
+                supplementary_evidence=[brief], requested_context=requested))
         cold = captured[0]["supplementary_evidence"][0]["content"]["handles"][0]["metadata"]
         requested = captured[1]["supplementary_evidence"][0]["content"]["handles"][0]["metadata"]
         self.assertNotIn("reading_notes", cold)
@@ -511,7 +504,7 @@ class ReviewEvidenceTests(unittest.TestCase):
         seen = []
         class Client:
             def ask_json(self, system, prompt, **ignored):
-                view = json.JSONDecoder().raw_decode(prompt[prompt.index("{"):])[0]
+                view = prompt_payload(prompt)
                 seen.append(view)
                 if len(seen) == 1:
                     raise LLMResponseError("Malformed outer response")

@@ -5,7 +5,7 @@ import shutil
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 DEFAULT_IGNORED_DIR_NAMES = {
@@ -202,6 +202,9 @@ def copy_code_workspace(
     workspace_dir: Path,
     *,
     max_file_bytes: int = 2_000_000,
+    max_files: int | None = None,
+    max_total_bytes: int | None = None,
+    path_allowed: Callable[[Path], bool] | None = None,
 ) -> CopyReport:
     """Copy a code root into an isolated, editable workspace.
 
@@ -215,6 +218,9 @@ def copy_code_workspace(
         workspace_dir: Destination workspace inside the code-task run.
         max_file_bytes: Maximum size for files to copy. Use ``0`` to disable
             this size guard.
+        max_files: Optional bounded selection, checked before copying.
+        max_total_bytes: Optional total size bound, checked before copying.
+        path_allowed: Consumer access rule, checked before any file is read.
 
     Returns:
         Summary of copied and skipped paths.
@@ -232,21 +238,30 @@ def copy_code_workspace(
         raise NotADirectoryError(f"Code root is not a directory: {source}")
     if max_file_bytes < 0:
         raise ValueError("max_file_bytes must be >= 0")
+    if any(value is not None and (type(value) is not int or value <= 0)
+           for value in (max_files, max_total_bytes)):
+        raise ValueError("Copy selection limits must be positive integers")
     if workspace.exists() and any(workspace.iterdir()):
         raise FileExistsError(f"Workspace already contains files: {workspace}")
 
-    workspace.mkdir(parents=True, exist_ok=True)
     skipped: list[dict[str, Any]] = []
     skipped_count = 0
     files_copied = 0
     bytes_copied = 0
+    selected: list[tuple[Path, Path]] = []
+    selection_bytes = 0
+    entries_seen = 0
 
     for current, dirnames, filenames in os.walk(source):
+        entries_seen += len(dirnames) + len(filenames)
+        if max_files is not None and entries_seen > max_files * 16:
+            raise ValueError("Project traversal exceeds its bounded selection; choose a smaller source")
         current_path = Path(current)
         filtered_dirnames: list[str] = []
         for dirname in dirnames:
             path = current_path / dirname
-            reason = _skip_dir_reason(path, source, workspace)
+            reason = (_skip_dir_reason(path, source, workspace)
+                      or ("access_excluded" if path_allowed and not path_allowed(path) else None))
             if reason:
                 skipped_count += 1
                 _record_skip(skipped, source, path, "dir", reason)
@@ -256,19 +271,41 @@ def copy_code_workspace(
 
         for filename in filenames:
             path = current_path / filename
-            reason = _skip_file_reason(path, max_file_bytes=max_file_bytes)
+            reason = ("access_excluded" if path_allowed and not path_allowed(path)
+                      else _skip_file_reason(path, max_file_bytes=max_file_bytes))
             if reason:
                 skipped_count += 1
                 _record_skip(skipped, source, path, "file", reason)
                 continue
 
             relative_path = path.relative_to(source)
-            destination = _safe_destination(workspace, relative_path)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, destination)
-            copied_size = destination.stat().st_size
-            files_copied += 1
-            bytes_copied += copied_size
+            _safe_destination(workspace, relative_path)
+            selected.append((path, relative_path))
+            selection_bytes += path.stat().st_size
+            if max_files is not None and len(selected) > max_files:
+                raise ValueError("Project exceeds max_files; choose a smaller source or an explicit larger bound")
+            if max_total_bytes is not None and selection_bytes > max_total_bytes:
+                raise ValueError("Project exceeds max_total_bytes; choose a smaller source or an explicit larger bound")
+
+    # One owner supplies legacy initialization and native project preparation.
+    # Reject quota overflow before copying, not after publishing a partial tree.
+    workspace.mkdir(parents=True, exist_ok=True)
+    if max_total_bytes is not None and shutil.disk_usage(workspace).free < selection_bytes:
+        raise ValueError("Insufficient disk space for the selected project")
+    for path, relative_path in selected:
+        if (path.is_symlink() or not path.resolve().is_relative_to(source)
+                or (path_allowed and not path_allowed(path))):
+            raise ValueError("Project source changed or became inaccessible during copying")
+        destination = _safe_destination(workspace, relative_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, destination, follow_symlinks=False)
+        copied_size = destination.stat().st_size
+        if destination.is_symlink() or (max_file_bytes > 0 and copied_size > max_file_bytes):
+            raise ValueError("Project source changed during copying")
+        files_copied += 1
+        bytes_copied += copied_size
+        if max_total_bytes is not None and bytes_copied > max_total_bytes:
+            raise ValueError("Project source grew beyond max_total_bytes during copying")
 
     return CopyReport(
         files_copied=files_copied,

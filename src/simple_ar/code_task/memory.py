@@ -416,11 +416,20 @@ def maybe_compact_task_memory(
 
 
 def task_memory_context(run_dir: Path, *, max_events: int = 10, max_findings: int = 6, max_repairs: int = 6) -> str:
-    """Return a compact Markdown memory block for prompts and handoffs."""
+    """Project retained memory without treating a read as a new event.
+
+    Missing memory is initialized by its existing owner; incomplete historical
+    fields can be filled in the view without rewriting the saved record.
+    """
 
     root = Path(run_dir)
     paths = code_task_memory_paths(root)
-    memory = ensure_task_memory(root)
+    memory = (_load_task_memory(paths.task_memory_json)
+              if paths.task_memory_json.is_file() else ensure_task_memory(root))
+    if not memory.objective:
+        memory.objective = _read_optional_text(code_task_paths(root).task_dir / "task.md").strip()
+    if not memory.constraints:
+        memory.constraints = _constraints_from_manifest(root)
     compressed = _load_compacted_memory(paths.compressed_memory_json)
     findings = _read_jsonl_safe(paths.review_findings_jsonl)[-max_findings:]
     repairs = _read_jsonl_safe(paths.repair_memory_jsonl)[-max_repairs:]

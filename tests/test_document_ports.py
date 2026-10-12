@@ -33,6 +33,36 @@ class DocumentPortTests(unittest.TestCase):
 
             self.assertEqual(parsed.parser, "plain_text")
             self.assertIn("bounded method", parsed.text)
+            import json
+            notebook = {'nbformat': 4, 'cells': [
+                {'cell_type': 'markdown', 'source': ['# Protocol\n', 'Use the original split.']},
+                {'cell_type': 'code', 'source': 'print("not executed")\n',
+                 'outputs': [{'data': {'image/png': 'binary-output' * 2000}}]}]}
+            for suffix in ('.ipynb', '.txt'):
+                original = Path(tmp) / ('experiment' + suffix)
+                raw = json.dumps(notebook)
+                original.write_text(raw, encoding='utf-8')
+                view = LocalDocumentParser().parse(original)
+                self.assertEqual(view.parser, 'notebook_cells')
+                self.assertIn('Use the original split.', view.text)
+                self.assertIn('print("not executed")\n', view.text)
+                self.assertNotIn('binary-output', view.text)
+                self.assertEqual(view.coverage['extracted_cells'], 2)
+                self.assertEqual(view.coverage['cells_with_omitted_outputs'], 1)
+                self.assertEqual(original.read_text(encoding='utf-8'), raw)
+                bundle = build_local_document_bundle([original],
+                    extraction_dir=Path(tmp) / ('extracted' + suffix), max_chunks=20)
+                self.assertEqual(bundle.records[0].parser, 'notebook_cells')
+                self.assertTrue(bundle.chunks)
+                self.assertTrue(all('binary-output' not in chunk.text for chunk in bundle.chunks))
+                self.assertIn('Use the original split.', '\n'.join(chunk.text for chunk in bundle.chunks))
+                self.assertNotEqual(bundle.records[0].local_path, str(original))
+            original.write_text('{"metric": 0.7}', encoding='utf-8')
+            self.assertEqual(LocalDocumentParser().parse(original).parser, 'plain_text')
+            original = Path(tmp) / 'invalid.ipynb'
+            original.write_text('{"nbformat": 4, "cells": [{}]}', encoding='utf-8')
+            with self.assertRaisesRegex(RuntimeError, 'invalid_notebook_cell'):
+                LocalDocumentParser().parse(original)
             pdf = Path(tmp) / "paper.pdf"
             pdf.write_bytes(b"%PDF-1.7\nfixture")
             from types import SimpleNamespace

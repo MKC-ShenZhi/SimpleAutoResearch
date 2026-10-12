@@ -237,7 +237,7 @@ def generate_greenfield_code_task(
         if not contract.get("benchmark_command"):
             contract["benchmark_command"] = benchmark_command
     else:
-        contract = _contract_from_task(
+        contract = build_greenfield_task_contract(
             task_text,
             benchmark_command=benchmark_command,
             max_files=max_files,
@@ -387,7 +387,7 @@ def generate_greenfield_code_task(
             agent_args=implementation_agent_args,
         )
     else:
-        _emit(message_callback, "Writing generated project files.")
+        _emit(message_callback, "Writing related project files through the shared implementation generator.")
         code_artifacts = write_generated_project(
             project_dir=project_dir,
             architecture_plan=architecture,
@@ -496,27 +496,6 @@ def _llm_client(
         ) from exc
 
 
-
-
-def _contract_from_task(
-    task_text: str,
-    *,
-    benchmark_command: str,
-    max_files: int,
-    max_generated_lines: int,
-    result_schema: dict[str, Any],
-    source: dict[str, Any] | None = None,
-    extra_contract: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    return build_greenfield_task_contract(
-        task_text,
-        benchmark_command=benchmark_command,
-        max_files=max_files,
-        max_generated_lines=max_generated_lines,
-        result_schema=result_schema,
-        source=source,
-        extra_contract=extra_contract,
-    )
 
 
 def result_schema_from_manifest(manifest: dict[str, Any]) -> dict[str, Any]:

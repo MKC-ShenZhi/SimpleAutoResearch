@@ -111,7 +111,7 @@ Locks, budgets, migration, and recovery in the implementation blueprint should b
 
 ### Current research-session extension boundaries
 
-These are current development contracts, not claims that every provider, project, or
+These are structured research development contracts, not claims that every provider, project, or
 scientific loop has passed live acceptance.
 
 `research-session` interprets task/assets/constraints into an accepted bounded plan and connects
@@ -146,11 +146,17 @@ path and remain bounded until a real consumer justifies a larger interface.
 
 ### Compatibility Audit
 
-The repository has one formal research entrypoint, segmented commands, and
-historical readers. The old eight-stage runner has been removed:
+Ordinary new tasks use the native goal-driven entrypoint; exact structured
+protocols, segmented commands and historical recovery retain their consumers.
+The old eight-stage runner has been removed:
 
 ```text
-research-session (formal user mainline)
+start (ordinary native goals and adaptable creation preferences)
+  -> ToolApplication -> CommonToolGateway -> shared domain modules
+  -> SessionController -> ArtifactStore
+
+research-session (exact structured protocols and saved-session recovery)
+  -> ResearchApplication
   -> typed research capabilities -> SessionController -> ArtifactStore
 
 research-brief (segmented/development)
@@ -160,11 +166,16 @@ simple-ar status / inspect / search-artifacts
   -> historical artifact readers (no old workflow execution)
 ```
 
-`research-session` is the shared user execution entrypoint; `start` prepares
-its ordinary task configuration. Inputs select a literature, code-repair,
-descriptive-analysis, material-writing or prepared-reproduction path. A command
-does not force every research action, and absence of a command does not force a
-literature survey. The application validates applicable inputs and permissions. The
+`start` sends ordinary goals and adaptable creation preferences to `ToolApplication`,
+which combines investigation, implementation, analysis, writing, visual/image work
+and publication through existing domain tools. `cli/start.py` adapts inputs; it
+has no execution ownership. Exact table columns, fixed edit/validation scope and
+reproduction protocols retain the TOML/`research-session` path through
+`ResearchApplication`. Saved tasks recover through their original owner and protocol;
+structured execution is not an implicit fallback after native failure. Goals and
+preferences grant no permissions: mounts remain read-only, access and resources
+are explicit, and process commands require exact approval. This is not an OS sandbox
+or proof of delivery reliability or scientific quality. The
 segmented commands remain useful for
 development, diagnostics, and persisted handoff continuation, but are not a
 parallel product workflow. `simple-ar run/resume` is retired; its flags are not
@@ -346,9 +357,9 @@ artifacts, choose a best result, or schedule work; missing parents and cycles
 are reported explicitly.
 
 The application layer owns the ordered capability sequence and calls
-`SessionController.execute_attempt()` explicitly. The new
-`simple_ar.app.research_application.ResearchApplication` is the first formal
-entry: it persists a `ResearchBrief` and normalized assets, then advances the
+`SessionController.execute_attempt()` explicitly. The structured
+`simple_ar.app.research_application.ResearchApplication` entry persists a
+`ResearchBrief` and normalized assets, then advances the
 visible sequence `plan -> search -> document_ingest -> read -> synthesize ->
 summarize` one bounded action at a time. It records the accepted output in
 `SessionManifest.state_refs`, so a reload can continue without reconstructing
@@ -1365,6 +1376,24 @@ Run config and public example config loading tests:
 ```bash
 uv run python -m unittest tests.test_run_config
 ```
+
+## Preview Completion Priorities
+
+The preview is not a completed V2.9 release. The next acceptance work should:
+
+- Complete a paper-to-reproduction task, including preparation, measured results,
+  a substantive feedback revision and a portable delivery. Prepared commands or
+  an initial PDF alone do not close this requirement.
+- Check conceptual-image feedback against the requested meaning and layout,
+  and validate cross-module use on one installation candidate. Earlier successful
+  reports or figures on other candidates remain evidence with their original scope.
+- Retire replaced implementation, templates and duplicate tests together after
+  checking public and historical consumers. Keep permissions, observed execution,
+  unknown usage and recovery; moving code between files is not simplification.
+
+Named-connection authentication is only a deployment check, not evidence of
+long-stream reliability or task quality. Freeze against complete user outcomes,
+not test counts, compilation success or a collection of demonstrations.
 
 ## Git Hygiene
 

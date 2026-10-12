@@ -4,20 +4,91 @@
 
 本文说明如何安装、配置和运行 SimpleAutoResearch。它是面向用户的实践指南；工作流概念和产物结构见 [工作流与产物](WORKFLOWS_zh.md)，完整命令表见 [CLI 参考](CLI_REFERENCE_zh.md)，TOML 字段见 [配置参考](CONFIG_REFERENCE_zh.md)。
 
-## 从一个功能开始
+## 从一个任务开始
 
-安装后执行 `uv run simple-ar start`，可以选择五类结构化引导：
+`uv run simple-ar start` 询问自然语言目标，进入实验性原生工具循环。
+材料用可重复的 `--source PATH` 只读挂载；公开检索需要 `--allow-network`，
+进程提案需要 `--allow-execution` 并单独批准命令。额度和续接规则见[原生入口](CLI_REFERENCE_zh.md#原生任务入口实验性)，
+完整跨任务验收尚未通过。
+
+结束时的结果面板显示保存的工作区、待处理动作和账本余额。已有交付记录可能属于
+当前反馈之前的版本；文件存在、终态和剩余调用次数不代表验收通过，也不保证
+下一次模型请求能放入剩余token额度。
+
+新原生任务提供授权范围内的完整工具契约，可在同一行动循环组合工作区、来源、代码、
+分析、写作和出版能力。历史按需加载任务续接时保留已保存的契约选择。
+工具可用不授予执行或网络权限，也不代表任务已成功。
+
+提供 Python 项目后，原生任务可复用现有准备模块调查说明、依赖声明和入口候选，
+取得概览及完整观察记录，不导入项目、安装依赖或执行测试。依赖元数据描述的是
+调查进程所在解释器，不代表另行选定的任务 Python 已准备好。
+最终 `write_file` 可携带明确的 `delivery`（说明、产物路径和未解决项），校验路径并成功
+写入后保存同一交付清单，不再为声明交付单独调用模型。只写文件仍不会自动完成任务，
+交付也不证明内容正确。
+
+新实现可复用已有生成器，一次准备关联源码与检查；使用模型目录的 `code` 路由和同一
+任务预算。原材料不变，候选、来源绑定及未解决项保存于任务中。执行仍需批准，
+语法检查不能替代行为验证，也不代表任务已交付。
+只给目标也可开始：代码所有者自行选择新文件，不要求用户提供仓库、协调层预列文件
+或固定入口文件名。已有项目为同一选择路径补充有界库存和原文；显式文件与窗口仍可使用。
+修改已有文件时，可为关联输出提供 `source_path` 和观察过的 `source_sha256`；
+专业调用基于完整有界原文生成精确替换，保留其余内容，再保存独立候选。
+新文件仍生成正文；原文或整体输入过大时明确拒绝，不用截断内容重写源文件。
+
+已观察的文本文件可按来源摘要原样转入工作区，包括生成候选，组装或修订可运行项目时
+不必重新发送全文。覆盖已有目标仍须当前摘要，并沿普通写入保留备份；挂载原始来源
+保持只读。复制不授予执行权限，也不证明修复正确。
+
+补充材料可使用 `simple-ar start --resume-task SESSION "结合这些笔记" --source notes/ --yes`。
+访问授权也可在续接时明确追加，保留已完成成果和原预算，不必另建任务从头执行。
+原生模型决策已终止且无接受回复时，可显式使用 `--resume-task SESSION --retry-model`，
+沿原剩余额度继续，不重复已完成工具；保留失败和有界未知预留。
+它不能处理在途操作、无界未知消耗或预算耗尽；具体条件及分开授权规则见CLI参考。
+
+原生任务可检查有界 CSV/TSV 或记录数组 JSON 表格，调用已有确定性分析能力，
+完成支持范围内的汇总及明确配对比较。分析包包含输入副本、图形和可重建结果。
+行含义、单位及配对关系仍须依据材料或集中澄清，观测数量不证明样本独立或统计显著。
+不支持的转换和方法进入已有代码/执行路径，并沿其授权边界处理；写作应消费实际
+计算结果，而不是代替计算。
+
+原生写作可同时使用供给文本、表格、保存结果的选定窗口及已取得的文献片段。
+已有图形复制到可编辑 `manuscript.md` 旁，以相对路径引用；反馈创建新版本，
+保留原稿与输入。写作工具不计算统计量或核验图形，需要这些工作时应先要求计算与核查，
+不能仅因正文生成就相信其结论。出版继续消费这份正文。
+图形可在路径之外明确提供图注：图注归图片，正文负责解释，出版负责编号。
+导出只移除紧邻且完全相同的重复图注，不猜测删除相似论述；旧路径输入仍有效。
+正文及图形应放在专用稿件目录：原生出版绑定授权的本地图形内容，盘点上限为
+4096 个目录条目和 256 MB 图形，派生出版目录不作为输入。即使正文未改，图片变化
+也需要新的批准；私有图片不复制，编译失败保留源码、失败版本和诊断。
+
+需要检查 PDF 版面时，原生出版工具可在编译时显式设置 `render_preview: true`。
+同一份 Markdown 派生 TeX/PDF，同一批准操作渲染全部页面，返回可交给
+`inspect_images` 的图片位置。该有界预览支持最多 12 页、120 DPI，每个尺寸缩放至
+不超过 1600 像素；更长文档明确报告，不偷偷截断。渲染不等于视觉审阅；请求的
+预览未完成时不交付，已编译 PDF 与诊断仍保留。
+
+### 成果偏好与结构化兼容
+
+执行 `uv run simple-ar start --guided` 选择成果偏好。普通调研、写作、复现、改码、数据、图形和
+代码偏好都与自然语言请求使用同一原生主干。提供目标及常见只读材料/项目/数据路径即可，
+无需先填验证器、编辑范围或完整测量协议。需要的公开来源/进程提案访问须明确确认，
+每条进程命令仍单独批准；`--yes` 只接受展示的摘要，`--prepare-only` 不调用模型或进程。
+详见[偏好输入](CLI_REFERENCE_zh.md#成果复用与概念图)。
+兼容由显式控制参数选择，不由偏好名称选择：
 
 | 功能 | 需要提供 | 执行边界 |
 | --- | --- | --- |
-| `survey` | 问题/范围，可选论文 | 在线或供材阅读，再写报告；需要模型 |
+| `survey` | 显式 `--sources`/获取控制，可选论文 | 保留声明的来源政策和报告协议；需要模型 |
 | `bug_fix` | 项目、允许路径、验证命令 | 受限修改与实际验证；需准备依赖 |
 | `reproduction` | 论文、已有项目/数据、固定协议/命令 | 指定结论，当前环境或明确选择任务虚拟环境，不自动获取数据 |
-| `writing` | 笔记/草稿或完成的分析包，可选论文 | 材料到报告/草稿，不默认检索或实验 |
-| `data_analysis` | 表格、字段、行/值含义和单位 | 描述统计、观测箱线图或已有柱状/折线/散点/矩阵热图值；无需 API |
+| `writing` | 显式 `--template` 或报告控制，笔记/草稿/分析包 | 保留指定结构化写作协议 |
+| `data_analysis` | 不加 `--scripted` 的显式数值/x/基线列选择，或物理表格控制 | 确定性表格快捷入口，描述统计与声明的图形；不加 `--with-report` 写作时无需 API |
 
-`--prepare-only` 只保存配置，不执行或调用模型。也可以选择 `start --chat`，用自然语言
-澄清影响结果的选择，确认后进入同一配置路径。它需要模型，会发送回复与指定材料预览，
+`--chat`/`--resume-setup` 保留结构化技术设置，`--from-session`/`--reuse` 保留登记成果与范围复用。
+即使显式提供 `--interaction checkpoints` 等默认值也会选择兼容协议，不能混用原生访问/预算参数；
+figure 与 scripted 分析在创建前拒绝不兼容的结构化控制。
+`--prepare-only` 只保存配置，不执行或调用模型。技术协议设置可选择 `start --chat`，用自然语言
+澄清影响结果的选择，确认后进入结构化配置路径。它需要模型，会发送回复与指定材料预览，
 并保存澄清用量；`--resume-setup PATH` 恢复草稿，不重开计费记录。这不是通用编程 Agent，
 代码/复现的执行命令和范围仍需明确。不能与承诺不调用 API 的 `--prepare-only` 同用。
 尚未确定的可选项不写成实际赋值；先回答影响结果的选择，完整确认配置仍在执行前校验。
@@ -26,11 +97,11 @@
 
 改码可用 `--project-python /path/to/project-venv/bin/python`（Windows 用
 `C:\path\project-venv\Scripts\python.exe`）指定已有项目环境，无须手改 TOML。
-省略仍使用当前环境；不创建环境或安装依赖。此选项仅适用于 `bug_fix`，不改变助手本身的 Python 要求。
+省略仍使用当前环境；不创建环境或安装依赖。此选项也适用于原生任务执行，不改变助手本身的 Python 要求。
 
 无 API 首次体验可执行
 `uv run simple-ar research-session --config examples/data-curves/research.toml`。
-已保存分析包可以用于后续写作；排版导出是单独的 `report-export`，见 [CLI](CLI_REFERENCE_zh.md)。
+已保存分析包可以用于后续写作；`report-export` 导出保存的结构化报告 attempt，原生稿件在任务中出版，见 [CLI](CLI_REFERENCE_zh.md)。
 
 终端选择数据列前会显示列名和示例值。[配对观察案例](../examples/data-paired/README_zh.md)
 无需模型即可计算同一行差值和标准误。准备复现命令前，可先用
@@ -48,7 +119,8 @@ requirements 的安装指令、包含文件或截断行仍未解析，版本匹�
 非 editable；构建可能执行代码、联网、写源目录构建文件。默认仍用当前环境。设置本身只保存选择，
 范围、用量及恢复见[配置参考](CONFIG_REFERENCE_zh.md#引导设置)。
 
-任务 TOML 保存项目实际配置，`.env` 仅放全局凭据/模型/传输设置；普通用户不必填写下面
+结构化任务的 TOML、原生任务的会话分别保存已确认配置。命名连接和路由放在 `models.toml`，
+凭据从环境读取；仅环境变量连接仍作为旧配置兼容方式。普通用户不必填写下面
 所有高级选项。详见[引导设置](CONFIG_REFERENCE_zh.md#引导设置)。
 
 ## 环境要求
@@ -65,8 +137,8 @@ requirements 的安装指令、包含文件或截断行仍未解析，版本匹�
 详见 [Matplotlib 字体回退说明](https://matplotlib.org/stable/users/explain/text/fonts.html)。
 
 图结构的方法图可在执行机器选装 [Graphviz](https://graphviz.org/download/)，确保 `PATH`
-中有 `dot`（Debian/Ubuntu：`sudo apt install graphviz`）。绘图工程会提供可用性信息，
-让生成代码可使用成熟布局工具，不必逐个手摆节点。数据图不要求此工具，任务设置不会自动
+中有 `dot`（Debian/Ubuntu：`sudo apt install graphviz`）。生成代码可使用成熟布局工具，
+任务应通过已授权命令确认它实际可用。数据图不要求此工具，任务设置不会自动
 安装；渲染后的标签和反馈箭头仍需视觉检查。
 
 克隆当前预览分支，与 [README](../README_zh.md) 一致：
@@ -90,6 +162,20 @@ uv run simple-ar --help
 
 ## 环境变量配置
 
+普通多任务使用建议配置共享命名目录。将[示例](../examples/model-profiles/models.toml)
+复制到 `~/.config/simple-ar/models.toml`，或私有位置并设置 `SIMPLE_AR_MODELS_CONFIG`
+为其绝对路径。各 profile 保存服务商实际 URL、模型与 API 模式，`api_key_env` 引用凭据变量名，
+密钥值留在环境或私有 `.env`；示例引用 `CCTQ_API_KEY`，可改为对应服务商的变量名。
+项目路径、数据、解释器和限额仍属于任务输入。
+
+设置一次 `default` 供普通文本任务使用，`code` 供代码工作使用；按需增加 `text`、`writing`、
+`vision`、`image` 路由，各任务共享目录。原生写作未设独立路由时沿用任务连接。
+终端中的 `start` 显示文本连接供选择，`--model profile:NAME` 可明确指定。
+`--model env` 在有目录时使用 text/default 路由，无目录时使用旧环境连接，不绕过目录。
+`simple-ar models` 本地检查凭据是否存在并校验目录声明，不调用 API，也不验证提供方连通性。
+原生决策要求 Chat；结构化文本工作流也支持 Responses。详见[命名连接](CONFIG_REFERENCE_zh.md#命名模型连接)。
+
+未配置目录时，兼容仅环境变量方式：
 仅在尚无 `.env` 时创建；不要覆盖已有连接设置：
 
 ```bash
@@ -102,7 +188,7 @@ PowerShell：
 Copy-Item .env.example .env
 ```
 
-最小模型连接示例，须替换为服务商实际设置：
+旧环境模型连接示例，须替换为服务商实际设置：
 
 ```bash
 OPENAI_API_KEY=your_api_key
@@ -112,13 +198,13 @@ SIMPLE_AR_LLM_API=chat
 SIMPLE_AR_LLM_STREAM=true
 ```
 
-传输与恢复说明（按需查阅的高级参考）：
+传输与恢复说明（按需查阅的高级参考；下列 `SIMPLE_AR_LLM_*` 连接设置用于旧环境方式，命名 profile 使用自身设置）：
 
-- `OPENAI_API_KEY` 是 LLM 模式必需项。
+- `OPENAI_API_KEY` 是旧环境 LLM 连接必需项；命名 profile 使用 `api_key_env` 引用的变量。
 - `OPENAI_BASE_URL` 可以指向 OpenAI，也可以指向第三方 OpenAI 兼容 `/v1` 接口。
-- `SIMPLE_AR_MODEL` 为 `research-session --model env` 提供模型名称；新会话省略
+- 无目录时，`SIMPLE_AR_MODEL` 为 `research-session --model env` 提供模型名称；新会话省略
   `--model` 表示明确使用确定性模式。
-- `SIMPLE_AR_LLM_BACKEND` 控制传输实现。默认 `openai` 使用 OpenAI Python SDK 直连；`litellm` 保留旧的 LiteLLM 兼容层。
+- `SIMPLE_AR_LLM_BACKEND` 控制传输实现。默认 `openai` 使用 OpenAI Python SDK 直连；`litellm` 保留旧的 LiteLLM 兼容层，需执行 `pip install 'simple-autoresearch[litellm]'` 安装可选依赖。默认 SDK 路径不需要该额外依赖。
 - `SIMPLE_AR_LLM_API` 控制请求形态。`responses` 会发送 Responses API 风格的 `instructions` 和 `input`，临时错误只在同一接口内有限重试；`chat` 会直接发送 Chat Completions 风格的 `messages`。已有的 `auto` 模式才会在 Responses 重试后再尝试 Chat，用于兼容只暴露其中一种接口的网关。
 - `SIMPLE_AR_LLM_STREAM=true` 在 `SIMPLE_AR_LLM_API=chat` 时启用 Chat Completions
   流式传输；客户端会在解析前拼接 chunks，服务商提供最终 usage 时仍会记录它。Responses
@@ -133,6 +219,10 @@ SIMPLE_AR_LLM_STREAM=true
   该设置传给传输客户端，不保证持续收到事件的流在相同墙钟时间内结束；重试也会延长逻辑调用。断流的实际用量不能确认时保留未知状态，不当成已确认零费用。
 - `SIMPLE_AR_MAX_OUTPUT_TOKENS` 是可选项；留空或设为 `0` / `off` / `none` / `unlimited` 时，不向 provider 传输出上限。只有你确实想限制模型输出长度时才设置正数。
 - `SIMPLE_AR_LLM_RETRY_ATTEMPTS` 和 retry delay 设置控制临时 provider 错误的有限指数退避重试，例如连接中断、限流、超时、5xx 响应和 Cloudflare 524 origin timeout。
+  SDK Chat 流区分发送前连接/连接池失败与可能发送后的读写失败、断流。
+  明确未发送的尝试消耗一次请求、零 tokens；未知用量且无输出上限的流停止，
+  不自动重发或切换接口。有上限文本在可重试时保留失败请求的保守预留。
+  增加重试次数不会覆盖这一区别，也不能解决提供方容量问题。
 - `SIMPLE_AR_LLM_MAX_WORKERS` 可选，限制单进程内每批模型请求的并发数；不设置则保留各阶段默认并发。服务商限流时可设为 `1`，不改变研究会话协议。
 - 在线研究调用在有界 provider 重试耗尽后停止并保留失败 attempt。研究 TOML 没有
   `[llm].allow_fallback` 开关；要离线运行请设置 `[model].name = ""`，不能把确定性输出描述成
@@ -168,6 +258,7 @@ SIMPLE_AR_LLM_STREAM=true
 
 ## 选择任务与最小输入
 
+普通任务用 `start` 提供目标与材料，按需要选择工具。下列示例使用显式结构化接口：
 `research-session` 接收目标、已有材料和明确的执行条件，再由 accepted plan
 选择适用能力；用户不需要填写内部阶段顺序。当前支持的任务形态如下：
 
@@ -176,7 +267,7 @@ SIMPLE_AR_LLM_STREAM=true
 | 在线综述 | `[task] outputs=["report"]`、`[research] providers=[...]`；`research-session --config survey.toml` | 不启动实验进程或代码项目 |
 | 分析已有论文/笔记 | 增加 `[research] materials_only=true` 与 `[assets].papers=[...]` | 不执行网络检索或伪造检索结果 |
 | 使用笔记/结果写作 | `[task] kind="writing"`、`outputs=["report"]`、`[assets].materials=[...]`、`[model] name="env"` | 不重做综合/检索/实验；分析 JSON 必须是完成的支持格式分析包 |
-| 描述/绘制已有数据 | `start --kind data_analysis` 或[数据曲线案例](../examples/data-curves/README.md) | 不调用模型，不推断统计结论、平滑或认证科学有效性 |
+| 描述/绘制已有数据 | `start --kind data_analysis --data-file PATH --value-column NAME` 或[数据曲线案例](../examples/data-curves/README.md) | 确定性快捷方式：不调用模型，不推断统计结论、平滑或认证科学有效性 |
 | 修复已有项目 | `[task] kind="bug_fix"` 加 `[execution] code_task_config="code_task.toml"`；运行研究配置 | 不自动引入文献或 baseline |
 | 复现/测量已有脚本 | `[execution] command=["python","measure.py"]`、`cwd`、指标与有限进程预算 | 不自动发现仓库或扩展种子 |
 | 改进已有研究项目 | `[task] kind="auto"` 配 `execution.code_task_config`、保护资产、benchmark 和 protocol；参见[持续学习案例](../examples/continual_learning/README.md) | 不安装依赖、下载数据或宣称科研成功 |
@@ -429,6 +520,11 @@ uv run simple-ar code-task execute runs/<run-id> --to-step run
 
 这种模式会复用 code-task 的 memory、reviewer、validation、runner 和 repair 产物，只是实现步骤不再应用 patch，而是在隔离 workspace 内生成 `generated_project/`。
 
+生成先写入独立候选，完成后才替换当前项目。旧项目保留在旁边的
+`.generated_project.previous-*`，失败候选保留为`.generated_project.candidate-*`，
+便于核查与恢复；生成失败不会清空已交付目录。这些目录不是当前输出，不自动删除。
+这只保护项目文件，不是规划元数据的整体事务，也没有新增会话运行时。
+
 在规划 greenfield 实现前，`execute` 会写出 `code_task/meta/dependency_advice.json`
 和 `.md`。它会扫描当前 Python 环境，把完整 installed-package snapshot 写入 JSON，
 并在终端只展示和任务相关的可用库子集。内置 dependency catalog 只是语义提示，不是
@@ -438,7 +534,7 @@ uv run simple-ar code-task execute runs/<run-id> --to-step run
 
 如果省略或显式使用 `workspace.mode = "auto"`，已有项目会先尝试 detached git worktree。如果 Git 不可用、不在仓库内、仓库还没有 commit，或 worktree 无法安全创建，本次 run 会降级为受保护的 copy，并在 `manifest.json.workspace` 写入 `requested_mode`、`selected_mode`、`fallback_reason` 和 `user_next_steps`。
 
-引导入口 `start --kind bug_fix` 也使用这一策略：干净 Git 项目保留已提交文件，不受复制大小限额影响；有未提交修改或非 Git 的项目复制当前状态。复制遗漏见清单，复制限额不等于源码阅读窗口，不能把复制出的子集视为完整仓库。
+显式 `start --kind bug_fix --allow PATTERN --validate COMMAND` 协议也使用这一策略：干净 Git 项目保留已提交文件，不受复制大小限额影响；有未提交修改或非 Git 的项目复制当前状态。复制遗漏见清单，复制限额不等于源码阅读窗口，不能把复制出的子集视为完整仓库。
 
 如果使用 `workspace.mode = "git_worktree"` 或 `--workspace-mode git_worktree`，`init` 会在 `code_task/workspace/` 创建 detached git worktree，而不是完整复制文件。这个模式要求 `code_root` 位于本地 Git 仓库中，并且仓库至少有一次 commit；`code_root` 可以是仓库根目录，也可以是 monorepo 中的项目子目录。子目录场景下，系统会在仓库根创建 worktree，并把 worktree 中对应子目录作为实际可编辑 project root，用于索引、修改和 benchmark 执行。如果目录不满足要求，CLI 会给出可操作提示，比如初始化 git、提交初始 baseline、传入正确项目路径，或者改用 `copy` 模式包含当前未提交文件状态。
 
@@ -548,12 +644,12 @@ reviewer 的语义文件组。Greenfield planning 额外写入
 `code_task/meta/planning/agent_steps.jsonl`，用于排查 requirements / architecture /
 interfaces / file-plan / planning-review 哪一步失败或反复回修。
 
-对于 greenfield run，同一套 review gate 会在验证前检查生成项目。如果 review 发现
-通用可修复问题，例如核心文件仍是 fallback、缺少 artifact writer、缺少本地 API 等，
-`execute` 可以用有限轮次的 LLM repair 优先生成结构化局部修复 action，例如唯一
-old/new 文本替换或函数级替换；只有文件职责整体错误时才回退到整文件替换。修复会记录
-edit application、重新同步 `code_task/meta/code_artifacts.json`，再跑一次 review。若问题仍然阻塞，run 会停住并
-保留当前生成产物和 review 报告，方便人工接管。
+对于 greenfield run，同一套 review gate 会在验证前检查生成项目。有限的审阅和运行
+修复轮次根据实际诊断选择关联文件，复用代码能力生成独立、绑定原件摘要的候选。
+应用仍经过 API、静态检查和快照保护；拒绝时还原整组变化，不留下半套修复。
+执行器同步 `code_task/meta/code_artifacts.json` 后重新审阅和验证。旧无绑定结果只保留
+历史含义，不证明当前项目已修复；显式新轮次先保留旧结果，再继续工作。生成或应用
+中断后保留诊断，不盲目重放。问题仍阻塞时，执行停住并保留产物和审阅记录。
 
 3. 在 patch-plan 审核面板出现时，阅读 `code_task/work_plan.md` 和
 `code_task/patch_plan.md`。如果计划合理，输入 `yes` 继续。如果你在非交互环境运行、
@@ -679,8 +775,10 @@ uv run simple-ar code-task context runs/<run-id> --max-files 8 --max-total-chars
 `context_pack.json`、`prompt_context.md` 和 `selected_snippets.jsonl`。
 这些文件记录选择了哪些源码片段、哪些文件因为预算被省略、哪些内容只作为证据
 而不能被自动修改。当前如果存在 latest context pack，`plan` 会优先使用它作为
-规划上下文，`propose-edits` 只会读取其中 editable snippets，并继续把 tests /
-benchmarks 作为 read-only evidence。
+规划上下文；`propose-edits` 从所选片段开始，继续把 tests / benchmarks 作为
+read-only evidence。有界补读更新当前源码窗口，不把窗口字符上限当成累计阅读额度。
+初始选段不代表授权范围：新读到的文件仍按配置的编辑权限判断，有明确批次时仍受
+批次目标限制。原始观察与每次提示保留的片段位置记录在 `edit_context_followup.json`。
 
 ### 手动 Primitive 路径
 

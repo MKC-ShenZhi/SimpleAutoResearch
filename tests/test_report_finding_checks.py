@@ -7,25 +7,17 @@ from simple_ar.report.agent import _dedupe_findings, run_report_agent
 from simple_ar.report.editor import coalesce_document_reviews, review_document, rejected_review_context_requests
 from simple_ar.report.schema import ReportSectionReview, ReviewerFinding, ReportIterationRecord
 from simple_ar.report.tool_gateway import ReportToolGateway
-from tests.report_review_fixtures import finding_check_objects
-
-
-def unresolved_opinion_response(view):
-    """Prompt-capture fixtures still answer every requested opinion explicitly."""
-    grouped = {}
-    for row in view["historical_findings_to_check"]:
-        review = grouped.setdefault(row["section_id"], {"section_id": row["section_id"],
-            "verdict": "revise_required", "finding_checks": []})
-        review["finding_checks"].append({"finding_id": row["finding_id"], "status": "unresolved",
-            "explanation": "This fixture does not establish a resolution."})
-    return {"section_reviews": list(grouped.values())}
+from tests.report_review_fixtures import (
+    document_review_inputs, finding_check_objects, opinion_check_response, prompt_payload,
+    unresolved_opinion_response,
+)
 
 
 class FindingCheckTests(unittest.TestCase):
     def test_explicit_verify_requests_are_read_before_rewriting_even_with_revision_verdict(self):
         for verdict in ('warning', 'revise_required', 'fail'):
             with self.subTest(verdict=verdict):
-                kwargs, completed, _, drafts = self.objects()
+                kwargs, completed, _, drafts = finding_check_objects()
                 completed['memory']['reviewer_findings'] = []
                 completed['reviewer_findings'] = []
                 kwargs['context'].synthesis_markdown = 'Retained derived interpretation, not original evidence.'
@@ -70,7 +62,7 @@ class FindingCheckTests(unittest.TestCase):
     def test_accepted_document_lookup_allocates_before_read_and_restores_without_repeating(self):
         for stop_at in ("allocated", "returned_unsaved", "completed"):
             with self.subTest(stop_at=stop_at):
-                kwargs, completed, _, drafts = self.objects()
+                kwargs, completed, _, drafts = finding_check_objects()
                 completed["memory"]["reviewer_findings"] = []
                 completed["reviewer_findings"] = []
                 kwargs["context"].synthesis_markdown = "Saved interpretation remains derived, not primary evidence."
@@ -141,7 +133,7 @@ class FindingCheckTests(unittest.TestCase):
         self.assertEqual(len(extract([row, second], 2)), 2)
 
     def rejected_lookup_objects(self):
-        kwargs, checkpoint, old, drafts = self.objects()
+        kwargs, checkpoint, old, drafts = finding_check_objects()
         kwargs["context"].synthesis_markdown = "Saved interpretation remains derived context."
         rejected = {"section_reviews": [{"section_id": "scope", "verdict": "revise_required",
             "context_requests": [{"tool_name": "get_synthesis_brief", "arguments": {}}],
@@ -159,10 +151,9 @@ class FindingCheckTests(unittest.TestCase):
                 if label == "report-document-finding-checker":
                     return rejected
                 if label == "report-document-finding-checker-format-correction":
-                    return {"section_reviews": [{"section_id": "scope", "verdict": "pass",
-                        "finding_checks": [{"finding_id": old.finding_id, "status": "not_applicable",
-                            "explanation": "The current text explicitly preserves uncertainty.",
-                            "draft_quotes": [drafts[0].draft_markdown]}]}]}
+                    return opinion_check_response(old, verdict="pass", status="not_applicable",
+                        explanation="The current text explicitly preserves uncertainty.",
+                        draft_quotes=[drafts[0].draft_markdown])
                 raise AssertionError("No Writer or extra correction is authorized")
         return kwargs, checkpoint, old, drafts, rejected, labels, views, Client()
 
@@ -192,6 +183,8 @@ class FindingCheckTests(unittest.TestCase):
                 saved = []
                 def sink(row):
                     saved.append(row)
+                    if not row["iterations"]:
+                        return  # The frozen plan checkpoint precedes review events.
                     event = row["iterations"][-1]
                     if event["action"] != "document_finding_check_rejected" or not event["tool_results"]:
                         return
@@ -225,7 +218,7 @@ class FindingCheckTests(unittest.TestCase):
                                     ({"handle": "unregistered", "query": "condition"}, "not_found"),
                                     ({"handle": "paper:p", "query": "condition", "limit": 99}, "error")):
             with self.subTest(expected=expected):
-                kwargs, checkpoint, _, drafts = self.objects()
+                kwargs, checkpoint, _, drafts = finding_check_objects()
                 checkpoint["memory"]["reviewer_findings"] = []
                 checkpoint["reviewer_findings"] = []
                 kwargs["context"].source_handles = [SourceHandle(handle="paper:p", kind="paper",
@@ -308,7 +301,7 @@ class FindingCheckTests(unittest.TestCase):
             self.assertEqual(result.sections, drafts)
 
     def test_rejected_discovery_in_opinion_role_keeps_history_and_cannot_dispatch_writer(self):
-        kwargs, checkpoint, old, drafts = self.objects()
+        kwargs, checkpoint, old, drafts = finding_check_objects()
         kwargs["config"].max_review_iterations = 2
         labels, saved = [], []
         class Client:
@@ -340,7 +333,7 @@ class FindingCheckTests(unittest.TestCase):
         self.assertIn(old, resumed.memory.reviewer_findings)
 
     def test_historical_check_cannot_add_new_findings_or_rewrite_instructions(self):
-        kwargs, _, old, drafts = self.objects()
+        kwargs, _, old, drafts = finding_check_objects()
         for extra in ({"findings": [{"finding_id": "new", "type": "style", "message": "A new preference."}]},
                       {"revision_instructions": ["Replace this section with a new argument."]}):
             with self.subTest(extra=extra):
@@ -351,18 +344,17 @@ class FindingCheckTests(unittest.TestCase):
                     def ask_json(self, *args, **ignored):
                         return response
                 with self.assertRaisesRegex(LLMResponseError, "cannot add"):
-                    review_document(client=Client(), template=kwargs["template"], memory=kwargs["memory"],
-                        sections=drafts, config=kwargs["config"], execution_summary={}, metric_summary={},
-                        historical_findings=[old], on_invalid_response=lambda row, error: rejected.append((row, error)))
+                    review_document(client=Client(), **document_review_inputs(
+                        kwargs["memory"], kwargs["config"], drafts, template=kwargs["template"],
+                        historical_findings=[old], on_invalid_response=lambda row, error: rejected.append((row, error))))
                 self.assertEqual(json.dumps(response, sort_keys=True), before)
                 self.assertEqual(rejected[0][0], response)
                 # Discovery still owns new findings; do not disable that role.
-                self.assertEqual(len(review_document(client=Client(), template=kwargs["template"],
-                    memory=kwargs["memory"], sections=drafts, config=kwargs["config"],
-                    execution_summary={}, metric_summary={})), 1)
+                self.assertEqual(len(review_document(client=Client(), **document_review_inputs(
+                    kwargs["memory"], kwargs["config"], drafts, template=kwargs["template"]))), 1)
 
     def test_historical_check_omits_drafting_directives_not_task_or_evidence(self):
-        kwargs, _, old, drafts = self.objects()
+        kwargs, _, old, drafts = finding_check_objects()
         objective = "Inspect all supplied sections and retain the user's conditions. " * 80
         kwargs["memory"].section_plan[0].goal = "An earlier Writer-only instruction."
         source = [{"handle": "material:source", "metadata": {"evidence_passages": [{"text": "Original source qualification."}]}}]
@@ -374,10 +366,10 @@ class FindingCheckTests(unittest.TestCase):
                 captured.append(view)
                 return unresolved_opinion_response(view)
         for prior, correction in ((None, None), ([old], None), ([old], {"validation_error": "An invalid check."})):
-            review_document(client=Client(), template=kwargs["template"], memory=kwargs["memory"],
-                sections=drafts, config=kwargs["config"], execution_summary={"metric": 1}, metric_summary={},
+            review_document(client=Client(), **document_review_inputs(
+                kwargs["memory"], kwargs["config"], drafts, template=kwargs["template"], execution_summary={"metric": 1},
                 source_evidence=source, execution_evidence=execution, writing_objective=objective,
-                historical_findings=prior, format_correction=correction)
+                historical_findings=prior, format_correction=correction))
         discovery = captured[0]
         self.assertIn("criteria", discovery)
         self.assertNotIn("section_responsibilities", discovery)
@@ -390,12 +382,10 @@ class FindingCheckTests(unittest.TestCase):
         self.assertEqual(captured[2]["response_format_correction"], {"validation_error": "An invalid check."})
         self.assertEqual(kwargs["memory"].section_plan[0].goal, "An earlier Writer-only instruction.")
 
-    objects = staticmethod(finding_check_objects)
-
     def test_explicit_closure_is_recorded_and_completed_resume_is_call_free(self):
         for status in ("resolved", "not_applicable"):
             with self.subTest(status=status):
-                kwargs, checkpoint, old, drafts = self.objects()
+                kwargs, checkpoint, old, drafts = finding_check_objects()
                 labels, saved = [], []
                 test = self
                 class Client:
@@ -407,10 +397,9 @@ class FindingCheckTests(unittest.TestCase):
                             return {"section_reviews": []}
                         test.assertEqual(label, "report-document-finding-checker")
                         test.assertEqual(view["historical_findings_to_check"][0]["finding_id"], old.finding_id)
-                        return {"section_reviews": [{"section_id": "scope", "verdict": "pass",
-                            "finding_checks": [{"finding_id": old.finding_id, "status": status,
-                                "explanation": "The current draft explicitly retains the uncertainty.",
-                                "draft_quotes": [drafts[0].draft_markdown]}]}]}
+                        return opinion_check_response(old, verdict="pass", status=status,
+                            explanation="The current draft explicitly retains the uncertainty.",
+                            draft_quotes=[drafts[0].draft_markdown])
                 result = run_report_agent(client=Client(), gateway=ReportToolGateway(kwargs["context"]),
                     completed_checkpoint=checkpoint, checkpoint_sink=saved.append, **kwargs)
                 self.assertFalse(result.memory.reviewer_findings)
@@ -425,7 +414,7 @@ class FindingCheckTests(unittest.TestCase):
                 self.assertEqual(len(labels), before)
 
     def test_opinion_response_contract_projects_only_requested_targets(self):
-        kwargs, _, old, drafts = self.objects()
+        kwargs, _, old, drafts = finding_check_objects()
         other = old.model_copy(update={"finding_id": "other-assumption"})
         cross = old.model_copy(update={"finding_id": "different-scope", "section_id": "limits"})
         captured = []
@@ -435,9 +424,9 @@ class FindingCheckTests(unittest.TestCase):
                 captured.append((system, view))
                 return unresolved_opinion_response(view)
         for prior in (None, [old, other, cross]):
-            review_document(client=Client(), template=kwargs["template"], memory=kwargs["memory"],
-                sections=drafts, config=kwargs["config"], execution_summary={}, metric_summary={},
-                historical_findings=prior)
+            review_document(client=Client(), **document_review_inputs(
+                kwargs["memory"], kwargs["config"], drafts, template=kwargs["template"],
+                historical_findings=prior))
         discovery, check = captured
         self.assertEqual(discovery[1]["output_schema"]["section_reviews"][0]["finding_checks"], [])
         target_rows = check[1]["output_schema"]["section_reviews"]
@@ -454,17 +443,17 @@ class FindingCheckTests(unittest.TestCase):
         self.assertEqual(check[1]["source_evidence"], discovery[1]["source_evidence"])
 
     def test_other_current_sections_are_evidence_not_extra_opinion_targets(self):
-        kwargs, _, old, drafts = self.objects()
+        kwargs, _, old, drafts = finding_check_objects()
         class Client:
             def ask_json(self, *args, **ignored):
                 return {"section_reviews": [{"section_id": "limits", "verdict": "pass"}]}
         with self.assertRaisesRegex(LLMResponseError, "unrequested target"):
-            review_document(client=Client(), template=kwargs["template"], memory=kwargs["memory"],
-                sections=drafts, config=kwargs["config"], execution_summary={}, metric_summary={},
-                historical_findings=[old])
+            review_document(client=Client(), **document_review_inputs(
+                kwargs["memory"], kwargs["config"], drafts, template=kwargs["template"],
+                historical_findings=[old]))
 
     def test_opinion_check_omits_imperative_remedy_without_changing_original_contract(self):
-        kwargs, _, old, drafts = self.objects()
+        kwargs, _, old, drafts = finding_check_objects()
         old.suggested_action = "Replace the observed condition with the requested condition."
         old.evidence_handles = ["material:conditions"]
         before = old.model_dump(mode="json")
@@ -474,8 +463,8 @@ class FindingCheckTests(unittest.TestCase):
                 view = json.loads(prompt)
                 captured.append(view)
                 return unresolved_opinion_response(view)
-        review_document(client=Client(), template=kwargs["template"], memory=kwargs["memory"],
-            sections=drafts, config=kwargs["config"], execution_summary={}, metric_summary={}, historical_findings=[old])
+        review_document(client=Client(), **document_review_inputs(
+            kwargs["memory"], kwargs["config"], drafts, template=kwargs["template"], historical_findings=[old]))
         view = captured[0]
         projected = view["historical_findings_to_check"][0]
         self.assertEqual(projected["message"], old.message)
@@ -490,7 +479,7 @@ class FindingCheckTests(unittest.TestCase):
 
     def test_opinion_response_shape_does_not_grow_with_number_or_priority_of_opinions(self):
         from simple_ar.report.schema import ReportEvidenceQuote
-        kwargs, _, old, drafts = self.objects()
+        kwargs, _, old, drafts = finding_check_objects()
         old.evidence_quotes = [ReportEvidenceQuote(pointer="/objective", quote="old task", role="declaration")]
         originals = [old.model_copy(deep=True, update={"finding_id": f"opinion-{index}",
                      "severity": "critical" if index % 2 else "minor",
@@ -503,9 +492,9 @@ class FindingCheckTests(unittest.TestCase):
                 captured.append(view)
                 return unresolved_opinion_response(view)
         for prior in (originals[:1], originals):
-            review_document(client=Client(), template=kwargs["template"], memory=kwargs["memory"],
-                sections=drafts, config=kwargs["config"], execution_summary={}, metric_summary={},
-                historical_findings=prior)
+            review_document(client=Client(), **document_review_inputs(
+                kwargs["memory"], kwargs["config"], drafts, template=kwargs["template"],
+                historical_findings=prior))
         self.assertEqual(captured[0]["output_schema"], captured[1]["output_schema"])
         self.assertEqual(len(captured[1]["historical_findings_to_check"]), 12)
         for original, projected in zip(before, captured[1]["historical_findings_to_check"]):
@@ -515,7 +504,7 @@ class FindingCheckTests(unittest.TestCase):
         self.assertEqual([row.model_dump(mode="json") for row in originals], before)
 
     def test_rejected_judgement_is_not_a_required_conclusion_or_new_source_evidence(self):
-        kwargs, _, old, drafts = self.objects()
+        kwargs, _, old, drafts = finding_check_objects()
         captured = []
         correction = {"validation_error": "Wrong source role.",
                       "rejected_response": {"claim": "The requested setting was observed."}}
@@ -524,9 +513,9 @@ class FindingCheckTests(unittest.TestCase):
                 view = json.loads(prompt)
                 captured.append(view)
                 return unresolved_opinion_response(view)
-        review_document(client=Client(), template=kwargs["template"], memory=kwargs["memory"],
-            sections=drafts, config=kwargs["config"], execution_summary={}, metric_summary={},
-            historical_findings=[old], format_correction=correction)
+        review_document(client=Client(), **document_review_inputs(
+            kwargs["memory"], kwargs["config"], drafts, template=kwargs["template"],
+            historical_findings=[old], format_correction=correction))
         view = captured[0]
         self.assertEqual(view["response_format_correction"], correction)
         self.assertEqual(view["correction_role"], "rejected_model_answer_not_evidence")
@@ -535,24 +524,20 @@ class FindingCheckTests(unittest.TestCase):
 
     def test_independent_inspection_retains_new_finding_action_contract(self):
         from simple_ar.report.schema import REVIEW_ACTION_RULES
-        kwargs, _, old, drafts = self.objects()
+        kwargs, _, old, drafts = finding_check_objects()
         captured = []
         class Client:
             def ask_json(self, system, prompt, **ignored):
                 captured.append(json.loads(prompt))
                 return {"section_reviews": []}
-        review_document(client=Client(), template=kwargs["template"], memory=kwargs["memory"],
-            sections=drafts, config=kwargs["config"], execution_summary={}, metric_summary={})
+        review_document(client=Client(), **document_review_inputs(
+            kwargs["memory"], kwargs["config"], drafts, template=kwargs["template"]))
         self.assertTrue(all(rule in captured[0]["focus"] for rule in REVIEW_ACTION_RULES))
         self.assertEqual(captured[0]["historical_findings_to_check"], [])
 
     def test_unresolved_verification_does_not_itself_authorize_a_prose_correction(self):
-        kwargs, checkpoint, old, drafts = self.objects()
-        kwargs["config"].max_review_iterations = 2
-        old.required_action = "verify"
-        old.suggested_action = "Check the unavailable original observation."
-        checkpoint["memory"]["reviewer_findings"] = [old.model_dump(mode="json")]
-        checkpoint["reviewer_findings"] = [old.model_dump(mode="json")]
+        kwargs, checkpoint, old, drafts = finding_check_objects(
+            max_review_iterations=2, finding_changes={"required_action": "verify", "suggested_action": "Check the unavailable original observation."})
         labels, saved = [], []
         class Client:
             def ask_json(self, system, prompt, *, label="", **ignored):
@@ -560,9 +545,8 @@ class FindingCheckTests(unittest.TestCase):
                 if label == "report-document-reviewer":
                     return {"section_reviews": []}
                 if label == "report-document-finding-checker":
-                    return {"section_reviews": [{"section_id": "scope", "verdict": "warning",
-                        "finding_checks": [{"finding_id": old.finding_id, "status": "unresolved",
-                            "explanation": "The missing source prevents deciding whether this old allegation applies."}]}]}
+                    return opinion_check_response(old, verdict="warning", status="unresolved",
+                        explanation="The missing source prevents deciding whether this old allegation applies.")
                 raise AssertionError("An unresolved verification is not a request to rewrite the draft")
         result = run_report_agent(client=Client(), gateway=ReportToolGateway(kwargs["context"]),
             completed_checkpoint=checkpoint, checkpoint_sink=saved.append, **kwargs)
@@ -580,11 +564,8 @@ class FindingCheckTests(unittest.TestCase):
         self.assertEqual(len(labels), before)
 
     def test_explicit_bounded_correction_of_a_verification_gap_still_runs(self):
-        kwargs, checkpoint, old, drafts = self.objects()
-        kwargs["config"].max_review_iterations = 1
-        old.required_action = "verify"
-        checkpoint["memory"]["reviewer_findings"] = [old.model_dump(mode="json")]
-        checkpoint["reviewer_findings"] = [old.model_dump(mode="json")]
+        kwargs, checkpoint, old, drafts = finding_check_objects(
+            max_review_iterations=1, finding_changes={"required_action": "verify"})
         labels = []
         class Client:
             def ask_json(self, system, prompt, *, label="", **ignored):
@@ -592,9 +573,8 @@ class FindingCheckTests(unittest.TestCase):
                 if label in {"report-document-reviewer", "report-document-verifier"}:
                     return {"section_reviews": []}
                 if label == "report-document-finding-checker":
-                    return {"section_reviews": [{"section_id": "scope", "verdict": "revise_required",
-                        "finding_checks": [{"finding_id": old.finding_id, "status": "unresolved",
-                            "explanation": "The current wording needs an explicit bound, not a fabricated source fact."}]}]}
+                    return opinion_check_response(old, verdict="revise_required", status="unresolved",
+                        explanation="The current wording needs an explicit bound, not a fabricated source fact.")
                 if label == "report-document-reviser-scope":
                     return {"section_id": "scope", "draft_markdown":
                         "The identity was not independently verified. No source identity conclusion is drawn."}
@@ -608,11 +588,8 @@ class FindingCheckTests(unittest.TestCase):
         self.assertIn(old, result.reviewer_findings)
 
     def test_separate_correction_cannot_close_a_pending_old_verification(self):
-        kwargs, checkpoint, old, drafts = self.objects()
-        kwargs["config"].max_review_iterations = 1
-        old.required_action = "verify"
-        checkpoint["memory"]["reviewer_findings"] = [old.model_dump(mode="json")]
-        checkpoint["reviewer_findings"] = [old.model_dump(mode="json")]
+        kwargs, checkpoint, old, drafts = finding_check_objects(
+            max_review_iterations=1, finding_changes={"required_action": "verify"})
         fresh = old.model_copy(update={"finding_id": "current-style", "type": "style", "severity": "minor",
             "required_action": "revise", "message": "A current readability correction."})
         test = self
@@ -622,11 +599,10 @@ class FindingCheckTests(unittest.TestCase):
                     return {"section_reviews": [{"section_id": "scope", "verdict": "revise_required",
                         "findings": [fresh.model_dump(mode="json")]}]}
                 if label == "report-document-finding-checker":
-                    return {"section_reviews": [{"section_id": "scope", "verdict": "warning",
-                        "finding_checks": [{"finding_id": old.finding_id, "status": "unresolved",
-                            "explanation": "The source needed to decide this allegation is not available."}]}]}
+                    return opinion_check_response(old, verdict="warning", status="unresolved",
+                        explanation="The source needed to decide this allegation is not available.")
                 if label == "report-document-reviser-scope":
-                    view = json.JSONDecoder().raw_decode(prompt[prompt.index('{'):])[0]
+                    view = prompt_payload(prompt)
                     test.assertEqual([row["finding_id"] for row in view["review_findings"]], [fresh.finding_id])
                     return {"section_id": "scope", "draft_markdown":
                         "The identity was not independently verified. This account remains provisional."}
@@ -642,13 +618,10 @@ class FindingCheckTests(unittest.TestCase):
     def test_pending_opinion_evidence_neither_closes_it_nor_requests_a_prose_rewrite(self):
         for allowed in (False, True):
             with self.subTest(backtracking=allowed):
-                kwargs, checkpoint, old, drafts = self.objects()
-                kwargs["config"].max_review_iterations = 2
+                kwargs, checkpoint, old, drafts = finding_check_objects(
+                    max_review_iterations=2, finding_changes={"required_action": "verify"})
                 kwargs["config"].allow_source_backtracking = allowed
                 kwargs["config"].max_backtracking_calls = 1
-                old.required_action = "verify"
-                checkpoint["memory"]["reviewer_findings"] = [old.model_dump(mode="json")]
-                checkpoint["reviewer_findings"] = [old.model_dump(mode="json")]
                 labels = []
                 class Client:
                     def ask_json(self, system, prompt, *, label="", **ignored):
@@ -674,17 +647,14 @@ class FindingCheckTests(unittest.TestCase):
 
     def test_opinion_evidence_is_fetched_before_correction_dispatch_and_can_close_without_writing(self):
         from simple_ar.report.schema import SourceHandle
-        kwargs, checkpoint, old, drafts = self.objects()
-        kwargs["config"].max_review_iterations = 2
+        kwargs, checkpoint, old, drafts = finding_check_objects(
+            max_review_iterations=2, finding_changes={"required_action": "verify"})
         kwargs["config"].allow_source_backtracking = True
         kwargs["config"].max_backtracking_calls = 1
-        old.required_action = "verify"
         source = SourceHandle(handle="paper:identity", kind="paper", title="Recorded source",
             metadata={"evidence_passages": [{"text": "The identity was not independently verified."}]})
         kwargs["context"].source_handles = [source]
         checkpoint["memory"]["source_handles"] = [source.model_dump(mode="json")]
-        checkpoint["memory"]["reviewer_findings"] = [old.model_dump(mode="json")]
-        checkpoint["reviewer_findings"] = [old.model_dump(mode="json")]
         labels = []
         test = self
         class Client:
@@ -719,7 +689,7 @@ class FindingCheckTests(unittest.TestCase):
 
     def test_unsent_contract_merge_retains_distinct_identities_and_role_records(self):
         from simple_ar.report.schema import ReportToolCall
-        _, _, old, _ = self.objects()
+        _, _, old, _ = finding_check_objects()
         same_prose = old.model_copy(update={"finding_id": "new-identity"})
         lookup = ReportToolCall(tool_name="get_synthesis_brief", arguments={})
         first = ReportSectionReview(section_id="scope", verdict="warning", findings=[same_prose],
@@ -738,7 +708,7 @@ class FindingCheckTests(unittest.TestCase):
         self.assertEqual([row.model_dump(mode="json") for row in (first, second, other)], before)
 
     def test_fresh_and_checked_old_requirements_use_one_candidate_contract(self):
-        kwargs, checkpoint, old, drafts = self.objects()
+        kwargs, checkpoint, old, drafts = finding_check_objects()
         kwargs["config"].max_review_iterations = 2
         fresh = old.model_copy(update={"finding_id": "fresh-defect", "message": "A separate current error remains."})
         labels = []
@@ -750,16 +720,15 @@ class FindingCheckTests(unittest.TestCase):
                     return {"section_reviews": [{"section_id": "scope", "verdict": "revise_required",
                         "findings": [fresh.model_dump(mode="json")], "revision_instructions": ["Fix the current claim."]}]}
                 if label == "report-document-finding-checker":
-                    return {"section_reviews": [{"section_id": "scope", "verdict": "revise_required",
-                        "finding_checks": [{"finding_id": old.finding_id, "status": "unresolved",
-                            "explanation": "The original requirement still applies."}]}]}
+                    return opinion_check_response(old, verdict="revise_required", status="unresolved",
+                        explanation="The original requirement still applies.")
                 if label == "report-document-reviser-scope":
-                    view = json.JSONDecoder().raw_decode(prompt[prompt.index('{'):])[0]
+                    view = prompt_payload(prompt)
                     test.assertEqual({f["finding_id"] for f in view["review_findings"]}, {old.finding_id, fresh.finding_id})
                     test.assertEqual(view["review_instructions"], ["Fix the current claim."])
                     return {"section_id": "scope", "draft_markdown": "A bounded corrected account."}
                 if label == "report-document-verifier-scope":
-                    view = json.JSONDecoder().raw_decode(prompt[prompt.index('{'):])[0]
+                    view = prompt_payload(prompt)
                     test.assertEqual({f["finding_id"] for f in view["revision_context"]["target_findings"]},
                                      {old.finding_id, fresh.finding_id})
                     return {"section_id": "scope", "verdict": "pass"}
@@ -778,7 +747,7 @@ class FindingCheckTests(unittest.TestCase):
         for response in ({"section_reviews": []}, {"section_reviews": [{"section_id": "scope",
                 "verdict": "revise_required", "finding_checks": [{"finding_id": "old-assumption",
                     "status": "unresolved", "explanation": "The supplied evidence is insufficient."}]}]}):
-            kwargs, checkpoint, old, drafts = self.objects()
+            kwargs, checkpoint, old, drafts = finding_check_objects()
             class Client:
                 def ask_json(self, system, prompt, *, label="", **ignored):
                     return response if label == "report-document-finding-checker" else {"section_reviews": []}
@@ -788,7 +757,7 @@ class FindingCheckTests(unittest.TestCase):
             self.assertEqual(result.sections, drafts)
 
     def test_missing_opinion_uses_existing_format_correction_not_another_writer_round(self):
-        kwargs, checkpoint, old, drafts = self.objects()
+        kwargs, checkpoint, old, drafts = finding_check_objects()
         second = old.model_copy(update={'finding_id': 'second-opinion', 'section_id': 'limits'})
         checkpoint['memory']['reviewer_findings'].append(second.model_dump(mode='json'))
         checkpoint['reviewer_findings'].append(second.model_dump(mode='json'))
@@ -826,7 +795,7 @@ class FindingCheckTests(unittest.TestCase):
         self.assertEqual(labels, before)
 
     def test_combined_candidate_resume_keeps_contract_and_new_inspection_issue(self):
-        kwargs, checkpoint, old, _ = self.objects()
+        kwargs, checkpoint, old, _ = finding_check_objects()
         kwargs["config"].max_review_iterations = 2
         fresh = old.model_copy(update={"finding_id": "fresh-defect", "message": "An independent current defect."})
         later = old.model_copy(update={"finding_id": "later-defect", "message": "A later inspection's separate concern."})
@@ -842,14 +811,13 @@ class FindingCheckTests(unittest.TestCase):
                         "findings": [finding.model_dump(mode="json")]}]}
                 if label == "report-document-finding-checker":
                     test.assertFalse(self.resumed)
-                    return {"section_reviews": [{"section_id": "scope", "verdict": "revise_required",
-                        "finding_checks": [{"finding_id": old.finding_id, "status": "unresolved",
-                            "explanation": "The original requirement still applies."}]}]}
+                    return opinion_check_response(old, verdict="revise_required", status="unresolved",
+                        explanation="The original requirement still applies.")
                 if label == "report-document-reviser-scope":
                     test.assertFalse(self.resumed, "Reuse the saved candidate")
                     return {"section_id": "scope", "draft_markdown": "A saved corrected candidate."}
                 if label == "report-document-verifier-scope":
-                    view = json.JSONDecoder().raw_decode(prompt[prompt.index('{'):])[0]
+                    view = prompt_payload(prompt)
                     test.assertEqual({f["finding_id"] for f in view["revision_context"]["target_findings"]},
                                      {old.finding_id, fresh.finding_id})
                     return {"section_id": "scope", "verdict": "pass"}
@@ -876,7 +844,7 @@ class FindingCheckTests(unittest.TestCase):
 
     def test_failed_or_unanchored_check_cannot_clear_history(self):
         for failure in (LLMError("Unavailable"), "The obsolete claim is in an old draft."):
-            kwargs, checkpoint, old, drafts = self.objects()
+            kwargs, checkpoint, old, drafts = finding_check_objects()
             class Client:
                 def ask_json(self, system, prompt, *, label="", **ignored):
                     if label.startswith("report-document-finding-checker"):
@@ -893,15 +861,14 @@ class FindingCheckTests(unittest.TestCase):
                                 for row in result.memory.reviewer_findings))
 
     def test_new_findings_are_not_erased_by_old_opinion_closure(self):
-        kwargs, checkpoint, old, drafts = self.objects()
+        kwargs, checkpoint, old, drafts = finding_check_objects()
         new = old.model_copy(update={"finding_id": "new-defect", "message": "A different issue remains."})
         class Client:
             def ask_json(self, system, prompt, *, label="", **ignored):
                 if label == "report-document-finding-checker":
-                    return {"section_reviews": [{"section_id": "scope", "verdict": "pass",
-                        "finding_checks": [{"finding_id": old.finding_id, "status": "not_applicable",
-                            "explanation": "The previous premise does not apply to this qualified draft.",
-                            "draft_quotes": [drafts[0].draft_markdown]}]}]}
+                    return opinion_check_response(old, verdict="pass", status="not_applicable",
+                        explanation="The previous premise does not apply to this qualified draft.",
+                        draft_quotes=[drafts[0].draft_markdown])
                 return {"section_reviews": [{"section_id": "limits", "verdict": "revise_required",
                     "findings": [new.model_copy(update={"section_id": "limits"}).model_dump(mode="json")]}]}
         result = run_report_agent(client=Client(), gateway=ReportToolGateway(kwargs["context"]),
@@ -910,7 +877,7 @@ class FindingCheckTests(unittest.TestCase):
         self.assertTrue(any(row.finding_id == "new-defect" for row in result.memory.reviewer_findings))
 
     def test_unknown_duplicate_empty_or_missing_quotes_are_rejected(self):
-        kwargs, checkpoint, old, drafts = self.objects()
+        kwargs, checkpoint, old, drafts = finding_check_objects()
         base = {"finding_id": old.finding_id, "status": "resolved",
                 "explanation": "The current draft retains uncertainty.", "draft_quotes": [drafts[0].draft_markdown]}
         for checks in ([{**base, "finding_id": "unknown"}], [base, base],
@@ -920,12 +887,12 @@ class FindingCheckTests(unittest.TestCase):
                 def ask_json(self, *args, **ignored):
                     return {"section_reviews": [{"section_id": "scope", "verdict": "pass", "finding_checks": checks}]}
             with self.assertRaises(LLMResponseError):
-                review_document(client=Client(), template=kwargs["template"], memory=kwargs["memory"],
-                    sections=drafts, config=kwargs["config"], execution_summary={}, metric_summary={},
-                    historical_findings=[old])
+                review_document(client=Client(), **document_review_inputs(
+                    kwargs["memory"], kwargs["config"], drafts, template=kwargs["template"],
+                    historical_findings=[old]))
 
     def test_cross_section_quote_requires_explicit_source_and_keeps_opinion_target(self):
-        kwargs, _, old, drafts = self.objects()
+        kwargs, _, old, drafts = finding_check_objects()
         drafts[1].draft_markdown = "A different section explicitly records the remaining uncertainty."
         check = {"finding_id": old.finding_id, "status": "not_applicable",
                  "explanation": "Both sections appropriately preserve the limitation.",
@@ -936,8 +903,8 @@ class FindingCheckTests(unittest.TestCase):
             def ask_json(self, *args, **ignored):
                 return response
         def run():
-            return review_document(client=Client(), template=kwargs["template"], memory=kwargs["memory"],
-                sections=drafts, config=kwargs["config"], execution_summary={}, metric_summary={}, historical_findings=[old])
+            return review_document(client=Client(), **document_review_inputs(
+                kwargs["memory"], kwargs["config"], drafts, template=kwargs["template"], historical_findings=[old]))
         review = run()[0]
         self.assertEqual(review.section_id, "scope")
         self.assertEqual(review.finding_checks[0].draft_quotes[1].section_id, "limits")
@@ -955,7 +922,7 @@ class FindingCheckTests(unittest.TestCase):
             run()
 
     def test_adopting_another_correction_cannot_clear_an_unchecked_old_issue(self):
-        kwargs, checkpoint, old, drafts = self.objects()
+        kwargs, checkpoint, old, drafts = finding_check_objects()
         kwargs["config"].max_review_iterations = 1
         new = old.model_copy(update={"finding_id": "new-defect", "message": "A separate issue needs correction."})
         class Client:
@@ -984,7 +951,7 @@ class FindingCheckTests(unittest.TestCase):
         self.assertNotIn("requested_findings", old.model_dump(mode="json"))
 
     def test_rejected_answer_is_retained_without_closing_or_rewriting(self):
-        kwargs, checkpoint, old, drafts = self.objects()
+        kwargs, checkpoint, old, drafts = finding_check_objects()
         rejected = {"section_reviews": [{"section_id": "scope", "verdict": "pass",
             "finding_checks": [{"finding_id": old.finding_id, "status": "resolved",
                 "explanation": "Claims to have resolved it.", "draft_quotes": ["Only in an obsolete draft."]}]}]}
@@ -1010,7 +977,7 @@ class FindingCheckTests(unittest.TestCase):
         self.assertEqual(len(labels), before)
 
     def test_one_format_correction_uses_rejection_without_adding_source_facts(self):
-        kwargs, checkpoint, old, drafts = self.objects()
+        kwargs, checkpoint, old, drafts = finding_check_objects()
         rejected = {"section_reviews": [{"section_id": "unknown", "verdict": "pass"}]}
         labels = []
         test = self
@@ -1027,10 +994,9 @@ class FindingCheckTests(unittest.TestCase):
                 test.assertIn("unknown section", view["response_format_correction"]["validation_error"])
                 test.assertEqual(view["correction_role"], "rejected_model_answer_not_evidence")
                 test.assertEqual(view["historical_findings_to_check"][0]["finding_id"], old.finding_id)
-                return {"section_reviews": [{"section_id": "scope", "verdict": "pass",
-                    "finding_checks": [{"finding_id": old.finding_id, "status": "not_applicable",
-                        "explanation": "The current draft preserves the uncertainty.",
-                        "draft_quotes": [{"section_id": "scope", "quote": drafts[0].draft_markdown}]}]}]}
+                return opinion_check_response(old, verdict="pass", status="not_applicable",
+                    explanation="The current draft preserves the uncertainty.",
+                    draft_quotes=[{"section_id": "scope", "quote": drafts[0].draft_markdown}])
         result = run_report_agent(client=Client(), gateway=ReportToolGateway(kwargs["context"]),
                                   completed_checkpoint=checkpoint, **kwargs)
         self.assertEqual(len(labels), 3)
@@ -1042,7 +1008,7 @@ class FindingCheckTests(unittest.TestCase):
         self.assertIn(old, result.reviewer_findings)
 
     def test_correction_restores_rejected_context_and_exact_opinion_set(self):
-        kwargs, checkpoint, old, drafts = self.objects()
+        kwargs, checkpoint, old, drafts = finding_check_objects()
         new = old.model_copy(update={"finding_id": "fresh", "section_id": "limits"})
         kwargs["context"].synthesis_markdown = "Saved interpretation, not primary evidence."
         labels, saved = [], []
@@ -1062,12 +1028,12 @@ class FindingCheckTests(unittest.TestCase):
                 view = json.loads(prompt)
                 test.assertEqual([row["finding_id"] for row in view["historical_findings_to_check"]], [old.finding_id])
                 test.assertEqual(view["supplementary_evidence"][-1]["tool_name"], "get_synthesis_brief")
-                return {"section_reviews": [{"section_id": "scope", "verdict": "pass",
-                    "finding_checks": [{"finding_id": old.finding_id, "status": "not_applicable",
-                        "explanation": "The adopted text retains the uncertainty.", "draft_quotes": [drafts[0].draft_markdown]}]}]}
+                return opinion_check_response(old, verdict="pass", status="not_applicable",
+                    explanation="The adopted text retains the uncertainty.",
+                    draft_quotes=[drafts[0].draft_markdown])
         def sink(row):
             saved.append(row)
-            if row["iterations"][-1]["action"] == "document_finding_check_rejected":
+            if row["iterations"] and row["iterations"][-1]["action"] == "document_finding_check_rejected":
                 raise RuntimeError("Interrupted before correction")
         client = Client()
         with self.assertRaisesRegex(RuntimeError, "before correction"):
@@ -1082,10 +1048,10 @@ class FindingCheckTests(unittest.TestCase):
         self.assertIn(new, result.memory.reviewer_findings)
         self.assertNotIn(old, result.memory.reviewer_findings)
 
-    def test_allocated_or_completed_correction_does_not_get_another_call_on_resume(self):
+    def test_correction_intent_resumes_once_and_completed_response_is_reused(self):
         for interrupt_status in ("started", "completed"):
             with self.subTest(interrupt_status=interrupt_status):
-                kwargs, checkpoint, old, drafts = self.objects()
+                kwargs, checkpoint, old, drafts = finding_check_objects()
                 labels, saved = [], []
                 class Client:
                     def ask_json(self, system, prompt, *, label="", **ignored):
@@ -1094,11 +1060,13 @@ class FindingCheckTests(unittest.TestCase):
                             return {"section_reviews": []}
                         if label == "report-document-finding-checker":
                             return {"section_reviews": [{"section_id": "unknown", "verdict": "pass"}]}
-                        return {"section_reviews": [{"section_id": "scope", "verdict": "pass",
-                            "finding_checks": [{"finding_id": old.finding_id, "status": "not_applicable",
-                                "explanation": "The current claim is qualified.", "draft_quotes": [drafts[0].draft_markdown]}]}]}
+                        return opinion_check_response(old, verdict="pass", status="not_applicable",
+                            explanation="The current claim is qualified.",
+                            draft_quotes=[drafts[0].draft_markdown])
                 def sink(row):
                     saved.append(row)
+                    if not row["iterations"]:
+                        return
                     event = row["iterations"][-1]
                     if event["action"] == "document_finding_format_correction" and event["status"] == interrupt_status:
                         raise RuntimeError("Interrupted at correction checkpoint")
@@ -1109,12 +1077,18 @@ class FindingCheckTests(unittest.TestCase):
                 before = len(labels)
                 result = run_report_agent(client=client, gateway=ReportToolGateway(kwargs["context"]),
                     completed_checkpoint=saved[-1], **kwargs)
-                self.assertEqual(len(labels), before)
-                self.assertEqual(old in result.memory.reviewer_findings, interrupt_status == "started")
+                self.assertEqual(labels[before:], ["report-document-finding-checker-format-correction"]
+                                 if interrupt_status == "started" else [])
+                self.assertNotIn(old, result.memory.reviewer_findings)
+                correction = next(row for row in result.iterations
+                                  if row.action == "document_finding_format_correction" and row.status == "completed")
+                self.assertTrue(correction.rejected_review["validated_reviews"])
+                self.assertEqual(sum(row.action == "document_finding_format_correction"
+                                     for row in result.iterations), 1)
 
     def test_unparsed_transport_or_budget_failure_has_no_format_retry(self):
         for error in (LLMError("Budget exhausted before request"), LLMResponseError("Response did not contain JSON")):
-            kwargs, checkpoint, old, drafts = self.objects()
+            kwargs, checkpoint, old, drafts = finding_check_objects()
             labels = []
             class Client:
                 def ask_json(self, system, prompt, *, label="", **ignored):
@@ -1129,18 +1103,18 @@ class FindingCheckTests(unittest.TestCase):
             self.assertIn(old, result.memory.reviewer_findings)
 
     def test_rejected_answer_cannot_silently_expand_review_window_during_correction(self):
-        kwargs, _, old, drafts = self.objects()
+        kwargs, _, old, drafts = finding_check_objects()
         kwargs["config"].max_document_review_prompt_chars = 90_000
         class Client:
             def ask_json(self, *args, **ignored):
                 raise AssertionError("Oversized correction must fail before a model call")
         with self.assertRaisesRegex(ValueError, "bounded evidence window"):
-            review_document(client=Client(), template=kwargs["template"], memory=kwargs["memory"],
-                sections=drafts, config=kwargs["config"], execution_summary={}, metric_summary={},
-                format_correction={"validation_error": "bad structure", "rejected_response": "x" * 90_000})
+            review_document(client=Client(), **document_review_inputs(
+                kwargs["memory"], kwargs["config"], drafts, template=kwargs["template"],
+                format_correction={"validation_error": "bad structure", "rejected_response": "x" * 90_000}))
 
     def test_independent_inspection_has_the_same_single_format_correction(self):
-        kwargs, checkpoint, old, drafts = self.objects()
+        kwargs, checkpoint, old, drafts = finding_check_objects()
         checkpoint["memory"]["reviewer_findings"] = []
         labels = []
         class Client:
@@ -1155,7 +1129,7 @@ class FindingCheckTests(unittest.TestCase):
 
     def test_final_verifier_recovers_its_correction_without_new_inspection(self):
         for status in ("started", "completed"):
-            kwargs, checkpoint, old, drafts = self.objects()
+            kwargs, checkpoint, old, drafts = finding_check_objects()
             event = ReportIterationRecord(iteration=1, section_id="", action="document_format_correction",
                 status=status, summary="Original validation error", rejected_review={
                     "label": "report-document-verifier", "format_correction": True})
@@ -1174,7 +1148,7 @@ class FindingCheckTests(unittest.TestCase):
 
     def test_final_verifier_context_stays_with_that_role_on_resume(self):
         from simple_ar.report.schema import ReportToolResult
-        kwargs, checkpoint, old, drafts = self.objects()
+        kwargs, checkpoint, old, drafts = finding_check_objects()
         context = ReportToolResult(tool_name="get_synthesis_brief", content={"text": "Saved requested context."})
         checkpoint["tool_results"] = [context.model_dump(mode="json")]
         checkpoint["iterations"] = [ReportIterationRecord(iteration=1, section_id="scope",
@@ -1195,7 +1169,7 @@ class FindingCheckTests(unittest.TestCase):
 
     def test_opinion_context_resume_keeps_the_saved_request_before_new_issues(self):
         from simple_ar.report.schema import ReportToolResult
-        kwargs, checkpoint, old, drafts = self.objects()
+        kwargs, checkpoint, old, drafts = finding_check_objects()
         fresh = old.model_copy(update={"finding_id": "fresh", "section_id": "limits"})
         checkpoint["memory"]["reviewer_findings"].append(fresh.model_dump(mode="json"))
         context = ReportToolResult(tool_name="get_synthesis_brief", content={"text": "Saved interpretation."})
@@ -1219,7 +1193,7 @@ class FindingCheckTests(unittest.TestCase):
         self.assertIn(old, result.memory.reviewer_findings)
 
     def test_rejected_check_checkpoint_preserves_fresh_inspection_on_interruption(self):
-        kwargs, checkpoint, old, drafts = self.objects()
+        kwargs, checkpoint, old, drafts = finding_check_objects()
         new = old.model_copy(update={"section_id": "limits", "finding_id": "fresh-defect"})
         saved = []
         class Client:
@@ -1230,7 +1204,7 @@ class FindingCheckTests(unittest.TestCase):
                 return {"section_reviews": [{"section_id": "unknown", "verdict": "pass"}]}
         def sink(row):
             saved.append(row)
-            if row["iterations"][-1]["action"] == "document_finding_check_rejected":
+            if row["iterations"] and row["iterations"][-1]["action"] == "document_finding_check_rejected":
                 raise RuntimeError("Interrupted after rejected answer")
         with self.assertRaisesRegex(RuntimeError, "rejected answer"):
             run_report_agent(client=Client(), gateway=ReportToolGateway(kwargs["context"]),
@@ -1241,7 +1215,7 @@ class FindingCheckTests(unittest.TestCase):
         self.assertEqual(event.rejected_review["response"]["section_reviews"][0]["section_id"], "unknown")
 
     def test_validation_callback_retains_other_malformed_parsed_answers(self):
-        kwargs, _, _, drafts = self.objects()
+        kwargs, _, _, drafts = finding_check_objects()
         for response in ({"section_reviews": "wrong shape"},
                          {"section_reviews": [{"section_id": "scope", "verdict": "invalid verdict"}]}):
             rejected = []
@@ -1249,14 +1223,14 @@ class FindingCheckTests(unittest.TestCase):
                 def ask_json(self, *args, **ignored):
                     return response
             with self.assertRaises((LLMResponseError, ValueError)):
-                review_document(client=Client(), template=kwargs["template"], memory=kwargs["memory"],
-                    sections=drafts, config=kwargs["config"], execution_summary={}, metric_summary={},
-                    on_invalid_response=lambda raw, reason: rejected.append((raw, reason)))
+                review_document(client=Client(), **document_review_inputs(
+                    kwargs["memory"], kwargs["config"], drafts, template=kwargs["template"],
+                    on_invalid_response=lambda raw, reason: rejected.append((raw, reason))))
             self.assertEqual(rejected[0][0], response)
             self.assertTrue(rejected[0][1])
 
     def test_model_cannot_close_controller_failure_as_an_old_opinion(self):
-        kwargs, checkpoint, old, drafts = self.objects()
+        kwargs, checkpoint, old, drafts = finding_check_objects()
         control = old.model_copy(update={"finding_id": "scope-document-revision-budget",
                                         "type": "document_revision_unresolved"})
         checkpoint["memory"]["reviewer_findings"].append(control.model_dump(mode="json"))
@@ -1267,22 +1241,21 @@ class FindingCheckTests(unittest.TestCase):
                     return {"section_reviews": []}
                 view = json.loads(prompt)
                 test.assertEqual([row["finding_id"] for row in view["historical_findings_to_check"]], [old.finding_id])
-                return {"section_reviews": [{"section_id": "scope", "verdict": "pass",
-                    "finding_checks": [{"finding_id": old.finding_id, "status": "not_applicable",
-                        "explanation": "The current draft appropriately retains the uncertainty.",
-                        "draft_quotes": [drafts[0].draft_markdown]}]}]}
+                return opinion_check_response(old, verdict="pass", status="not_applicable",
+                    explanation="The current draft appropriately retains the uncertainty.",
+                    draft_quotes=[drafts[0].draft_markdown])
         result = run_report_agent(client=Client(), gateway=ReportToolGateway(kwargs["context"]),
                                   completed_checkpoint=checkpoint, **kwargs)
         self.assertIn(control, result.memory.reviewer_findings)
         self.assertNotIn(old, result.memory.reviewer_findings)
         with self.assertRaisesRegex(ValueError, "controller failures"):
-            review_document(client=Client(), template=kwargs["template"], memory=kwargs["memory"],
-                sections=drafts, config=kwargs["config"], execution_summary={}, metric_summary={},
-                historical_findings=[control])
+            review_document(client=Client(), **document_review_inputs(
+                kwargs["memory"], kwargs["config"], drafts, template=kwargs["template"],
+                historical_findings=[control]))
 
     def test_owner_success_clears_only_its_old_service_failure(self):
         for covered in (True, False):
-            kwargs, checkpoint, old, drafts = self.objects()
+            kwargs, checkpoint, old, drafts = finding_check_objects()
             controls = [old.model_copy(update={"finding_id": identifier, "section_id": "",
                 "type": "document_review_unavailable"}) for identifier in (
                     "document-review-unavailable", "document-finding-check-unavailable", "document-recheck-unavailable")]
@@ -1291,9 +1264,8 @@ class FindingCheckTests(unittest.TestCase):
                 def ask_json(self, system, prompt, *, label="", **ignored):
                     if label == "report-document-reviewer" or not covered:
                         return {"section_reviews": []}
-                    return {"section_reviews": [{"section_id": "scope", "verdict": "revise_required",
-                        "finding_checks": [{"finding_id": old.finding_id, "status": "unresolved",
-                            "explanation": "The evidence is still insufficient."}]}]}
+                    return opinion_check_response(old, verdict="revise_required", status="unresolved",
+                        explanation="The evidence is still insufficient.")
             result = run_report_agent(client=Client(), gateway=ReportToolGateway(kwargs["context"]),
                                       completed_checkpoint=checkpoint, **kwargs)
             current = {row.finding_id for row in result.memory.reviewer_findings}
@@ -1303,7 +1275,7 @@ class FindingCheckTests(unittest.TestCase):
             self.assertIn(old, result.memory.reviewer_findings)
 
     def test_control_deduplication_preserves_owner_not_repeated_payload(self):
-        _, _, old, _ = self.objects()
+        _, _, old, _ = finding_check_objects()
         first = old.model_copy(update={"finding_id": "document-review-unavailable",
             "section_id": "", "type": "document_review_unavailable"})
         second = first.model_copy(update={"finding_id": "document-recheck-unavailable"})
@@ -1312,7 +1284,7 @@ class FindingCheckTests(unittest.TestCase):
                          [first, second, old, duplicate_opinion])
 
     def test_exact_deduplication_retains_changed_action_severity_and_evidence(self):
-        _, _, old, _ = self.objects()
+        _, _, old, _ = finding_check_objects()
         changed = [old.model_copy(update={"required_action": "verify"}),
                    old.model_copy(update={"severity": "minor"}),
                    old.model_copy(update={"draft_quotes": []})]
@@ -1320,7 +1292,7 @@ class FindingCheckTests(unittest.TestCase):
 
     def test_collision_handles_preserve_originals_and_avoid_supplied_ids(self):
         from simple_ar.report.editor import historical_opinion_handles
-        _, _, old, _ = self.objects()
+        _, _, old, _ = finding_check_objects()
         second = old.model_copy(update={"message": "A different allegation from another review."})
         reserved = old.model_copy(update={"finding_id": old.finding_id + "::opinion-1"})
         other_section = old.model_copy(update={"section_id": "limits"})
@@ -1336,7 +1308,7 @@ class FindingCheckTests(unittest.TestCase):
         self.assertEqual(before, [row.model_dump(mode="json") for row in opinions])
 
     def test_colliding_checks_close_only_the_requested_record_and_resume_call_free(self):
-        kwargs, checkpoint, old, drafts = self.objects()
+        kwargs, checkpoint, old, drafts = finding_check_objects()
         second = old.model_copy(update={"message": "A separate unresolved claim uses the same model ID."})
         checkpoint["memory"]["reviewer_findings"].append(second.model_dump(mode="json"))
         checkpoint["reviewer_findings"].append(second.model_dump(mode="json"))
@@ -1374,7 +1346,7 @@ class FindingCheckTests(unittest.TestCase):
         self.assertEqual(resumed.memory.reviewer_findings, [second])
 
     def test_raw_ambiguous_id_cannot_close_either_collision_member(self):
-        kwargs, _, old, drafts = self.objects()
+        kwargs, _, old, drafts = finding_check_objects()
         second = old.model_copy(update={"message": "Another original opinion."})
         class Client:
             def ask_json(self, system, prompt, **ignored):
@@ -1383,12 +1355,12 @@ class FindingCheckTests(unittest.TestCase):
                         "explanation": "Ambiguous closure must fail.",
                         "draft_quotes": [drafts[0].draft_markdown]}]}]}
         with self.assertRaisesRegex(LLMResponseError, "unknown or repeated opinion"):
-            review_document(client=Client(), template=kwargs["template"], memory=kwargs["memory"],
-                sections=drafts, config=kwargs["config"], execution_summary={}, metric_summary={},
-                historical_findings=[old, second])
+            review_document(client=Client(), **document_review_inputs(
+                kwargs["memory"], kwargs["config"], drafts, template=kwargs["template"],
+                historical_findings=[old, second]))
 
     def test_collision_handles_survive_rejected_check_and_format_recovery(self):
-        kwargs, checkpoint, old, drafts = self.objects()
+        kwargs, checkpoint, old, drafts = finding_check_objects()
         second = old.model_copy(update={"message": "A separate opinion with a reused ID."})
         checkpoint["memory"]["reviewer_findings"].append(second.model_dump(mode="json"))
         labels, saved, handles = [], [], []
@@ -1415,7 +1387,7 @@ class FindingCheckTests(unittest.TestCase):
                         for handle, status in zip(ids, ("not_applicable", "unresolved"))]}]}
         def interrupt(row):
             saved.append(row)
-            if row["iterations"][-1]["action"] == "document_finding_check_rejected":
+            if row["iterations"] and row["iterations"][-1]["action"] == "document_finding_check_rejected":
                 raise RuntimeError("Saved rejected collision check")
         client = Client()
         with self.assertRaisesRegex(RuntimeError, "Saved rejected collision"):
@@ -1430,7 +1402,7 @@ class FindingCheckTests(unittest.TestCase):
         self.assertEqual(event.requested_findings, [old, second])
 
     def test_interrupted_opinion_lookup_reuses_context_only_for_that_check(self):
-        kwargs, checkpoint, old, drafts = self.objects()
+        kwargs, checkpoint, old, drafts = finding_check_objects()
         kwargs["context"].synthesis_markdown = "A saved unverified interpretation."
         labels, saved = [], []
         test = self
@@ -1449,13 +1421,12 @@ class FindingCheckTests(unittest.TestCase):
                         "context_requests": [{"tool_name": "get_synthesis_brief", "arguments": {}}]}]}
                 test.assertEqual(label, "report-document-finding-checker-evidence")
                 test.assertEqual(view["supplementary_evidence"][-1]["tool_name"], "get_synthesis_brief")
-                return {"section_reviews": [{"section_id": "scope", "verdict": "pass",
-                    "finding_checks": [{"finding_id": old.finding_id, "status": "not_applicable",
-                        "explanation": "An interpretation cannot establish the identity and the draft is qualified.",
-                        "draft_quotes": [drafts[0].draft_markdown]}]}]}
+                return opinion_check_response(old, verdict="pass", status="not_applicable",
+                    explanation="An interpretation cannot establish the identity and the draft is qualified.",
+                    draft_quotes=[drafts[0].draft_markdown])
         def sink(row):
             saved.append(row)
-            if row["iterations"][-1]["action"] == "document_finding_context":
+            if row["iterations"] and row["iterations"][-1]["action"] == "document_finding_context":
                 raise RuntimeError("Interrupted after opinion lookup")
         client = Client()
         with self.assertRaisesRegex(RuntimeError, "opinion lookup"):
@@ -1471,7 +1442,7 @@ class FindingCheckTests(unittest.TestCase):
         self.assertEqual(gateway.call_counts["get_synthesis_brief"], 1)
 
     def test_interrupted_check_does_not_lose_new_findings_to_old_section_passes(self):
-        kwargs, checkpoint, old, drafts = self.objects()
+        kwargs, checkpoint, old, drafts = finding_check_objects()
         # Earlier per-section passes must not override the later document owner.
         checkpoint["iterations"] = [ReportIterationRecord(iteration=i, section_id=row.section_id,
             action="review", status="pass").model_dump(mode="json") for i, row in enumerate(drafts, start=1)]
@@ -1483,14 +1454,14 @@ class FindingCheckTests(unittest.TestCase):
         class Client:
             resumed = False
             def ask_json(self, system, prompt, *, label="", **ignored):
-                if label == "report-document-reviewer":
-                    return {"section_reviews": []} if self.resumed else {"section_reviews": [{
-                        "section_id": "limits", "verdict": "revise_required", "findings": [new.model_dump(mode="json")]}]}
                 if self.resumed:
-                    return {"section_reviews": []}
-                return {"section_reviews": [{"section_id": "scope", "verdict": "pass",
-                    "finding_checks": [{"finding_id": old.finding_id, "status": "not_applicable",
-                        "explanation": "The current statement is qualified.", "draft_quotes": [drafts[0].draft_markdown]}]}]}
+                    raise AssertionError("Accepted inspection and applied opinion checks cannot be replayed")
+                if label == "report-document-reviewer":
+                    return {"section_reviews": [{
+                        "section_id": "limits", "verdict": "revise_required", "findings": [new.model_dump(mode="json")]}]}
+                return opinion_check_response(old, verdict="pass", status="not_applicable",
+                    explanation="The current statement is qualified.",
+                    draft_quotes=[drafts[0].draft_markdown])
         def sink(row):
             saved.append(row)
             if any(event["action"] == "document_finding_check" for event in row["iterations"]):

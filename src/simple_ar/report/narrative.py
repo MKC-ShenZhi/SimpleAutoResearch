@@ -98,7 +98,11 @@ def report_objective(context: ReportContext, memory: ReportMemory) -> str:
 def prior_draft_context(context: ReportContext) -> dict[str, Any]:
     """Expose selected old prose for editing, never as an evidence choice."""
     return {
-        "drafts": [_prompt_handle_view(row) for row in context.source_handles if row.kind == "prior_draft"],
+        "drafts": [{**_prompt_handle_view(row),
+            **({'retained_body': row.metadata['draft_markdown'],
+                'body_scope': 'Complete retained earlier Markdown; not original-source evidence.'}
+               if isinstance(row.metadata.get('draft_markdown'), str) else {})}
+            for row in context.source_handles if row.kind == "prior_draft"],
         "use": "These are earlier drafts selected for revision or reorganization, not primary evidence. "
                "Use them to identify what to preserve or change. Resolve factual claims from the actual sources "
                "and recorded results; new supported evidence can supersede old prose. Do not cite a draft "
@@ -108,7 +112,7 @@ def prior_draft_context(context: ReportContext) -> dict[str, Any]:
 
 def report_tool_context(
     result: ReportToolResult, *, source_evidence: list[dict[str, Any]] | None = None,
-    include_reading_notes: bool = True,
+    include_reading_notes: bool = True, evidence_reference: str = "source_evidence",
 ) -> dict[str, Any]:
     """Project saved brief handles too; do not rewrite historical tool records.
 
@@ -139,7 +143,7 @@ def report_tool_context(
             if source_evidence is not None and view in source_evidence:
                 # Exact duplicate only: a newer/different passage or conflicting
                 # metadata must not be replaced merely because its id matches.
-                view = {"handle": view["handle"], "evidence_reference": "source_evidence"}
+                view = {"handle": view["handle"], "evidence_reference": evidence_reference}
             projected.append(view)
         data["content"][key] = projected
     return data
@@ -1051,7 +1055,7 @@ def _prompt_metrics(
     ]}
 
 
-def _prompt_handle_view(handle: Any) -> dict[str, Any]:
+def _prompt_handle_view(handle: Any, *, navigation: bool = False) -> dict[str, Any]:
     """Return a compact model-facing handle with short citation guidance.
 
     The raw handle is retained for source provenance and chunk backtracking, but
@@ -1073,16 +1077,31 @@ def _prompt_handle_view(handle: Any) -> dict[str, Any]:
     # Writer and Reviewer must see the same evidence, not just an abstract.
     # Keep source excerpts distinct from model-derived reading notes.
     source_metadata = handle.metadata
+    if (handle.kind == 'material'
+            and source_metadata.get('evidence_role') == 'supplied_figure_not_visually_or_scientifically_verified'
+            and isinstance(source_metadata.get('caption'), str)):
+        # Explicit composition captions are bound authoring input, not a
+        # navigation preview. The export manifest consumes the same full text.
+        data['metadata']['caption'] = source_metadata['caption']
     if handle.kind == "prior_draft":
         data["attribution_guidance"] = "Earlier prose selected for editing, not primary evidence or a bibliography source."
         data["metadata"]["evidence_role"] = "prior_draft_not_primary_evidence"
     directory = source_metadata.get("source_directory")
     if isinstance(directory, dict):
-        data["metadata"]["source_directory"] = directory
+        # The retained directory is an address book, not evidence. Repeating
+        # long section/chunk identities in every planning/writing/review prompt
+        # obscures the actual passages. Search supplies exact chunk addresses
+        # when needed; group headings without changing the source snapshot.
+        data["metadata"]["source_directory"] = {
+            "headings": directory.get("headings", list(dict.fromkeys(
+                str(row.get("heading") or "") for row in directory.get("sections", [])))),
+            "total_sections": directory.get("total_sections"),
+            "truncated": directory.get("truncated", False),
+            "scope": "Distinct headings in retained directory entries, not reading coverage or paragraph adjacency."}
         data["source_navigation"] = (
             "This directory locates retained sections; headings are not evidence. "
             "When the requested experiment, definition or comparison is absent from the overview, "
-            "use search_source_chunks with its specific heading or get_neighbor_chunks with its chunk_id "
+            "use search_source_chunks with a specific heading/question, then get_neighbor_chunks with a returned chunk_id "
             "before concluding that the retained source lacks it."
         )
     if isinstance(source_metadata.get("recorded_execution_evidence"), dict):
@@ -1192,11 +1211,15 @@ def _prompt_handle_view(handle: Any) -> dict[str, Any]:
         # A single presentation budget, not a second six-passage sample of
         # referenced evidence. Both Writer and independent Reviewer use this view.
         selected_passages = []
-        remaining = 24000
-        for row in passages:
+        # Explicit evidence is already selected and bounded at ingestion. Do
+        # not turn that selection back into an overview, losing late conditions.
+        explicit = not navigation and source_metadata.get("evidence_selection") == "explicit_retained_chunks"
+        passage_limit = 96000 if explicit else 1400
+        remaining = 96000 if explicit else 24000
+        for row in (passages[:1] if navigation else passages):
             if not isinstance(row, dict):
                 continue
-            text = str(row.get("text", ""))[:min(1400, remaining)]
+            text = str(row.get("text", ""))[:min(passage_limit, remaining)]
             if not text:
                 continue
             selected_passages.append({**row, "text": text,
@@ -1205,11 +1228,11 @@ def _prompt_handle_view(handle: Any) -> dict[str, Any]:
             if not remaining:
                 break
         data["metadata"]["evidence_passages"] = [
-            {"chunk_id": str(row.get("chunk_id", "")), "text": str(row.get("text", ""))[:1400],
+            {"chunk_id": str(row.get("chunk_id", "")), "text": str(row.get("text", "")),
              "character_start": row.get("character_start"), "character_end": row.get("character_end"),
              "total_characters": row.get("total_characters"), "selection": row.get("selection", ""),
              **{key: row[key] for key in ("heading", "section_id") if key in row},
-             "truncated": bool(row.get("truncated")) or len(str(row.get("text", ""))) > 1400}
+             "truncated": bool(row.get("truncated"))}
             for row in selected_passages
         ]
         data["metadata"]["evidence_passages_truncated"] = (bool(source_metadata.get("evidence_passages_truncated"))

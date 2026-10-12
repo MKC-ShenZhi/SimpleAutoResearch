@@ -22,6 +22,10 @@ def _paper_to_bibtex(paper: Paper) -> str:
         "author": " and ".join(metadata["authors"]),
         "url": metadata["url"],
     }
+    if not metadata["authors"]:
+        # BibTeX styles use key for an authorless label/sort fallback. This is
+        # the existing citation identity, not a manufactured author or title.
+        fields["key"] = paper.id
     if metadata["year"]:
         fields["year"] = metadata["year"]
     if metadata["doi"]:
@@ -35,12 +39,17 @@ def _paper_to_bibtex(paper: Paper) -> str:
     lines = [f"@misc{{{paper.id},"]
     for key, value in fields.items():
         if value:
-            lines.append(f"  {key} = {{{_escape_bibtex(value)}}},")
+            lines.append(f"  {key} = {{{_escape_bibtex(value, literal_url=key in {'url', 'doi', 'eprint'})}}},")
     lines[-1] = lines[-1].rstrip(",")
     lines.append("}")
     return "\n".join(lines)
 
 
-def _escape_bibtex(value: str) -> str:
-    """Escape the small subset of BibTeX-sensitive characters we emit."""
-    return value.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+def _escape_bibtex(value: str, *, literal_url: bool = False) -> str:
+    """Keep recorded text literal in TeX; locator fields are read by \\url."""
+    escapes = {"\\": r"\textbackslash{}", "{": r"\{", "}": r"\}",
+               "&": r"\&", "%": r"\%", "$": r"\$", "#": r"\#", "_": r"\_",
+               "~": r"\textasciitilde{}", "^": r"\textasciicircum{}"}
+    if literal_url:
+        escapes = {"\\": r"\\", "{": r"\{", "}": r"\}"}
+    return "".join(escapes.get(char, char) for char in value)

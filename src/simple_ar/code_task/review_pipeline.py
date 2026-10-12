@@ -11,7 +11,7 @@ from __future__ import annotations
 import ast
 import os
 from pathlib import Path, PurePosixPath
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from simple_ar.code_task.analysis.interfaces import public_api_from_source, render_source_snippets, _module_name, _resolve_import_module
 from simple_ar.code_task.analysis.index import IGNORED_FILE_NAMES, is_python_environment, read_code_task_text
@@ -43,13 +43,15 @@ def build_review_index(
     *,
     result_schema: Mapping[str, Any] | None = None,
     contract: Mapping[str, Any] | None = None,
+    excluded_names: frozenset[str] = frozenset(),
+    path_filter: Callable[[Path], bool] | None = None,
 ) -> dict[str, Any]:
     """Build a complete local review index without calling an LLM."""
 
     files: list[dict[str, Any]] = []
     notebooks: list[dict[str, Any]] = []
     required_metrics = _required_metrics(result_schema or {})
-    for path in sorted(_project_files(project_dir)):
+    for path in sorted(_project_files(project_dir, excluded_names=excluded_names, path_filter=path_filter)):
         if not path.is_file() or path.is_symlink():
             continue
         rel = _safe_rel(project_dir, path)
@@ -96,16 +98,20 @@ def build_review_index(
     }
 
 
-def _project_files(project_dir: Path):
+def _project_files(project_dir: Path, *, excluded_names: frozenset[str] = frozenset(),
+                   path_filter: Callable[[Path], bool] | None = None):
     """Prune dependency/cache trees before traversal, not after visiting them."""
     for directory, children, names in os.walk(project_dir, followlinks=False):
         parent = Path(directory)
         children[:] = [name for name in children
-                       if name not in SKIP_PARTS and not name.endswith((".egg-info", ".dist-info"))
+                       if name not in SKIP_PARTS and name not in excluded_names and not name.startswith(".env")
+                       and not name.endswith((".egg-info", ".dist-info"))
                        and not is_python_environment(parent / name)
-                       and not (parent / name).is_symlink()]
+                       and not (parent / name).is_symlink()
+                       and (path_filter is None or path_filter(parent / name))]
         for name in names:
-            yield parent / name
+            if name not in excluded_names and (path_filter is None or path_filter(parent / name)):
+                yield parent / name
 
 
 def build_review_clusters(

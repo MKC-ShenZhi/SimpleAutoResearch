@@ -28,7 +28,123 @@ from simple_ar.research.documents.ingest import DocumentBundle
 from tests.report_review_fixtures import draft_quotes
 
 
+def _agent_inputs(context, memory, config):
+    return dict(context=context, memory=memory, config=config,
+        template=load_report_template_bundle(report_mode=context.report_mode, config=config),
+        gateway=ReportToolGateway(context))
+
+
+class _CheckpointStop(BaseException):
+    """Interrupt outside the agent's handled provider/runtime failures."""
+
+
+def _interrupt_checkpoint(saved, predicate):
+    def checkpoint(row):
+        saved.append(copy.deepcopy(row))
+        if predicate(row):
+            raise _CheckpointStop()
+    return checkpoint
+
+
 class DocumentFirstTests(unittest.TestCase):
+    def test_composition_caption_ownership_selection_publication_and_recovery(self):
+        from unittest.mock import Mock
+        from simple_ar.core.budget import BudgetLedger
+        from simple_ar.tools.workspace import WorkspaceToolGateway
+        from simple_ar.tools.writing import ComposeRequest, WritingToolGateway
+
+        for select_roots in (False, True):
+            with self.subTest(select_roots=select_roots), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                sources = root / 'inputs'
+                sources.mkdir()
+                table = sources / 'observations.csv'
+                table.write_text('group,count\ncontrol,4\nvariant,3\n', encoding='utf-8')
+                image = sources / 'comparison.svg'
+                original = b'<svg xmlns="http://www.w3.org/2000/svg"/>'
+                image.write_bytes(original)
+                caption = 'Observed *group counts*; supplied descriptive results. ' + (
+                    'Scope and original measurement conditions remain part of the caption. ' * 16)
+                ledger = BudgetLedger()
+                workspace = WorkspaceToolGateway(root, {'source0': sources}, ledger)
+                client = Mock()
+                request = {'goal': 'Explain the recorded observations.', 'title': 'Group comparison',
+                    'figures': [{'path': str(image), 'caption': caption}]}
+                draft = {'draft_markdown': f'## Observations\n\n![{caption}](figures/selected-1.svg)\n\nInterpretation remains limited.'}
+                if select_roots:
+                    request['material_roots'] = [str(sources)]
+                    client.ask_json.side_effect = [{'materials': [str(table)], 'figures': [str(image)]}, draft]
+                else:
+                    request['materials'] = [{'path': str(table)}]
+                    client.ask_json.return_value = draft
+                gateway = WritingToolGateway(root, workspace, ledger, 'retained-test-model', 'test',
+                    client_factory=lambda identity: client)
+                identity = 'caption-composition'
+                with patch('simple_ar.report.capability.run_report_capability',
+                           side_effect=RuntimeError('assembly interrupted')):
+                    interrupted = gateway.call('compose_document', request, identity=identity)
+                self.assertEqual(interrupted.status, 'error')
+                self.assertIn('assembly interrupted', interrupted.error)
+                owner = root / 'tools/writing' / identity
+                binding = json.loads((owner / 'request.json').read_text(encoding='utf-8'))
+                self.assertEqual(binding['figure_caption_contract'], 'pandoc_image.v1')
+                self.assertEqual(binding['inputs'][-1]['caption'], caption)
+                self.assertEqual(binding['inputs'][-1]['sha256'], hashlib.sha256(original).hexdigest())
+                snapshot = json.loads((owner / 'writer/report_inputs.json').read_text(encoding='utf-8'))
+                self.assertEqual(snapshot['owner'], 'direct_article.v1')
+                retained_writer_bytes = {name: (owner / 'writer' / name).read_bytes()
+                    for name in ('report_inputs.json', 'response.json', 'writer.json')}
+                self.assertEqual(json.loads(retained_writer_bytes['response.json']), draft)
+                self.assertFalse((owner / 'writer/sections.json').exists())
+                figure = next(row for row in snapshot['inputs']['article']['source_handles'] if row['handle'].startswith('figure:'))
+                self.assertEqual(figure['metadata']['caption'], caption)
+                self.assertNotIn('summary', figure)  # Do not supply the same caption twice.
+                self.assertIn(caption, client.ask_json.call_args.args[1])
+                self.assertEqual(client.ask_json.call_args.args[1].count(caption), 1)
+                self.assertEqual(client.ask_json.call_count, 2 if select_roots else 1)
+                with patch.object(gateway, 'client_factory', side_effect=AssertionError('no model replay')):
+                    composed = gateway.call('compose_document', request, identity=identity)
+                self.assertEqual(composed.status, 'ok', composed.error)
+                self.assertEqual({name: (owner / 'writer' / name).read_bytes()
+                    for name in retained_writer_bytes}, retained_writer_bytes)
+                manuscript = workspace.resolve(composed.data['editable_markdown'])
+                manifest = manuscript.parent / 'figures/figures_manifest.json'
+                self.assertEqual(json.loads(manifest.read_text(encoding='utf-8')),
+                    {'figures': [{'path': 'figures/selected-1.svg', 'caption': caption}]})
+                self.assertIn(str(manifest.relative_to(root)).replace('\\', '/'), composed.artifacts)
+                self.assertIn(caption, manuscript.read_text(encoding='utf-8'))
+                self.assertEqual((manuscript.parent / 'figures/selected-1.svg').read_bytes(), original)
+                self.assertEqual(image.read_bytes(), original)
+                with self.assertRaises(ValueError):
+                    workspace.resolve(str(image), write=True)
+                # Partial publication is reconciled only against the retained
+                # assembly, including the caption manifest's exact bytes.
+                receipt = owner / 'result.json'
+                receipt_bytes = receipt.read_bytes()
+                receipt.unlink()
+                manifest_bytes = manifest.read_bytes()
+                manifest.write_text('{}', encoding='utf-8')
+                with patch.object(gateway, 'client_factory', side_effect=AssertionError('no model replay')):
+                    rejected = gateway.call('compose_document', request, identity=identity)
+                    self.assertEqual(rejected.status, 'error')
+                    self.assertIn('Retained publication changed', rejected.error)
+                    manifest.unlink()
+                    restored = gateway.call('compose_document', request, identity=identity)
+                self.assertEqual(restored.status, 'ok', restored.error)
+                self.assertEqual(manifest.read_bytes(), manifest_bytes)
+                self.assertEqual(receipt.read_bytes(), receipt_bytes)
+                changed = copy.deepcopy(request)
+                changed['figures'][0]['caption'] = 'Changed caption.'
+                self.assertEqual(gateway.call('compose_document', changed, identity=identity).status, 'error')
+                self.assertEqual(ledger.entries, ())
+        # The legacy request still serializes bare paths, not synthetic captions.
+        legacy = ComposeRequest.model_validate({'goal': 'Explain', 'title': 'Report', 'figures': ['old.png']})
+        self.assertEqual(legacy.model_dump()['figures'], ['old.png'])
+        for figures in ([{'path': 'old.png', 'caption': '   '}],
+                        ['old.png', {'path': 'old.png', 'caption': 'Caption'}]):
+            with self.assertRaises(ValidationError):
+                ComposeRequest.model_validate({'goal': 'Explain', 'title': 'Report', 'figures': figures})
+
     def inputs(self, count=2, scope="document", **updates):
         context = ReportContext(topic="A bounded account", report_mode="supplied_materials")
         memory = ReportMemory(section_plan=[ReportSectionPlan(section_id=sid, heading=sid,
@@ -36,9 +152,7 @@ class DocumentFirstTests(unittest.TestCase):
             for i, sid in enumerate(("results", "limits")[:count], 1)])
         config = ReportRuntimeConfig(outline_strategy="template", document_review=True,
             review_scope=scope, max_review_iterations=1, **updates)
-        return dict(context=context, memory=memory, config=config,
-            template=load_report_template_bundle(report_mode=context.report_mode, config=config),
-            gateway=ReportToolGateway(context))
+        return _agent_inputs(context, memory, config)
 
     def client(self, labels, *, revise=False, fail=False):
         class Client:
@@ -147,6 +261,32 @@ class DocumentFirstTests(unittest.TestCase):
         self.assertTrue(any("document-verifier" in label for label in labels))
         self.assertTrue(any(row.action == "document_revise" and row.adopted for row in result.iterations))
         self.assertIn("Revised bounded result", result.report_body)
+
+        # A single-document section uses the section reviewer. Its completed
+        # opinion must survive a refused revision without another review call.
+        kwargs, interrupted, calls = self.inputs(count=1, scope="section"), [], []
+        kwargs['config'] = kwargs['config'].model_copy(update={'allow_llm_fallback': False})
+        regular = self.client(calls)
+        class InterruptedRevision:
+            def ask_json(self, system, prompt, *, label='', **options):
+                if label == 'report-reviewer-results':
+                    calls.append(label)
+                    return {'verdict': 'revise_required', 'revision_instructions': ['Clarify the observation.']}
+                if 'reviser' in label:
+                    raise LLMError('Budget refused before sending revision')
+                return regular.ask_json(system, prompt, label=label, **options)
+        with self.assertRaises(LLMError):
+            run_report_agent(**kwargs, client=InterruptedRevision(),
+                checkpoint_sink=lambda row: interrupted.append(copy.deepcopy(row)))
+        self.assertEqual(interrupted[-1]['iterations'][-1]['action'], 'review')
+        self.assertEqual(interrupted[-1]['iterations'][-1]['revision_instructions'], ['Clarify the observation.'])
+        resumed_calls = []
+        restored = run_report_agent(**kwargs, client=self.client(resumed_calls),
+            completed_checkpoint=interrupted[-1])
+        self.assertEqual(resumed_calls[0], 'report-reviser-results-round-1')
+        self.assertNotIn('report-reviewer-results', resumed_calls)
+        self.assertEqual(sum(row.action == 'review' for row in restored.iterations), 1)
+        self.assertIn('Revised bounded result', restored.report_body)
 
     def test_normal_revision_recheck_and_finished_resume_share_current_reference_owner(self):
         from simple_ar.report.narrative import delivery_text_observation
@@ -281,8 +421,7 @@ class JointDraftingTests(unittest.TestCase):
             kind='material', title=row.heading, summary=f'Original evidence for {row.section_id}') for row in plans])
         config = ReportRuntimeConfig(outline_strategy='template', document_review=True, review_scope='document',
             draft_scope='document', max_review_iterations=0)
-        return dict(context=context, memory=memory, config=config,
-            template=load_report_template_bundle(report_mode=context.report_mode, config=config), gateway=ReportToolGateway(context))
+        return _agent_inputs(context, memory, config)
 
     def client(self, labels, requests, *, bad=None):
         class Client:
@@ -512,8 +651,6 @@ class JointDraftingTests(unittest.TestCase):
             kwargs['memory'].source_handles[0] = kwargs['memory'].source_handles[0].model_copy(update={
                 'kind': kind, 'metadata': {'source_directory': {'sections': []},
                                              'evidence_passages_truncated': True}})
-            class Stop(BaseException):
-                pass
             class Selector:
                 def ask_json(self, system, prompt, *, label='', **options):
                     self_payload = json.JSONDecoder().raw_decode(prompt[prompt.index('{'):])[0]
@@ -522,13 +659,11 @@ class JointDraftingTests(unittest.TestCase):
                         raise AssertionError('Composition must follow saved selection')
                     return {'context_requests': selected}
             selector = Selector()
-            def save_selection(row):
-                saved.append(copy.deepcopy(row))
-                if any(event['action'] == 'writer_context' and event['status'] == 'completed'
-                       for event in row['iterations']):
-                    raise Stop()
+            save_selection = _interrupt_checkpoint(saved, lambda row: any(
+                event['action'] == 'writer_context' and event['status'] == 'completed'
+                for event in row['iterations']))
             with patch.object(kwargs['gateway'], 'call', return_value=evidence) as read:
-                with self.assertRaises(Stop):
+                with self.assertRaises(_CheckpointStop):
                     run_report_agent(**kwargs, client=selector, checkpoint_sink=save_selection)
                 self.assertEqual(read.call_count, len(selected))
             self.assertNotIn('sections', selector.assert_contract)
@@ -711,14 +846,9 @@ class JointDraftingTests(unittest.TestCase):
     def test_planned_read_allocation_interruption_does_not_replan_or_replay(self):
         kwargs, plan = self.planning_inputs()
         saved = []
-        class Stop(BaseException):
-            pass
-        def checkpoint(row):
-            saved.append(copy.deepcopy(row))
-            if row['tool_results']:
-                raise Stop()
+        checkpoint = _interrupt_checkpoint(saved, lambda row: row['tool_results'])
         with patch.object(kwargs['gateway'], 'call') as read:
-            with self.assertRaises(Stop):
+            with self.assertRaises(_CheckpointStop):
                 run_report_agent(**kwargs, client=self.planned_client(plan, [], []), checkpoint_sink=checkpoint)
             read.assert_not_called()
         labels, prompts = [], []
@@ -763,20 +893,15 @@ class JointDraftingTests(unittest.TestCase):
 
     def test_interruption_after_allocation_retains_unconfirmed_read_as_unavailable(self):
         kwargs, saved = self.inputs(), []
-        class Stop(BaseException):
-            pass
         regular = self.client([], [])
         class Reader:
             def ask_json(self, system, prompt, *, label='', **options):
                 if label == 'report-writer-document':
                     return {'context_requests': [{'tool_name': 'get_paper_brief', 'arguments': {'handle': 'material:comparison'}}]}
                 return regular.ask_json(system, prompt, label=label, **options)
-        def checkpoint(row):
-            saved.append(copy.deepcopy(row))
-            if row['tool_results']:
-                raise Stop()
+        checkpoint = _interrupt_checkpoint(saved, lambda row: row['tool_results'])
         with patch.object(kwargs['gateway'], 'call') as read:
-            with self.assertRaises(Stop):
+            with self.assertRaises(_CheckpointStop):
                 run_report_agent(**kwargs, client=Reader(), checkpoint_sink=checkpoint)
             read.assert_not_called()
         labels, prompts = [], []
@@ -894,9 +1019,7 @@ class JointRevisionTests(unittest.TestCase):
             for i, sid in enumerate(('method', 'result', 'scope'), 1)])
         config = ReportRuntimeConfig(outline_strategy='template', document_review=True,
             review_scope='document', draft_scope='document', max_review_iterations=2)
-        return dict(context=context, memory=memory, config=config,
-            template=load_report_template_bundle(report_mode=context.report_mode, config=config),
-            gateway=ReportToolGateway(context))
+        return _agent_inputs(context, memory, config)
 
     def client(self, labels, *, reject=False):
         class Client:
@@ -1019,19 +1142,17 @@ class JointRevisionTests(unittest.TestCase):
         self.assertEqual(prior, saved[-1])
 
     def test_candidate_verification_resume_reuses_completed_inspection(self):
-        for action in ('document_joint_verify',):
-            with self.subTest(action=action):
-                labels, saved = [], []
-                def interrupt(row):
-                    saved.append(copy.deepcopy(row))
-                    if any(event['action'] == action for event in row['iterations']):
-                        raise RuntimeError('Saved completed check')
-                with self.assertRaisesRegex(RuntimeError, 'completed check'):
-                    run_report_agent(**self.inputs(), client=self.client(labels), checkpoint_sink=interrupt)
-                run_report_agent(**self.inputs(), client=self.client(labels), completed_checkpoint=saved[-1])
-                self.assertEqual(labels.count('report-document-joint-reviser'), 1)
-                self.assertNotIn('report-document-finding-checker', labels)
-                self.assertEqual(labels.count('report-document-verifier'), 1)
+        labels, saved = [], []
+        def interrupt(row):
+            saved.append(copy.deepcopy(row))
+            if any(event['action'] == 'document_joint_verify' for event in row['iterations']):
+                raise RuntimeError('Saved completed check')
+        with self.assertRaisesRegex(RuntimeError, 'completed check'):
+            run_report_agent(**self.inputs(), client=self.client(labels), checkpoint_sink=interrupt)
+        run_report_agent(**self.inputs(), client=self.client(labels), completed_checkpoint=saved[-1])
+        self.assertEqual(labels.count('report-document-joint-reviser'), 1)
+        self.assertNotIn('report-document-finding-checker', labels)
+        self.assertEqual(labels.count('report-document-verifier'), 1)
 
     def test_unaccepted_candidates_do_not_mix_or_reset_round_allowance(self):
         labels = []

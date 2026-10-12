@@ -149,6 +149,25 @@ class ResearchReportApplicationTests(unittest.TestCase):
             documents_ref=ArtifactRef("sources/bundle.json"), assets=[])
         self.assertEqual(reused.papers[0]["url"], "https://example.test/code")
         self.assertEqual(reused.source_handles[0].citation_key, "P1")
+        # Connector identities survive composition without recreating intake
+        # assets or guessing publication identities from matching titles.
+        originals = documents.records[:2]
+        prior = DocumentRecord(document_id='previous', source='fixture', title='Same title',
+            metadata={'kind': 'prior_draft', 'paper_id': 'previous-paper'})
+        analysis = DocumentRecord(document_id='derived', source='local_analysis', title='Same title',
+            metadata={'paper_id': 'not-a-measured-paper'})
+        retained = DocumentBundle(records=[*originals, prior, analysis], fulltext_manifest={},
+            fulltext_extraction={}, sections=[], chunks=[TextChunk(f'{row.document_id}-text',
+                row.document_id, 'Retained original or explicitly derived text.')
+                for row in [*originals, prior, analysis]])
+        native, native_memory = build_material_report_inputs(topic='Use original identities',
+            documents=retained, documents_ref=ArtifactRef('sources/selected.json'), assets=[],
+            selected_evidence=True)
+        self.assertEqual([row['id'] for row in native.papers], ['p1', 'p2'])
+        self.assertEqual(set(native.citation_key_map.values()), {'p1', 'p2'})
+        self.assertEqual(native_memory.source_handles, native.source_handles)
+        self.assertEqual({row.metadata['document_id'] for row in native.source_handles
+            if row.kind == 'paper'}, {'doc-p1', 'doc-p2'})
         for key in ("p1", "p2"):
             result = ReportToolGateway(projected).call(ReportToolCall(tool_name="get_paper_brief", arguments={"paper_id": key}))
             evidence = result.content["handles"][0]

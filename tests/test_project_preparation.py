@@ -446,6 +446,7 @@ class ProjectPreparationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             self.project(root)
+            (root / 'README.rst').write_text('Project setup and test instructions in reStructuredText.\n')
             (root / 'configuration.py').write_text('value = 1\n' * 2000)
             (root / 'justfile').write_text('run:\n    python main.py --trials 10000\n')
             (root / 'run.sh').write_text('python main.py --trials 10000\n')
@@ -457,6 +458,8 @@ class ProjectPreparationTests(unittest.TestCase):
             with patch('subprocess.run', side_effect=AssertionError('read only')):
                 facts = inspect_project_preparation(root, read_paths=('configuration.py', 'justfile', 'run.sh', 'recipe.custom'))
             row = next(row for row in facts['excerpts'] if row['path'] == 'configuration.py')
+            self.assertIn('README.rst', facts['document_paths'])
+            self.assertIn('reStructuredText', next(row['text'] for row in facts['excerpts'] if row['path'] == 'README.rst'))
             self.assertEqual(len(row['text']), 8000)
             self.assertTrue(row['truncated'])
             self.assertIn('configuration.py', facts['source_file_paths'])
@@ -668,6 +671,22 @@ class ProjectDataPreparationTests(unittest.TestCase):
             self.assertFalse((workspace / 'external.csv').exists())
             self.assertEqual(payload['workspace_info']['patterns']['data_inputs'], ['data.csv'])
             self.assertEqual((original / 'data.csv').read_text(), 'original')
+            new_context = CapabilityContext(ArtifactStore(root / 'new-attempt'), AttemptManifest('prepare-new'))
+            # Formal execution retains its own explicit limit; the preparation
+            # probe's RunRequest is not authorization for a later measurement.
+            new_config = {'command': ['python', 'generated_project/main.py'], 'timeout_sec': 5, 'code_task': {'kind': 'greenfield', 'code_root': None, 'workspace_mode': 'empty',
+                'approval_note': 'Create in isolated empty workspace', 'allowed_patterns': ['generated_project/**']}}
+            new_result = run_preparation_capability(context=new_context, request=PreparationRequest(new_config,
+                'Create a reusable program', RunRequest(['python', 'generated_project/main.py'], root, timeout_sec=5)))
+            self.assertEqual(new_result.status, 'completed')
+            new_payload = new_context.store.read_json('execution.json')
+            self.assertIsNone(new_payload['source_project'])
+            self.assertFalse((Path(new_payload['workspace']) / 'main.py').exists())
+            from simple_ar.core.artifacts import read_json
+            manifest = read_json(Path(new_payload['execution']['code_task']['run_dir']) / 'manifest.json')
+            self.assertEqual(manifest['code_task']['kind'], 'greenfield')
+            from simple_ar.app.research_execution import implementation_request
+            implementation_request(new_payload['execution'], client=object(), task_text='Create a program', validate=True)
 
     def test_code_task_venv_preparation_routes_checker_and_formal_command(self):
         import sys

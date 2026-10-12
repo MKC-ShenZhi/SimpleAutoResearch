@@ -40,6 +40,19 @@ simple-ar start --chat --model profile:daily
 没有时选 `default`；CodeTask 选 `code`，再回到能力匹配的 `default`。
 `profile:名称` 选择完整连接，`route:用途` 选择路由，任务 TOML 的 `[model].name` 也接受这两种值。
 嵌套代码任务默认使用代码路由；任务明确指定的代码连接会保留给子调用。
+原生 `compose_document` 可用独立的 `writing` 路由处理选材、起草和反馈，共用原任务账本。
+该连接声明 `text` 能力即可，不新增模型能力类型。没有此路由时保持所选任务连接，
+包括显式选择的 profile；可让日常协调与科学表达使用不同的模型或思考设置，
+但配置本身不保证理解正确。命名任务快照绑定明确的写作路由，模型或端点改变时
+需创建新任务，不能在恢复时静默换连接。
+同一可选路由也可由 `focus_work` 通过 `purpose="writing"` 和具体目标选择，
+在既有行动循环中调查、修订及交付。该消费者要求 `openai_chat`；Responses 写作连接
+仍可服务 `compose_document`，但原生工作焦点会明确拒绝它。连接选择不自动提高
+思考强度、工具权限或共享预算。
+
+新整篇起草只发起一次逻辑 `ask_json` 调用，采用所选连接的共享有界重试、API 协议及
+JSON 政策；物理尝试沿原账本和额度计账。JSON 解析或文章内容格式失败保留响应，
+不自动重写文章；恢复使用冻结输入和已保存响应，不盲目重发。历史 Writer 检查点保持原契约。
 
 每个 profile 必填 `api`、`base_url`、`model`、`api_key_env`、`capabilities`。
 文本接口支持 `openai_chat`、`openai_responses`，目前仅 Chat 支持 `stream=true`。
@@ -47,38 +60,75 @@ simple-ar start --chat --model profile:daily
 （源码使用 `uv sync --extra http2`）。默认关闭，不切换服务商，也不能保证消除网关卡顿；
 选择前在运行机器验证长输入和长输出。修改已保存任务的此选项属于连接变化；省略或false
 仍兼容此前HTTP/1.1绑定。
-可选字段：`request_timeout_sec`、`max_output_tokens`、`retry_attempts`、
+可选字段：`request_timeout_sec`、`max_output_tokens`、`context_input_tokens`、`retry_attempts`、
 `retry_base_delay_sec`、`retry_max_delay_sec`、`reasoning_effort`、`thinking_mode`、
 `reasoning_output_tokens`、`json_response_format`、`chat_token_limit_param`、
 `input_price_per_million`、`output_price_per_million`。
 超时、等待和显式 token 上限须为正值；重试次数包含首次请求，单次调用仍可指定输出上限。
 推理、JSON 等参数是否被服务商接受需要实测，不由模型名称保证。
+`context_input_tokens` 是原生行动循环的输入工作集目标，默认24,000，包含工具契约、
+思考历史和观察。它只控制本地呈现，不是服务商请求参数，也不代表模型的真实上下文上限。
+较长任务可在命名连接中设置如 `context_input_tokens = 64000`，先核对提供方的输入输出
+合计限制和任务总预算。当前工作连接拥有该设置；剩余tokens扣除输出预留后仍可缩小它。
+增大输入会增加重复输入费用，不保证判断更好。已保存命名任务可调整此设置而不改变
+模型身份、权限或账本；已耗尽的合同不会因此恢复额度。
+`reasoning_effort="low"` 只降低思考强度，不等于关闭服务商思考。
+思考档位并非跨提供方等价：[DeepSeek 将 `medium` 映射为 `high`](https://api-docs.deepseek.com/guides/thinking_mode/)。
+其思考模式工具调用还会将此前的 `reasoning_content` 带入后续输入，因此提高档位可能同时增加
+思考输出及后续输入成本，不代表每次目录调查、编辑或验证决策都会更好。必要时按工作责任使用
+不同命名连接，先检查完整交付及反馈收益，再决定是否作为默认配置。
+支持该开关的 Chat 提供方可使用 `thinking_mode="disabled"`，并将 effort 留空或
+设为 `reasoning_effort="none"`；关闭思考与启用思考强度的冲突配置会拒绝。
+调用或 profile 的显式输出上限优先；`reasoning_output_tokens` 备用上限仅用于
+启用的 effort，不用于 `none` 或关闭思考。提供方可能将思考与最终文本一起计入
+输出上限；只有思考、`finish_reason="length"` 而无最终文本不是完成的结果。
+应核对提供方语义，不能只延长超时。
 SDK Chat 流式且设置有限超时时，提交与正文读取同时受总时长约束，随后最多两秒本地清理。
 未收到完成标记而到期，保留未知用量；有输出上限的纯文本请求可在 retry_attempts 内
 沿同一 API 重试，每次失败保留完整预算预留。无上限或视觉请求停止，预算不足也停止。
 这不代表服务商已停止或不计费。
-非流式、Responses 和 LiteLLM 保留其传输超时语义。已有 asyncio 事件循环中调用该同步接口，
+`retry_attempts = 1` 会关闭自动重试，单纯延长超时不会改变此策略。
+示例文本连接使用600秒时限及最多三次请求；若要求未知用量的文本重试仍受有限任务预算约束，
+应选择服务商支持的明确输出上限。不要无意中把图像连接的单次提交设置复制给文本连接。
+非流式、Responses 和 LiteLLM 保留其传输超时语义。SDK 请求设置正有限超时时，TCP/TLS
+建连最多等待20秒，配置时限更短则取该时限；读取、写入及连接池等待仍用配置值。
+因此600秒生成时限不会让单次建连也等待十分钟。SDK内部重试仍关闭，新请求沿既有
+`retry_attempts`及任务预算计账。已有 asyncio 事件循环中调用该同步接口，
 使用 `await asyncio.to_thread(client.ask, ...)`，不嵌套新事件循环。
 
 `json_response_format="off"` 只是不发送服务商原生 JSON 参数，`ask_json` 仍解析并检查 JSON。
 它用于接口兼容，不是过载修复。HTTP 连接成功后，流中仍可能返回上游错误；立即返回的
 `overloaded` 不能靠延长超时解决。有界重试逐次计入物理调用并保留未知用量，不重置旧任务额度。
 切换路由前，应在实际运行机器对比 SDK 和框架请求，并验证较长响应，而不只测试一句话。
+流诊断只保留SDK异常类型、可取得的HTTP状态及白名单协议错误码/类型，不保存服务商任意正文、
+请求ID或地址。未取得错误码意味着未知，不证明超时；不接受未完成的半段输出。
 恢复任务可调整超时、输出上限和重试设置，模型、端点及代码路由身份仍绑定；不改写旧快照。
 
 能力声明不是探针结果。`simple-ar image` 使用 `openai_images` 连接生成或编辑；
 可选 `image_size`、`image_quality` 传给提供商，须验证其实际支持。
 Images 不能用作文本客户端，
 也不能继承文本的流式、token、JSON 或 token 单价参数。
+图像连接设为 `http2=true` 时，实际执行环境须安装 `simple-autoresearch[http2]`。
+缺依赖在预留额度和登记提交前拒绝；完整且未变的旧图片仍可离线复用。
+历史未知提交不据此改账或自动重发。
 
 `simple-ar image-review` 使用独立 `vision` 路由，连接须声明 `vision` 能力并显式选择
 `openai_chat` 或 `openai_responses`，不自动切换 API 模式。发送实际图片像素，不是文件名；
 支持最多四张静态 PNG/JPEG/WebP，总计不超过 20 MiB，每张不超过 4,194,304 像素。
 服务商提供用量时据实登记，未提供时保留未知而不是零。反馈检查可见问题，不证明科学正确性。
+超出本地图片限制时返回明确校验说明，可缩小检查副本，原图保持不变。
+审阅沿命名连接的输出上限；未配置时使用 3,000 tokens 的有界默认值。
+无法解析的最终响应保留在审阅目录的 `rejected-response.json`，不作为反馈发布，也不自动重发。
+
+原生任务的 `--allow-vision` 授权 `inspect_images`；看图共用模型调用和 token 额度，
+不占图像生成额度。因此 `--max-images 0` 禁用生成/编辑，不禁用已授权的看图。
+任务上下文区分工具可用、剩余额度与提供方通路是否正常。
 
 cctq 官方异步图像任务协议须显式选择 `api = "cctq_images_async"`；
 `openai_images` 保留通用同步接口。异步路径使用配置的 origin，保存同一 task ID，
 轮询该任务并认证下载同 origin 的 `files/0`，不硬编码主机、不跨服务商或接口 fallback。
+`request_timeout_sec` 约束提交、轮询和下载的整段调用，随后最多两秒本地清理。
+已保存任务 ID 的恢复只发 GET；中断且未保存 ID 的提交不重放。
 已通过用户配置的代理验证旧任务结果恢复和一次反馈编辑；不代表服务器直连已稳定。
 此前同步请求的超时仍保留为失败，不能算成功。
 
@@ -596,12 +646,12 @@ CodeTask TOML 旧有的相对路径仍以运行时 cwd 为基准，不会被静�
 | `[execute].baseline_metrics_file` | `baseline_policy = "provided"` 时使用的 JSON 或 `metric=0.82` 文本指标文件。JSON 支持 `{"accuracy": 0.8}`、`{"metrics": {...}}` 和 `{"metric_values": {...}}`。 |
 | `[execute].apply_proposed_edits` | 允许 execute 应用已经审核过的 proposal。review-first 流程建议保持 false。 |
 | `[execute].allow_large_edits` | 允许应用超过 normal 预算但落在 large 预算内的已审核 proposal。 |
-| `[execute].allow_planning_fallback` | LLM work-plan / patch-plan / greenfield 架构规划 / greenfield 文件生成重试后仍失败时，是否允许 deterministic fallback。真实 LLM run 建议保持 false，这样坏输出会安全停止并可重跑。 |
+| `[execute].allow_planning_fallback` | 允许明确的离线规划，以及完整、用量已知的响应格式失败后的 greenfield fallback；不把提供方、预算、时限或未完成流失败替换成离线成功。要求模型实施的任务保持 false。 |
 | `[execute].planning_mode` | Greenfield 规划：`tool_agent` 分需求、架构、接口、文件计划及有限审阅，正常至少五次调用；`compact` 在重试前仅一次架构调用。两者共用文件生成和执行，调用数不代表研究质量。 |
 | `[execute].planning_review_rounds` | standalone code-task 中 greenfield planning reviewer 可触发的最大回修轮数。默认 `2`；轻量 smoke example 可设为 `1`，大型服务器任务可按需调大。 |
-| `[execute].llm_retry_attempts` | work-plan、patch-plan、greenfield 架构规划和 greenfield 文件生成的 LLM 尝试次数；全部失败后才停止或显式 fallback。 |
+| `[execute].llm_retry_attempts` | work/patch 规划和 greenfield 架构/文件生成的完整响应纠正上限，含首次尝试。运输重试和等待只由共享连接的 `retry_attempts`（旧环境变量 `SIMPLE_AR_LLM_RETRY_ATTEMPTS`）负责，不再由阶段乘倍。账本有未核清操作时不纠正或 fallback，即使用量维度已记全。 |
 | `[execute].repair_rounds` | 技术性验证/运行失败后的有限修复次数（非负整数，默认 `0`）。带 CodeTask 项目的 `research-session` 也用它限制单条件科研修订失败后的修复/复测；复测沿用既定协议与进程预算，不授权科研方法变更、增种子或配对修订的自动修复。修复仍需审核。 |
-| `[execute].max_files` | plan/proposal/repair 步骤纳入 LLM 上下文的最大文件数。 |
+| `[execute].max_files` | plan/proposal/repair 步骤纳入 LLM 上下文的最大文件数，也限制新 greenfield 规划的文件数，包括补入的 `main.py`。完整规划超限时明确拒绝，不静默丢弃模块或依赖；已保存规划不按新上限重建。 |
 | `[execute].max_source_chars_per_file` | LLM 上下文中单个文件的 source snippet 字符预算。 |
 | `[execute].max_generated_lines` | greenfield 生成行数预算。省略时会回退到 `[resource].max_generated_lines`，再回退到保守默认值。 |
 | `[models.code_task].planner` | work-plan 和 patch-plan 使用的模型。 |

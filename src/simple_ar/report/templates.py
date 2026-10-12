@@ -20,7 +20,7 @@ def is_builtin_template(template: ReportTemplateBundle, config: ReportRuntimeCon
         and (config is None or config.template in {"", "auto", *BUILTIN_TEMPLATE_NAMES}))
 
 
-def _intended_use(template: ReportTemplateBundle) -> str:
+def intended_use_guidance(template: ReportTemplateBundle) -> str:
     # Remove fallback chapter assignments, not genre-specific composition.
     # These blocks guide argument and prose without competing with the plan.
     return "\n\n".join(f"## {heading}\n\n{body.strip()}" for heading, body in
@@ -37,7 +37,7 @@ def planning_template_guidance(template: ReportTemplateBundle, config: ReportRun
     """
     if config.outline_strategy == "template" or not is_builtin_template(template, config):
         return template.template_markdown
-    return _intended_use(template)
+    return intended_use_guidance(template)
 
 
 def _adapted_builtin_plan(
@@ -60,7 +60,7 @@ def drafting_template_guidance(
     """
     if not _adapted_builtin_plan(template, memory, config):
         return template.template_markdown
-    return _intended_use(template)
+    return intended_use_guidance(template)
 
 
 def reviewing_template_guidance(

@@ -8,28 +8,133 @@ It is the practical user guide; workflow concepts and artifact details live in
 [CLI Reference](CLI_REFERENCE.md), and TOML fields live in
 [Configuration Reference](CONFIG_REFERENCE.md).
 
-## Start with one function
+## Start with a task
 
-After installation, `uv run simple-ar start` offers five structured choices:
+`uv run simple-ar start` asks for a natural-language goal and enters the experimental
+native tool loop. Supply read-only materials with repeatable `--source PATH`; public
+retrieval needs `--allow-network`, and command proposals need `--allow-execution`
+plus separate approval. See [native entry](CLI_REFERENCE.md#native-task-entry-experimental)
+for retained budgets and continuation. Complete cross-task acceptance is still pending.
+
+The closing result panel shows the saved workspace, pending action and ledger
+balance. A retained delivery record may precede the current feedback; saved files,
+terminal status and available request slots do not prove acceptance or that the
+next model request fits the remaining token allowance.
+
+New native tasks expose the full authorized tool contracts. The model can combine
+workspace, sources, code, analysis, writing and publication capabilities in the same
+action loop. Historical on-demand tasks retain their saved contract selection on
+continuation. Tool availability does not grant execution or network access or
+establish that a task has succeeded.
+
+Add material to the same task with `simple-ar start --resume-task SESSION "Use these notes"
+--source notes/ --yes`. Access flags can also be explicitly added on continuation;
+this preserves completed results and the original budget, rather than starting over.
+If a native model decision has terminated with no accepted reply, explicit
+`--resume-task SESSION --retry-model` can use its remaining budget without
+repeating completed tools. It retains failures and bounded unknown reservations;
+it is not a remedy for in-flight operations, unbounded charges or exhausted budgets.
+See the CLI reference for the recovery conditions and separate authorization steps.
+
+For a supplied Python project, the native task can inspect instructions, dependency
+declarations and entry candidates through the existing preparation module. Its
+overview links to a retained full observation; it does not import the project,
+install dependencies or execute tests. Dependency metadata belongs to the
+inspecting interpreter, not necessarily the separately selected task Python.
+The final `write_file` operation can carry an explicit `delivery` with its summary,
+artifact paths and unresolved work. The task validates those paths and saves the
+same delivery manifest after a successful write, without a separate model turn.
+Writing a file alone does not complete the task or certify its contents.
+
+For a new implementation, the native task can prepare related source files and
+checks together through the existing generator, using the catalog's `code` route
+and the same task budget. Original materials remain unchanged; the candidate,
+source bindings and unresolved gaps are saved. Execution still needs approval,
+and syntax validation alone does not establish correct behavior or delivery.
+A goal alone is sufficient: the code owner can choose new file paths without a
+supplied repository, coordinator-selected list or mandatory entry filename.
+An existing project adds its bounded inventory and source context to that same
+selection path; explicit files and source windows remain supported.
+For an existing-file change, a planned output may specify `source_path` and its
+observed `source_sha256`. The professional call uses the complete bounded original
+to propose exact replacements, preserving unrelated text in a separate candidate.
+New files still use full content; oversized sources or combined context are rejected
+explicitly rather than rewriting a source from truncated input.
+
+Observed text files can be copied into the workspace by source digest. This
+includes generated candidate files, avoiding manual content retransmission when
+assembling or revising a runnable project. Replacing an existing destination
+still requires its current digest and keeps the ordinary backup; original mounted
+sources remain read-only. Copying does not authorize execution or verify a repair.
+
+Native tasks can inspect bounded CSV/TSV or record-array JSON tables and use the
+existing deterministic analysis capability for supported summaries and explicit
+paired comparisons. The package includes copied input, figures and a rebuildable
+result. Row meaning, units and pairing still need evidence or clarification;
+observed counts do not establish independent samples or statistical significance.
+Unsupported transformations and methods use the existing code/execution path,
+with its separate authorization. Writing should consume calculated results, not
+replace them with mental arithmetic.
+
+Native composition can use selected windows from supplied text, tables or saved
+results together with retained literature passages. Existing figures are copied
+beside the editable `manuscript.md` with relative paths; feedback creates a new
+version and preserves its inputs. This does not calculate statistics or verify
+figures: request the necessary calculation and checks before relying on conclusions.
+The manuscript remains the input to the existing publication tool.
+Figures may supply an explicit caption together with their path. That caption
+belongs to the image, while surrounding prose discusses its meaning; publication
+owns numbering. An exact adjacent repetition is removed during export, not
+arbitrary similar discussion. Legacy figure paths remain valid.
+Keep it and its figure assets in a focused authoring directory: native publication
+pins the authorized local image inventory, bounded to 4,096 directory entries and
+256 MB of images, excluding derived publications. Changing a local figure requires
+new approval even when the text is unchanged. Private assets are not copied;
+compilation failure retains the source, failed version and diagnostics.
+
+For a PDF that needs visual inspection, the native publication tool accepts
+`render_preview: true` with compilation. It derives TeX/PDF from the same Markdown
+and renders every page in the same approved operation, returning image locators
+for `inspect_images`. This bounded preview supports up to 12 pages at 120 DPI,
+scaled to at most 1,600 pixels per dimension; larger documents are reported rather
+than silently truncated. Rendering is not a visual review. Requested incomplete
+previews prevent delivery, while the compiled PDF and diagnostics remain available.
+
+### Outcome preferences and structured compatibility
+
+`uv run simple-ar start --guided` offers outcome preferences. Ordinary survey,
+writing, reproduction, repair, data, figure and code preferences use the same
+native owner as a plain request. Supply a goal and common read-only material,
+project or data paths; no validator, edit scope or full measurement protocol is
+required. Optional public-source/process-proposal access is explicitly confirmed,
+and each process command still needs approval. `--yes` accepts only the displayed
+summary; `--prepare-only` makes no model/process call.
+See [preference inputs](CLI_REFERENCE.md#goal-driven-code-analysis-and-figures).
+Explicit controls select compatibility, rather than the preference name:
 
 | Function | Bring | Execution boundary |
 | --- | --- | --- |
-| `survey` | Question/scope; optional papers | Search or supplied-material reading, then report; model needed |
+| `survey` | Explicit `--sources`/retrieval controls; optional papers | Retains the declared source policy and report protocol; model needed |
 | `bug_fix` | Project, allowed paths, validation command | Bounded edits and actual validation; prepared dependencies |
 | `reproduction` | Paper, existing project/data, fixed protocol/command | Specified conclusion; current environment or explicitly selected task venv, no automatic data retrieval |
-| `writing` | Notes/draft or completed analysis package; optional papers | Existing material to report/draft; no implied search or experiment |
-| `data_analysis` | Table, selected fields, row/value meanings and units | Descriptive statistics, observation boxes or supplied bar/line/scatter/heatmap values; no API |
+| `writing` | Explicit `--template` or report controls; notes/draft or analysis package | Retains the requested structured writing protocol |
+| `data_analysis` | Explicit value/x/baseline column selectors without `--scripted`, or physical table controls | Deterministic table shortcut; descriptive statistics and declared plots, no API unless `--with-report` requests writing |
 
+`--chat`/`--resume-setup` retain technical structured setup, and
+`--from-session`/`--reuse` retain registered result/scope reuse. Even an explicitly
+supplied default such as `--interaction checkpoints` selects compatibility;
+strict controls cannot mix native access/budget flags. `figure` and `--scripted`
+analysis reject incompatible structured controls before task creation.
 `--prepare-only` saves task configuration without execution or API calls.
 For code repair in an already prepared project environment, add
 `--project-python /path/to/project-venv/bin/python` (Windows:
 `C:\path\project-venv\Scripts\python.exe`). This saves the existing CodeTask
 external-interpreter setting; no manual TOML edit, environment creation or
-installation is needed. Omission keeps the current environment. This option is
-only for `bug_fix`, not the assistant's own Python requirement.
+installation is needed. Omission keeps the current environment. Interpreter selection
+also applies to native execution; it does not change the assistant's own Python requirement.
 
-For natural-language clarification instead, use `start --chat`: it asks about
-meaningful choices, then proposes settings for the same configuration path. This
+For model-assisted technical protocol setup, use `start --chat`: it asks about
+meaningful choices, then proposes settings for the structured configuration path. This
 opt-in setup uses your configured model, sends replies and supplied asset previews,
 and requires confirmation. `--resume-setup PATH` resumes its draft without resetting
 setup usage. It is not a general coding Agent; prepared reproduction/code execution
@@ -41,8 +146,9 @@ Paired analysis needs baseline and candidate numeric columns in the same row;
 long-format method rows must be matched and reshaped beforehand.
 For a first no-API run, use
 `uv run simple-ar research-session --config examples/data-curves/research.toml`.
-Saved analysis packages can then become writing material. Export is a separate
-`report-export` command; see [CLI](CLI_REFERENCE.md).
+Saved analysis packages can then become writing material. `report-export` exports
+a saved structured report attempt; native manuscripts use publication in their
+task. See [CLI](CLI_REFERENCE.md).
 
 Data column selection in a terminal shows column names and sample values. For
 explicitly matched runs, try [paired observations](../examples/data-paired/README.md),
@@ -68,8 +174,10 @@ same resolver call (default off, not editable; build code/network/source metadat
 are possible). Default remains current environment. Setup only saves the choice;
 see [scope, budgets and recovery](CONFIG_REFERENCE.md#guided-setup).
 
-The task TOML is the effective configuration for each project. `.env` only holds
-global credentials/model/transport settings. Ordinary use need not set every
+Structured tasks use their saved task TOML; native tasks retain their confirmed
+configuration in the session. Named connections/routes live in `models.toml`,
+with credentials resolved from the environment; legacy environment-only connections
+remain a fallback. Ordinary use need not set every
 advanced option below. See [guided setup](CONFIG_REFERENCE.md#guided-setup).
 
 ## Requirements
@@ -89,8 +197,8 @@ quality check. See [Matplotlib's font fallback guide](https://matplotlib.org/sta
 
 For graph-like method diagrams, optionally install [Graphviz](https://graphviz.org/download/)
 on the execution host and make `dot` available on `PATH` (Debian/Ubuntu:
-`sudo apt install graphviz`). The figure scaffold reports its availability so generated
-code can use a mature layout renderer rather than manually placing every node.
+`sudo apt install graphviz`). Generated code can use this mature layout renderer;
+the task should check its actual availability through an authorized command.
 It is not required for data plots; setup does not install it automatically, and
 rendered labels and feedback arrows still need visual inspection.
 
@@ -115,6 +223,27 @@ uv run simple-ar --help
 
 ## Environment Configuration
 
+Use a shared named catalog for ordinary multi-task setup. Copy
+[the example](../examples/model-profiles/models.toml) to
+`~/.config/simple-ar/models.toml`, or a private path and set
+`SIMPLE_AR_MODELS_CONFIG` to its absolute path. Set your provider's actual URL,
+model and API mode in each profile; `api_key_env` references a credential variable
+whose value stays in the environment or private `.env`. The example references
+`CCTQ_API_KEY`; a profile can name your provider's corresponding variable instead.
+Project paths, data, interpreters and task limits remain task inputs.
+
+Configure `default` for ordinary text tasks and `code` for code work. Optional
+`text`, `writing`, `vision` and `image` routes share this catalog across tasks;
+native writing without its own route retains the task connection. `start` displays
+text connections and offers a terminal selection; `--model profile:NAME` selects
+explicitly. `--model env` means the catalog's text/default route when configured,
+and the legacy environment connection otherwise. It does not bypass a catalog.
+Run `simple-ar models` to inspect local configuration without API calls; it checks
+credential presence and validates catalog declarations, not provider connectivity.
+Native decisions require Chat; structured text workflows can also use Responses.
+See [named connections](CONFIG_REFERENCE.md#named-model-connections).
+
+For the compatible environment-only route when no catalog is configured:
 Create a local `.env` file only if one does not already exist. Do not overwrite your current connection settings:
 
 ```bash
@@ -127,7 +256,7 @@ On PowerShell:
 Copy-Item .env.example .env
 ```
 
-Minimum model connection example; replace values with your provider's settings:
+Legacy model connection example; replace values with your provider's settings:
 
 ```bash
 OPENAI_API_KEY=your_api_key
@@ -137,15 +266,17 @@ SIMPLE_AR_LLM_API=chat
 SIMPLE_AR_LLM_STREAM=true
 ```
 
-Transport and recovery notes (optional expert reference):
+Transport and recovery notes (optional expert reference; `SIMPLE_AR_LLM_*`
+connection settings below apply to the legacy route, not named profiles):
 
-- `OPENAI_API_KEY` is required for LLM mode.
+- `OPENAI_API_KEY` is required for the legacy LLM connection; named profiles use their `api_key_env` variable.
 - `OPENAI_BASE_URL` can point to OpenAI or a third-party OpenAI-compatible `/v1` endpoint.
-- `SIMPLE_AR_MODEL` supplies the model name for `research-session --model env`;
+- Without a catalog, `SIMPLE_AR_MODEL` supplies the model name for `research-session --model env`;
   omitting `--model` when starting a session explicitly selects deterministic mode.
 - `SIMPLE_AR_LLM_BACKEND` controls the transport implementation. The default
   `openai` uses the OpenAI Python SDK directly; `litellm` keeps the older
-  LiteLLM compatibility layer.
+  LiteLLM compatibility layer, available with `pip install 'simple-autoresearch[litellm]'`.
+  The default SDK transport does not require that extra.
 - `SIMPLE_AR_LLM_API` controls the request shape. `responses` sends Responses
   API-style `instructions` plus `input` and retries transient failures on that
   API only; `chat` sends Chat Completions-style `messages` directly. The
@@ -189,6 +320,12 @@ Transport and recovery notes (optional expert reference):
   exponential backoff for transient provider errors such as connection resets,
   rate limits, timeouts, 5xx responses, and gateway errors such as Cloudflare
   524 origin timeouts.
+  SDK Chat streams distinguish connection/pool acquisition failures before
+  dispatch from read/write failures or interruptions after possible dispatch.
+  Proven pre-dispatch failures consume one request attempt and zero tokens;
+  an uncertain uncapped stream stops without automatic replay or API fallback.
+  Capped text retains its conservative reservation before an eligible retry.
+  A higher retry count does not override this distinction or resolve provider overload.
 - `SIMPLE_AR_LLM_MAX_WORKERS` is an optional ceiling applied to each model-call
   batch in the process. Leave it unset for per-stage defaults; set it to `1`
   for a rate-limited provider without changing the research-session protocol.
@@ -239,6 +376,8 @@ resume checks; distinguish diagnostic-wrapper failures from product failures.
 
 ## Choose a task and its smallest input
 
+For ordinary work, `start` accepts a goal and materials and chooses necessary
+tools. The examples below use the explicit structured interface:
 `research-session` accepts a goal, available materials, and explicit execution
 conditions. The accepted plan selects the applicable capabilities; users do not
 need to write an internal stage list. Use these supported shapes:
@@ -248,7 +387,7 @@ need to write an internal stage list. Use these supported shapes:
 | Online survey | `[task] outputs=["report"]`, `[research] providers=[...]`; `research-session --config survey.toml` | No experiment process or code project |
 | Analyse supplied papers/notes | Add `[research] materials_only=true` and `[assets].papers=[...]` | No web search or fabricated search result |
 | Write from notes/results | `[task] kind="writing"`, `outputs=["report"]`, `[assets].materials=[...]`, `[model] name="env"` | No new synthesis, search or experiment; analysis JSON must be a completed supported package |
-| Describe/plot supplied data | `start --kind data_analysis` or the [data curves case](../examples/data-curves/README.md) | No model calls, arbitrary inference, smoothing or scientific validation |
+| Describe/plot supplied data | `start --kind data_analysis --data-file PATH --value-column NAME` or the [data curves case](../examples/data-curves/README.md) | Deterministic shortcut: no model calls, arbitrary inference, smoothing or scientific validation |
 | Repair an existing project | `[task] kind="bug_fix"` plus `[execution] code_task_config="code_task.toml"`; run the research config | No literature or baseline unless the task explicitly supplies it |
 | Reproduce or measure an existing script | `[execution] command=["python","measure.py"], cwd="/abs/project", primary_metric="accuracy"` and a finite process budget | No automatic repository discovery or seed expansion |
 | Improve an existing research project | Use `[task] kind="auto"` with `execution.code_task_config`, protected assets, benchmark and protocol; the [continual-learning case](../examples/continual_learning/README.md) is the prepared example | No dependency install, dataset download, or scientific success claim |
@@ -543,6 +682,13 @@ validation, runner, and repair artifacts, but the implementation step generates
 `code_task/workspace/generated_project/` instead of applying a patch to copied
 source files.
 
+Generation builds a separate candidate before replacing this directory. Previous
+projects remain beside it as `.generated_project.previous-*`; failed candidates
+remain as `.generated_project.candidate-*` for diagnosis. A generation failure
+does not erase the delivered project. These retained directories are not active
+outputs and are not deleted automatically. This protects project files, not an
+atomic transaction covering all planning metadata or a second session runtime.
+
 Before planning the greenfield implementation, execute writes
 `code_task/meta/dependency_advice.json` and `.md`. It scans the active Python
 environment, records a full installed-package snapshot in JSON, and prints the
@@ -556,7 +702,7 @@ When `workspace.mode = "auto"` is omitted or selected explicitly, existing
 projects first try a detached git worktree. If Git cannot be used safely, the
 run falls back to a guarded copy and records `requested_mode`, `selected_mode`,
 `fallback_reason`, and `user_next_steps` under `manifest.json.workspace`.
-The guided `start --kind bug_fix` entry uses this same strategy: a clean Git
+The explicit `start --kind bug_fix --allow PATTERN --validate COMMAND` protocol uses this same strategy: a clean Git
 project retains committed files regardless of the copy-size limit, while an
 uncommitted or non-Git project uses a guarded copy of its current state. Copy
 omissions are listed in the manifest; the copy limit is not a source-reading
@@ -739,14 +885,15 @@ architecture, interfaces, file-plan, and planning-review failures easier to
 trace.
 
 For greenfield runs, the same review gate checks generated files before
-validation. If the review detects generic recoverable issues such as fallback
-core files, missing artifact writers, or missing local APIs, `execute` can use a
-bounded LLM repair round that first asks for structured local repair actions
-such as unique old/new replacements or function-level rewrites. Whole-file
-replacement remains available for structural file-level failures, but it is no
-longer the default repair shape. The repair records an edit application, resyncs
-`code_task/meta/code_artifacts.json`, and reruns review. If the problem is still
-blocking, the run stops with the reviewed artifacts intact for inspection.
+validation. Bounded review and runtime repair rounds use the actual diagnostics
+to select related files and generate a separate, hash-bound candidate through
+the shared code capability. Applying it retains the existing API/static guards
+and snapshots; rejection restores the associated changes rather than leaving
+a partial repair. The executor resyncs `code_task/meta/code_artifacts.json` and
+reruns review/validation. Saved unbound legacy results remain historical, not
+current repair certificates; an explicitly started new round preserves them
+before performing new work. Interrupted generation/application is retained for
+inspection, not blindly replayed. Blocking findings still stop execution.
 
 3. At the patch-plan review panel, read `code_task/work_plan.md` and
 `code_task/patch_plan.md`. If the plan is reasonable, answer `yes` to continue.
@@ -881,8 +1028,13 @@ uv run simple-ar code-task context runs/<run-id> --max-files 8 --max-total-chars
 pack records token-like character budgets, selected editable files,
 read-only evidence, truncated snippets, and omitted files. It is a reviewable
 intermediate artifact for LLM planning/editing. When a latest context pack
-exists, `plan` uses it for planning context, while `propose-edits` uses only
-its editable snippets and keeps tests/benchmarks as read-only evidence.
+exists, `plan` uses it for planning context. `propose-edits` starts from its
+selected snippets and keeps tests/benchmarks as read-only evidence. Bounded
+follow-up reads refresh the current source window rather than treating its
+character limit as a lifetime reading quota. Initial selection does not grant
+or restrict authorization: newly observed files still follow the configured
+edit scope and, when present, the explicit batch targets. Original observations
+and the spans retained in each prompt are saved in `edit_context_followup.json`.
 
 ### Manual Primitive Path
 

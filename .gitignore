@@ -28,6 +28,7 @@ wheels/
 # Runtime outputs
 .local/
 runs/
+output/
 artifacts/
 .researchclaw_cache/
 benchmark/arc_bench/__pycache__/

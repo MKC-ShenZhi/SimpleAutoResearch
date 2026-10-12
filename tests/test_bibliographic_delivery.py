@@ -100,6 +100,16 @@ class BibliographicDeliveryTests(unittest.TestCase):
         self.assertIn('doi = {10.1234/example}', bibtex)
         self.assertEqual(metadata['missing_fields'], [])
         self.assertEqual(metadata['verification_status'], 'not_independently_verified')
+        for title in ('Métadonnées & 50% #1', 'https://example.org/paper.pdf?part=a_b&view=2#results'):
+            with self.subTest(title=title):
+                paper = self.paper(title=title, authors=['René Example'])
+                bibliography = papers_to_bibtex([paper])
+                self.assertIn(r'\&', bibliography)
+                self.assertIn('author = {René Example}', bibliography)
+                self.assertIn('url = {https://example.org/paper}', bibliography)
+                self.assertEqual(citation_map_artifact({paper.id: 1}, [paper])['entries'][0]['title'], title)
+                self.assertIn(title, references_markdown([paper]))
+                self.assertNotIn('key =', bibliography)
 
     def test_missing_metadata_is_visible_without_publishing_local_locations(self):
         paper = self.paper(source='local_files', authors=[], published=None, doi=None,
@@ -111,6 +121,7 @@ class BibliographicDeliveryTests(unittest.TestCase):
         self.assertNotIn('/private/user', str((refs, bibtex, artifact)))
         self.assertNotIn('author =', bibtex)
         self.assertNotIn('year =', bibtex)
+        self.assertIn('key = {source-1}', bibtex)
         self.assertEqual(paper.source_id, '/private/user/source.pdf')  # Original provenance is untouched.
 
     def test_unrecognized_date_is_not_reinterpreted_as_a_year(self):

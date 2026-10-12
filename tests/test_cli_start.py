@@ -28,7 +28,8 @@ class StartTests(unittest.TestCase):
     def test_document_urls_preserve_literal_input_and_require_confirmed_chat_acquisition(self):
         url = 'https://example.test/paper'
         args = build_parser().parse_args(['start', '--kind', 'reproduction', '--goal', 'Inspect paper',
-            '--document', url, '--document', 'local-paper.md', '--prepare-only'])
+            '--document', url, '--document', 'local-paper.md', '--environment', 'current', '--prepare-only'])
+        args._explicit_start_destinations = {'environment'}
         self.assertEqual(args.document, [url, Path('local-paper.md')])
         with patch('sys.stdin.isatty', return_value=False), patch('simple_ar.cli.start.print_line'), \
              patch('simple_ar.research.documents.fulltext.urllib.request.urlopen') as fetch:
@@ -124,127 +125,198 @@ class StartTests(unittest.TestCase):
             self.assertEqual(repeat_code['benchmark']['command'], 'python main.py')
             self.assertEqual(session.store.resolve('session_manifest.json').read_bytes(), retained)
 
-    def test_figure_prepare_only_without_data_uses_canonical_large_code_task(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            goal = "Draw a conceptual inputs-to-model-to-evidence method with an uncertainty branch"
-            with patch("simple_ar.result_analysis.script_project.preview_table_source") as preview, \
-                    patch("subprocess.run") as process:
-                config = self.prepare("--kind", "figure", "--goal", goal,
-                                      "--output-root", str(root / "tasks"), "--prepare-only")
-            preview.assert_not_called()
-            process.assert_not_called()
-            defaults = research_defaults(["research-session", "--config", str(config)])
-            self.assertEqual(defaults["task_kind"], "bug_fix")
-            source = config.parent / "source"
-            self.assertEqual(list((source / "data").iterdir()), [])
-            self.assertEqual(list(source.rglob("*.csv")), [])
-            compile((source / "analysis.py").read_bytes(), "analysis.py", "exec", dont_inherit=True)
-            self.assertIn("No dataset was supplied", (source / "README.md").read_text(encoding="utf-8"))
-            self.assertIn(goal, (source / "README.md").read_text(encoding="utf-8"))
-            self.assertIn("figure.svg", (source / "tests/verify_delivery.py").read_text(encoding="utf-8"))
-            self.assertIn("embedded raster", (source / "tests/verify_delivery.py").read_text(encoding="utf-8"))
-            self.assertFalse((source / "outputs").exists())
-            options = load_code_task_init_options(config_path=defaults["code_task_config"])
-            execution = load_code_task_execute_options(config_path=defaults["code_task_config"])
-            self.assertEqual(Path(options.code_root), source.resolve())
-            self.assertEqual(options.edit_scope_allowed_patterns, ("analysis.py", "src/**", "outputs/**"))
-            self.assertIn("data/**", options.edit_scope_protected_patterns)
-            self.assertIn("tests/**", options.edit_scope_protected_patterns)
-            self.assertEqual(execution.budget_profile, "large")
-            self.assertEqual(execution.edit_budget_overrides, {"max_new_chars": 32000})
-            self.assertTrue(execution.allow_large_edits)
-            self.assertEqual(execution.baseline_policy, "skip")
-            self.assertEqual(defaults["data_path"], [str((source / "data").resolve())])
-
-    def test_script_project_diagram_entry_reuses_scaffold_and_checks_vectors(self):
-        import json
-        from simple_ar.result_analysis import script_project
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            data = root / "measurements.csv"
-            data.write_text("stage,value\ninput,1\n", encoding="utf-8")
-            goal = "  Draw inputs → model → evidence.\nKeep the uncertainty branch.  "
-            for name, source, diagram in (("concept", None, True), ("combined", data, True),
-                                          ("analysis", data, False)):
-                with self.subTest(mode=name), patch.object(script_project, "preview_table_source",
-                        wraps=script_project.preview_table_source) as preview, \
-                        patch("subprocess.run") as process:
-                    project, command = script_project.prepare_script_project(root / name, source, goal, diagram=diagram)
-                    self.assertEqual(command, ("python", "tests/verify_delivery.py"))
-                    self.assertEqual(script_project.PROTECTED_PATTERNS, ("data/**", "tests/**"))
-                    self.assertTrue((project / "README.md").read_text(encoding="utf-8").startswith(goal + "\n"))
-                    self.assertFalse((project / "outputs").exists())
-                    process.assert_not_called()  # Preparation never executes the scaffold.
-                    if source is None:
-                        preview.assert_not_called()
-                        self.assertEqual(list((project / "data").iterdir()), [])
-                        self.assertIn("No dataset was supplied", (project / "README.md").read_text())
-                    else:
-                        preview.assert_called_once()
-                        self.assertEqual((project / "data/input.csv").read_bytes(), data.read_bytes())
-                    checker = project / "tests/verify_delivery.py"
-                    if not diagram:
-                        outputs = project / "outputs"
-                        outputs.mkdir()
-                        (outputs / "results.json").write_text('{"count": 2}')
-                        (outputs / "report.md").write_text("Two observations; no figure requested.")
-                        namespace = {"__file__": str(checker), "__name__": "delivery_checker_test"}
-                        exec(compile(checker.read_text(), str(checker), "exec"), namespace)
-                        with contextlib.redirect_stdout(io.StringIO()):
-                            namespace["main"]()
-                        (outputs / "custom.svg").write_text('<svg xmlns="http://www.w3.org/2000/svg"/>')
-                        with contextlib.redirect_stdout(io.StringIO()):
-                            namespace["main"]()
-                        (outputs / "custom.svg").write_text("not svg")
-                        from xml.etree.ElementTree import ParseError
-                        with self.assertRaises(ParseError):
-                            namespace["main"]()
-                        continue
-                    readme = (project / "README.md").read_text(encoding="utf-8")
-                    self.assertIn("Do not invent measured values", readme)
-                    self.assertIn("svg.fonttype='none'", readme)
-                    outputs = project / "outputs"
-                    outputs.mkdir()
-                    from PIL import Image
-                    Image.new("RGB", (2, 2), "white").save(outputs / "figure.png")
-                    (outputs / "results.json").write_text(json.dumps({"components": ["model"],
-                        "relationships": [], "input_sources": ["user goal"]}), encoding="utf-8")
-                    (outputs / "report.md").write_text("Conceptual method; no measured performance.")
-                    namespace = {"__file__": str(checker), "__name__": "delivery_checker_test"}
-                    exec(compile(checker.read_text(), str(checker), "exec"), namespace)
-                    valid = '<svg xmlns="http://www.w3.org/2000/svg"><text x="1" y="1">Model</text><path d="M0 0 L1 1"/></svg>'
-                    (outputs / "figure.svg").write_text(valid)
-                    with contextlib.redirect_stdout(io.StringIO()):
-                        namespace["main"]()
-                    self.assertEqual(process.call_args.args[0][1], str(project / "analysis.py"))
-                    for invalid in (valid.replace("</svg>", '<image href="data:image/png;base64,AA=="/></svg>'),
-                                    '<svg xmlns="http://www.w3.org/2000/svg"/>'):
-                        (outputs / "figure.svg").write_text(invalid)
-                        with self.assertRaisesRegex(ValueError, "editable|text, paths or shapes"):
-                            namespace["main"]()
-            missing = root / "missing-data"
-            with self.assertRaisesRegex(ValueError, "only for diagram=True"):
-                script_project.prepare_script_project(missing, None, goal)
-            self.assertFalse(missing.exists())
-
-    def test_scripted_analysis_reuses_code_task_and_protects_inputs_and_checker(self):
+    def test_ordinary_preferences_enter_one_native_owner_with_declarations_and_read_only_mounts(self):
+        from unittest.mock import MagicMock
+        from simple_ar.cli.main import main
+        from simple_ar.tools.workspace import resolve_mounted_path
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             data = root / "measurements.csv"
             data.write_text("method,cost,quality\na,1,3\nb,2,4\n", encoding="utf-8")
-            config = self.prepare("--kind", "data_analysis", "--scripted", "--data-file", str(data),
-                "--goal", "Draw a cost/performance trade-off with an inset", "--observation-unit", "one supplied method summary", "--output-root", str(root / "tasks"), "--prepare-only")
-            defaults = research_defaults(["research-session", "--config", str(config)])
-            self.assertEqual(defaults["task_kind"], "bug_fix")
-            settings = tomllib.loads((config.parent / "code_task.toml").read_text())
-            self.assertEqual(settings["edit_scope"]["allowed_patterns"], ["analysis.py", "src/**", "outputs/**"])
-            self.assertIn("tests/**", settings["edit_scope"]["protected_patterns"])
-            self.assertEqual((config.parent / "source/data/input.csv").read_bytes(), data.read_bytes())
-            self.assertIn("Never infer pairing", (config.parent / "task.md").read_text())
-            self.assertIn("one supplied method summary", (config.parent / "task.md").read_text())
-            self.assertIn('"path": "outputs/<filename>"', (config.parent / 'task.md').read_text())
-            self.assertFalse((config.parent / "source/outputs").exists())
+            notes = root / "notes.md"
+            notes.write_text("Supplied semantics, not independent observations.", encoding="utf-8")
+            paper = root / "paper.md"
+            paper.write_text("Original source fixture.", encoding="utf-8")
+            project = root / "project"
+            project.mkdir()
+            checker = root / "checker.py"
+            checker.write_text("raise SystemExit('user evaluator')\n", encoding="utf-8")
+            interpreter = root / "project python"
+            interpreter.write_bytes(b"interpreter entry fixture")
+            goal = "  Compare costs.\nKeep the uncertainty branch.  "
+            originals = {path: path.read_bytes() for path in (data, notes, checker)}
+            for kind in ("survey", "writing", "reproduction", "bug_fix", "data_analysis", "figure", "code"):
+                app = MagicMock()
+                app.session.store.root = root / kind
+                from simple_ar.core.budget import BudgetLedger
+                app.ledger = BudgetLedger({})
+                app.state = {"pending": None}
+                app.workspace.workspace = root / kind / "workspace"
+                app.session.store.exists.return_value = False
+                options = ["start", "--kind", kind, "--goal", goal, "--model", "profile:chosen",
+                    "--source", str(checker), "--document", str(paper), "--material", str(notes),
+                    "--project-python", str(interpreter), "--max-turns", "7", "--max-tokens", "43210",
+                    "--output-root", str(root / "runs"), "--prepare-only"]
+                if kind != "code":
+                    options += ["--data-file", str(data), "--observation-unit", "one supplied summary",
+                        "--data-attribution", "User's dataset v2", "--data-mode", "values"]
+                if kind == "data_analysis":
+                    options += ["--with-report", "--allow-execution"]
+                if kind in {"bug_fix", "reproduction", "code"}:
+                    options += ["--project", str(project), "--data-path", str(data)]
+                with self.subTest(kind=kind), patch("sys.stdin.isatty", return_value=False), \
+                        patch("simple_ar.cli.start.select_start_model") as selection, \
+                        patch("simple_ar.app.tool_application.ToolApplication.create", return_value=app) as create, \
+                        patch("simple_ar.cli.start.new_research_session_root", side_effect=AssertionError("legacy configuration")), \
+                        patch("subprocess.run") as process, contextlib.redirect_stdout(io.StringIO()):
+                    main(options)
+                selection.assert_called_once()
+                app.run.assert_not_called()
+                process.assert_not_called()
+                self.assertTrue(create.call_args.args[1].startswith(goal + "\n\n"))
+                kwargs = create.call_args.kwargs
+                self.assertEqual(kwargs["model"], "profile:chosen")
+                self.assertEqual(kwargs["max_turns"], 7)
+                self.assertEqual(kwargs["max_tokens"], 43210)
+                self.assertEqual(kwargs["project_python"], interpreter)
+                self.assertEqual(kwargs["allow_execution"], kind == "data_analysis")
+                self.assertFalse(kwargs["allow_network"])
+                expected_sources = [checker.resolve(), paper.resolve(), notes.resolve()]
+                if kind in {"bug_fix", "reproduction", "code"}:
+                    expected_sources.extend([data.resolve(), project.resolve()])
+                elif kind != "code":
+                    expected_sources.append(data.resolve())
+                self.assertEqual(list(kwargs["sources"].values()), expected_sources)
+                self.assertEqual(list(kwargs["sources"].values()).count(notes.resolve()), 1)
+                mounts = {**kwargs["sources"], "workspace": root / kind / "workspace"}
+                self.assertEqual(resolve_mounted_path(mounts, str(checker.resolve())), checker.resolve())
+                with self.assertRaisesRegex(ValueError, "writable workspace"):
+                    resolve_mounted_path(mounts, str(checker.resolve()), write=True)
+                self.assertIn("document", create.call_args.args[1])
+                self.assertIn("material", create.call_args.args[1])
+                self.assertIn("outcome preference (not an access grant)", create.call_args.args[1])
+                if kind in {"bug_fix", "reproduction", "code"}:
+                    self.assertIn(project.resolve(), kwargs["sources"].values())
+                    self.assertIn('"project"', create.call_args.args[1])
+                if kind != "code":
+                    self.assertIn("one supplied summary", create.call_args.args[1])
+                    self.assertIn("User's dataset v2", create.call_args.args[1])
+                    self.assertIn('"data_mode": "values"', create.call_args.args[1])
+                self.assertFalse(list(root.rglob("code_task.toml")))
+                self.assertFalse(list(root.rglob("verify_delivery.py")))
+            self.assertEqual({path: path.read_bytes() for path in originals}, originals)
+            app.run.return_value = {"status": "paused", "status_reason": "Awaiting command approval"}
+            with patch("sys.stdin.isatty", return_value=False), \
+                    patch("simple_ar.cli.start.select_start_model"), \
+                    patch("simple_ar.app.tool_application.ToolApplication.create", return_value=app) as create, \
+                    patch("simple_ar.cli.start.new_research_session_root", side_effect=AssertionError("legacy configuration")), \
+                    patch("subprocess.run") as process, contextlib.redirect_stdout(io.StringIO()):
+                main(["start", "--kind", "data_analysis", "--scripted", "--goal", goal,
+                      "--data-file", str(data), "--allow-execution", "--yes"])
+            self.assertTrue(create.call_args.kwargs["allow_execution"])
+            app.run.assert_called_once()
+            self.assertEqual(app.run.call_args.kwargs["approved_execution"], "")
+            self.assertIsNone(app.run.call_args.kwargs["approve"])
+            process.assert_not_called()  # Summary consent never executes a command.
+            # The explicit menu is an input preference; it enters the same owner.
+            from simple_ar.cli.start import FUNCTION_LABELS
+            for number, kind in enumerate(FUNCTION_LABELS, 1):
+                with self.subTest(guided=kind), patch("sys.stdin.isatty", return_value=True), \
+                        patch("builtins.input", side_effect=[str(number), str(notes), ""]) as prompts, \
+                        patch("simple_ar.cli.main._run_native_start") as native:
+                    main(["start", "--guided", "--goal", goal, "--max-turns", "7", "--prepare-only"])
+                adapted = native.call_args.args[0]
+                self.assertEqual(adapted.kind, kind)
+                self.assertTrue(adapted.request.startswith(goal + "\n\n"))
+                self.assertFalse(adapted.allow_execution)
+                self.assertFalse(adapted.allow_network)
+                self.assertEqual(adapted.source, [notes.resolve()])
+                self.assertEqual(adapted.max_turns, 7)
+                self.assertEqual(prompts.call_count, 3)  # Preference + common paths, no technical survey.
+                args = build_parser().parse_args(["start", "--kind", kind, "--goal", goal,
+                                                 "--source", str(notes), "--prepare-only"])
+                with patch("sys.stdin.isatty", return_value=False), \
+                        patch("simple_ar.cli.main._run_native_start") as native:
+                    self.assertIsNone(prepare_start(args))
+                self.assertTrue(native.call_args.args[0].request.startswith(goal + "\n\n"))
+            # Bare start already owns the native default; preferences do not change it.
+            for argv in (["start"], ["start", goal], ["start", "--goal", goal]):
+                with patch("simple_ar.cli.main._run_native_start") as native, \
+                        patch("builtins.input", side_effect=AssertionError("no menu")):
+                    main(argv)
+                native.assert_called_once()
+                self.assertIsNone(native.call_args.args[0].kind)
+
+    def test_creation_rejects_unmapped_controls_and_unsafe_data_before_calls(self):
+        from simple_ar.cli.main import main
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = root / "measurements.csv"
+            data.write_text("x,y\n1,2\n", encoding="utf-8")
+            secret = root / ".env"
+            secret.write_text("private fixture", encoding="utf-8")
+            large = root / "large.csv"
+            with large.open("wb") as stream:
+                stream.truncate(20 * 1024 * 1024 + 1)
+            base = ["start", "--kind", "data_analysis", "--scripted", "--goal", "Analyze supplied values",
+                    "--data-file", str(data), "--prepare-only", "--output-root", str(root / "runs")]
+            cases = [
+                ([*base, "--timeout-sec", "60"], "timeout_sec"),
+                ([*base, "--interaction", "checkpoints"], "interaction"),
+                ([*base, "--data-max-points", "10000"], "data_max_points"),
+                ([*base, "--data-max-mb", "20"], "data_max_mb"),
+                ([*base, "--validate", "python check.py"], "validate"),
+                ([*base, "--allow", "**"], "allow"),
+                ([*base, "--chat"], "chat"),
+                ([*base, "--template", "experiment"], "template"),
+                ([*base, "--document", "https://example.test/paper"], "local mounted"),
+                ([*base, "--source", str(secret)], "Private/runtime"),
+                (["start", "Analyze supplied material", "--source", str(secret), "--prepare-only"], "Private/runtime"),
+                ([*base, "--data-file", str(large)], "20 MiB"),
+                ([*base, "--resume-task", str(root)], "saved task"),
+                ([*base, "--approve-execution", "old-command"], "requires --resume-task"),
+            ]
+            with patch("simple_ar.cli.start.select_start_model") as model, \
+                    patch("simple_ar.app.tool_application.ToolApplication.create") as create, \
+                    patch("simple_ar.cli.start.new_research_session_root") as legacy:
+                for argv, message in cases:
+                    with self.subTest(argv=argv), self.assertRaisesRegex(SystemExit, message):
+                        main(argv)
+                model.assert_not_called()
+                create.assert_not_called()
+                legacy.assert_not_called()
+            self.assertFalse((root / "runs").exists())
+            # Compatibility is selected by explicit controls, including values
+            # equal to parser defaults, rather than a task-name allowlist.
+            from simple_ar.cli.main import _explicit_session_option_destinations
+            from simple_ar.cli.start import migrate_new_start
+            controls = (["--allow", "src/**"], ["--validate", "python check.py"],
+                        ["--template", "material_report"], ["--sources", "materials"], ["--fulltext"],
+                        ["--web-extract-backend", "direct"], ["--max-cited-sources", "3"],
+                        ["--interaction", "checkpoints"], ["--environment", "current"],
+                        ["--hypothesis", "Claim"], ["--dataset", "Conditions"],
+                        ["--expected-outcome", "Criterion"], ["--metric", "score"],
+                        ["--output-files", "{}"], ["--metric-sources", "{}"],
+                        ["--cwd", str(root)], ["--timeout-sec", "300"],
+                        ["--requirements", "requirements.txt"], ["--install-project"],
+                        ["--check-argv", '["python", "check.py"]'], ["--command", "python", "run.py"])
+            for kind in ("survey", "writing", "bug_fix", "reproduction", "code", "data_analysis"):
+                for flags in controls:
+                    argv = ["start", "--kind", kind, "--goal", "Keep exact controls", *flags]
+                    parser = build_parser()
+                    args = parser.parse_args(argv)
+                    args._explicit_start_destinations = _explicit_session_option_destinations(parser, argv, set(), command="start")
+                    before = vars(args).copy()
+                    with self.subTest(compatibility_kind=kind, controls=flags):
+                        self.assertFalse(migrate_new_start(args))
+                        self.assertEqual(vars(args), before)
+            for flags in (["--chat"], ["--resume-setup", str(root)],
+                          ["--from-session", str(root), "--reuse", "report"],
+                          ["--data-file", str(data), "--value-column", "x"],
+                          ["--data-file", str(data), "--x-column", "x"],
+                          ["--data-file", str(data), "--paired-baseline", "x"]):
+                args = build_parser().parse_args(["start", "--kind", "data_analysis", *flags])
+                self.assertFalse(migrate_new_start(args))
 
     def test_saved_delivery_reuse_keeps_draft_evidence_and_old_session(self):
         from simple_ar.core.capabilities import CapabilityRegistry
@@ -339,6 +411,34 @@ class StartTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "No current reusable"):
                 self.prepare("--from-session", str(session.store.root), "--reuse", "data_analysis",
                     "--goal", "Explain", "--prepare-only")
+            # Native deliveries use the same mounted path rule, but resume the
+            # saved tool task rather than manufacturing a legacy writing task.
+            from simple_ar.app.tool_application import ToolApplication
+            from simple_ar.cli.main import main
+            native = SessionController.create(root / "native", session_id="native",
+                topic="Reuse results", registry=CapabilityRegistry())
+            native.manifest.transition_recipe = ToolApplication.RECIPE
+            native.manifest.status = "partial"
+            native.store.write_text("workspace/note.md", "Saved results, not new measurements.")
+            native.store.write_json("delivery.json", {"summary": "A short note", "artifacts": ["workspace/note.md"],
+                "unresolved": ["Raw data unavailable"]})
+            native.save()
+            self.assertEqual(session_materials(native.store.root), {"artifacts": [native.store.root / "workspace/note.md"]})
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                main(["results", str(native.store.root)])
+            self.assertIn("--resume-task", output.getvalue())
+            self.assertIn("Raw data unavailable", output.getvalue())
+            self.assertNotIn("--kind writing", output.getvalue())
+            native.manifest.status = "paused"
+            native.save()
+            self.assertEqual(session_materials(native.store.root), {})
+            native.manifest.status = "partial"
+            native.save()
+            for invalid in ("workspace/../session_manifest.json", "workspace/.env", "source0/note.md", "workspace/missing.md"):
+                native.store.write_json("delivery.json", {"summary": "Invalid", "artifacts": [invalid], "unresolved": []})
+                with self.assertRaises(ValueError):
+                    session_materials(native.store.root)
 
     def test_table_options_share_owner_defaults_and_choices(self):
         from simple_ar.cli.research_config import FIELDS, data_options_supplied, setup_option_contract
@@ -359,7 +459,7 @@ class StartTests(unittest.TestCase):
             with self.subTest(flag=flag):
                 self.assertTrue(data_options_supplied(parser.parse_args(["start", flag, value])))
 
-    def test_new_guided_survey_plans_document_from_evidence_without_changing_existing_config(self):
+    def test_explicit_survey_protocol_plans_document_without_changing_existing_config(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / 'source.md'
@@ -405,9 +505,9 @@ class StartTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'not found'):
                 self.prepare(*common, '--data-path', str(root / 'absent'), '--command', 'python', 'run.py')
             with self.assertRaisesRegex(ValueError, 'requires --kind reproduction'):
-                self.prepare('--kind', 'survey', '--goal', 'Survey', '--data-path', str(data), '--prepare-only')
+                self.prepare('--kind', 'survey', '--goal', 'Survey', '--sources', 'materials', '--data-path', str(data), '--prepare-only')
 
-    def test_default_writing_template_matches_supplied_material_not_failed_experiment(self):
+    def test_explicit_writing_templates_match_material_not_failed_experiment(self):
         from simple_ar.report.schema import ReportRuntimeConfig
         from simple_ar.report.templates import load_report_template_bundle
         with tempfile.TemporaryDirectory() as directory:
@@ -415,7 +515,7 @@ class StartTests(unittest.TestCase):
             material = root / "notes.md"
             material.write_text("# Notes\nSupplied observations, not a locally executed experiment.\n", encoding="utf-8")
             config = self.prepare("--kind", "writing", "--goal", "Explain notes", "--material", str(material),
-                                  "--output-root", str(root / "runs"), "--prepare-only")
+                                  "--template", "material_report", "--output-root", str(root / "runs"), "--prepare-only")
             defaults = research_defaults(["research-session", "--config", str(config)])
             self.assertEqual(defaults["report_template"], "material_report")
             self.assertEqual(defaults["report_draft_scope"], "document")
@@ -454,7 +554,7 @@ class StartTests(unittest.TestCase):
             self.assertNotIn("--model", resume_hint)
             self.assertIn("research-session --session-root PATH", resume_hint)
 
-    def test_guided_custom_writing_template_keeps_its_topology(self):
+    def test_explicit_custom_writing_template_keeps_its_topology(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             material = root / "notes.md"
@@ -558,7 +658,7 @@ class StartTests(unittest.TestCase):
                         text = "<html><body><h1>Published source</h1><p>Original conditions remain readable.</p></body></html>"
                         material.write_text(text, encoding="utf-8")
                         config = self.prepare("--kind", "writing", "--goal", "Compare the supplied sources",
-                            role, str(material), "--output-root", str(root / "runs"), "--prepare-only")
+                            role, str(material), "--template", "material_report", "--output-root", str(root / "runs"), "--prepare-only")
                         values = research_defaults(["research-session", "--config", str(config)])
                         self.assertEqual(values["outputs"], ["report"])
                         self.assertEqual(values["local_document" if role == "--document" else "material"], [str(material.resolve())])
@@ -613,7 +713,11 @@ class StartTests(unittest.TestCase):
             self.assertFalse((root / "runs").exists())
 
     def prepare(self, *arguments):
-        args = build_parser().parse_args(["start", *arguments])
+        from simple_ar.cli.main import _explicit_session_option_destinations
+        parser = build_parser()
+        argv = ["start", *arguments]
+        args = parser.parse_args(argv)
+        args._explicit_start_destinations = _explicit_session_option_destinations(parser, argv, set(), command="start")
         with patch("sys.stdin.isatty", return_value=False), contextlib.redirect_stdout(io.StringIO()):
             return prepare_start(args)
 
@@ -656,6 +760,26 @@ class StartTests(unittest.TestCase):
             self.assertEqual(execution.baseline_policy, "skip")
             self.assertEqual(Path(options.task_file).read_text(encoding="utf-8"), "Fix the rounding error\n")
             self.assertEqual(list(project.iterdir()), [])
+            guide = root / "guide.md"
+            created = self.prepare("--kind", "code", "--goal", "Build a reusable CSV validator",
+                "--allow", "generated_project/**", "--validate", "python generated_project/main.py",
+                "--with-report", "--output-root", str(root / "new-code"), "--prepare-only")
+            created_defaults = research_defaults(["research-session", "--config", str(created)])
+            new_options = load_code_task_init_options(config_path=created_defaults["code_task_config"])
+            self.assertEqual(created_defaults["outputs"], ["code_task", "report"])
+            self.assertEqual(new_options.kind, "greenfield")
+            self.assertIsNone(new_options.code_root)
+            self.assertEqual(new_options.workspace_mode, "empty")
+            self.assertFalse((created.parent / "source").exists())
+            guide.write_text("# API contract\nMissing inputs must remain distinguishable from numeric zero.\n", encoding="utf-8")
+            combined = self.prepare("--kind", "bug_fix", "--goal", "Update the data reader and explain the change",
+                "--project", str(project), "--allow", "src/**", "--validate", "python -m unittest discover -s tests",
+                "--document", str(guide), "--sources", "materials", "--with-report",
+                "--output-root", str(root / "combined"), "--prepare-only")
+            values = research_defaults(["research-session", "--config", str(combined)])
+            self.assertEqual(values["outputs"], ["bug_fix", "report"])
+            self.assertEqual(values["local_document"], [str(guide.resolve())])
+            self.assertTrue(values["research_materials_only"])
             interpreter = root / "environment with spaces" / "python"
             interpreter.parent.mkdir()
             interpreter.touch()  # Input check only; prepare-only must not execute it.
@@ -682,7 +806,7 @@ class StartTests(unittest.TestCase):
             for flags, expected in ((["--kind", "writing", "--project-python", str(interpreter)], "requires --kind bug_fix"),
                                     (["--kind", "bug_fix", "--project-python", str(root / "missing")], "not found")):
                 with self.subTest(flags=flags), self.assertRaisesRegex(ValueError, expected):
-                    self.prepare(*flags, "--prepare-only", "--output-root", str(root / "refused"))
+                    self.prepare(*flags, "--interaction", "checkpoints", "--prepare-only", "--output-root", str(root / "refused"))
                 self.assertFalse((root / "refused").exists())
 
     @unittest.skipUnless(shutil.which("git"), "Git is required for workspace isolation")
@@ -738,7 +862,7 @@ class StartTests(unittest.TestCase):
                 else:
                     self.assertNotIn("research_max_fulltext_documents", values)
                     self.assertNotIn("research_max_pdf_mb", values)
-            with self.assertRaisesRegex(ValueError, "bug_fix does not consume"):
+            with self.assertRaisesRegex(ValueError, "requires explicit --sources search"):
                 self.prepare("--kind", "bug_fix", "--goal", "Fix", "--fulltext", "--prepare-only")
 
     def test_explicit_report_source_bound_roundtrips_without_affecting_other_tasks(self):
@@ -759,7 +883,7 @@ class StartTests(unittest.TestCase):
                 ["--kind", "survey", "--sources", "materials"],
                 ["--kind", "survey", "--sources", "search", "--allow", "src/**"],
                 ["--kind", "bug_fix", "--project", directory, "--validate", "python tests.py", "--allow", "../*"],
-                ["--kind", "survey"],
+                ["--kind", "survey", "--goal", " "],
             ):
                 with self.subTest(extra=extra), self.assertRaises(ValueError):
                     self.prepare("--goal", "task", "--prepare-only", "--output-root", str(root), *extra)
@@ -773,14 +897,21 @@ class StartTests(unittest.TestCase):
             self.assertEqual(len(configs), 1)
             self.assertEqual(tomllib.loads(configs[0].read_text())["task"]["goal"], "task")
 
-    def test_interactive_decline_saves_without_execution(self):
+    def test_interactive_native_decline_creates_no_task_or_legacy_configuration(self):
+        from simple_ar.cli.main import main
         with tempfile.TemporaryDirectory() as directory:
-            args = build_parser().parse_args(["start", "--output-root", directory])
+            from unittest.mock import MagicMock
+            app = MagicMock()
             with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", side_effect=[
-                "survey", "Review this direction", "", "search", "n",
-            ]), contextlib.redirect_stdout(io.StringIO()):
-                self.assertIsNone(prepare_start(args))
-            self.assertEqual(len(list(Path(directory).glob("*/research.toml"))), 1)
+                "survey", "Review this direction", "", "none", "n",
+            ]) as prompts, patch("simple_ar.cli.start.select_start_model"), \
+                    patch("simple_ar.app.tool_application.ToolApplication.create", return_value=app) as create, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                main(["start", "--guided", "--output-root", directory])
+            create.assert_not_called()
+            app.run.assert_not_called()
+            self.assertFalse(list(Path(directory).glob("*/research.toml")))
+            self.assertEqual(prompts.call_count, 5)
 
     def test_explicit_source_scope_never_prompts_for_optional_documents(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -792,31 +923,221 @@ class StartTests(unittest.TestCase):
             self.assertTrue(config.is_file())
             prompt.assert_not_called()
 
-    def test_interactive_number_selects_existing_writing_configuration(self):
+    def test_interactive_preferences_require_explicit_access_and_retain_named_model(self):
+        from simple_ar.cli.main import main
         with tempfile.TemporaryDirectory() as directory:
             material = Path(directory) / "notes.md"
             material.write_text("# Supplied observations\n", encoding="utf-8")
-            args = build_parser().parse_args(["start", "--material", str(material),
-                "--goal", "Summarize supplied notes", "--prepare-only", "--output-root", directory])
-            output = io.StringIO()
-            with patch("sys.stdin.isatty", return_value=True), \
-                    patch("builtins.input", side_effect=["4"]), contextlib.redirect_stdout(output):
-                config = prepare_start(args)
-            self.assertEqual(tomllib.loads(config.read_text())["task"]["kind"], "writing")
-            self.assertIn("no API needed", output.getvalue())
-            self.assertIn("confirmed command and environment", output.getvalue())
+            for choice, network, process in (("none", False, False), ("network", True, False),
+                                             ("process", False, True), ("both", True, True)):
+                with self.subTest(access=choice), patch("sys.stdin.isatty", return_value=True), \
+                        patch("builtins.input", side_effect=["4", choice]), \
+                        patch("simple_ar.cli.main._run_native_start") as native, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    main(["start", "--guided", "--material", str(material), "--model", "profile:chosen",
+                          "--goal", "Summarize supplied notes", "--output-root", directory])
+                adapted = native.call_args.args[0]
+                self.assertEqual(adapted.model, "profile:chosen")
+                self.assertFalse(getattr(adapted, "_model_confirmed", False))
+                self.assertEqual(adapted.allow_network, network)
+                self.assertEqual(adapted.allow_execution, process)
+                self.assertEqual(adapted.approve_execution, "")
 
     def test_invalid_interactive_selection_creates_no_bundle(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "output"
-            args = build_parser().parse_args(["start", "--output-root", str(root)])
+            args = build_parser().parse_args(["start", "--guided", "--output-root", str(root)])
             with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="99"), \
                     contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, "Choose"):
                 prepare_start(args)
             self.assertFalse(root.exists())
 
-    def test_main_dispatches_only_to_existing_session_cli(self):
+    def test_native_resume_and_readout_preserve_existing_authorization_and_state(self):
         from simple_ar.cli.main import main
+        from simple_ar.core.budget import BudgetLedger
+        from unittest.mock import MagicMock
+        app = MagicMock()
+        app.run.return_value = {'status': 'completed', 'status_reason': 'verified'}
+        app.session.store.root = Path('saved-task').resolve()
+        app.session.store.exists.return_value = False
+        app.workspace.workspace = app.session.store.root / 'workspace'
+        app.state = {'pending': None}
+        app.ledger = BudgetLedger({'llm_requests': 2, 'total_tokens': 100, 'process_wall_seconds': 20})
+        app.ledger.reserve('old-call', {'llm_requests': 2, 'total_tokens': 100})
+        app.ledger.settle('old-call', {'llm_requests': 2, 'total_tokens': 100})
+        with patch('simple_ar.app.tool_application.ToolApplication.load', return_value=app), \
+                patch('sys.stdin.isatty', return_value=False), contextlib.redirect_stdout(io.StringIO()):
+            continuation = ['start', '--resume-task', 'saved-task', '--source', 'extra notes', '--allow-network']
+            main(continuation)
+            app.run.assert_not_called()
+            main([*continuation, '--prepare-only'])
+            app.run.assert_not_called()
+            main([*continuation, '--yes'])
+            self.assertIsNone(app.run.call_args.kwargs['resource_allowances'])
+            self.assertEqual(app.run.call_args.kwargs['read_only_sources'], (Path('extra notes'),))
+            self.assertTrue(app.run.call_args.kwargs['allow_network'])
+            self.assertFalse(app.run.call_args.kwargs['allow_execution'])
+            app.run.reset_mock()
+            with self.assertRaisesRegex(SystemExit, 'separately'):
+                main([*continuation, '--yes', '--approve-execution', 'old-command'])
+            app.run.assert_not_called()
+            resources = ['start', '--resume-task', 'saved-task', 'Continue the saved goal',
+                '--authorize-remaining', 'llm_requests=3', '--authorize-remaining', 'total_tokens=500',
+                '--authorize-remaining', 'process_wall_seconds=2.5',
+                '--authorization-id', 'continuation-1', '--authorization-reason', 'Finish authorized work']
+            before = [entry.to_dict() for entry in app.ledger.entries]
+            with patch('simple_ar.core.console.make_console') as console:
+                for extra in ([], ['--prepare-only', '--yes']):
+                    main([*resources, *extra])
+                    app.run.assert_not_called()
+                summary = console.return_value.print.call_args_list[0].args[0].renderable.plain
+                self.assertIn("'total_tokens': 100", summary)
+                self.assertIn('Original cumulative usage is not cleared', summary)
+                self.assertIn('New remaining is not a total historical limit', summary)
+                main([*resources, '--yes', '--max-tokens', '9000', '--max-turns', '99'])
+            forwarded = app.run.call_args.kwargs
+            self.assertEqual(forwarded['resource_allowances'],
+                {'llm_requests': 3, 'total_tokens': 500, 'process_wall_seconds': 2.5})
+            self.assertEqual(forwarded['authorization_id'], 'continuation-1')
+            self.assertEqual(forwarded['authorization_reason'], 'Finish authorized work')
+            self.assertEqual(forwarded['feedback'], 'Continue the saved goal')
+            self.assertEqual(forwarded['approved_execution'], '')
+            self.assertFalse(forwarded['allow_execution'])
+            self.assertNotIn('model', forwarded)
+            self.assertNotIn('max_tokens', forwarded)
+            self.assertNotIn('max_turns', forwarded)
+            self.assertEqual([entry.to_dict() for entry in app.ledger.entries], before)
+            app.run.reset_mock()
+            with patch('sys.stdin.isatty', return_value=True), patch('builtins.input', return_value='n'):
+                main(resources)
+                app.run.assert_not_called()
+            with patch('sys.stdin.isatty', return_value=True), patch('builtins.input', return_value='y'):
+                main(resources)
+                app.run.assert_called_once()
+            app.run.reset_mock()
+            for argv, message in (
+                ([*resources, '--yes', '--approve-execution', 'old-command'], 'separately'),
+                (['start', '--authorize-remaining', 'total_tokens=500'], '--resume-task'),
+                (['start', '--resume-task', 'saved-task', '--authorization-id', 'orphan'], 'require --authorize-remaining'),
+                (['start', '--resume-task', 'saved-task', '--authorization-reason', 'orphan'], 'require --authorize-remaining'),
+                (['start', '--resume-task', 'saved-task', '--authorize-remaining', 'total_tokens=500'], 'requires --authorization-id'),
+                (['start', '--resume-task', 'saved-task', '--authorize-remaining', 'total_tokens=500', '--authorization-id', 'missing-reason'], 'requires --authorization-id'),
+                (['start', '--resume-task', 'saved-task', '--authorize-remaining', 'total_tokens=500', '--authorization-reason', 'missing-id'], 'requires --authorization-id'),
+                ([*resources, '--authorization-reason', ' '], 'requires --authorization-id'),
+                ([*resources, '--authorize-remaining', 'total_tokens=600'], 'Duplicate'),
+                ([*resources, '--authorize-remaining', 'bad-format'], 'DIMENSION=AMOUNT'),
+            ):
+                with self.subTest(argv=argv), self.assertRaisesRegex(SystemExit, message):
+                    main(argv)
+                app.run.assert_not_called()
+            main(['start', '--resume-task', 'saved-task', '--max-tokens', '9000', '--max-turns', '99',
+                '--approve-execution', 'old-command'])
+            self.assertIsNone(app.run.call_args.kwargs['resource_allowances'])
+            self.assertEqual(app.run.call_args.kwargs['approved_execution'], 'old-command')
+            self.assertFalse(app.run.call_args.kwargs['retry_model'])
+            app.run.reset_mock()
+            main(['start', '--resume-task', 'saved-task', '--retry-model', '--prepare-only'])
+            app.run.assert_not_called()
+            main(['start', '--resume-task', 'saved-task', '--retry-model'])
+            self.assertTrue(app.run.call_args.kwargs['retry_model'])
+            self.assertEqual(app.run.call_args.kwargs['feedback'], '')
+            app.run.reset_mock()
+            for argv in (['start', '--retry-model'],
+                    ['start', '--kind', 'code', '--retry-model'],
+                    ['start', '--resume-task', 'saved-task', '--retry-model', 'new task'],
+                    ['start', '--resume-task', 'saved-task', '--retry-model', '--allow-network'],
+                    ['start', '--resume-task', 'saved-task', '--retry-model', '--approve-execution', 'token'],
+                    [*resources, '--retry-model', '--yes']):
+                with self.subTest(retry_argv=argv), self.assertRaises(SystemExit):
+                    main(argv)
+                app.run.assert_not_called()
+        # The same native CLI fixture reads retained state without taking over
+        # terminal consumption, recovery, budget authorization or acceptance.
+        from simple_ar.cli.main import _render_native_result
+        from simple_ar.core.capabilities import ArtifactStore
+        from simple_ar.tools.workspace import resolve_mounted_path
+        from types import SimpleNamespace
+        from rich.console import Console
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            app.session.store = ArtifactStore(root)
+            workspace = root / 'workspace'
+            workspace.mkdir()
+            app.workspace = SimpleNamespace(workspace=workspace,
+                resolve=lambda locator: resolve_mounted_path({'workspace': workspace}, locator))
+            app.state = {'requests': ['Initial draft', 'Feedback'],
+                         'pending': {'kind': 'model', 'attempt': 'native-turn-0002'}}
+            app.ledger = BudgetLedger({'llm_requests': 3, 'total_tokens': 500})
+            app.ledger.reserve('draft', {'llm_requests': 1, 'total_tokens': 100})
+            app.ledger.settle('draft', {'llm_requests': 1, 'total_tokens': 100})
+            app.ledger.reserve('unreconciled', {'llm_requests': 1, 'total_tokens': 300})
+            app.ledger.mark_unknown('unreconciled', reason='Interrupted', known_actual={'llm_requests': 1})
+            app.ledger.reserve('in-flight', {'llm_requests': 1})
+            app.session.store.write_text('workspace/draft.md', 'Initial draft')
+            app.session.store.write_text('workspace/unlisted.md', 'Not a delivery inventory')
+            app.session.store.write_json('delivery.json', {'summary': 'Initial draft',
+                'artifacts': ['workspace/draft.md', 'workspace/missing.pdf', 'workspace/.env',
+                              '../outside.pdf', 'workspace/unlisted.md'], 'unresolved': []})
+            before = {path: path.read_bytes() for path in root.rglob('*') if path.is_file()}
+            ledger_before = app.ledger.to_dict()
+            state_before = json.dumps(app.state)
+            for saved_status, reason in (
+                ('paused', 'BudgetExceededError: requested 400, remaining 100'),
+                ('paused', 'RuntimeError: Operation failed; inspect saved diagnostics: LLMError: '
+                 "LLM budget prevented provider attempt 1: Budget exceeded for 'total_tokens'"),
+                ('paused', 'LLMError: https://private-provider.invalid api_key=secret'),
+                ('completed', 'Delivery manifest saved; scientific quality requires independent checking'),
+                ('partial', 'Delivery manifest saved; scientific quality requires independent checking'),
+            ):
+                output = io.StringIO()
+                with self.subTest(status=saved_status, reason=reason), contextlib.redirect_stdout(output), \
+                        patch('simple_ar.core.console.make_console', return_value=Console(file=output, width=500)), \
+                        patch.object(app, 'run', side_effect=AssertionError('readout must not run')):
+                    _render_native_result(app, {'status': saved_status, 'status_reason': reason})
+                text = output.getvalue()
+                self.assertIn(f'Status: {saved_status}', text)
+                self.assertIn('Saved delivery record', text)
+                self.assertIn('Request/version binding not checked', text)
+                self.assertIn('native-turn-0002', text)
+                self.assertIn('draft.md', text)
+                self.assertIn('missing or not a file', text)
+                self.assertIn('outside allowed paths', text)
+                self.assertIn('settled=100', text)
+                self.assertIn('unreconciled=1', text)
+                self.assertIn('unknown', text)
+                self.assertIn('not establish acceptance', text)
+                self.assertNotIn('unlisted.md', text)
+                self.assertNotIn('.env', text)
+                self.assertNotIn('private-provider', text)
+                self.assertNotIn('api_key', text)
+                if saved_status == 'paused':
+                    self.assertIn('Current request has no confirmed delivery', text)
+                if 'budget prevented provider attempt' in reason or reason.startswith('BudgetExceededError:'):
+                    self.assertIn('Insufficient remaining budget before dispatch', text)
+            self.assertEqual(app.ledger.to_dict(), ledger_before)
+            self.assertEqual(json.dumps(app.state), state_before)
+            self.assertEqual({path: path.read_bytes() for path in root.rglob('*') if path.is_file()}, before)
+            for record in ({'artifacts': None}, None):
+                app.session.store.write_json('delivery.json', record)
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    _render_native_result(app, {'status': 'paused', 'status_reason': ''})
+                self.assertIn('Saved delivery record unreadable', output.getvalue())
+            (root / 'delivery.json').unlink()
+            with contextlib.redirect_stdout(output := io.StringIO()):
+                _render_native_result(app, {'status': 'paused', 'status_reason': ''})
+            self.assertIn('No saved delivery record', output.getvalue())
+        with patch('simple_ar.cli.main._run_native_start') as native, \
+                patch('simple_ar.cli.start.new_research_session_root') as legacy:
+            for argv in (['start'], ['start', '--goal', 'Explain saved results'],
+                         ['start', '--source', 'results with spaces', '--prepare-only'],
+                         ['start', '--allow-network', '--model', 'profile:research']):
+                with self.subTest(argv=argv):
+                    main(argv)
+            self.assertEqual(native.call_count, 4)
+            legacy.assert_not_called()
+            with self.assertRaisesRegex(SystemExit, 'Do not mix'):
+                main(['start', 'Write a report', '--template', 'experiment'])
         with tempfile.TemporaryDirectory() as directory, patch("sys.stdin.isatty", return_value=False), \
                 patch("simple_ar.cli.main._print_research_session") as run, contextlib.redirect_stdout(io.StringIO()):
             main(["start", "--kind", "survey", "--goal", "task", "--sources", "search",
@@ -891,7 +1212,7 @@ class StartTests(unittest.TestCase):
                 self.assertFalse(output.exists())
             with self.assertRaisesRegex(ValueError, "Missing input"):
                 self.prepare("--kind", "reproduction", "--goal", "Check", "--document", str(paper),
-                    "--output-root", str(output), "--prepare-only")
+                    "--hypothesis", "Claim", "--output-root", str(output), "--prepare-only")
             with self.assertRaisesRegex(ValueError, "require --kind reproduction"):
                 self.prepare("--kind", "survey", "--goal", "Read", "--sources", "search", "--prepare-only",
                     "--output-root", str(output), "--command", "python", "run.py")
@@ -902,7 +1223,8 @@ class StartTests(unittest.TestCase):
             paper = Path(directory) / "paper.md"
             paper.write_text("source", encoding="utf-8")
             args = build_parser().parse_args(["start", "--kind", "reproduction", "--goal", "Check",
-                "--document", str(paper), "--output-root", directory, "--prepare-only"])
+                "--document", str(paper), "--environment", "current", "--output-root", directory, "--prepare-only"])
+            args._explicit_start_destinations = {'environment'}
             with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", side_effect=[
                     "Published claim", "Existing data", "Value near 0.9", '["python", "run.py"]', "coverage",
                     ]), contextlib.redirect_stdout(io.StringIO()):

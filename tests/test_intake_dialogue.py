@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 from io import BytesIO
 from pathlib import Path
@@ -57,6 +59,12 @@ class AnalysisReportProposalTests(unittest.TestCase):
 
 
 class IntakeDialogueTests(unittest.TestCase):
+    def setUp(self):
+        # Offline dialogue fixtures must not consume the host's model catalog.
+        catalog = patch('simple_ar.integrations.model_profiles.load_model_catalog', return_value=None)
+        catalog.start()
+        self.addCleanup(catalog.stop)
+
     def test_supplied_paper_url_becomes_attributed_excerpt_and_prepared_material_with_restore(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -212,7 +220,7 @@ class IntakeDialogueTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'Data semantics'):
                 validate_proposal(proposal('figure', options={'value_column': ['invented']}), args, set())
 
-    def test_custom_analysis_dialogue_uses_code_path_without_requiring_preset_columns(self):
+    def test_custom_analysis_technical_setup_cannot_recreate_retired_scaffold(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             data = root / 'measurements.csv'
@@ -224,30 +232,70 @@ class IntakeDialogueTests(unittest.TestCase):
             resolved = self.converse(args, client, ['y'])
             self.assertTrue(resolved.scripted)
             contract = client.requests[0]['response_contract']
-            self.assertIn('scripted', contract['options'])
+            self.assertNotIn('scripted', contract['options'])
             self.assertIn('with_report', contract['options'])
-            self.assertIn('scripted=true', contract['native_paired_analysis'])
+            self.assertNotIn('scripted=true', contract['native_paired_analysis'])
+            self.assertIn('ordinary start', contract['native_paired_analysis'])
             self.assertNotIn('execution_proposal', contract)
             self.assertEqual(resolved.goal, args.goal)
             self.assertEqual(resolved.value_column, [])
+            no_calls = Client()
+            resumed = self.converse(self.args(root, '--resume-setup', str(resolved._start_root)), no_calls, [])
+            self.assertTrue(resumed.scripted)
+            self.assertEqual(resumed.goal, args.goal)
+            self.assertEqual(no_calls.requests, [])
             resolved.prepare_only = True
-            with patch('sys.stdin.isatty', return_value=False), patch('simple_ar.cli.start.print_line'):
-                config = prepare_start(resolved)
-            settings = research_defaults(['research-session', '--config', str(config)])
-            self.assertEqual(settings['task_kind'], 'bug_fix')
-            contract = (resolved._start_root / 'source' / 'README.md').read_text()
-            self.assertIn(args.goal, contract)
-            self.assertIn('method summary', (resolved._start_root / 'task.md').read_text())
-            generated_config = (resolved._start_root / 'code_task.toml').read_text()
-            self.assertIn('budget_profile = "large"', generated_config)
-            self.assertIn('allow_large_edits = true', generated_config)
+            retained = (resolved._start_root / 'setup.json').read_bytes()
+            with patch('sys.stdin.isatty', return_value=False), patch('simple_ar.cli.start.print_line'), \
+                    self.assertRaisesRegex(ValueError, 'chat/resume_setup structured controls'):
+                prepare_start(resolved)
+            self.assertEqual((resolved._start_root / 'setup.json').read_bytes(), retained)
+            self.assertFalse((resolved._start_root / 'code_task.toml').exists())
             with self.assertRaisesRegex(ValueError, 'cannot combine'):
                 validate_proposal(proposal('data_analysis', options={'scripted': True, 'with_report': True}), args, set())
             with self.assertRaisesRegex(ValueError, 'explicit scripted'):
                 validate_proposal(proposal('data_analysis', options={'scripted': True}), args, {'scripted'})
 
     def test_public_acquisition_requires_source_basis_and_separate_permission(self):
+        from simple_ar.cli.intake_dialogue import _discover_sources
+        from simple_ar.research.sources.capability import SearchResult
+        from simple_ar.literature.models import Paper
         args = build_parser().parse_args(['start', '--kind', 'reproduction'])
+        queries = ['Find a public paper copy and author implementation']
+        self.assertEqual(validate_proposal(proposal('reproduction', source_queries=queries),
+                                          args, set())['source_queries'], queries)
+        for changes in ({'kind': 'writing'}, {'assets': [{'role': 'paper', 'path_quote': 'paper.pdf'}]},
+                        {'source_queries': ['']}, {'source_queries': queries * 3}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                validate_proposal({**proposal('reproduction', source_queries=queries), **changes}, args, set())
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            result = SearchResult(status='partial', responses=(), diagnostics=('One provider unavailable',),
+                papers=(Paper(id='source', title='Public source', authors=[], abstract='Metadata only',
+                              url='https://example.org/paper', fulltext_url='https://example.org/paper.pdf'),))
+            state = {}
+            with patch('simple_ar.research.sources.capability.search_sources', return_value=result) as search, \
+                 patch('simple_ar.cli.intake_dialogue.print_line'), patch('builtins.input', return_value='n'):
+                self.assertFalse(_discover_sources(queries, args, state, root))
+                search.assert_not_called()
+            with patch('simple_ar.research.sources.capability.search_sources', return_value=result) as search, \
+                 patch('simple_ar.cli.intake_dialogue.print_line'), patch('builtins.input', return_value='y'):
+                self.assertTrue(_discover_sources(queries, args, state, root))
+                self.assertEqual(search.call_count, 1)
+                self.assertFalse(_discover_sources(queries, args, state, root))
+                args.material = []  # Resume after saved response, before material adoption.
+                self.assertTrue(_discover_sources(queries, args, state, root))
+                self.assertEqual(search.call_count, 1)
+            metadata = args.material[0].read_text(encoding='utf-8')
+            self.assertIn('https://example.org/paper.pdf', metadata)
+            self.assertIn('One provider unavailable', metadata)
+            self.assertEqual(args.document, [])
+            args.material = []
+            (Path(state['source_lookups'][0]['path']) / 'responses.json').unlink()
+            with patch('simple_ar.research.sources.capability.search_sources') as search, \
+                 patch('simple_ar.cli.intake_dialogue.print_line'):
+                self.assertFalse(_discover_sources(queries, args, state, root))
+                search.assert_not_called()
         url = 'https://github.com/example/research'
         request = {'role': 'project', 'url': url, 'basis': [{'path': 'paper.md', 'quote': url}]}
         facts = {'paper_previews': [{'source_path': 'paper.md', 'text': 'Implementation: ' + url}]}
@@ -762,6 +810,21 @@ class IntakeDialogueTests(unittest.TestCase):
             self.assertEqual(defaults["value_column"], ["old", "new"])
             self.assertEqual(read_json(config.parent / "setup.json")["status"], "configured")
             self.assertNotIn("execution", tomllib.loads(config.read_text()))
+            # The public adapter adopts the confirmed protocol once, without
+            # rediscovering a native preference or reopening technical setup.
+            from simple_ar.cli.main import main
+            resolved.prepare_only, resolved.yes = False, True
+            with patch("sys.stdin.isatty", return_value=False), \
+                    patch("simple_ar.cli.intake_dialogue.discuss_start", return_value=resolved) as discussion, \
+                    patch("simple_ar.cli.main._run_native_start") as native, \
+                    patch("simple_ar.cli.main._print_research_session") as run, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                main(["start", "--chat", "--goal", args.goal, "--data-file", str(data), "--yes"])
+            discussion.assert_called_once()
+            native.assert_not_called()
+            self.assertEqual(run.call_args.args[0].paired_baseline, defaults["paired_baseline"])
+            self.assertEqual(run.call_args.args[0].value_column, defaults["value_column"])
+            self.assertEqual(len(client.requests), 2)
 
     def test_waiting_proposal_resumes_without_model_replay_or_budget_reset(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -769,6 +832,9 @@ class IntakeDialogueTests(unittest.TestCase):
             args = self.args(root)
             first = Client(proposal("survey", options={"sources": "search"}, questions=['Prefer this scope or another?']))
             self.assertIsNone(self.converse(args, first, ["stop"]))
+            contract = first.requests[0]['response_contract']
+            self.assertNotIn('figure', contract['kind'])
+            self.assertNotIn('scripted', contract['options'])
             draft = self.draft(root)
             ledger = draft.parent / "setup_budget.json"
             old = ledger.read_bytes()

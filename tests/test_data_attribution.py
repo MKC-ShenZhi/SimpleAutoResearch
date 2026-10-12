@@ -72,7 +72,7 @@ class DataAttributionTests(unittest.TestCase):
         self.assertNotIn("## References", append_references_section(text, []))
 
     def test_data_option_rejected_for_other_functions(self):
-        args = build_parser().parse_args(["start", "--kind", "survey", "--goal", "Review", "--data-attribution", "A source"])
+        args = build_parser().parse_args(["start", "--kind", "survey", "--sources", "materials", "--goal", "Review", "--data-attribution", "A source"])
         from simple_ar.cli.start import prepare_start
         with patch("sys.stdin.isatty", return_value=False), self.assertRaisesRegex(ValueError, "Data options"):
             prepare_start(args)

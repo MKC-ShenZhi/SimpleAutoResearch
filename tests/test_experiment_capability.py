@@ -71,11 +71,12 @@ class ExperimentCapabilityTests(unittest.TestCase):
             root = Path(tmp)
             store = ArtifactStore(root / "attempt")
             command = [sys.executable, "-c", "import os; from pathlib import Path; "
-                "p=Path(os.environ['SIMPLE_AR_OUTPUT_DIR']); p.mkdir(); "
+                "p=Path(os.environ['SIMPLE_AR_OUTPUT_DIR']); assert p.is_dir(); "
                 "(p/'curve.json').write_text('[1, 2]'); print('accuracy: 0.5')"]
             result = run_experiment_capability(context=CapabilityContext(store=store,
                 attempt=AttemptManifest(attempt_id="experiment-1")),
                 request=ExperimentRequest(run=RunRequest(command, root, 5)))
+            self.assertEqual(result.status, "completed", result.diagnostics)
             output = next(ref for ref in result.artifacts if ref.kind == "experiment_outputs")
             self.assertEqual((store.resolve(output) / "curve.json").read_text(), "[1, 2]")
             canonical = store.read_json(next(ref for ref in result.artifacts if ref.kind == "experiment_result"))

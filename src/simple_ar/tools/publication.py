@@ -1,0 +1,230 @@
+"""Existing ACM export, with rendering delegated to the shared process owner."""
+from __future__ import annotations
+
+import hashlib
+import os
+from pathlib import Path
+import re
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from simple_ar.core.budget import BudgetError
+from simple_ar.core.capabilities import ArtifactStore
+from simple_ar.core.process import ProcessSpec, run_process
+from simple_ar.report.export import ReportExportError, export_acm_report
+from simple_ar.tools.specs import CommonToolSpec, ToolResult
+from simple_ar.tools.workspace import DeliveryRequest, resolve_mounted_path
+
+
+class ExportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    markdown: str = Field(description="Workspace Markdown file; local figures and references.bib use its directory.")
+    title: str = Field(default="", max_length=500)
+    compile_pdf: bool = True
+    render_preview: bool = Field(default=False, exclude_if=lambda value: value is False,
+        description="Explicitly render every compiled PDF page with Poppler: at most 12 pages, 120 DPI scaled to a maximum 1600 pixels per dimension. Requires compile_pdf=true. Returns PNG locators for optional inspect_images; rendering is not visual review. Incomplete previews prevent delivery. False preserves historical request bindings.")
+    delivery: DeliveryRequest | None = Field(default=None,
+        description="Optional explicit final delivery after successful export/compilation. Exported files are added automatically; artifacts selects other already-existing outputs or retained task evidence. Disclose unresolved work. This does not certify scientific or visual quality. Request this operation alone when delivering.")
+
+    @model_validator(mode="after")
+    def validate_preview(self) -> ExportRequest:
+        if self.render_preview and not self.compile_pdf:
+            raise ValueError("render_preview requires compile_pdf=true")
+        return self
+
+
+def publication_tool_specs() -> list[CommonToolSpec]:
+    return [CommonToolSpec(name="export_report", domain="publication", permission_level="execution",
+        risk_level="medium", input_schema=ExportRequest.model_json_schema(),
+        description="Derive editable ACM TeX from the canonical workspace Markdown, citations and local images; optionally compile PDF and explicitly request bounded previews of every PDF page. The same rendering approval covers requested Poppler processes. Preserves the source and records real processes. Preview locators can be passed to inspect_images separately; no review is invoked. Optional explicit delivery ends the task after successful requested export without another model turn; incomplete preview never delivers. Compilation/rendering is not content or visual verification.")]
+
+
+def export_input_binding(source: Path, request: ExportRequest, *, output_root: Path | None = None,
+                         include_images: bool = True) -> dict[str, Any]:
+    """Pin authoring inputs once for approval and export recovery, without secrets."""
+    root = source.parent.resolve()
+    inputs = {}
+    for path in (source, root / 'references.bib', root / 'figures/figures_manifest.json'):
+        if path.exists() and not path.resolve().is_relative_to(root):
+            raise ValueError('Export input escapes the manuscript directory')
+        key = path.relative_to(root).as_posix()
+        inputs[key] = None
+        if path.is_file():
+            with path.open('rb') as file:
+                inputs[key] = hashlib.file_digest(file, 'sha256').hexdigest()
+    if not include_images:
+        return {**request.model_dump(exclude_none=True), 'inputs': inputs}
+    # Approval must cover actual figure bytes, including standalone Markdown
+    # images without a generated manifest. Bind the authorized local image
+    # inventory rather than introducing a second Markdown/Pandoc parser here.
+    directories, visited, entries, image_bytes = [root], set(), 0, 0
+    while directories:
+        directory = directories.pop()
+        if directory in visited:
+            continue
+        visited.add(directory)
+        for candidate in sorted(directory.iterdir()):
+            if output_root is not None and candidate.resolve().is_relative_to(output_root.resolve()):
+                continue  # Derived exports are not authoring inputs.
+            entries += 1
+            if entries > 4096:
+                raise ValueError('Publication image inventory exceeds 4096 entries; use a focused manuscript directory')
+            try:
+                path = resolve_mounted_path({'workspace': root}, str(candidate))
+            except ValueError:
+                # Private paths are not authoring inputs. An escaping symlink
+                # cannot be silently omitted from an approval inventory.
+                if not candidate.resolve().is_relative_to(root):
+                    raise ValueError('Publication asset escapes the manuscript directory')
+                continue
+            if path.is_dir():
+                directories.append(path)
+            elif path.is_file() and path.suffix.lower() in {'.png', '.jpg', '.jpeg', '.svg', '.pdf'}:
+                key = path.relative_to(root).as_posix()
+                if key in inputs:
+                    continue
+                image_bytes += path.stat().st_size
+                if image_bytes > 256_000_000:
+                    raise ValueError('Publication image inventory exceeds 256 MB; use a focused manuscript directory')
+                with path.open('rb') as file:
+                    inputs[key] = hashlib.file_digest(file, 'sha256').hexdigest()
+    return {**request.model_dump(exclude_none=True), 'inputs': inputs, 'image_binding_version': 1}
+
+
+class PublicationToolGateway:
+    def __init__(self, root: Path, workspace: Any, ledger: Any) -> None:
+        self.root, self.workspace, self.ledger = root, workspace, ledger
+
+    def call(self, name: str, arguments: dict[str, Any], *, identity: str) -> ToolResult:
+        try:
+            if name != "export_report" or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,100}", identity):
+                raise ValueError("Invalid publication invocation")
+            request = ExportRequest.model_validate(arguments)
+            source = self.workspace.resolve(request.markdown, write=True)
+            if not source.is_file() or source.suffix.lower() != ".md" or source.stat().st_size > 256000:
+                raise ValueError("Use an existing workspace Markdown file no larger than 256 KiB")
+            if request.delivery is not None:
+                self.workspace.resolve_delivery(request.delivery)  # Reject invalid extra artifacts before rendering.
+            prefix = f"workspace/publications/{identity}"
+            output = self.workspace.resolve(prefix, write=True)
+            owner = ArtifactStore(self.root / "tools" / "publications" / identity)
+            saved = owner.read_json('request.json') if owner.exists('request.json') else None
+            binding = export_input_binding(source, request, output_root=self.workspace.workspace / 'publications',
+                include_images=saved is None or 'image_binding_version' in saved)
+            if saved is not None:
+                output_binding_version = saved.get('output_binding_version')
+                if output_binding_version not in {None, 1}:
+                    raise ValueError('Unsupported publication output binding version; preserve the receipt')
+                # Historical exports only pinned the Markdown body. Restore
+                # their recorded version; do not invent missing past bindings.
+                if 'image_binding_version' in saved:
+                    current = binding
+                elif 'inputs' in saved:
+                    # Old terminal exports retain their recorded coverage;
+                    # never upgrade their historical approval after the fact.
+                    current = {**request.model_dump(exclude_none=True), 'inputs': {
+                        key: binding['inputs'].get(key) for key in saved['inputs']}}
+                else:
+                    current = {**request.model_dump(exclude_none=True), 'sha256': binding['inputs'][source.name]}
+                recorded_inputs = {key: value for key, value in saved.items() if key != 'output_binding_version'}
+                if recorded_inputs != current:
+                    raise ValueError("Export inputs changed; retain the previous version")
+                if not (output / "export.json").is_file():
+                    raise ValueError("Interrupted export has no terminal manifest; inspect process receipts, do not replay")
+                manifest = ArtifactStore(output).read_json("export.json")
+            else:
+                # Mark new requests before rendering so an interrupted commit
+                # cannot be mistaken for a historical, unbound export.
+                owner.write_json("request.json", {**binding, 'output_binding_version': 1})
+                count = 0
+
+                def render(argv, *, cwd, text=None, timeout=60, env=None):
+                    nonlocal count
+                    count += 1
+                    process_id = f"{identity}-render-{count}"
+                    logs = self.root / "tools" / "processes" / process_id
+                    command = list(argv)
+                    if text is not None:
+                        logs.mkdir(parents=True, exist_ok=True)
+                        input_path = logs / "input.txt"
+                        input_path.write_text(text, encoding="utf-8")
+                        command.append(str(input_path))  # Pandoc accepts a file instead of stdin.
+                    environment = {key: os.environ[key] for key in ("PATH", "LANG", "SYSTEMROOT", "WINDIR") if key in os.environ}
+                    environment.update({key: value for key, value in (env or {}).items()
+                                        if key in {"openin_any", "openout_any", "shell_escape", "LC_ALL"}})
+                    try:
+                        result = run_process(ProcessSpec(argv=command, cwd=cwd, timeout_sec=timeout,
+                            env=environment, output_dir=logs, invocation_id=process_id,
+                            attempt_id=identity, tail_bytes=12000, log_bytes=2000000), budget_ledger=self.ledger)
+                    except BudgetError as exc:
+                        raise ReportExportError(f"Rendering budget unavailable; inspect tools/processes/{process_id}: {exc}") from exc
+                    if result.returncode or result.stop_reason or any(
+                            stream["log_bytes_discarded"] for stream in result.record["streams"].values()):
+                        raise ReportExportError(f"Renderer failed or output truncated; inspect tools/processes/{process_id}")
+                    return (logs / "stdout.log").read_text(encoding="utf-8", errors="replace")
+
+                def validate_asset(path):
+                    authorized = self.workspace.resolve(str(path))
+                    key = authorized.relative_to(source.parent).as_posix()
+                    with authorized.open('rb') as file:
+                        digest = hashlib.file_digest(file, 'sha256').hexdigest()
+                    if binding['inputs'].get(key) != digest:
+                        raise ReportExportError('Figure is outside the bound authoring inputs or changed during rendering')
+
+                try:
+                    manifest = export_acm_report(source.parent, output, title=request.title or None,
+                        body_name=source.name, compile_pdf=request.compile_pdf, render_preview=request.render_preview, runner=render,
+                        validate_asset=validate_asset)
+                except ReportExportError:
+                    if not (output / 'export.json').is_file():
+                        raise
+                    # A failed preview can still retain accurate compilation
+                    # evidence. Return that terminal manifest without delivery.
+                    manifest = ArtifactStore(output).read_json('export.json')
+            artifacts = [f"{prefix}/{file}" for file in ("main.tex", "body.tex", "references.bib", "source.md", "export.json", "main.pdf")
+                         if (output / file).is_file()]
+            completed = manifest['status'] in {'exported', 'compiled'}
+            if request.render_preview:
+                completed = completed and manifest.get('compiled') is True and manifest.get('pdf_preview', {}).get('rendered') is True
+            hashes = None
+            if completed or (saved is not None and owner.exists('result.json')):
+                if saved is not None and not owner.exists('result.json'):
+                    if output_binding_version is not None:
+                        raise ValueError('Interrupted publication has no successful output byte binding; inspect retained files and process receipts, do not replay')
+                    return ToolResult(tool_name=name, status='blocked', artifacts=artifacts,
+                        error='Historical publication has no output byte binding; its manifest records past rendering only. Inspect the retained project or request a new export identity; no automatic delivery or recompilation.',
+                        data={'historical_manifest': manifest, 'project': prefix, 'artifacts': artifacts,
+                            'output_integrity': 'historical_unbound',
+                            'scope': 'Historical rendering receipt only; current project bytes and compilation are unverified.'})
+                # Workspace owns bounded directory expansion and file digests.
+                # Include figures, editable variants, source attachments, build
+                # records and instructions, rather than a second filename list.
+                artifacts = self.workspace.resolve_delivery(DeliveryRequest(
+                    summary='Editable publication project', artifacts=[prefix]))['artifacts']
+                hashes = self.workspace.artifact_hashes(artifacts)
+                if saved is not None:
+                    retained = owner.read_json('result.json').get('artifact_sha256')
+                    if not retained or retained != hashes:
+                        raise ValueError('Publication project files changed or are missing; saved rendering applies only to the original byte-bound version, not this project. Preserve both versions; no replay')
+                else:
+                    owner.write_json('result.json', {'artifact_sha256': hashes})
+            preview_images = [f"{prefix}/{path}" for path in manifest.get('pdf_preview', {}).get('pages', [])]
+            delivery = None
+            if completed and request.delivery is not None:
+                if request.compile_pdf and not (output / 'main.pdf').is_file():
+                    raise ValueError('Compiled publication PDF is missing; no delivery')
+                delivery = self.workspace.resolve_delivery(request.delivery.model_copy(update={
+                    'artifacts': [*request.delivery.artifacts, *artifacts]}))
+            return ToolResult(tool_name=name, status="ok" if completed else "error",
+                error='' if completed else str(manifest.get('compile_note') or manifest.get('error') or 'Publication did not complete; inspect the retained manifest'),
+                data={"manifest": manifest, "project": prefix, "artifacts": artifacts,
+                    **({'artifact_sha256': hashes, 'output_integrity': 'byte_bound'} if hashes is not None else {}),
+                    **({'delivery': delivery} if delivery is not None else {}),
+                    **({'preview_images': preview_images,
+                        'preview_scope': 'All PDF pages rendered; visual quality not reviewed. Pass these locators to inspect_images in groups of at most four if review is needed.'}
+                       if request.render_preview and completed else {}),
+                    "scope": "Rendering only; scientific and visual quality need independent inspection"}, artifacts=artifacts)
+        except Exception as exc:
+            return ToolResult(tool_name=name, status="error",
+                error=f"Publication unavailable ({type(exc).__name__}: {exc}); inspect saved export/process records. Source and failed version retained; no blind replay.")

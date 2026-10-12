@@ -273,11 +273,12 @@ def validate_session_arguments(args: argparse.Namespace) -> SessionArguments:
                                (materials, SUPPORTED_MATERIAL_SUFFIXES if task_kind == "writing" else SUPPORTED_DOCUMENT_SUFFIXES)):
             if any(not Path(path).expanduser().is_file() or Path(path).suffix.lower() not in suffixes for path in paths):
                 raise SystemExit("Report inputs must be local text/HTML/PDF; writing also accepts JSON material and table_analysis.v1 packages.")
-    if outputs and task_kind != "bug_fix" and "experiments" not in outputs and (command or execution_details or getattr(args, "code_task_config", None)):
+    code_delivery = bool(getattr(args, "code_task_config", None) and outputs and set(outputs) & {"bug_fix", "code_task"} and "experiments" not in outputs)
+    if outputs and task_kind != "bug_fix" and not code_delivery and "experiments" not in outputs and (command or execution_details or getattr(args, "code_task_config", None)):
         raise SystemExit("Execution configuration requires experiments in --outputs/task.outputs.")
-    if task_kind == "bug_fix" and outputs and set(outputs) != {"bug_fix"}:
-        raise SystemExit("--task-kind bug_fix requires --outputs bug_fix or no explicit outputs.")
-    if task_kind == "survey" and (command or execution_details or getattr(args, "code_task_config", None)):
+    if task_kind == "bug_fix" and outputs and ("bug_fix" not in outputs or set(outputs) - {"bug_fix", "report"}):
+        raise SystemExit("--task-kind bug_fix requires bug_fix and optionally report in --outputs.")
+    if task_kind == "survey" and not code_delivery and (command or execution_details or getattr(args, "code_task_config", None)):
         raise SystemExit("--task-kind survey cannot include execution or CodeTask configuration.")
     if task_kind == "measurement":
         if outputs != ["experiments"]:
@@ -405,7 +406,7 @@ def research_defaults(
             for key, value in allowances.items()
         ):
             raise ValueError("continuation.remaining must map resource names to numeric amounts")
-    if "outputs" in defaults and (not defaults["outputs"] or set(defaults["outputs"]) - {"summary", "report", "experiments", "bug_fix", "data_analysis"}):
+    if "outputs" in defaults and (not defaults["outputs"] or set(defaults["outputs"]) - {"summary", "report", "experiments", "bug_fix", "code_task", "data_analysis"}):
         raise ValueError("task.outputs must contain summary, report, experiments, bug_fix and/or data_analysis")
     if defaults.get("task_kind", "auto") not in {"auto", "survey", "bug_fix", "measurement", "reproduction", "writing", "data_analysis"}:
         raise ValueError("task.kind must be auto, survey, bug_fix, measurement, reproduction, writing or data_analysis")
@@ -419,8 +420,8 @@ def research_defaults(
         "experiments" not in defaults.get("outputs", []) or set(defaults.get("outputs", [])) - {"experiments", "report"}
     ):
         raise ValueError("task.kind=reproduction requires experiments and optionally report in task.outputs")
-    if defaults.get("task_kind") == "bug_fix" and "outputs" in defaults and set(defaults["outputs"]) != {"bug_fix"}:
-        raise ValueError("task.kind=bug_fix requires task.outputs = [\"bug_fix\"] or an omitted outputs field")
+    if defaults.get("task_kind") == "bug_fix" and "outputs" in defaults and ("bug_fix" not in defaults["outputs"] or set(defaults["outputs"]) - {"bug_fix", "report"}):
+        raise ValueError("task.kind=bug_fix requires bug_fix and optionally report in task.outputs")
     if defaults.get("task_kind") == "measurement" and defaults.get("outputs") != ["experiments"]:
         raise ValueError("task.kind=measurement requires task.outputs = [\"experiments\"]")
     if defaults.get("report_reviewer", "llm") not in {"llm", "disabled"}:

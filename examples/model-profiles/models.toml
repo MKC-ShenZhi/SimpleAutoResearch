@@ -8,6 +8,10 @@ version = 1
 default = "daily"
 code = "daily"
 image = "paper_art"
+# Optional: writing = "scientific_writer" selects a text-capable profile for native
+# composition/feedback without changing daily coordination or code decisions.
+# Omit it to preserve the task connection. Configure its URL, key reference and
+# reasoning settings explicitly; higher effort is not a quality guarantee.
 # To enable rendered-figure inspection, add vision = "figure_eye" and configure
 # the example below with a model your provider actually supports for image input.
 
@@ -20,8 +24,15 @@ capabilities = ["text", "code"]
 stream = true
 # Optional: install simple-autoresearch[http2] and test your server's route.
 # http2 = true
-request_timeout_sec = 180
+request_timeout_sec = 600
 retry_attempts = 3
+# Native action-loop input working set, including schemas and reasoning history.
+# Default is 24000. Set after checking provider input+output limits and task cost.
+# context_input_tokens = 64000
+# For budget-bounded text retries after uncertain transport failures, set an
+# explicit provider-supported output cap, e.g. max_output_tokens = 32768.
+# Each physical attempt counts; unknown usage keeps its reservation. Uncapped
+# or visual uncertain requests stop instead of automatically replaying.
 
 # Used by simple-ar image. Confirm the provider's real Images protocol;
 # a Chat example or declared capability alone is not proof.

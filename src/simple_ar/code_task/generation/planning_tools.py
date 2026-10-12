@@ -5,17 +5,10 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from simple_ar.code_task.generation.agent_step import run_json_agent_step, write_agent_step_artifact
-from simple_ar.code_task.generation.file_specs import (
-    dedupe_file_rows,
-    entrypoint_first,
-    infer_file_kind,
-    normalize_dependency_paths,
-    normalize_plan_path,
-)
 from simple_ar.code_task.generation.common import scalar_list, text as clean_text
 from simple_ar.code_task.generation.task_contract import contract_prompt_view
 from simple_ar.core.artifacts import write_json
-from simple_ar.integrations.llm import LLMClient, LLMError
+from simple_ar.integrations.llm import LLMClient, LLMResponseError
 
 
 MessageCallback = Callable[[str], None]
@@ -43,6 +36,9 @@ def build_tool_agent_architecture_plan(
     earliest affected stage, and downstream stages are regenerated from that
     point. This keeps long prompts and repeated mistakes from becoming one
     opaque monolithic planning failure.
+
+    retry_attempts bounds completed JSON corrections per stage; provider retry
+    and accounting stay in LLMClient. review_rounds bounds content revisions.
     """
 
     retry_attempts = max(1, int(retry_attempts or 1))
@@ -72,12 +68,14 @@ def build_tool_agent_architecture_plan(
                 planning_dir=planning_dir,
                 message_callback=message_callback,
             )
-        review = _run_review(
+        review = _run_stage(
+            "review",
             contract=contract,
             result_schema=result_schema,
             resource_plan=resource_plan,
             domain_profile=domain_profile,
             state=state,
+            feedback=[],
             client=client,
             retry_attempts=retry_attempts,
             attempt_index=round_index + 1,
@@ -103,26 +101,22 @@ def build_tool_agent_architecture_plan(
             f"Planning review requested revision from `{rerun_from}`; regenerating downstream planning artifacts.",
         )
 
-    plan = _assemble_architecture_plan(
-        contract=contract,
-        result_schema=result_schema,
-        resource_plan=resource_plan,
-        state=state,
-        review=review,
-        revision_count=revision_count,
-    )
-    blockers = _planning_blockers(plan)
-    if blockers:
+    try:
+        plan = _assemble_architecture_plan(
+            contract=contract,
+            result_schema=result_schema,
+            resource_plan=resource_plan,
+            state=state,
+            review=review,
+            revision_count=revision_count,
+        )
+    except LLMResponseError as exc:
         if planning_dir is not None:
-            write_json(
-                planning_dir / "blocking_issues.json",
-                {
-                    "schema_version": "greenfield_planning_blockers.v1",
-                    "blockers": blockers,
-                    "review": dict(review),
-                },
-            )
-        raise LLMError("Greenfield planning did not converge: " + "; ".join(blockers[:4]))
+            write_json(planning_dir / "blocking_issues.json", {
+                "schema_version": "greenfield_planning_blockers.v1",
+                "blockers": [str(exc)], "review": dict(review),
+            })
+        raise
     if planning_dir is not None:
         write_json(planning_dir / "state.json", state)
         write_json(planning_dir / "final_plan.json", plan)
@@ -145,74 +139,43 @@ def _run_stage(
     message_callback: MessageCallback | None,
 ) -> dict[str, Any]:
     label = f"greenfield-plan-{stage}" if attempt_index == 1 else f"greenfield-plan-{stage}-r{attempt_index}"
-    _emit(message_callback, f"Planning tool `{stage}`.")
-    prompt = _stage_prompt(
-        stage,
-        contract=contract,
-        result_schema=result_schema,
-        resource_plan=resource_plan,
-        domain_profile=domain_profile,
-        state=state,
-        feedback=feedback,
-    )
+    if stage == "review":
+        _emit(message_callback, "Reviewing greenfield planning artifacts.")
+        prompt = _review_prompt(
+            contract=contract,
+            result_schema=result_schema,
+            resource_plan=resource_plan,
+            domain_profile=domain_profile,
+            state=state,
+        )
+    else:
+        _emit(message_callback, f"Planning tool `{stage}`.")
+        prompt = _stage_prompt(
+            stage,
+            contract=contract,
+            result_schema=result_schema,
+            resource_plan=resource_plan,
+            domain_profile=domain_profile,
+            state=state,
+            feedback=feedback,
+        )
     raw = run_json_agent_step(
         client=client,
-        system=_stage_system(stage),
+        system=PLANNING_REVIEW_SYSTEM if stage == "review" else _stage_system(stage),
         prompt=prompt,
         label=label,
         stage=stage,
         attempt_index=attempt_index,
         retry_attempts=retry_attempts,
-        max_output_tokens=_stage_output_tokens(stage, resource_plan),
+        max_output_tokens=900 if stage == "review" else _stage_output_tokens(stage, resource_plan),
         artifact_dir=planning_dir,
         feedback=feedback,
         output_summary_callback=_agent_step_output_summary,
         message_callback=message_callback,
     )
-    normalized = _normalize_stage_result(stage, raw)
+    normalized = _normalize_review(raw) if stage == "review" else _normalize_stage_result(stage, raw)
     write_agent_step_artifact(planning_dir, stage=stage, attempt_index=attempt_index, value=normalized)
     return normalized
-
-
-def _run_review(
-    *,
-    contract: Mapping[str, Any],
-    result_schema: Mapping[str, Any],
-    resource_plan: Mapping[str, Any],
-    domain_profile: Mapping[str, Any],
-    state: Mapping[str, Any],
-    client: LLMClient,
-    retry_attempts: int,
-    attempt_index: int,
-    planning_dir: Path | None,
-    message_callback: MessageCallback | None,
-) -> dict[str, Any]:
-    _emit(message_callback, "Reviewing greenfield planning artifacts.")
-    prompt = _review_prompt(
-        contract=contract,
-        result_schema=result_schema,
-        resource_plan=resource_plan,
-        domain_profile=domain_profile,
-        state=state,
-    )
-    label = "greenfield-plan-review" if attempt_index == 1 else f"greenfield-plan-review-r{attempt_index}"
-    raw = run_json_agent_step(
-        client=client,
-        system=PLANNING_REVIEW_SYSTEM,
-        prompt=prompt,
-        label=label,
-        stage="review",
-        attempt_index=attempt_index,
-        retry_attempts=retry_attempts,
-        max_output_tokens=900,
-        artifact_dir=planning_dir,
-        feedback=[],
-        output_summary_callback=_agent_step_output_summary,
-        message_callback=message_callback,
-    )
-    review = _normalize_review(raw)
-    write_agent_step_artifact(planning_dir, stage="review", attempt_index=attempt_index, value=review)
-    return review
 
 
 def _stage_prompt(
@@ -355,12 +318,14 @@ def _assemble_architecture_plan(
     review: Mapping[str, Any],
     revision_count: int,
 ) -> dict[str, Any]:
+    # Import at assembly time: architecture's factory dispatches to this producer.
+    # Only the producer canonicalizes, before final_plan.json is published.
+    from simple_ar.code_task.generation.architecture import normalize_architecture_plan
+
     requirements = state.get("requirements") if isinstance(state.get("requirements"), Mapping) else {}
     architecture = state.get("architecture") if isinstance(state.get("architecture"), Mapping) else {}
     interfaces = state.get("interfaces") if isinstance(state.get("interfaces"), Mapping) else {}
     file_plan = state.get("file_plan") if isinstance(state.get("file_plan"), Mapping) else {}
-    max_files = _positive_int(resource_plan.get("max_files"), 8)
-    files = _normalize_files(file_plan.get("files"), max_files=max_files)
     risks = scalar_list(architecture.get("risks"))[:8]
     findings = review.get("findings") if isinstance(review.get("findings"), list) else []
     if findings:
@@ -372,10 +337,10 @@ def _assemble_architecture_plan(
         "architecture_summary": clean_text(architecture.get("architecture_summary"))
         or "Bounded generated project with explicit interfaces and a command-line entrypoint.",
         "data_flow": scalar_list(architecture.get("data_flow"))[:8],
-        "interfaces": _render_interfaces(interfaces)[:10],
+        "interfaces": interfaces,
         "test_strategy": scalar_list(architecture.get("test_strategy"))[:8],
         "risks": [item for item in risks if item][:10],
-        "files": files,
+        "files": file_plan.get("files", []),
         "planning": {
             "mode": "tool_agent",
             "review_status": clean_text(review.get("status")) or "unknown",
@@ -388,8 +353,7 @@ def _assemble_architecture_plan(
         "planning_status": clean_text(review.get("status")) or "unknown",
         "result_schema": dict(result_schema),
     }
-    plan.update(_shared_contracts(contract=contract, resource_plan=resource_plan, files=files, interfaces=interfaces))
-    return plan
+    return normalize_architecture_plan(plan, contract=contract, resource_plan=resource_plan)
 
 
 def _normalize_stage_result(stage: str, value: Mapping[str, Any]) -> dict[str, Any]:
@@ -424,94 +388,9 @@ def _normalize_stage_result(stage: str, value: Mapping[str, Any]) -> dict[str, A
     if stage == "file_plan":
         return {
             "objective": clean_text(value.get("objective")),
-            "files": _normalize_files(value.get("files"), max_files=64),
+            "files": value.get("files", []),
         }
     return dict(value)
-
-
-def _shared_contracts(
-    *,
-    contract: Mapping[str, Any],
-    resource_plan: Mapping[str, Any],
-    files: list[dict[str, Any]],
-    interfaces: Mapping[str, Any],
-) -> dict[str, Any]:
-    evidence_plan = contract.get("evidence_plan") if isinstance(contract.get("evidence_plan"), Mapping) else {}
-    metric_contract = contract.get("metric_contract") if isinstance(contract.get("metric_contract"), Mapping) else {}
-    implementation_contract = (
-        contract.get("implementation_contract")
-        if isinstance(contract.get("implementation_contract"), Mapping)
-        else {}
-    )
-    module_apis = interfaces.get("module_apis") if isinstance(interfaces.get("module_apis"), list) else []
-    shared_schemas = interfaces.get("shared_schemas") if isinstance(interfaces.get("shared_schemas"), list) else []
-    return {
-        "artifact_contract": {
-            "required_artifacts": scalar_list(evidence_plan.get("required_artifacts"))[:30],
-            "required_comparisons": scalar_list(evidence_plan.get("required_comparisons"))[:30],
-            "hypotheses": scalar_list(evidence_plan.get("hypotheses"))[:20],
-            "claim_policy": scalar_list(evidence_plan.get("claim_policy"))[:8],
-        },
-        "metric_contract": {
-            "primary_metric": metric_contract.get("primary_metric", ""),
-            "required_metrics": scalar_list(metric_contract.get("required_metrics"))[:40],
-            "metric_directions": metric_contract.get("metric_directions", {}),
-            "default_fill_policy": metric_contract.get("default_fill_policy", "do_not_fill_missing_required_metrics_with_zero"),
-        },
-        "resource_contract": dict(resource_plan.get("execution_budget", {}))
-        if isinstance(resource_plan.get("execution_budget"), Mapping)
-        else {},
-        "interface_registry": {
-            "files": [
-                {
-                    "path": row.get("path", ""),
-                    "dependencies": scalar_list(row.get("dependencies"))[:16],
-                    "public_api": scalar_list(row.get("public_api"))[:20],
-                    "acceptance_criteria": scalar_list(row.get("acceptance_criteria"))[:12],
-                    "contract_obligations": scalar_list(row.get("contract_obligations"))[:24],
-                    "kind": row.get("kind", ""),
-                }
-                for row in files
-                if row.get("path")
-            ],
-            "module_apis": [dict(row) for row in module_apis if isinstance(row, Mapping)][:20],
-            "shared_schemas": [dict(row) for row in shared_schemas if isinstance(row, Mapping)][:16],
-        },
-        "implementation_contract": {
-            "schema_version": implementation_contract.get("schema_version", "code_task_implementation_contract.v1"),
-            "ownership_policy": implementation_contract.get("ownership_policy", ""),
-            "obligations": [
-                dict(row)
-                for row in implementation_contract.get("obligations", [])
-                if isinstance(row, Mapping)
-            ][:80],
-            "owner_index": _obligation_owner_index(files),
-        },
-    }
-
-
-def _obligation_owner_index(files: list[dict[str, Any]]) -> dict[str, list[str]]:
-    owners: dict[str, list[str]] = {}
-    for row in files:
-        path = str(row.get("path") or "")
-        if not path:
-            continue
-        for obligation_id in scalar_list(row.get("contract_obligations"), limit=40):
-            owners.setdefault(obligation_id, []).append(path)
-    return owners
-
-
-def _planning_blockers(plan: Mapping[str, Any]) -> list[str]:
-    blockers: list[str] = []
-    files = plan.get("files")
-    file_rows = [row for row in files if isinstance(row, Mapping)] if isinstance(files, list) else []
-    paths = [normalize_plan_path(row.get("path")) for row in file_rows]
-    if not any(row.get("entrypoint") or row.get("path") == "main.py" for row in file_rows):
-        blockers.append("file plan has no main.py entrypoint")
-    duplicates = sorted({path for path in paths if path and paths.count(path) > 1})
-    if duplicates:
-        blockers.append("file plan has duplicate path(s): " + ", ".join(duplicates[:5]))
-    return blockers
 
 
 def _normalize_review(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -574,45 +453,6 @@ def _normalize_named_rows(value: object, *, max_rows: int) -> list[dict[str, Any
     return result
 
 
-def _normalize_files(value: object, *, max_files: int) -> list[dict[str, Any]]:
-    rows = value if isinstance(value, list) else []
-    files: list[dict[str, Any]] = []
-    for row in rows:
-        if not isinstance(row, Mapping):
-            continue
-        path = normalize_plan_path(row.get("path"))
-        if not path:
-            continue
-        files.append(
-            {
-                "path": path,
-                "purpose": clean_text(row.get("purpose"))[:500] or "Generated project file.",
-                "dependencies": normalize_dependency_paths(row.get("dependencies"), limit=16),
-                "public_api": scalar_list(row.get("public_api"))[:40],
-                "acceptance_criteria": scalar_list(row.get("acceptance_criteria"))[:16],
-                "contract_obligations": scalar_list(row.get("contract_obligations") or row.get("obligation_ids"))[:24],
-                "entrypoint": bool(row.get("entrypoint")) or path == "main.py",
-                "kind": infer_file_kind(path, row.get("kind")),
-            }
-        )
-    files = dedupe_file_rows(files, dependency_limit=16, public_api_limit=40, acceptance_limit=16)
-    if files and not any(row["path"] == "main.py" for row in files):
-        files.insert(
-            0,
-            {
-                "path": "main.py",
-                "purpose": "Command-line entrypoint that calls the generated project orchestrator.",
-                "dependencies": [],
-                "public_api": ["main(argv=None)"],
-                "acceptance_criteria": ["Runs with `python main.py` and prints parseable metrics."],
-                "entrypoint": True,
-                "kind": "source",
-            },
-        )
-    files = entrypoint_first(files)
-    return _prune_dependencies(files[: max(1, max_files)])
-
-
 def _base_context(
     *,
     contract: Mapping[str, Any],
@@ -646,25 +486,6 @@ def _domain_profile_view(profile: Mapping[str, Any]) -> dict[str, Any]:
     return data
 
 
-def _render_interfaces(value: Mapping[str, Any]) -> list[str]:
-    lines: list[str] = []
-    for row in value.get("shared_schemas", []) if isinstance(value.get("shared_schemas"), list) else []:
-        if isinstance(row, Mapping):
-            name = clean_text(row.get("name") or row.get("description"))
-            fields = row.get("fields")
-            field_text = ", ".join(str(item) for item in fields[:10]) if isinstance(fields, list) else clean_text(fields)
-            lines.append(f"Schema {name}: {field_text}".strip())
-    for row in value.get("module_apis", []) if isinstance(value.get("module_apis"), list) else []:
-        if isinstance(row, Mapping):
-            module = clean_text(row.get("module") or row.get("name"))
-            api = row.get("public_api")
-            api_text = ", ".join(str(item) for item in api[:12]) if isinstance(api, list) else clean_text(api)
-            lines.append(f"{module}: {api_text}".strip())
-    lines.extend(scalar_list(value.get("cross_file_contracts"))[:20])
-    lines.extend(scalar_list(value.get("stdout_contract"))[:10])
-    return [line for line in lines if line]
-
-
 def _merge_review_feedback(feedback: dict[str, list[str]], review: Mapping[str, Any]) -> None:
     requests = _planning_patch_requests(review)
     if not requests:
@@ -688,32 +509,36 @@ def _review_target_stage(review: Mapping[str, Any]) -> str:
 
 
 def _planning_patch_requests(review: Mapping[str, Any], *, round_index: int | None = None) -> list[dict[str, Any]]:
-    requests = review.get("patch_requests")
-    rows = requests if isinstance(requests, list) else []
-    normalized: list[dict[str, Any]] = []
-    for index, row in enumerate(rows[:12], start=1):
-        if not isinstance(row, Mapping):
-            continue
-        target = _normalize_target_stage(row.get("target_stage"))
-        issue = clean_text(row.get("issue"))[:800]
-        change = clean_text(row.get("required_change"))[:800]
-        if not issue and not change:
-            continue
-        item: dict[str, Any] = {
-            "id": clean_text(row.get("id")) or f"{target}-{index}",
-            "target_stage": target,
-            "severity": _normalize_severity(row.get("severity")),
-            "issue": issue,
-            "required_change": change or issue,
-        }
-        if round_index is not None:
-            item["round"] = round_index
-        normalized.append(item)
-    if normalized:
-        return normalized
-    findings = review.get("findings")
-    finding_rows = findings if isinstance(findings, list) else []
-    return _review_findings_to_patch_requests(finding_rows, round_index=round_index)
+    # Explicit requests take precedence; findings supply only blocking changes.
+    for key in ("patch_requests", "findings"):
+        value = review.get(key)
+        rows = value if isinstance(value, list) else []
+        normalized: list[dict[str, Any]] = []
+        for index, row in enumerate(rows[:12], start=1):
+            if not isinstance(row, Mapping):
+                continue
+            severity = _normalize_severity(row.get("severity"))
+            if key == "findings" and severity not in {"high", "critical"}:
+                continue
+            issue = clean_text(row.get("issue"))[:800]
+            change = clean_text(row.get("required_change"))[:800]
+            if not issue and not change:
+                continue
+            target = _normalize_target_stage(row.get("target_stage"))
+            request_id = clean_text(row.get("id")) if key == "patch_requests" else ""
+            item: dict[str, Any] = {
+                "id": request_id or f"{target}-{index}",
+                "target_stage": target,
+                "severity": severity,
+                "issue": issue,
+                "required_change": change or issue,
+            }
+            if round_index is not None:
+                item["round"] = round_index
+            normalized.append(item)
+        if normalized:
+            return normalized
+    return []
 
 
 def _review_findings_to_patch_requests(
@@ -721,29 +546,7 @@ def _review_findings_to_patch_requests(
     *,
     round_index: int | None = None,
 ) -> list[dict[str, Any]]:
-    requests: list[dict[str, Any]] = []
-    for index, row in enumerate(findings[:12], start=1):
-        if not isinstance(row, Mapping):
-            continue
-        severity = _normalize_severity(row.get("severity"))
-        if severity not in {"high", "critical"}:
-            continue
-        issue = clean_text(row.get("issue"))[:800]
-        change = clean_text(row.get("required_change"))[:800]
-        if not issue and not change:
-            continue
-        target = _normalize_target_stage(row.get("target_stage"))
-        item: dict[str, Any] = {
-            "id": f"{target}-{index}",
-            "target_stage": target,
-            "severity": severity,
-            "issue": issue,
-            "required_change": change or issue,
-        }
-        if round_index is not None:
-            item["round"] = round_index
-        requests.append(item)
-    return requests
+    return _planning_patch_requests({"findings": findings}, round_index=round_index)
 
 
 def _write_patch_requests(
@@ -880,13 +683,6 @@ def _agent_step_output_summary(stage: str, output: Mapping[str, Any]) -> dict[st
             "finding_count": len(findings) if isinstance(findings, list) else 0,
         }
     return {}
-
-
-def _prune_dependencies(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    known = {row["path"] for row in files}
-    for row in files:
-        row["dependencies"] = [dep for dep in row.get("dependencies", []) if dep in known]
-    return files
 
 
 def _json_block(value: object) -> str:

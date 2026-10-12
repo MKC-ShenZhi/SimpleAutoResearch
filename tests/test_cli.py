@@ -24,6 +24,88 @@ TEST_ROOT = Path(__file__).resolve().parents[1] / ".tmp_tests"
 
 
 class CliTests(unittest.TestCase):
+    def test_native_retry_model_cli_routes_only_explicit_selector_and_confirms_once(self):
+        from simple_ar.core.budget import BudgetLedger
+
+        app = MagicMock()
+        app.state = {'config': {'model': 'profile:saved'}, 'pending': None}
+        app.session.store.root = Path('saved-task').resolve()
+        app.ledger = BudgetLedger({'llm_requests': 8, 'total_tokens': 100000})
+        app.run.return_value = {'status': 'paused', 'status_reason': 'Saved response'}
+        client = MagicMock()
+        client.connection_binding.return_value = {'profile': 'new', 'settings': {
+            'base_url': 'https://replacement.invalid/v1', 'model': 'replacement-model'}}
+        base = ['start', '--resume-task', 'saved-task', '--retry-model']
+        with patch('simple_ar.app.tool_application.ToolApplication.load', return_value=app), \
+                patch('simple_ar.integrations.llm.LLMClient.from_env', return_value=client) as factory, \
+                patch('simple_ar.cli.main._render_native_result'), \
+                patch('sys.stdin.isatty', return_value=False), \
+                patch.dict('os.environ', {'SIMPLE_AR_MODEL': 'profile:environment-default'}), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            main(base)
+            self.assertEqual(app.run.call_args.kwargs.get('retry_model_selector', ''), '')
+            self.assertTrue(app.run.call_args.kwargs['retry_model'])
+            factory.assert_not_called()
+            app.run.reset_mock()
+            for selector in ('profile:new', 'route:default'):
+                with self.subTest(selector=selector):
+                    main([*base, '--model', selector, '--prepare-only'])
+                    app.run.assert_not_called()
+                    main([*base, '--model', selector])
+                    app.run.assert_not_called()
+                    with patch('sys.stdin.isatty', return_value=True), \
+                            patch('builtins.input', return_value='n') as confirm:
+                        main([*base, '--model', selector])
+                        confirm.assert_called_once()
+                        app.run.assert_not_called()
+                    with patch('sys.stdin.isatty', return_value=True), \
+                            patch('builtins.input', return_value='y') as confirm:
+                        main([*base, '--model', selector])
+                        confirm.assert_called_once()
+                        app.run.assert_called_once()
+                    self.assertEqual(app.run.call_args.kwargs['retry_model_selector'], selector)
+                    self.assertEqual(app.state['config']['model'], 'profile:saved')
+                    app.run.reset_mock()
+                    with patch('builtins.input') as confirm:
+                        main([*base, '--model', selector, '--yes'])
+                        confirm.assert_not_called()
+                    app.run.assert_called_once()
+                    self.assertEqual(app.run.call_args.kwargs['retry_model_selector'], selector)
+                    app.run.reset_mock()
+            self.assertIn('https://replacement.invalid/v1', output.getvalue())
+            self.assertIn('replacement-model', output.getvalue())
+
+    def test_native_resume_cli_rejects_explicit_model_change_without_retry(self):
+        from simple_ar.core.budget import BudgetLedger
+
+        app = MagicMock()
+        app.state = {'config': {'model': 'profile:saved'}, 'pending': None}
+        app.session.store.root = Path('saved-task').resolve()
+        app.ledger = BudgetLedger({'llm_requests': 8, 'total_tokens': 100000})
+        app.run.return_value = {'status': 'paused', 'status_reason': 'Saved response'}
+        base = ['start', '--resume-task', 'saved-task']
+        with patch('simple_ar.app.tool_application.ToolApplication.load', return_value=app), \
+                patch('simple_ar.integrations.llm.LLMClient.from_env') as factory, \
+                patch('simple_ar.cli.main._render_native_result'), \
+                patch('sys.stdin.isatty', return_value=False), \
+                patch.dict('os.environ', {'SIMPLE_AR_MODEL': 'profile:environment-default'}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            before = app.ledger.to_dict()
+            for selector in ('profile:new', 'route:default', 'raw-model'):
+                with self.subTest(selector=selector), self.assertRaises(SystemExit):
+                    main([*base, '--model', selector])
+                app.run.assert_not_called()
+                factory.assert_not_called()
+                self.assertEqual(app.ledger.to_dict(), before)
+                self.assertEqual(app.state['config']['model'], 'profile:saved')
+            for flags in ([], ['--model', 'profile:saved']):
+                main([*base, *flags])
+                app.run.assert_called_once()
+                self.assertFalse(app.run.call_args.kwargs['retry_model'])
+                self.assertEqual(app.run.call_args.kwargs.get('retry_model_selector', ''), '')
+                app.run.reset_mock()
+            factory.assert_not_called()
+
     def test_visual_review_sends_snapshot_preserves_original_and_recovers_without_call(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -530,6 +612,28 @@ class CliTests(unittest.TestCase):
             )
             self.assertIn("task_plan", resumed.view().state_refs)
             self.assertEqual(resumed.view().budget["attempts"], len(resumed.view().attempts))
+            # Historical CodeTask continues through its saved orchestrator,
+            # including greenfield strategy; it is not converted to native.
+            saved = root / "saved-code-task.toml"
+            saved.write_text('[execute]\nmodel="profile:saved"\nplanning_mode="compact"\n'
+                             'repair_rounds=2\n[environment]\nmode="current"\n', encoding="utf-8")
+            code_run = root / "old-code-run"
+            before = saved.read_bytes()
+            with patch("simple_ar.cli.main.execute_code_task") as execute, \
+                    patch("simple_ar.cli.main.render_execute_header"), \
+                    patch("simple_ar.cli.main.render_execute_result"), \
+                    patch("simple_ar.app.tool_application.ToolApplication.create") as native:
+                main(["code-task", "execute", str(code_run), "--config", str(saved),
+                      "--to-step", "validate", "--no-llm", "--no-review-inline"])
+            execute.assert_called_once()
+            self.assertEqual(execute.call_args.args[0], code_run)
+            self.assertEqual(execute.call_args.kwargs["to_step"], "validate")
+            self.assertEqual(execute.call_args.kwargs["planning_mode"], "compact")
+            self.assertEqual(execute.call_args.kwargs["repair_rounds"], 2)
+            self.assertEqual(execute.call_args.kwargs["model"], "profile:saved")
+            self.assertFalse(execute.call_args.kwargs["use_llm"])
+            self.assertEqual(saved.read_bytes(), before)
+            native.assert_not_called()
 
     def test_research_session_cli_resume_without_model_fails_before_mutation(self) -> None:
         from simple_ar.app.research_application import (
@@ -1402,12 +1506,31 @@ class CliTests(unittest.TestCase):
                         contextlib.redirect_stdout(io.StringIO()):
                     config.write_text(original_config + f"repair_rounds = {repairs}\n")
                     main(["research-session", "--task-kind", "bug_fix", "--topic", "Repair the project",
-                          "--model", "gpt-5.4", "--code-task-config", str(config),
+                          "--model", "gpt-5.4", "--code-task-config", str(config), "--with-report",
                           *(["--process-invocations", "0", "--process-wall-seconds", "0"] if explicit else [])])
                     limits = created.call_args.kwargs["services"].budget_limits
                     self.assertEqual(limits["process_invocations"], count)
                     self.assertEqual(limits["process_wall_seconds"], seconds)
+                    self.assertEqual(created.call_args.args[0].requested_outputs, ("bug_fix", "report"))
+                    self.assertEqual(created.call_args.kwargs["services"].config["report"]["template"], "auto")
+                    self.assertEqual(created.call_args.kwargs["services"].config["report"]["mode"], "supplied_materials")
             config.write_text(original_config)
+            greenfield = root / "greenfield.toml"
+            greenfield.write_text('[code_task]\nkind="greenfield"\n' +
+                f'task_file="{task_file.as_posix()}"\n[workspace]\nmode="empty"\n' +
+                '[edit_scope]\nallowed_patterns=["generated_project/**"]\n' +
+                '[benchmark]\ncommand="python generated_project/main.py"\n' +
+                '[execute]\nuse_llm=true\nbaseline_policy="skip"\n', encoding="utf-8")
+            with patch("simple_ar.cli.main._optional_research_llm_client", return_value=object()), \
+                    patch("simple_ar.app.research_application.create_session", return_value=app) as creator, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                main(["research-session", "--topic", "Create a project", "--model", "fixture-model",
+                      "--code-task-config", str(greenfield), "--outputs", "code_task", "report"])
+            new_execution = creator.call_args.kwargs["services"].config["execution"]
+            self.assertEqual(new_execution["code_task"]["kind"], "greenfield")
+            self.assertIsNone(new_execution["code_task"]["code_root"])
+            self.assertEqual(new_execution["code_task"]["workspace_mode"], "empty")
+            self.assertEqual(creator.call_args.args[0].requested_outputs, ("code_task", "report"))
             reproduction = root / "reproduction.toml"
             reproduction.write_text(
                 '[task]\ngoal="Check published conditions"\nkind="reproduction"\noutputs=["experiments"]\n'

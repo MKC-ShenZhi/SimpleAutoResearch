@@ -109,7 +109,8 @@ class AnalysisWritingTests(unittest.TestCase):
                       '--data-file', str(source), '--group-column', 'label', '--value-column', 'score',
                       '--observation-unit', 'one supplied row', '--value-unit', 'points', '--prepare-only']
             parser = build_parser()
-            with patch('sys.stdin.isatty', return_value=False), contextlib.redirect_stdout(io.StringIO()):
+            with patch('sys.stdin.isatty', return_value=False), \
+                    patch('simple_ar.cli.start.select_start_model'), contextlib.redirect_stdout(io.StringIO()):
                 plain = prepare_start(parser.parse_args([*common, '--output-root', str(root / 'plain')]))
                 report = prepare_start(parser.parse_args([*common, '--with-report', '--model', 'env',
                     '--output-root', str(root / 'report')]))
@@ -232,6 +233,11 @@ class AnalysisWritingTests(unittest.TestCase):
         self.assertEqual(view.status, 'completed', view.status_reason)
         return app.controller.store.resolve(view.state_refs['data_analysis'])
 
+    def package_input(self, root):
+        path = self.package(root)
+        store = ArtifactStore(path.parent)
+        return path, store, store.ref(path.name, kind='table_analysis', schema='table_analysis.v1')
+
     def test_rechecks_package_rejects_stale_records_and_raw_json(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -241,22 +247,18 @@ class AnalysisWritingTests(unittest.TestCase):
             self.assertIn('value unit (user-declared): points',
                           json.loads(path.read_text(encoding='utf-8'))['figures'][0]['caption'])
             original = path.read_text(encoding='utf-8')
-            payload = json.loads(original)
-            payload['records'][0]['mean'] = 999
-            path.write_text(json.dumps(payload), encoding='utf-8')
-            with self.assertRaisesRegex(ValueError, 'no longer matches'):
-                load_analysis_package(path)
-            path.write_text('[{"score":1}]', encoding='utf-8')
-            with self.assertRaisesRegex(ValueError, 'table_analysis.v1'):
-                load_analysis_package(path)
-            path.write_text('{"schema_version":"table_analysis.v1","status":"completed"}', encoding='utf-8')
-            with self.assertRaisesRegex(ValueError, 'column settings'):
-                load_analysis_package(path)
-            payload = json.loads(original)
-            payload['source'] = {}
-            path.write_text(json.dumps(payload), encoding='utf-8')
-            with self.assertRaisesRegex(ValueError, 'relative path'):
-                load_analysis_package(path)
+            stale = json.loads(original)
+            stale['records'][0]['mean'] = 999
+            missing_source = json.loads(original)
+            missing_source['source'] = {}
+            for contents, error in ((json.dumps(stale), 'no longer matches'),
+                    ('[{"score":1}]', 'table_analysis.v1'),
+                    ('{"schema_version":"table_analysis.v1","status":"completed"}', 'column settings'),
+                    (json.dumps(missing_source), 'relative path')):
+                with self.subTest(error=error):
+                    path.write_text(contents, encoding='utf-8')
+                    with self.assertRaisesRegex(ValueError, error):
+                        load_analysis_package(path)
 
     def test_pre_coordinate_v1_package_keeps_bar_defaults_and_imports(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -294,7 +296,7 @@ class AnalysisWritingTests(unittest.TestCase):
             root = Path(directory)
             path = self.package(root)
             argv = ['start', '--kind', 'writing', '--goal', 'Explain data honestly', '--material', str(path),
-                    '--output-root', str(root / 'guided'), '--prepare-only']
+                    '--template', 'material_report', '--output-root', str(root / 'guided'), '--prepare-only']
             with patch('sys.stdin.isatty', return_value=False), contextlib.redirect_stdout(io.StringIO()):
                 config = prepare_start(build_parser().parse_args(argv))
             settings = research_defaults(['research-session', '--config', str(config)])
@@ -389,9 +391,7 @@ class AnalysisWritingTests(unittest.TestCase):
         from simple_ar.report.schema import ReportDocumentPlan, ReportSectionPlan
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            path = self.package(root)
-            source = ArtifactStore(path.parent)
-            ref = source.ref(path.name, kind='table_analysis', schema='table_analysis.v1')
+            path, source, ref = self.package_input(root)
             original = path.read_bytes()
             drafts = (ReportSectionDraft(section_id='findings', heading='Findings', draft_markdown='Supported observations.'),
                       ReportSectionDraft(section_id='limits', heading='Limits', draft_markdown='No population inference.'))
@@ -434,9 +434,7 @@ class AnalysisWritingTests(unittest.TestCase):
         from simple_ar.report.schema import ReportDocumentPlan, ReportSectionPlan, ReportVisualIntent
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            path = self.package(root)
-            inputs = ArtifactStore(path.parent)
-            ref = inputs.ref(path.name, kind='table_analysis', schema='table_analysis.v1')
+            _, inputs, ref = self.package_input(root)
             drafts = tuple(ReportSectionDraft(section_id=key, heading=key, draft_markdown='Supported observations.')
                            for key in ('scope', 'findings', 'limits'))
             plan = ReportDocumentPlan(sections=[ReportSectionPlan(section_id=row.section_id, heading=row.heading,
@@ -463,9 +461,7 @@ class AnalysisWritingTests(unittest.TestCase):
         from simple_ar.report.capability import assemble_report_document
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            path = self.package(root)
-            inputs = ArtifactStore(path.parent)
-            ref = inputs.ref(path.name, kind='table_analysis', schema='table_analysis.v1')
+            _, inputs, ref = self.package_input(root)
             for settings, included in (({'enabled': True}, True), ({'enabled': False}, False), ({'mode': 'off'}, False)):
                 store = ArtifactStore(root / str(settings))
                 request = ReportAssemblyRequest(title='Describe', sections=(ReportSectionDraft(section_id='discussion',

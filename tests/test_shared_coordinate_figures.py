@@ -2,10 +2,12 @@
 import contextlib
 import io
 import json
+import math
 from pathlib import Path
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
+from tests import captured_data_figures
 
 from simple_ar.cli.main import main
 from simple_ar.result_analysis.table import TableSpec, describe_table, load_analysis_package, rebuild
@@ -20,20 +22,23 @@ class SharedCoordinateTests(unittest.TestCase):
                          x_column="step", value_unit="points", **changes)
 
     def test_shared_panel_has_common_scale_legend_and_unchanged_values(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, captured_data_figures() as drawn:
             root = Path(directory)
             result = describe_table(self.rows, self.spec(series_layout="shared"))
             figures = render_table_figures(result, root)
             self.assertEqual(len(figures), 1)
             svg = ET.parse(root / figures[0]["path"]).getroot()
-            points = svg.findall(".//{*}circle")
-            self.assertEqual(len(points), 4)
-            self.assertEqual(points[1].get("cy"), points[2].get("cy"))
+            self.assertEqual(len(drawn[0].axes), 1)
+            ax = drawn[0].axes[0]
+            points = ax.collections[0].get_offsets().tolist()
+            self.assertCountEqual(points, [[0, 0], [1, 2], [0, 2], [1, 4]])
+            self.assertEqual(ax.transData.transform(points[1])[1], ax.transData.transform(points[2])[1])
+            self.assertEqual([node.get_text() for node in ax.get_legend().get_texts()], ["A", "B"])
             labels = [(node.text or "") + "".join(child.tail or "" for child in node) for node in svg.findall(".//{*}text")]
             self.assertIn("A", labels)
             self.assertIn("B", labels)
             self.assertEqual([row["value"] for row in result["records"]], [0, 2, 2, 4])
-            self.assertIn("no normalization", figures[0]["caption"])
+            self.assertIn("Series share axes", figures[0]["caption"])
             self.assertNotIn("sample_std", result["records"][0])
 
     def test_default_and_legacy_spec_keep_separate_axes(self):
@@ -44,26 +49,38 @@ class SharedCoordinateTests(unittest.TestCase):
 
     def test_missing_points_break_only_their_own_line(self):
         rows = [self.rows[0], {"step": .5, "A": None, "B": 3}, self.rows[1]]
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, captured_data_figures() as drawn:
             root = Path(directory)
             figure = render_table_figures(describe_table(rows, self.spec(series_layout="shared", missing="omit")), root)[0]
-            paths = ET.parse(root / figure["path"]).getroot().findall(".//{*}path")
-            curves = [node for node in paths if node.get("stroke-width") == "1.5"]
-            self.assertEqual([node.get("d").count("M") for node in curves], [2, 1])
+            ET.parse(root / figure["path"])
+            curves = drawn[0].axes[0].lines
+            self.assertEqual(len(curves), 2)
+            self.assertEqual([line.get_xdata().tolist() for line in curves], [[0, .5, 1], [0, .5, 1]])
+            self.assertEqual([math.isnan(v) for v in curves[0].get_ydata()], [False, True, False])
+            self.assertEqual(curves[0].get_ydata()[[0, 2]].tolist(), [0, 2])
+            self.assertEqual(curves[1].get_ydata().tolist(), [2, 3, 4])
+            self.assertEqual(len(drawn[0].axes[0].collections[0].get_offsets()), 5)
 
     def test_column_labels_wrap_without_losing_common_unit(self):
         spec = TableSpec(("A", "B"), "point", mode="values", plot="scatter", x_column="step",
                          width="column", series_layout="shared", value_unit="author-defined conditional coverage error")
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, captured_data_figures() as drawn:
             root = Path(directory)
             figure = render_table_figures(describe_table(self.rows, spec), root)[0]
             svg = ET.parse(root / figure["path"]).getroot()
             labels = [(node.text or "") + "".join(child.tail or "" for child in node) for node in svg.findall(".//{*}text")]
-            self.assertIn("Values (author-defined conditional", labels)
-            self.assertIn("coverage error)", labels)
-            self.assertGreater(float(svg.get("viewBox").split()[-1]), 340)
-            points = [node for node in svg.findall(".//{*}circle") if node.find("{*}title") is not None]
-            self.assertEqual(len(points), 4)
+            ax = drawn[0].axes[0]
+            self.assertEqual(" ".join(ax.get_ylabel().split()), "Values (author-defined conditional coverage error)")
+            self.assertIn("\n", ax.get_ylabel())
+            self.assertIn(" ".join(ax.get_ylabel().split()), " ".join(" ".join(labels).split()))
+            self.assertAlmostEqual(drawn[0].get_figwidth(), 3.5)
+            self.assertAlmostEqual(float(svg.get("viewBox").split()[-1]), drawn[0].get_figheight() * 72)
+            label_box = ax.yaxis.label.get_window_extent(drawn[0].canvas.get_renderer())
+            self.assertGreaterEqual(label_box.x0, 0)
+            self.assertGreaterEqual(label_box.y0, 0)
+            self.assertLessEqual(label_box.x1, drawn[0].bbox.width)
+            self.assertLessEqual(label_box.y1, drawn[0].bbox.height)
+            self.assertCountEqual(ax.collections[0].get_offsets().tolist(), [[0, 0], [1, 2], [0, 2], [1, 4]])
 
     def test_physical_point_limit_applies_to_the_entire_shared_panel(self):
         with tempfile.TemporaryDirectory() as directory:

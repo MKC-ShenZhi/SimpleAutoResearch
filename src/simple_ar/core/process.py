@@ -98,7 +98,44 @@ class _Capture:
             "tail_bytes_discarded": max(0, self.total - len(self.tail)),
             "log_bytes_discarded": max(0, self.total - self.written) if self.path else None,
             "log_path": str(self.path) if self.path else None,
+            "observation_source": "final_tail",
+            "observation_bytes_discarded": max(0, self.total - len(self.tail)),
+            "final_tail_available": True,
         }
+
+
+def process_observation(record: dict, output_dir: Path, *, tail_bytes: int = 12000) -> dict:
+    """Project finalized output without executing or rewriting an invocation.
+
+    New receipts own the exact decoded final tails. Legacy logs contain a
+    bounded prefix, so their last bytes cannot stand in for a lost final tail.
+    """
+    if record["status"] not in {"finished", "stopped"}:
+        raise ValueError("Only finalized process records have recoverable output")
+    if tail_bytes < 1:
+        raise ValueError("A positive legacy tail limit is required")
+    streams = {name: dict(record.get("streams", {}).get(name, {}))
+               for name in ("stdout", "stderr")}
+    if "output" in record:
+        output = {name: record["output"][name] for name in streams}
+    else:
+        output = {}
+        for name, metadata in streams.items():
+            with (output_dir / f"{name}.log").open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                handle.seek(max(0, handle.tell() - tail_bytes))
+                raw = handle.read(tail_bytes)
+            output[name] = raw.decode("utf-8", errors="replace").replace("\r\n", "\n")
+            seen = metadata.get("bytes_seen")
+            metadata.update(
+                observation_source="legacy_log_tail", final_tail_available=False,
+                observation_bytes_discarded=max(0, seen - len(raw)) if seen is not None else None,
+            )
+            # Missing historical measurements are unknown, never zero omissions.
+            metadata.setdefault("log_bytes_discarded", None)
+            metadata.setdefault("tail_bytes_discarded", None)
+    return {"returncode": record["returncode"], "stop_reason": record.get("stop_reason"),
+            **output, "streams": streams}
 
 
 def run_process(
@@ -278,13 +315,15 @@ def _run_process(
         stop_reason=stop_reason, returncode=process.returncode,
         finished_at=datetime.now(timezone.utc).isoformat(), duration_sec=duration,
         streams={name: capture.metadata() for name, capture in captures.items()},
+        output={name: capture.tail.decode("utf-8", errors="replace").replace("\r\n", "\n")
+                for name, capture in captures.items()},
     )
     save()
     if errors:
         raise errors[0]
     return ProcessResult(
         returncode=process.returncode, stop_reason=stop_reason,
-        stdout=captures["stdout"].tail.decode("utf-8", errors="replace").replace("\r\n", "\n"),
-        stderr=captures["stderr"].tail.decode("utf-8", errors="replace").replace("\r\n", "\n"),
+        stdout=record["output"]["stdout"],
+        stderr=record["output"]["stderr"],
         duration_sec=duration, record=record,
     )

@@ -6,17 +6,377 @@ Use this page to look up command syntax and effects. For a first task, follow [U
 
 ## Guided entry
 
-`simple-ar models [--config PATH] [--profile NAME --purpose text|code|vision|image]`
+`simple-ar models [--config PATH] [--profile NAME --purpose text|code|writing|vision|image]`
 inspects named connections and credential presence locally, without API calls or showing keys.
-See [model configuration](CONFIG_REFERENCE.md#named-model-connections) for activation and routing.
+For shared setup, put the catalog at `~/.config/simple-ar/models.toml` or select
+its absolute path with `SIMPLE_AR_MODELS_CONFIG`. TOML holds routes and connection
+settings; `api_key_env` references credentials held in the environment/private `.env`.
+`start` displays text profiles and offers a terminal selection. `--model env`
+uses text/default when a catalog exists, otherwise the legacy environment connection;
+`--model profile:NAME` selects explicitly. Code work uses the code route; native
+writing without a writing route keeps the task connection. Native decisions require
+Chat. See [model configuration](CONFIG_REFERENCE.md#named-model-connections) for activation and routing.
 
 ```bash
 uv run simple-ar start
+uv run simple-ar start --guided
 uv run simple-ar start --chat
 uv run simple-ar start --kind writing --material notes.md --model env
 ```
 
-`start` prepares an ordinary task and delegates execution to `research-session`.
+Bare `start` prompts for a natural-language goal and uses the native loop.
+Ordinary `--kind` choices and `--guided` select outcome preferences for that same
+native owner: survey, writing, reproduction, repair, data, figure and code.
+The adapter asks for a goal and common read-only material/project/data paths;
+optional public-source/process-proposal access needs explicit confirmation.
+It reuses the named-model selector and task summary. The kind grants no access.
+Explicit structured protocols retain `research-session` compatibility; their
+controls cannot be mixed with native access/budget options.
+
+### Native task entry (experimental)
+
+```bash
+simple-ar start "Inspect these results and explain the comparison" --source results/ --model profile:NAME --yes
+simple-ar start --resume-task SESSION "Shorten the explanation without rerunning"
+simple-ar start --resume-task SESSION --retry-model
+simple-ar start --resume-task SESSION "Use these additional notes" --source notes/ --allow-network --yes
+simple-ar start --resume-task SESSION --authorize-remaining llm_requests=10 --authorize-remaining total_tokens=100000 --authorization-id continuation-1 --authorization-reason "Finish the saved goal" --yes
+```
+
+A positional request, `--goal` without structured options, or bare `start` uses the
+native tool loop, not the structured task pipeline.
+Repeat `--source PATH` to expose read-only files/directories as `source0`, `source1`, etc.;
+new files are written in the session's `workspace/`. New mounts must be regular files
+or directories, not symlinks or private/runtime paths such as `.aws` or `.env`.
+The same private-name policy applies inside mounted roots regardless of letter
+case, including listing, search and inspection before source reads.
+Creation and added-access requests use the same checks before changing the task;
+an invalid addition leaves the existing mounts, permissions and ledger unchanged.
+`--prepare-only` saves a task without
+model calls. `--max-turns` (30) and `--max-tokens` (600000) bound the whole saved task,
+including feedback; resume does not reset them. This entry currently supports local
+text investigation, source search/acquisition, code creation, result explanation and
+publication export. Image tools require explicit named routes and allowances.
+Complete research acceptance has not passed; tool availability is not task success.
+Token accounting reserves the estimated input before dispatch. Without an output
+cap, the final response can exceed the remaining estimate; actual usage is still
+recorded and further requests stop. A task token allowance is not a strict
+provider-side spending cap when output is uncapped.
+On continuation, `--source`, `--allow-network`, `--allow-execution` and `--allow-vision`
+can explicitly add access after confirmation (`--yes` for noninteractive use).
+Existing mounts, model binding, interpreter, completed work and budgets remain unchanged;
+process commands still require separate approval. Started or unknown operations must
+be reconciled first. On resume, `--prepare-only` displays the proposal without applying
+it; do not combine an access grant with `--approve-execution`.
+After a terminated, failed native model decision without an accepted reply,
+`--retry-model` explicitly permits a new decision attempt using the saved finite
+output cap and remaining allowance. Prior failures and bounded unknown charges
+remain recorded and reserved; neither tools nor the whole task are replayed.
+Cached replies follow ordinary recovery without a new request. Running requests,
+unconfirmed reservations, unbounded unknown charges and pending tools are refused.
+Use this option separately from feedback, access/resource grants and command
+approval. Ordinary resume does not silently replace a failed model request;
+`--prepare-only` still makes no change or call.
+To replace an unreliable connection for that closed failed decision, add
+`--model profile:NAME` or `--model route:NAME` to `--retry-model`. The confirmation
+shows the selected text, code and writing connections. Their resolved bindings and
+the transition are saved together with the new decision identity; vision retains
+its original binding. The replacement must use Chat and the same finite output cap.
+History that lacks required reasoning fields is not reconstructed: choose a
+compatible non-thinking profile instead. Cached replies cannot change connections,
+and an explicit different `--model` without `--retry-model` is rejected. Omitting
+`--model` retains the saved selector, not the current environment default.
+To explicitly continue a resource-limited saved goal, use the same repeated
+`--authorize-remaining DIMENSION=AMOUNT` format as `research-session`, with
+`--authorization-id` and `--authorization-reason`. These options require
+`--resume-task`; an ID or reason without allowances is rejected. The confirmation
+shows recorded cumulative usage and the proposed remaining allowances: historical
+usage is preserved, and the new remaining amount is not a total historical limit.
+`--yes` accepts this summary; `--prepare-only` only previews it and never authorizes
+or runs the task. Reusing an authorization ID does not replenish spent
+capacity. Ordinary `--max-tokens`/`--max-turns` do not add resources on resume.
+Model bindings and permissions remain unchanged; commands still need exact approval.
+Confirm resource continuation separately from `--approve-execution`, and reconcile
+started or unknown operations first.
+File tools accept short authorized mount locators, such as `source0/README.md` and
+`workspace/project`, as well as observed absolute paths within those roots.
+Observations provide filesystem addresses for generated code and argv; mount names
+are not actual directories, and embedded program strings are never rewritten.
+Experimental `focus_work` selects the TOML `code` or optional `writing` route for a
+concrete work goal, or returns to the original task connection with `task`. It changes
+the next model decision only, not tools, authorization, approvals or shared allowances.
+Request a switch alone; resume derives its focus from saved results without creating
+a subtask or resetting the ledger. Successful switching is not task verification.
+Both professional focuses can investigate evidence, edit, use authorized tools and
+deliver in the same action loop. Writing without an explicit route retains the
+original task client. Native focus requires Chat mode and rejects unsupported
+protocols; `compose_document` separately retains its existing Responses support.
+Absolute paths do not authorize extra roots or source modification.
+The latest actual `run_process` result and latest nonzero result remain available when older turns are
+indexed. A complete, path-bound read-back is reused rather than duplicated.
+This retains that execution's exit code and streams, not proof about the current
+file version or an unresolved-failure declaration; a cancelled or blocked proposal does not replace the result.
+Historical indexes may use lossless columns/rows instead of repeated object keys.
+Original receipts remain readable; final context metadata is included in input estimates.
+Source lookup and composition check resolved ownership for both path forms: generated
+workspace documents and attempt history cannot be used as original-source records.
+Composition may fill missing bibliographic fields from retained front matter in the
+same writing response. Exact source quotations are checked; this is not independent
+publication-identity verification, and supplied metadata is not replaced.
+Each model turn receives remaining shared-ledger capacity, unknown-usage dimensions
+and an approximate input-cost estimate. These inform scope decisions, not guarantee
+completion or increase the saved limits.
+`prepare_implementation` may take `goal` and `project_path`
+without a file list: the code owner inspects the bounded project, selects related
+existing/new files in one model request and passes hash-bound originals to the
+existing generation request. Selected existing files that need no change can
+return empty replacements and retain their original bytes; selection does not
+require manufacturing edits. Explicit `files` remain available for new or already
+investigated code. Selection and generation share the task ledger; selection is
+retained with coverage and inputs, not a second plan or session. A complete
+response-contract rejection can receive one correction within the remaining
+allowance; both proposals are retained. Transport failures, unknown use and
+Python syntax failures are not replayed by this owner. Interrupted submissions
+are not blindly replayed. Generation does not transfer, execute, verify or deliver
+the candidate.
+
+`inspect_project` reuses the read-only project preparation inspector for an
+authorized directory and optional explicit `data_paths`. It returns declared
+dependencies, entry/test/document candidates, coverage and a readable full
+attempt record. Private paths are excluded before indexing. This derived
+observation is not original-paper evidence, execution authorization or proof
+that the task interpreter is ready; no project code is imported or run.
+`copy_project` prepares an editable project from an authorized source directory
+using the existing CodeTask copy owner through the same workspace gateway.
+Set `source` to the directory and `path` to a nonexistent subdirectory of the
+writable workspace; absolute authorized paths and legacy mount aliases are accepted.
+For example, tool arguments `{"source":"source0/project","path":"workspace/project"}`
+copy ordinary source, tests, configuration, documentation and binary resources
+without a shell, network access or project execution. The source stays unchanged.
+Cache/build directories, symlinks and native private/runtime paths are skipped,
+including `.git`, `.aws`, `.ssh`, `.codex`, `.agents`, virtual environments and
+all `.env*` names (also `.env.example`). Oversized individual files are skipped.
+The `copy` report records counts, bytes and a bounded list of skips with reasons;
+inspect it before deciding whether the editable subset is sufficient.
+`max_files` defaults to 1000 (1–4096), `max_total_bytes` to 134217728
+(128 MiB; 1–536870912), and `max_file_bytes` to 2000000 (1–67108864).
+Invalid paths, an empty eligible source, an existing destination or exceeded
+file-count/total-byte limits reject the operation without publishing a target.
+Successful data includes `absolute_path`, `source`, `copy` and `files` with
+project-relative paths and SHA256 digests. Before publishing the candidate,
+`attempts/IDENTITY/project-copy.json` records the request and output hashes.
+Recovery requires the same request and matching current target hashes; a repeated
+ID returns the saved result rather than copying again. A mismatch blocks recovery.
+This is an editable subset, not a complete Git repository copy. It does not
+guarantee no omissions, installed dependencies, a ready environment or verified
+execution. Execution continues to require the normal authorization and approval
+under the existing SessionController owner.
+`write_file` accepts an optional explicit `delivery` containing `summary`,
+`artifacts` and `unresolved`. It must include the file being written; all other
+artifacts must already exist in the writable workspace. Invalid paths are rejected
+before writing. A successful final write uses the existing delivery/terminal-state
+owner; ordinary writes and standalone `deliver_result` retain their behavior.
+Artifacts may also name workspace project directories. The existing inventory
+expands each directory to an explicit snapshot of at most 200 accessible files,
+excluding private paths, virtual environments, Python bytecode caches and symlinks.
+Empty or oversized selections are rejected, not silently truncated. This records
+files, not an archive or proof that the project is portable or correct.
+New native tasks save a non-secret connection binding. Changing the named model,
+endpoint or protocol rejects further calls and execution; restore the original
+catalog, or start a new task. Credential rotation and operational timeout/output
+limits use the existing compatibility rules. Older native tasks without this
+snapshot retain legacy resolution; their historical connection cannot be reconstructed.
+Composition and code preparation resolve their clients through that task owner;
+they do not independently choose another default connection. Newly authorized
+vision also saves its own non-secret binding, excluding the unused code route.
+Changing its model/profile/endpoint rejects image inspection before sending;
+credentials may rotate and operational timeout/output settings may change.
+Older already-authorized vision tasks without a binding retain legacy resolution,
+not a reconstructed historical identity. Image generation keeps its versioned
+submission/recovery owner and is separate from this vision binding.
+The soft input-history retention target uses the current connection's
+`context_input_tokens` (default 24000 estimated tokens), including tool schemas,
+and finite capacity subtracts the current connection's effective output reservation
+from the remaining token allowance, without dividing it by the request ceiling.
+The current complete operation remains intact even if it exceeds the target.
+Earlier complete assistant/tool blocks are retained contiguously while shared capacity
+permits, preserving decisions and their matching results. `retained_turn_start` identifies
+that suffix; omitted turns may contribute version-checked text windows and a recent
+observation view limited to 2000 estimated tokens, without duplicating retained blocks.
+`history_archive` identifies omitted accepted-turn ranges and historical failure counts,
+not missing evidence or resolved failures. The read-only `read_history` tool pages those
+indexes without a model call or another memory store. Continue byte windows with the
+returned `end_turn` pinned and `next_offset_bytes`; attempt numbers are not turn indexes.
+Original records and inline cancellation results remain accessible. The latest execution
+and latest nonzero execution retain their original diagnosis when not already visible.
+Historical identities are not current file contents or verified conclusions. Older model
+deliberation remains in raw records. This is not an output cap or exact tokenizer guarantee and does not bypass
+budget preflight; a protected context may still exceed the target or remaining capacity.
+If the indivisible current turn alone exceeds this soft target, optional earlier
+blocks, indexes and text windows are omitted; the complete operation is never split.
+`--project-python PATH` selects an existing interpreter for native `python`/`python3` process
+calls and preserves a virtualenv entry path. It neither installs dependencies nor
+creates an environment. The saved interpreter is reused on task continuation;
+resume cannot silently replace it. Its executable directory leads the filtered
+process `PATH`, so child commands can use the same task environment. Python scripts
+should use `sys.executable` for portable child calls; no alias shims or environments
+are created. Command approval binds the resolved argv and filtered environment;
+changes require approval again. Existing execution receipts recover without rerunning.
+
+`list_directory` can discover filenames recursively with `file_glob`, returning
+mounted paths and pagination without file contents. Traversal stops after 4096
+entries and reports `inventory_truncated`; a truncated inventory is not proof
+that a file is absent. For retained document records, omit the query in
+`find_source_passages` to inspect identity and coverage first, then query text
+for actual evidence rather than reading the whole serialized bundle.
+
+The experimental `compose_document` tool drafts an article from selected retained
+DocumentBundle chunk IDs, or creates a feedback version from an existing Markdown
+draft. It uses the explicit writing route when configured, otherwise the task's
+selected text connection, with the shared model budget, and saves
+a new `manuscript.md` with publication citation keys and references, and preserves
+the old draft. Inspect, edit and export that same body; the assembler's display
+snapshot remains a tool record, not another editable manuscript.
+New whole-article work units explicitly bind their assembly form and retain authored
+heading hierarchy. Historical work units keep their original assembly form during
+resume; changing a saved assembly is not a way to relayout a completed export.
+New compositions make one whole-article writing request from selected original
+passages, material windows, known bibliography, figures and an optional prior
+draft, without the legacy section-planning/review lifecycle. The original input
+and response are retained before validation. The shared LLM client owns bounded
+transport attempts and accounting; this work unit adds no format correction or
+separate retry loop. Directory selection remains a separate
+shared-budget request when needed. Structured writing commands are unchanged.
+An omitted material line limit keeps byte-window semantics. Recovery reads the
+originally bound byte range and verifies its contents, rather than reinterpreting
+historical serialized defaults under the current reader.
+It does not search, run experiments or independently review its output; the calling task must inspect
+the article and verify consequential claims. A complete, input-bound article
+response can resume assembly and missing publication files without another model
+request. Historical Writer results retain their original checkpoint validation.
+Partial, unknown or failed writing results are not resubmitted; changed
+partial files are preserved and rejected. Reuse checks the saved manuscript, references
+and figure bytes. Edited or missing outputs (or older records without byte bindings)
+require inspection or a new feedback version, not automatic regeneration.
+Ordinary-entry composition acceptance
+has not passed merely because this tool is available.
+Retained original connector identities are reused for citations without a second
+intake role assignment. Unknown publication fields stay unknown; prior drafts
+and derived analysis remain different from original references.
+
+For local material directories, `material_roots` delegates file selection to the
+writing owner instead of requiring coordinator-selected `materials` windows.
+Selection uses the same bounded, private-path-filtered inventory as code preparation;
+it consumes the shared model allowance and binds the visible file versions.
+The result reports selected files, unread coverage and omitted-file counts.
+Roots may include retained `document_bundle.v1` originals, such as the task's
+`evidence` directory. Selection preserves their identities and chooses focused
+source questions for the existing passage retriever and Writer; generated
+workspace files and attempt history cannot become original-source evidence.
+Source declarations and previews are not verified claims. The operation does
+not search or acquire new sources.
+`material_roots` may accompany explicit `sources`, figures and a prior draft;
+only explicit `materials` windows and `material_roots` are mutually exclusive. Explicit
+locators use authorized absolute paths or mount aliases such as `workspace/…`;
+they are checked before paid selection. Saved mixed-selection requests retain
+their bound recovery semantics, not permission to change the selection on resume.
+Selection is not exhaustive reading, statistical validation or visual inspection;
+changed inputs and interrupted selection are not blindly replayed.
+
+New native `edit_file` declarations use a `replacements` list for exact,
+non-overlapping changes against the same original. Historical `old_text`/`new_text`
+single-change inputs remain accepted with the same validation and write boundaries.
+Every span must match uniquely before anything is written. The current digest,
+backup and atomic-write path are shared with `write_file`; stale, ambiguous or
+overlapping changes and edits to read-only sources are rejected.
+Version conflicts return the authorized target's current digest and the supplied
+expectation without writing or returning its body. This is a snapshot, not an
+automatic retry: an explicit matching expectation is still required, and later
+changes reject it. Read-only or private targets do not expose a conflict digest.
+
+`read_file` accepts either a byte offset or a one-based `start_line` from search
+results. Line windows retain the digest and byte continuation, cap the returned
+bytes/lines, and support files up to 256000 bytes; larger inputs use byte windows.
+An explicit `max_lines` also limits a byte-origin window, including a read from
+offset zero. Omitting it on a byte read retains the byte-only behavior. Both
+limits apply when supplied; `max_bytes` can end within a line. Continue at the
+returned `next_offset_bytes`, rather than estimating offsets from decoded text.
+
+For larger data or image files, `read_file` with `full_digest=true` streams the
+digest of an authorized regular file up to 64 MiB while returning only the
+requested text window. The default digest policy is unchanged. `copy_file`
+copies text or binary bytes up to the same bound using that source digest;
+replacing an existing destination also requires its observed digest. It shares
+the version checks, backup and atomic commit with text writes, without decoding
+the source or exposing its contents to the model. Directory copying retains its
+separate size limits and omission report.
+
+Native `search_files` requires `rg` (ripgrep) on the execution host. It searches
+literal text in authorized files and reports the scanned file page, continuation
+and truncation limits; it is not an exhaustive repository index. Read-only search
+still consumes a shared process receipt and allowance. New tasks allow up to ten
+process invocations per model-turn allowance, with the total process wall-clock
+budget unchanged. Recovery retains the saved limits, including older tasks.
+
+`--allow-network` authorizes public source search and original-text acquisition,
+independently of process execution. Existing arXiv, OpenAlex, Semantic Scholar and
+optional Tavily providers are reused; the Tavily provider requires its own credential.
+Acquired originals/search records live in read-only `evidence/`, not writable output.
+Question-based passage lookup is local and preserves source offsets and truncation.
+It also accepts retained document records in supplied read-only mounts, so existing
+originals can be reused without network access; generated workspace records are rejected.
+Each acquisition currently bounds one document, three fetch attempts, 8 MiB and
+60 PDF pages; parser coverage/failures remain recorded. Search excerpts are not full
+text, and retrieval is not verification. The shared `source_operations` allowance
+counts provider/adapter operations, not HTTP requests or vendor credits.
+
+`--allow-vision` separately authorizes `inspect_images`: mounted PNG/JPEG/WebP
+images are sent to the TOML `vision` route, using the same task request/token ledger.
+A missing vision route fails preflight, without substituting the text model.
+Feedback and original image copies are saved per inspection; a saved response is
+reused, while an interrupted request without a response is not blindly resent.
+Rejected response content is reported separately from connection failure and
+retained locally; it is not accepted as findings or automatically resent.
+Visual feedback is not proof of numerical or scientific correctness. Source search
+authorization does not grant vision access, and vision access does not grant search.
+
+`--max-images N` authorizes up to N image-generation/edit submissions through the
+TOML `image` route; default zero keeps these tools disabled. `create_image` saves a
+new version and never replaces its input. `resume_image` accepts that exact version:
+saved completions are reused, known async tasks are queried/downloaded, and unknown
+dispatches are not resubmitted. All versions share the task's persistent image ledger;
+resume does not reset the allowance. Endpoint/proxy/credential checks occur before
+task creation. These raster illustrations are not measurements or editable vectors.
+
+`export_report` converts workspace Markdown and its local assets into an editable
+ACM project and optionally a PDF, reusing the existing exporter and shared process
+receipts. It requires execution permission and explicit approval; compilation does
+not establish article quality or compliance with a requested page count. Completed
+exports include the complete project, figures and rebuild instructions. New exports
+bind output file digests before reuse; changed or missing files cannot inherit an
+old compilation result. Historical input-only receipts remain readable as history,
+not present-byte certification or automatic delivery. Interrupted exports without
+a successful output binding are not blindly repeated. Earlier versions remain.
+
+`--allow-execution` permits process proposals, not automatic execution. Each command
+needs terminal approval or the printed `--approve-execution TOKEN` on resume; `--yes`
+only confirms task creation. A workspace is **not an OS sandbox**: timeout and log
+bounds do not enforce CPU, memory, filesystem or network isolation. Resume retains
+the saved model connection, sources, permissions, receipts and budget; it cannot be
+combined with structured setup/reuse switches. A delivery manifest verifies file
+existence, not scientific correctness. Unknown interrupted operations are not replayed.
+Feedback cancels unstarted pending proposals; operations already attempted must first
+be reconciled. `simple-ar results SESSION` lists the current delivered files and
+limitations, with the native resume command. During a paused revision an older
+delivery is retained on disk but is not presented as the revised task's completion.
+
+For multi-step work the assistant can use `update_work_plan` to record a concise,
+changeable approach alongside actual actions. The latest plan for the current user
+request remains visible after history compaction and resume, without a separate
+planning model or scheduler. New feedback requires a current plan rather than
+treating an old plan as accepted. Step statuses and cited records are the assistant's
+claims: they do not grant execution approval, verify results or complete delivery.
+Simple tasks need not create a plan.
 
 Online surveys can request new sources after reading exposes a specific gap.
 With model reading and automatic expansion enabled, one follow-up search/ingest/read
@@ -32,11 +392,12 @@ is not proof of runnable code, successful data download or scientific correctnes
 
 | Options | Applies to | Purpose |
 | --- | --- | --- |
-| `--kind`, `--goal`, `--output-root` | All | Select function, task and output location |
-| `--model`, `--interaction` | Model-backed tasks | Model connection and participation policy |
-| `--prepare-only`, `--yes` | Structured setup | Save without execution/API, or confirm supplied choices |
+| `--guided`, `--kind`, `--goal`, `--output-root` | New tasks | Optional outcome preference, goal and output location; strict controls select compatibility |
+| `--model` | Model-backed tasks | Named connection or compatible environment route |
+| `--interaction` | Structured tasks | Participation policy; explicitly supplying it selects compatibility |
+| `--prepare-only`, `--yes` | Native / structured setup | Save without execution/API, or accept the displayed summary; no extra execution authority |
 | `--chat`, `--resume-setup PATH` | Model-assisted setup | Clarify a task or resume its saved setup draft |
-| `--sources materials\|search`, `--document PATH`, `--fulltext`, `--max-cited-sources N` | Survey | Source access, repeatable bibliographic papers, retrieval and citation limits |
+| `--sources materials\|search`, `--document PATH`, `--fulltext`, `--max-cited-sources N` | Survey / code repair | Optional source access, repeatable documents, retrieval and citation limits |
 | `--material PATH`, `--template` | Writing | Repeatable notes/results and requested report format |
 | `--project`, `--validate`, `--allow PATTERN`, `--project-python PATH` | Code repair / opt-in reproduction adapter | Project, independent validator, repeatable edit scope and existing interpreter |
 | `--data-path PATH` | Code/reproduction | Repeatable input file/directory, not the table-analysis source |
@@ -46,21 +407,27 @@ is not proof of runnable code, successful data download or scientific correctnes
 | `--environment current\|venv`, `--requirements PATH`, `--install-project` | Reproduction | Explicit dependency preparation |
 | `--check-argv JSON` | Reproduction | Explicit short check before measurement; no inferred command, and no check metrics in measured results |
 | `--command ARGV...` | Reproduction | Actual command; place it last |
-| `--with-report` | Data analysis | Also write from the analysis; requires a model |
+| `--with-report` | Data analysis / code repair | Also write from saved analysis or code-validation results; requires a model |
 
 Author output arguments can use literal `{output_dir}`, bound to the current
 invocation without shell expansion. See [file metric selectors](CONFIG_REFERENCE.md).
 
-Supported kinds: `survey`, `bug_fix`, `reproduction`, `writing`, `data_analysis`, `figure`. Structured setup is model-free until execution; chat setup itself uses the model and needs a terminal. Do not combine `--chat` with `--prepare-only`.
+Preference kinds: `survey`, `bug_fix`, `reproduction`, `writing`, `data_analysis`, `figure`, `code`. Technical `--chat` retains supported structured protocols; figure/scripted proposals cannot recreate a retired scaffold and are refused. Structured preparation makes no model call; chat setup itself uses the model and needs a terminal. Do not combine `--chat` with `--prepare-only`.
 
 Code-repair chat can inspect project text and propose a validation argv with quoted
 source basis. Confirmation serializes it into the existing CodeTask benchmark
 command; explicit `--validate` is retained. Setup does not run commands or install
-dependencies, and ordinary start still confirms edit scope and execution.
+dependencies; explicit structured repair still confirms edit scope and execution.
+
+Code repair can use `--document PATH` for supporting documentation or
+`--sources search` for explicitly authorized discovery; `--fulltext` requires
+online source access. Add `--with-report` to explain the actual patch and validation
+results without treating code checks as scientific measurements. These options do
+not widen `--allow` or change the independent validator.
 
 Code repair's interpreter defaults to current. `--project-python` preserves an existing virtualenv entry path; it does not create or install an environment. Reproduction also accepts it for the formal command and short check; with explicitly chosen `--environment venv`, it selects the base interpreter for the new task environment. Chat can adopt an existing interpreter path quoted from your message after confirmation; it never selects one from source instructions.
 
-Reproduction keeps the fixed-command path by default. For an existing Python
+Explicit reproduction protocols keep the fixed-command path. For an existing Python
 project already validated in a reproduction session, use `start --kind reproduction
 --from-session SESSION --reuse code_project --document PAPER --goal "Check readiness and repeat"`.
 This prepares an isolated task with the saved single-command protocol, output selectors,
@@ -127,6 +494,14 @@ excerpt; PDF downloading/raw retention requires separate permission or explicit
 `--fulltext`. The preview is limited to 8000 characters / three PDF pages, not
 full-paper understanding. When a question needs later methods or instructions,
 chat can request a read-only lookup in an already supplied document or material.
+For a paper identity or an unavailable source, chat can propose public-source searches
+instead of requiring you to find every URL. Confirm the displayed queries and providers:
+Tavily plus OpenAlex when `TAVILY_API_KEY` is set, otherwise arXiv plus OpenAlex.
+Setup permits two discovery rounds of at most two queries each, with five results
+per query/provider. Metadata and provider failures are saved; metadata is not an
+acquired paper or verified author identity. Recovery reuses saved responses, and
+an interrupted request is not automatically resent. Downloads and execution remain
+separate confirmations.
 Use `--material` for ordinary JSON/BibTeX notes and recorded results, not
 `--document`; dialogue previews retain that material role and do not verify its claims.
 Reproduction preparation can retain these notes in its task assets and use them
@@ -151,7 +526,7 @@ consumes the acquired/local files rather than starting another retrieval phase.
 
 ### Existing data (no API)
 
-Use `start --kind data_analysis`; add `--with-report --model env` only for writing. The data options are shared with `research-session`:
+Use `start --kind data_analysis --data-file PATH --value-column NAME` for the deterministic shortcut; add `--with-report --model env` for writing. Without selected columns or other protocol controls, the data preference uses native investigation. The table options are shared with `research-session`:
 
 | Option group | Purpose |
 | --- | --- |
@@ -171,42 +546,70 @@ For an accompanying report, `start` accepts `--material` and `--document`;
 not a different numeric transformation. Analysis-only ignores model settings.
 See [data fields](CONFIG_REFERENCE.md#existing-data-descriptive-analysis) for compatible option combinations.
 
-### Code-driven analysis and plots
+### Goal-driven code, analysis and figures
 
 ```bash
-simple-ar start --kind data_analysis --scripted --data-file measurements.csv --goal "Compare cost and quality in a three-panel figure"
+simple-ar start --kind data_analysis --scripted --data-file measurements.csv --goal "Compare cost and quality in a three-panel figure" --allow-execution
+simple-ar start --kind figure --document method.md --goal "Draw observations → comparison → evidence" --allow-execution
+simple-ar start --kind code --material requirements.md --goal "Build a reusable CSV validator" --allow-execution
 ```
 
-This uses a model and executes generated code after ordinary execution confirmation.
-It prepares a small project and reuses CodeTask editing, protected data/checker files,
-validation, logging and recovery. No dependencies are installed. Deliveries include
-script, computed JSON and explanation. Figures follow the task: table-only analysis
-needs no plot, and multiple named figures/tables under outputs/ are retained.
-Matching PNG/SVG/PDF files are grouped as figure exports. File
-checks do not establish statistical correctness. Workspace isolation is not an
-OS/network sandbox. The canonical task uses the existing `bug_fix` execution path.
+These new tasks use the existing native action loop, configuration, ledger and
+recovery. They create no repair scaffold, synthetic evaluator or `bug_fix` task.
+The goal is retained verbatim before appended delivery requirements and declarations.
+The creation choice is a starting preference, not a tool or plot-type restriction.
+Figure requests ask for code/layout source, PNG, editable vector SVG and explanation;
+scripted analysis requests runnable source, computed results and explanation.
+Actual outputs and verification remain task work, not an entry-point certification.
 
-Chat setup can propose this path for custom statistics or combined plots beyond
-the presets, then ask for confirmation; users need not select `--scripted` or
-prefill `value_column`. Unclear data semantics still require clarification, and
-user replies and units remain in `task.md`. Explanation is included; do not combine
-this path with `--with-report`, `--material` or `--project`. This routing capability
-does not establish successful real-world figure delivery.
-New scripted-analysis scaffolds retain the `large` profile's total limits, with
-new source blocks allowed up to the existing 32,000-character ceiling, disclosed
-before execution. Ordinary project repair keeps its existing limits. These edit
-limits do not establish analysis or figure correctness.
+Local `--document`, `--material`, `--project`, `--data-path`, `--data-file` and `--source`
+inputs become read-only mounts, with their declared roles preserved. Data-file
+inputs retain the regular-file/no-symlink/private-file protection and 20 MiB limit;
+use `--source` for larger bounded investigation. No input snapshot or placeholder
+dataset is manufactured. New source and outputs belong to the task workspace.
+Supplied evaluation files remain read-only; this is not an OS sandbox.
+Public document URLs in this adapter are rejected: express them in the goal and
+grant `--allow-network` separately when acquisition is intended.
+
+Explicit columns, units, attribution, observation units, pairing, missing-value
+policy and presentation choices are preserved as user declarations in the goal;
+unprovided preset defaults do not restrict native analysis. These declarations do
+not establish statistical assumptions or independently verify results.
+`--with-report` requests a report from actual materials/results.
+`--model`, `--project-python`, `--output-root` and native resource/access flags
+go directly to the same owner; interpreter selection does not install dependencies.
+No creation choice grants process/network permission. Use `--allow-execution`
+for command proposals; each command still needs individual approval.
+`--yes` accepts the summary only. `--prepare-only` saves a native session without
+model/process calls. Continue using `start --resume-task SESSION`.
+
+Explicit controls outside the native/shared/material/declaration destinations
+select structured compatibility: source/retrieval policy, report templates/limits,
+edit scope/validator, reproduction command/metrics/environment, physical table
+limits and interaction settings. Even explicitly supplying a parser default
+selects that contract; no strict field is silently translated into a preference.
+`--chat`/`--resume-setup` keep technical setup and its confirmed historical settings;
+`--from-session`/`--reuse` keep bounded registered scope and validators. The
+recognized preference set is `survey`, `bug_fix`, `reproduction`, `writing`,
+`data_analysis`, `figure`, `code`; `--scripted` requires `--kind data_analysis`.
+Creation preferences cannot be applied to `--resume-task`.
+For `data_analysis`, explicit `--value-column`, `--x-column` or `--paired-baseline` without `--scripted` selects the
+no-model TableSpec shortcut; a data path alone is an ordinary native preference.
+Figure/scripted requests with incompatible strict controls are rejected before
+task creation. A project alone is a read-only native mount; `--allow`/`--validate`
+retain exact structured editing and execution semantics. Strict protocols cannot
+mix native access/budget controls. Direct `research-session` and `code-task init/execute`
+remain explicit structured interfaces; their saved sessions continue under their
+original execution owner. This migration does not equate their planning, baseline,
+review or measurement settings to a natural-language native task.
 
 ## Reuse deliveries
 
-For an editable conceptual method/architecture diagram, use
-`simple-ar start --kind figure --goal "Draw observations → comparison → evidence"`.
-No dummy dataset is created; optional `--data-file` supplies a real table. This
-shares the script/CodeTask route above and requires PNG, vector SVG, a design
-record and explanation. Structural checks do not verify diagram semantics or
-visual quality. Paper/material interpretation is not part of this entry yet.
+Native creations expose delivered files via `results SESSION`; feedback uses
+`start --resume-task SESSION`. Historical registered packages and projects retain
+the following compatibility routes.
 
-Guided code tasks default to one technical repair round. When process limits are
+Structured compatibility code tasks default to one technical repair round. When process limits are
 omitted, `research-session` reserves one validation plus the configured repair/retest
 rounds; explicit limits, including zero, remain authoritative. A repair allowance
 does not authorize installation, scientific protocol changes or unlimited retries.
@@ -239,11 +642,11 @@ To change the argument or chapter structure, use `--reuse report` with that goal
 to start a new adaptive writing task. It reuses the registered evidence without
 rewriting the original task's accepted outline. Normal revision keeps that outline.
 
-New validated script-analysis deliveries selected with `--reuse code_analysis` carry
+Historical validated script-analysis deliveries selected with `--reuse code_analysis` carry
 their source, input data, recorded results and PNG/vector exports into writing.
 Generated projects use `analysis.py` as the entry point; helper modules and editable
 layout sources may live in `src/` and are included in the portable package.
-New generated projects retain the large edit profile's file and total-size limits,
+Explicit compatible CodeTask projects retain the large edit profile's file and total-size limits,
 with its per-source-block limit set to the existing 32,000-character absolute ceiling.
 Advanced numeric overrides in the CodeTask `[budget]` table also reach research
 execution and recovery; they do not bypass the absolute limits or protected paths.
@@ -319,7 +722,7 @@ Use an unused output directory. Relative data paths resolve from the project roo
 
 | Command | Purpose |
 | --- | --- |
-| `simple-ar start` | Guided survey/code-fix/prepared-reproduction/material-writing/descriptive-data setup; saves editable configuration and enters the same research session. |
+| `simple-ar start` | Natural-language goal or ordinary outcome preference enters the native tool loop; explicit structured protocols retain their configuration and session owner. |
 | `simple-ar research-session` | Canonical entry for a bounded task-driven session; the accepted plan selects applicable research and execution steps. |
 | `simple-ar research-session-continue` | Retry one failed canonical explicit experiment. |
 | `simple-ar research-session-migrate` | Create a canonical successor from a read-only `session_manifest.v1`. |
@@ -383,6 +786,10 @@ retained; choose a new one for each export.
 Editable SVG sources are kept alongside converted figures. Links to external
 local evidence become labels, with their original targets recorded in `export.json`;
 datasets and source artifacts are not automatically copied or redistributed.
+Literal fenced code travels in `code/block-*.txt`; keep this directory with the
+editable project. TeX uses `fvextra` for code lines and `seqsplit` for long inline
+identifiers, without changing the canonical Markdown or executing code content.
+`etoolbox` protects these commands in titles/captions; PDF metadata keeps literal text.
 
 The output is a single-column `acmart` manuscript demonstration with editable
 `main.tex`, `body.tex`, bibliography, figures, and `export.json`. This does not
@@ -393,7 +800,8 @@ Without a manifest, the supplied image captions are left unchanged.
 Generated figures prefer nearby placement (`htbp`) while allowing normal LaTeX
 floating; placement is not forced and compilation alone is not visual acceptance.
 Pandoc is required. `--compile` additionally needs `pdflatex`, `bibtex`, and
-the acmart TeX packages; it records `build.log` and returns a nonzero status
+the acmart TeX packages, `fvextra`, `seqsplit`, `etoolbox`, and scalable fallback fonts (full `cm-super` on Debian/Ubuntu,
+not just its 10pt-only minimal subset); it records `build.log` and returns a nonzero status
 when compilation is unavailable or fails, keeping the generated source.
 Compilation currently uses pdfLaTeX; non-Latin scripts may require adapting
 the editable project to another engine and fonts.
@@ -1062,8 +1470,8 @@ uv run simple-ar code-task execute runs/<run-id> --apply-proposed-edits --timeou
 | `--validation-max-file-bytes N` | int | Max file size scanned by static validation. |
 | `--apply-proposed-edits` | flag | Apply reviewed `proposed_edits.json` after plan approval. |
 | `--allow-large-edits` | flag | Allow a reviewed proposal that exceeds the normal edit budget. |
-| `--allow-planning-fallback` | flag | Allow deterministic offline work/patch plans after LLM planning retries fail. |
-| `--llm-retry-attempts N` | int | Stage-level LLM attempts for work-plan, patch-plan, greenfield architecture/file generation, and repair before stopping or explicitly falling back. |
+| `--allow-planning-fallback` | flag | Allow explicit offline planning or fallback after known, complete response-format failures; not after provider, budget, deadline or partial-stream failures. |
+| `--llm-retry-attempts N` | int | Bound completed-response corrections for work/patch planning and greenfield generation, including the first attempt. Transport retries belong to the shared model connection; unreconciled operations prevent correction and fallback. |
 | `--repair-rounds N` | int | Number of bounded repair proposals after failure. |
 | `--max-files N` | int | Context file budget for LLM steps. |
 | `--max-source-chars-per-file N` | int | Per-file source context budget. |
@@ -1124,12 +1532,21 @@ requirements, architecture, interface, file-plan, and planning-review artifacts
 under `code_task/meta/planning/`. Use `--planning-mode compact` for a lower-call
 planning path; subsequent file generation, review, and execution are shared.
 
-If greenfield review fails with generic recoverable findings, bounded repair
-rounds first ask for structured local actions such as unique old/new replacements
-or function-level rewrites. Whole-file replacement is kept for structural
-file-level failures. Repairs resync `code_task/meta/code_artifacts.json` before
-review/validation continues. If the finding is still blocking, execution stops
-with the generated files and review report preserved.
+Generated-project review checks structure and scaffold risks; it does not
+certify task acceptance. Natural-language command names, output paths and
+library preferences are assessed contextually, not by a fixed phrase-matching
+gate. Model findings remain advisory; actual validation and benchmark evidence
+are separate. When a review contract changes, resume preserves the previous
+report under `code_task/meta/review_history/` before refreshing the active report.
+
+Bounded greenfield review/runtime repair selects related files from the actual
+diagnostics and prepares one isolated candidate through the shared code owner.
+Application retains API/static guards and snapshot rollback; repaired files
+resync `code_task/meta/code_artifacts.json` before review/validation continues.
+Completed repair reuse checks inputs and project bytes. Legacy unbound results
+remain history; explicit new rounds preserve that history and may continue work.
+Interrupted candidates are not blindly replayed. Blocking findings still stop
+execution with files, diagnostics and snapshots preserved.
 
 #### `simple-ar code-task decide-plan`
 
@@ -1334,8 +1751,8 @@ uv run simple-ar code-task work-plan runs/<run-id>
 | `--model NAME` | string | Model override. |
 | `--no-llm` | flag | Use fallback planning. |
 | `--force` | flag | Regenerate existing work-plan artifacts. |
-| `--allow-planning-fallback` | flag | Allow deterministic fallback if LLM work planning fails. |
-| `--llm-retry-attempts N` | int | LLM work planning attempts before failing or falling back. |
+| `--allow-planning-fallback` | flag | Allow fallback after known, complete work-plan response-format failures, not transport failures. |
+| `--llm-retry-attempts N` | int | Completed-response work-plan correction bound, including the first attempt; no additional transport retry layer. |
 | `--max-files N` | int | Planning context file budget. |
 | `--max-source-chars-per-file N` | int | Per-file source context budget. |
 
@@ -1394,8 +1811,8 @@ uv run simple-ar code-task plan runs/<run-id>
 | `--model NAME` | string | Model override. |
 | `--no-llm` | flag | Use fallback plan. |
 | `--force` | flag | Regenerate existing plan. |
-| `--allow-planning-fallback` | flag | Allow deterministic fallback if LLM patch planning fails. |
-| `--llm-retry-attempts N` | int | LLM patch planning attempts before failing or falling back. |
+| `--allow-planning-fallback` | flag | Allow fallback after known, complete patch-plan response-format failures, not transport failures. |
+| `--llm-retry-attempts N` | int | Completed-response patch-plan correction bound, including the first attempt; no additional transport retry layer. |
 | `--max-files N` | int | Context file budget. |
 | `--max-source-chars-per-file N` | int | Per-file source context budget. |
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -1636,6 +1637,7 @@ def _attempt_greenfield_run_repair(
         },
         stderr_text=runtime_output_text or stderr_text,
         output_path=paths.meta_dir / "run_repair.json",
+        attempt_id=f"round-{_repair_count(load_code_task_manifest(run_dir), field='run_repair_count') + 1}",
         code_artifacts=_read_optional_dict(paths.meta_dir / "code_artifacts.json"),
         architecture_plan=_read_optional_dict(paths.meta_dir / "architecture_plan.json"),
         result_schema=result_schema_from_manifest(load_code_task_manifest(run_dir)),
@@ -1718,6 +1720,7 @@ def _repair_greenfield_review_failure(
         project_dir=paths.workspace_dir / "generated_project",
         review_report=review,
         output_path=repair_path,
+        attempt_id=f"round-{_repair_count(manifest, field='review_repair_count') + 1}",
         code_artifacts=code_artifacts,
         architecture_plan=_read_optional_dict(paths.meta_dir / "architecture_plan.json"),
         result_schema=result_schema_from_manifest(manifest),
@@ -1770,7 +1773,20 @@ def _rerun_greenfield_review(
         meta_dir=paths.meta_dir,
         use_llm=False,
     )
-    write_json(paths.meta_dir / "review_report.json", review)
+    report_path = paths.meta_dir / "review_report.json"
+    if report_path.is_file():
+        # Contract migration refreshes the active view, not historical facts.
+        # Keep the complete prior report before replacing that view; this is
+        # an immutable artifact, not another review state or replay policy.
+        previous = read_json(report_path)
+        digest = hashlib.sha256(report_path.read_bytes()).hexdigest()
+        historical = paths.meta_dir / "review_history" / f"{digest}.json"
+        if historical.is_file():
+            if read_json(historical) != previous:
+                raise ValueError("Retained historical review changed; refusing to replace the active report")
+        else:
+            write_json(historical, previous)
+    write_json(report_path, review)
     _record_review_report_findings(run_dir, paths.meta_dir / "review_report.json")
     manifest = load_code_task_manifest(run_dir)
     implementation = manifest_section(manifest, "implementation")

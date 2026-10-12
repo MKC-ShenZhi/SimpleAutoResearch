@@ -2,6 +2,8 @@
 import json
 import unittest
 
+from tests.report_review_fixtures import document_review_inputs, prompt_payload, unresolved_opinion_response
+
 from simple_ar.integrations.llm import LLMError
 from simple_ar.report.agent import _needs_revision, _needs_evidence_recheck, run_report_agent
 from simple_ar.report.audit import build_report_audit
@@ -155,7 +157,7 @@ class ReviewActionTests(unittest.TestCase):
                                 return {'verdict': 'pass', 'findings': []}
                             return {'verdict': 'warning', 'findings': [finding.model_dump(mode='json')]}
                         if 'reviser' in label:
-                            row = json.JSONDecoder().raw_decode(prompt[prompt.index('{'):])[0]
+                            row = prompt_payload(prompt)
                             assert row['review_findings'][0]['required_action'] == action
                             return {'draft_markdown': 'Only the supplied setting was observed; wider validity is unknown.'}
                         return {'draft_markdown': 'The conclusion holds everywhere.'}
@@ -210,22 +212,19 @@ class ReviewActionTests(unittest.TestCase):
             def ask_json(client, system, prompt, **kwargs):
                 view = json.loads(prompt)
                 seen.append(view)
-                return {'section_reviews': [{'section_id': row['section_id'],
-                    'finding_checks': [{'finding_id': row['finding_id'], 'status': 'unresolved',
-                        'explanation': 'Synthetic capture checks input projection, not factual resolution.'}]}
-                    for row in view.get('historical_findings_to_check', [])]}
-        review_document(client=Client(), template=objects['template'], memory=objects['memory'],
-            sections=[ReportSectionDraft(section_id='findings', heading='Findings', draft_markdown='Text')],
-            config=objects['config'], execution_summary={}, metric_summary={},
+                return unresolved_opinion_response(view, verdict=None,
+                    explanation='Synthetic capture checks input projection, not factual resolution.')
+        inputs = document_review_inputs(objects['memory'], objects['config'],
+            [ReportSectionDraft(section_id='findings', heading='Findings', draft_markdown='Text')],
+            template=objects['template'])
+        review_document(client=Client(), **inputs,
             historical_findings=[objects['memory'].reviewer_findings[0]])
         self.assertEqual([row['finding_id'] for row in seen[0]['historical_findings_to_check']], ['scope'])
         for field in ('required_action', 'severity', 'suggested_action'):
             self.assertNotIn(field, seen[0]['historical_findings_to_check'][0])
         self.assertEqual([row.model_dump(mode='json') for row in objects['memory'].reviewer_findings], before)
         self.assertNotIn('findings', seen[0]['output_schema']['section_reviews'][0])
-        review_document(client=Client(), template=objects['template'], memory=objects['memory'],
-            sections=[ReportSectionDraft(section_id='findings', heading='Findings', draft_markdown='Text')],
-            config=objects['config'], execution_summary={}, metric_summary={})
+        review_document(client=Client(), **inputs)
         self.assertIn('required_action', seen[1]['output_schema']['section_reviews'][0]['findings'][0])
 
 

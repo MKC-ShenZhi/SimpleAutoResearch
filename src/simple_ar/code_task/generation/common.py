@@ -1,15 +1,51 @@
 from __future__ import annotations
 
-from pathlib import PurePosixPath
-from typing import Any, Mapping
+from contextlib import contextmanager
+from pathlib import Path, PurePosixPath, PureWindowsPath
+import tempfile
+import uuid
+from typing import Any, Iterator, Mapping
+
+
+@contextmanager
+def generation_candidate(destination: Path) -> Iterator[Path]:
+    """Publish completed files, retaining old projects and failed candidates.
+
+    The caller owns the exact output directory. This is not a session transaction
+    or a lock: its existing task owner must serialize generation and metadata.
+    """
+    destination = Path(destination).absolute()
+    if (destination == Path(destination.anchor) or destination == Path.cwd().absolute()
+            or any(path.is_symlink() for path in (destination, *destination.parents))
+            or (destination.exists() and not destination.is_dir())):
+        raise ValueError("Generation requires a concrete, non-symlink output directory")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    candidate = Path(tempfile.mkdtemp(prefix=f".{destination.name}.candidate-", dir=destination.parent))
+    try:
+        yield candidate
+    except BaseException as exc:
+        exc.add_note(f"Generated candidate retained at {candidate}; previous output was not replaced")
+        raise
+    previous = None
+    if destination.exists():
+        previous = destination.with_name(f".{destination.name}.previous-{uuid.uuid4().hex}")
+        destination.rename(previous)
+    try:
+        candidate.rename(destination)
+    except BaseException:
+        if previous is not None:
+            previous.rename(destination)
+        raise
 
 
 def safe_relative_path(value: str) -> str:
     """Return a normalized relative POSIX path, or an empty string if unsafe."""
 
-    text = value.replace("\\", "/").strip().lstrip("/")
+    text = value.replace("\\", "/").strip()
     path = PurePosixPath(text)
-    if not text or path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+    windows = PureWindowsPath(text)
+    if (not path.parts or path.is_absolute() or windows.drive or windows.root
+            or any(part == ".." or ":" in part or "\0" in part for part in path.parts)):
         return ""
     return path.as_posix()
 
@@ -42,13 +78,3 @@ def scalar_list(value: object, *, limit: int | None = None, tail: bool = False) 
     if limit is None:
         return rows
     return rows[-limit:] if tail else rows[:limit]
-
-
-def contains_any(value: str, needles: tuple[str, ...]) -> bool:
-    return any(needle in value for needle in needles)
-
-
-def clip_text(value: str, *, max_chars: int) -> str:
-    if len(value) <= max_chars:
-        return value
-    return value[: max(0, max_chars - 1)].rstrip() + "..."

@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import PurePosixPath
 from typing import Any, Mapping
 
-from simple_ar.code_task.generation.common import scalar_list, text
+from simple_ar.code_task.generation.common import safe_relative_path, scalar_list, text
 
 
 SOURCE_FILE_KINDS = {"source", "doc", "config", "data"}
@@ -33,18 +33,24 @@ RUNTIME_DIRECTORY_NAMES = {
 def normalize_plan_path(value: object) -> str:
     """Return a safe path relative to the generated project root."""
 
-    text = _strip_generated_root_prefix(str(value or ""))
-    text = text.replace("\\", "/").strip().lstrip("/")
-    if not text or text.startswith("../") or "/../" in text or text == "..":
-        return ""
-    path = PurePosixPath(text)
-    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
-        return ""
-    return path.as_posix()
+    return safe_relative_path(_strip_generated_root_prefix(str(value or "")))
 
 
 def normalize_dependency_paths(value: object, *, limit: int) -> list[str]:
     return [path for path in (normalize_plan_path(item) for item in scalar_list(value)[:limit]) if path]
+
+
+def is_deliverable_project_file(value: str) -> bool:
+    relative = safe_relative_path(value)
+    if not relative:
+        return False
+    path = PurePosixPath(relative)
+    return not (
+        "__pycache__" in path.parts
+        or any(part.startswith(".") and part != ".env.example" for part in path.parts)
+        or relative.lower().endswith((".pyc", ".pyo", ".log", ".tmp"))
+        or path.name in {"agent_result.json", "ingestion.json", "review.md"}
+    )
 
 
 def dedupe_file_rows(
@@ -145,7 +151,7 @@ def _merge_unique(first: list[str], second: list[str], *, limit: int) -> list[st
 
 
 def _strip_generated_root_prefix(value: str) -> str:
-    text = value.replace("\\", "/").strip().lstrip("/")
+    text = value.replace("\\", "/").strip()
     for prefix in ("generated_project/",):
         if text == prefix[:-1]:
             return ""

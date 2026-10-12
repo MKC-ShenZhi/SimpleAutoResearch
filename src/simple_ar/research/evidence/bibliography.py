@@ -1,4 +1,4 @@
-"""Fill missing local citation fields from the same supplied source's front matter.
+"""Fill missing citation fields from the same retained source's front matter.
 
 This is a pure projection of a reading proposal, not a metadata service or an
 identity certificate. Provider/user fields, source identity and saved documents
@@ -24,17 +24,24 @@ CITATION_FIELD_VALUE_RULE = (
 )
 
 
-def _filename_title(record: DocumentRecord) -> str:
+def _placeholder_title(record: DocumentRecord) -> str:
+    if record.source == "supporting_material" and record.metadata.get("kind") == "supporting_material":
+        return str(record.url or "")
     return PurePosixPath(str(record.source_id or "").replace("\\", "/")).stem.replace("_", " ").replace("-", " ").strip()
+
+
+def _can_fill_source_fields(record: DocumentRecord) -> bool:
+    return (not record.metadata.get("paper_id") and (record.source == "local_files"
+        or (record.source == "supporting_material" and record.metadata.get("kind") == "supporting_material")))
 
 
 def local_citation_fields_to_fill(paper: Mapping[str, Any], record: DocumentRecord) -> list[str]:
     """Request fields using the same placeholder and availability rules as acceptance."""
-    if record.source != "local_files" or record.metadata.get("paper_id"):
+    if not _can_fill_source_fields(record):
         return []
     details = bibliographic_details(Paper.from_row(dict(paper)))
     return [field for field, missing in (
-        ("title", bool(_filename_title(record)) and paper.get("title") == _filename_title(record)),
+        ("title", bool(_placeholder_title(record)) and paper.get("title") == _placeholder_title(record)),
         ("authors", not details["authors"]), ("published", not details["year"]),
         ("doi", not details["doi"]), ("url", not details["url"])) if missing]
 
@@ -49,12 +56,12 @@ def apply_bibliographic_note(paper: Mapping[str, Any], record: DocumentRecord,
                             section: DocumentSection | None, note: Mapping[str, Any] | None,
                             ) -> tuple[dict[str, Any], dict[str, Any]]:
     row, origins = dict(paper), {}
-    if (record.source != "local_files" or record.metadata.get("paper_id") or section is None
+    if (not _can_fill_source_fields(record) or section is None
             or section.document_id != record.document_id or section.section != "front_matter"):
         return row, origins
     note = note or {}
     text = " ".join(section.text[:FRONT_MATTER_CHARS].split())
-    filename = _filename_title(record)
+    placeholder = _placeholder_title(record)
     proposal = note.get("bibliographic_fields", [])
     fields = list(proposal[:5]) if isinstance(proposal, list) else []
     # Legacy notes proposed only a title. Retain that narrow, source-matched
@@ -86,7 +93,7 @@ def apply_bibliographic_note(paper: Mapping[str, Any], record: DocumentRecord,
             if value not in quote or len(value) > (240 if field == "title" else 480):
                 continue
             if field == "title":
-                if not filename or row.get(field) != filename or value == filename:
+                if not placeholder or row.get(field) != placeholder or value == placeholder:
                     continue
             elif field == "url":
                 if str(row.get(field) or "").lower().startswith(("http://", "https://")):

@@ -38,7 +38,7 @@ IGNORED_FILE_NAMES = {
 # Shared with question-directed source lookup; retain its existing language
 # coverage rather than inventing another binary-extension denylist.
 SOURCE_SUFFIXES = {
-    ".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rs",
+    ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rs",
     ".c", ".cc", ".cpp", ".h", ".hpp", ".cs", ".rb", ".r", ".jl", ".sh",
 }
 
@@ -56,7 +56,7 @@ def read_code_task_text(path: Path) -> str | None:
         data = path.read_bytes()
         if b"\0" in data:
             return None
-        if path.suffix.lower() == ".py":
+        if path.suffix.lower() in {".py", ".pyi"}:
             try:
                 encoding, _ = tokenize.detect_encoding(io.BytesIO(data).readline)
                 text = data.decode(encoding)

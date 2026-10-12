@@ -44,6 +44,49 @@ class TableAnalysisTests(unittest.TestCase):
         self.assertIsNone(b['sample_std'])
         self.assertNotIn('execution_status', result)
         self.assertNotIn('significance', result)
+        # Native and structured consumers share the computation/snapshot owner,
+        # not a model's mental aggregate or a second table implementation.
+        from simple_ar.core.budget import BudgetLedger
+        from simple_ar.tools.workspace import WorkspaceToolGateway
+        from simple_ar.tools.analysis import AnalysisToolGateway, analysis_tool_specs
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'supplied'
+            source.mkdir()
+            table = source / 'records.csv'
+            original = 'group,value\nA,1\nA,3\nB,-2\n'
+            table.write_text(original)
+            workspace = WorkspaceToolGateway(root, {'source0': source}, BudgetLedger({}))
+            gateway = AnalysisToolGateway(root, workspace)
+            self.assertEqual({row.name for row in analysis_tool_specs()}, {'inspect_table', 'analyze_table'})
+            preview = gateway.call('inspect_table', {'path': str(table)}, identity='inspect')
+            self.assertTrue(preview.ok, preview.error)
+            self.assertEqual(preview.data['row_count'], 3)
+            self.assertEqual(preview.data['column_summary'][0]['distinct_nonmissing'], 2)
+            arguments = {'path': str(table), 'spec': {'value_columns': ['value'],
+                'observation_unit': 'one supplied row', 'group_column': 'group'}}
+            computed = gateway.call('analyze_table', arguments, identity='computed')
+            self.assertTrue(computed.ok, computed.error)
+            package = workspace.resolve(computed.data['analysis'])
+            saved = json.loads(package.read_text())
+            self.assertEqual(saved['records'], result['records'])
+            self.assertEqual(load_analysis_package(package)[0]['records'], result['records'])
+            self.assertEqual(table.read_text(), original)
+            table.write_text('group,value\nchanged,900\n')
+            with patch('simple_ar.tools.analysis.analyze_table_capability') as recalculate:
+                cached = gateway.call('analyze_table', arguments, identity='computed')
+                self.assertEqual(cached.data, computed.data)
+                recalculate.assert_not_called()
+            self.assertEqual((package.parent / 'input.csv').read_text(), original)
+            changed = gateway.call('analyze_table', {**arguments, 'spec': {**arguments['spec'], 'missing': 'omit'}}, identity='computed')
+            self.assertFalse(changed.ok)
+            self.assertIn('settings changed', changed.error)
+            package.write_text('{}')
+            modified = gateway.call('analyze_table', arguments, identity='computed')
+            self.assertFalse(modified.ok)
+            self.assertIn('was modified', modified.error)
+            private = gateway.call('inspect_table', {'path': str(source / '.env.csv')}, identity='private')
+            self.assertFalse(private.ok)
 
     def test_missing_is_not_zero_and_omissions_are_per_column(self):
         rows = parse_table('group,x,y\nA,1,\nA,,4\n', '.csv')

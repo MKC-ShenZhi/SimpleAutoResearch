@@ -2040,7 +2040,6 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "arxiv" },
-    { name = "litellm" },
     { name = "matplotlib" },
     { name = "openai" },
     { name = "packaging" },
@@ -2053,6 +2052,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+litellm = [
+    { name = "litellm" },
+]
 examples = [
     { name = "scikit-learn" },
 ]
@@ -2064,7 +2066,7 @@ http2 = [
 requires-dist = [
     { name = "arxiv", specifier = ">=3.0.0" },
     { name = "h2", marker = "extra == 'http2'", specifier = ">=4,<5" },
-    { name = "litellm", specifier = ">=1.86.2" },
+    { name = "litellm", marker = "extra == 'litellm'", specifier = ">=1.86.2" },
     { name = "matplotlib", specifier = ">=3.10" },
     { name = "openai", specifier = ">=2.34.0" },
     { name = "packaging", specifier = ">=24.0" },
@@ -2076,7 +2078,7 @@ requires-dist = [
     { name = "scikit-learn", marker = "extra == 'examples'", specifier = ">=1.8.0" },
     { name = "tqdm", specifier = ">=4.67.3" },
 ]
-provides-extras = ["examples", "http2"]
+provides-extras = ["examples", "http2", "litellm"]
 
 [[package]]
 name = "six"

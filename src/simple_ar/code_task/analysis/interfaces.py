@@ -5,10 +5,11 @@ from __future__ import annotations
 import ast
 import json
 import symtable
-from pathlib import Path, PurePosixPath
+from pathlib import Path
+from simple_ar.code_task.generation.common import safe_relative_path as _safe_path
 from typing import Any, Mapping, Sequence
 
-from simple_ar.code_task.analysis.index import project_python_files
+from simple_ar.code_task.analysis.index import project_python_files, read_code_task_text
 
 
 def order_file_specs(files: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
@@ -50,6 +51,9 @@ def dependency_context(
 ) -> dict[str, Any]:
     """Describe actual generated dependency APIs for the next file prompt."""
 
+    # Local import: source_context consumes the interface projection below.
+    from simple_ar.code_task.analysis.source_context import read_source_context_text
+
     rows: list[dict[str, Any]] = []
     dependencies = file_spec.get("dependencies")
     for raw_path in dependencies if isinstance(dependencies, list) else []:
@@ -62,14 +66,15 @@ def dependency_context(
             "planned": True,
             "available": target.is_file(),
         }
-        if target.is_file() and target.suffix == ".py":
-            row["public_api"] = public_api(target)
-            source = target.read_text(encoding="utf-8", errors="replace")
-            row["source_excerpt"] = source[:max_source_chars]
-        elif target.is_file() and target.suffix == ".json":
+        source = (read_source_context_text(project_dir, rel_path, indexed=True)
+                  if target.suffix in {".py", ".json"} else None)
+        if source is not None and target.suffix == ".py":
+            row["public_api"] = public_api_from_source(source)
+            row["source_excerpt"] = source[:max(0, max_source_chars)]
+        elif source is not None and target.suffix == ".json":
             try:
-                payload = json.loads(target.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+                payload = json.loads(source)
+            except json.JSONDecodeError:
                 payload = {}
             row["json_shape"] = _json_shape(payload)
         rows.append(row)
@@ -82,11 +87,8 @@ def dependency_context(
 def public_api(path: Path) -> list[str]:
     """Extract concise top-level Python API signatures."""
 
-    try:
-        source = path.read_text(encoding="utf-8", errors="replace")
-    except (OSError, SyntaxError):
-        return []
-    return public_api_from_source(source)
+    source = read_code_task_text(path)
+    return public_api_from_source(source) if source is not None else []
 
 
 def public_api_from_source(source: str) -> list[str]:
@@ -617,11 +619,3 @@ def _json_shape(value: Any, *, depth: int = 0) -> Any:
     if isinstance(value, list):
         return [_json_shape(value[0], depth=depth + 1)] if value else []
     return type(value).__name__
-
-
-def _safe_path(value: str) -> str:
-    value = value.replace("\\", "/").strip().lstrip("/")
-    path = PurePosixPath(value)
-    if not value or path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
-        return ""
-    return path.as_posix()

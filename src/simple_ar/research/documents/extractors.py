@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import replace
 from html.parser import HTMLParser
@@ -50,7 +51,40 @@ class LocalDocumentParser:
 
         suffix = path.suffix.lower()
         if suffix in MATERIAL_TEXT_SUFFIXES:
-            return ParsedDocument(_read_text(path), "plain_text")
+            text = _read_text(path)
+            # Remote text caches do not retain the URL's filename extension.
+            # Identify notebook structure, not a particular source or project.
+            notebook = None
+            if suffix == '.ipynb' or text.lstrip().startswith('{'):
+                try:
+                    notebook = json.loads(text)
+                except ValueError:
+                    if suffix == '.ipynb':
+                        raise RuntimeError('invalid_notebook_json') from None
+            if isinstance(notebook, dict) and 'nbformat' in notebook:
+                if type(notebook['nbformat']) is not int or notebook['nbformat'] != 4:
+                    raise RuntimeError('unsupported_notebook_version')
+                cells = notebook.get('cells')
+                if not isinstance(cells, list):
+                    raise RuntimeError('invalid_notebook_cells')
+                pieces, outputs = [], 0
+                for index, cell in enumerate(cells):
+                    if not isinstance(cell, dict) or cell.get('cell_type') not in {'code', 'markdown', 'raw'}:
+                        raise RuntimeError('invalid_notebook_cell')
+                    source = cell.get('source', '')
+                    if isinstance(source, list) and all(isinstance(line, str) for line in source):
+                        source = ''.join(source)
+                    if not isinstance(source, str):
+                        raise RuntimeError('invalid_notebook_source')
+                    pieces.append(f"# Notebook cell {index + 1} ({cell['cell_type']})\n\n{source}")
+                    outputs += bool(cell.get('outputs'))
+                return ParsedDocument('\n\n'.join(pieces), 'notebook_cells', coverage={
+                    'notebook_cells': len(cells), 'extracted_cells': len(cells),
+                    'cells_with_omitted_outputs': outputs,
+                    'scope': 'Cell sources only; saved outputs, images and execution status are not read or verified.'})
+            if suffix == '.ipynb':
+                raise RuntimeError('invalid_notebook_structure')
+            return ParsedDocument(text, "plain_text")
         if suffix in HTML_SUFFIXES:
             return ParsedDocument(_html_to_text(_read_text(path)), "basic_html")
         if suffix == ".pdf":
@@ -68,6 +102,9 @@ def document_extraction_limitations(records: list[DocumentRecord]) -> tuple[str,
     notes = []
     for record in records:
         coverage = record.metadata.get("fulltext_extraction", {}).get("coverage", {})
+        if 'notebook_cells' in coverage:
+            notes.append(f"Source {record.document_id} contains {coverage['extracted_cells']} notebook cell sources; "
+                         "saved outputs, images and execution status are not read or verified. Inspect the original notebook when they matter.")
         if coverage.get("unpaired_unicode_replacements"):
             notes.append(f"Source {record.document_id} contains {coverage['unpaired_unicode_replacements']} "
                          "unpaired Unicode characters replaced during extraction; affected text needs source inspection.")
@@ -205,7 +242,8 @@ def _parse_hint(
             hint=hint,
         )
 
-    text_path = resolution.path if resolution.path.suffix.lower() in MATERIAL_TEXT_SUFFIXES else _write_extracted_text(
+    text_path = resolution.path if (parser_name == 'plain_text'
+        and resolution.path.suffix.lower() in MATERIAL_TEXT_SUFFIXES) else _write_extracted_text(
         extraction_dir=extraction_dir,
         record=record,
         text=text,

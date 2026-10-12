@@ -17,8 +17,14 @@ from typing import Any
 from simple_ar.core.capabilities import ArtifactRef, CapabilityContext, CapabilityResult
 from simple_ar.literature.bibtex import papers_to_bibtex
 from simple_ar.literature.models import Paper
-from simple_ar.literature.verify import CitationError, validate_citations
-from simple_ar.report.assembler import apply_section_numbering, assemble_report_sections, split_report_references
+from simple_ar.literature.verify import CitationError, find_citation_ids, validate_citations
+from simple_ar.report.assembler import (
+    ReportAssemblyMode,
+    apply_section_numbering,
+    assemble_report_sections,
+    split_report_references,
+    validate_whole_article,
+)
 from simple_ar.report.citations import (
     append_references_section,
     cited_papers,
@@ -43,7 +49,11 @@ from simple_ar.report.schema import (
 
 @dataclass(frozen=True, slots=True)
 class ReportAssemblyRequest:
-    """Explicit inputs for assembling one report from completed sections."""
+    """Explicit sectional inputs or one completed article, with legacy defaults.
+
+    Callers opt new whole-article work units in explicitly; historical partial
+    assemblies must retain SECTION_DRAFTS rather than infer mode from labels.
+    """
 
     title: str
     sections: tuple[ReportSectionDraft | Mapping[str, Any], ...]
@@ -61,6 +71,7 @@ class ReportAssemblyRequest:
     analysis_handles: Mapping[str, str] = field(default_factory=dict)
     experiment_context: ReportContext | Mapping[str, Any] | None = None
     experiment_inputs: tuple[ArtifactRef, ...] = ()
+    assembly_mode: ReportAssemblyMode | str = ReportAssemblyMode.SECTION_DRAFTS
 
     def __post_init__(self) -> None:
         if not self.title.strip():
@@ -69,6 +80,9 @@ class ReportAssemblyRequest:
             section if isinstance(section, ReportSectionDraft) else ReportSectionDraft.model_validate(section)
             for section in self.sections
         ))
+        object.__setattr__(self, "assembly_mode", ReportAssemblyMode(self.assembly_mode))
+        if self.assembly_mode == ReportAssemblyMode.WHOLE_ARTICLE:
+            validate_whole_article(self.sections)
         if not isinstance(self.config, ReportRuntimeConfig):
             object.__setattr__(self, "config", ReportRuntimeConfig.model_validate(self.config))
         if self.document_plan is not None and not isinstance(self.document_plan, ReportDocumentPlan):
@@ -92,6 +106,8 @@ class ReportAssemblyResult:
     figures: tuple[ReportFigureRecord, ...] = ()
     removed_citations: tuple[str, ...] = ()
     citation_numbers: Mapping[str, int] = field(default_factory=dict)
+    # Transient assembly output; persisted formats share these exact identities.
+    cited_papers: tuple[Paper, ...] = ()
 
     @property
     def references_markdown(self) -> str:
@@ -107,7 +123,7 @@ def assemble_report_document(
 ) -> ReportAssemblyResult:
     """Assemble explicit section drafts without changing their meaning."""
 
-    report_body, cited, removed_citations, config, document_plan = _prepare_assembly_text(request)
+    report_body, papers, removed_citations, config, document_plan = _prepare_assembly_text(request)
     renderer = figure_renderer or DeterministicFigureRenderer()
     if request.paired_comparisons and figure_renderer is None:
         from simple_ar.report.figures import add_paired_measurement_figures
@@ -138,7 +154,7 @@ def assemble_report_document(
     # downstream exports instead of leaving them only in the display report.
     report_body = rendered.report_markdown
     return replace(
-        _display_report_text(report_body, cited, config, request.template_name),
+        _display_report_text(report_body, papers, config, request.template_name),
         figures=tuple(rendered.figures),
         removed_citations=tuple(removed_citations),
     )
@@ -151,9 +167,9 @@ def preview_report_document(request: ReportAssemblyRequest) -> ReportAssemblyRes
     This predicts headings, citation display and references, not future renderer
     output, attachment rechecks or the scientific validity of the content.
     """
-    body, cited, removed, config, _ = _prepare_assembly_text(request)
+    body, papers, removed, config, _ = _prepare_assembly_text(request)
     return replace(
-        _display_report_text(body, cited, config, request.template_name),
+        _display_report_text(body, papers, config, request.template_name),
         removed_citations=tuple(removed),
     )
 
@@ -171,25 +187,36 @@ def _prepare_assembly_text(
         raise ValueError("Report assembly requires at least one non-empty section draft.")
 
     config, document_plan = request.config, request.document_plan
+    supplemental_sections: list[ReportSectionDraft] = []
     if request.experiment_context is not None:
         from simple_ar.report.projection import _append_verified_experiment_evidence
-        sections = _append_verified_experiment_evidence(sections, request.experiment_context, config)
+        projected = _append_verified_experiment_evidence(sections, request.experiment_context, config)
+        if request.assembly_mode == ReportAssemblyMode.WHOLE_ARTICLE:
+            supplemental_sections = list(projected[len(sections):])
+        else:
+            sections = projected
     report_body = assemble_report_sections(
         # The frozen plan is shared by drafting, review and final assembly.
         # Legacy/custom plans without a title retain the caller's heading.
         title=document_plan.title if document_plan and document_plan.title else request.title,
         sections=_order_sections(sections, document_plan),
+        assembly_mode=request.assembly_mode,
+        supplemental_sections=supplemental_sections,
     )
-    report_body, cited, removed_citations = _prepare_report_citations(
+    report_body, papers, removed_citations = _prepare_report_citations(
         report_body,
         request.papers,
         request.citation_key_map,
     )
-    return report_body, cited, removed_citations, config, document_plan
+    return report_body, papers, removed_citations, config, document_plan
 
 
-def _display_report_text(report_body: str, cited: list[Paper], config: ReportRuntimeConfig, template_name: str) -> ReportAssemblyResult:
-    """Format the same reader-facing text before or after figure insertion."""
+def _display_report_text(report_body: str, papers: list[Paper], config: ReportRuntimeConfig, template_name: str) -> ReportAssemblyResult:
+    """Resolve final body references once, including renderer-inserted captions."""
+    validate_citations(report_body, {paper.id for paper in papers})
+    cited = cited_papers(report_body, papers)
+    if papers and not cited:
+        raise CitationError("Report body did not cite any paper from papers.jsonl")
     citation_map = citation_display_map(cited)
     report = append_references_section(
         display_citation_numbers(report_body, citation_map),
@@ -203,7 +230,7 @@ def _display_report_text(report_body: str, cited: list[Paper], config: ReportRun
         style=config.style,
     )
     return ReportAssemblyResult(report_markdown=report, report_body_markdown=report_body,
-                                citation_numbers=citation_map)
+                                citation_numbers=citation_map, cited_papers=tuple(cited))
 
 
 def _prepare_report_citations(
@@ -211,25 +238,22 @@ def _prepare_report_citations(
     paper_rows: tuple[Mapping[str, Any], ...],
     citation_key_map: Mapping[str, str],
 ) -> tuple[str, list[Paper], list[str]]:
-    """Normalize the writer-facing body and select its recorded references.
+    """Normalize the writer-facing body against the registered bibliography.
 
     Citation membership is checked here; metadata accuracy and support for
     individual claims are not independently certified by assembly.
     """
 
     papers = [Paper.from_row(dict(row)) for row in paper_rows]
-    if not papers:
-        return strip_references_section(report_body), [], []
     allowed_ids = {paper.id for paper in papers}
     body = strip_references_section(report_body)
     body = expand_short_citation_keys(body, dict(citation_key_map))
     body = normalize_bare_source_id_citations(body, allowed_ids)
     body, removed = sanitize_report_citations(body, allowed_ids)
     validate_citations(body, allowed_ids)
-    cited = cited_papers(body, papers)
-    if not cited:
+    if papers and not find_citation_ids(body):
         raise CitationError("Report body did not cite any paper from papers.jsonl")
-    return body, cited, removed
+    return body, papers, removed
 
 
 def _order_sections(
@@ -296,8 +320,7 @@ def run_report_capability(
         schema="report_body.v1",
         producer="report.assembly",
     )
-    cited = _cited_papers_from_request(result.report_body_markdown, request)
-    citation_map = citation_display_map(cited)
+    cited = list(result.cited_papers)
     references_ref = context.store.write_text(
         "references.bib",
         papers_to_bibtex(cited),
@@ -307,7 +330,7 @@ def run_report_capability(
     )
     citation_map_ref = context.store.write_json(
         "citation_map.json",
-        citation_map_artifact(citation_map, cited, dict(request.citation_key_map)),
+        citation_map_artifact(dict(result.citation_numbers), cited, dict(request.citation_key_map)),
         kind="citation_map",
         schema="citation_map.v1",
         producer="report.assembly",
@@ -353,7 +376,7 @@ def run_report_capability(
         },
         provenance={
             "capability": "report",
-            "assembly": "section_drafts",
+            "assembly": request.assembly_mode.value,
             "result_schema": "report.v1",
         },
     )
@@ -431,21 +454,8 @@ def _attach_table_analyses(
     return request, attachments, figures
 
 
-def _cited_papers_from_request(
-    report_body: str,
-    request: ReportAssemblyRequest,
-) -> list[Paper]:
-    """Reconstruct the deterministic reference set for persisted artifacts."""
-
-    if not request.papers:
-        return []
-    return cited_papers(
-        report_body,
-        [Paper.from_row(dict(row)) for row in request.papers],
-    )
-
-
 __all__ = [
+    "ReportAssemblyMode",
     "ReportAssemblyRequest",
     "ReportAssemblyResult",
     "assemble_report_document",

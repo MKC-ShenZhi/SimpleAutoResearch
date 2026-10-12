@@ -115,7 +115,9 @@ def _paper_from_result(result: arxiv.Result) -> Paper:
         title=_clean_space(result.title),
         authors=[str(author) for author in result.authors],
         abstract=_clean_space(result.summary),
-        url=result.entry_id,
+        # Atom uses an HTTP identifier; expose the canonical HTTPS acquisition
+        # locator without upgrading arbitrary user or third-party URLs.
+        url=f"https://arxiv.org/abs/{source_id}",
         published=result.published.date().isoformat() if result.published else None,
         categories=list(result.categories),
         source="arxiv",

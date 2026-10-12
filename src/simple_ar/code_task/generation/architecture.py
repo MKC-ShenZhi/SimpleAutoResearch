@@ -1,17 +1,19 @@
 from __future__ import annotations
 
+import copy
 import json
-import time
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from simple_ar.integrations.llm import LLMClient, LLMError
+from simple_ar.integrations.llm import LLMClient, LLMError, LLMResponseError
+from simple_ar.code_task.generation.agent_step import run_json_agent_step, response_accounting_known, write_agent_step_artifact
 from simple_ar.code_task.generation.common import scalar_list, text as clean_text
 from simple_ar.code_task.generation.task_contract import contract_prompt_view
 from simple_ar.code_task.generation.planning_tools import build_tool_agent_architecture_plan
 from simple_ar.code_task.generation.file_specs import (
     dedupe_file_rows,
     entrypoint_first,
+    infer_file_kind,
     normalize_dependency_paths,
     normalize_plan_path,
 )
@@ -34,7 +36,11 @@ def build_architecture_plan(
     planning_review_rounds: int = 2,
     message_callback: Callable[[str], None] | None = None,
 ) -> tuple[dict[str, Any], str]:
-    """Build a bounded architecture/file plan for a greenfield experiment."""
+    """Build a bounded plan; retry_attempts bounds completed format corrections.
+
+    allow_fallback permits offline planning or known completed format failures,
+    never provider, budget, deadline or incomplete-stream failures.
+    """
 
     retry_attempts = max(1, int(retry_attempts or 1))
     last_error: LLMError | None = None
@@ -42,7 +48,7 @@ def build_architecture_plan(
     if client is not None:
         if mode == "tool_agent":
             try:
-                raw = build_tool_agent_architecture_plan(
+                plan = build_tool_agent_architecture_plan(
                     contract=contract,
                     result_schema=result_schema,
                     resource_plan=resource_plan,
@@ -53,8 +59,9 @@ def build_architecture_plan(
                     planning_dir=planning_dir,
                     message_callback=message_callback,
                 )
-                plan = normalize_architecture_plan(raw, contract=contract, resource_plan=resource_plan)
-            except LLMError as exc:
+            except LLMResponseError as exc:
+                if not response_accounting_known(client):
+                    raise
                 last_error = exc
                 _emit(message_callback, f"Greenfield tool-agent planning failed. {exc}")
             else:
@@ -69,23 +76,25 @@ def build_architecture_plan(
                         domain_profile=domain_profile,
                         retry_feedback=_retry_feedback(last_error, attempt),
                     )
-                    raw = client.ask_json(
-                        GREENFIELD_ARCHITECT_SYSTEM,
-                        prompt,
+                    raw = run_json_agent_step(
+                        client=client, system=GREENFIELD_ARCHITECT_SYSTEM, prompt=prompt,
                         label="greenfield-architecture" if attempt == 1 else f"greenfield-architecture-retry-{attempt}",
+                        stage="compact", attempt_index=attempt, retry_attempts=1,
                         max_output_tokens=_architecture_output_tokens(resource_plan),
+                        artifact_dir=planning_dir, message_callback=message_callback,
                     )
+                    write_agent_step_artifact(planning_dir, stage="compact", attempt_index=attempt, value=raw)
                     return normalize_architecture_plan(raw, contract=contract, resource_plan=resource_plan), "compact"
-                except LLMError as exc:
+                except LLMResponseError as exc:
+                    if not response_accounting_known(client):
+                        raise
                     last_error = exc
                     if attempt < retry_attempts:
-                        delay = _stage_retry_delay(attempt)
                         _emit(
                             message_callback,
                             "Greenfield architecture planning failed "
-                            f"(attempt {attempt}/{retry_attempts}); retrying in {delay:.1f}s. {exc}",
+                            f"(attempt {attempt}/{retry_attempts}); correcting the completed response. {exc}",
                         )
-                        time.sleep(delay)
                     else:
                         _emit(
                             message_callback,
@@ -93,11 +102,8 @@ def build_architecture_plan(
                             f"(attempt {attempt}/{retry_attempts}); no retries left. {exc}",
                         )
     if client is not None and not allow_fallback:
-        raise LLMError(
-            "Greenfield architecture planning failed after "
-            f"{retry_attempts} attempt(s); fallback is disabled. "
-            "Set [execute].allow_planning_fallback = true only for demos/offline smoke tests."
-        ) from last_error
+        assert last_error is not None
+        raise last_error
     if client is None and not allow_fallback:
         raise LLMError(
             "Greenfield architecture planning requires an LLM client when fallback is disabled. "
@@ -134,6 +140,11 @@ def normalize_architecture_plan(
     contract: Mapping[str, Any],
     resource_plan: Mapping[str, Any],
 ) -> dict[str, Any]:
+    """Canonicalize a newly produced plan once, before publishing or consuming it.
+
+    Both planning producers use this owner for files and shared contracts.
+    Saved planning snapshots are deliberately not passed through this function.
+    """
     max_files = _positive_int(resource_plan.get("max_files"), 8)
     raw_files = value.get("files")
     files = [_normalize_file(row) for row in raw_files if isinstance(row, Mapping)] if isinstance(raw_files, list) else []
@@ -142,12 +153,20 @@ def normalize_architecture_plan(
         dependency_limit=12,
         public_api_limit=30,
         acceptance_limit=12,
-    )[:max_files]
+    )
     if not files:
-        raise LLMError("Architecture planning returned no usable file specifications")
+        raise LLMResponseError("Architecture planning returned no usable file specifications",
+            raw_response=json.dumps(dict(value), ensure_ascii=False))
     if not any(row.get("path") == "main.py" for row in files):
-        files.insert(0, _main_file_spec())
-    files = entrypoint_first(files)
+        files.insert(0, _normalize_file(_main_file_spec()))
+    if len(files) > max_files:
+        raise LLMResponseError(f"Architecture plan requires {len(files)} files but max_files is {max_files}; revise the plan or explicitly increase the limit",
+            raw_response=json.dumps(dict(value), ensure_ascii=False))
+    files = (
+        [row for row in files if row["path"] == "main.py"]
+        + entrypoint_first([row for row in files if row["path"] != "main.py"])
+    )
+    interface_spec = value.get("interfaces")
     plan = {
         "schema_version": "greenfield_architecture.v1",
         "mode": "greenfield_project",
@@ -155,12 +174,17 @@ def normalize_architecture_plan(
         "architecture_summary": clean_text(value.get("architecture_summary"))
         or "Small, reviewable experiment project with a single command-line entrypoint.",
         "data_flow": scalar_list(value.get("data_flow"))[:8],
-        "interfaces": scalar_list(value.get("interfaces"))[:8],
+        "interfaces": (_render_interfaces(interface_spec) if isinstance(interface_spec, Mapping)
+            else scalar_list(interface_spec))[:10],
         "test_strategy": scalar_list(value.get("test_strategy"))[:8],
-        "risks": scalar_list(value.get("risks"))[:8],
+        "risks": scalar_list(value.get("risks"))[:10],
         "files": files,
     }
     plan.update(_shared_contracts(contract=contract, resource_plan=resource_plan, files=files, raw=value))
+    # These are assembled stage facts, not a second plan or state owner.
+    for key in ("planning", "planning_status", "result_schema"):
+        if key in value:
+            plan[key] = copy.deepcopy(value[key])
     return plan
 
 
@@ -207,17 +231,14 @@ def fallback_architecture_plan(
             "Fallback generation is a conservative runnable scaffold, not a domain-specific breakthrough.",
             "LLM-generated files still require review and run guard validation.",
         ],
-        "files": _ensure_public_api(
-            _fallback_files(
-                required_metrics,
-                _positive_int(resource_plan.get("max_files"), 8),
-                contract=contract,
-                domain_profile=domain_profile,
-            )
+        "files": _fallback_files(
+            required_metrics,
+            _positive_int(resource_plan.get("max_files"), 8),
+            contract=contract,
+            domain_profile=domain_profile,
         ),
     }
-    plan.update(_shared_contracts(contract=contract, resource_plan=resource_plan, files=plan["files"], raw={}))
-    return plan
+    return normalize_architecture_plan(plan, contract=contract, resource_plan=resource_plan)
 
 
 def _shared_contracts(
@@ -232,6 +253,12 @@ def _shared_contracts(
     evidence_plan = contract.get("evidence_plan") if isinstance(contract.get("evidence_plan"), Mapping) else {}
     metric_contract = contract.get("metric_contract") if isinstance(contract.get("metric_contract"), Mapping) else {}
     interfaces = raw.get("interfaces") if isinstance(raw.get("interfaces"), Mapping) else {}
+    implementation = contract.get("implementation_contract")
+    implementation = implementation if isinstance(implementation, Mapping) else {}
+    owners: dict[str, list[str]] = {}
+    for row in files:
+        for obligation in scalar_list(row.get("contract_obligations"), limit=40):
+            owners.setdefault(obligation, []).append(row["path"])
     return {
         "artifact_contract": {
             "required_artifacts": scalar_list(evidence_plan.get("required_artifacts"))[:30],
@@ -249,6 +276,13 @@ def _shared_contracts(
         if isinstance(resource_plan.get("execution_budget"), Mapping)
         else {},
         "interface_registry": _interface_registry(files=files, interfaces=interfaces),
+        "implementation_contract": {
+            "schema_version": implementation.get("schema_version", "code_task_implementation_contract.v1"),
+            "ownership_policy": implementation.get("ownership_policy", ""),
+            "obligations": [copy.deepcopy(dict(row)) for row in implementation.get("obligations", [])
+                if isinstance(row, Mapping)][:80],
+            "owner_index": owners,
+        },
     }
 
 
@@ -263,14 +297,34 @@ def _interface_registry(*, files: list[dict[str, Any]], interfaces: Mapping[str,
                 "dependencies": scalar_list(row.get("dependencies"))[:16],
                 "public_api": scalar_list(row.get("public_api"))[:20],
                 "acceptance_criteria": scalar_list(row.get("acceptance_criteria"))[:12],
+                "contract_obligations": scalar_list(row.get("contract_obligations"))[:24],
                 "kind": row.get("kind", ""),
             }
         )
     return {
         "files": [row for row in by_file if row.get("path")],
-        "module_apis": [dict(row) for row in module_apis if isinstance(row, Mapping)][:20],
-        "shared_schemas": [dict(row) for row in shared_schemas if isinstance(row, Mapping)][:16],
+        "module_apis": [copy.deepcopy(dict(row)) for row in module_apis if isinstance(row, Mapping)][:20],
+        "shared_schemas": [copy.deepcopy(dict(row)) for row in shared_schemas if isinstance(row, Mapping)][:16],
     }
+
+
+def _render_interfaces(value: Mapping[str, Any]) -> list[str]:
+    lines: list[str] = []
+    for row in value.get("shared_schemas", []) if isinstance(value.get("shared_schemas"), list) else []:
+        if isinstance(row, Mapping):
+            name = clean_text(row.get("name") or row.get("description"))
+            fields = row.get("fields")
+            field_text = ", ".join(str(item) for item in fields[:10]) if isinstance(fields, list) else clean_text(fields)
+            lines.append(f"Schema {name}: {field_text}".strip())
+    for row in value.get("module_apis", []) if isinstance(value.get("module_apis"), list) else []:
+        if isinstance(row, Mapping):
+            module = clean_text(row.get("module") or row.get("name"))
+            api = row.get("public_api")
+            api_text = ", ".join(str(item) for item in api[:12]) if isinstance(api, list) else clean_text(api)
+            lines.append(f"{module}: {api_text}".strip())
+    lines.extend(scalar_list(value.get("cross_file_contracts"))[:20])
+    lines.extend(scalar_list(value.get("stdout_contract"))[:10])
+    return [line for line in lines if line]
 
 
 def render_architecture_markdown(plan: Mapping[str, Any]) -> str:
@@ -486,7 +540,7 @@ def _fallback_capability_files(metric_note: str, max_files: int, task_text: str)
         "resources",
     ]
     files = [catalog[key] for key in order if key in selected][: max(1, max_files)]
-    return _prune_file_dependencies(files)
+    return files
 
 
 def _generic_file_catalog(metric_note: str) -> dict[str, dict[str, Any]]:
@@ -624,18 +678,6 @@ def _mentions_any(text: str, needles: tuple[str, ...]) -> bool:
     return any(needle in text for needle in needles)
 
 
-def _prune_file_dependencies(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    selected_paths = {str(row.get("path", "")) for row in files}
-    pruned: list[dict[str, Any]] = []
-    for row in files:
-        copy = dict(row)
-        dependencies = copy.get("dependencies")
-        if isinstance(dependencies, list):
-            copy["dependencies"] = [str(dep) for dep in dependencies if str(dep) in selected_paths]
-        pruned.append(copy)
-    return pruned
-
-
 def _main_file_spec() -> dict[str, Any]:
     return {
         "path": "main.py",
@@ -656,7 +698,9 @@ def _normalize_file(row: Mapping[str, Any]) -> dict[str, Any]:
         "dependencies": normalize_dependency_paths(row.get("dependencies"), limit=12),
         "public_api": scalar_list(row.get("public_api"))[:30] or _default_public_api(path),
         "acceptance_criteria": scalar_list(row.get("acceptance_criteria"))[:12],
+        "contract_obligations": scalar_list(row.get("contract_obligations") or row.get("obligation_ids"))[:24],
         "entrypoint": bool(row.get("entrypoint")) or path == "main.py",
+        "kind": infer_file_kind(path, row.get("kind")),
     }
 
 
@@ -667,10 +711,6 @@ def _retry_feedback(error: LLMError | None, attempt: int) -> str:
         f"The previous architecture attempt failed validation before attempt {attempt}: {error}. "
         "Return one strict JSON object only, with a concrete task-specific file plan and no Markdown fences."
     )
-
-
-def _stage_retry_delay(attempt: int) -> float:
-    return min(30.0, 2.0 * (2 ** max(0, attempt - 1)))
 
 
 def _architecture_output_tokens(resource_plan: Mapping[str, Any]) -> int:
@@ -694,13 +734,6 @@ def _architecture_contract_view(contract: Mapping[str, Any]) -> dict[str, Any]:
 def _emit(callback: Callable[[str], None] | None, message: str) -> None:
     if callback is not None:
         callback(message)
-
-
-def _ensure_public_api(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    for row in files:
-        path = str(row.get("path", ""))
-        row.setdefault("public_api", _default_public_api(path))
-    return files
 
 
 def _default_public_api(path: str) -> list[str]:

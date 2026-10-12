@@ -4,6 +4,415 @@
 
 This file records implemented, user-visible changes in reverse chronological order. Usage and technical references live in `docs/`; future plans and private acceptance records are not release claims.
 
+## 2026-10-12
+
+- Writing can combine explicit original sources with delegated material directories.
+  Directory selection indexes authorized candidates without pre-reading unrelated
+  data or weights; selected inputs and source previews retain content-version checks.
+  Unsupported or oversized files are disclosed, while legacy inventory recovery is unchanged.
+  Direct article drafting shares the existing citation-field value rules; saved
+  earlier article prompts recover without resubmitting a model request.
+- Supplied source metadata survives linked-material projection, and source-local
+  bibliography notes accept the source's document or citation identity. ACM
+  exports retain valid citation labels in ordinary clean rebuilds, including
+  missing-author/date records; compilation no longer rewrites generated `.bbl`
+  files or requires users to repair them manually.
+- Task startup shares one owner for route validation, material reuse and dialogue;
+  the CLI no longer repeats these conversions. Saved technical proposals retain
+  their existing confirmation and recovery behaviour.
+- Process observations preserve the actual final output tails in their existing
+  invocation receipt. Fresh and recovered results share one projection, including
+  measured output omissions; legacy logs do not claim to recover a lost final tail.
+  Native Python commands and their children use the selected task environment;
+  command approvals bind the effective argv and filtered environment. Changed
+  approvals are rejected, while recorded executions recover without rerunning.
+- Report display, bibliography and citation maps share the final rendered body's
+  reference set, including citations introduced by figure captions. Persistence
+  no longer reconstructs a separate set from the original section drafts.
+- Code generation, review and repair share bounded source reading and decoding;
+  rejected environment/private paths are not pre-read for head/tail windows.
+  Dependency excerpts retain complete interface observations, and generated
+  project review reuses one interface set across its checks and advisory clusters.
+- Visual review explicitly requests a `findings` object and distinguishes rejected
+  response content from connection failure. Invalid replies stay in local records;
+  they are neither accepted as findings nor automatically resent.
+- Structured report recovery preserves applied checks and consumed correction
+  allowances without reopening review because unresolved findings remain.
+  Interrupted corrections require their matching parent response; duplicate finding
+  identities are rejected, while original replies and unresolved opinions are retained.
+- New code-project plans use one assembly owner for compact and staged planning,
+  retaining file obligations, interfaces and review status through generation.
+  Insufficient file budgets reject the plan instead of dropping required modules;
+  saved planning snapshots retain their original meaning.
+  Staged planning and review share step execution and normalized-result recording;
+  patch feedback has one converter, preserving revision routing and saved history.
+- New native material mounts are checked before connection selection or task/access
+  changes. Private paths, symlinks and non-regular inputs are rejected through the
+  same admission rule for direct entry, guided preferences and additional materials.
+  Mounted reads, inventories and project inspection apply the private-name rule
+  regardless of letter case. Project inspection and implementation selection
+  filter traversal and source reads through the same authorized inventory;
+  saved selection receipts retain their original recovery behavior.
+  Writing material selection exposes short mounted locators instead of long
+  absolute paths; aliases are checked against the same resolved inventory and
+  cannot select a file twice or extend access.
+- Whole-article composition follows its named connection's shared transport,
+  retry and JSON settings instead of overriding them locally. Each physical
+  attempt stays on the task ledger; saved responses recover without redrafting.
+  New article inputs omit unused sectional Writer state and send a previous draft
+  once; historical input snapshots retain their original representation.
+- Workspace file copies support text and binary files up to 64 MiB through the
+  same atomic, version-checked writer used by edits. An explicit streamed digest
+  can be requested without reading a whole data file into model context;
+  ordinary text-window and historical request behavior remain unchanged.
+- New native tasks receive the full authorized tool contracts directly, removing
+  the mandatory specialist-contract selection step. Saved on-demand tasks retain
+  their original selection receipts and recovery behavior; permission checks remain.
+- Failed native decisions can explicitly continue with a compatible named Chat
+  connection using `--retry-model --model profile:NAME` or `route:NAME`.
+  Text/code/writing bindings and the transition are saved in the existing task;
+  cached replies, history, vision, permissions and unknown charges are retained.
+  Ordinary resume keeps its saved selector; an unrequested model switch is rejected.
+- Finite SDK timeouts bound TCP/TLS connection waits to at most 20 seconds without
+  shortening configured read/write waits or the Chat streaming deadline. SDK
+  internal retries remain disabled; task retry accounting and unknown usage remain.
+- New workspace edit tool schemas use one `replacements` list. Historical
+  single-change inputs remain accepted with the same exact-match, version, backup
+  and write boundaries; redundant legacy replacement conversion is removed.
+
+## 2026-10-11
+
+- Native composition and professional work support an optional named `writing`
+  route, separate from daily coordination. A bounded writing focus can investigate,
+  revise and deliver in the same action loop without a separate workflow.
+  Both retain the task budget and pinned connection; without the route, the
+  selected task model is unchanged. Native work requires Chat; composition
+  continues to support Responses.
+  Native resource context distinguishes image generation/editing from authorized
+  visual inspection, which uses the shared model-call and token budget.
+
+- Publication exports include the complete editable project and figure assets.
+  Reuse checks the saved output bytes; historical input-only receipts remain
+  historical rather than certifying current files. New whole-article composition
+  preserves authored heading hierarchy instead of applying section wrappers;
+  historical composition retains its original assembly form on resume.
+  Whole-article recovery validates known saved prompt versions and their complete
+  responses without reconstructing or replaying the original request.
+  Composition accepts explicit figure captions; export binds the same caption
+  and removes only an exact adjacent duplicate, retaining surrounding discussion.
+  Native export can render bounded, complete PDF page previews within the same
+  approved operation. Previews share output integrity and recovery; incomplete
+  requested rendering prevents delivery without discarding compiled files.
+  Technical text wrapping uses `seqsplit` and `fvextra`; literal code attachments
+  travel with the editable project, including tabs and escaped command text.
+  Title/caption commands retain safe expansion and literal PDF metadata.
+
+- Writing and assembly share registered citation identities and citation cleanup,
+  including empty bibliographies; original connector identities do not need a
+  second intake assignment. Prior drafts and derived results remain distinct.
+  New native compositions use one whole-article request rather than the legacy
+  section-planning/review lifecycle, preserving inputs and responses before
+  validation. Feedback creates a new version; historical Writer checkpoints
+  keep their recovery rules. This does not add automatic factual review.
+  Material recovery retains observed byte ranges; omitted line limits are not
+  made explicit by writing or implementation input serialization.
+  Composition interrupted after a complete, bound Writer result can reconcile
+  assembly and publication without another model request; partial, unknown or
+  modified records are preserved rather than blindly regenerated.
+
+- Native composition can select relevant local files from authorized material
+  roots, using the same version-bound inventory as code preparation. Selection
+  and writing share the task budget; explicit source windows remain available.
+  New requests choose explicit inputs or delegated selection, not both; explicit
+  locators are checked before paid selection. Saved requests keep their bound
+  recovery rules. arXiv metadata exposes canonical HTTPS source locators, so
+  ordinary search results meet the public acquisition contract.
+  Retained original bundles in these roots can be selected by source questions,
+  preserving provenance and passage coverage without coordinator-authored inputs.
+  File-change conflicts now report actionable version expectations without
+  writing, exposing file contents or automatically retrying.
+  Explicit line limits also apply to byte-origin reads; byte-only readers and
+  exact continuation offsets retain their existing behavior.
+  Native context retains contiguous complete decisions and matching tool results
+  within shared serialized capacity, rather than only the latest operation.
+  Omitted history remains readable through `read_history`; version-checked
+  original windows supplement it without duplicating retained turns.
+  Latest execution/failure diagnoses remain available without a second memory
+  store. Oversized indivisible operations stay exact; optional context does not
+  bypass the existing budget checks.
+  New native decisions load named specialist contracts on demand from the
+  permissioned catalog, including each owner's work-unit description.
+  Selection shares action receipts and recovery;
+  historical tasks retain full contracts and permissions do not change.
+  Ordinary guided preferences use the same native owner across research, writing,
+  reproduction, code and figures, without a repair scaffold or prefilled technical
+  protocol. Materials remain read-only; access is confirmed separately. Explicit
+  table-column shortcuts, validation protocols and saved setup remain compatible;
+  unmapped native controls are rejected before creation.
+
+- Code preparation can start from a goal alone, or receive an existing project,
+  without a preselected file list or mandatory entry filename.
+  The code owner selects related paths and binds actual originals
+  before using the existing candidate writer; selection and generation share
+  the task budget and the same bound execution observations, including file
+  selection for a diagnosed repair. Selected existing files may remain unchanged rather than
+  acquire artificial edits. Complete response-contract rejections can receive
+  one budgeted correction with both proposals retained; transport and unknown-use
+  failures are not replayed here. This does not execute or verify the project.
+  Generated-project review and runtime repair now share related-file selection
+  and candidate generation instead of separate per-file requests. Application
+  consumes validated candidates without decoding them again, retaining API/static
+  guards and a single checked whole-unit rollback; completed reuse binds project
+  bytes, while explicit new rounds preserve unbound historical results.
+
+- Structured generated-project review separates structural checks from task
+  acceptance. Fixed prose-matching gates for commands, artifact paths and
+  library preferences have been removed; contextual review retains the complete
+  declared task and remains advisory. Contract refresh preserves prior reports
+  before replacing the active view. Actual execution checks remain independent.
+
+- Code planning and generation no longer repeat shared transport retries or
+  fall back after provider, budget, deadline or incomplete-stream failures.
+  Bounded correction remains available for complete response-format failures
+  with reconciled accounting. Reading retained code-task memory no longer
+  rewrites its timestamp or manifest. Images check optional HTTP/2 support before
+  reserving or recording submission, without altering older uncertain records.
+  SDK Chat deadlines retain a whitelisted transport phase and stream-open state;
+  visual-tool failures preserve those diagnostics without exposing request content
+  or changing unknown-use accounting and retry policy.
+  Visual tools expose image admission limits and actionable local validation;
+  review follows the named connection's output cap and retains rejected final
+  responses locally, without publishing them as findings or automatically resending.
+  Async image tasks enforce one cancellable deadline across submission, polling
+  and download, replacing between-chunk checks that could overrun the time limit.
+  Recovery retains the accepted ID and never submits a replacement generation.
+
+- Model configuration supports a per-profile `context_input_tokens` target for native history,
+  retaining the 24,000 default and the shared task budget. Input retuning does
+  not change model identity or revive an exhausted task. Chat accepts disabled
+  thinking with empty or `none`
+  effort, rejecting contradictory active effort before dispatch. Disabled
+  thinking no longer activates the reasoning-output fallback; explicit output
+  caps retain precedence. Workspace processes suppress Python import bytecode
+  writes by default without claiming filesystem isolation.
+
+- Native tasks can retain and update a concise working plan across history
+  compaction and resume. Plans belong to the current user request, not a fixed
+  workflow; their progress labels do not replace execution checks or delivery.
+  On-demand contracts expose planning as an optional tool, not a required stage.
+  Deep history compaction retains acquired-source identities and extraction
+  status, plus observed file paths, versions and read positions; originals remain
+  readable. These observations do not certify claims or current file contents.
+  Result panels show saved artifact locations, pending work and ledger balances,
+  distinguishing retained records from confirmed current delivery and unknown
+  reservations from recorded consumption.
+
+- Native tasks can prepare an editable project in one `copy_project` operation,
+  reusing the CodeTask copy owner. Ordinary code, tests, documentation and binary
+  resources are retained; exclusions and size bounds are reported. Interrupted
+  publication reconciles its recorded file versions without recopying or
+  overwriting subsequent edits. This does not install or execute the project.
+
+- Native task resume supports explicit remaining-resource authorization with
+  an ID and reason. Confirmation distinguishes cumulative usage from the new
+  allowance; repeated authorization does not replenish spent capacity. Model
+  bindings, execution approvals and unresolved-operation safeguards remain.
+  A separate `--retry-model` can continue a terminated failed native decision
+  with a new attempt, saved output cap and remaining budget. Old failures and
+  bounded unknown charges stay recorded; cached replies are recovered without
+  new calls, and in-flight requests or pending tools are not replayed.
+
+- Context planning and transport share the effective output limit. Finite
+  input capacity accounts for that reservation without silently lowering the
+  output cap; Responses-to-Chat conversion now preserves an explicit limit.
+  Native history can use a lossless column/row index, and its final metadata
+  is included in input estimates. The latest nonzero execution diagnosis is
+  retained alongside the last execution; neither certifies the current project.
+
+## 2026-10-10
+
+- Native tool declarations now use the execution gateway's permission policy:
+  unavailable operations are not advertised, and explicitly granted access
+  refreshes the declarations. Execution still independently checks authorization;
+  task names do not select a separate tool list or workflow.
+
+- Native `focus_work` can select the configured code connection for a bounded
+  work goal and return to the original task connection. Investigation, editing
+  and verification stay in one history, approval path and shared ledger; resume
+  reads the saved decision rather than starting a separate agent workflow.
+  Composition, code preparation and visual inspection resolve their clients
+  through the same task owner. Newly authorized vision routes retain a non-secret
+  connection binding, so resume cannot silently send images to a changed model.
+  Coherent code preparation receives the actual candidate directory and task
+  interpreter from the workspace owner; their presence does not certify
+  dependencies or authorize execution.
+
+- SDK connection failures distinguish pre-dispatch connection/pool errors from
+  possibly dispatched requests using transport causes. Proven pre-dispatch
+  attempts retain the request count with zero tokens and permit bounded retries;
+  uncertain uncapped Chat streams stop without automatic replay or API fallback.
+  Existing capped-text and legacy transport retry policies remain intact.
+  Budget-blocked retries and failed usage reconciliation retain both the budget
+  stop and safe preceding provider diagnostics, without exposing raw responses
+  or changing unknown usage records.
+  Interrupted Chat streams retain safe progress counts and completion/usage
+  flags, distinguishing an unopened stream from a partial response without
+  logging its contents or treating incomplete tool arguments as a result.
+
+- Observed text sources and generated candidates can be copied into the workspace
+  by digest without retransmitting their contents. Existing destinations retain
+  the ordinary write safeguards and backup; changed generation candidates are no
+  longer restored as if they were the recorded original output.
+  Project directories can be delivered through the existing bounded inventory:
+  the manifest lists accessible files, excludes private paths and Python caches,
+  and rejects oversized or empty selections rather than silently truncating them.
+  Terminal actions must come last in a batch; invalid order is rejected before
+  the terminal side effect. A retained, version-bound delivery can finish after
+  interruption without another model call or tool replay. Feedback starts a new
+  revision and cannot adopt the previous delivery or unstarted action queue.
+  Delivery can also reference this task's retained evidence without granting write
+  access or admitting external source mounts and attempt histories as outputs.
+
+- Native tasks can inspect supplied tables and call the existing deterministic
+  analysis capability directly. Statistics, figures and copied inputs share one
+  portable package; unchanged completed versions are reused. Unsupported analyses
+  still use the code tools rather than being forced into a preset.
+
+- Native publication approval and recovery now bind local figure contents, not
+  only the Markdown, bibliography and figure manifest. Derived exports are
+  excluded; historical terminal versions keep their recorded coverage. PDF
+  export also supports signed Unicode subscripts/superscripts and returns saved
+  compilation diagnostics when rendering fails.
+  An explicitly requested final export can save the normal delivery manifest
+  after success without another model turn; failures and historical exports do
+  not acquire a delivery retroactively.
+
+- Native composition accepts selected text, table and result-file windows as well
+  as retained literature passages. Existing figures travel with the editable
+  manuscript; feedback preserves the original version. File access and window
+  selection reuse workspace tools, without turning supplied results into verified
+  measurements or adding a separate analysis/report pipeline.
+  Reusing a completed composition now checks all manuscript, reference and figure
+  bytes; edited or missing outputs are not reported as the original saved version.
+  Retained literature can also be selected by concrete source questions through
+  the existing lexical retriever, with exact selected passages bound to the
+  manuscript. Explicit chunk selections retain their historical receipt format;
+  no matches are not replaced with an abstract or treated as evidence of absence.
+  Passage queries return source identities alongside the original text, avoiding
+  separate title/URL lookups. Whole-article composition keeps writing principles
+  without imposing the fallback template's chapter list; a single article is no
+  longer assembled under a duplicate document-title heading.
+
+- Native context retention no longer divides the remaining token allowance by
+  the maximum future request count. Raising a request ceiling therefore does not
+  discard more observed source text; low balances still reduce retained history.
+  The existing input target and shared ledger remain in use. Observation indexes
+  omit duplicate paths and empty optional fields while retaining original records,
+  recent operation payloads and recoverable progress. Output limits and task
+  allowances are unchanged; an oversized protected context remains visible.
+  Successful file observations can retain exact, version-labelled text windows
+  after turn eviction. Recent reads and writes take priority within the same input
+  budget; after execution, original windows are revalidated against authorized
+  paths and digests. Changed, deleted or redirected files are omitted, without
+  injecting unobserved content or introducing a second memory state. Original
+  operation payloads and receipts remain unchanged.
+  The latest actual process result survives history indexing, without duplicating
+  a complete bound read-back or interpreting a blocked proposal as execution.
+  Under capacity pressure, older observation indexes retain receipt locators
+  rather than accumulating all arguments and metadata indefinitely. Original
+  records and the latest actual execution diagnosis remain available.
+
+- Native code preparation can generate a coherent set of related files in one
+  request through the existing generator and named code route. Candidates retain
+  their source bindings and unresolved gaps without replacing original materials;
+  existing-file changes use digest-bound exact replacements rather than whole-file
+  regeneration. Candidate generation and direct editing share the same replacement
+  rules; execution, behavioral checks and delivery remain separate responsibilities.
+
+- Native project investigation reuses the existing preparation inspector for
+  declarations, entry candidates and data locations. Full observations remain in
+  attempt records, separate from original-source evidence; private paths are
+  excluded before indexing. Preparation also recognizes README instructions in
+  reStructuredText and long-form Markdown, without importing or running project code.
+  A final file write can include an explicit delivery manifest, avoiding a separate
+  model call solely to declare completion. Existing artifact validation and task
+  completion own the result; a plain write still does not complete a task.
+
+- Bare `start` now asks for a natural-language task and uses the native loop;
+  the structured menu is explicit with `--guided`. Existing structured commands
+  remain compatible, while mixed native/structured options are rejected.
+  Continuation can explicitly add read-only materials and access grants after
+  confirmation, without replacing existing results or resetting task allowances.
+
+- Native tasks can use an explicitly supplied project Python environment. Older
+  closed tool rounds are projected into readable observation indices while recent
+  calls retain their original payloads; raw records and saved budgets are unchanged.
+  Historical indices retain bounded, exact command identities and short process
+  output, so completed checks remain identifiable without replaying them.
+  Ambiguous edits identify the replacement and first matching lines, including
+  overlapping text matches, without writing partial changes.
+  File tools accept authorized absolute paths alongside legacy aliases, so generated
+  programs can use the same filesystem addresses without rewriting source strings.
+  Source lookup and composition retain the original-source boundary for absolute
+  paths, rejecting generated workspace records and attempt history as evidence.
+- New native tasks pin their non-secret model connection for continuation;
+  changing model/endpoint identity is rejected before further calls or execution.
+  Credential rotation and operational tuning follow the existing compatibility rules.
+- Generated-project plans, interfaces, repair actions and external-output review share one relative
+  path check. Absolute, drive-qualified, traversal and alternate-stream paths are
+  rejected instead of silently converted; duplicate deliverable filters are merged.
+  Internal and handoff-based generation now publish a completed candidate instead
+  of deleting the previous project first. Failed candidates and prior projects
+  remain available; a failed publication restores the previous output directory.
+  Code-proposal follow-up reads refresh the bounded source window instead of
+  stopping when the initial selection fills it. Newly read files retain configured
+  edit permissions and explicit batch restrictions; original observations remain saved.
+  Python type declarations (`.pyi`) also use Python decoding and definition-based
+  source lookup, avoiding unrelated prose matches when requesting a named class.
+- Experimental native tasks can compose a source-based article from selected
+  retained chunks and rewrite it from a complete previous draft. Existing Writer
+  and citation assembly use the shared task budget; new versions preserve old
+  drafts. Explicitly selected evidence retains its full text within the shared
+  composition window, rather than being shortened into another overview.
+  Composition is not independent review or a completed research task.
+  New composition versions expose one citation-preserving manuscript for editing
+  and export; display copies remain tool records rather than competing drafts.
+  Missing citation fields can also be filled from retrieved source front matter:
+  source and citation IDs are joined through their recorded handles, and proposals
+  must match exact same-source quotations without replacing supplied metadata.
+  Notebook v4 material is read as cell sources, including text caches fetched
+  from public URLs; saved outputs and images are explicitly outside this reading
+  scope. Original files remain intact and downstream chunks use the extracted view.
+- Native publication approval and recovery share the input binding for the body,
+  bibliography and figure manifest, rejecting changed inputs instead of reusing
+  an older export. Historical versions retain their recorded recovery semantics.
+- Report writing saves completed section reviews before attempting revision;
+  recovery reuses those opinions instead of paying for the same review again.
+  Source-selection navigation no longer repeats full evidence and long chunk
+  directories; writing and review retain the evidence and its access limits.
+  Identical source views already present in a request are referenced once;
+  new or conflicting tool evidence remains available without changing stored records.
+- Native tasks receive current shared-ledger resources and approximate next-input
+  cost when choosing actions; recovery does not refresh those limits. Retained
+  document records can be queried from supplied read-only mounts, without
+  requiring a new acquisition or accepting generated output as original evidence.
+  Bounded recursive filename discovery and source-record overviews avoid opening
+  every acquisition directory or reading full metadata JSON just to identify material.
+- Native workspace search uses ripgrep with explicit file coverage and output
+  limits; file reads can use the returned line locations instead of guessing byte
+  offsets. New tasks account for search subprocesses separately from model turns;
+  process wall-clock limits remain bounded and existing task budgets stay unchanged.
+- LiteLLM is now an optional `litellm` extra rather than a default installation
+  dependency. Compatibility connections report missing installation before
+  reserving request usage; the default SDK transport is unchanged.
+- Experimental native tasks can atomically edit multiple uniquely matching,
+  non-overlapping spans in one observed file; any failed match leaves it unchanged.
+  Single-span calls remain supported, retaining digest checks, backups and read-only
+  source protection. Tool-call history preserves actual write payloads instead
+  of substituting omission markers that could be copied into generated source.
+- The common tool gateway initializes compatibility domains only when called;
+  native tasks no longer create unused legacy code and experiment gateway state.
+
 ## 2026-10-09
 
 - Guided setup uses Rich function and task panels, lists named text connections
@@ -16,6 +425,12 @@ This file records implemented, user-visible changes in reverse chronological ord
   Partial edit proposals no longer suppress explicit requests for missing
   source context; bounded follow-up reads retain unapplied draft edits for a
   complete replacement proposal before application.
+  Completed edit responses with invalid JSON retain their original text and
+  receive one budgeted format correction; transport failures are not retried
+  by this path, and edit review and execution validation still apply.
+  Code repair can also use supporting documents or explicitly authorized search,
+  and optionally report the saved patch and validation results without requiring
+  a scientific experiment protocol or repeating code execution.
 - Literature search stops live queries to a provider after HTTP 429 within the
   current batch, while preserving failures, checking query-specific caches and
   continuing other configured providers instead of repeating quota failures.
@@ -82,7 +497,11 @@ This file records implemented, user-visible changes in reverse chronological ord
   override an explicitly online investigation with a local-only search default.
   Legacy untyped local drafts are excluded when the saved session declares them
   as report material, without guessing their role from filenames.
-- Preparation can inspect declared lockfiles through the same bounded source
+- Reproduction dialogue can discover public paper copies and project
+  references through existing search providers after confirmation, retaining
+  metadata, provider failures and saved responses across recovery without
+  treating search results as acquired papers or execution authority.
+  Preparation can inspect declared lockfiles through the same bounded source
   lookup, without sending their generated contents by default. Public download
   proposals select an inspected source path; code locates the exact URL instead
   of requiring the model to recopy prose. PDF reading preserves HTTP link targets

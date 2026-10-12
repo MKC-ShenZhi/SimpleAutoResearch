@@ -525,6 +525,30 @@ def clip_source_snippet(row: dict[str, Any], *, max_chars: int) -> dict[str, Any
     return result
 
 
+def refresh_source_snippets(
+    previous: list[dict[str, Any]], incoming: list[dict[str, Any]], *,
+    preferred_paths: set[str], max_total_chars: int,
+) -> list[dict[str, Any]]:
+    """Bound the current prompt, not the lifetime of observed source.
+
+    New requested evidence takes precedence over old navigation snippets. Exact
+    coordinates and roles survive clipping; the caller retains original records.
+    """
+    rows = incoming + sorted(previous, key=lambda row: row["path"] not in preferred_paths)
+    selected, seen = [], set()
+    remaining = max(0, max_total_chars)
+    for row in rows:
+        identity = (row["path"], row.get("access_role"), row.get("source_offset", 0), row["text"])
+        if remaining <= 0:
+            break
+        if identity in seen or not row["text"]:
+            continue
+        seen.add(identity)
+        selected.append(clip_source_snippet(row, max_chars=remaining))
+        remaining -= len(selected[-1]["text"])
+    return selected
+
+
 def read_source_snippets(
     workspace_dir: Path, selected_files: list[str], *, max_chars_per_file: int,
     editable_files: list[str] | None = None,

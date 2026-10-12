@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import shutil
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Mapping
 
 from simple_ar.agent_backends import (
@@ -17,6 +17,9 @@ from simple_ar.agent_backends import (
 )
 from simple_ar.core.artifacts import write_json
 from simple_ar.integrations.llm import LLMClient
+from simple_ar.code_task.generation.common import safe_relative_path as _safe_project_path
+from simple_ar.code_task.generation.common import generation_candidate
+from simple_ar.code_task.generation.file_specs import is_deliverable_project_file as _is_deliverable_project_file
 
 
 def should_use_agent_backend(provider: str) -> bool:
@@ -158,9 +161,8 @@ def write_greenfield_project_from_agent_backend(
             f"Status={result.status}; generated_file_count={len(generated_files)}; "
             f"message={result.message}; result={result.result_path or package.handoff_dir}."
         )
-    if project_dir.exists():
-        shutil.rmtree(project_dir)
-    shutil.copytree(generated_dir, project_dir, ignore=_copy_ignore)
+    with generation_candidate(project_dir) as candidate:
+        shutil.copytree(generated_dir, candidate, ignore=_copy_ignore, dirs_exist_ok=True)
     code_artifacts = _code_artifacts_from_project(project_dir, source=f"agent:{normalized_provider}")
     agent_result = {
         "provider": normalized_provider,
@@ -304,29 +306,6 @@ def _copy_ignore(directory: str, names: list[str]) -> set[str]:
             ignored.add(name)
     return ignored
 
-
-def _is_deliverable_project_file(value: str) -> bool:
-    path = PurePosixPath(value.replace("\\", "/").strip().lstrip("/"))
-    if not path.parts:
-        return False
-    lowered = path.as_posix().lower()
-    if "__pycache__" in path.parts or any(part.startswith(".") and part != ".env.example" for part in path.parts):
-        return False
-    if lowered.endswith((".pyc", ".pyo", ".log", ".tmp")):
-        return False
-    if path.name in {"agent_result.json", "ingestion.json"}:
-        return False
-    if path.name == "review.md":
-        return False
-    return True
-
-
-def _safe_project_path(value: str) -> str:
-    value = value.replace("\\", "/").strip().lstrip("/")
-    path = PurePosixPath(value)
-    if not value or path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
-        return ""
-    return path.as_posix()
 
 
 def _normalize_provider(value: str) -> str:

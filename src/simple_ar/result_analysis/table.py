@@ -403,11 +403,16 @@ def preview_table_source(path: Path, *, max_mb: int) -> dict:
     columns = list(rows[0])
     shown = columns[:40]
     return {"row_count": len(rows), "columns": [name[:200] for name in shown],
+        "column_summary": [{"column": name[:200], "column_name_truncated": len(name) > 200,
+            "missing": sum(row[name] is None or (isinstance(row[name], str) and not row[name].strip()) for row in rows),
+            "distinct_nonmissing": len({json.dumps(row[name], sort_keys=True, ensure_ascii=False)
+                for row in rows if row[name] is not None and not (isinstance(row[name], str) and not row[name].strip())})}
+            for name in shown],
         "columns_omitted": max(0, len(columns) - len(shown)),
         "column_names_truncated": any(len(name) > 200 for name in shown),
         "example_rows": [{name[:200]: str(row[name])[:200] for name in shown} for row in rows[:5]],
         "cell_values_truncated": any(len(str(row[name])) > 200 for row in rows[:5] for name in shown),
-        "status": "bounded shape/examples only; truncated names are not selectable names; meanings, independence, units and pairing are not verified"}
+        "status": "counts cover the complete bounded table; distinct counts preserve raw typed values, not unique participants; examples and names are bounded, truncated names are not selectable; meanings, independence, units and pairing are not verified"}
 
 
 def validate_table_columns(rows: list[dict], spec: TableSpec) -> None:

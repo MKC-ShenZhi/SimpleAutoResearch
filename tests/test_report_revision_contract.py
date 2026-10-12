@@ -11,11 +11,7 @@ from simple_ar.report.schema import (
 )
 from simple_ar.report.templates import load_report_template_bundle
 from simple_ar.report.tool_gateway import ReportToolGateway
-from tests.report_review_fixtures import draft_quotes
-
-
-def payload(prompt):
-    return json.JSONDecoder().raw_decode(prompt[prompt.index('{'):])[0]
+from tests.report_review_fixtures import draft_quotes, prompt_payload
 
 
 class RevisionContractTests(unittest.TestCase):
@@ -35,9 +31,9 @@ class RevisionContractTests(unittest.TestCase):
                     memory.document_plan = ReportDocumentPlan(sections=[section])
                 common = dict(context=context, memory=memory, section=section, config=config,
                     previous_draft=baseline, review=review, draft_mode="section_revision")
-                normal = payload(_writer_prompt(**common, template=template, extra_context=[], source_batch_index=1,
+                normal = prompt_payload(_writer_prompt(**common, template=template, extra_context=[], source_batch_index=1,
                     source_batch_count=1, include_previous_draft=True))
-                corrected = payload(_writer_recovery_prompt(**common))
+                corrected = prompt_payload(_writer_recovery_prompt(**common))
                 for view in (normal, corrected):
                     self.assertEqual(view["narrative_context"]["planning_status"]["scope"],
                         "organizational_intent_not_current_prose_or_scientific_support")
@@ -94,7 +90,7 @@ class RevisionContractTests(unittest.TestCase):
         calls = []
         class Client:
             def ask_json(self, system, prompt, **kwargs):
-                calls.append(payload(prompt))
+                calls.append(prompt_payload(prompt))
                 return {"section_id": "other" if len(calls) == 1 else section.section_id, "verdict": "pass"}
         reviewed = _review_section_with_recovery(client=Client(), context=context, memory=memory, section=section,
             template=template, config=config, draft=draft, label="target-review")
@@ -118,9 +114,9 @@ class RevisionContractTests(unittest.TestCase):
         before = review.model_dump(mode="json")
         common = dict(context=context, memory=memory, section=section, config=config,
             previous_draft=original, review=review, draft_mode="section_revision")
-        ordinary = payload(_writer_prompt(**common, template=template, extra_context=[], source_batch_index=1,
+        ordinary = prompt_payload(_writer_prompt(**common, template=template, extra_context=[], source_batch_index=1,
             source_batch_count=1, include_previous_draft=True))
-        recovery = payload(_writer_recovery_prompt(**common))
+        recovery = prompt_payload(_writer_recovery_prompt(**common))
         expected = ["Retain attribution.", "Remove repeated prose while retaining the qualification."]
         self.assertEqual(ordinary["review_instructions"], expected)
         self.assertEqual(recovery["review_instructions"], expected)
@@ -202,7 +198,7 @@ class RevisionContractTests(unittest.TestCase):
         prompts = [_writer_prompt(**common, template=template, extra_context=[], source_batch_index=1,
                                   source_batch_count=1, include_previous_draft=True), _writer_recovery_prompt(**common)]
         for prompt in prompts:
-            row = payload(prompt)
+            row = prompt_payload(prompt)
             self.assertNotIn('at least about', row['revision_preservation_requirement'])
             self.assertIn('Remove unsupported or duplicated', row['revision_preservation_requirement'])
             self.assertEqual(row['review_findings'][0]['finding_id'], 'f1')
@@ -216,7 +212,7 @@ class RevisionContractTests(unittest.TestCase):
         seen = []
         class Client:
             def ask_json(self, system, prompt, **kwargs):
-                seen.append(payload(prompt))
+                seen.append(prompt_payload(prompt))
                 if len(seen) == 1:
                     raise LLMResponseError('bad outer object')
                 return {'section_id': 'conclusion', 'verdict': 'pass'}
@@ -237,7 +233,7 @@ class RevisionContractTests(unittest.TestCase):
             resumed = False
             def ask_json(client, system, prompt, *, label='', **kwargs):
                 labels.append(label)
-                row = payload(prompt)
+                row = prompt_payload(prompt)
                 if 'reviewer' in label:
                     if client.resumed:
                         self.assertEqual(row['revision_context']['revision_instructions'], self.review().revision_instructions)
@@ -287,7 +283,7 @@ class RevisionContractTests(unittest.TestCase):
                 if label == 'report-document-verifier':
                     return {'section_reviews': []}
                 if label == 'report-document-verifier-conclusion':
-                    self.assertEqual(payload(prompt)['revision_context']['revision_instructions'], self.review().revision_instructions)
+                    self.assertEqual(prompt_payload(prompt)['revision_context']['revision_instructions'], self.review().revision_instructions)
                     return {'section_id': 'conclusion', 'verdict': 'pass'}
                 if 'reviewer' in label:
                     return {'verdict': 'pass'}
@@ -319,7 +315,7 @@ class RevisionContractTests(unittest.TestCase):
                 if label == 'report-document-reviewer':
                     return {'section_reviews': [self.review(prompt).model_dump(mode='json')]}
                 if label == 'report-document-verifier-conclusion':
-                    row = payload(prompt)
+                    row = prompt_payload(prompt)
                     targets.append(row['revision_context'])
                     self.assertEqual(row['revision_context']['target_findings'][0]['finding_id'], 'f1')
                     return self.review(prompt).model_dump(mode='json')
@@ -432,7 +428,7 @@ class RevisionContractTests(unittest.TestCase):
                         if label == 'report-document-verifier':
                             return {'section_reviews': []}
                         if label == 'report-document-verifier-conclusion':
-                            contract = payload(prompt)['revision_context']
+                            contract = prompt_payload(prompt)['revision_context']
                             self.assertTrue(any(row['finding_id'] == 'f1' for row in contract['target_findings']))
                             if client.revisions == 1:
                                 return {'section_id': 'conclusion', 'verdict': 'revise_required',
@@ -447,7 +443,7 @@ class RevisionContractTests(unittest.TestCase):
                         sid = 'body' if 'body' in label else 'conclusion'
                         if 'document-reviser' in label:
                             client.revisions += 1
-                            row = payload(prompt)
+                            row = prompt_payload(prompt)
                             contracts.append(row)
                             if client.revisions == 2:
                                 self.assertIn('Restore the nearby citation.', row['review_instructions'])

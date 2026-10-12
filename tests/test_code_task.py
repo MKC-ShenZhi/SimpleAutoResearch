@@ -43,7 +43,7 @@ from simple_ar.code_task.generation.generated_project_repair import (
     repair_generated_project_from_review,
     repair_generated_project_from_run_failure,
 )
-from simple_ar.code_task.generation.review import review_generated_project
+from simple_ar.code_task.generation.review import GREENFIELD_REVIEW_CONTRACT_VERSION, review_generated_project
 from simple_ar.code_task.orchestration.execute import (
     _update_generated_repair_artifacts,
     _attempt_greenfield_run_repair,
@@ -56,6 +56,63 @@ from simple_ar.core.budget import BudgetLedger
 
 
 TEST_ROOT = Path(__file__).resolve().parents[1] / ".tmp_tests"
+
+
+TOY_BENCHMARK_COMMAND = "python -m unittest discover -s tests"
+TOY_PREDICT_SOURCE = (
+    "def predict(text):\n"
+    "    return 'spam' if 'win' in text.lower() else 'ham'\n"
+)
+TOY_PREDICT_WITH_PRIZE = (
+    "def predict(text):\n"
+    "    lowered = text.lower()\n"
+    "    return 'spam' if any(keyword in lowered for keyword in ('win', 'prize')) else 'ham'\n"
+)
+
+
+def _invoke_generated_repair(phase, kwargs, diagnostics=None):
+    diagnostics = diagnostics or {'status': 'failed', 'findings': [{'summary': 'Actual blocking diagnosis.'}]}
+    if phase == 'review':
+        return repair_generated_project_from_review(review_report=diagnostics, **kwargs)
+    return repair_generated_project_from_run_failure(failure_analysis=diagnostics,
+        stderr_text="STDERR: AttributeError: score\nSTDOUT: raw record 37", **kwargs)
+
+
+class _RelatedRepairClient:
+    """Fixture for public shared-selection/related-candidate behavior."""
+
+    def __init__(self, changes):
+        self.changes, self.selected = changes, list(changes)
+        self.requests, self.unresolved = [], []
+        self.extra_file = self.generation_error = self.before_generation_response = None
+        self._budget_ledger = BudgetLedger({'llm_requests': 2})
+
+    def ask_json(self, _system, prompt, *, label='', max_output_tokens=None):
+        request = json.loads(prompt)
+        self.requests.append((label, request))
+        identity = f'fixture-{len(self.requests)}'
+        self._budget_ledger.reserve(identity, {'llm_requests': 1})
+        if label == 'implementation-selection':
+            self._budget_ledger.settle(identity, {'llm_requests': 1})
+            return {'files': [{'path': path, 'purpose': f'Repair {path} from actual diagnostics.'}
+                for path in self.selected]}
+        if self.generation_error:
+            self._budget_ledger.mark_unknown(identity, reason='Interrupted response')
+            raise self.generation_error
+        rows = []
+        for spec in request['planned_files']:
+            path = spec['path']
+            if path in request['original_files']:
+                rows.append({'path': path, 'replacements': [
+                    {'old_text': old, 'new_text': new} for old, new in self.changes.get(path, [])]})
+            else:
+                rows.append({'path': path, 'content': 'VALUE = 2\n'})
+        if self.extra_file:
+            rows.append(self.extra_file)
+        if self.before_generation_response:
+            self.before_generation_response()
+        self._budget_ledger.settle(identity, {'llm_requests': 1})
+        return {'summary': 'Related producer/consumer repair.', 'unresolved': self.unresolved, 'files': rows}
 
 
 class CodeTaskTests(unittest.TestCase):
@@ -611,6 +668,14 @@ class CodeTaskTests(unittest.TestCase):
 
             self.assertEqual(result["status"], "failed")
             self.assertEqual(result["rejected_actions"][0]["reason"], "parent_path_is_file")
+            for unsafe in ('/artifacts_io.py', 'C:/artifacts_io.py',
+                           'C:artifacts_io.py', '../artifacts_io.py'):
+                with self.subTest(path=unsafe):
+                    rejected = apply_repair_actions(root, [
+                        {'action': 'rewrite_file', 'path': unsafe, 'content': 'VALUE = 99\n'}])
+                    self.assertEqual(rejected['status'], 'failed')
+                    self.assertEqual(rejected['rejected_actions'][0]['reason'], 'missing_or_unsafe_path')
+                    self.assertEqual(read_text(root/'artifacts_io.py'), 'VALUE = 1\n')
 
     def test_greenfield_review_does_not_infer_hidden_labels_from_helper_names(self) -> None:
         with _temporary_root() as root:
@@ -789,148 +854,268 @@ class CodeTaskTests(unittest.TestCase):
                 )
             )
 
-    def test_greenfield_review_repair_regenerates_fallback_core_file(self) -> None:
-        class FakeClient:
-            def ask_json(self, _system: str, _prompt: str, *, label: str = "") -> dict[str, str]:
-                self.label = label
-                return {
-                    "content": (
-                        "from __future__ import annotations\n\n"
-                        "def run_experiment() -> dict[str, float]:\n"
-                        "    return {'accuracy': 1.0}\n"
-                    ),
-                    "summary": "Regenerated runner with real metric path.",
-                }
+    def test_generated_repair_shared_unit_preserves_diagnostics_and_obligations(self) -> None:
+        for phase in ('review', 'run'):
+            with self.subTest(phase=phase), _temporary_root() as root:
+                project = root / 'generated_project'
+                originals = {'src/producer.py': "def produce():\n    return {'score': 1}\n",
+                    'src/report.py': "def render(summary):\n    return summary.score\n",
+                    'app.py': '# Preserve orchestration.\n'}
+                for path, text in originals.items():
+                    write_text(project / path, text)
+                original_bytes = {path: (project / path).read_bytes() for path in originals}
+                client = _RelatedRepairClient({'src/producer.py': [('score', 'accuracy')],
+                    'src/report.py': [('summary.score', "summary['accuracy']")], 'app.py': []})
+                diagnostics = {'status': 'failed', 'findings': [{'summary': 'Producer/report mismatch.'}],
+                    'failure_graph_data': {'primary_signal': 'attribute mismatch',
+                        'traceback_files': ['src/report.py'], 'artifact_scan': {'expected_path': 'artifacts/results.json'}}}
+                kwargs = dict(project_dir=project, output_path=root / f'{phase}_repair.json',
+                    code_artifacts={'generated_files': [{'path': 'src/producer.py', 'mode': 'fallback'}]},
+                    architecture_plan={'files': [{'path': 'src/report.py', 'purpose': 'Report consumer',
+                        'dependencies': ['src/producer.py'], 'public_api': ['render(summary)']}]},
+                    result_schema={'required_metrics': ['accuracy']}, contract={'objective': 'Measure accuracy.'},
+                    dependency_advice={'notes': ['No install authorized.']},
+                    previous_repair_context='Prior app-only repair failed.', client=client, attempt_id='round-1')
+                result = _invoke_generated_repair(phase, kwargs, diagnostics)
+                self.assertEqual(result['status'], 'patched', result)
+                self.assertEqual(set(result['changed_files']), {'src/producer.py', 'src/report.py'})
+                self.assertEqual(read_text(project / 'app.py'), originals['app.py'])
+                self.assertEqual(len(client.requests), 2)
+                self.assertEqual(client._budget_ledger.remaining('llm_requests'), 0)
+                selection, generation = [request for _, request in client.requests]
+                self.assertIn('visible_project_paths', selection)
+                self.assertEqual(set(generation['original_files']), set(originals))
+                for path, text in originals.items():
+                    self.assertEqual(generation['original_files'][path]['text'], original_bytes[path].decode('utf-8'))
+                binding = generation['source_windows'][0]
+                for key in ('architecture_plan', 'result_schema', 'contract', 'dependency_advice', 'previous_repair_context'):
+                    self.assertEqual(binding[key], kwargs[key])
+                self.assertEqual(binding['diagnostics']['review_report' if phase == 'review' else 'failure_analysis'], diagnostics)
+                dependencies = generation['source_windows'][-1]['files']
+                self.assertEqual({row['path'] for row in dependencies}, set(originals))
+                self.assertTrue(all(set(row) == {'path', 'actual_dependency_apis'} for row in dependencies))
+                self.assertIn('produce()', str(dependencies))
+                self.assertFalse(generation['execution']['performed'])
+                self.assertEqual(result['snapshot']['captured_count'], 2)
+                self.assertTrue(all(row['mode'] == f'llm_{phase}_repair_actions'
+                    for row in result['regenerated_files']))
+                for row in result['regenerated_files']:
+                    actions = row['edit_application']['applied_actions']
+                    self.assertEqual(len(actions), 1)
+                    self.assertEqual(actions[0]['before_public_api'], actions[0]['after_public_api'])
+                if phase == 'run':
+                    self.assertIn('raw record 37', binding['diagnostics']['runtime_output'])
+                    plan = read_json(Path(result['repair_plan']))
+                    self.assertEqual(plan['schema_version'], 'code_task_repair_plan.v1')
+                    self.assertIn('STDERR', plan['observed_error'])
+                    self.assertEqual({row['path'] for row in plan['target_files']}, set(originals))
+                    atomic = read_json(Path(result['atomic_patch_set']))
+                    self.assertEqual(atomic['status'], 'patched')
+                    self.assertEqual(set(atomic['changed_files']), set(result['changed_files']))
 
+    def test_generated_repair_receipt_binds_completed_project_and_inputs(self) -> None:
         with _temporary_root() as root:
-            project = root / "generated_project"
-            runner = project / "generated_experiment" / "runner.py"
-            runner.parent.mkdir(parents=True)
-            write_text(runner, "from __future__ import annotations\n\n# Reserved generated module.\n")
-            review = {
-                "status": "failed",
-                "findings": [
-                    {
-                        "category": "mixed_generation_fallback",
-                        "summary": "Core file `generated_experiment/runner.py` fell back while related files were LLM-generated.",
-                    }
-                ],
-            }
-            artifacts = {
-                "generated_files": [
-                    {"path": "generated_experiment/runner.py", "mode": "fallback", "line_count": 3}
-                ]
-            }
-            architecture = {
-                "files": [
-                    {
-                        "path": "generated_experiment/runner.py",
-                        "purpose": "Single authoritative orchestrator.",
-                        "dependencies": [],
-                        "public_api": ["run_experiment() -> dict[str, float]"],
-                    }
-                ]
-            }
+            project = root / 'project'
+            write_text(project / 'module.py', 'VALUE = 1\n')
+            client = _RelatedRepairClient({'module.py': [('VALUE = 1', 'VALUE = 2')]})
+            kwargs = dict(project_dir=project, output_path=root / 'run_repair.json', client=client, attempt_id='round-1')
+            result = _invoke_generated_repair('run', kwargs)
+            self.assertEqual(result['status'], 'patched', result)
+            receipt = root / 'repair_attempts/run/round-1/result.json'
+            saved, ledger = receipt.read_bytes(), client._budget_ledger.to_dict()
+            self.assertEqual(_invoke_generated_repair('run', kwargs), result)
+            for content in ('VALUE = 3\n', 'VALUE = 1\n'):
+                write_text(project / 'module.py', content)
+                rejected = _invoke_generated_repair('run', kwargs)
+                self.assertEqual(rejected['status'], 'failed')
+                self.assertEqual(rejected['changed_files'], [])
+                self.assertIn('Project bytes/inventory changed', str(rejected['unresolved_errors']))
+                self.assertEqual(read_text(project / 'module.py'), content)
+            write_text(project / 'module.py', 'VALUE = 2\n')
+            rejected = _invoke_generated_repair('run', kwargs, {'status': 'different failure'})
+            self.assertEqual(rejected['status'], 'failed')
+            self.assertIn('inputs changed', str(rejected['unresolved_errors']))
+            write_text(project / 'additional.py', 'EXTRA = 1\n')
+            self.assertEqual(_invoke_generated_repair('run', kwargs)['status'], 'failed')
+            self.assertEqual(len(client.requests), 2)
+            self.assertEqual(client._budget_ledger.to_dict(), ledger)
+            self.assertEqual(receipt.read_bytes(), saved)
+            completed = read_json(receipt)
+            completed['completed'] = False
+            write_json(receipt, completed)
+            rejected = _invoke_generated_repair('run', kwargs)
+            self.assertEqual(rejected['status'], 'failed')
+            self.assertIn('completed consumer result', str(rejected['unresolved_errors']))
+            self.assertEqual(len(client.requests), 2)
 
-            result = repair_generated_project_from_review(
-                project_dir=project,
-                review_report=review,
-                output_path=root / "review_repair.json",
-                code_artifacts=artifacts,
-                architecture_plan=architecture,
-                result_schema={"required_metrics": ["accuracy"]},
-                contract={"objective": "Generate a runnable metric project."},
-                client=FakeClient(),  # type: ignore[arg-type]
-            )
+    def test_generated_repair_candidate_rejection_is_atomic_across_files(self) -> None:
+        for phase in ('review', 'run'):
+            for failure in ('api', 'syntax', 'unresolved', 'extra_path', 'ambiguous', 'traceback'):
+                with self.subTest(phase=phase, failure=failure), _temporary_root() as root:
+                    project = root / 'project'
+                    write_text(project / 'first.py', 'VALUE = 1\n')
+                    second_path = 'main.py' if failure == 'traceback' else 'second.py'
+                    write_text(project / second_path, 'def measure(x):\n    return x + 1\n')
+                    before = {path: path.read_bytes() for path in project.glob('*.py')}
+                    changes = [('return x + 1', 'return x + 2')]
+                    if failure in ('api', 'syntax'):
+                        changes = [('def measure(x):', 'def measure(x, required):' if failure == 'api' else 'def measure(:')]
+                    if failure == 'ambiguous':
+                        changes = [('absent original span', 'replacement')]
+                    if failure == 'traceback':
+                        changes = [('return x + 1',
+                            'try:\n        return x + 1\n    except Exception:\n        return 0')]
+                    client = _RelatedRepairClient({'first.py': [('VALUE = 1', 'VALUE = 2')], second_path: changes})
+                    # Review may add a file before a later candidate is rejected.
+                    # Whole-unit rollback must remove it as well as restore edits.
+                    if phase == 'review':
+                        client.selected.insert(1, 'new.py')
+                    client.unresolved = ['Missing scientific condition.'] if failure == 'unresolved' else []
+                    client.extra_file = {'path': 'outside.py', 'content': 'VALUE = 9\n'} if failure == 'extra_path' else None
+                    result = _invoke_generated_repair(phase,
+                        dict(project_dir=project, output_path=root / f'{phase}_repair.json', client=client))
+                    self.assertEqual(result['status'], 'failed', result)
+                    self.assertEqual(result['changed_files'], [])
+                    self.assertEqual(result.get('regenerated_files', []), [])
+                    for path, raw in before.items():
+                        self.assertEqual(path.read_bytes(), raw)
+                    self.assertFalse((project / 'outside.py').exists())
+                    self.assertFalse((project / 'new.py').exists())
+                    self.assertEqual(len(client.requests), 2)
+                    if failure == 'api':
+                        self.assertIn('public_api_signature_would_change', str(result['unresolved_errors']))
+                    if failure == 'traceback':
+                        self.assertIn('broad_exception_without_traceback', str(result['unresolved_errors']))
+                    if failure in ('api', 'traceback'):
+                        self.assertEqual(result['snapshot']['captured_count'], 3 if phase == 'review' else 2)
+                        self.assertEqual(result['snapshot']['restored_count'], result['snapshot']['captured_count'])
+                    if phase == 'run':
+                        self.assertEqual(read_json(Path(result['atomic_patch_set']))['status'], 'failed')
 
-            self.assertEqual(result["status"], "patched")
-            self.assertEqual(result["regenerated_files"][0]["path"], "generated_experiment/runner.py")
-            self.assertIn("return {'accuracy': 1.0}", read_text(runner))
+    def test_generated_repair_scope_and_source_races_do_not_publish(self) -> None:
+        for failure in ('new_runtime_file', 'private', 'traversal', 'non_python', 'over_scope', 'source_race'):
+            with self.subTest(failure=failure), _temporary_root() as root:
+                project = root / 'project'
+                write_text(project / 'module.py', 'VALUE = 1\n')
+                client = _RelatedRepairClient({'module.py': [('VALUE = 1', 'VALUE = 2')]})
+                if failure == 'over_scope':
+                    client.selected = [f'module{i}.py' for i in range(9)]
+                    for path in client.selected:
+                        write_text(project / path, 'VALUE = 1\n')
+                elif failure == 'source_race':
+                    client.before_generation_response = lambda: write_text(project / 'module.py', 'USER_CHANGE = 7\n')
+                else:
+                    client.selected = [{'new_runtime_file': 'new.py', 'private': '.codex/private.py',
+                        'traversal': '../outside.py', 'non_python': 'config.json'}[failure]]
+                result = _invoke_generated_repair('run',
+                    dict(project_dir=project, output_path=root / 'run_repair.json', client=client))
+                self.assertEqual(result['status'], 'failed', result)
+                self.assertEqual(result['changed_files'], [])
+                self.assertEqual(len(client.requests), 2 if failure == 'source_race' else 1)
+                self.assertEqual(read_text(project / 'module.py'),
+                    'USER_CHANGE = 7\n' if failure == 'source_race' else 'VALUE = 1\n')
+                self.assertFalse((root / 'outside.py').exists())
 
-    def test_rejected_repair_actions_do_not_fall_back_to_whole_file_content(self) -> None:
-        class Client:
-            def ask_json(self, _system, _prompt, *, label=""):
-                return {
-                    "actions": [
-                        {"action": "replace_block", "path": "module.py", "old_string": "VALUE = 1", "new_string": "VALUE = 2"},
-                        {"action": "rewrite_file", "path": "outside.py", "content": "VALUE = 3"},
-                    ],
-                    "content": "VALUE = 4\n",
-                }
+    def test_generated_repair_interrupted_generation_and_application_are_not_replayed(self) -> None:
+        from simple_ar.integrations.llm import LLMStreamError
+        for interruption in ('unknown_generation', 'candidate_application'):
+            with self.subTest(interruption=interruption), _temporary_root() as root:
+                project = root / 'project'
+                write_text(project / 'module.py', 'VALUE = 1\n')
+                client = _RelatedRepairClient({'module.py': [('VALUE = 1', 'VALUE = 2')]})
+                kwargs = dict(project_dir=project, output_path=root / 'run_repair.json', client=client, attempt_id='round-1')
+                if interruption == 'unknown_generation':
+                    client.generation_error = LLMStreamError('Incomplete generation response')
+                    self.assertEqual(_invoke_generated_repair('run', kwargs)['status'], 'failed')
+                    self.assertTrue(client._budget_ledger.unknown_dimensions())
+                    # Interrupted before completed consumer receipt persistence.
+                    (root / 'repair_attempts/run/round-1/result.json').unlink()
+                else:
+                    with patch('simple_ar.code_task.generation.generated_project_repair.apply_repair_actions',
+                               side_effect=RuntimeError('application interrupted')):
+                        with self.assertRaisesRegex(RuntimeError, 'application interrupted'):
+                            _invoke_generated_repair('run', kwargs)
+                    self.assertTrue((root / 'repair_attempts/run/round-1/candidate.json').is_file())
+                    self.assertIn('application interrupted',
+                        read_text(root / 'repair_attempts/run/round-1/application-error.json'))
+                before = client._budget_ledger.to_dict()
+                resumed = _invoke_generated_repair('run', kwargs)
+                self.assertEqual(resumed['status'], 'failed')
+                self.assertIn('no request or edit replayed', str(resumed['unresolved_errors']))
+                self.assertIn('candidate saved' if interruption == 'candidate_application' else 'generation incomplete',
+                    str(resumed['unresolved_errors']))
+                self.assertEqual(len(client.requests), 2)
+                self.assertEqual(client._budget_ledger.to_dict(), before)
+                self.assertEqual(read_text(project / 'module.py'), 'VALUE = 1\n')
 
-        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as tmp:
-            root = Path(tmp)
-            project = root / "project"
-            project.mkdir()
-            write_text(project / "module.py", "VALUE = 1\n")
-            result = repair_generated_project_from_review(
-                project_dir=project,
-                review_report={"status": "failed", "findings": [{"summary": "module.py needs repair."}]},
-                output_path=root / "repair.json", client=Client(),
-            )
-            self.assertEqual(result["status"], "failed")
-            self.assertEqual(result["changed_files"], [])
-            self.assertEqual(read_text(project / "module.py"), "VALUE = 1\n")
-            self.assertFalse((project / "outside.py").exists())
-            self.assertTrue(result["unresolved_errors"])
+    def test_generated_repair_restore_failure_retains_original_rejection(self) -> None:
+        with _temporary_root() as root:
+            project = root / 'project'
+            write_text(project / 'first.py', 'VALUE = 1\n')
+            write_text(project / 'second.py', 'def measure(x):\n    return x\n')
+            client = _RelatedRepairClient({'first.py': [('VALUE = 1', 'VALUE = 2')],
+                'second.py': [('def measure(x):', 'def measure(x, required):')]})
+            with patch('simple_ar.code_task.editing.snapshots.FileSnapshotSet.restore',
+                       return_value=[{'path': 'first.py', 'status': 'failed', 'reason': 'snapshot_file_missing'}]):
+                result = _invoke_generated_repair('run',
+                    dict(project_dir=project, output_path=root / 'run_repair.json', client=client))
+            self.assertEqual(result['status'], 'failed')
+            self.assertIn('public_api_signature_would_change', str(result['unresolved_errors']))
+            self.assertIn('snapshot_file_missing', str(result['unresolved_errors']))
+            self.assertIn('restoration incomplete', str(result['notes']))
+            self.assertTrue(Path(result['snapshot']['manifest']).is_file())
+
+    def test_generated_repair_saved_legacy_results_are_history_without_redispatch(self) -> None:
+        for phase in ('review', 'run'):
+            for structured in (False, True):
+                with self.subTest(phase=phase, structured=structured), _temporary_root() as root:
+                    project = root / 'project'
+                    write_text(project / 'module.py', 'USER_CHANGE = 8\n')
+                    response = ({'actions': [{'action': 'rewrite_file', 'path': 'module.py', 'content': 'VALUE = 2\n'}]}
+                        if structured else {'content': 'VALUE = 2\n'})
+                    saved = {'schema_version': f'greenfield_{phase}_repair.v1', 'status': 'patched',
+                        'changed_files': ['module.py'], 'regenerated_files': [{'path': 'module.py', 'response': response}],
+                        'notes': [], 'unresolved_errors': []}
+                    output = root / f'{phase}_repair.json'
+                    write_json(output, saved)
+                    client = Mock()
+                    client.ask_json.side_effect = AssertionError('Historical response must not be regenerated')
+                    result = _invoke_generated_repair(phase, dict(project_dir=project, output_path=output, client=client))
+                    self.assertEqual(result['status'], 'skipped')
+                    self.assertEqual(result['historical_status'], 'patched')
+                    self.assertFalse(result['current_project_verified'])
+                    self.assertEqual(result['historical_result'], saved)
+                    self.assertEqual(read_json(output), saved)
+                    self.assertEqual(read_text(project / 'module.py'), 'USER_CHANGE = 8\n')
+                    client.ask_json.assert_not_called()
+                    following = _RelatedRepairClient({'module.py': [('USER_CHANGE = 8', 'USER_CHANGE = 9')]})
+                    revised = _invoke_generated_repair(phase, dict(project_dir=project,
+                        output_path=output, client=following, attempt_id='round-2'))
+                    self.assertEqual(revised['status'], 'patched', revised)
+                    self.assertEqual(len(following.requests), 2)
+                    self.assertEqual(read_json(root / f'repair_attempts/{phase}/round-2/previous-unbound-summary.json'), saved)
+                    self.assertEqual(read_text(project / 'module.py'), 'USER_CHANGE = 9\n')
 
     def test_generated_repair_does_not_hide_internal_errors(self) -> None:
-        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as tmp:
-            root = Path(tmp)
-            project = root / "project"
-            project.mkdir()
-            target = project / "module.py"
-            write_text(target, "VALUE = 1\n")
+        with _temporary_root() as root:
+            project = root / 'project'
+            write_text(project / 'module.py', 'VALUE = 1\n')
+            kwargs = dict(project_dir=project, output_path=root / 'review_repair.json')
             client = Mock()
-            kwargs = dict(
-                project_dir=project,
-                review_report={"status": "failed", "findings": [{"summary": "module.py needs repair."}]},
-                output_path=root / "repair.json", client=client,
-            )
-            client.ask_json.side_effect = LLMError("provider unavailable")
-            result = repair_generated_project_from_review(**kwargs)
-            self.assertEqual(result["status"], "failed")
-            self.assertIn("provider unavailable", result["unresolved_errors"][0])
-            client.ask_json.side_effect = TypeError("invalid internal state")
-            with self.assertRaisesRegex(TypeError, "invalid internal state"):
-                repair_generated_project_from_review(**kwargs)
+            client.ask_json.side_effect = LLMError('provider unavailable')
+            result = _invoke_generated_repair('review', dict(kwargs, client=client, attempt_id='provider'))
+            self.assertEqual(result['status'], 'failed')
+            self.assertIn('provider unavailable', str(result['unresolved_errors']))
+            client.ask_json.side_effect = TypeError('invalid internal state')
+            with self.assertRaisesRegex(TypeError, 'invalid internal state'):
+                _invoke_generated_repair('review', dict(kwargs, client=client, attempt_id='internal'))
             client.ask_json.reset_mock()
-            with patch("simple_ar.code_task.generation.generated_project_repair.build_review_index",
-                       side_effect=RuntimeError("index construction failed")):
-                with self.assertRaisesRegex(RuntimeError, "index construction failed"):
-                    repair_generated_project_from_review(**kwargs)
+            with patch('simple_ar.code_task.review_pipeline.build_review_index',
+                       side_effect=RuntimeError('index construction failed')):
+                with self.assertRaisesRegex(RuntimeError, 'index construction failed'):
+                    _invoke_generated_repair('review', dict(kwargs, client=client, attempt_id='index'))
             client.ask_json.assert_not_called()
-            self.assertEqual(read_text(target), "VALUE = 1\n")
-
-    def test_generated_repair_formats_share_validation_and_restore(self) -> None:
-        cases = [
-            ("print(0)\n", "print(1)\n", "patched"),
-            ("VALUE = 1\n", "def broken(\n", "failed"),
-            ("def evaluate():\n    return 1\n", "print(1)\n", "failed"),
-        ]
-        for structured in (False, True):
-            for before, after, expected in cases:
-                with self.subTest(structured=structured, after=after), tempfile.TemporaryDirectory(dir=TEST_ROOT) as tmp:
-                    class Client:
-                        def ask_json(self, _system, _prompt, *, label=""):
-                            if structured:
-                                return {"actions": [{"action": "rewrite_file", "path": "module.py", "content": after}]}
-                            return {"content": after}
-
-                    root = Path(tmp)
-                    project = root / "project"
-                    project.mkdir()
-                    target = project / "module.py"
-                    write_text(target, before)
-                    result = repair_generated_project_from_review(
-                        project_dir=project,
-                        review_report={"status": "failed", "findings": [{"summary": "module.py needs repair."}]},
-                        output_path=root / "repair.json", client=Client(),
-                    )
-                    self.assertEqual(result["status"], expected)
-                    self.assertEqual(read_text(target), after if expected == "patched" else before)
-                    self.assertEqual(result["changed_files"], ["module.py"] if expected == "patched" else [])
-                    self.assertEqual(bool(result["unresolved_errors"]), expected == "failed")
+            self.assertEqual(read_text(project / 'module.py'), 'VALUE = 1\n')
 
     def test_generated_repair_inventory_uses_actual_files_and_explicit_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1207,7 +1392,7 @@ primary_metric = "accuracy"
                 kwargs = dict(contract={}, result_schema={}, resource_plan={}, domain_profile={},
                               client=client, review_rounds=0)
                 if not paths:
-                    with self.assertRaisesRegex(LLMError, "no main.py entrypoint"):
+                    with self.assertRaisesRegex(LLMError, "no usable file specifications"):
                         build_tool_agent_architecture_plan(**kwargs)
                 else:
                     plan = build_tool_agent_architecture_plan(**kwargs)
@@ -1218,7 +1403,8 @@ primary_metric = "accuracy"
                         from simple_ar.code_task.generation.writer import write_generated_project
 
                         writer = Mock()
-                        writer.ask_json.return_value = {"content": "def main():\n    print('accuracy: 0.75')\n\nmain()\n"}
+                        writer.ask_json.return_value = {"files": [{"path": "main.py",
+                            "content": "def main():\n    print('accuracy: 0.75')\n\nmain()\n"}]}
                         with tempfile.TemporaryDirectory(dir=TEST_ROOT) as tmp:
                             project = Path(tmp) / "project"
                             artifacts = write_generated_project(
@@ -1260,17 +1446,154 @@ primary_metric = "accuracy"
         client = Mock()
         client.ask_json.return_value = {"files": []}
         for mode in ("compact", "tool_agent"):
-            with self.subTest(mode=mode), patch(
-                "simple_ar.code_task.generation.architecture.build_tool_agent_architecture_plan",
-                return_value={"files": []},
-            ):
+            with self.subTest(mode=mode):
                 kwargs = dict(contract={}, result_schema={}, resource_plan={}, domain_profile={},
                               client=client, planning_mode=mode)
-                with self.assertRaisesRegex(LLMError, "fallback is disabled"):
+                with self.assertRaisesRegex(LLMError, "no usable file specifications"):
                     build_architecture_plan(**kwargs)
                 plan, source = build_architecture_plan(**kwargs, allow_fallback=True)
                 self.assertEqual(source, "fallback")
                 self.assertTrue(plan["files"])
+
+    def test_plan_factory_owns_file_boundary_for_both_producers(self) -> None:
+        from simple_ar.code_task.generation.architecture import build_architecture_plan
+
+        rows = [
+            {"path": "alternate.py", "entrypoint": True, "dependencies": ["discarded.py", "../secret"]},
+            {"path": "generated_project/alternate.py", "contract_obligations": ["O1"]},
+            {"path": "discarded.py"},
+            *[{"path": path} for path in ("../escape.py", "/absolute.py", "C:/secret.py")],
+        ]
+        before = json.dumps(rows, sort_keys=True)
+        for mode in ("compact", "tool_agent"):
+            for limit in (1, 2, 3):
+                with self.subTest(mode=mode, limit=limit):
+                    client = Mock()
+                    client.ask_json.return_value = {"files": rows, "status": "pass"}
+                    kwargs = dict(contract={}, result_schema={}, resource_plan={"max_files": limit},
+                        domain_profile={}, client=client, planning_mode=mode, planning_review_rounds=0)
+                    if limit < 3:
+                        with self.assertRaisesRegex(LLMError, 'requires 3 files but max_files'):
+                            build_architecture_plan(**kwargs)
+                        self.assertEqual(json.dumps(rows, sort_keys=True), before)
+                        continue
+                    plan, source = build_architecture_plan(**kwargs)
+                    self.assertEqual(source, mode)
+                    self.assertEqual([row["path"] for row in plan["files"]],
+                        ["main.py", "alternate.py", "discarded.py"])
+                    self.assertTrue(plan["files"][0]["entrypoint"])
+                    self.assertEqual(plan["files"][1]["dependencies"], ['discarded.py'])
+                    self.assertEqual(plan["files"][1]["contract_obligations"], ["O1"])
+                    self.assertEqual(json.dumps(rows, sort_keys=True), before)
+        with self.assertRaisesRegex(LLMError, 'max_files is 1'):
+            build_architecture_plan(contract={}, result_schema={},
+                resource_plan={"max_files": 1}, domain_profile={}, allow_fallback=True)
+        offline, source = build_architecture_plan(contract={}, result_schema={},
+            resource_plan={"max_files": 4}, domain_profile={}, allow_fallback=True)
+        self.assertEqual(source, "fallback")
+        self.assertEqual(len(offline['files']), 4)
+        self.assertEqual(offline['files'][0]['path'], 'main.py')
+
+    def test_tool_agent_plan_reaches_generation_and_snapshot_without_reconstruction(self) -> None:
+        from simple_ar.code_task.generation.greenfield import generate_greenfield_code_task
+        from simple_ar.code_task.generation.task_contract import (
+            build_greenfield_task_contract, save_task_contract,
+        )
+
+        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as tmp:
+            root = Path(tmp)
+            task = root / "task.md"
+            write_text(task, "Generate a bounded CPU project printing score.")
+            source_run, restored_run = root / "source", root / "restored"
+            for run in (source_run, restored_run):
+                initialize_code_task(run_dir=run, code_root=None, task_file=task,
+                    kind="greenfield", workspace_mode="empty", primary_metric="score",
+                    benchmark_command="python generated_project/main.py")
+            contract = build_greenfield_task_contract(read_text(task),
+                benchmark_command="python generated_project/main.py", max_files=3,
+                max_generated_lines=1600, result_schema={"primary_metric": "score"},
+                extra_contract={"implementation_obligations": [{
+                    "id": "o1", "requirement": "Preserve records for reporting.",
+                    "owner_files": ["records.py"],
+                }]})
+            for run in (source_run, restored_run):
+                save_task_contract(run / "code_task/meta", contract)
+            interfaces = {
+                "shared_schemas": [{"name": "Record", "fields": ["score"],
+                    "producer": "records.py", "consumers": ["main.py"]}],
+                "module_apis": [{"module": "records.py", "public_api": ["records()"]}],
+            }
+            file_rows = [
+                {"path": "generated_project/main.py", "dependencies": ["records.py"]},
+                {"path": "records.py", "public_api": ["records()"], "contract_obligations": ["o1"]},
+                {"path": "results", "kind": "runtime_dir"},
+            ]
+            requests = []
+
+            def respond(_system, prompt, *, label, **_kwargs):
+                if label.startswith("greenfield-unit-"):
+                    context = json.loads(prompt)
+                    requests.append(context)
+                    return {"files": [{"path": row["path"], "content":
+                        "print('score: 0.5')\n" if row["path"] == "main.py"
+                        else "def records():\n    return []\n"}
+                        for row in context["planned_files"]]}
+                return {
+                    "greenfield-plan-requirements": {"objective": "Preserve records."},
+                    "greenfield-plan-architecture": {"architecture_summary": "Shared records."},
+                    "greenfield-plan-interfaces": interfaces,
+                    "greenfield-plan-file_plan": {"files": file_rows},
+                    "greenfield-plan-review": {"status": "needs_revision", "summary": "Recorded limitation.",
+                        "findings": [{"severity": "high", "target_stage": "interfaces",
+                            "issue": "Coverage remains bounded.", "required_change": "Retain the limitation."}]},
+                }[label]
+
+            client = Mock()
+            client.ask_json.side_effect = respond
+            with patch("simple_ar.code_task.generation.greenfield._llm_client", return_value=client), patch(
+                "simple_ar.code_task.generation.greenfield.review_generated_project",
+                return_value={"status": "passed", "findings": []},
+            ) as reviewer:
+                generate_greenfield_code_task(source_run, max_files=3, planning_review_rounds=0)
+            meta = source_run / "code_task/meta"
+            plan = read_json(meta / "architecture_plan.json")
+            self.assertEqual(plan, read_json(meta / "planning/final_plan.json"))
+            self.assertEqual(requests[0]["architecture"], plan)
+            self.assertEqual(reviewer.call_args.kwargs["architecture_plan"], plan)
+            self.assertEqual(plan["interface_registry"]["shared_schemas"], interfaces["shared_schemas"])
+            self.assertEqual(plan["interface_registry"]["module_apis"], interfaces["module_apis"])
+            self.assertEqual(plan["implementation_contract"]["owner_index"]["o1"], ["records.py"])
+            self.assertTrue(any(row["id"] == "o1" for row in plan["implementation_contract"]["obligations"]))
+            self.assertTrue(any(row["id"] == "o1" for row in requests[0]["obligations"]["records.py"]))
+            self.assertEqual(plan["files"][2]["kind"], "runtime_dir")
+            self.assertEqual(plan["planning_status"], "needs_revision")
+            self.assertEqual(plan["planning"]["patch_request_count"], 1)
+            self.assertEqual(plan["planning"]["revision_count"], 0)
+            self.assertEqual(plan["planning"]["review_summary"], "Recorded limitation.")
+            self.assertEqual(plan["result_schema"]["primary_metric"], "score")
+            self.assertEqual([row["path"] for row in read_json(meta / "file_plan.json")["files"]],
+                [row["path"] for row in plan["files"]])
+
+            # An old saved plan is imported as-is, including absent modern fields.
+            legacy = {key: value for key, value in plan.items()
+                if key not in {"implementation_contract", "planning", "planning_status", "result_schema"}}
+            legacy["historical_extension"] = {"keep": ["original shape"]}
+            write_json(meta / "architecture_plan.json", legacy)
+            source_bytes = {path: path.read_bytes() for path in meta.rglob("*") if path.is_file()}
+            requests.clear()
+            client.reset_mock()
+            with patch("simple_ar.code_task.generation.greenfield._llm_client", return_value=client), patch(
+                "simple_ar.code_task.generation.greenfield.review_generated_project",
+                return_value={"status": "passed", "findings": []},
+            ), patch("simple_ar.code_task.generation.architecture.normalize_architecture_plan",
+                side_effect=AssertionError("Saved plans must not be canonicalized")):
+                generate_greenfield_code_task(restored_run, max_files=3,
+                    planning_snapshot_from=source_run)
+            self.assertEqual(read_json(restored_run / "code_task/meta/architecture_plan.json"), legacy)
+            self.assertEqual(requests[0]["architecture"], legacy)
+            self.assertTrue(all(call.kwargs["label"].startswith("greenfield-unit-")
+                for call in client.ask_json.call_args_list))
+            self.assertEqual({path: path.read_bytes() for path in meta.rglob("*") if path.is_file()}, source_bytes)
 
     def test_greenfield_execute_generates_validates_and_runs_project(self) -> None:
         with _temporary_root() as root:
@@ -1327,17 +1650,31 @@ primary_metric = "accuracy"
             # Refresh retired review rules without regenerating or rerunning the experiment.
             review_path = run_dir / "code_task/meta/review_report.json"
             prior_review = read_json(review_path)
-            prior_review["metadata"]["review_contract_version"] = 12
+            prior_review["metadata"]["review_contract_version"] = GREENFIELD_REVIEW_CONTRACT_VERSION - 1
             write_json(review_path, prior_review)
             metrics_path = run_dir / "code_task/run/patched/metrics.json"
             measured_bytes = metrics_path.read_bytes()
             with patch("simple_ar.code_task.orchestration.execute.run_code_task_benchmark") as benchmark:
                 refreshed = execute_code_task(run_dir, use_llm=False, to_step="review", max_files=8)
             benchmark.assert_not_called()
-            self.assertEqual(read_json(review_path)["metadata"]["review_contract_version"], 13)
+            self.assertEqual(read_json(review_path)["metadata"]["review_contract_version"], GREENFIELD_REVIEW_CONTRACT_VERSION)
             self.assertTrue(any(step.step == "review" and step.detail.startswith("refreshed status")
                                 for step in refreshed.steps))
             self.assertEqual(metrics_path.read_bytes(), measured_bytes)
+            historical = list((review_path.parent / "review_history").glob("*.json"))
+            self.assertEqual(len(historical), 1)
+            self.assertEqual(read_json(historical[0]), prior_review)
+            current_review = read_json(review_path)
+            write_json(historical[0], {**prior_review, "status": "tampered"})
+            write_json(review_path, prior_review)
+            with patch("simple_ar.code_task.orchestration.execute.run_code_task_benchmark") as benchmark:
+                with self.assertRaisesRegex(ValueError, "historical review changed"):
+                    execute_code_task(run_dir, use_llm=False, to_step="review", max_files=8)
+            benchmark.assert_not_called()
+            self.assertEqual(read_json(review_path), prior_review)
+            self.assertEqual(metrics_path.read_bytes(), measured_bytes)
+            write_json(historical[0], prior_review)
+            write_json(review_path, current_review)
 
             # Exercise the same runner after an actual subprocess failure.
             # The repair boundary restores this fixture; it does not fake a metric.
@@ -1484,89 +1821,36 @@ primary_metric = "accuracy"
             self.assertEqual(read_text(package_dir / "runner.py"),
                              "def run_experiment(preset='smoke'):\n    return {'score': 1.0}\n")
 
-    def test_greenfield_run_repair_uses_llm_for_runtime_contract_mismatch(self) -> None:
-        class FakeClient:
-            def __init__(self) -> None:
-                self.labels: list[str] = []
-                self.prompts: list[str] = []
+    def _assert_greenfield_artifact_guard(
+        self, root: Path, run_name: str, script: str, expected_reason: str,
+    ) -> tuple[Path, dict]:
+        """Exercise the common score benchmark while preserving each failure input."""
+        task_file = root / "task.md"
+        write_text(
+            task_file,
+            "# Task\n\nWrite artifacts/results.json and artifacts/report.md with measured rows.\n",
+        )
+        run_dir = root / "runs" / run_name
+        initialize_code_task(
+            run_dir=run_dir,
+            code_root=None,
+            task_file=task_file,
+            kind="greenfield",
+            benchmark_command="python generated_project/main.py",
+            workspace_mode="empty",
+            primary_metric="score",
+            metric_directions={"score": "higher"},
+        )
+        project_dir = run_dir / "code_task" / "workspace" / "generated_project"
+        project_dir.mkdir(parents=True)
+        write_text(project_dir / "main.py", script)
 
-            def ask_json(self, _system: str, _prompt: str, *, label: str = "") -> dict[str, str]:
-                self.labels.append(label)
-                self.prompts.append(_prompt)
-                if label == "greenfield-run-repair-plan":
-                    return {
-                        "diagnosis": "The data producer and processing consumer disagree on metadata fields.",
-                        "root_cause": "DatasetInput metadata contract mismatch.",
-                        "target_files": [
-                            {"path": "generated_experiment/inputs.py", "reason": "producer"},
-                            {"path": "generated_experiment/processing.py", "reason": "consumer"},
-                            {"path": "generated_experiment/runner.py", "reason": "orchestrator"},
-                        ],
-                        "repair_strategy": "Make the generated data bundle and processing path share one contract.",
-                        "risks": [],
-                    }
-                path = label.removeprefix("greenfield-run-repair-")
-                return {
-                    "content": (
-                        "from __future__ import annotations\n\n"
-                        f"REPAIRED_PATH = {path!r}\n"
-                    ),
-                    "summary": f"Repaired {path}.",
-                }
+        result = run_code_task_benchmark(run_dir, timeout_sec=30, skip_validation=True)
 
-        with _temporary_root() as root:
-            project_dir = root / "generated_project"
-            package_dir = project_dir / "generated_experiment"
-            package_dir.mkdir(parents=True)
-            for name in ["inputs.py", "processing.py", "runner.py", "__init__.py"]:
-                write_text(package_dir / name, "from __future__ import annotations\n")
-            write_text(project_dir / "main.py", "from __future__ import annotations\n")
-
-            fake = FakeClient()
-            repair = repair_generated_project_from_run_failure(
-                project_dir=project_dir,
-                failure_analysis={"status": "needs_repair", "implicated_files": ["generated_project/main.py"]},
-                stderr_text=(
-                    "ERROR: Experiment run failed: "
-                    "\"DatasetInput.metadata for 'wine' is missing required keys: features, labels\""
-                ),
-                output_path=root / "run_repair_contract.json",
-                code_artifacts={
-                    "generated_files": [
-                        {"path": "generated_experiment/inputs.py", "mode": "llm"},
-                        {"path": "generated_experiment/processing.py", "mode": "llm"},
-                        {"path": "generated_experiment/runner.py", "mode": "llm"},
-                        {"path": "main.py", "mode": "llm"},
-                    ]
-                },
-                client=fake,
-            )
-
-            self.assertEqual(repair["status"], "patched")
-            self.assertIn("generated_experiment/inputs.py", repair["changed_files"])
-            self.assertIn("generated_experiment/processing.py", repair["changed_files"])
-            self.assertTrue(fake.labels)
-            file_labels = [label for label in fake.labels if label != "greenfield-run-repair-plan"]
-            self.assertEqual(
-                file_labels[:3],
-                [
-                    "greenfield-run-repair-generated_experiment/inputs.py",
-                    "greenfield-run-repair-generated_experiment/processing.py",
-                    "greenfield-run-repair-generated_experiment/runner.py",
-                ],
-            )
-            repair_prompts = [prompt for label, prompt in zip(fake.labels, fake.prompts) if label != "greenfield-run-repair-plan"]
-            self.assertTrue(any("Runtime repair plan" in prompt for prompt in repair_prompts))
-            self.assertTrue(any("Relevant project context" in prompt for prompt in repair_prompts))
-            self.assertIn("REPAIRED_PATH", read_text(package_dir / "inputs.py"))
-            repair_plan = read_json(root / "run_repair_plan.json")
-            self.assertEqual(repair_plan["schema_version"], "code_task_repair_plan.v1")
-            self.assertIn("schema", repair_plan["affected_contracts"])
-            self.assertEqual(repair_plan["target_files"][0]["path"], "generated_experiment/inputs.py")
-            patch_set = read_json(root / "atomic_patch_set.json")
-            self.assertEqual(patch_set["schema_version"], "code_task_atomic_patch_set.v1")
-            self.assertEqual(patch_set["status"], "patched")
-            self.assertIn("generated_experiment/inputs.py", patch_set["changed_files"])
+        self.assertEqual(result.status, "failed")
+        report = read_json(result.report_path)
+        self.assertEqual(report["quality_guard"]["reason"], expected_reason)
+        return run_dir, report
 
     def test_greenfield_benchmark_rejects_empty_zero_evidence(self) -> None:
         with _temporary_root() as root:
@@ -1626,57 +1910,16 @@ primary_metric = "accuracy"
 
     def test_greenfield_benchmark_rejects_zero_exit_without_required_results(self) -> None:
         with _temporary_root() as root:
-            task_file = root / "task.md"
-            write_text(
-                task_file,
-                "# Task\n\nWrite artifacts/results.json and artifacts/report.md with measured rows.\n",
-            )
-            run_dir = root / "runs" / "missing-results"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=None,
-                task_file=task_file,
-                kind="greenfield",
-                benchmark_command="python generated_project/main.py",
-                workspace_mode="empty",
-                primary_metric="score",
-                metric_directions={"score": "higher"},
-            )
-            project_dir = run_dir / "code_task" / "workspace" / "generated_project"
-            project_dir.mkdir(parents=True)
-            write_text(
-                project_dir / "main.py",
+            run_dir, report = self._assert_greenfield_artifact_guard(
+                root, "missing-results",
                 "print('ERROR: experiment failed but was swallowed')\n",
+                "missing_results_artifact",
             )
-
-            result = run_code_task_benchmark(run_dir, timeout_sec=30, skip_validation=True)
-
-            self.assertEqual(result.status, "failed")
-            report = read_json(result.report_path)
-            self.assertEqual(report["quality_guard"]["reason"], "missing_results_artifact")
 
     def test_greenfield_benchmark_rejects_missing_required_report(self) -> None:
         with _temporary_root() as root:
-            task_file = root / "task.md"
-            write_text(
-                task_file,
-                "# Task\n\nWrite artifacts/results.json and artifacts/report.md with measured rows.\n",
-            )
-            run_dir = root / "runs" / "missing-report"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=None,
-                task_file=task_file,
-                kind="greenfield",
-                benchmark_command="python generated_project/main.py",
-                workspace_mode="empty",
-                primary_metric="score",
-                metric_directions={"score": "higher"},
-            )
-            project_dir = run_dir / "code_task" / "workspace" / "generated_project"
-            project_dir.mkdir(parents=True)
-            write_text(
-                project_dir / "main.py",
+            run_dir, report = self._assert_greenfield_artifact_guard(
+                root, "missing-report",
                 (
                     "from pathlib import Path\n"
                     "artifacts = Path('generated_project') / 'artifacts'\n"
@@ -1686,37 +1929,14 @@ primary_metric = "accuracy"
                     ")\n"
                     "print('score: 1.0')\n"
                 ),
+                "missing_required_artifact",
             )
-
-            result = run_code_task_benchmark(run_dir, timeout_sec=30, skip_validation=True)
-
-            self.assertEqual(result.status, "failed")
-            report = read_json(result.report_path)
-            self.assertEqual(report["quality_guard"]["reason"], "missing_required_artifact")
             self.assertIn("report.md", report["quality_guard"]["message"])
 
     def test_greenfield_benchmark_reports_artifact_path_mismatch(self) -> None:
         with _temporary_root() as root:
-            task_file = root / "task.md"
-            write_text(
-                task_file,
-                "# Task\n\nWrite artifacts/results.json and artifacts/report.md with measured rows.\n",
-            )
-            run_dir = root / "runs" / "artifact-path-mismatch"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=None,
-                task_file=task_file,
-                kind="greenfield",
-                benchmark_command="python generated_project/main.py",
-                workspace_mode="empty",
-                primary_metric="score",
-                metric_directions={"score": "higher"},
-            )
-            project_dir = run_dir / "code_task" / "workspace" / "generated_project"
-            project_dir.mkdir(parents=True)
-            write_text(
-                project_dir / "main.py",
+            run_dir, report = self._assert_greenfield_artifact_guard(
+                root, "artifact-path-mismatch",
                 (
                     "from pathlib import Path\n"
                     "root_artifacts = Path('artifacts')\n"
@@ -1728,13 +1948,8 @@ primary_metric = "accuracy"
                     "(expected / 'results.json').write_text('')\n"
                     "print('score: 1.0')\n"
                 ),
+                "artifact_path_mismatch",
             )
-
-            result = run_code_task_benchmark(run_dir, timeout_sec=30, skip_validation=True)
-
-            self.assertEqual(result.status, "failed")
-            report = read_json(result.report_path)
-            self.assertEqual(report["quality_guard"]["reason"], "artifact_path_mismatch")
             scan = read_json(run_dir / report["artifact_scan"])
             self.assertEqual(scan["status"], "warning")
             self.assertTrue(
@@ -1796,311 +2011,6 @@ primary_metric = "accuracy"
             self.assertIn("generated_project/artifacts/results.json", scanned_paths)
             self.assertIn("generated_project/artifacts/report.md", scanned_paths)
             self.assertNotIn("generated_project/submission/results/metrics.json", scanned_paths)
-
-    def test_greenfield_run_repair_targets_custom_project_layout(self) -> None:
-        class FakeClient:
-            def __init__(self) -> None:
-                self.labels: list[str] = []
-
-            def ask_json(self, _system: str, _prompt: str, *, label: str = "") -> dict[str, str]:
-                self.labels.append(label)
-                if label == "greenfield-run-repair-plan":
-                    if "has no attribute" in _prompt:
-                        targets = [
-                            "src/loaders.py",
-                            "src/preprocess.py",
-                            "src/model_core.py",
-                            "src/pipeline.py",
-                        ]
-                    else:
-                        targets = [
-                            {"path": "src/loaders.py"},
-                            {"path": "src/preprocess.py"},
-                            {"path": "src/pipeline.py"},
-                        ]
-                    return {
-                        "diagnosis": "Use project-specific producer and consumer files instead of fixed generated_experiment names.",
-                        "root_cause": "The generated project has a custom package layout.",
-                        "target_files": targets,
-                        "repair_strategy": "Repair the producer, transformer, and orchestrator in that order.",
-                        "risks": [],
-                    }
-                path = label.removeprefix("greenfield-run-repair-")
-                return {
-                    "content": (
-                        "from __future__ import annotations\n\n"
-                        f"REPAIRED_PATH = {path!r}\n"
-                    ),
-                    "summary": f"Repaired {path}.",
-                }
-
-        with _temporary_root() as root:
-            project_dir = root / "generated_project"
-            for rel_path in [
-                "app.py",
-                "src/loaders.py",
-                "src/preprocess.py",
-                "src/pipeline.py",
-                "src/model_core.py",
-            ]:
-                target = project_dir / rel_path
-                target.parent.mkdir(parents=True, exist_ok=True)
-                write_text(target, "from __future__ import annotations\n")
-
-            fake = FakeClient()
-            repair = repair_generated_project_from_run_failure(
-                project_dir=project_dir,
-                failure_analysis={"status": "needs_repair", "implicated_files": ["generated_project/app.py"]},
-                stderr_text=(
-                    "ERROR: Experiment run failed: "
-                    "\"DatasetInput.metadata is missing required keys: features, labels\""
-                ),
-                output_path=root / "run_repair_custom_layout.json",
-                code_artifacts={
-                    "generated_files": [
-                        {"path": "app.py", "mode": "llm"},
-                        {"path": "src/loaders.py", "mode": "llm"},
-                        {"path": "src/preprocess.py", "mode": "llm"},
-                        {"path": "src/pipeline.py", "mode": "llm"},
-                        {"path": "src/model_core.py", "mode": "llm"},
-                    ]
-                },
-                client=fake,
-            )
-
-            self.assertEqual(repair["status"], "patched")
-            file_labels = [label for label in fake.labels if label != "greenfield-run-repair-plan"]
-            self.assertEqual(
-                file_labels[:3],
-                [
-                    "greenfield-run-repair-src/loaders.py",
-                    "greenfield-run-repair-src/preprocess.py",
-                    "greenfield-run-repair-src/pipeline.py",
-                ],
-            )
-            self.assertIn("src/loaders.py", repair["changed_files"])
-
-            fake_attr = FakeClient()
-            attr_repair = repair_generated_project_from_run_failure(
-                project_dir=project_dir,
-                failure_analysis={"status": "needs_repair", "implicated_files": ["generated_project/app.py"]},
-                stderr_text="Experiment failed: 'str' object has no attribute 'X'",
-                output_path=root / "run_repair_custom_attribute_error.json",
-                code_artifacts={
-                    "generated_files": [
-                        {"path": "app.py", "mode": "llm"},
-                        {"path": "src/loaders.py", "mode": "llm"},
-                        {"path": "src/preprocess.py", "mode": "llm"},
-                        {"path": "src/pipeline.py", "mode": "llm"},
-                        {"path": "src/model_core.py", "mode": "llm"},
-                    ]
-                },
-                client=fake_attr,
-            )
-
-            self.assertEqual(attr_repair["status"], "patched")
-            attr_file_labels = [label for label in fake_attr.labels if label != "greenfield-run-repair-plan"]
-            self.assertEqual(
-                attr_file_labels[:4],
-                [
-                    "greenfield-run-repair-src/loaders.py",
-                    "greenfield-run-repair-src/preprocess.py",
-                    "greenfield-run-repair-src/model_core.py",
-                    "greenfield-run-repair-src/pipeline.py",
-                ],
-            )
-
-    def test_greenfield_run_repair_includes_attribute_consumers(self) -> None:
-        class FakeClient:
-            def __init__(self) -> None:
-                self.labels: list[str] = []
-
-            def ask_json(self, _system: str, _prompt: str, *, label: str = "") -> dict[str, str]:
-                self.labels.append(label)
-                if label == "greenfield-run-repair-plan":
-                    return {
-                        "diagnosis": "The producer changed metrics to dicts but the plan missed one report consumer.",
-                        "root_cause": "Metric contract mismatch across producer and consumer files.",
-                        "target_files": [
-                            {"path": "src/aggregator.py"},
-                            {"path": "src/runner.py"},
-                            {"path": "app.py"},
-                        ],
-                        "repair_strategy": "Repair all files that directly consume the missing metric symbol.",
-                        "risks": [],
-                    }
-                path = label.removeprefix("greenfield-run-repair-")
-                if path == "src/report.py":
-                    return {
-                        "content": (
-                            "from __future__ import annotations\n\n"
-                            f"REPAIRED_PATH = {path!r}\n\n"
-                            "def render(summary):\n"
-                            "    return summary['mean']['balanced_accuracy']\n"
-                        ),
-                        "summary": f"Repaired {path}.",
-                    }
-                return {
-                    "content": (
-                        "from __future__ import annotations\n\n"
-                        f"REPAIRED_PATH = {path!r}\n"
-                    ),
-                    "summary": f"Repaired {path}.",
-                }
-
-        with _temporary_root() as root:
-            project_dir = root / "generated_project"
-            files = {
-                "app.py": "from __future__ import annotations\n",
-                "src/aggregator.py": "from __future__ import annotations\nmean = {'balanced_accuracy': 1.0}\n",
-                "src/runner.py": "from __future__ import annotations\n",
-                "src/report.py": (
-                    "from __future__ import annotations\n\n"
-                    "def render(summary):\n"
-                    "    return summary.mean.balanced_accuracy\n"
-                ),
-            }
-            for rel_path, content in files.items():
-                target = project_dir / rel_path
-                target.parent.mkdir(parents=True, exist_ok=True)
-                write_text(target, content)
-
-            fake = FakeClient()
-            repair = repair_generated_project_from_run_failure(
-                project_dir=project_dir,
-                failure_analysis={"status": "needs_repair", "implicated_files": []},
-                stderr_text="ERROR: 'dict' object has no attribute 'balanced_accuracy'",
-                output_path=root / "run_repair_attribute_consumer.json",
-                code_artifacts={
-                    "generated_files": [
-                        {"path": "app.py", "mode": "llm"},
-                        {"path": "src/aggregator.py", "mode": "llm"},
-                        {"path": "src/runner.py", "mode": "llm"},
-                        {"path": "src/report.py", "mode": "llm"},
-                    ]
-                },
-                client=fake,
-            )
-
-            self.assertEqual(repair["status"], "patched")
-            file_labels = [label for label in fake.labels if label != "greenfield-run-repair-plan"]
-            self.assertIn("greenfield-run-repair-src/report.py", file_labels)
-            self.assertIn("src/report.py", repair["changed_files"])
-
-    def test_greenfield_run_repair_prefers_structured_local_actions(self) -> None:
-        class FakeClient:
-            def __init__(self) -> None:
-                self.labels: list[str] = []
-
-            def ask_json(self, _system: str, _prompt: str, *, label: str = "") -> dict[str, object]:
-                self.labels.append(label)
-                if label == "greenfield-run-repair-plan":
-                    return {
-                        "failure_kind": "runtime",
-                        "diagnosis": "The report consumer uses attribute access on a dict.",
-                        "root_cause": "Producer returns a mapping while consumer expects an object.",
-                        "observed_error": "'dict' object has no attribute 'balanced_accuracy'",
-                        "repeated_failure": False,
-                        "repair_scope": "block",
-                        "why_not_smaller_scope": "The failing expression is one local line.",
-                        "why_not_larger_scope": "The producer API is otherwise coherent.",
-                        "target_files": [{"path": "src/report.py"}],
-                        "dependency_trace": ["metrics dict -> report consumer"],
-                        "repair_strategy": "Use mapping access in the consumer.",
-                        "risks": [],
-                    }
-                return {
-                    "summary": "Replace one consumer expression with mapping access.",
-                    "actions": [
-                        {
-                            "action": "replace_block",
-                            "path": "src/report.py",
-                            "old_string": "return summary.mean.balanced_accuracy\n",
-                            "new_string": "return summary['mean']['balanced_accuracy']\n",
-                            "rationale": "The summary object is a dict.",
-                        }
-                    ],
-                }
-
-        with _temporary_root() as root:
-            project_dir = root / "generated_project"
-            report = project_dir / "src" / "report.py"
-            report.parent.mkdir(parents=True)
-            write_text(
-                report,
-                (
-                    "from __future__ import annotations\n\n"
-                    "def render(summary):\n"
-                    "    return summary.mean.balanced_accuracy\n"
-                ),
-            )
-
-            repair = repair_generated_project_from_run_failure(
-                project_dir=project_dir,
-                failure_analysis={"status": "needs_repair", "implicated_files": []},
-                stderr_text="ERROR: 'dict' object has no attribute 'balanced_accuracy'",
-                output_path=root / "run_repair_actions.json",
-                code_artifacts={"generated_files": [{"path": "src/report.py", "mode": "llm"}]},
-                client=FakeClient(),
-            )
-
-            self.assertEqual(repair["status"], "patched")
-            self.assertEqual(repair["changed_files"], ["src/report.py"])
-            content = read_text(report)
-            self.assertIn("summary['mean']['balanced_accuracy']", content)
-            self.assertNotIn("summary.mean.balanced_accuracy", content)
-            edit_application = repair["regenerated_files"][0]["edit_application"]
-            self.assertEqual(edit_application["status"], "patched")
-            self.assertEqual(edit_application["applied_actions"][0]["action"], "replace_block")
-            self.assertEqual(repair["snapshot"]["captured_count"], 1)
-            self.assertTrue(Path(repair["snapshot"]["manifest"]).is_file())
-            self.assertFalse((root / "run_repair_backups").exists())
-
-    def test_greenfield_run_repair_rejects_unapproved_public_api_drift(self) -> None:
-        class FakeClient:
-            def ask_json(self, _system: str, _prompt: str, *, label: str = "") -> dict[str, object]:
-                if label == "greenfield-run-repair-plan":
-                    return {
-                        "diagnosis": "The artifact path producer/consumer contract is mismatched.",
-                        "root_cause": "config.get_artifact_paths contract drifted.",
-                        "target_files": [{"path": "config.py"}],
-                        "repair_scope": "file",
-                        "repair_strategy": "Rewrite config.",
-                    }
-                return {
-                    "summary": "Rewrite config but accidentally change the public return contract.",
-                    "content": (
-                        "from __future__ import annotations\n\n"
-                        "from pathlib import Path\n"
-                        "from typing import Tuple\n\n"
-                        "def get_artifact_paths() -> Tuple[Path, Path]:\n"
-                        "    return Path('artifacts/results.json'), Path('artifacts/report.md')\n"
-                    ),
-                }
-
-        with _temporary_root() as root:
-            project_dir = root / "generated_project"
-            project_dir.mkdir(parents=True)
-            original = (
-                "from __future__ import annotations\n\n"
-                "from pathlib import Path\n\n"
-                "def get_artifact_paths() -> dict[str, Path]:\n"
-                "    return {'results': Path('artifacts/results.json'), 'report': Path('artifacts/report.md')}\n"
-            )
-            write_text(project_dir / "config.py", original)
-
-            repair = repair_generated_project_from_run_failure(
-                project_dir=project_dir,
-                failure_analysis={"status": "needs_repair", "implicated_files": ["generated_project/config.py"]},
-                stderr_text='TypeError: tuple indices must be integers or slices, not str; paths["results"]',
-                output_path=root / "run_repair_api_drift.json",
-                code_artifacts={"generated_files": [{"path": "config.py", "mode": "llm"}]},
-                client=FakeClient(),
-            )
-
-            self.assertNotEqual(repair["status"], "patched")
-            self.assertIn("public_api_signature_would_change", "\n".join(repair["unresolved_errors"]))
-            self.assertEqual((project_dir / "config.py").read_text(encoding="utf-8"), original)
 
     def test_greenfield_review_flags_stdlib_shadow_and_nested_artifact_path(self) -> None:
         with _temporary_root() as root:
@@ -2519,16 +2429,9 @@ protected_patterns = ["pyproject.toml"]
 
     def test_code_task_map_rebuilds_repo_map_from_workspace(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nMap this project.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=code_root,
-                task_file=task_file,
-                benchmark_command="python -m unittest discover -s tests",
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nMap this project.\n",
+                benchmark_command=TOY_BENCHMARK_COMMAND,
             )
             write_text(
                 run_dir / "code_task" / "workspace" / "feature.py",
@@ -2559,16 +2462,9 @@ protected_patterns = ["pyproject.toml"]
 
     def test_code_task_locate_writes_ranked_targets_and_evidence(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nImprove spam keyword prediction.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=code_root,
-                task_file=task_file,
-                benchmark_command="python -m unittest discover -s tests",
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nImprove spam keyword prediction.\n",
+                benchmark_command=TOY_BENCHMARK_COMMAND,
             )
 
             result = locate_code_task_context(
@@ -2611,16 +2507,9 @@ protected_patterns = ["pyproject.toml"]
 
     def test_code_task_context_pack_writes_prompt_and_snippets(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nImprove spam keyword prediction.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=code_root,
-                task_file=task_file,
-                benchmark_command="python -m unittest discover -s tests",
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nImprove spam keyword prediction.\n",
+                benchmark_command=TOY_BENCHMARK_COMMAND,
             )
 
             result = build_code_task_context_pack(
@@ -2773,8 +2662,7 @@ protected_patterns = ["pyproject.toml"]
                 run_dir=run_dir, code_root=code_root, task_file=root / "task.md",
                 benchmark_command="python -m unittest discover -s tests",
             )
-            generate_patch_plan(run_dir, use_llm=False)
-            record_plan_decision(run_dir, decision="approve")
+            _approve_offline_patch_plan(run_dir)
             client = Mock()
             client.ask_json.side_effect = [
                 {"edits": [], "context_request": {"dependency_symbols": [
@@ -2808,8 +2696,7 @@ protected_patterns = ["pyproject.toml"]
                 run_dir=run_dir, code_root=code_root, task_file=root / "task.md",
                 benchmark_command="python -m unittest discover -s tests",
             )
-            generate_patch_plan(run_dir, use_llm=False)
-            record_plan_decision(run_dir, decision="approve")
+            _approve_offline_patch_plan(run_dir)
             client = Mock()
             client.ask_json.side_effect = [
                 {"edits": [], "context_request": {"dependency_symbols": [
@@ -2868,19 +2755,9 @@ protected_patterns = ["pyproject.toml"]
 
     def test_work_plan_offline_writes_batchable_items_and_manifest(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(
-                task_file,
-                "# Task\n\nImprove spam keyword prediction without changing tests.\n",
-            )
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=code_root,
-                task_file=task_file,
-                benchmark_command="python -m unittest discover -s tests",
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nImprove spam keyword prediction without changing tests.\n",
+                benchmark_command=TOY_BENCHMARK_COMMAND,
             )
             build_code_task_context_pack(
                 run_dir,
@@ -3000,16 +2877,9 @@ protected_patterns = ["pyproject.toml"]
 
     def test_create_code_task_batch_reuses_existing_item_batch(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nImprove spam classifier accuracy.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=code_root,
-                task_file=task_file,
-                benchmark_command="python -m unittest discover -s tests",
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nImprove spam classifier accuracy.\n",
+                benchmark_command=TOY_BENCHMARK_COMMAND,
             )
             generate_code_task_work_plan(run_dir, use_llm=False)
 
@@ -3024,16 +2894,9 @@ protected_patterns = ["pyproject.toml"]
 
     def test_execute_selects_first_implementation_work_item(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nImprove spam prediction.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=code_root,
-                task_file=task_file,
-                benchmark_command="python -m unittest discover -s tests",
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nImprove spam prediction.\n",
+                benchmark_command=TOY_BENCHMARK_COMMAND,
             )
             _write_analysis_first_work_plan(run_dir)
 
@@ -3114,16 +2977,9 @@ protected_patterns = ["pyproject.toml"]
 
     def test_record_plan_decision_updates_work_plan_approval(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nApprove both plans.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=code_root,
-                task_file=task_file,
-                benchmark_command="python -m unittest discover -s tests",
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nApprove both plans.\n",
+                benchmark_command=TOY_BENCHMARK_COMMAND,
             )
             generate_code_task_work_plan(run_dir, use_llm=False)
             generate_patch_plan(run_dir, use_llm=False)
@@ -3137,16 +2993,9 @@ protected_patterns = ["pyproject.toml"]
 
     def test_probe_code_task_environment_writes_report_and_manifest(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nProbe this project.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=code_root,
-                task_file=task_file,
-                benchmark_command="python -m unittest discover -s tests",
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nProbe this project.\n",
+                benchmark_command=TOY_BENCHMARK_COMMAND,
             )
 
             result = probe_code_task_environment(run_dir)
@@ -3206,19 +3055,9 @@ protected_patterns = ["pyproject.toml"]
 
     def test_patch_plan_offline_writes_reviewable_plan_and_updates_manifest(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(
-                task_file,
-                "# Task\n\nImprove spam keyword handling and keep the public predict API stable.\n",
-            )
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=code_root,
-                task_file=task_file,
-                benchmark_command="python -m unittest discover -s tests",
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nImprove spam keyword handling and keep the public predict API stable.\n",
+                benchmark_command=TOY_BENCHMARK_COMMAND,
             )
 
             result = generate_patch_plan(run_dir, use_llm=False)
@@ -3239,16 +3078,9 @@ protected_patterns = ["pyproject.toml"]
 
     def test_plan_and_propose_use_latest_context_pack_when_available(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nImprove spam keyword prediction without editing tests.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=code_root,
-                task_file=task_file,
-                benchmark_command="python -m unittest discover -s tests",
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nImprove spam keyword prediction without editing tests.\n",
+                benchmark_command=TOY_BENCHMARK_COMMAND,
             )
             context = build_code_task_context_pack(
                 run_dir,
@@ -3292,6 +3124,7 @@ protected_patterns = ["pyproject.toml"]
             self.assertTrue(context.context_pack_path.is_file())
 
     def test_failed_llm_edit_is_not_an_offline_proposal_and_can_retry(self) -> None:
+        from simple_ar.integrations.llm import LLMResponseError
         with _temporary_root() as root:
             code_root = root / "project"
             _write_toy_project(code_root)
@@ -3300,8 +3133,7 @@ protected_patterns = ["pyproject.toml"]
             initialize_code_task(run_dir=run_dir, code_root=code_root,
                                  task_file=root / "task.md",
                                  benchmark_command="python -m unittest discover -s tests")
-            generate_patch_plan(run_dir, use_llm=False)
-            record_plan_decision(run_dir, decision="approve")
+            _approve_offline_patch_plan(run_dir)
             with patch("simple_ar.code_task.editing.patching.LLMClient.for_task"), patch(
                 "simple_ar.code_task.editing.patching._ask_llm_for_edits",
                 side_effect=LLMError("provider 524; prior consumption is unknown"),
@@ -3309,12 +3141,31 @@ protected_patterns = ["pyproject.toml"]
                 with self.assertRaisesRegex(LLMError, "provider 524; prior consumption is unknown"):
                     propose_patch_edits(run_dir, use_llm=True)
             self.assertFalse((run_dir / "code_task/meta/proposed_edits.json").exists())
-            with patch("simple_ar.code_task.editing.patching.LLMClient.for_task"), patch(
-                "simple_ar.code_task.editing.patching._ask_llm_for_edits",
-                return_value={"edits": [], "validation": ["No change needed."]},
-            ):
+            with patch("simple_ar.code_task.editing.patching.LLMClient.for_task") as factory:
+                factory.return_value.ask_json.side_effect = [
+                    LLMResponseError("invalid JSON", raw_response='{"edits": [broken first draft'),
+                    LLMResponseError("invalid JSON", raw_response='{"edits": [broken corrected draft'),
+                ]
+                with self.assertRaisesRegex(LLMError, "invalid JSON"):
+                    propose_patch_edits(run_dir, use_llm=True)
+                self.assertEqual(factory.return_value.ask_json.call_count, 2)
+                requests = factory.return_value.ask_json.call_args_list
+                self.assertEqual(requests[1].kwargs['label'], 'code-task-propose-edits-format')
+                self.assertIn('broken first draft', requests[1].args[1])
+                rejected = list((run_dir / 'code_task/meta').glob('edit_response_invalid_*.txt'))
+                self.assertEqual(len(rejected), 2)
+                self.assertEqual({path.read_text() for path in rejected},
+                                 {'{"edits": [broken first draft', '{"edits": [broken corrected draft'})
+                self.assertFalse((run_dir / 'code_task/meta/proposed_edits.json').exists())
+            with patch("simple_ar.code_task.editing.patching.LLMClient.for_task") as factory:
+                factory.return_value.ask_json.side_effect = [
+                    LLMResponseError('invalid JSON', raw_response='incomplete proposal'),
+                    _FakeCodeTaskClient().ask_json('', '', label='code-task-propose-edits'),
+                ]
                 recovered = propose_patch_edits(run_dir, use_llm=True)
+                self.assertEqual(factory.return_value.ask_json.call_count, 2)
             self.assertEqual(recovered.mode, "llm")
+            self.assertEqual(recovered.edit_count, 1)
 
     def test_requested_symbol_context_replaces_clipped_prefix_with_bounded_window(self) -> None:
         from simple_ar.code_task.editing.patching import _requested_source_context
@@ -3332,6 +3183,20 @@ protected_patterns = ["pyproject.toml"]
             self.assertLessEqual(len(result[0]["text"]), 200)
             self.assertEqual(result[0]["access_role"], "read_only")
             self.assertGreater(result[0]["source_offset"], 0)
+
+            # Type declarations are Python source too. A generic prose hit
+            # must not replace the specifically requested declaration.
+            for suffix in (".py", ".pyi", ".md"):
+                with self.subTest(suffix=suffix):
+                    path = f"public_api{suffix}"
+                    source = "# complete description\n" * 200 + "class Series:\n    def preview(self, count: int) -> list[int]: ...\n"
+                    write_text(root / path, source)
+                    declaration = _requested_source_context(root, build_codebase_index(root),
+                        {"files": [path], "symbols": ["Series"], "query": "complete declaration"},
+                        supplied=[], max_files=1, max_chars=160, max_total_chars=160)
+                    self.assertEqual(len(declaration), 1)
+                    self.assertIn("class Series", declaration[0]["text"])
+                    self.assertEqual(source[declaration[0]["source_offset"]:][:len(declaration[0]["text"])], declaration[0]["text"])
 
             # A middle observation leaves a small header and a large unseen
             # definition body. The header must not consume the only window,
@@ -3423,8 +3288,7 @@ protected_patterns = ["pyproject.toml"]
                 run_dir=run_dir, code_root=code_root, task_file=root / "task.md",
                 benchmark_command="python -m unittest discover -s tests",
             )
-            generate_patch_plan(run_dir, use_llm=False)
-            record_plan_decision(run_dir, decision="approve")
+            _approve_offline_patch_plan(run_dir)
             client = Mock()
             client.ask_json.side_effect = [
                 {"edits": [], "summary": "The required behavior is beyond the visible prefix; its interface is missing.",
@@ -3464,8 +3328,7 @@ protected_patterns = ["pyproject.toml"]
                 run_dir=run_dir, code_root=code_root, task_file=root / "task.md",
                 benchmark_command="python -m unittest discover -s tests",
             )
-            generate_patch_plan(run_dir, use_llm=False)
-            record_plan_decision(run_dir, decision="approve")
+            _approve_offline_patch_plan(run_dir)
             client = Mock()
             client.ask_json.side_effect = [
                 {"edits": [], "summary": "Cannot find the function in the displayed source."},
@@ -3514,8 +3377,7 @@ protected_patterns = ["pyproject.toml"]
             run_dir = root / "run"
             initialize_code_task(run_dir=run_dir, code_root=code_root,
                                  task_file=root / "task.md", benchmark_command="python -m unittest")
-            generate_patch_plan(run_dir, use_llm=False)
-            record_plan_decision(run_dir, decision="approve")
+            _approve_offline_patch_plan(run_dir)
             initial = {"edits": [], "summary": "Need lifecycle context",
                        "context_request": {"files": ["tests/lifecycle.py", "../../.env"]}}
             client = Mock()
@@ -3558,6 +3420,40 @@ protected_patterns = ["pyproject.toml"]
             self.assertEqual(result.edit_count, 0)
             client.ask_json.assert_called_once()
 
+            # A full navigation pack cannot block later evidence or act as an
+            # edit authorization list. The source scope still protects tests.
+            workspace = run_dir / "code_task/workspace"
+            write_text(workspace / "spam_model.py", "# initial navigation\n" * 80 + read_text(workspace / "spam_model.py"))
+            write_text(workspace / "integration.py", "def normalize(value):\n    return value\n")
+            pack = build_code_task_context_pack(run_dir, query="spam prediction", refresh_map=True,
+                preferred_paths=("spam_model.py",), max_files=1,
+                max_source_chars_per_file=600, max_total_chars=600)
+            original_pack = read_text(pack.snippets_path)
+            self.assertEqual(read_json(pack.context_pack_path)["budget"]["used_chars"], 600)
+            client.reset_mock()
+            client.ask_json.return_value = {"edits": [{"path": "integration.py",
+                "old": "return value", "new": "return str(value)", "reason": "Normalize the boundary."}]}
+            with patch("simple_ar.code_task.editing.patching.LLMClient.for_task", return_value=client), patch(
+                "simple_ar.code_task.editing.patching._ask_llm_for_edits", return_value={
+                    "edits": [], "context_request": {"files": ["integration.py", "tests/lifecycle.py"]}},
+            ):
+                result = propose_patch_edits(run_dir, use_llm=True, max_files=2, force=True)
+            self.assertEqual(result.edit_count, 1)
+            client.ask_json.assert_called_once()
+            prompt = client.ask_json.call_args.args[1]
+            self.assertIn("def normalize(value)", prompt)
+            self.assertIn("def end_task()", prompt)
+            evidence = read_json(run_dir / "code_task/meta/edit_context_followup.json")
+            window = evidence["prompt_window"]
+            self.assertEqual(window["max_chars"], 600)
+            self.assertLessEqual(window["used_chars"], 600)
+            self.assertEqual({row["path"]: row["access_role"] for row in evidence["snippets"]},
+                {"integration.py": "editable", "tests/lifecycle.py": "read_only"})
+            self.assertIn("integration.py", result.selected_files)
+            self.assertEqual(read_text(pack.snippets_path), original_pack)
+            self.assertEqual(read_text(workspace / "integration.py"), "def normalize(value):\n    return value\n")
+            self.assertEqual(read_text(workspace / "tests/lifecycle.py"), "def end_task():\n    pass\n")
+
     def test_propose_edits_restricts_llm_to_current_batch_targets(self) -> None:
         with _temporary_root() as root:
             code_root = root / "toy_project"
@@ -3581,8 +3477,7 @@ protected_patterns = ["pyproject.toml"]
             work_plan["items"][0]["budget_profile"] = "normal"
             write_json(work_plan_path, work_plan)
             create_code_task_batch(run_dir, work_item_id="W1")
-            generate_patch_plan(run_dir, use_llm=False)
-            record_plan_decision(run_dir, decision="approve")
+            _approve_offline_patch_plan(run_dir)
             located = build_code_task_context_pack(
                 run_dir, query="predict", max_files=3,
                 max_source_chars_per_file=500,
@@ -3594,15 +3489,8 @@ protected_patterns = ["pyproject.toml"]
                     "edits": [
                         {
                             "path": "spam_model.py",
-                            "old": (
-                                "def predict(text):\n"
-                                "    return 'spam' if 'win' in text.lower() else 'ham'\n"
-                            ),
-                            "new": (
-                                "def predict(text):\n"
-                                "    lowered = text.lower()\n"
-                                "    return 'spam' if any(keyword in lowered for keyword in ('win', 'prize')) else 'ham'\n"
-                            ),
+                            "old": TOY_PREDICT_SOURCE,
+                            "new": TOY_PREDICT_WITH_PRIZE,
                             "reason": "Improve the selected batch target.",
                         },
                         {
@@ -3672,21 +3560,13 @@ protected_patterns = ["pyproject.toml"]
 
     def test_propose_edits_budget_requires_large_approval(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nMake a deliberately large local implementation.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=code_root,
-                task_file=task_file,
-                benchmark_command="python -m unittest discover -s tests",
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nMake a deliberately large local implementation.\n",
+                benchmark_command=TOY_BENCHMARK_COMMAND,
             )
             generate_code_task_work_plan(run_dir, use_llm=False)
             create_code_task_batch(run_dir, work_item_id="W1")
-            generate_patch_plan(run_dir, use_llm=False)
-            record_plan_decision(run_dir, decision="approve")
+            _approve_offline_patch_plan(run_dir)
             large_new = "def predict(text):\n" + "    lowered = text.lower()\n" * 260 + "    return 'spam'\n"
             fake_client = _FakeRepairClient(
                 {
@@ -3694,10 +3574,7 @@ protected_patterns = ["pyproject.toml"]
                     "edits": [
                         {
                             "path": "spam_model.py",
-                            "old": (
-                                "def predict(text):\n"
-                                "    return 'spam' if 'win' in text.lower() else 'ham'\n"
-                            ),
+                            "old": TOY_PREDICT_SOURCE,
                             "new": large_new,
                             "reason": "Large local implementation.",
                         }
@@ -3870,13 +3747,10 @@ protected_patterns = ["pyproject.toml"]
 
     def test_apply_edits_requires_approved_plan_and_then_patches_workspace(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nAlso detect prize as spam.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(run_dir=run_dir, code_root=code_root, task_file=task_file,
-                                 edit_scope_allowed_patterns=("spam_model.py", "src/**"))
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nAlso detect prize as spam.\n",
+                edit_scope_allowed_patterns=("spam_model.py", "src/**"),
+            )
             generate_patch_plan(run_dir, use_llm=False)
             proposal_path = _write_valid_edit_proposal(run_dir)
 
@@ -3943,14 +3817,10 @@ protected_patterns = ["pyproject.toml"]
         from simple_ar.code_task.editing.patching import EditBudgetApprovalRequired
         from simple_ar.code_task.orchestration.execute import implement_code_task
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nApply a reviewed large proposal.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(run_dir=run_dir, code_root=code_root, task_file=task_file)
-            generate_patch_plan(run_dir, use_llm=False)
-            record_plan_decision(run_dir, decision="approve")
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nApply a reviewed large proposal.\n",
+            )
+            _approve_offline_patch_plan(run_dir)
             proposal_path = _write_valid_edit_proposal(run_dir)
             proposal = read_json(proposal_path)
             proposal["budget"] = {
@@ -3982,14 +3852,10 @@ protected_patterns = ["pyproject.toml"]
 
     def test_apply_repair_proposal_records_latest_applied_proposal(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nApply a reviewed repair proposal.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(run_dir=run_dir, code_root=code_root, task_file=task_file)
-            generate_patch_plan(run_dir, use_llm=False)
-            record_plan_decision(run_dir, decision="approve")
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nApply a reviewed repair proposal.\n",
+            )
+            _approve_offline_patch_plan(run_dir)
             repair_dir = run_dir / "code_task" / "repairs" / "repair-001"
             repair_dir.mkdir(parents=True)
             repair_proposal = _write_valid_edit_proposal(run_dir, path=repair_dir / "proposed_edits.json")
@@ -4015,14 +3881,10 @@ protected_patterns = ["pyproject.toml"]
 
     def test_apply_edits_allows_multiple_ordered_edits_in_one_file(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nApply two edits in the same file.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(run_dir=run_dir, code_root=code_root, task_file=task_file)
-            generate_patch_plan(run_dir, use_llm=False)
-            record_plan_decision(run_dir, decision="approve")
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nApply two edits in the same file.\n",
+            )
+            _approve_offline_patch_plan(run_dir)
             proposal_path = run_dir / "code_task" / "meta" / "proposed_edits.json"
             write_json(
                 proposal_path,
@@ -4036,10 +3898,7 @@ protected_patterns = ["pyproject.toml"]
                         },
                         {
                             "path": "spam_model.py",
-                            "old": (
-                                "def predict(text):\n"
-                                "    return 'spam' if 'win' in text.lower() else 'ham'\n"
-                            ),
+                            "old": TOY_PREDICT_SOURCE,
                             "new": (
                                 "def predict(text):\n"
                                 "    lowered = text.lower()\n"
@@ -4065,14 +3924,10 @@ protected_patterns = ["pyproject.toml"]
 
     def test_apply_edits_rejects_path_traversal_without_modifying_workspace(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nTry an unsafe edit.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(run_dir=run_dir, code_root=code_root, task_file=task_file)
-            generate_patch_plan(run_dir, use_llm=False)
-            record_plan_decision(run_dir, decision="approve")
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nTry an unsafe edit.\n",
+            )
+            _approve_offline_patch_plan(run_dir)
             proposal_path = root / "bad_edits.json"
             write_json(
                 proposal_path,
@@ -4105,8 +3960,7 @@ protected_patterns = ["pyproject.toml"]
             write_text(task_file, "# Task\n\nImprove source behavior without changing validation targets.\n")
             run_dir = root / "runs" / "code-task-run"
             initialize_code_task(run_dir=run_dir, code_root=code_root, task_file=task_file)
-            generate_patch_plan(run_dir, use_llm=False)
-            record_plan_decision(run_dir, decision="approve")
+            _approve_offline_patch_plan(run_dir)
             proposal_path = root / "protected_edits.json"
             write_json(
                 proposal_path,
@@ -4146,14 +4000,10 @@ protected_patterns = ["pyproject.toml"]
 
     def test_propose_edits_drops_protected_llm_paths(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nImprove the spam model without changing tests.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(run_dir=run_dir, code_root=code_root, task_file=task_file)
-            generate_patch_plan(run_dir, use_llm=False)
-            record_plan_decision(run_dir, decision="approve")
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nImprove the spam model without changing tests.\n",
+            )
+            _approve_offline_patch_plan(run_dir)
 
             fake_client = _FakeRepairClient(
                 {
@@ -4161,10 +4011,7 @@ protected_patterns = ["pyproject.toml"]
                     "edits": [
                         {
                             "path": "spam_model.py",
-                            "old": (
-                                "def predict(text):\n"
-                                "    return 'spam' if 'win' in text.lower() else 'ham'\n"
-                            ),
+                            "old": TOY_PREDICT_SOURCE,
                             "new": (
                                 "def predict(text):\n"
                                 "    lowered = text.lower()\n"
@@ -4341,16 +4188,9 @@ protected_patterns = ["pyproject.toml"]
 
     def test_run_code_task_benchmark_captures_outputs_and_updates_status(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nRun existing tests.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=code_root,
-                task_file=task_file,
-                benchmark_command="python -m unittest discover -s tests",
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nRun existing tests.\n",
+                benchmark_command=TOY_BENCHMARK_COMMAND,
             )
 
             result = run_code_task_benchmark(run_dir, timeout_sec=10)
@@ -4407,15 +4247,8 @@ protected_patterns = ["pyproject.toml"]
 
     def test_run_code_task_benchmark_stops_warning_flood_with_watchdog(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nStop noisy runaway benchmark output.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=code_root,
-                task_file=task_file,
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nStop noisy runaway benchmark output.\n",
                 benchmark_command="python warning_flood.py",
             )
             write_text(
@@ -4437,16 +4270,9 @@ protected_patterns = ["pyproject.toml"]
 
     def test_run_code_task_baseline_records_pre_patch_result(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nCapture baseline.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=code_root,
-                task_file=task_file,
-                benchmark_command="python -m unittest discover -s tests",
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nCapture baseline.\n",
+                benchmark_command=TOY_BENCHMARK_COMMAND,
             )
 
             result = run_code_task_baseline(run_dir, timeout_sec=10)
@@ -4546,21 +4372,13 @@ protected_patterns = ["pyproject.toml"]
 
     def test_manual_validate_and_run_sync_latest_batch_state(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nDetect prize messages as spam.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=code_root,
-                task_file=task_file,
-                benchmark_command="python -m unittest discover -s tests",
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nDetect prize messages as spam.\n",
+                benchmark_command=TOY_BENCHMARK_COMMAND,
             )
             generate_code_task_work_plan(run_dir, use_llm=False)
             create_code_task_batch(run_dir, work_item_id="W1")
-            generate_patch_plan(run_dir, use_llm=False)
-            record_plan_decision(run_dir, decision="approve")
+            _approve_offline_patch_plan(run_dir)
             apply_patch_edits(run_dir, edits_file=_write_valid_edit_proposal(run_dir))
 
             validate_code_task(run_dir)
@@ -4860,19 +4678,11 @@ protected_patterns = ["pyproject.toml"]
 
     def test_analyze_failure_and_offline_repair_proposal(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nBreak then diagnose the spam classifier.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=code_root,
-                task_file=task_file,
-                benchmark_command="python -m unittest discover -s tests",
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nBreak then diagnose the spam classifier.\n",
+                benchmark_command=TOY_BENCHMARK_COMMAND,
             )
-            generate_patch_plan(run_dir, use_llm=False)
-            record_plan_decision(run_dir, decision="approve")
+            _approve_offline_patch_plan(run_dir)
             apply_patch_edits(run_dir, edits_file=_write_failing_edit_proposal(run_dir))
             failed = run_code_task_benchmark(run_dir, timeout_sec=10)
             self.assertEqual(failed.status, "failed")
@@ -4904,15 +4714,8 @@ protected_patterns = ["pyproject.toml"]
 
     def test_failure_analysis_prefers_runtime_stderr_over_validation_warning(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nDiagnose runtime stderr before validation warnings.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=code_root,
-                task_file=task_file,
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nDiagnose runtime stderr before validation warnings.\n",
                 benchmark_command="python broken_runtime.py",
             )
             write_text(
@@ -4935,15 +4738,8 @@ protected_patterns = ["pyproject.toml"]
 
     def test_greenfield_run_repair_analyzes_failure_when_budget_exhausted(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nDiagnose final failure even when repair budget is gone.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=code_root,
-                task_file=task_file,
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nDiagnose final failure even when repair budget is gone.\n",
                 benchmark_command="python broken_runtime.py",
             )
             write_text(
@@ -4970,16 +4766,9 @@ protected_patterns = ["pyproject.toml"]
 
     def test_execute_runs_to_approval_gate(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nImprove the spam classifier.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=code_root,
-                task_file=task_file,
-                benchmark_command="python -m unittest discover -s tests",
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nImprove the spam classifier.\n",
+                benchmark_command=TOY_BENCHMARK_COMMAND,
             )
 
             result = execute_code_task(run_dir, use_llm=False, timeout_sec=10)
@@ -5003,16 +4792,9 @@ protected_patterns = ["pyproject.toml"]
 
     def test_execute_blocks_on_llm_work_plan_failure_without_fallback(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nImprove the spam classifier with LLM planning.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=code_root,
-                task_file=task_file,
-                benchmark_command="python -m unittest discover -s tests",
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nImprove the spam classifier with LLM planning.\n",
+                benchmark_command=TOY_BENCHMARK_COMMAND,
             )
             fake_client = _FailingCodeTaskClient()
 
@@ -5028,25 +4810,20 @@ protected_patterns = ["pyproject.toml"]
             self.assertEqual(result.stop_reason, "llm_planning_failed")
             self.assertEqual(result.steps[-1].step, "work-plan")
             self.assertEqual(result.steps[-1].status, "blocked")
-            self.assertIn("LLM work planning failed", result.steps[-1].detail)
-            self.assertEqual(fake_client.calls, 2)
+            self.assertIn("LLM response did not contain a JSON object", result.steps[-1].detail)
+            self.assertEqual(fake_client.calls, 1)
             self.assertFalse((run_dir / "code_task" / "work_plan.json").exists())
             self.assertFalse((run_dir / "code_task" / "work_plan.md").exists())
 
     def test_execute_uses_planning_fallback_only_when_explicitly_allowed(self) -> None:
+        from simple_ar.integrations.llm import LLMResponseError, LLMStreamError, LLMDeadlineError
+        from simple_ar.core.budget import BudgetExceededError
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nImprove the spam classifier with fallback allowed.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=code_root,
-                task_file=task_file,
-                benchmark_command="python -m unittest discover -s tests",
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nImprove the spam classifier with fallback allowed.\n",
+                benchmark_command=TOY_BENCHMARK_COMMAND,
             )
-            fake_client = _FailingCodeTaskClient()
+            fake_client = _FailingCodeTaskClient(LLMResponseError('invalid JSON', raw_response='{broken'))
 
             with patch("simple_ar.code_task.editing.work_plan.LLMClient.from_env", return_value=fake_client):
                 result = execute_code_task(
@@ -5064,19 +4841,96 @@ protected_patterns = ["pyproject.toml"]
             self.assertEqual(fake_client.calls, 2)
             work_plan = read_json(run_dir / "code_task" / "work_plan.json")
             self.assertEqual(work_plan["mode"], "offline")
+            self.assertTrue(work_plan['approval']['required'])
+            self.assertEqual(read_json(run_dir / 'code_task/meta/planning_steps/work-plan-response-001.json')
+                ['raw_response'], '{broken')
+
+            generate_patch_plan(run_dir, use_llm=False)
+            record_plan_decision(run_dir, decision='approve')
+            retained_paths = [run_dir / 'code_task' / name for name in
+                ('work_plan.json', 'work_plan.md', 'patch_plan.md')]
+            retained_paths.extend((run_dir / 'code_task/memory').rglob('*'))
+            retained = {path: path.read_bytes() for path in retained_paths if path.is_file()}
+            approved = read_json(run_dir / 'manifest.json')
+            admission = LLMError('budget admission failed')
+            admission.__cause__ = BudgetExceededError('remaining budget')
+            cases = [(LLMError('provider unavailable'), None), (admission, None),
+                (LLMStreamError('incomplete stream'), None), (LLMDeadlineError('deadline'), None),
+                (LLMResponseError('unreconciled dispatch', raw_response='{broken'), 'unknown'),
+                (LLMResponseError('pending dispatch', raw_response='{broken'), 'reserved'),
+                (LLMError('provider failed during correction'), 'correction')]
+            for generate in (generate_code_task_work_plan, generate_patch_plan):
+                for error, status in cases:
+                    for allow in (False, True):
+                        with self.subTest(consumer=generate.__name__, error=str(error), fallback=allow):
+                            client = Mock()
+                            client.ask_json.side_effect = ([LLMResponseError('invalid JSON', raw_response='{broken'), error]
+                                if status == 'correction' else error)
+                            ledger = BudgetLedger({'llm_requests': 10, 'image_requests': 3})
+                            client._budget_ledger = ledger
+                            if status in ('unknown', 'reserved'):
+                                ledger.reserve('image', {'image_requests': 1})
+                                if status == 'unknown':
+                                    ledger.mark_unknown('image', reason='dispatch unknown',
+                                        known_actual={'image_requests': 1})
+                                self.assertEqual(ledger.unknown_dimensions(), ())
+                            before = ledger.to_dict()
+                            with patch.object(LLMClient, 'for_task', return_value=client), self.assertRaises(type(error)) as caught:
+                                generate(run_dir, llm_client=client, llm_retry_attempts=3,
+                                    allow_llm_fallback=allow, force=True)
+                            self.assertIs(caught.exception, error)
+                            self.assertEqual(client.ask_json.call_count, 2 if status == 'correction' else 1)
+                            self.assertEqual(ledger.to_dict(), before)
+                            self.assertEqual({path: path.read_bytes() for path in retained}, retained)
+                            manifest = read_json(run_dir / 'manifest.json')
+                            self.assertEqual(manifest['plan'], approved['plan'])
+                            self.assertEqual(manifest['work_plan'], approved['work_plan'])
+
+            for generate in (generate_code_task_work_plan, generate_patch_plan):
+                for allow in (False, True):
+                    client = Mock()
+                    errors = [LLMResponseError('invalid JSON', raw_response='{first'),
+                              LLMResponseError('invalid JSON', raw_response='{second')]
+                    client.ask_json.side_effect = errors
+                    with self.subTest(consumer=generate.__name__, complete_format_failure=True, fallback=allow), \
+                            patch.object(LLMClient, 'for_task', return_value=client):
+                        if allow:
+                            result = generate(run_dir, llm_client=client, llm_retry_attempts=2,
+                                allow_llm_fallback=True, force=True)
+                            self.assertEqual(result.mode, 'offline')
+                            self.assertTrue(result.pending_approval)
+                        else:
+                            with self.assertRaises(LLMResponseError) as caught:
+                                generate(run_dir, llm_client=client, llm_retry_attempts=2, force=True)
+                            self.assertIs(caught.exception, errors[-1])
+                        self.assertEqual(client.ask_json.call_count, 2)
+                        self.assertIn('completed response', client.ask_json.call_args.args[1])
+                client = Mock()
+                ledger = BudgetLedger({'llm_requests': 2, 'total_tokens': 200})
+                client._budget_ledger = ledger
+                def complete(*_args, **_kwargs):
+                    reservation = str(client.ask_json.call_count)
+                    ledger.reserve(reservation, {'llm_requests': 1, 'total_tokens': 100})
+                    ledger.settle(reservation, {'llm_requests': 1, 'total_tokens': 25})
+                    if client.ask_json.call_count == 1:
+                        raise LLMResponseError('invalid JSON', raw_response='{broken')
+                    return {'summary': 'Corrected plan', 'items': [{'objective': 'Fix keyword handling',
+                        'target_files': ['spam_model.py']}]}
+                client.ask_json.side_effect = complete
+                with self.subTest(consumer=generate.__name__, corrected=True), \
+                        patch.object(LLMClient, 'for_task', return_value=client):
+                    result = generate(run_dir, llm_client=client, llm_retry_attempts=2, force=True)
+                    self.assertEqual(result.mode, 'llm')
+                    self.assertTrue(result.pending_approval)
+                    self.assertEqual(client.ask_json.call_count, 2)
+                    self.assertEqual(ledger.remaining('llm_requests'), 0)
+                    self.assertEqual(ledger.remaining('total_tokens'), 150)
 
     def test_execute_blocks_on_llm_patch_plan_failure_without_fallback(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nImprove the spam classifier patch plan.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=code_root,
-                task_file=task_file,
-                benchmark_command="python -m unittest discover -s tests",
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nImprove the spam classifier patch plan.\n",
+                benchmark_command=TOY_BENCHMARK_COMMAND,
             )
             first = execute_code_task(run_dir, use_llm=False, to_step="batch", timeout_sec=10)
             self.assertEqual(first.stop_reason, "stop_point")
@@ -5094,22 +4948,15 @@ protected_patterns = ["pyproject.toml"]
             self.assertEqual(result.stop_reason, "llm_planning_failed")
             self.assertEqual(result.steps[-1].step, "plan")
             self.assertEqual(result.steps[-1].status, "blocked")
-            self.assertIn("LLM patch planning failed", result.steps[-1].detail)
-            self.assertEqual(fake_client.calls, 2)
+            self.assertIn("LLM response did not contain a JSON object", result.steps[-1].detail)
+            self.assertEqual(fake_client.calls, 1)
             self.assertFalse((run_dir / "code_task" / "patch_plan.md").exists())
 
     def test_execute_can_skip_expensive_baseline(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nSkip unchanged baseline for an expensive task.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=code_root,
-                task_file=task_file,
-                benchmark_command="python -m unittest discover -s tests",
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nSkip unchanged baseline for an expensive task.\n",
+                benchmark_command=TOY_BENCHMARK_COMMAND,
             )
 
             result = execute_code_task(
@@ -5163,16 +5010,9 @@ protected_patterns = ["pyproject.toml"]
 
     def test_execute_dry_run_has_no_side_effects(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nPreview orchestration.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=code_root,
-                task_file=task_file,
-                benchmark_command="python -m unittest discover -s tests",
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nPreview orchestration.\n",
+                benchmark_command=TOY_BENCHMARK_COMMAND,
             )
 
             result = execute_code_task(run_dir, dry_run=True, use_llm=False)
@@ -5246,16 +5086,9 @@ protected_patterns = ["pyproject.toml"]
 
     def test_execute_interactive_skips_completed_steps_without_prompting(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nResume already completed execute steps.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=code_root,
-                task_file=task_file,
-                benchmark_command="python -m unittest discover -s tests",
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nResume already completed execute steps.\n",
+                benchmark_command=TOY_BENCHMARK_COMMAND,
             )
             result = execute_code_task(run_dir, to_step="baseline", use_llm=False, timeout_sec=10)
             self.assertEqual(result.stop_reason, "stop_point")
@@ -5279,16 +5112,9 @@ protected_patterns = ["pyproject.toml"]
 
     def test_execute_inline_review_can_approve_plan_and_continue(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nApprove plan inline and continue.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=code_root,
-                task_file=task_file,
-                benchmark_command="python -m unittest discover -s tests",
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nApprove plan inline and continue.\n",
+                benchmark_command=TOY_BENCHMARK_COMMAND,
             )
 
             stdout = io.StringIO()
@@ -5317,16 +5143,9 @@ protected_patterns = ["pyproject.toml"]
 
     def test_execute_applies_reviewed_proposal_after_approval(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nAdd another spam keyword.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=code_root,
-                task_file=task_file,
-                benchmark_command="python -m unittest discover -s tests",
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nAdd another spam keyword.\n",
+                benchmark_command=TOY_BENCHMARK_COMMAND,
             )
             execute_code_task(run_dir, use_llm=False, timeout_sec=10, to_step='batch')
             first = execute_code_task(run_dir, use_llm=False, timeout_sec=10)
@@ -5395,16 +5214,9 @@ protected_patterns = ["pyproject.toml"]
 
     def test_execute_generates_repair_proposal_after_failed_run(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nBreak then repair the spam classifier.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=code_root,
-                task_file=task_file,
-                benchmark_command="python -m unittest discover -s tests",
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nBreak then repair the spam classifier.\n",
+                benchmark_command=TOY_BENCHMARK_COMMAND,
             )
             execute_code_task(run_dir, use_llm=False, timeout_sec=10, to_step='batch')
             first = execute_code_task(run_dir, use_llm=False, timeout_sec=10)
@@ -5448,16 +5260,9 @@ protected_patterns = ["pyproject.toml"]
 
     def test_execute_reports_patch_apply_failure_without_traceback(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nHandle an invalid proposal.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=code_root,
-                task_file=task_file,
-                benchmark_command="python -m unittest discover -s tests",
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nHandle an invalid proposal.\n",
+                benchmark_command=TOY_BENCHMARK_COMMAND,
             )
             execute_code_task(run_dir, use_llm=False, timeout_sec=10)
             record_plan_decision(run_dir, decision="approve")
@@ -5519,16 +5324,9 @@ protected_patterns = ["pyproject.toml"]
             findings = read_jsonl(run_dir / "code_task/memory/review_findings.jsonl")
             self.assertTrue(any(row.get("key") == "edit-proposal-budget-rejected" for row in findings))
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nImprove the spam classifier.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=code_root,
-                task_file=task_file,
-                benchmark_command="python -m unittest discover -s tests",
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nImprove the spam classifier.\n",
+                benchmark_command=TOY_BENCHMARK_COMMAND,
             )
             execute_code_task(run_dir, use_llm=False, timeout_sec=10)
             record_plan_decision(run_dir, decision="approve")
@@ -5593,16 +5391,9 @@ protected_patterns = ["pyproject.toml"]
 
     def test_analyze_validation_failure_without_benchmark_run(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nRepair a syntax error before running tests.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=code_root,
-                task_file=task_file,
-                benchmark_command="python -m unittest discover -s tests",
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nRepair a syntax error before running tests.\n",
+                benchmark_command=TOY_BENCHMARK_COMMAND,
             )
             write_text(run_dir / "code_task" / "workspace" / "spam_model.py", "def broken(:\n")
             validation = validate_code_task(run_dir)
@@ -5637,8 +5428,7 @@ protected_patterns = ["pyproject.toml"]
                 task_file=task_file,
                 benchmark_command="python -m unittest discover -s tests",
             )
-            generate_patch_plan(run_dir, use_llm=False)
-            record_plan_decision(run_dir, decision="approve")
+            _approve_offline_patch_plan(run_dir)
             apply_patch_edits(run_dir, edits_file=_write_failing_edit_proposal(run_dir))
             failed = run_code_task_benchmark(run_dir, timeout_sec=10)
             self.assertEqual(failed.status, "failed")
@@ -5671,19 +5461,11 @@ protected_patterns = ["pyproject.toml"]
 
     def test_repair_proposal_drops_diff_marker_edits(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nRepair the broken spam classifier.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=code_root,
-                task_file=task_file,
-                benchmark_command="python -m unittest discover -s tests",
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nRepair the broken spam classifier.\n",
+                benchmark_command=TOY_BENCHMARK_COMMAND,
             )
-            generate_patch_plan(run_dir, use_llm=False)
-            record_plan_decision(run_dir, decision="approve")
+            _approve_offline_patch_plan(run_dir)
             apply_patch_edits(run_dir, edits_file=_write_failing_edit_proposal(run_dir))
             failed = run_code_task_benchmark(run_dir, timeout_sec=10)
             self.assertEqual(failed.status, "failed")
@@ -5771,6 +5553,25 @@ def _temporary_root():
     TEST_ROOT.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(dir=TEST_ROOT) as tmp:
         yield Path(tmp)
+
+
+def _initialize_toy_task(root: Path, task_text: str, **options) -> tuple[Path, Path, Path]:
+    """Create the shared project without supplying implicit task authorization."""
+    code_root = root / "toy_project"
+    task_file = root / "task.md"
+    _write_toy_project(code_root)
+    write_text(task_file, task_text)
+    run_dir = root / "runs" / "code-task-run"
+    initialize_code_task(
+        run_dir=run_dir, code_root=code_root, task_file=task_file, **options,
+    )
+    return code_root, task_file, run_dir
+
+
+def _approve_offline_patch_plan(run_dir: Path) -> None:
+    """Prepare an approved plan only in scenarios that already grant approval."""
+    generate_patch_plan(run_dir, use_llm=False)
+    record_plan_decision(run_dir, decision="approve")
 
 
 def _write_toy_project(code_root: Path) -> None:
@@ -5984,15 +5785,8 @@ def _write_valid_edit_proposal(run_dir: Path, path: Path | None = None) -> Path:
             "edits": [
                 {
                     "path": "spam_model.py",
-                    "old": (
-                        "def predict(text):\n"
-                        "    return 'spam' if 'win' in text.lower() else 'ham'\n"
-                    ),
-                    "new": (
-                        "def predict(text):\n"
-                        "    lowered = text.lower()\n"
-                        "    return 'spam' if any(keyword in lowered for keyword in ('win', 'prize')) else 'ham'\n"
-                    ),
+                    "old": TOY_PREDICT_SOURCE,
+                    "new": TOY_PREDICT_WITH_PRIZE,
                     "reason": "Extend the keyword baseline while preserving the public API.",
                 }
             ],
@@ -6010,10 +5804,7 @@ def _write_failing_edit_proposal(run_dir: Path) -> Path:
             "edits": [
                 {
                     "path": "spam_model.py",
-                    "old": (
-                        "def predict(text):\n"
-                        "    return 'spam' if 'win' in text.lower() else 'ham'\n"
-                    ),
+                    "old": TOY_PREDICT_SOURCE,
                     "new": (
                         "def predict(text):\n"
                         "    return 'ham'\n"
@@ -6103,15 +5894,8 @@ class _FakeCodeTaskClient:
                 "edits": [
                     {
                         "path": "spam_model.py",
-                        "old": (
-                            "def predict(text):\n"
-                            "    return 'spam' if 'win' in text.lower() else 'ham'\n"
-                        ),
-                        "new": (
-                            "def predict(text):\n"
-                            "    lowered = text.lower()\n"
-                            "    return 'spam' if any(keyword in lowered for keyword in ('win', 'prize')) else 'ham'\n"
-                        ),
+                        "old": TOY_PREDICT_SOURCE,
+                        "new": TOY_PREDICT_WITH_PRIZE,
                         "reason": "Classify prize messages as spam.",
                     }
                 ],
@@ -6122,12 +5906,13 @@ class _FakeCodeTaskClient:
 
 
 class _FailingCodeTaskClient:
-    def __init__(self) -> None:
+    def __init__(self, error: LLMError | None = None) -> None:
         self.calls = 0
+        self.error = error or LLMError("LLM response did not contain a JSON object")
 
     def ask_json(self, system: str, user: str, *, label: str = "") -> dict[str, object]:
         self.calls += 1
-        raise LLMError("LLM response did not contain a JSON object")
+        raise self.error
 
 
 def _indexed_file(index: dict[str, object], path: str) -> dict[str, object]:

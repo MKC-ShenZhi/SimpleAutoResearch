@@ -9,7 +9,7 @@ import threading
 import unittest
 from pathlib import Path
 
-from simple_ar.core.process import ProcessSpec, run_process
+from simple_ar.core.process import ProcessSpec, process_observation, run_process
 from simple_ar.core.process import settle_process_record
 from simple_ar.core.budget import BudgetLedger, BudgetExceededError, BudgetConflictError
 from simple_ar.experiment.execution.backend import LocalExecutionBackend, RunRequest
@@ -70,6 +70,10 @@ class ProcessControlTests(unittest.TestCase):
                                output_dir=root / "timeout")
             result = run_process(spec, budget_ledger=ledger)
             self.assertEqual(result.stop_reason, "timeout")
+            restored = process_observation(result.record, root / "timeout")
+            self.assertEqual(restored["stop_reason"], "timeout")
+            self.assertEqual(restored["returncode"], result.returncode)
+            self.assertEqual(restored["stdout"], result.stdout)
             self.assertEqual(ledger.remaining("process_invocations"), 0)
             with self.assertRaises(BudgetConflictError):
                 run_process(spec, budget_ledger=ledger)
@@ -77,17 +81,34 @@ class ProcessControlTests(unittest.TestCase):
     def test_large_output_is_drained_with_bounded_logs_and_metric_tail(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            result = run_process(ProcessSpec(
-                [sys.executable, "-u", "-c", "import os; os.write(1, b'x'*300000); os.write(1, '\\n准确率: 0.75\\n'.encode()); os.write(2, b'warning\\n'); raise SystemExit(3)"],
-                root, 5, output_dir=root / "process", log_bytes=4096, tail_bytes=128,
-            ))
-            self.assertEqual(result.returncode, 3)
-            self.assertIn("准确率: 0.75", result.stdout)
-            self.assertLessEqual(len(result.stdout.encode()), 128)
-            self.assertEqual((root / "process/stdout.log").stat().st_size, 4096)
-            self.assertGreater(result.record["streams"]["stdout"]["tail_bytes_discarded"], 290000)
-            stored = json.loads((root / "process/invocation.json").read_text(encoding="utf-8"))
-            self.assertEqual(stored["returncode"], 3)
+            raw_streams = {"stdout": ("界" * 100000 + "\r\n准确率: 0.75\r\n").encode(),
+                           "stderr": b"y" * 300000 + b"\xffwarning\r\n"}
+            code = ("import os; os.write(1, ('界'*100000+'\\r\\n准确率: 0.75\\r\\n').encode()); "
+                    "os.write(2, b'y'*300000+b'\\xffwarning\\r\\n'); raise SystemExit(3)")
+            for log_bytes in (4096, 0):
+                with self.subTest(log_bytes=log_bytes):
+                    output = root / str(log_bytes)
+                    result = run_process(ProcessSpec([sys.executable, "-u", "-c", code],
+                        root, 5, output_dir=output, log_bytes=log_bytes, tail_bytes=128))
+                    stored = json.loads((output / "invocation.json").read_text(encoding="utf-8"))
+                    recovered = process_observation(stored, output)
+                    self.assertEqual(result.returncode, 3)
+                    self.assertEqual(recovered["returncode"], 3)
+                    self.assertIsNone(recovered["stop_reason"])
+                    self.assertIn("准确率: 0.75", recovered["stdout"])
+                    self.assertEqual(recovered["streams"], result.record["streams"])
+                    for name, raw in raw_streams.items():
+                        expected = raw[-128:].decode("utf-8", errors="replace").replace("\r\n", "\n")
+                        self.assertEqual(getattr(result, name), expected)
+                        self.assertEqual(recovered[name], expected)
+                        self.assertEqual(stored["output"][name], expected)
+                        self.assertEqual((output / f"{name}.log").read_bytes(), raw[:log_bytes])
+                        metadata = recovered["streams"][name]
+                        self.assertEqual(metadata["bytes_seen"], len(raw))
+                        self.assertEqual(metadata["tail_bytes_discarded"], len(raw) - 128)
+                        self.assertEqual(metadata["observation_bytes_discarded"], len(raw) - 128)
+                        self.assertEqual(metadata["log_bytes_discarded"], len(raw) - log_bytes)
+                        self.assertTrue(metadata["final_tail_available"])
 
     def test_timeout_preserves_output_and_records_reason(self):
         with tempfile.TemporaryDirectory() as tmp:

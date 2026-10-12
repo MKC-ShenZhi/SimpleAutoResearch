@@ -161,7 +161,7 @@ def inspect_project_preparation(
         relative = str(row["path"])
         path = root / relative
         is_dependency = path.name in DEPENDENCY_FILE_NAMES
-        is_readme = path.name.lower().startswith("readme") and path.suffix.lower() in {".md", ".txt", ""}
+        is_readme = path.name.lower().startswith("readme") and path.suffix.lower() in {".md", ".markdown", ".rst", ".txt", ""}
         if not (is_dependency or is_readme):
             continue
         # Top-level declarations first; nested examples often describe a
@@ -403,7 +403,7 @@ def run_preparation_capability(*, context: CapabilityContext, request: Preparati
     config = dict(request.execution)
     task = dict(config["code_task"])
     if set(task) - {
-        "code_root", "approval_note", "max_repairs", "allowed_patterns",
+        "kind", "code_root", "approval_note", "max_repairs", "allowed_patterns",
         "budget_profile", "allow_large_edits", "edit_budget_overrides", "workspace_mode", "protected_patterns",
         "env_mode", "python_executable",
         "validation_command", "validation_timeout_sec", "initial_files",
@@ -419,14 +419,20 @@ def run_preparation_capability(*, context: CapabilityContext, request: Preparati
         code_task_validation(config, required=True)
     protected = task.pop("protected_patterns", ())
     workspace_mode = task.pop("workspace_mode", "auto")
+    kind = task.pop("kind", "existing_project")
+    if kind not in {"existing_project", "greenfield"}:
+        raise ValueError("Code preparation kind must be existing_project or greenfield.")
     env_mode = task.get("env_mode", "current")
     python_executable = task.get("python_executable")
-    if workspace_mode not in {"auto", "copy", "git_worktree"}:
+    if workspace_mode not in {"auto", "copy", "git_worktree"} and not (kind == "greenfield" and workspace_mode == "empty"):
         raise ValueError("Research project preparation supports auto, copy or git_worktree; sparse/empty workspaces require standalone CodeTask.")
     for name, patterns in (("allowed_patterns", () if allowed is None else allowed), ("protected_patterns", protected)):
         if not isinstance(patterns, (list, tuple)) or any(not isinstance(p, str) or not p.strip() for p in patterns):
             raise ValueError(f"{name} must be a list of workspace-relative patterns; empty uses CodeTask defaults.")
-    root = Path(task["code_root"])
+    source_root = Path(task["code_root"]) if task.get("code_root") else None
+    if source_root is None and (kind != "greenfield" or workspace_mode != "empty"):
+        raise ValueError("Only greenfield with an empty workspace may omit code_root.")
+    root = source_root or request.run.cwd
     if not root.is_absolute() or not root.is_dir():
         raise ValueError("code_task.code_root must be an existing absolute project directory.")
     lineage_root = Path(request.source_project) if request.source_project is not None else root
@@ -452,7 +458,7 @@ def run_preparation_capability(*, context: CapabilityContext, request: Preparati
     argv = task["validation_command"] if "environment" in config else request.run.command
     command = subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
     initialized = initialize_code_task(
-        run_dir=context.store.root / (request.run_dir or Path("project_run")), code_root=root,
+        run_dir=context.store.root / (request.run_dir or Path("project_run")), code_root=source_root, kind=kind,
         task_file=context.store.resolve(task_ref), benchmark_command=command,
         workspace_mode=workspace_mode,
         env_mode=env_mode, python_executable=python_executable,
@@ -472,7 +478,7 @@ def run_preparation_capability(*, context: CapabilityContext, request: Preparati
     config["code_task"] = task
     payload = {
         "schema_version": "prepared_execution.v1", "execution": config,
-        "source_project": str(lineage_root.resolve()), "workspace": str(initialized.workspace_dir),
+        "source_project": str(lineage_root.resolve()) if source_root is not None else None, "workspace": str(initialized.workspace_dir),
         "copy_report": initialized.copy_report.to_json(),
         "workspace_info": initialized.workspace.to_manifest(run_dir=initialized.run_dir),
         "limitations": ["No dependency installation or dataset download; external datasets remain external assets.",

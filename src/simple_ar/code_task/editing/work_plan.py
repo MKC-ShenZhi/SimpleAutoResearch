@@ -30,7 +30,8 @@ from simple_ar.code_task.runtime.state import (
 )
 from simple_ar.code_task.memory import task_memory_context
 from simple_ar.code_task.analysis.interfaces import render_source_snippets, snippet_api_contract
-from simple_ar.integrations.llm import LLMClient, LLMError
+from simple_ar.integrations.llm import LLMClient, LLMResponseError
+from simple_ar.code_task.generation.agent_step import response_accounting_known, retry_suffix
 from simple_ar.integrations.usage import record_usage
 
 
@@ -94,11 +95,11 @@ def generate_code_task_work_plan(
         run_dir: Code-task run directory created by ``code-task init``.
         model: Optional OpenAI-compatible model override.
         use_llm: Whether to call the configured LLM provider.
-        allow_llm_fallback: When true, use the deterministic work plan after
-            all LLM attempts fail. When false, raise ``LLMError`` so callers can
-            stop and retry later without writing an offline plan.
-        llm_retry_attempts: Number of LLM planning attempts before failing or
-            falling back.
+        allow_llm_fallback: Permit a deterministic plan after completed format
+            failures with reconciled accounting. Provider, budget, stream and
+            deadline failures propagate without fallback.
+        llm_retry_attempts: Total attempts for completed JSON format correction.
+            Provider retries and accounting belong to LLMClient.
         force: Overwrite existing ``work_plan.json`` and ``work_plan.md``.
         max_files: Maximum number of source/evidence files included in the
             planning prompt.
@@ -173,21 +174,16 @@ def generate_code_task_work_plan(
     mode = "offline"
     plan_data: dict[str, Any] | None = None
     if use_llm:
-        last_error: LLMError | None = None
+        client = LLMClient.for_task(
+            client=llm_client, model=model,
+            usage_callback=lambda usage: record_usage(paths.meta_dir, usage,
+                stage="code_task.work_plan", message_callback=message_callback),
+        )
+        last_error: LLMResponseError | None = None
         for attempt in range(1, llm_retry_attempts + 1):
             try:
                 suffix = f" (attempt {attempt}/{llm_retry_attempts})" if llm_retry_attempts > 1 else ""
                 _emit(message_callback, f"Calling LLM for code-task work planning{suffix}.")
-                client = LLMClient.for_task(
-                    client=llm_client,
-                    model=model,
-                    usage_callback=lambda usage: record_usage(
-                        paths.meta_dir,
-                        usage,
-                        stage="code_task.work_plan",
-                        message_callback=message_callback,
-                    ),
-                )
                 plan_data = _ask_llm_for_work_plan(
                     client,
                     task_text=task_text,
@@ -198,17 +194,22 @@ def generate_code_task_work_plan(
                     memory_context=memory_context,
                     allowed_patterns=allowed_patterns,
                     protected_patterns=protected_patterns,
+                    retry_feedback=retry_suffix(last_error, attempt),
                 )
                 mode = "llm"
                 break
-            except LLMError as exc:
+            except LLMResponseError as exc:
+                write_json(paths.meta_dir / "planning_steps" / f"work-plan-response-{attempt:03d}.json",
+                    {"error": str(exc), "raw_response": exc.raw_response})
+                if not response_accounting_known(client):
+                    raise
                 last_error = exc
                 _emit(message_callback, f"LLM work planning attempt {attempt} failed: {exc}")
         if plan_data is None and last_error is not None:
             if allow_llm_fallback:
                 _emit(message_callback, f"Using offline fallback after LLM work planning failed. {last_error}")
             else:
-                raise LLMError(f"LLM work planning failed after {llm_retry_attempts} attempt(s): {last_error}") from last_error
+                raise last_error
 
     if plan_data is None:
         plan_data = _offline_work_plan(
@@ -310,6 +311,7 @@ def _ask_llm_for_work_plan(
     memory_context: str,
     allowed_patterns: tuple[str, ...],
     protected_patterns: tuple[str, ...],
+    retry_feedback: str = "",
 ) -> dict[str, Any]:
     prompt = _work_plan_user_prompt(
         task_text=task_text,
@@ -321,7 +323,7 @@ def _ask_llm_for_work_plan(
         allowed_patterns=allowed_patterns,
         protected_patterns=protected_patterns,
     )
-    response = client.ask_json(CODE_TASK_WORK_PLAN_SYSTEM, prompt, label="code-task-work-plan")
+    response = client.ask_json(CODE_TASK_WORK_PLAN_SYSTEM, prompt + retry_feedback, label="code-task-work-plan")
     return response if isinstance(response, dict) else {}
 
 

@@ -108,6 +108,7 @@ class VerticalCapabilityFlowTests(unittest.TestCase):
                 attempt_id="attempt-005",
                 request=ReportAssemblyRequest(
                     title="Reliable agents",
+                    papers=({"id": "paper-1", "title": "Reliable agents", "authors": ["Fixture Author"]},),
                     sections=(
                         ReportSectionDraft(
                             section_id="findings",
@@ -119,13 +120,16 @@ class VerticalCapabilityFlowTests(unittest.TestCase):
             )
             self.assertEqual(result.status, "completed")
             report_ref = controller.attempt_output_refs("attempt-005")[0]
+            body_ref = controller.attempt_output_ref("attempt-005", kind="report_body", schema="report_body.v1")
+            self.assertIn("[@paper-1]", controller.store.read_text(body_ref))
 
             result = controller.execute_attempt(
                 "report_audit",
                 attempt_id="attempt-006",
-                inputs=(report_ref,),
+                inputs=(report_ref, body_ref),
                 request=ReportAuditCapabilityRequest(
                     report_ref=report_ref,
+                    report_body_ref=body_ref,
                     context=ReportContext(
                         topic="reliable agents",
                         report_mode="research_only",
@@ -300,6 +304,7 @@ class VerticalCapabilityFlowTests(unittest.TestCase):
                 inputs=(analysis_ref,),
                 request=ReportAssemblyRequest(
                     title="Reliable agents",
+                    papers=tuple(paper.to_row() for paper in search_result.papers),
                     sections=(
                         ReportSectionDraft(
                             section_id="findings",
@@ -314,6 +319,8 @@ class VerticalCapabilityFlowTests(unittest.TestCase):
             )
             self.assertEqual(result.status, "completed")
             report_ref = controller.attempt_output_refs("report-001")[0]
+            body_ref = controller.attempt_output_ref("report-001", kind="report_body", schema="report_body.v1")
+            self.assertIn("[@paper-1]", controller.store.read_text(body_ref))
             self.assertIn(
                 f"{metric['name']} {metric['value']}",
                 controller.store.read_text(report_ref),
@@ -322,9 +329,10 @@ class VerticalCapabilityFlowTests(unittest.TestCase):
             result = controller.execute_attempt(
                 "report_audit",
                 attempt_id="audit-001",
-                inputs=(report_ref,),
+                inputs=(report_ref, body_ref),
                 request=ReportAuditCapabilityRequest(
                     report_ref=report_ref,
+                    report_body_ref=body_ref,
                     context=ReportContext(
                         topic="reliable agents",
                         report_mode="research_only",

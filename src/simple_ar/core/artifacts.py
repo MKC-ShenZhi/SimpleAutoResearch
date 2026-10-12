@@ -8,6 +8,30 @@ import time
 from typing import Any, Iterable
 
 
+def replace_exact_spans(text: str, replacements: Iterable[tuple[str, str]]) -> str:
+    """Apply unique, non-overlapping replacements against one original text."""
+    spans = []
+    for number, (old, new) in enumerate(replacements, 1):
+        if not old:
+            raise ValueError('Replacement text must not be empty')
+        start = text.find(old)
+        second = text.find(old, start + 1) if start >= 0 else -1
+        if start < 0 or second >= 0:
+            locations = [text.count('\n', 0, offset) + 1
+                         for offset in (start, second) if offset >= 0]
+            raise ValueError(f'Replacement {number} must match exactly once; '
+                f'first matching lines: {locations}. Include unique context; no edits were written.')
+        spans.append((start, start + len(old), new))
+    if not spans:
+        raise ValueError('Supply at least one replacement')
+    spans.sort()
+    if any(left[1] > right[0] for left, right in zip(spans, spans[1:])):
+        raise ValueError('Edit spans overlap; use one replacement for their combined context')
+    for start, end, replacement in reversed(spans):
+        text = text[:start] + replacement + text[end:]
+    return text
+
+
 def write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")

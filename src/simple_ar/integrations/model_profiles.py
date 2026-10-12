@@ -23,7 +23,7 @@ def model_connections_compatible(saved: dict, current: dict) -> bool:
     never the identity of the model used for the saved scientific task.
     """
     operational = {"request_timeout_sec", "max_output_tokens", "retry_attempts",
-                   "retry_base_delay_sec", "retry_max_delay_sec"}
+                   "retry_base_delay_sec", "retry_max_delay_sec", "context_input_tokens"}
 
     def identity(value):
         if isinstance(value, dict):
@@ -46,6 +46,7 @@ class ModelProfile(BaseModel):
     http2: bool = False
     request_timeout_sec: float = Field(default=180.0, gt=0)
     max_output_tokens: int | None = Field(default=None, gt=0)
+    context_input_tokens: int = Field(default=24000, gt=0)
     retry_attempts: int = Field(default=3, ge=1)
     retry_base_delay_sec: float = Field(default=1.0, gt=0)
     retry_max_delay_sec: float = Field(default=12.0, gt=0)
@@ -82,13 +83,16 @@ class ModelProfile(BaseModel):
 
     @model_validator(mode="after")
     def compatible(self) -> "ModelProfile":
+        if (self.api == "openai_chat" and self.thinking_mode == "disabled"
+                and self.reasoning_effort not in {"", "none"}):
+            raise ValueError("thinking_mode='disabled' requires reasoning_effort='' or 'none'")
         caps = set(self.capabilities)
         if not caps:
             raise ValueError("Declare at least one capability")
         if self.api in {"openai_images", "cctq_images_async"}:
             if caps - {"image_generate", "image_edit"}:
                 raise ValueError("Images profiles only declare image capabilities")
-            text_options = {"stream", "max_output_tokens", "reasoning_effort", "json_response_format",
+            text_options = {"stream", "max_output_tokens", "context_input_tokens", "reasoning_effort", "json_response_format",
                             "chat_token_limit_param", "thinking_mode", "reasoning_output_tokens",
                             "input_price_per_million", "output_price_per_million"}
             if self.model_fields_set & text_options:
@@ -152,8 +156,8 @@ class ModelCatalog(BaseModel):
     def references(self) -> "ModelCatalog":
         if not self.profiles or any(not name.strip() or ":" in name for name in self.profiles):
             raise ValueError("Profiles need nonempty names without ':'")
-        if set(self.routes) - {"default", "text", "code", "vision", "image"}:
-            raise ValueError("Unknown route; use default, text, code, vision or image")
+        if set(self.routes) - {"default", "text", "code", "writing", "vision", "image"}:
+            raise ValueError("Unknown route; use default, text, code, writing, vision or image")
         if set(self.routes.values()) - set(self.profiles):
             raise ValueError("Route refers to an unknown profile")
         return self
@@ -163,13 +167,13 @@ class ModelCatalog(BaseModel):
             name = selector.removeprefix("profile:")
         else:
             route = selector.removeprefix("route:") if selector and selector.startswith("route:") else purpose
-            if route not in {"default", "text", "code", "vision", "image"}:
+            if route not in {"default", "text", "code", "writing", "vision", "image"}:
                 raise ModelConfigError("Unknown model route")
             name = self.routes.get(route) or self.routes.get("default", "")
         if name not in self.profiles:
             raise ModelConfigError("Model profile/route is missing; configure it explicitly")
         profile = self.profiles[name]
-        required = "image_generate" if purpose == "image" else purpose
+        required = {"image": "image_generate", "writing": "text"}.get(purpose, purpose)
         if required not in profile.capabilities:
             raise ModelConfigError(f"Profile {name!r} does not declare capability {required!r}")
         if selector and not selector.startswith(("profile:", "route:")) and selector != profile.model:

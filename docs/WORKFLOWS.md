@@ -11,6 +11,24 @@ duplicating the full artifact manual; for concrete commands and file trees, see
 
 ## Task-Driven Execution And Recovery
 
+Ordinary `start` passes goals, read-only materials and constraints to
+`ToolApplication`. One action loop combines source investigation, code/execution,
+analysis, writing, visual/image work and publication through `CommonToolGateway`,
+reusing domain modules, `SessionController`, artifacts and the budget ledger.
+Creation preferences express outcomes, not mandatory internal pipelines or access
+grants. Network, vision, process proposals and resources have explicit boundaries;
+process commands still need exact approval. Workspace isolation is not an OS sandbox.
+
+Exact table, fixed code scope/validation and reproduction protocols retain the
+TOML/`research-session` path through `ResearchApplication`. These serve public new
+tasks as well as history. Native tasks accept feedback and recover through
+`start --resume-task`; structured sessions keep their own recovery entrypoints.
+Recovery does not rebuild old tasks with new defaults, accept partial responses
+as delivery or replay completed side effects. The accepted-plan, segmented Writer
+and capability flows below describe their structured consumers and saved tasks.
+Module reuse does not establish acceptance of every combination, graphical feedback,
+scientific capability or delivery reliability.
+
 New default research plans generate a standalone summary only when requested
 (or when summary is the default deliverable). With local sources and explicit
 materials-only scope, a report-only survey/research task can ingest and write
@@ -82,7 +100,7 @@ behavior checks; static `passed` is not runtime success.
 
 ### Optional natural-language task setup
 
-`start --chat` precedes the ordinary configuration/session path. A small setup draft
+`start --chat` precedes the explicit structured configuration/session path. A small setup draft
 retains original user replies, proposed settings, asset approvals and the existing
 budget ledger for this conversation. Named asset previews are bounded and explicitly
 mark unread/truncated content. Models select semantic settings, not execution powers.
@@ -340,8 +358,8 @@ Persisted extraction is reused, including after a writer failure; editing an ori
 file does not silently replace the saved evidence. This is task-scoped input reuse,
 not a general cross-session memory service.
 
-`start` saves regular task inputs and delegates to `research-session`; it is
-not another planner or lifecycle. Preparation alone makes no model/process calls.
+For explicit structured protocols, `start` saves task inputs and delegates to
+`research-session`; this adapter is not another planner or lifecycle. Preparation alone makes no model/process calls.
 Reading-to-synthesis preserves limitations, open questions, confidence and refs,
 labels omitted card rows, and does not silently truncate user execution constraints.
 This does not certify semantic understanding.
@@ -691,7 +709,7 @@ independent of the heading's language. Otherwise it remains in the comparison
 appendix. Lines connect recorded pairs, not confidence intervals; rendering is
 not scientific validation.
 
-The formal research entrypoint is `research-session`. It owns attempts, artifacts,
+For structured research, the entrypoint is `research-session`. It owns attempts, artifacts,
 reports and audits in one session, while `ResearchApplication` selects only the
 capabilities justified by the task, supplied assets and accepted execution
 constraints. There is no user-facing fixed stage sequence.
@@ -713,7 +731,9 @@ replay completed side effects or let the core invent a domain-specific stage.
 Public entrypoints remain intentionally small:
 
 ```text
-simple-ar research-session       # canonical task-driven entry and recovery
+simple-ar start                  # ordinary native goal-driven tasks
+simple-ar start --resume-task PATH # native feedback and recovery
+simple-ar research-session       # exact structured protocols and saved-session recovery
 simple-ar research-brief         # compatibility request/result adapter
 simple-ar status RUN_DIR         # read-only archive display
 ```
@@ -772,7 +792,7 @@ does not merge artifacts or schedule work.
 
 Historical research-session readers expose the stored `next_capability` and
 execution evidence. They do not recompute a next-step recommendation with a
-retired policy; new research decisions belong to ResearchApplication.
+retired policy; structured research decisions belong to ResearchApplication.
 
 For a library caller that wants one in-memory value, use
 `research.brief.build_research_brief()` is an in-memory compatibility view only.
@@ -828,7 +848,7 @@ do not silently become a model-generated result.
 The segmented `research-experiment` creator is retired. Experiment and analysis
 capabilities remain shared by the formal application, without a separate session lifecycle.
 
-For a single session that owns both sides of this handoff, use
+For a structured session that owns both sides of this handoff, use
 `simple-ar research-session`. It reuses the same explicit
 `plan -> search -> document_ingest -> read -> synthesize` prefix, records a
 `research_design.v1` handoff, and continues with one explicit `ExperimentRequest`
@@ -1022,7 +1042,7 @@ reference to the separate audit capability.
 ### 1. Research Report (Literature-First, Segmented/Advanced)
 
 Use this when you want a literature review, survey, or DeepResearch-like report without emphasizing experiments.
-For an ordinary complete research task, use `research-session`; this section describes a reusable
+For an ordinary complete research task, use `start`; this section describes a reusable
 capability boundary.
 
 Conceptual flow:
@@ -1031,8 +1051,8 @@ Conceptual flow:
 plan -> search -> read -> synthesize -> report
 ```
 
-Without an execution command or CodeTask configuration, `research-session`
-uses the literature-only path and does not start an experiment. Reports belong
+In the literature-first structured path, without an execution command or CodeTask
+configuration, `research-session` uses the literature-only path and does not start an experiment. Reports belong
 to the same lifecycle; `--no-report` explicitly omits that delivery.
 
 ### 2. Code Task (Existing Codebase)

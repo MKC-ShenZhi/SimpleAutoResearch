@@ -15,7 +15,7 @@ def build_parser(
     models = subparsers.add_parser("models", help="Inspect named model connections locally; no API calls.")
     models.add_argument("--config", type=Path, help="Model catalog TOML; otherwise SIMPLE_AR_MODELS_CONFIG or user config.")
     models.add_argument("--profile", help="Inspect one profile name, without exposing its credential.")
-    models.add_argument("--purpose", choices=("text", "code", "vision", "image"), default="text")
+    models.add_argument("--purpose", choices=("text", "code", "writing", "vision", "image"), default="text")
 
     from simple_ar.cli.start import add_start_parser
     add_start_parser(subparsers)
@@ -125,7 +125,7 @@ def build_parser(
         "--task-kind", choices=("auto", "survey", "bug_fix", "measurement", "reproduction", "writing", "data_analysis"), default="auto",
         help="Task-driven path: survey reads evidence; bug_fix patches a project; measurement analyzes a command; reproduction reads supplied papers then checks a fixed explicit protocol without innovation.",
     )
-    session_parser.add_argument("--outputs", nargs="+", choices=("summary", "report", "experiments", "bug_fix", "data_analysis"))
+    session_parser.add_argument("--outputs", nargs="+", choices=("summary", "report", "experiments", "bug_fix", "code_task", "data_analysis"))
     from simple_ar.cli.start import add_data_options
     add_data_options(session_parser)
     session_parser.add_argument("--material", action="append", default=[],
@@ -435,7 +435,7 @@ def build_parser(
         "--kind",
         choices=("existing_project", "greenfield"),
         default=None,
-        help="Code-task mode. Use greenfield for from-scratch project generation.",
+        help="Explicit structured compatibility: existing_project or greenfield with its saved scope/benchmark/planning contract. For goal-driven creation use start GOAL.",
     )
     code_task_init.add_argument("--task-file", default=None)
     code_task_init.add_argument("--output-root", default=None)
@@ -579,13 +579,13 @@ def build_parser(
     code_task_work_plan.add_argument(
         "--allow-planning-fallback",
         action="store_true",
-        help="Allow deterministic fallback if LLM work planning fails.",
+        help="Allow offline fallback after a known complete work-plan format failure, not transport failure.",
     )
     code_task_work_plan.add_argument(
         "--llm-retry-attempts",
         type=int,
         default=1,
-        help="LLM work planning attempts before failing or falling back.",
+        help="Completed-response work-plan corrections, including the first attempt; transport retries use the model connection.",
     )
     code_task_work_plan.add_argument("--max-files", type=int, default=8)
     code_task_work_plan.add_argument("--max-source-chars-per-file", type=int, default=2500)
@@ -622,13 +622,13 @@ def build_parser(
     code_task_plan.add_argument(
         "--allow-planning-fallback",
         action="store_true",
-        help="Allow deterministic fallback if LLM patch planning fails.",
+        help="Allow offline fallback after a known complete patch-plan format failure, not transport failure.",
     )
     code_task_plan.add_argument(
         "--llm-retry-attempts",
         type=int,
         default=1,
-        help="LLM patch planning attempts before failing or falling back.",
+        help="Completed-response patch-plan corrections, including the first attempt; transport retries use the model connection.",
     )
     code_task_plan.add_argument("--max-files", type=int, default=8)
     code_task_plan.add_argument("--max-source-chars-per-file", type=int, default=2500)
@@ -805,7 +805,7 @@ def build_parser(
         "--llm-retry-attempts",
         type=int,
         default=None,
-        help="Stage-level LLM attempts for planning, greenfield architecture/file generation, and patch repair.",
+        help="Completed-response corrections for planning and greenfield generation; transport retries use the model connection.",
     )
     code_task_execute.add_argument(
         "--planning-review-rounds",

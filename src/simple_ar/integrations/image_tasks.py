@@ -6,6 +6,7 @@ result directory is adopted. Image validation and final delivery belong to calle
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import mimetypes
@@ -40,6 +41,19 @@ def _numeric_usage(value: object, key: str) -> dict:
 def request_task_image(*, base_url: str, key: str, model: str, prompt: str,
                        source: Path | None, options: dict, timeout: float,
                        http2: bool, store: ArtifactStore, proxy: str | None = None) -> tuple[bytes, dict, str]:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(_request_task_image(base_url=base_url, key=key, model=model,
+            prompt=prompt, source=source, options=options, timeout=timeout,
+            http2=http2, store=store, proxy=proxy))
+    raise ImageTaskError("Synchronous image requests cannot run inside an asyncio loop; use asyncio.to_thread")
+
+
+async def _request_task_image(*, base_url: str, key: str, model: str, prompt: str,
+                              source: Path | None, options: dict, timeout: float,
+                              http2: bool, store: ArtifactStore,
+                              proxy: str | None = None) -> tuple[bytes, dict, str]:
     """One POST at most; retries after a saved ID issue GETs only.
 
     The timeout bounds this invocation, including submission, polling and download.
@@ -47,6 +61,7 @@ def request_task_image(*, base_url: str, key: str, model: str, prompt: str,
     Keys may rotate during recovery; the nonsecret request fingerprint must match.
     """
     levels = {}
+    client = deadline_scope = None
     try:
         base = base_url.rstrip("/")
         parsed = urlsplit(base)
@@ -105,17 +120,19 @@ def request_task_image(*, base_url: str, key: str, model: str, prompt: str,
         # Match the SDK transport: honor the caller's configured HTTP(S) proxy
         # and certificate environment, with normal TLS verification. This is
         # network routing, not an automatic provider/base-URL fallback.
-        with httpx.Client(http2=http2, follow_redirects=False, **({"proxy": proxy} if proxy else {}),
-                          headers={"Authorization": f"Bearer {key}"}) as client:
+        client = httpx.AsyncClient(http2=http2, follow_redirects=False,
+            **({"proxy": proxy} if proxy else {}), headers={"Authorization": f"Bearer {key}"})
+        deadline_scope = asyncio.timeout(timeout)
+        async with deadline_scope:
             if "id" not in state:
                 fields = {**options, "model": model, "prompt": prompt, "async": True}
                 if source is None:
-                    response = client.post(base + "/images/generations", json=fields,
+                    response = await client.post(base + "/images/generations", json=fields,
                                            timeout=remaining(timeout))
                 else:
                     with source.open("rb") as handle:
                         mime = mimetypes.guess_type(source.name)[0] or "application/octet-stream"
-                        response = client.post(base + "/images/edits",
+                        response = await client.post(base + "/images/edits",
                             data={k: "true" if v is True else str(v) for k, v in fields.items()},
                             files={"image": (source.name, handle, mime)}, timeout=remaining(timeout))
                 if response.status_code != 202:
@@ -128,7 +145,7 @@ def request_task_image(*, base_url: str, key: str, model: str, prompt: str,
             # Completion is already recorded by this provider; recovery only
             # needs the authenticated file, not another task-status request.
             while state.get("status") != "completed":
-                response = client.get(endpoint, timeout=remaining(timeout))
+                response = await client.get(endpoint, timeout=remaining(timeout))
                 if response.status_code != 200:
                     raise ImageTaskError("Image task query failed; resume saved ID, do not resubmit")
                 payload = response.json()
@@ -144,12 +161,12 @@ def request_task_image(*, base_url: str, key: str, model: str, prompt: str,
                     raise ImageTaskError("Provider image task failed; saved ID retained, no automatic new task")
                 if status == "completed":
                     break
-                time.sleep(min(5, remaining()))
+                await asyncio.sleep(min(5, remaining()))
             content = bytearray()
-            with client.stream("GET", endpoint + "/files/0", timeout=remaining(timeout)) as response:
+            async with client.stream("GET", endpoint + "/files/0", timeout=remaining(timeout)) as response:
                 if response.status_code != 200:
                     raise ImageTaskError("Image task download failed; resume saved ID with GET only")
-                for chunk in response.iter_bytes():
+                async for chunk in response.aiter_bytes():
                     remaining()
                     if len(content) + len(chunk) > 20 * 1024 * 1024:
                         raise ImageTaskError("Image task download exceeds 20 MiB; saved ID retained")
@@ -160,7 +177,15 @@ def request_task_image(*, base_url: str, key: str, model: str, prompt: str,
     except ImageTaskError:
         raise
     except Exception as error:
+        if isinstance(error, TimeoutError) and deadline_scope is not None and deadline_scope.expired():
+            raise ImageTaskError("Async image deadline exceeded; retain saved state, resume a saved ID with GET only") from None
         raise ImageTaskError(f"Async image transport or record failure ({type(error).__name__}); inspect saved state, never resend blindly") from None
     finally:
+        if client is not None:
+            try:
+                async with asyncio.timeout(2.0):
+                    await client.aclose()
+            except Exception:
+                pass  # Cleanup must not replace the request result or failure.
         for name, level in levels.items():
             logging.getLogger(name).setLevel(level)

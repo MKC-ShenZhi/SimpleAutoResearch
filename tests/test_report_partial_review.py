@@ -3,7 +3,7 @@ import copy
 import json
 import unittest
 
-from tests.report_review_fixtures import finding_check_objects
+from tests.report_review_fixtures import finding_check_objects, prompt_payload
 from simple_ar.integrations.llm import LLMError, LLMResponseError
 from simple_ar.report.agent import run_report_agent
 from simple_ar.report.editor import _validate_document_reviews, _validated_document_review_subset
@@ -11,14 +11,6 @@ from simple_ar.report.tool_gateway import ReportToolGateway
 
 
 class PartialReviewTests(unittest.TestCase):
-    def objects(self, *, historical=False):
-        kwargs, checkpoint, old, drafts = finding_check_objects()
-        if not historical:
-            kwargs["memory"].reviewer_findings = []
-            checkpoint["memory"]["reviewer_findings"] = []
-            checkpoint["reviewer_findings"] = []
-        return kwargs, checkpoint, old, drafts
-
     def mixed(self):
         good = {"finding_id": "qualified-observation", "section_id": "scope",
             "type": "unsupported_claim", "severity": "major", "required_action": "revise",
@@ -37,7 +29,7 @@ class PartialReviewTests(unittest.TestCase):
                 "verified_execution_results": {"metrics": {"score": 5}}}
 
     def test_subset_keeps_strict_evidence_checks_raw_bytes_and_no_parent_instructions(self):
-        _, _, _, drafts = self.objects()
+        _, _, _, drafts = finding_check_objects(historical=False)
         response = self.mixed()
         metric = {"finding_id": "wrong-score", "section_id": "scope", "type": "metric_mismatch",
             "severity": "major", "required_action": "revise", "message": "Observed score disagrees.",
@@ -58,11 +50,13 @@ class PartialReviewTests(unittest.TestCase):
         self.assertEqual(response, before)
 
     def test_ambiguous_or_foreign_envelope_never_salvages_a_peer(self):
-        _, _, old, drafts = self.objects(historical=True)
+        _, _, old, drafts = finding_check_objects()
         valid = self.mixed()["section_reviews"][0]
         check = {"finding_id": old.finding_id, "status": "resolved", "explanation": "Current uncertainty is explicit.",
                  "draft_quotes": [drafts[0].draft_markdown]}
-        cases = [([valid, valid], {}), ([valid, {"section_id": "unknown"}], {}),
+        cases = [([valid, valid], {}),
+                 ([{**valid, "findings": [valid["findings"][0]] * 2}], {}),
+                 ([valid, {"section_id": "unknown"}], {}),
                  ([{**valid, "findings": [{**valid["findings"][0], "section_id": "limits"}]}], {}),
                  ([{**valid, "section_id": []}], {}),
                  ([{**valid, "finding_checks": [{**check, "finding_id": "foreign"}]}], {}),
@@ -77,7 +71,7 @@ class PartialReviewTests(unittest.TestCase):
                     sections=drafts, prior_by_key=prior, evidence_view=self.view(drafts)), [])
 
     def test_historical_subset_closes_only_exact_valid_opinions(self):
-        kwargs, checkpoint, old, drafts = self.objects(historical=True)
+        kwargs, checkpoint, old, drafts = finding_check_objects()
         other = old.model_copy(update={"finding_id": "other-opinion"})
         for field in (checkpoint["memory"], checkpoint):
             field["reviewer_findings"].append(other.model_dump(mode="json"))
@@ -104,6 +98,7 @@ class PartialReviewTests(unittest.TestCase):
         self.assertEqual([event.rejected_review["response"] for event in rejections], [response, response])
         self.assertFalse(rejections[0].rejected_review["partial_ready"])
         self.assertTrue(rejections[1].rejected_review["partial_ready"])
+        self.assertTrue(saved[-1]["document_review_done"])
         before = len(labels)
         restored = run_report_agent(client=Client(), gateway=ReportToolGateway(kwargs["context"]),
             completed_checkpoint=saved[-1], **kwargs)
@@ -113,7 +108,7 @@ class PartialReviewTests(unittest.TestCase):
     def test_valid_subcontract_reaches_writer_but_bad_record_and_instructions_do_not(self):
         for invalid_final in (False, True):
             with self.subTest(invalid_final=invalid_final):
-                kwargs, checkpoint, _, drafts = self.objects()
+                kwargs, checkpoint, _, drafts = finding_check_objects(historical=False)
                 kwargs["config"].max_review_iterations = 1
                 response, labels, saved, requests = self.mixed(), [], [], []
                 test = self
@@ -123,7 +118,7 @@ class PartialReviewTests(unittest.TestCase):
                         if label.startswith("report-document-reviewer"):
                             return response
                         if label == "report-document-reviser-scope":
-                            view = json.JSONDecoder().raw_decode(prompt[prompt.index('{'):])[0]
+                            view = prompt_payload(prompt)
                             requests.append(view)
                             test.assertEqual([f["finding_id"] for f in view["review_findings"]], ["qualified-observation"])
                             test.assertNotIn("Follow the invented heading opinion.", prompt)
@@ -149,6 +144,7 @@ class PartialReviewTests(unittest.TestCase):
                     self.assertNotIn("qualified-observation", current)
                 self.assertEqual(labels.count("report-document-reviewer-format-correction"), 1)
                 self.assertEqual(labels.count("report-document-reviser-scope"), 1)
+                self.assertTrue(saved[-1]["document_review_done"])
                 before = len(labels)
                 restored = run_report_agent(client=Client(), gateway=ReportToolGateway(kwargs["context"]),
                     completed_checkpoint=saved[-1], **kwargs)
@@ -158,7 +154,7 @@ class PartialReviewTests(unittest.TestCase):
     def test_interruption_at_rejected_subset_never_repeats_consumed_correction(self):
         for rejection_number in (1, 2):
             with self.subTest(rejection_number=rejection_number):
-                kwargs, checkpoint, _, drafts = self.objects()
+                kwargs, checkpoint, _, drafts = finding_check_objects(historical=False)
                 labels, saved = [], []
                 response = self.mixed()
                 class Client:
@@ -184,7 +180,7 @@ class PartialReviewTests(unittest.TestCase):
                 self.assertIn("document-review-unavailable", {f.finding_id for f in result.memory.reviewer_findings})
 
     def test_envelope_role_violation_does_not_release_valid_historical_check(self):
-        kwargs, checkpoint, old, drafts = self.objects(historical=True)
+        kwargs, checkpoint, old, drafts = finding_check_objects()
         response = self.mixed()
         response["section_reviews"][0]["finding_checks"] = [{"finding_id": old.finding_id,
             "status": "resolved", "explanation": "Valid quote but forbidden discovery in same batch.",
@@ -202,7 +198,7 @@ class PartialReviewTests(unittest.TestCase):
         self.assertEqual(len(labels), 3)
 
     def test_transport_failure_after_first_subset_does_not_spend_it_as_complete(self):
-        kwargs, checkpoint, _, drafts = self.objects()
+        kwargs, checkpoint, _, drafts = finding_check_objects(historical=False)
         labels, response = [], self.mixed()
         class Client:
             def ask_json(self, system, prompt, *, label="", **ignored):
@@ -218,14 +214,23 @@ class PartialReviewTests(unittest.TestCase):
         self.assertIn("document-review-unavailable", {f.finding_id for f in result.memory.reviewer_findings})
 
     def test_valid_other_section_does_not_certify_failed_peer(self):
-        _, _, _, drafts = self.objects()
+        _, _, _, drafts = finding_check_objects(historical=False)
         response = self.mixed()
         response["section_reviews"].append({"section_id": "limits", "verdict": "pass"})
         subset = _validated_document_review_subset(response, sections=drafts, prior_by_key={}, evidence_view=self.view(drafts))
         self.assertEqual([(row.section_id, row.verdict) for row in subset], [("scope", "revise_required"), ("limits", "pass")])
+        # Multiple independent observations may share a section; only reused
+        # identities make the envelope ambiguous, not the shared target itself.
+        peer = copy.deepcopy(response["section_reviews"][0])
+        peer["findings"] = [{**peer["findings"][0], "finding_id": "independent-peer"}]
+        peer["revision_instructions"] = []
+        response["section_reviews"].append(peer)
+        subset = _validated_document_review_subset(response, sections=drafts, prior_by_key={}, evidence_view=self.view(drafts))
+        self.assertEqual([f.finding_id for f in subset[0].findings], ["qualified-observation", "independent-peer"])
+        self.assertFalse(subset[0].revision_instructions)
 
     def test_partial_historical_resume_preserves_closure_and_failed_peer(self):
-        kwargs, checkpoint, old, drafts = self.objects(historical=True)
+        kwargs, checkpoint, old, drafts = finding_check_objects()
         other = old.model_copy(update={"finding_id": "unchecked-peer"})
         for field in (checkpoint["memory"], checkpoint):
             field["reviewer_findings"].append(other.model_dump(mode="json"))
@@ -256,7 +261,7 @@ class PartialReviewTests(unittest.TestCase):
         self.assertIn("document-finding-check-unavailable", current)
 
     def test_partial_review_keeps_original_two_target_allowance(self):
-        kwargs, checkpoint, _, drafts = self.objects()
+        kwargs, checkpoint, _, drafts = finding_check_objects(historical=False)
         third_plan = kwargs["memory"].section_plan[-1].model_copy(update={"section_id": "third", "heading": "third",
             "draft_order": 3, "final_order": 3})
         kwargs["memory"].section_plan.append(third_plan)

@@ -111,7 +111,7 @@ class CoordinateFigureTests(unittest.TestCase):
                 rebuild(moved / 'analysis.json')
 
     def test_coordinate_flags_do_not_silently_apply_to_other_tasks(self):
-        base = ['start', '--kind', 'survey', '--goal', 'Survey', '--prepare-only']
+        base = ['start', '--kind', 'survey', '--sources', 'materials', '--goal', 'Survey', '--prepare-only']
         for flag in (['--data-plot', 'scatter'], ['--x-column', 'time'], ['--x-unit', 'seconds'], ['--data-max-points', '5']):
             with self.subTest(flag=flag), patch('sys.stdin.isatty', return_value=False), contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, 'Data options require'):
                 prepare_start(build_parser().parse_args([*base, *flag]))

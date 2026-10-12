@@ -20,7 +20,7 @@ class CodeTaskExperimentSpec:
     """Source and runtime configuration for an embedded code-task experiment."""
 
     template: str
-    code_root: Path
+    code_root: Path | None
     task_file: Path | None
     benchmark_command: str | None
     primary_metric: str | None = None
@@ -40,6 +40,7 @@ class CodeTaskExperimentSpec:
     allow_test_changes: bool = False
     allow_large_edits: bool = False
     approval_note: str = "Auto-approved inside the isolated research-session workspace."
+    kind: str = "existing_project"
 
     def result_schema(self) -> dict[str, object]:
         """Return the metric contract enforced by the Code-Task configuration."""
@@ -71,6 +72,7 @@ def code_task_project_spec(
     config: dict[str, object],
     *,
     task_file_override: Path | None = None,
+    allow_greenfield: bool = False,
 ) -> CodeTaskExperimentSpec:
     """Resolve a generic user-project code-task spec from pipeline config."""
 
@@ -106,12 +108,15 @@ def code_task_project_spec(
         except CodeTaskConfigError as exc:
             raise RuntimeError(f"Invalid code-task execute configuration: {exc}") from exc
 
+    if options.kind == "greenfield" and not allow_greenfield:
+        raise RuntimeError("Greenfield code projects use the shared research-session or standalone CodeTask, not the legacy experiment bridge.")
     task_file = task_file_override
     if task_file is None and options.task_file:
         task_file = _resolve_user_path(options.task_file)
     return CodeTaskExperimentSpec(
         template=CODE_TASK_PROJECT_TEMPLATE,
-        code_root=_resolve_user_path(options.code_root),
+        code_root=_resolve_user_path(options.code_root) if options.code_root else None,
+        kind=options.kind,
         task_file=task_file,
         benchmark_command=options.benchmark_command,
         primary_metric=options.primary_metric,

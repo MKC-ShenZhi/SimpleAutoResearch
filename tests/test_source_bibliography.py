@@ -152,17 +152,48 @@ class SourceBibliographyTests(unittest.TestCase):
         self.assertEqual(row['published'], '2025-04-03')
 
     def test_fields_roundtrip_and_reach_shared_references_and_bibtex(self):
-        bundle = DocumentBundle([self.record], {}, {}, [self.header], [])
-        read = ReadResult(status='completed', bundle=bundle, paper_notes=(self.note,))
-        restored = ReadResult.from_handoff_dict(read.to_handoff_dict(), bundle=bundle)
-        handles = _paper_source_handles(provided_materials_result([self.record]))
-        context = ReportContext(topic='Review', report_mode='research_only', papers=[self.paper], source_handles=handles)
-        projected, memory = attach_report_read_evidence(context, ReportMemory(source_handles=handles),
-            documents=bundle, read=restored, read_ref=ArtifactRef('read.json'))
-        paper = Paper.from_row(projected.papers[0])
-        self.assertIn('Ada Example, Grace Example (2025)', references_markdown([paper]))
-        self.assertIn('author = {Ada Example and Grace Example}', papers_to_bibtex([paper]))
-        self.assertEqual(memory.source_handles[0].metadata['bibliographic_sources']['published']['quote'], '2025-04-03')
+        from dataclasses import replace
+        from simple_ar.report.citations import citation_map_artifact
+        for document_id, linked in (('doc', False), ('doc', True), ('résumé/文献', True)):
+            for note_id in ('document', 'citation'):
+                with self.subTest(document_id=document_id, linked=linked, note_id=note_id):
+                    record = (replace(self.record, document_id=document_id) if not linked else
+                        DocumentRecord(document_id, 'https://example.org/study.pdf?version=2',
+                            'supporting_material', url='https://example.org/study.pdf?version=2',
+                            metadata={'kind': 'supporting_material'}, extraction_status='parsed'))
+                    header = replace(self.header, document_id=document_id)
+                    bundle = DocumentBundle([record], {}, {}, [header],
+                        [TextChunk('body', document_id, 'Observed results with qualifications.',
+                            metadata={'section': 'results'})])
+                    context, memory = build_material_report_inputs(topic='Review', documents=bundle,
+                        documents_ref=ArtifactRef('documents.json'),
+                        assets=[] if linked else [SimpleNamespace(locator=record.source_id, role='paper')])
+                    paper_id = context.papers[0]['id']
+                    note = {**self.note, 'paper_id': paper_id if note_id == 'citation' else document_id}
+                    read = ReadResult(status='completed', bundle=bundle, paper_notes=(note,))
+                    restored = ReadResult.from_handoff_dict(read.to_handoff_dict(), bundle=bundle)
+                    original = copy.deepcopy((context.model_dump(), bundle.to_handoff_dict()))
+                    projected, memory = attach_report_read_evidence(context, memory, documents=bundle,
+                        read=restored, read_ref=ArtifactRef('read.json'))
+                    paper = Paper.from_row(projected.papers[0])
+                    self.assertEqual(paper.id, paper_id)
+                    self.assertEqual(paper.title, 'A source title')
+                    self.assertIn('Ada Example, Grace Example (2025)', references_markdown([paper]))
+                    self.assertIn('author = {Ada Example and Grace Example}', papers_to_bibtex([paper]))
+                    self.assertEqual(citation_map_artifact({paper_id: 1}, [paper])['entries'][0]
+                        ['bibliography']['authors'], paper.authors)
+                    self.assertEqual(memory.source_handles[0].metadata['bibliographic_sources']
+                        ['published']['quote'], '2025-04-03')
+                    self.assertEqual(context.model_dump(), original[0])
+                    self.assertEqual(bundle.to_handoff_dict(), original[1])
+                    if linked:
+                        self.assertEqual(paper_id, 'material-' + document_id.encode().hex())
+                        self.assertEqual(paper.url, record.url)  # A known locator is not overwritten.
+                    # Both spellings can appear across planner/writer responses;
+                    # acceptance remains idempotent and same-source, not fuzzy.
+                    repeated, _ = apply_report_bibliography(projected, memory, documents=bundle,
+                        notes=[{**note, 'paper_id': document_id}, {**note, 'paper_id': paper_id}])
+                    self.assertEqual(repeated.papers, projected.papers)
 
     def test_existing_read_call_receives_front_matter_without_extra_model_request(self):
         client = Mock()
@@ -210,7 +241,9 @@ class MaterialBibliographyTests(unittest.TestCase):
         source_view = _prompt_handle_view(navigable.source_handles[0])
         directory = source_view['metadata']['source_directory']
         self.assertEqual(directory['total_sections'], 10)
-        self.assertEqual(directory['sections'][-1]['heading'], 'Independent experiment 8')
+        self.assertEqual(directory['headings'][-1], 'Independent experiment 8')
+        self.assertEqual(navigable.source_handles[0].metadata['source_directory']['sections'][-1]
+            ['heading'], 'Independent experiment 8')  # Original addresses remain retained.
         self.assertNotIn('span-8', [row['chunk_id'] for row in source_view['metadata']['evidence_passages']])
         self.assertEqual(review_source_evidence([source_view])[0]['metadata']['source_directory'], directory)
         self.assertEqual(len(bundle.chunks), 10)  # Navigation does not rewrite the source.
@@ -290,6 +323,20 @@ class MaterialBibliographyTests(unittest.TestCase):
             self.assertEqual(linked_handles[0].kind, "material")
             self.assertEqual(linked_handles[0].metadata['document_chunk_count'], 1)
             self.assertEqual(linked_context.citation_key_map['P9'], linked.id)
+            # Known source metadata must not disappear just because a document
+            # is linked supporting material rather than a provider search hit.
+            from dataclasses import replace
+            bundle.records[-1] = replace(bundle.records[-1], authors=['René Example'],
+                published='2024', doi='10.1234/linked',
+                metadata={'kind': 'supporting_material', 'bibliographic_notes': ['Supplied version notice.']})
+            known, _ = build_material_report_inputs(topic='Reuse known identity', documents=bundle,
+                documents_ref=ArtifactRef('documents.json'), assets=[])
+            paper = Paper.from_row(next(row for row in known.papers if row['id'] == linked.id))
+            self.assertEqual((paper.authors, paper.published, paper.doi),
+                             (['René Example'], '2024', '10.1234/linked'))
+            self.assertIn('Supplied version notice.', paper.bibliographic_notes)
+            handle = next(row for row in known.source_handles if row.paper_id == linked.id)
+            self.assertEqual(handle.metadata['bibliography'], bibliographic_details(paper))
 
     def test_projection_assembly_and_bibtex_use_the_same_accepted_fields(self):
         context, memory, bundle, note, _ = self.inputs()

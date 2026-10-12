@@ -82,47 +82,74 @@ def source_context_for_files(
     snippets: list[dict[str, Any]] = []
     limit = max(0, max_chars_per_file)
     for rel_path in dict.fromkeys(selected_files):
-        path = workspace_file(workspace_dir, rel_path)
-        if limit == 0 or path is None or not path.is_file() or path.name.startswith(".env"):
+        if limit == 0:
             continue
         lines = list(dict.fromkeys(line for anchor, line in anchors
             if anchor == rel_path or anchor.endswith("/" + rel_path)))[:2]
-        text = read_code_task_text(path)
+        text = read_source_context_text(workspace_dir, rel_path, indexed=True)
         if text is None:
             continue
         if len(text) <= limit:
             lines = []
         observed: list[dict[str, Any]] = []
         remaining = limit
+        source = {"path": rel_path, "text": text, "source_chars": len(text),
+                  "source_offset": 0, "start_line": 1}
+        offsets = [0]
+        for source_line in text.splitlines(keepends=True):
+            offsets.append(offsets[-1] + len(source_line))
         for position, line in enumerate(lines or [None]):
-            request: dict[str, Any] = {"files": [rel_path]}
-            if line is not None:
-                request["line_range"] = {"start": max(1, line - 4), "end": line + 75}
-            found = requested_source_context(workspace_dir, {"files": [{"path": rel_path}]},
-                request, supplied=observed, max_files=1,
-                max_chars=remaining // (len(lines) - position) if lines else remaining,
-                max_total_chars=remaining)
-            observed.extend(found)
-            remaining -= sum(len(row["text"]) for row in found)
+            if line is not None and (type(line) is not int or line + 75 < max(1, line - 4)):
+                raise ValueError("A source line_range needs one file, 1-200 lines, and no search terms.")
+            start_line = max(1, line - 4) if line is not None else 1
+            if start_line >= len(offsets) and text:
+                continue
+            start = offsets[min(start_line - 1, len(offsets) - 1)]
+            end = offsets[min(line + 75, len(offsets) - 1)] if line is not None else len(text)
+            size = remaining // (len(lines) - position) if lines else remaining
+            gaps = _unseen_intervals(start, end, [(row["source_offset"],
+                row["source_offset"] + len(row["text"])) for row in observed])
+            if gaps and size > 0:
+                start, end = max(gaps, key=lambda gap: min(size, gap[1] - gap[0]))
+                row = clip_source_snippet({**source, "text": text[start:end], "source_offset": start,
+                    "start_line": text.count("\n", 0, start) + 1,
+                    "truncated": start > 0 or end < len(text)}, max_chars=size)
+                observed.append(row)
+                remaining -= len(row["text"])
         if not observed and lines:
-            observed = requested_source_context(workspace_dir, {"files": [{"path": rel_path}]},
-                {"files": [rel_path]}, supplied=[], max_files=1, max_chars=limit)
+            observed = [clip_source_snippet(source, max_chars=limit)]
         if not lines and include_unanchored_tail and len(text) > limit and limit > 1:
             # Generated-project review has no diff. Preserve its head/tail
             # coverage without joining disjoint code or exceeding the budget.
             half = limit // 2
             offset = len(text) - (limit - half)
-            observed = [
-                clip_source_snippet({"path": rel_path, "text": text, "source_chars": len(text),
-                    "source_offset": 0, "start_line": 1}, max_chars=half),
-                clip_source_snippet({"path": rel_path, "text": text[offset:], "source_chars": len(text),
-                    "source_offset": offset, "start_line": text.count("\n", 0, offset) + 1,
-                    "truncated": True}, max_chars=limit - half),
-            ]
+            observed = [clip_source_snippet({**source, "text": text[start:], "source_offset": start,
+                "start_line": text.count("\n", 0, start) + 1, "truncated": True}, max_chars=size)
+                for start, size in ((0, half), (offset, limit - half))]
         for row in observed:
             row["access_role"] = "editable" if editable_files is None or rel_path in editable_files else "read_only"
         snippets.extend(observed)
     return snippets
+
+
+def read_source_context_text(workspace: Path, relative: str, *, indexed: bool = False) -> str | None:
+    """Read within the existing source boundary before constructing any view.
+
+    Indexed paths keep their historical size/format allowance. Neither an
+    inventory entry nor a planned dependency authorizes private/environment
+    trees or a path outside the workspace.
+    """
+    workspace = workspace.resolve()
+    rel = Path(relative)
+    path = workspace_file(workspace, relative)
+    if (path is None or not path.is_file() or path.name.startswith(".env")
+            or (not indexed and (path.suffix.lower() not in CONTEXT_SUFFIXES
+                                 or path.stat().st_size > 500_000))
+            or any(part in IGNORED_DIR_NAMES or part.startswith(".") for part in rel.parts[:-1])
+            or any(is_python_environment(workspace.joinpath(*rel.parts[:depth]))
+                   for depth in range(1, len(rel.parts)))):
+        return None
+    return read_code_task_text(path)
 
 
 def _construction_call_positions(text: str, symbols: list[str], query: str) -> list[int]:
@@ -306,16 +333,7 @@ def requested_source_context(workspace: Path, index: dict[str, Any], request: di
     for relative in dict.fromkeys(candidates):
         if remaining <= 0:
             break
-        rel = Path(relative)
-        path = workspace_file(workspace, relative)
-        if (path is None or not path.is_file() or path.name.startswith(".env")
-                or (relative not in known and (
-                    path.suffix.lower() not in CONTEXT_SUFFIXES or path.stat().st_size > 500_000))
-                or any(part in IGNORED_DIR_NAMES or part.startswith(".") for part in rel.parts[:-1])
-                or any(is_python_environment(workspace.joinpath(*rel.parts[:depth]))
-                       for depth in range(1, len(rel.parts)))):
-            continue
-        text = read_code_task_text(path)
+        text = read_source_context_text(workspace, relative, indexed=relative in known)
         if text is None:
             continue
         size = min(max_chars, remaining)
@@ -329,14 +347,10 @@ def requested_source_context(workspace: Path, index: dict[str, Any], request: di
             gaps = _unseen_intervals(start, end, seen)
             if gaps and size > 0:
                 start, end = max(gaps, key=lambda gap: min(size, gap[1] - gap[0]))
-                excerpt = text[start:min(end, start + size)]
-                result.append({"path": relative, "access_role": "read_only", "text": excerpt,
-                               "source_chars": len(text),
-                               "source_offset": start,
-                               "start_line": text.count("\n", 0, start) + 1,
-                               "end_line": text.count("\n", 0, start + len(excerpt) - 1) + 1,
-                               "truncated": start > 0 or start + len(excerpt) < len(text),
-                               "has_unread_tail": start + len(excerpt) < len(text)})
+                result.append(clip_source_snippet({"path": relative, "access_role": "read_only",
+                    "text": text[start:end], "source_chars": len(text), "source_offset": start,
+                    "start_line": text.count("\n", 0, start) + 1,
+                    "truncated": start > 0 or end < len(text)}, max_chars=size))
             break
         def positions_for(terms: list[str]) -> list[int]:
             # Preserve the caller's term priority rather than selecting the
@@ -346,15 +360,15 @@ def requested_source_context(workspace: Path, index: dict[str, Any], request: di
 
         literal_positions = ([match.start() for match in re.finditer(re.escape(literal), text)]
                              if literal else [])
-        call_positions = _construction_call_positions(text, request.get("symbols", []), request.get("query", "")) if path.suffix == ".py" and not literal else []
+        call_positions = _construction_call_positions(text, request.get("symbols", []), request.get("query", "")) if Path(relative).suffix.lower() in {".py", ".pyi"} and not literal else []
         symbol_positions = positions_for(symbols) if not literal else []
         query_positions = positions_for(query_terms) if not literal else []
         positions = literal_positions + call_positions + query_positions + symbol_positions
         unseen = lambda items: [pos for pos in items if not any(lo <= pos < hi for lo, hi in seen)]
         if literal and not literal_positions:
             continue
-        # The query expresses the requested behavior; named symbols can be
-        # implementation helpers or imports that appear far from that behavior.
+        # An explicit identity outranks generic prose in a lookup question.
+        # Queries supplement it; named Python definitions/calls remain primary.
         # Exact matches often name a use site; include its preceding setup and
         # call arguments as well as the continuation after it.
         starts = [max(0, min(pos - size // 2, len(text) - size)) for pos in unseen(literal_positions)]
@@ -363,12 +377,12 @@ def requested_source_context(workspace: Path, index: dict[str, Any], request: di
         # source is observed, complete the requested unseen definition first.
         if not seen:
             starts += call_starts
-        if not literal and path.suffix == ".py":
+        if not literal and Path(relative).suffix.lower() in {".py", ".pyi"}:
             starts += _python_symbol_starts(text, request.get("symbols", []), seen)
         if seen:
             starts += call_starts
-        starts += [max(0, min(pos - size // 4, len(text) - size)) for pos in unseen(query_positions)]
         starts += [max(0, min(pos - size // 4, len(text) - size)) for pos in unseen(symbol_positions)]
+        starts += [max(0, min(pos - size // 4, len(text) - size)) for pos in unseen(query_positions)]
         if not positions and not symbols and not query_terms:
             first = 0
             for lo, hi in sorted(seen):
@@ -404,13 +418,10 @@ def requested_source_context(workspace: Path, index: dict[str, Any], request: di
             # The interval subtraction above already guarantees unseen bytes;
             # do not rescan every character or impose a second novelty quota.
             excerpt = text[start:end]
-            result.append({"path": relative, "access_role": "read_only", "text": excerpt,
-                           "source_chars": len(text),
-                           "source_offset": start,
-                           "start_line": text.count("\n", 0, start) + 1,
-                           "end_line": text.count("\n", 0, start + len(excerpt) - 1) + 1,
-                           "truncated": start > 0 or start + len(excerpt) < len(text),
-                           "has_unread_tail": start + len(excerpt) < len(text)})
+            result.append(clip_source_snippet({"path": relative, "access_role": "read_only",
+                "text": excerpt, "source_chars": len(text), "source_offset": start,
+                "start_line": text.count("\n", 0, start) + 1,
+                "truncated": start > 0 or end < len(text)}, max_chars=len(excerpt)))
             seen.append((start, start + len(excerpt)))
             remaining -= len(excerpt)
             file_windows += 1

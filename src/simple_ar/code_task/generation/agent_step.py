@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import hashlib
-import time
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from simple_ar.core.artifacts import append_jsonl, write_json
-from simple_ar.integrations.llm import LLMClient, LLMError
+from simple_ar.integrations.llm import LLMClient, LLMError, LLMResponseError
+from simple_ar.core.budget import BudgetLedger
 
 
 MessageCallback = Callable[[str], None]
@@ -22,23 +22,27 @@ def run_json_agent_step(
     stage: str,
     attempt_index: int,
     retry_attempts: int,
-    max_output_tokens: int,
+    max_output_tokens: int | None,
     artifact_dir: Path | None = None,
     feedback: list[str] | None = None,
     output_summary_callback: OutputSummaryCallback | None = None,
     message_callback: MessageCallback | None = None,
 ) -> dict[str, Any]:
-    """Run one structured LLM agent step with retry and audit artifacts."""
+    """Run a structured step; retry_attempts bounds completed JSON corrections.
+
+    LLMClient alone owns provider/transport retries and physical-call accounting.
+    """
 
     retry_attempts = max(1, int(retry_attempts or 1))
     feedback_rows = list(feedback or [])
     last_error: LLMError | None = None
     for attempt in range(1, retry_attempts + 1):
         call_label = label if attempt == 1 else f"{label}-retry-{attempt}"
+        request_prompt = prompt + retry_suffix(last_error, attempt)
         try:
             result = client.ask_json(
                 system,
-                prompt + retry_suffix(last_error, attempt),
+                request_prompt,
                 label=call_label,
                 max_output_tokens=max_output_tokens,
             )
@@ -50,7 +54,7 @@ def run_json_agent_step(
                 retry_index=attempt,
                 label=call_label,
                 status="passed",
-                prompt=prompt,
+                prompt=request_prompt,
                 output=output,
                 feedback=feedback_rows,
                 output_summary_callback=output_summary_callback,
@@ -58,6 +62,9 @@ def run_json_agent_step(
             return output
         except LLMError as exc:
             last_error = exc
+            if isinstance(exc, LLMResponseError) and artifact_dir is not None:
+                write_json(artifact_dir / stage / f"attempt-{attempt_index:03d}-response-{attempt:03d}.json",
+                    {"error": str(exc), "raw_response": exc.raw_response})
             record_agent_step(
                 artifact_dir,
                 stage=stage,
@@ -65,23 +72,22 @@ def run_json_agent_step(
                 retry_index=attempt,
                 label=call_label,
                 status="failed",
-                prompt=prompt,
+                prompt=request_prompt,
                 output={"error": str(exc)},
                 feedback=feedback_rows,
                 output_summary_callback=output_summary_callback,
             )
-            if attempt >= retry_attempts:
+            if (not isinstance(exc, LLMResponseError) or attempt >= retry_attempts
+                    or not response_accounting_known(client)):
                 _emit(
                     message_callback,
                     f"Agent step `{label}` failed after {attempt}/{retry_attempts} attempt(s). {exc}",
                 )
                 raise
-            delay = retry_delay(attempt)
             _emit(
                 message_callback,
-                f"Agent step `{label}` failed ({attempt}/{retry_attempts}); retrying in {delay:.1f}s. {exc}",
+                f"Agent step `{label}` needs JSON correction ({attempt}/{retry_attempts}). {exc}",
             )
-            time.sleep(delay)
     raise LLMError(f"Agent step `{label}` failed without a captured error.")
 
 
@@ -139,13 +145,20 @@ def retry_suffix(error: LLMError | None, attempt: int) -> str:
     return (
         "\nPrevious attempt failed before attempt "
         f"{attempt}: {error}\n"
-        "The previous output was not parseable or the transport failed. "
+        "The completed response did not satisfy the JSON format. "
         "Return a smaller single JSON object only: no Markdown, no commentary, no trailing analysis.\n"
     )
 
 
-def retry_delay(attempt: int) -> float:
-    return min(30.0, 2.0 * (2 ** max(0, attempt - 1)))
+def response_accounting_known(client: LLMClient) -> bool:
+    """Do not correct or replace a response with unreconciled ledger operations.
+
+    Fully accounted dimensions do not establish that dispatch completed:
+    unknown and pending reserved entries remain authoritative uncertainty.
+    """
+    budget = getattr(client, '_budget_ledger', None)
+    return not isinstance(budget, BudgetLedger) or all(
+        entry.status in ('settled', 'released') for entry in budget.entries)
 
 
 def _emit(callback: MessageCallback | None, message: str) -> None:

@@ -2,8 +2,22 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterator
+from enum import Enum
 
 from simple_ar.report.schema import ReportSectionDraft
+
+
+class ReportAssemblyMode(str, Enum):
+    SECTION_DRAFTS = "section_drafts"
+    WHOLE_ARTICLE = "whole_article"
+
+
+def validate_whole_article(sections: list[ReportSectionDraft] | tuple[ReportSectionDraft, ...]) -> None:
+    """A completed article is one successful, non-empty writer work unit."""
+    if len(sections) != 1:
+        raise ValueError("Whole-article assembly requires exactly one completed draft.")
+    if sections[0].status not in {"drafted", "revised"} or not sections[0].draft_markdown.strip():
+        raise ValueError("Whole-article assembly requires a successful, non-empty draft.")
 
 
 def normalize_report_markdown(markdown: str) -> str:
@@ -114,14 +128,56 @@ def _is_unnumbered_academic_heading(title: str) -> bool:
     }
 
 
-def assemble_report_sections(*, title: str, sections: list[ReportSectionDraft]) -> str:
-    """Assemble section drafts into one final Markdown body without references."""
-    parts = [f"# {title.strip() or 'Research Report'}"]
-    for section in sections:
+def assemble_report_sections(
+    *,
+    title: str,
+    sections: list[ReportSectionDraft],
+    assembly_mode: ReportAssemblyMode | str = ReportAssemblyMode.SECTION_DRAFTS,
+    supplemental_sections: list[ReportSectionDraft] | None = None,
+) -> str:
+    """Own the title and wrappers; completed articles own their body hierarchy.
+
+    Supplemental sections are projected delivery records, not article work
+    units. They retain the same section presentation as legacy assembly.
+    """
+    mode = ReportAssemblyMode(assembly_mode)
+    canonical_title = f"# {title.strip() or 'Research Report'}"
+    if mode == ReportAssemblyMode.WHOLE_ARTICLE:
+        validate_whole_article(sections)
+        parts = [canonical_title, _article_body(sections[0].draft_markdown)]
+        sectional = []
+    else:
+        parts = [canonical_title]
+        sectional = sections
+    for section in [*sectional, *(supplemental_sections or [])]:
         body = _section_body(section.draft_markdown, heading=section.heading)
         if body:
-            parts.append(f"## {section.heading}\n\n{body}")
+            # Preserve historical wrapper semantics only for sectional inputs.
+            standalone = (mode == ReportAssemblyMode.SECTION_DRAFTS and len(sections) == 1
+                          and section.heading.strip().casefold() == title.strip().casefold())
+            parts.append(body if standalone else f"## {section.heading}\n\n{body}")
     return normalize_report_markdown("\n\n".join(parts))
+
+
+def _article_body(markdown: str) -> str:
+    """Replace an optional leading ATX title without rewriting body headings.
+
+    Additional H1 headings are ambiguous document boundaries: refuse them
+    instead of silently demoting or deleting authored structure. References
+    use the existing shared boundary, and fenced examples are untouched.
+    """
+    rows = list(_markdown_lines(markdown.strip("\r\n")))
+    first_content = next((index for index, (line, _, _) in enumerate(rows) if line.strip()), None)
+    if first_content is not None:
+        first = rows[first_content][1]
+        if first and len(first[1]) == 1:
+            rows = rows[first_content + 1:]
+    body = strip_report_references("\n".join(row[0] for row in rows))
+    if any(match and len(match[1]) == 1 for _, match, _ in _markdown_lines(body)):
+        raise ValueError("Whole-article body cannot contain additional document titles (H1 headings).")
+    if not body.strip():
+        raise ValueError("Whole-article assembly requires a non-empty body after its title and references.")
+    return body.strip("\r\n")
 
 
 def _section_body(markdown: str, *, heading: str) -> str:

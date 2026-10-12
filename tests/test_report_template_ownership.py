@@ -86,8 +86,10 @@ class TemplateOwnershipTests(unittest.TestCase):
                              "Earlier supplementary reader answer"):
                 self.assertIn(retained, encoded)
             self.assertEqual(checked["section_constraints"]["target_words"], 300)
-            self.assertEqual(len(checked["extra_tool_context"]), 6)
-            self.assertEqual(checked["extra_tool_context_omitted"], 2)
+            self.assertEqual(len(checked["extra_tool_context"]), len(tools_before))
+            self.assertEqual(checked["extra_tool_context_omitted"], 0)
+            self.assertEqual([row["tool_name"] for row in checked["extra_tool_context"]],
+                             [row["tool_name"] for row in tools_before])
             self.assertEqual(checked["extra_tool_context"][0]["tool_name"], "get_paper_brief")
             self.assertEqual(checked["extra_tool_context"][1]["content"]["text_status"]["independent_verification"],
                              "not_performed")

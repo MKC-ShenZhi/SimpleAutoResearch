@@ -2,6 +2,19 @@
 
 [English version](WORKFLOWS.md)
 
+普通 `start` 将目标、只读材料和约束交给 `ToolApplication`，由同一行动循环经
+`CommonToolGateway` 组合来源调查、代码/执行、分析、写作、视觉/图像与出版，复用现有
+专业模块、`SessionController`、产物和预算账本。新建偏好表达成果要求，不强制选择内部
+流水线，也不授予访问或执行权限。网络、视觉、进程提案及资源各有明确边界，进程仍需
+精确命令批准；工作区隔离不等于操作系统沙箱。
+
+精确表格、固定代码范围/验证及复现等结构化协议仍沿 TOML/`research-session` 与
+`ResearchApplication` 执行；它们也服务公开新任务，不只读取历史。普通原生任务通过
+`start --resume-task` 沿原记录接受反馈和恢复，结构化会话保留自己的恢复入口。恢复不把
+旧任务重建成新默认，不把半截响应当成果，也不重放已完成副作用。以下 accepted plan、
+分段 Writer 和 capability 流程说明适用于相应结构化消费者及已保存任务；模块复用不代表
+所有组合、图形反馈、科学能力或可靠性交付已经通过验收。
+
 新默认研究计划只在明确请求摘要（或摘要是默认交付）时生成独立摘要。
 已有本地原文、明确仅用材料且只请求报告的调研/研究任务，可摄入后直接写作并查询
 保存原文；接受的计划仍可选择阅读笔记与综合。明确请求摘要、评估、设计或实验时
@@ -54,7 +67,7 @@ CodeTask初始化在原工作区清单中只保留语法失败文件的已有索
 
 ## 可选自然语言任务澄清
 
-`start --chat` 位于普通配置/会话入口之前。澄清草稿保存用户原始回复、方案、材料授权和
+`start --chat` 位于精确结构化配置/会话入口之前。澄清草稿保存用户原始回复、方案、材料授权和
 沿既有 BudgetLedger 记录的此次对话用量；材料预览有界，截断/未读明确标出。模型建议语义，
 不授予执行权限。确认后同一序列化器校验并保存 TOML。`--resume-setup` 复用待确认方案和
 账本；真正执行仍由原会话控制器恢复。结构化设置和描述分析本身无需 API，选择 chat 才为
@@ -250,7 +263,7 @@ references 不等于书目。明确的 Markdown 章节或附录可以恢复正�
 仍有问题时保留 partial，不循环搜索或重新下载。该步骤按现有 read attempt 恢复，
 没有新增逐篇 API 中断检查点，失败后可能重新执行本次阅读。
 
-`start` 保存普通任务输入后交给 `research-session`，不新增规划器/生命周期；只准备
+精确结构化协议的 `start` 保存任务输入后交给 `research-session`，适配器不新增规划器/生命周期；只准备
 配置不会调用模型或进程。阅读传给综合时保留局限、开放问题、置信度和引用，并说明
 卡片裁剪；用户执行约束不再静默截尾。这不代表语义理解已经得到保证。
 报告规划、写作、格式纠正及两级审阅使用已保存的problem/goal任务要求，不以短记忆
@@ -430,7 +443,7 @@ Agent 结果/检查点顶层的 `reviewer_findings` 保留历史意见，包含�
 图形放入该章节，不依赖标题语言；否则保留对照附录。连线表示记录的配对，不是置信区间；
 绘图不等于科学验证。
 
-正式研究入口是 `research-session`，在同一会话中维护 attempt、产物、报告与审计，
+结构化研究入口是 `research-session`，在同一会话中维护 attempt、产物、报告与审计，
 由 `ResearchApplication` 根据任务、已有材料和已接受的执行约束选择需要的能力；对用户没有
 固定阶段序列。
 
@@ -449,7 +462,9 @@ attempt 输出；`SessionController` 负责 attempt、预算、lineage 和产物
 公开入口保持精简：
 
 ```text
-simple-ar research-session       # 正式任务驱动入口与恢复
+simple-ar start                  # 普通原生目标驱动任务
+simple-ar start --resume-task PATH # 原生反馈与恢复
+simple-ar research-session       # 精确结构化协议与已保存会话恢复
 simple-ar research-brief         # 兼容请求/结果适配器
 simple-ar status RUN_DIR         # 只读展示存档
 ```
@@ -495,7 +510,7 @@ controller 不会自行推断分支，也不会替调用方选择结果。需要
 `attempt_lineage()`；它只读取持久化的 attempt manifest，不合并产物或调度新工作。
 
 历史研究会话读取器展示记录过的 `next_capability` 和执行证据，不再用已退出的策略
-重新推算下一步；新研究的动作选择归 ResearchApplication 负责。
+重新推算下一步；结构化研究的动作选择归 ResearchApplication 负责。
 
 如果库调用方只想得到一个内存中的聚合值，可以使用
 `research.brief.build_research_brief()` 只保留为内存中的兼容视图。默认 registry 刻意不再
@@ -503,7 +518,7 @@ controller 不会自行推断分支，也不会替调用方选择结果。需要
 历史 `research_brief.v1` handoff 仍可读取，但不会再成为第二条可执行 lifecycle。
 
 下面的 `research-brief` 是分段/开发入口，不是普通用户的完整任务入口。面向普通用户的流程应
-优先使用 `simple-ar research-session`；需要只构建研究 handoff、调试阅读或从已有 handoff
+优先使用 `simple-ar start`；需要只构建研究 handoff、调试阅读或从已有 handoff
 开始时，才使用这些较小的组合入口。`research-brief` 现在只是参数/返回值适配器，
 请求同一个 `ResearchApplication` 生成文献摘要，采用其生命周期及默认请求/token 预算，
 不再维护独立编排器。其研究能力顺序为：
@@ -544,7 +559,7 @@ Read provenance、`planner: llm` 与 `generation_mode: llm`。缺少凭据、传
 分段 `research-experiment` 创建器已退出。实验与分析能力继续由正式应用复用，
 不再为旧 synthesis 文件另建一套会话生命周期。
 
-如果希望把完整流程保留在同一个 session 中，应使用唯一正式主线
+如果需要在同一个结构化 session 中组合这些 handoff，可使用
 `simple-ar research-session`。它复用相同的
 `plan -> search -> document_ingest -> read -> synthesize` 前缀，记录一个
 `research_design.v1` handoff，再用一个明确提供的 `ExperimentRequest` 进入现有 Analysis
@@ -687,7 +702,7 @@ retry 或阶段转移；持久化的独立分析还会写出 `analysis_status.js
 ### 1. Research Report：文献优先（分段/高级用例）
 
 适合想要 literature review、survey 或 DeepResearch-like report，而不强调实验执行的场景。
-普通用户的完整研究任务仍应使用 `research-session`；这里描述的是可复用的分段能力边界。
+普通用户的完整研究任务使用 `start`；这里描述的是可复用的分段能力边界。
 
 概念流程：
 
@@ -695,7 +710,7 @@ retry 或阶段转移；持久化的独立分析还会写出 `analysis_status.js
 plan -> search -> read -> synthesize -> report
 ```
 
-未提供执行命令或 CodeTask 配置时，`research-session` 使用纯文献路径，不启动实验。
+在文献优先的结构化路径中，未提供执行命令或 CodeTask 配置时，`research-session` 使用纯文献路径，不启动实验。
 报告属于同一生命周期；只有显式 `--no-report` 才省略该交付。
 
 ### 2. Code Task：已有代码库

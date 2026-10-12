@@ -364,10 +364,14 @@ class SourceBacktrackingTests(unittest.TestCase):
         self.assertEqual(len(saved[-1]["tool_results"]), 1)
         self.assertEqual(saved[-1]["sections"], [])
         self.assertEqual(saved[-1]["pending_draft"]["draft_markdown"], "Unqualified source claim.")
-        event = saved[-1]["iterations"][-1]
-        self.assertEqual(event["action"], "review_context")
+        event = next(row for row in reversed(saved[-1]["iterations"]) if row["action"] == "review_context")
         self.assertEqual(event["tool_results"], saved[-1]["tool_results"])
         self.assertEqual(event["findings"][0]["finding_id"], "qualify")
+        if not interrupt_at_save:
+            accepted = saved[-1]["iterations"][-1]
+            self.assertEqual(accepted["action"], "review")
+            self.assertEqual(accepted["findings"], event["findings"])
+            self.assertEqual(accepted["tool_results"], event["tool_results"])
         before = len(labels)
         client.resumed = True
         resumed = self.report_kwargs(client, max_review_iterations=1)
@@ -379,6 +383,7 @@ class SourceBacktrackingTests(unittest.TestCase):
         self.assertEqual(result.sections[0].draft_markdown, "Qualified source claim.")
         self.assertNotIn("report-writer-method", labels[before:])
         self.assertEqual(sum("reviser" in label for label in labels[before:]), 1)
+        self.assertEqual(sum("reviewer" in label for label in labels[before:]), 1 if not interrupt_at_save else 2)
 
     def test_resume_does_not_reset_the_source_tool_allowance(self):
         saved = []

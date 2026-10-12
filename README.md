@@ -4,15 +4,16 @@
 
 [中文](README_zh.md) · [Quick start](#quick-start) · [Examples](#choose-a-case) · [Documentation](#documentation) · [Changelog](CHANGELOG.md)
 
-Choose a function in the guided CLI, describe a task and provide the material you already have. SimpleAutoResearch
-organises the necessary work in a saved session and delivers files you can
-inspect, edit, rebuild, and continue using.
+Describe your goal and provide the material you already have. The native `start`
+entry investigates it and chooses tools in one saved task. SimpleAutoResearch
+delivers files you can inspect, edit, rebuild, and continue using.
 
-Use individual functions or connect them: **existing data → analysis and plots →
-report → optional ACM export**. A code repair need not search papers, and writing from
-existing results need not repeat an experiment.
+Scientific modules can be used individually or combined as needed: **existing data →
+analysis and plots → report → optional ACM export**. Code work includes creating
+projects, analysis scripts and editable figures as well as repairing a repository.
+Writing from existing results need not repeat an experiment.
 
-> **Source-visible preview.** Guided native workflows are available; general autonomous reproduction and integrated external coding Agents are not. Inspect sources, measurements and audits before relying on a result.
+> **Source-visible preview.** The native tool loop and explicit structured workflows are available; complete cross-task acceptance, general autonomous reproduction and integrated external coding Agents are not claimed. Inspect sources, measurements and audits before relying on a result.
 >
 > Licensing is not yet selected. Public repository access is not an open-source license.
 
@@ -21,23 +22,25 @@ existing results need not repeat an experiment.
 | Task | Bring | Get |
 | --- | --- | --- |
 | Research a direction | A question, scope and optional papers | Source-backed comparisons, reading notes and a report |
-| Repair a codebase | A repository, problem, allowed edits and validation command | An edited workspace, change records and validation results |
+| Create or modify code | A goal, optional repository and validation requirements | Generated source or an edited workspace, change records and actual validation status |
 | Analyse and plot data | A table, selected columns and their meanings | Descriptive statistics, paired comparisons and editable SVG/PDF/PNG figures |
-| Write from material | Papers, notes, a draft or saved analysis | A reviewed report or paper-style draft, references and reused figures |
+| Write from material | Papers, notes, a draft or saved analysis | An editable report or paper-style draft, references and reused figures |
 | Reproduce a specified conclusion | A paper, prepared project/data and agreed protocol | Recorded measurements and an account of the reproduction scope |
 | Export a saved report | Report artifacts and export tools | An editable ACM LaTeX project, with optional PDF compilation |
 
-Analysis can run without a model API. Research, code repair and writing require
-one; reproduction requires the target scientific environment. The first five tasks
-have guided `start` entries, while `report-export` uses an existing report.
+The explicit table-analysis shortcut can run without a model API. Native tasks,
+research, generated code and writing require one; measurement requires the target
+scientific environment. `start` accepts goals or optional outcome preferences;
+`report-export` uses an existing structured report.
 See [current boundaries](#current-boundaries) for the supported scope.
 
 ### Why use an assistant around these tasks?
 
 For a table-analysis task that also needs a written report, use
 `simple-ar start --kind data_analysis --with-report` (or request it in
-`start --chat`). Analysis, reusable figures and reviewed writing share the
-same saved session. Analysis alone remains zero-API; writing requires a model.
+`start --chat`). With explicit table column selectors, analysis, reusable figures
+and reviewed writing share the same structured session. That analysis shortcut
+alone remains zero-API; native investigation and writing require a model.
 
 - **Less material handoff.** Saved analysis packages and report artifacts can
   feed the next task instead of becoming disconnected chat answers.
@@ -81,6 +84,24 @@ or benchmark result. See the [case guide](examples/data-curves/README.md).
 
 ### 3. Configure a model for research, code or writing
 
+For a simpler setup across tasks and projects, configure a shared [named model
+catalog](docs/CONFIG_REFERENCE.md#named-model-connections). Copy [the catalog
+example](examples/model-profiles/models.toml) to `~/.config/simple-ar/models.toml`,
+or a private location such as `.local/models.toml` and set `SIMPLE_AR_MODELS_CONFIG`
+to its absolute path. Replace the example's endpoints and model IDs with your
+provider's settings. TOML owns connection settings and routes; each `api_key_env`
+names a credential variable whose value stays in your environment or private `.env`.
+The example uses `CCTQ_API_KEY`; choose the variable names appropriate to your provider.
+
+Configure `default` once for ordinary tasks and `code` for code-capable work;
+add `writing`, `vision` or `image` routes when needed. Without an explicit `writing`
+route, native writing keeps the task connection. `start` displays text connections
+and lets terminal users choose; `--model profile:NAME` selects one explicitly.
+`simple-ar models` checks local settings and credential presence without a request;
+declared capabilities do not verify provider support. Native decisions require
+Chat mode; structured text workflows can also use Responses.
+
+The environment-only connection remains compatible when no catalog is configured.
 Copy `.env.example` to `.env` **only if you do not already have one**:
 `cp .env.example .env` on a shell, or `Copy-Item .env.example .env` on PowerShell.
 Edit it with your provider's actual values:
@@ -95,18 +116,10 @@ SIMPLE_AR_LLM_STREAM=false
 
 Use an API format supported by your provider; `responses` is also supported.
 Streaming is optional; enable it only when your provider handles it reliably.
-Keep secrets out of Git. `.env` holds global model/transport settings; project
-paths, interpreters, data and task limits belong in task configuration.
+Keep secrets out of Git. These global model/transport settings apply to the legacy
+connection; named profiles use their own settings. Project paths, interpreters,
+data and task limits belong in task configuration.
 [Advanced settings](docs/CONFIG_REFERENCE.md) are optional.
-
-For multiple providers or separate text/code models, use a [named model catalog](docs/CONFIG_REFERENCE.md#named-model-connections).
-Copy [the catalog example](examples/model-profiles/models.toml) to a private location
-such as `.local/models.toml`, then set `SIMPLE_AR_MODELS_CONFIG` in `.env` to its
-absolute path. Configure it once: subsequent tasks share its default/text/code/image
-routes, or select `--model profile:NAME`. Each profile owns its URL, model and
-credential variable; keep the key values in `.env`. `simple-ar models` checks the
-local setup without sending a request. For reuse across projects, the default
-catalog location is `~/.config/simple-ar/models.toml`.
 
 ### 4. Start your own task
 
@@ -114,21 +127,33 @@ catalog location is `~/.config/simple-ar/models.toml`.
 uv run simple-ar start
 ```
 
-The numbered menu explains each function and its preparation requirements.
-Select a number or `survey`, `bug_fix`, `reproduction`, `writing` or `data_analysis`.
-The structured guide collects relevant inputs, saves ordinary TOML under
-`runs/assistant/`, and starts the shared session. You do not have to write a task
-file first. `--prepare-only` saves configuration without execution or model calls.
-For code repair, `--project-python PATH` can select an existing project interpreter;
+Describe your goal at the prompt, or pass it directly. The experimental native
+loop investigates materials and chooses actions without requiring a function selection:
+
+```bash
+uv run simple-ar start "Explain these results" --source results/ --model profile:NAME
+```
+
+Repeat `--source PATH` for read-only materials. Public retrieval requires
+`--allow-network`; process proposals require `--allow-execution` and separate
+command approval. `--prepare-only` saves the task without model calls or execution.
+Complete cross-task acceptance is still pending. `start --guided` offers outcome
+preferences; ordinary `--kind` choices use the same native loop. Explicit controls
+such as `--template`, `--sources`, `--allow`/`--validate` or a reproduction protocol
+retain structured compatibility. For `--kind data_analysis`, explicit
+`--value-column`, `--x-column` or `--paired-baseline` without `--scripted` selects
+the no-API table shortcut. Structured
+protocols cannot mix native access/budget options; see the [exact routing rules](docs/CLI_REFERENCE.md#goal-driven-code-analysis-and-figures).
+For code execution, `--project-python PATH` can select an existing project interpreter;
 omit it to use the current environment. It does not create environments or install dependencies.
-For natural-language task clarification, opt in with:
+For model-assisted clarification of a structured task, opt in with:
 
 ```bash
 uv run simple-ar start --chat
 ```
 
 Describe your goal and answer the material questions. The model proposes a function
-and semantic settings; you confirm them before the same ordinary task configuration
+and semantic settings; you confirm them before the structured task configuration
 is saved. Execution choices remain explicit. For code repair, chat can propose a test command using
 inspected project instructions; you confirm it and the editable scope before
 ordinary execution. An explicit `--validate` command is not replaced. Replies and
@@ -147,8 +172,9 @@ and metadata. It **does not download full text or train models**. Change
 `[task].goal` for another question; use the guide/configuration reference when
 you need supplied papers or best-effort full-text retrieval.
 
-> **Cost:** model calls are billable. Cumulative API request/token caps are
-> optional and otherwise uncapped. Process time, resources and research-round
+> **Cost:** model calls are billable. Native tasks default to 30 requests and
+> 600,000 shared tokens, retained on resume; structured API caps are optional.
+> Uncapped model output can exceed a token estimate. Process time, resources and research-round
 > limits are separate. There is no fixed completion-time promise.
 
 ## Choose a case
@@ -182,8 +208,10 @@ fresh-checkout quick start. See the [example index](examples/README.md) for scop
 | ACM export | `main.tex`, `body.tex`, bibliography, figures and `export.json` | Edit/move the project; inspect `build.log` when compilation is requested |
 | Code/measurement | Edited workspace, actual validation/run logs and saved results | Inspect the actual change and evaluation conditions, not only the final prose |
 
-The terminal prints exact session/attempt paths. Keep the whole analysis directory so
-its copied data remains available after moving it.
+The terminal prints exact session/attempt paths. The table describes structured
+deliveries; native tasks save a workspace and delivery manifest, and native writing
+can produce an editable `manuscript.md` for publication. Keep the whole analysis
+directory so its copied data remains available after moving it.
 
 For example, connect an analysis package to writing without repeating its task:
 
@@ -192,7 +220,9 @@ uv run simple-ar start --kind writing --goal "Explain these results and their li
 ```
 
 Replace `PATH_TO_ANALYSIS` with the printed analysis directory; model access is
-needed for writing. Export that report separately if desired:
+needed for writing. This ordinary writing preference uses the native loop; ask it
+for publication of its manuscript when needed. For an existing structured report
+attempt (for example, from the survey config), export separately:
 
 ```bash
 uv run simple-ar report-export --report-dir "PATH_TO_REPORT_ATTEMPT" --output runs/acm-draft
@@ -205,16 +235,17 @@ PDF or a conference submission. See the [export guide](docs/CLI_REFERENCE.md#sim
 
 ## Bring your own material
 
-Choose the task and intended delivery first:
+Describe the goal, intended delivery and available inputs:
 
 - **Survey:** question, scope, source papers and whether online search is allowed.
-- **Code:** repository, reported problem, allowed files and a real validation command.
+- **Code:** creation or modification goal, optional repository and validation requirements; exact edit scope and validator belong to the structured protocol.
 - **Data:** table, selected fields, row/value meanings and units.
 - **Writing:** source material, report or paper-style draft, and optional reference papers.
 - **Reproduction:** specified paper conclusion, prepared execution conditions and fixed evaluation.
 
-Guided setup saves editable task configuration. Project paths, data, interpreters
-and task limits belong there, not in `.env`. See [Usage](docs/USAGE.md) for worked
+Native tasks save confirmed inputs, permissions and limits in their session;
+structured setup saves editable TOML. Project paths, data, interpreters and task
+limits belong there. See [Usage](docs/USAGE.md) for worked
 examples and [Configuration](docs/CONFIG_REFERENCE.md) for expert fields.
 
 ## Inspect and resume
@@ -222,19 +253,25 @@ examples and [Configuration](docs/CONFIG_REFERENCE.md) for expert fields.
 The terminal prints the session directory, deliverables and current action.
 Read actual measurements and source evidence alongside the report.
 
-To resume unchanged model-backed inputs, use the saved session path:
+For a native task, use its saved path and optionally append feedback:
+
+```bash
+uv run simple-ar start --resume-task "SESSION_PATH"
+```
+
+For an unchanged structured model-backed session, retain the historical command:
 
 ```bash
 uv run simple-ar research-session --session-root "SESSION_PATH" --model env
 ```
 
-Do not rerun `start` to continue a session. For the model-free data example,
+Do not create another task to resume saved work. For the model-free data example,
 omit `--model env`. A new run without `--session-root` creates a new session.
 Continuation does not reset an exhausted budget or imply background execution
 after disconnect. Confirm an interrupted worker has stopped before recovery;
 see the [CLI reference](docs/CLI_REFERENCE.md).
 
-New CLI sessions default to `checkpoints`; use `--interaction assisted`,
+New structured CLI sessions default to `checkpoints`; use `--interaction assisted`,
 `checkpoints` or `autonomous` to choose participation. Examples can specify a
 different policy. No mode supplies missing facts, assets or permissions.
 
@@ -259,7 +296,7 @@ revision and prose revision are different actions—not one generic retry.
 ## Current boundaries
 
 - **Reading and writing:** models can misread material or leave unresolved claims and incomplete references. Audits and compilation do not certify scientific or publication quality.
-- **Data and figures:** supported descriptive analysis and bar/box/line/scatter/matrix-heatmap plots use declared semantics. General statistical inference and free-form scientific illustration are not provided.
+- **Data and figures:** deterministic summaries and bar/box/line/scatter/matrix-heatmap plots use declared semantics. Other methods and editable method figures can use generated code with approved execution; raster generation/editing uses a named image route and allowance. Availability does not certify statistics, visual quality or scientific correctness.
 - **Execution:** workspaces and bounded processes are not an OS sandbox. Prepare the target environment and protect sensitive inputs.
 - **Scope:** general autonomous provisioning, integrated external Agents and formal PaperBench/ScienceAgentBench results are not claimed.
 
@@ -269,8 +306,8 @@ See [workflows](docs/WORKFLOWS.md) for evidence and recovery boundaries.
 
 | Guide | Purpose |
 | --- | --- |
-| [Usage](docs/USAGE.md) | Choose a function, run it, inspect outputs and troubleshoot |
-| [Configuration](docs/CONFIG_REFERENCE.md) | Global connections, task inputs and optional expert settings |
+| [Usage](docs/USAGE.md) | Start a goal, select optional preferences, inspect outputs and troubleshoot |
+| [Configuration](docs/CONFIG_REFERENCE.md) | Named connections, compatible environment settings and task inputs |
 | [CLI reference](docs/CLI_REFERENCE.md) | Commands, continuation and explicit revisions |
 | [Workflows and artifacts](docs/WORKFLOWS.md) | Evidence, execution and saved-result boundaries |
 | [Development](docs/DEVELOPMENT.md) | Module ownership and engineering contracts |

@@ -262,27 +262,10 @@ def ordered_body_citation_ids(markdown: str, allowed_ids: set[str]) -> list[str]
     return ordered
 
 
-def literature_citation_sentence(papers: list[Paper]) -> str:
-    """Create one conservative citation sentence for fallback introductions."""
-    real_papers = [paper for paper in papers if paper.source != "fixture"]
-    selected = real_papers or papers
-    if not selected:
-        return ""
-    keys = " ".join(f"[@{paper.id}]" for paper in selected[:3])
-    return f"The body cites examples from the retrieved set such as {keys}."
-
-
 def body_citation_ids(markdown: str, allowed_ids: set[str]) -> set[str]:
     """Return allowed citation ids that appear before the References section."""
     body = strip_references_section(markdown)
     found = set(re.findall(_CITATION_PATTERN, body))
     return found & allowed_ids
 
-
-def model_citation_key(paper_id: str, citation_key_map: dict[str, str]) -> str:
-    """Return the short model-facing citation key for one paper id."""
-    for key, mapped_paper_id in citation_key_map.items():
-        if mapped_paper_id == paper_id:
-            return key
-    return ""
 

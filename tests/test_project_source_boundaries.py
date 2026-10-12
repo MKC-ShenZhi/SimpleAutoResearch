@@ -10,9 +10,8 @@ from simple_ar.code_task.analysis.interfaces import (
 from simple_ar.code_task.analysis.resource_static import analyze_resource_risks
 from simple_ar.code_task.execution.failure import _source_signal_files as failure_sources
 from simple_ar.code_task.execution.failure_graph import _source_signal_files as graph_sources
-from simple_ar.code_task.generation.generated_project_repair import (
-    _compile_project, _generated_python_paths,
-)
+from simple_ar.code_task.analysis.index import project_python_files
+from simple_ar.code_task.generation.generated_project_repair import _compile_project
 
 
 class ProjectSourceBoundaryTests(unittest.TestCase):
@@ -65,7 +64,7 @@ class ProjectSourceBoundaryTests(unittest.TestCase):
                 paths = search(root, "AttributeError: object has no attribute 'missing_attribute'")
                 self.assertIn('environment/consumer.py', paths)
                 self.assertFalse(any('generated-runtime/' in path for path in paths))
-            paths = _generated_python_paths({}, project_dir=root)
+            paths = [path.relative_to(root).as_posix() for path in project_python_files(root)]
             self.assertIn('environment/domain.py', paths)
             self.assertFalse(any('generated-runtime/' in path for path in paths))
             self.assertEqual(_compile_project(root), [])

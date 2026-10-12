@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 from contextlib import ExitStack, contextmanager
 import hashlib
+from importlib import import_module
 from io import BytesIO
 import json
 import logging
@@ -150,6 +151,14 @@ def run_image(
                 raise ImagesError("Saved image task requires its original pending reservation")
         if not resuming and any(e.reservation_id == reservation_id for e in ledger.entries):
             raise ImagesError("Reservation already exists; recover its original directory")
+        # Validate the optional transport before reserving or recording a
+        # submission. A missing local dependency is not an unknown POST.
+        # Completed, intact artifacts returned above need no network runtime.
+        if profile.http2:
+            try:
+                import_module("h2.connection")
+            except ImportError:
+                raise ImagesError("HTTP/2 requires simple-autoresearch[http2]; no image submission attempted") from None
         store.root.mkdir(parents=True, exist_ok=True)
         if not resuming and any(store.root.iterdir()):
             raise ImagesError("Images requires an empty, independent output directory")

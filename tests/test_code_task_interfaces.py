@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import tempfile
+import json
 import unittest
 import os
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from simple_ar.code_task.analysis.interfaces import (
     dependency_context,
@@ -16,7 +17,12 @@ from simple_ar.code_task.analysis.interfaces import (
 from simple_ar.code_task.analysis.entrypoints import analyze_entrypoint_debuggability
 from simple_ar.code_task.analysis.resource_static import analyze_resource_risks
 from simple_ar.code_task.generation.common import safe_relative_path, string_list
-from simple_ar.code_task.generation.review import review_generated_project
+from simple_ar.code_task.generation.review import (
+    GREENFIELD_REVIEW_CONTRACT_VERSION,
+    is_current_greenfield_review,
+    review_generated_project,
+)
+from simple_ar.code_task.generation.task_contract import contract_prompt_view
 from simple_ar.code_task.generation.writer import _response_self_reports_defect, write_generated_project
 from simple_ar.code_task import initialize_code_task, review_code_task_changes, build_code_task_context_pack
 from simple_ar.code_task.analysis.index import build_codebase_index
@@ -61,7 +67,24 @@ class CodeTaskInterfaceTests(unittest.TestCase):
     def test_generation_common_helpers_normalize_paths_and_lists(self) -> None:
         self.assertEqual(safe_relative_path("pkg\\runner.py"), "pkg/runner.py")
         self.assertEqual(safe_relative_path("../escape.py"), "")
-        self.assertEqual(safe_relative_path("/absolute.py"), "absolute.py")
+        from simple_ar.code_task.generation.file_specs import normalize_plan_path
+        from simple_ar.code_task.analysis.interfaces import _safe_path
+        from simple_ar.code_task.generation.agent_backend import _safe_project_path, _is_deliverable_project_file
+        from simple_ar.code_task.generation.review import _is_reviewable_generated_path
+        for value in ("/absolute.py", "C:/escape.py", "C:escape.py", "\\\\server\\share\\file.py",
+                      "pkg/../escape.py", "pkg/file.py:stream", ".", "bad\0.py"):
+            with self.subTest(value=value):
+                for normalize in (safe_relative_path, normalize_plan_path, _safe_path, _safe_project_path):
+                    self.assertEqual(normalize(value), "")
+                self.assertFalse(_is_deliverable_project_file(value))
+                self.assertFalse(_is_reviewable_generated_path(value))
+        self.assertEqual(normalize_plan_path("generated_project/pkg/runner.py"), "pkg/runner.py")
+        for value, expected in (("pkg/runner.py", True), (".env.example", True),
+                                (".env", False), ("pkg/__pycache__/runner.pyc", False),
+                                ("review.md", False), ("pkg/debug.log", False)):
+            with self.subTest(value=value):
+                self.assertEqual(_is_deliverable_project_file(value), expected)
+                self.assertEqual(_is_reviewable_generated_path(value), expected)
         self.assertEqual(string_list([" a ", "", 3], limit=2), ["a", "3"])
 
     def test_file_specs_are_ordered_dependencies_first(self) -> None:
@@ -78,20 +101,44 @@ class CodeTaskInterfaceTests(unittest.TestCase):
     def test_dependency_context_exposes_actual_generated_api(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
-            write_text(
-                project / "pkg" / "data.py",
-                "def load_text_classification_splits(config_path=None):\n    return [], {}\n",
-            )
-
-            context = dependency_context(
-                project,
-                {"path": "pkg/runner.py", "dependencies": ["pkg/data.py"]},
-            )
-
+            source = ("# coding: latin-1\n# café\n"
+                "def load_text_classification_splits(config_path=None):\n    return [], {}\n"
+                + "# padding\n" * 20 + "def later_api():\n    return 1\n")
+            (project / "pkg").mkdir()
+            (project / "pkg/data.py").write_bytes(source.encode("latin-1"))
+            from simple_ar.code_task.analysis import source_context as owner
+            with patch.object(owner, "read_code_task_text", wraps=owner.read_code_task_text) as read:
+                context = dependency_context(project,
+                    {"path": "pkg/runner.py", "dependencies": ["pkg/data.py"]}, max_source_chars=30)
+            self.assertEqual(read.call_count, 1)
             dependency = context["dependencies"][0]
             self.assertTrue(dependency["available"])
             self.assertIn("def load_text_classification_splits(config_path=None)", dependency["public_api"])
             self.assertNotIn("load_text_classification_dataset", str(context))
+            # API observation uses the complete decoded file even when its
+            # excerpt is bounded. Generation and repair share the same reader.
+            self.assertIn("def later_api()", dependency["public_api"])
+            self.assertEqual(dependency["source_excerpt"], source[:30])
+            for anchors in ((), (("pkg/data.py", 20), ("pkg/data.py", 21)), (("pkg/data.py", 9999),)):
+                with patch.object(owner, "read_code_task_text", wraps=owner.read_code_task_text) as read:
+                    rows = owner.source_context_for_files(project, ["pkg/data.py"],
+                        max_chars_per_file=100, anchors=anchors, editable_files=[], include_unanchored_tail=True)
+                self.assertEqual(read.call_count, 1)
+                self.assertTrue(rows)
+                self.assertLessEqual(sum(len(row["text"]) for row in rows), 100)
+                for row in rows:
+                    offset = row["source_offset"]
+                    self.assertEqual(row["text"], source[offset:offset + len(row["text"])])
+                    self.assertEqual(row["source_chars"], len(source))
+                    self.assertEqual(row["access_role"], "read_only")
+            write_text(project / "isolated/pyvenv.cfg", "home = python\n")
+            write_text(project / "isolated/hidden.py", "def private_dependency(): pass\n")
+            with patch.object(owner, "read_code_task_text", side_effect=AssertionError("Private source read")):
+                context = dependency_context(project, {"dependencies": ["isolated/hidden.py", "../outside.py"]})
+                self.assertNotIn("public_api", context["dependencies"][0])
+                self.assertEqual(len(context["dependencies"]), 1)
+                self.assertEqual(owner.source_context_for_files(project, ["isolated/hidden.py"],
+                    max_chars_per_file=10, include_unanchored_tail=True), [])
 
     def test_resource_static_flags_fit_inside_nested_loops(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -144,7 +191,7 @@ class CodeTaskInterfaceTests(unittest.TestCase):
     def test_writer_strips_single_markdown_fence_from_file_content(self) -> None:
         class FakeClient:
             def ask_json(self, _system: str, _prompt: str, **_kwargs: object) -> dict[str, str]:
-                return {"content": "```python\nprint('score: 1.0')\n```", "summary": "Fenced but valid Python."}
+                return {"files": [{"path": "main.py", "content": "```python\nprint('score: 1.0')\n```"}], "summary": "Fenced but valid Python."}
 
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp) / "generated_project"
@@ -161,15 +208,57 @@ class CodeTaskInterfaceTests(unittest.TestCase):
 
             self.assertEqual(artifacts["generated_files"][0]["mode"], "llm_repaired")
             self.assertEqual((project / "main.py").read_text(encoding="utf-8"), "print('score: 1.0')\n")
+            write_text(project / "user-notes.md", "Keep the previous delivered project.\n")
+            before = {p.relative_to(project): p.read_bytes() for p in project.rglob("*") if p.is_file()}
+            write_generated_project(
+                project_dir=project,
+                architecture_plan={"files": [{"path": "main.py", "kind": "source", "entrypoint": True}]},
+                result_schema={"required_metrics": ["score"]}, contract={}, memory={},
+                client=FakeClient(), allow_fallback=False,
+            )
+            previous = list(Path(tmp).glob(".generated_project.previous-*"))
+            self.assertEqual(len(previous), 1)
+            self.assertEqual({p.relative_to(previous[0]): p.read_bytes() for p in previous[0].rglob("*") if p.is_file()}, before)
+            self.assertFalse((project / "user-notes.md").exists())
+            self.assertFalse(list(Path(tmp).glob(".generated_project.candidate-*")))
+            current = (project / "main.py").read_bytes()
+            rename = Path.rename
+
+            def reject_candidate(source: Path, target: Path) -> Path:
+                if ".candidate-" in source.name:
+                    raise OSError("simulated publication failure")
+                return rename(source, target)
+
+            with patch.object(Path, "rename", reject_candidate), self.assertRaisesRegex(OSError, "publication failure"):
+                write_generated_project(
+                    project_dir=project,
+                    architecture_plan={"files": [{"path": "main.py", "kind": "source", "entrypoint": True}]},
+                    result_schema={}, contract={}, memory={}, client=FakeClient(),
+                )
+            self.assertEqual((project / "main.py").read_bytes(), current)
+            self.assertEqual(len(list(Path(tmp).glob(".generated_project.previous-*"))), 1)
+            self.assertEqual(len(list(Path(tmp).glob(".generated_project.candidate-*"))), 1)
+            if os.name != "nt":
+                alias = Path(tmp) / "alias"
+                alias.symlink_to(project, target_is_directory=True)
+                with self.assertRaisesRegex(ValueError, "non-symlink"):
+                    write_generated_project(
+                        project_dir=alias,
+                        architecture_plan={}, result_schema={}, contract={}, memory={},
+                    )
+                self.assertEqual((project / "main.py").read_bytes(), current)
 
     def test_writer_records_invalid_file_generation_diagnostics(self) -> None:
         class FakeClient:
             def ask_json(self, _system: str, _prompt: str, **_kwargs: object) -> dict[str, str]:
-                return {"content": "def broken(:\n    pass\n", "summary": "Invalid Python."}
+                return {"files": [{"path": "main.py", "content": "def broken(:\n    pass\n"}], "summary": "Invalid Python."}
 
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp) / "generated_project"
             steps = Path(tmp) / "steps"
+            write_text(project / "main.py", "print('original result')\n")
+            write_text(project / "outputs" / "measurement.json", '{"actual": 7}\n')
+            before = {p.relative_to(project): p.read_bytes() for p in project.rglob("*") if p.is_file()}
             with self.assertRaises(Exception):
                 write_generated_project(
                     project_dir=project,
@@ -186,6 +275,436 @@ class CodeTaskInterfaceTests(unittest.TestCase):
             failure = read_json(steps / "invalid_files" / "main.py" / "attempt-001.json")
             self.assertEqual(failure["validation"]["reason"], "syntax_error")
             self.assertTrue((steps / "invalid_files" / "main.py" / "attempt-001.py").is_file())
+            self.assertEqual({p.relative_to(project): p.read_bytes() for p in project.rglob("*") if p.is_file()}, before)
+            self.assertEqual(len(list(Path(tmp).glob(".generated_project.candidate-*"))), 1)
+            self.assertFalse(list(Path(tmp).glob(".generated_project.previous-*")))
+
+    def test_writer_generates_related_batches_without_a_twelve_file_project_limit(self) -> None:
+        class Client:
+            def __init__(self):
+                self.requests = []
+
+            def ask_json(self, _system, prompt, **kwargs):
+                request = json.loads(prompt)
+                self.requests.append((request, kwargs))
+                return {"files": [
+                    {"path": row["path"], "content": "def value():\n    return 1\n"}
+                    for row in request["planned_files"]], "summary": "Related implementations."}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            client = Client()
+            memory = {"retained": "prior decisions"}
+            files = [{"path": "main.py", "kind": "source"}] + [
+                {"path": f"module_{index}.py", "kind": "source"} for index in range(12)]
+            artifacts = write_generated_project(project_dir=Path(tmp) / "project",
+                architecture_plan={"files": files}, result_schema={}, contract={},
+                memory=memory, client=client, files_per_batch=4)
+            self.assertEqual([len(request["planned_files"]) for request, _ in client.requests], [4, 4, 4, 1])
+            self.assertEqual(len(artifacts["generated_files"]), 13)
+            self.assertEqual(artifacts["schema_version"], "greenfield_code_artifacts.v1")
+            self.assertEqual(artifacts["entrypoint"], "main.py")
+            self.assertEqual(memory["retained"], "prior decisions")
+            self.assertEqual(len(memory["file_summaries"]), 13)
+            self.assertEqual(len(memory["generated_batches"]), 4)
+            self.assertEqual(len(client.requests[1][0]["implementation_memory"]["file_summaries"]), 4)
+            self.assertTrue(all(kwargs["max_output_tokens"] is None for _, kwargs in client.requests))
+            single_unit = Client()
+            large = write_generated_project(project_dir=Path(tmp) / "large_unit",
+                architecture_plan={"files": files}, result_schema={}, contract={},
+                memory={}, client=single_unit, files_per_batch=13)
+            self.assertEqual(len(single_unit.requests), 1)
+            self.assertEqual(len(large["generated_files"]), 13)
+
+    def test_writer_retries_invalid_json_as_one_unit_and_keeps_explicit_fallback(self) -> None:
+        from simple_ar.core.budget import BudgetLedger
+        class Client:
+            def __init__(self, valid_on_retry):
+                self.calls = 0
+                self.valid_on_retry = valid_on_retry
+                self._budget_ledger = BudgetLedger({'llm_requests': 3, 'total_tokens': 300})
+
+            def ask_json(self, _system, prompt, **kwargs):
+                self.calls += 1
+                reservation = str(self.calls)
+                self._budget_ledger.reserve(reservation, {'llm_requests': 1, 'total_tokens': 100})
+                self._budget_ledger.settle(reservation, {'llm_requests': 1, 'total_tokens': 25})
+                if self.calls > 1:
+                    self_feedback = prompt.split("Validation feedback: ")[-1]
+                    assert "JSON" in self_feedback
+                return {"files": [
+                    {"path": "main.py", "content": "print('ok')\n"},
+                    {"path": "config.json", "content": "{}" if self.valid_on_retry and self.calls > 1 else "{broken"}]}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            plan = {"files": [{"path": "main.py", "kind": "source"},
+                {"path": "config.json", "kind": "config"}]}
+            options = dict(project_dir=project, architecture_plan=plan,
+                result_schema={}, contract={}, retry_attempts=3)
+            client = Client(True)
+            artifacts = write_generated_project(**options, memory={}, client=client)
+            self.assertEqual(client.calls, 2)
+            self.assertEqual(client._budget_ledger.remaining('llm_requests'), 1)
+            self.assertEqual(client._budget_ledger.remaining('total_tokens'), 250)
+            self.assertEqual(json.loads((project / "config.json").read_text()), {})
+            self.assertTrue(all(row["mode"] == "llm" for row in artifacts["generated_files"]))
+            before = {p.relative_to(project): p.read_bytes() for p in project.rglob("*") if p.is_file()}
+            memory = {"retained": ["original"]}
+            failed = Client(False)
+            from simple_ar.integrations.llm import LLMError
+            with self.assertRaises(LLMError):
+                write_generated_project(**options, memory=memory, client=failed)
+            self.assertEqual(failed.calls, 3)
+            self.assertEqual(memory, {"retained": ["original"]})
+            self.assertEqual({p.relative_to(project): p.read_bytes() for p in project.rglob("*") if p.is_file()}, before)
+            fallback = Client(False)
+            artifacts = write_generated_project(**options, memory={}, client=fallback, allow_fallback=True)
+            self.assertEqual(fallback.calls, 3)
+            self.assertTrue(all(row["mode"] == "fallback" for row in artifacts["generated_files"]))
+            before = {p.relative_to(project): p.read_bytes() for p in project.rglob("*") if p.is_file()}
+            for status in ('unknown', 'unknown_accounted', 'reserved'):
+                with self.subTest(status=status):
+                    uncertain = Mock()
+                    uncertain.ask_json.return_value = {'files': []}
+                    ledger = BudgetLedger({'llm_requests': 3, 'total_tokens': 300, 'image_requests': 3})
+                    uncertain._budget_ledger = ledger
+                    amounts = {'image_requests': 1} if status != 'unknown' else {'llm_requests': 1, 'total_tokens': 100}
+                    ledger.reserve('prior', amounts)
+                    if status != 'reserved':
+                        ledger.mark_unknown('prior', reason='dispatch unknown',
+                            known_actual=amounts if status == 'unknown_accounted' else None)
+                    if status != 'unknown':
+                        self.assertEqual(ledger.unknown_dimensions(), ())
+                    ledger_before = ledger.to_dict()
+                    with self.assertRaises(ValueError):
+                        write_generated_project(**options, memory=memory, client=uncertain, allow_fallback=True)
+                    self.assertEqual(uncertain.ask_json.call_count, 1)
+                    self.assertEqual(ledger.to_dict(), ledger_before)
+                    self.assertEqual(memory, {"retained": ["original"]})
+                    self.assertEqual({p.relative_to(project): p.read_bytes() for p in project.rglob("*") if p.is_file()}, before)
+
+    def test_generation_failure_ownership_and_completed_json_correction(self) -> None:
+        from simple_ar.code_task.generation.agent_step import run_json_agent_step
+        from simple_ar.code_task.generation.architecture import build_architecture_plan
+        from simple_ar.code_task.generation.writer import write_implementation_unit
+        from simple_ar.core.budget import BudgetLedger, BudgetExceededError
+        from simple_ar.integrations.llm import LLMError, LLMResponseError, LLMStreamError, LLMDeadlineError
+
+        budget_error = LLMError('request admission failed')
+        budget_error.__cause__ = BudgetExceededError('remaining budget')
+        failures = [(LLMError('provider unavailable'), False, False), (budget_error, False, False),
+            (LLMStreamError('partial stream'), True, False),
+            (LLMDeadlineError('deadline; usage unknown'), True, False),
+            (LLMResponseError('completed invalid JSON', raw_response='{broken'), True, False),
+            (LLMResponseError('dispatch unknown but dimensions accounted', raw_response='{broken'), 'unknown_accounted', False),
+            (LLMResponseError('pending operation', raw_response='{broken'), 'reserved', False),
+            (LLMError('provider failed during correction'), False, True)]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / 'project'
+            write_text(project / 'main.py', "print('original')\n")
+            original = (project / 'main.py').read_bytes()
+            for owner in ('step', 'compact', 'tool_agent', 'legacy_writer', 'native_writer'):
+                for error, unknown, correction in failures:
+                    with self.subTest(owner=owner, error=type(error).__name__, status=unknown):
+                        ledger = BudgetLedger({'llm_requests': 10, 'total_tokens': 1000})
+                        ledger.reserve('prior', {'llm_requests': 1, 'total_tokens': 100})
+                        # A completed response may coexist with a prior unknown charge.
+                        if unknown in ('unknown_accounted', 'reserved'):
+                            ledger.settle('prior', {'llm_requests': 1, 'total_tokens': 25})
+                            ledger.reserve('image', {'image_requests': 1})
+                            if unknown == 'unknown_accounted':
+                                ledger.mark_unknown('image', reason='dispatch unknown', known_actual={'image_requests': 1})
+                            self.assertEqual(ledger.unknown_dimensions(), ())
+                        elif unknown:
+                            ledger.mark_unknown('prior', reason='retained uncertain charge')
+                        else:
+                            ledger.settle('prior', {'llm_requests': 1, 'total_tokens': 25})
+                        before = ledger.to_dict()
+                        client = Mock()
+                        client._budget_ledger = ledger
+                        client.ask_json.side_effect = ([LLMResponseError('invalid JSON', raw_response='{broken'), error]
+                            if correction else error)
+                        memory = {'retained': True}
+                        with self.assertRaises(type(error)) as caught:
+                            if owner == 'step':
+                                run_json_agent_step(client=client, system='JSON', prompt='goal',
+                                    label='unit', stage='unit', attempt_index=1, retry_attempts=3,
+                                    max_output_tokens=100, artifact_dir=root / owner)
+                            elif owner in ('compact', 'tool_agent'):
+                                build_architecture_plan(contract={}, result_schema={}, resource_plan={},
+                                    domain_profile={}, client=client, planning_mode=owner,
+                                    retry_attempts=3, allow_fallback=True, planning_dir=root / owner)
+                            elif owner == 'legacy_writer':
+                                write_generated_project(project_dir=project,
+                                    architecture_plan={'files': [{'path': 'main.py', 'kind': 'source'}]},
+                                    result_schema={}, contract={}, memory=memory, client=client,
+                                    retry_attempts=3, allow_fallback=True, agent_step_dir=root / owner)
+                            else:
+                                write_implementation_unit(project_dir=project, goal='goal',
+                                    files=[{'path': 'main.py'}], source_windows=[], client=client,
+                                    artifact_dir=root / owner)
+                        self.assertIs(caught.exception, error)
+                        self.assertEqual(client.ask_json.call_count, 2 if correction else 1)
+                        self.assertEqual(ledger.to_dict(), before)
+                        self.assertEqual(memory, {'retained': True})
+                        self.assertEqual((project / 'main.py').read_bytes(), original)
+
+            client = Mock()
+            ledger = BudgetLedger({'llm_requests': 2, 'total_tokens': 200})
+            client._budget_ledger = ledger
+            def complete(*_args, **_kwargs):
+                reservation = str(client.ask_json.call_count)
+                ledger.reserve(reservation, {'llm_requests': 1, 'total_tokens': 100})
+                ledger.settle(reservation, {'llm_requests': 1, 'total_tokens': 25})
+                if client.ask_json.call_count == 1:
+                    raise LLMResponseError('invalid JSON', raw_response='{broken')
+                return {'ok': True}
+            client.ask_json.side_effect = complete
+            steps = root / 'corrected'
+            result = run_json_agent_step(client=client, system='JSON', prompt='goal', label='unit',
+                stage='unit', attempt_index=1, retry_attempts=2, max_output_tokens=100, artifact_dir=steps)
+            self.assertEqual(result, {'ok': True})
+            self.assertEqual(client.ask_json.call_count, 2)
+            self.assertEqual(ledger.remaining('llm_requests'), 0)
+            self.assertEqual(ledger.remaining('total_tokens'), 150)
+            self.assertNotIn('transport failed', client.ask_json.call_args.args[1])
+            self.assertEqual(read_json(steps / 'unit/attempt-001-response-001.json')['raw_response'], '{broken')
+            rows = read_jsonl(steps / 'agent_steps.jsonl')
+            self.assertEqual([row['status'] for row in rows], ['failed', 'passed'])
+            self.assertNotEqual(rows[0]['prompt_sha256'], rows[1]['prompt_sha256'])
+
+    def test_writer_line_limit_and_bad_file_set_never_publish_or_register_memory(self) -> None:
+        class Client:
+            def __init__(self, rows):
+                self.rows = rows
+                self.calls = 0
+
+            def ask_json(self, *_args, **_kwargs):
+                self.calls += 1
+                return {"files": self.rows}
+
+        from simple_ar.integrations.llm import LLMError
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            write_text(project / "main.py", "print('original')\n")
+            for rows, limit in (
+                ([{"path": "main.py", "content": "a = 1\n"},
+                  {"path": "helper.py", "content": "a = 1\nb = 2\n"}], 2),
+                ([{"path": "../escape.py", "content": "a = 1\n"}], 100),
+                ([], 100),
+            ):
+                with self.subTest(rows=rows):
+                    client = Client(rows)
+                    memory = {"prior": True}
+                    with self.assertRaises(LLMError):
+                        write_generated_project(project_dir=project,
+                            architecture_plan={"files": [{"path": row["path"], "kind": "source"}
+                                for row in rows] if limit == 2 else [{"path": "main.py", "kind": "source"}]},
+                            result_schema={}, contract={}, memory=memory,
+                            client=client, max_generated_lines=limit, retry_attempts=2)
+                    self.assertEqual(memory, {"prior": True})
+                    self.assertEqual((project / "main.py").read_text(), "print('original')\n")
+                    self.assertFalse((Path(tmp) / "escape.py").exists())
+
+    def test_shared_unit_retains_exact_replacements_and_single_attempt_policy(self) -> None:
+        from simple_ar.code_task.generation.writer import write_implementation_unit
+        class Client:
+            def __init__(self, rows):
+                self.rows = rows
+                self.calls = 0
+                self.requests = []
+
+            def ask_json(self, *_args, **_kwargs):
+                self.calls += 1
+                self.requests.append(json.loads(_args[1]))
+                return {"files": self.rows, "unresolved": []}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original = "VALUE = 1\n# preserve this note\n"
+            client = Client([{"path": "module.py", "replacements": [
+                {"old_text": "VALUE = 1", "new_text": "VALUE = 2"}]}])
+            observations = [{'record': 'records/failed/native_result.json',
+                'arguments': {'argv': ['python', 'check.py'], 'cwd': '/candidate'},
+                'result': {'status': 'ok', 'data': {'returncode': 1,
+                    'stdout': '', 'stderr': 'AssertionError: actual behavior differs\n'}}}]
+            result = write_implementation_unit(project_dir=root / "unit", goal="Change value",
+                files=[{"path": "module.py"}], source_windows=[], client=client,
+                artifact_dir=root / "steps", original_files={"module.py": {"text": original}},
+                execution_observations=observations)
+            self.assertEqual(client.calls, 1)
+            self.assertEqual(client.requests[0]['execution_observations'], observations)
+            self.assertEqual((root / "unit/module.py").read_text(), "VALUE = 2\n# preserve this note\n")
+            self.assertEqual(result["unresolved"], [])
+            invalid = Client([{"path": "module.py", "content": "def broken(:\n"}])
+            with self.assertRaises(SyntaxError):
+                write_implementation_unit(project_dir=root / "unit", goal="New module",
+                    files=[{"path": "module.py"}], source_windows=[], client=invalid, artifact_dir=root / "failed")
+            self.assertEqual(invalid.calls, 1)
+            self.assertEqual((root / "unit/module.py").read_text(), "VALUE = 2\n# preserve this note\n")
+
+    def test_implementation_owner_selects_new_files_and_preserves_input_recovery(self) -> None:
+        from simple_ar.core.budget import BudgetLedger
+        from simple_ar.tools.implementation import ImplementationRequest, ImplementationToolGateway
+        from simple_ar.tools.workspace import WorkspaceToolGateway
+
+        for inputs in ('goal', 'windows', 'project', 'saved_project', 'explicit'):
+            with self.subTest(inputs=inputs), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = root / 'source'
+                original = 'VALUE = 1\n# Preserve the complete original.\n'
+                write_text(source / 'library.py', original)
+                write_text(source / 'method.txt', 'Original method definition.\n')
+                ledger = BudgetLedger({'llm_requests': 2})
+                workspace = WorkspaceToolGateway(root, {'source': source}, ledger)
+                output = workspace.resolve('workspace/implementations/unit', write=True)
+                owner = root / 'attempts/unit/implementation'
+                arguments = {'goal': 'Create a library and usage documentation.'}
+                selected = [{'path': 'library.py', 'purpose': 'Library implementation.'},
+                            {'path': 'USAGE.md', 'purpose': 'Usage documentation.'}]
+                if inputs == 'windows':
+                    arguments['source_windows'] = [{'path': 'source/method.txt'}]
+                if inputs in ('project', 'saved_project'):
+                    arguments['project_path'] = 'source'
+                if inputs == 'explicit':
+                    arguments['files'] = selected
+                if inputs == 'saved_project':
+                    # Retained pre-change selection shape: restore without
+                    # reinspection or adding fields to its durable binding.
+                    inventory = workspace.bind_inventory(source.resolve(), identity='unit')
+                    saved_input = {'request': ImplementationRequest.model_validate(arguments).model_dump(),
+                        'source_windows': [], **inventory}
+                    saved_files = [dict(selected[0], source_path=str((source / 'library.py').resolve()),
+                        source_sha256=inventory['file_hashes'][str((source / 'library.py').resolve())]), selected[1]]
+                    write_json(owner / 'selection-input.json', saved_input)
+                    write_json(owner / 'selection-response.json', {'files': selected})
+                    write_json(owner / 'selection.json', {'input': saved_input, 'files': saved_files,
+                        'coverage': {'inventory_scope': inventory['inventory_scope']},
+                        'source_context': [], 'declared_project': {}})
+                client = Mock()
+                client._budget_ledger = ledger
+                factory = Mock(return_value=client)
+                observations = Mock(return_value=[{'result': {'data': {'returncode': 1,
+                    'stderr': 'Original diagnostic.\n'}}}])
+
+                def respond(_system, prompt, *, label, **_kwargs):
+                    ledger.reserve(label, {'llm_requests': 1})
+                    ledger.settle(label, {'llm_requests': 1})
+                    request = json.loads(prompt)
+                    if label == 'implementation-selection':
+                        self.assertFalse(output.exists())
+                        self.assertEqual(request['goal'], arguments['goal'])
+                        if inputs in ('goal', 'windows'):
+                            self.assertIsNone(request['project_path'])
+                            self.assertNotIn('project_index', request)
+                        if inputs == 'windows':
+                            self.assertIn('Original method definition.', str(request['source_windows']))
+                        return {'files': selected}
+                    self.assertEqual([row['path'] for row in request['planned_files']],
+                        ['library.py', 'USAGE.md'])
+                    self.assertEqual(request['execution_observations'], observations.return_value)
+                    if inputs in ('project', 'saved_project'):
+                        self.assertEqual(request['original_files']['library.py']['text'], original)
+                        implementation = {'path': 'library.py', 'replacements': [
+                            {'old_text': 'VALUE = 1', 'new_text': 'VALUE = 2'}]}
+                    else:
+                        self.assertEqual(request['original_files'], {})
+                        implementation = {'path': 'library.py', 'content': 'VALUE = 2\n'}
+                    if inputs == 'windows':
+                        self.assertIn('Original method definition.', str(request['source_windows']))
+                    return {'files': [implementation, {'path': 'USAGE.md', 'content': '# Usage\n'}],
+                        'unresolved': ['Execution remains to be verified.']}
+
+                client.ask_json.side_effect = respond
+                gateway = ImplementationToolGateway(root, workspace, ledger, 'model', 'session',
+                    client_factory=factory, execution_observations=observations)
+                with patch.object(workspace, 'bind_inventory', wraps=workspace.bind_inventory) as inventory_calls:
+                    if inputs == 'saved_project':
+                        with patch('simple_ar.code_task.generation.selection.implementation_selection_context',
+                                   side_effect=AssertionError('Use retained selection')):
+                            result = gateway.call('prepare_implementation', arguments, identity='unit')
+                    else:
+                        result = gateway.call('prepare_implementation', arguments, identity='unit')
+                    self.assertEqual(result.status, 'ok', result.error)
+                    if inputs in ('goal', 'windows', 'explicit'):
+                        inventory_calls.assert_not_called()
+                self.assertEqual((source / 'library.py').read_text(), original)
+                self.assertEqual((output / 'library.py').read_text(),
+                    original.replace('VALUE = 1', 'VALUE = 2') if inputs in ('project', 'saved_project') else 'VALUE = 2\n')
+                self.assertFalse((output / 'main.py').exists())
+                self.assertEqual(result.data['unresolved'], ['Execution remains to be verified.'])
+                self.assertEqual(client.ask_json.call_count, 1 if inputs in ('saved_project', 'explicit') else 2)
+                self.assertEqual(ledger.remaining('llm_requests'), 1 if inputs in ('saved_project', 'explicit') else 0)
+                factory.assert_called_once_with('unit')
+                if inputs == 'explicit':
+                    binding = read_json(owner / 'request.json')
+                    self.assertNotIn('selection', binding)
+                    self.assertEqual(binding['request'], {**arguments, 'source_windows': []})
+                retained = {path: path.read_bytes() for path in owner.rglob('*.json')}
+                before = ledger.to_dict()
+                # Recover with changed history and no model connection.
+                gateway.client_factory = Mock(side_effect=AssertionError('No redispatch'))
+                observations.return_value = []
+                restored = gateway.call('prepare_implementation', arguments, identity='unit')
+                self.assertEqual(restored.model_dump(), result.model_dump())
+                self.assertEqual(ledger.to_dict(), before)
+                self.assertEqual({path: path.read_bytes() for path in retained}, retained)
+                changed = gateway.call('prepare_implementation', dict(arguments, goal='Different goal'), identity='unit')
+                self.assertEqual(changed.status, 'error')
+                if inputs == 'windows':
+                    write_text(source / 'method.txt', 'Changed method definition.\n')
+                    self.assertEqual(gateway.call('prepare_implementation', arguments, identity='unit').status, 'error')
+                if inputs in ('project', 'saved_project'):
+                    write_text(source / 'library.py', 'VALUE = 3\n')
+                    self.assertEqual(gateway.call('prepare_implementation', arguments, identity='unit').status, 'error')
+                write_text(output / 'USAGE.md', '# Changed candidate\n')
+                self.assertEqual(gateway.call('prepare_implementation', arguments, identity='unit').status, 'error')
+                self.assertEqual(ledger.to_dict(), before)
+
+    def test_implementation_selection_keeps_permissions_budget_and_no_replay(self) -> None:
+        from simple_ar.core.budget import BudgetLedger
+        from simple_ar.integrations.llm import LLMStreamError
+        from simple_ar.tools.implementation import ImplementationToolGateway
+        from simple_ar.tools.workspace import WorkspaceToolGateway
+
+        for failure in ('traversal', 'private', 'missing_project', 'overlap',
+                        'unknown_selection', 'unknown_writer', 'budget'):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                ledger = BudgetLedger({'llm_requests': 1 if failure == 'budget' else 2})
+                workspace = WorkspaceToolGateway(root, {}, ledger)
+                arguments = {'goal': 'Create a library.'}
+                if failure in ('missing_project', 'overlap'):
+                    arguments['project_path'] = 'workspace/missing' if failure == 'missing_project' else 'workspace'
+                client = Mock()
+                client._budget_ledger = ledger
+
+                def respond(_system, _prompt, *, label, **_kwargs):
+                    ledger.reserve(label, {'llm_requests': 1})
+                    if ((failure == 'unknown_selection' and label == 'implementation-selection')
+                            or (failure == 'unknown_writer' and label == 'implementation-unit')):
+                        ledger.mark_unknown(label, reason='Interrupted response')
+                        raise LLMStreamError('Incomplete response')
+                    ledger.settle(label, {'llm_requests': 1})
+                    path = '../escape.py' if failure == 'traversal' else '.env' if failure == 'private' else 'library.py'
+                    return {'files': [{'path': path, 'purpose': 'Library implementation.'}]}
+
+                client.ask_json.side_effect = respond
+                gateway = ImplementationToolGateway(root, workspace, ledger, 'model', 'session',
+                    client_factory=Mock(return_value=client))
+                result = gateway.call('prepare_implementation', arguments, identity='unit')
+                self.assertEqual(result.status, 'error')
+                calls = client.ask_json.call_count
+                self.assertEqual(calls, 0 if failure in ('missing_project', 'overlap')
+                    else 2 if failure in ('unknown_writer', 'budget') else 1)
+                self.assertFalse((workspace.workspace / 'implementations/unit').exists())
+                before = ledger.to_dict()
+                self.assertEqual(gateway.call('prepare_implementation', arguments, identity='unit').status, 'error')
+                self.assertEqual(client.ask_json.call_count, calls)
+                self.assertEqual(ledger.to_dict(), before)
+                if failure.startswith('unknown'):
+                    self.assertTrue(ledger.unknown_dimensions())
 
     def test_review_accepts_runtime_placeholders_as_runtime_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -578,55 +1097,132 @@ class CodeTaskInterfaceTests(unittest.TestCase):
             self.assertEqual(review["status"], "failed")
             self.assertTrue(any(row["category"] == "mixed_generation_fallback" for row in review["findings"]))
 
-    def test_review_blocks_missing_explicit_greenfield_task_surface(self) -> None:
+    def _task_surface_review_inputs(self, project: Path) -> dict:
+        write_text(
+            project / "main.py",
+            "from pathlib import Path\n"
+            "class ExperimentSummary:\n    pass\n"
+            "def final_metrics_from_evaluation():\n    return {'best_score': 1.0}\n"
+            "def main(output_root):\n"
+            "    for stem, suffix in [('results', 'json'), ('report', 'md'), ('condition_results', 'jsonl')]:\n"
+            "        (Path(output_root) / (stem + '.' + suffix)).write_text('{}')\n"
+            "    return {'best_score': 1.0, 'task_count': 1}\n",
+        )
+        return {
+            "project_dir": project,
+            "code_artifacts": {"generated_files": [{"path": "main.py", "mode": "llm", "line_count": 10}]},
+            "result_schema": {"required_metrics": ["best_score", "task_count"]},
+            "resource_plan": {"max_files": 4, "max_generated_lines": 200},
+            "dependency_advice": {
+                "packages": [{"package": "sample-lib", "import_name": "sample_lib", "status": "installed"}],
+            },
+            "use_llm": False,
+        }
+
+    def test_review_does_not_infer_task_acceptance_from_prose(self) -> None:
+        tasks = {
+            "legacy_phrasing": (
+                "Create README.md, self-check, list-datasets, list-models, --mode report; "
+                "prefer sample-lib when available; at least two tasks; single authoritative reporting; "
+                "artifacts/results.json, artifacts/report.md, artifacts/condition_results.jsonl."
+            ),
+            "arbitrary_phrasing": (
+                "Expose inspect-corpus and summarize-run; write exports/findings.ndjson; "
+                "use another-library if installed; run a varied suite."
+            ),
+            "negation": (
+                "Do not add self-check, list-datasets, list-models, or --mode report. "
+                "README.md and artifacts/results.json are obsolete examples. "
+                "Avoid sample-lib even when available; do not require multiple tasks."
+            ),
+            "indirect_paths": (
+                "Write artifacts/results.json, artifacts/report.md, artifacts/condition_results.jsonl "
+                "by joining the caller's output directory with computed stems and extensions."
+            ),
+        }
         with tempfile.TemporaryDirectory() as tmp:
-            project = Path(tmp)
-            write_text(project / "main.py", "def main():\n    print('best_score: 1.0')\n")
-            write_text(project / "generated_experiment" / "__init__.py", "")
-            write_text(
-                project / "generated_experiment" / "runner.py",
-                "def run_experiment():\n    return {'best_score': 1.0, 'task_count': 1.0}\n",
-            )
+            inputs = self._task_surface_review_inputs(Path(tmp))
+            for name, task in tasks.items():
+                with self.subTest(name=name):
+                    review = review_generated_project(**inputs, contract={"task": task})
+                    self.assertFalse(any(row["severity"] == "blocking" for row in review["findings"]))
+                    self.assertFalse(review["findings"])
+                    self.assertEqual(review["metadata"]["task_acceptance"], "not_verified")
+                    self.assertEqual(review["metadata"]["deterministic_review_scope"],
+                                     "structural_checks_and_scaffold_risks")
+            self.assertTrue(is_current_greenfield_review(review))
+            previous = dict(review, metadata=dict(review["metadata"],
+                            review_contract_version=GREENFIELD_REVIEW_CONTRACT_VERSION - 1))
+            saved = json.dumps(previous, sort_keys=True)
+            self.assertFalse(is_current_greenfield_review(previous))
+            self.assertEqual(json.dumps(previous, sort_keys=True), saved)
 
+    def test_review_still_blocks_missing_structured_obligation_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            inputs = self._task_surface_review_inputs(Path(tmp))
             review = review_generated_project(
-                project_dir=project,
-                code_artifacts={
-                    "generated_files": [
-                        {"path": "main.py", "mode": "llm", "line_count": 2},
-                        {"path": "generated_experiment/__init__.py", "mode": "llm", "line_count": 1},
-                        {"path": "generated_experiment/runner.py", "mode": "llm", "line_count": 2},
-                    ]
-                },
-                result_schema={"primary_metric": "best_score", "required_metrics": ["best_score", "task_count"]},
-                resource_plan={"max_files": 16, "max_generated_lines": 2000},
-                contract={
-                    "objective": "Greenfield analysis suite",
-                    "task": (
-                        "Create README.md, self-check, prefer sample-lib/sample_lib when available, "
-                        "at least two tasks, artifacts/results.json, artifacts/report.md, "
-                        "and artifacts/condition_results.jsonl."
-                    ),
-                },
-                dependency_advice={
-                    "packages": [
-                        {
-                            "package": "sample-lib",
-                            "import_name": "sample_lib",
-                            "status": "installed",
-                            "matched_terms": ["sample-lib", "sample_lib"],
-                        }
-                    ]
-                },
-                use_llm=False,
+                **inputs,
+                contract={"implementation_contract": {"obligations": [{
+                    "id": "export-findings", "requirement": "Export the findings.",
+                    "owner_files": ["exporter.py"],
+                }]}},
+            )
+            self.assertEqual(review["status"], "failed")
+            self.assertEqual(
+                [(row["category"], row["severity"]) for row in review["findings"]],
+                [("implementation_obligation_owner_missing", "blocking")],
             )
 
-            categories = {row["category"] for row in review["findings"]}
-            self.assertEqual(review["status"], "failed")
-            self.assertIn("missing_required_artifact", categories)
-            self.assertIn("missing_artifact_writer", categories)
-            self.assertIn("missing_cli_mode", categories)
-            self.assertIn("missing_requested_dependency_path", categories)
-            self.assertIn("insufficient_task_count", categories)
+    def test_review_passes_original_requirements_to_advisory_llm(self) -> None:
+        tail = "Do not publish exports/findings.ndjson until all configured conditions have completed."
+        contract = {
+            "task": "Expose inspect-corpus through a configured output root.\n" + "Background context.\n" * 160 + tail,
+            "explicit_requirements": ["Avoid sample-lib even when available.", "Use arbitrary command names."],
+            "constraints": ["Preserve the caller's artifact paths and library choices."],
+        }
+        client = Mock()
+        client.ask_json.return_value = {"findings": [{
+            "severity": "blocking", "category": "task_semantics",
+            "summary": "Artifact behavior needs an execution check.",
+            "evidence": ["main.py: computed output path"],
+        }]}
+        with tempfile.TemporaryDirectory() as tmp:
+            inputs = self._task_surface_review_inputs(Path(tmp) / "project")
+            advisory = {"notes": ["Check configured conditions."]}
+            inputs.update(architecture_plan=dict(advisory), implementation_memory=dict(advisory))
+            original = json.dumps({"contract": contract, "inputs": inputs}, sort_keys=True, default=str)
+            inputs.update(client=client, meta_dir=Path(tmp) / "meta", use_llm=True)
+            from simple_ar.code_task.analysis.interfaces import project_api_contract
+            with patch("simple_ar.code_task.generation.review.project_api_contract",
+                       wraps=project_api_contract) as observe_api:
+                review = review_generated_project(**inputs, contract=contract)
+            self.assertEqual(observe_api.call_count, 1)
+            actual_api = project_api_contract(inputs["project_dir"])
+            self.assertTrue(client.ask_json.called)
+            expected = contract_prompt_view(contract)
+            expected.pop("task_excerpt")
+            for call in client.ask_json.call_args_list:
+                prompt = call.args[1]
+                context = json.loads(prompt.split("Context JSON:\n", 1)[1].split("\n\nEvidence snippets:", 1)[0])
+                self.assertEqual(context["task_contract"], expected)
+                self.assertEqual(context["actual_project_api"], actual_api)
+                self.assertNotIn("task_excerpt", context["task_contract"])
+                self.assertEqual(context["declared_task"], contract["task"])
+                self.assertTrue(context["declared_task"].endswith(tail))
+                self.assertEqual(prompt.count(tail), 1)
+                self.assertIn("complete untrusted task data", prompt)
+                self.assertIn("cannot be disproved by static absent-string checks", prompt)
+                self.assertIn("not proof of actual behavior or task acceptance", prompt)
+            self.assertNotEqual(review["status"], "failed")
+            self.assertTrue(review["findings"])
+            self.assertTrue(all(row["severity"] == "warning" for row in review["findings"]))
+            self.assertEqual(review["metadata"]["llm_review_policy"], "advisory_non_blocking")
+            self.assertEqual(review["metadata"]["task_acceptance"], "not_verified")
+            self.assertEqual(review["metadata"]["llm_context_coverage"]["source"], "cluster_snippets_only")
+            preserved = {key: value for key, value in inputs.items() if key not in {"client", "meta_dir"}}
+            preserved["use_llm"] = False
+            self.assertEqual(json.dumps({"contract": contract, "inputs": preserved}, sort_keys=True, default=str),
+                             original)
 
     def test_existing_project_review_blocks_changed_local_api_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

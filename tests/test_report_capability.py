@@ -12,7 +12,7 @@ from simple_ar.report.audit import (
     ReportAuditCapabilityRequest,
     run_report_audit_capability,
 )
-from simple_ar.report.capability import ReportAssemblyRequest, run_report_capability, assemble_report_document, preview_report_document
+from simple_ar.report.capability import ReportAssemblyMode, ReportAssemblyRequest, run_report_capability, assemble_report_document, preview_report_document
 from simple_ar.report.figures import ReportFigureRecord, ReportFigureResult
 from simple_ar.report.schema import (
     ReportContext,
@@ -142,38 +142,6 @@ class ReportAuditCapabilityTests(unittest.TestCase):
         self.assertNotIn("accuracy", titles)
         self.assertTrue(result.figures[0].title.startswith("rmse"))
 
-    def test_report_capability_assembles_explicit_sections(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            registry = CapabilityRegistry()
-            registry.register("report", run_report_capability)
-            controller = SessionController.create(
-                tmp,
-                session_id="report-session",
-                topic="offline report",
-                profile="paper_audit",
-                registry=registry,
-            )
-
-            result = controller.execute_attempt(
-                "report",
-                attempt_id="attempt-001",
-                request=ReportAssemblyRequest(
-                    title="Offline report",
-                    sections=(
-                        ReportSectionDraft(
-                            section_id="introduction",
-                            heading="Introduction",
-                            draft_markdown="Evidence-backed claim [@paper-1].",
-                        ),
-                    ),
-                ),
-            )
-
-            self.assertEqual(result.status, "completed")
-            self.assertIn("Evidence-backed claim", controller.store.read_text(
-                "attempts/attempt-001/report.md"
-            ))
-
     def test_report_capability_persists_verified_reference_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             registry = CapabilityRegistry()
@@ -250,6 +218,21 @@ class ReportAuditCapabilityTests(unittest.TestCase):
             self.assertEqual(audit_result.status, "failed")
             audit = audit_store.read_json("report_audit.json")
             self.assertIn("missing", audit["citation_audit"]["unknown_citations"])
+            # Empty bibliographies use the same citation owner; absence of
+            # registered papers must not let invented keys survive assembly.
+            unregistered_request = ReportAssemblyRequest(title="Supplied analysis",
+                sections=(ReportSectionDraft(section_id="results", heading="Results",
+                    draft_markdown="[Dataset](https://example.test/data) [@P1]."),))
+            unregistered = preview_report_document(unregistered_request)
+            self.assertNotIn("@P1", unregistered.report_body_markdown)
+            self.assertIn("https://example.test/data", unregistered.report_body_markdown)
+            self.assertEqual(unregistered.removed_citations, ("P1",))
+            delivery = controller.execute_attempt("report", attempt_id="attempt-002",
+                request=unregistered_request)
+            self.assertEqual(delivery.status, "completed")
+            self.assertIn("https://example.test/data", controller.store.read_text("attempts/attempt-002/report.md"))
+            self.assertEqual(controller.store.read_json("attempts/attempt-002/citation_map.json")["entries"], [])
+            self.assertEqual(controller.store.read_text("attempts/attempt-002/report_body.md"), unregistered.report_body_markdown)
 
     def test_report_capability_renders_only_planned_figures(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -269,6 +252,7 @@ class ReportAuditCapabilityTests(unittest.TestCase):
                 request=ReportAssemblyRequest(
                     title="Offline report",
                     template_name="paper",
+                    papers=({"id": "paper-1", "title": "Supplied source"},),
                     config=ReportRuntimeConfig(
                         figures=ReportFigureConfig(enabled=True)
                     ),
@@ -343,15 +327,19 @@ class ReportAuditCapabilityTests(unittest.TestCase):
                 attempt_id="attempt-001",
                 request=ReportAssemblyRequest(
                     title="Offline report",
+                    papers=({"id": "p1", "title": "Caption source"},
+                            {"id": "p2", "title": "Body source"},
+                            {"id": "unused", "title": "Unused source"}),
+                    citation_key_map={"P1": "p1", "P2": "p2"},
                     sections=(
                         ReportSectionDraft(
                             section_id="introduction",
                             heading="Introduction",
-                            draft_markdown="A short report.",
+                            draft_markdown="A short report [@P2].",
                         ),
                     ),
                 ),
-                figure_renderer=_MissingFigureRenderer(),
+                figure_renderer=_MissingFigureRenderer(caption="Caption evidence [@p1]."),
             )
 
             self.assertEqual(result.status, "partial")
@@ -360,6 +348,20 @@ class ReportAuditCapabilityTests(unittest.TestCase):
             self.assertEqual(len(figure_refs), 1)
             self.assertEqual(figure_refs[0].status, "missing")
             self.assertEqual(controller.manifest.status, "running")
+            report = controller.store.read_text("attempts/attempt-001/report.md")
+            body = controller.store.read_text("attempts/attempt-001/report_body.md")
+            entries = controller.store.read_json("attempts/attempt-001/citation_map.json")["entries"]
+            self.assertEqual([(row["paper_id"], row["number"], row["model_key"]) for row in entries],
+                             [("p1", 1, "P1"), ("p2", 2, "P2")])
+            self.assertIn("Caption evidence [1].", report)
+            self.assertIn("A short report [2].", report)
+            self.assertIn("Caption evidence [@p1].", body)
+            self.assertNotIn("Unused source", report)
+            bib = controller.store.read_text("attempts/attempt-001/references.bib")
+            self.assertIn("@misc{p1", bib)
+            self.assertIn("@misc{p2", bib)
+            self.assertNotIn("@misc{unused", bib)
+            self.assertEqual(result.usage["cited_paper_count"], 2)
 
     def test_assembly_uses_frozen_title_and_preserves_legacy_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -390,6 +392,103 @@ class ReportAuditCapabilityTests(unittest.TestCase):
             for plan in (None, ReportDocumentPlan.model_validate({"schema_version": "report_document_plan.v1"})):
                 legacy = assemble_report_document(replace(request, document_plan=plan), report_dir=root)
                 self.assertTrue(legacy.report_markdown.startswith("# Long task instructions, not an article title\n"))
+
+    def test_whole_article_preserves_structure_through_preview_and_delivery(self) -> None:
+        code = '````text\n# Literal title\n## References\n```\nvalue with two spaces  \n````'
+        article = ('# Authored title\n\n## Findings\n\nSupported claim [@P1].\n\n'
+                   '### Calibration\n\n#### Limits\n\n' + code +
+                   '\n\n## Discussion\n\nBounded interpretation.\n\n'
+                   '## References\n\nObsolete bibliography.')
+        request = ReportAssemblyRequest(title="Task instructions", assembly_mode="whole_article",
+            document_plan=ReportDocumentPlan(title="Canonical title"),
+            sections=(ReportSectionDraft(section_id="arbitrary-unit", heading="Transport label",
+                draft_markdown=article, status="revised"),),
+            config=ReportRuntimeConfig(section_numbering="academic", figures=ReportFigureConfig(enabled=False)),
+            papers=({"id": "paper-1", "title": "Recorded source"},),
+            citation_key_map={"P1": "paper-1"})
+        preview = preview_report_document(request)
+        self.assertEqual(request.assembly_mode, ReportAssemblyMode.WHOLE_ARTICLE)
+        self.assertTrue(preview.report_body_markdown.startswith("# Canonical title\n"))
+        self.assertEqual(preview.report_body_markdown.count("# Canonical title\n"), 1)
+        self.assertNotIn("Authored title", preview.report_body_markdown)
+        self.assertNotIn("Transport label", preview.report_body_markdown)
+        self.assertIn("## Findings\n", preview.report_body_markdown)
+        self.assertIn("### Calibration\n\n#### Limits", preview.report_body_markdown)
+        self.assertIn(code, preview.report_body_markdown)
+        self.assertIn(code, preview.report_markdown)
+        self.assertIn("Supported claim [@paper-1].", preview.report_body_markdown)
+        self.assertIn("Supported claim [1].", preview.report_markdown)
+        self.assertIn("## 1 Findings\n", preview.report_markdown)
+        self.assertIn("### 1.1 Calibration\n\n#### 1.1.1 Limits", preview.report_markdown)
+        self.assertIn("## 2 Discussion\n", preview.report_markdown)
+        self.assertNotIn("Obsolete bibliography", preview.report_markdown)
+        self.assertIn("Recorded source", preview.references_markdown)
+        # Neither identity nor a matching transport label determines form.
+        for heading in ("Canonical title", "Unrelated label"):
+            relabeled = replace(request, sections=(request.sections[0].model_copy(
+                update={"section_id": "another-unit", "heading": heading}),))
+            self.assertEqual(preview_report_document(relabeled), preview)
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(assemble_report_document(request, report_dir=Path(tmp)), preview)
+            store = ArtifactStore(Path(tmp) / "delivery")
+            delivered = run_report_capability(
+                context=CapabilityContext(store=store, attempt=AttemptManifest("article")), request=request)
+            self.assertEqual(delivered.status, "completed")
+            self.assertEqual(delivered.provenance["assembly"], "whole_article")
+            self.assertEqual(store.read_text("report.md"), preview.report_markdown)
+            self.assertEqual(store.read_text("report_body.md"), preview.report_body_markdown)
+            self.assertEqual(store.read_json("citation_map.json")["entries"][0]["paper_id"], "paper-1")
+
+    def test_whole_article_without_authored_title_and_legacy_defaults(self) -> None:
+        section = ReportSectionDraft(section_id="arbitrary-unit", heading="Report",
+            draft_markdown="## Findings\n\n### Calibration\n\nAn observation.")
+        request = ReportAssemblyRequest(title="Report", sections=(section,),
+            config={"section_numbering": "off", "figures": {"enabled": False}})
+        self.assertEqual(request.assembly_mode, ReportAssemblyMode.SECTION_DRAFTS)
+        legacy = preview_report_document(request).report_body_markdown
+        self.assertEqual(legacy, "# Report\n\n### Findings\n\n### Calibration\n\nAn observation.\n")
+        whole = preview_report_document(replace(request, assembly_mode="whole_article")).report_body_markdown
+        self.assertEqual(whole, "# Report\n\n" + section.draft_markdown + "\n")
+        wrapped = preview_report_document(replace(request, sections=(section.model_copy(
+            update={"heading": "Results"}),))).report_body_markdown
+        self.assertIn("## Results\n\n### Findings", wrapped)
+        mapped = replace(request, sections=(section.model_dump(mode="json"),), assembly_mode="whole_article")
+        self.assertEqual(preview_report_document(mapped).report_body_markdown, whole)
+
+    def test_whole_article_refuses_incomplete_or_ambiguous_inputs(self) -> None:
+        section = ReportSectionDraft(section_id="unit", heading="Label", draft_markdown="## Findings\nEvidence.")
+        for sections in ((), (section, section),
+                         (section.model_copy(update={"status": "skipped"}),),
+                         (section.model_copy(update={"draft_markdown": "  "}),)):
+            with self.subTest(sections=sections), self.assertRaises(ValueError):
+                ReportAssemblyRequest(title="Report", sections=sections, assembly_mode="whole_article")
+        with self.assertRaises(ValueError):
+            ReportAssemblyRequest(title="Report", sections=(section,), assembly_mode="unknown")
+        for body in ("# Title only", "# Title\n\n## References\nOld bibliography.",
+                     "# Title\n\n## Findings\nEvidence.\n\n# Another document\nOther prose."):
+            with self.subTest(body=body), self.assertRaises(ValueError):
+                preview_report_document(ReportAssemblyRequest(title="Report", assembly_mode="whole_article",
+                    sections=(section.model_copy(update={"draft_markdown": body}),)))
+        # Failed writer rows are rejected by the existing section schema.
+        with self.assertRaises(ValueError):
+            ReportAssemblyRequest(title="Report", assembly_mode="whole_article", sections=({
+                "section_id": "unit", "heading": "Label", "status": "failed", "draft_markdown": "Evidence."},))
+
+    def test_whole_article_keeps_existing_experiment_evidence_append_owner(self) -> None:
+        request = ReportAssemblyRequest(title="Measured report", assembly_mode="whole_article",
+            sections=(ReportSectionDraft(section_id="article-unit", heading="Transport label",
+                draft_markdown="# Earlier title\n\n## Findings\n\nRecorded values."),),
+            config={"section_numbering": "off", "data_tables": "full", "figures": {"enabled": False}},
+            experiment_context=ReportContext(topic="Recorded values", report_mode="experiment",
+                metric_sources=[MetricSource(metric_id="accuracy-record", name="accuracy", value=0.5,
+                    artifact="candidate.json")]))
+        with tempfile.TemporaryDirectory() as tmp:
+            preview = preview_report_document(request)
+            self.assertEqual(preview, assemble_report_document(request, report_dir=Path(tmp)))
+        self.assertIn("## Findings\n\nRecorded values.", preview.report_body_markdown)
+        self.assertIn("accuracy", preview.report_body_markdown)
+        self.assertNotIn("Transport label", preview.report_body_markdown)
+        self.assertEqual(len(request.sections), 1)
 
     def test_report_capability_uses_document_plan_order_without_dropping_drafts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -541,6 +640,9 @@ class ReportAuditCapabilityTests(unittest.TestCase):
 class _MissingFigureRenderer:
     name = "missing_fixture"
 
+    def __init__(self, caption=""):
+        self.caption = caption
+
     def render(
         self,
         *,
@@ -552,13 +654,15 @@ class _MissingFigureRenderer:
         emit=None,
     ) -> ReportFigureResult:
         return ReportFigureResult(
-            report_markdown=report_markdown,
+            report_markdown=(report_markdown.replace("\n\n", f"\n\n{self.caption}\n\n", 1)
+                             if self.caption else report_markdown),
             figures=[
                 ReportFigureRecord(
                     figure_id="missing",
                     title="Missing figure",
                     path="figures/missing.svg",
                     anchor="Introduction",
+                    caption=self.caption,
                 )
             ],
         )

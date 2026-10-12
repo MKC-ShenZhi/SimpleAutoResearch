@@ -192,7 +192,11 @@ def main(argv: Sequence[str] | None = None) -> None:
         return
     if args.command == "results":
         from simple_ar.cli.start import session_materials
+        from simple_ar.app.tool_application import ToolApplication
+        from simple_ar.core.session import SessionController
+        from simple_ar.core.capabilities import CapabilityRegistry
         try:
+            session = SessionController.load(args.session, registry=CapabilityRegistry())
             deliveries = session_materials(args.session)
         except (OSError, ValueError) as exc:
             raise SystemExit(f"Cannot read deliveries: {exc}") from exc
@@ -200,22 +204,24 @@ def main(argv: Sequence[str] | None = None) -> None:
             print_line(f"{name}: " + ", ".join(str(path) for path in paths))
         if not deliveries:
             print_line("No current reusable delivery. The session may be incomplete.")
+        if session.manifest.transition_recipe == ToolApplication.RECIPE:
+            print_line(f"Status: {session.manifest.status}")
+            if session.manifest.status in {"completed", "partial"}:
+                delivery = session.store.read_json("delivery.json")
+                print_line(delivery["summary"])
+                for limitation in delivery.get("unresolved", []):
+                    print_line(f"Unresolved: {limitation}")
+            print_line(f"Continue: simple-ar start --resume-task '{args.session}' 'Your changes'")
+            return
         print_line("Continue: simple-ar start --kind writing --from-session SESSION --reuse NAME --goal 'Your changes'")
         if "code_project" in deliveries:
             print_line("Revise code/figure: simple-ar start --from-session SESSION --reuse code_project --goal 'Your changes'")
         return
     if args.command == "start":
-        from simple_ar.cli.start import prepare_start, reuse_session_materials, select_start_model
+        args._explicit_start_destinations = _explicit_session_option_destinations(parser, arguments, set(), command="start")
+        from simple_ar.cli.start import prepare_start
         from simple_ar.core.locking import SessionLockError
         try:
-            reuse_session_materials(args)
-            if args.chat or args.resume_setup:
-                from simple_ar.cli.intake_dialogue import discuss_start
-                args._explicit_start_destinations = _explicit_session_option_destinations(parser, arguments, set(), command="start")
-                select_start_model(args, interactive=sys.stdin.isatty())
-                args = discuss_start(args)
-                if args is None:
-                    return
             config_path = prepare_start(args)
         except LLMError as exc:
             raise SystemExit(f"Setup model call failed; the printed setup draft is retained: {exc}") from exc
@@ -468,7 +474,7 @@ def _print_research_session(args: argparse.Namespace) -> None:
         except (CodeTaskConfigError, RuntimeError, TypeError, ValueError) as exc:
             raise SystemExit(f"Invalid research Code-Task configuration: {exc}") from exc
         missing_inputs = []
-        if not code_task_spec.code_root.is_dir():
+        if code_task_spec.code_root is not None and not code_task_spec.code_root.is_dir():
             missing_inputs.append(f"project directory: {code_task_spec.code_root}")
         if code_task_spec.task_file is not None and not code_task_spec.task_file.is_file():
             missing_inputs.append(f"task file: {code_task_spec.task_file}")
@@ -485,7 +491,7 @@ def _print_research_session(args: argparse.Namespace) -> None:
                 "--code-task-config requires [execute].use_llm = true because "
                 "the existing Code-Task backend generates the implementation."
             )
-        code_task_baseline_policy = "skip" if task_kind in {"bug_fix", "reproduction"} else execute_options.baseline_policy
+        code_task_baseline_policy = "skip" if task_kind in {"bug_fix", "reproduction"} or (outputs and "bug_fix" in outputs and "experiments" not in outputs) else execute_options.baseline_policy
         timeout_sec = (
             args.timeout_sec
             if args.timeout_sec is not None
@@ -508,12 +514,11 @@ def _print_research_session(args: argparse.Namespace) -> None:
     feasibility_client = None if task_kind == "data_analysis" else _optional_research_llm_client(
         review_model or None, "feasibility review", max_output_tokens=getattr(args, "max_output_tokens", None),
     )
-    if task_kind == "bug_fix" and (args.with_report or (outputs and "report" in outputs)):
-        raise SystemExit("Bug-fix tasks produce a patch and validation evidence, not an academic report.")
     if task_kind == "data_analysis":
         report_requested = not analysis_only
     else:
-        report_requested = task_kind != "bug_fix" and bool(task_kind == "writing" or args.with_report or (llm_client is not None and not args.no_report))
+        report_requested = bool(args.with_report or (task_kind != "bug_fix" and
+                                (task_kind == "writing" or (llm_client is not None and not args.no_report))))
     if outputs is not None:
         report_requested = "report" in outputs
     if report_requested and llm_client is None:
@@ -538,7 +543,8 @@ def _print_research_session(args: argparse.Namespace) -> None:
             except OSError as exc:
                 raise SystemExit(f"Could not read Code-Task task file: {exc}") from exc
         task = {
-            "code_root": str(code_task_spec.code_root.resolve()),
+            "kind": code_task_spec.kind,
+            "code_root": str(code_task_spec.code_root.resolve()) if code_task_spec.code_root is not None else None,
             "workspace_mode": code_task_spec.workspace_mode,
             "env_mode": code_task_spec.env_mode,
             "python_executable": code_task_spec.python_executable,
@@ -563,7 +569,7 @@ def _print_research_session(args: argparse.Namespace) -> None:
                         validation_timeout_sec=execute_options.timeout_sec)
         execution = {
             "command": command,
-            "cwd": str(code_task_spec.code_root.resolve()),
+            "cwd": str(code_task_spec.code_root.resolve()) if code_task_spec.code_root is not None else str(Path(code_task_spec.config_path).parent.resolve()),
             "timeout_sec": timeout_sec,
             "label": args.label,
             "result_schema": _merge_result_schemas(
@@ -607,7 +613,9 @@ def _print_research_session(args: argparse.Namespace) -> None:
         from simple_ar.app.research_execution import execution_request
         execution_request(execution)
     request_text = args.topic.strip()
-    experiment_requested = task_kind != "bug_fix" and (execution is not None or bool(outputs and "experiments" in outputs))
+    from simple_ar.research.task_plan import implementation_only
+    code_delivery = task_kind == "bug_fix" or implementation_only(execution, outputs or ())
+    experiment_requested = not code_delivery and (execution is not None or bool(outputs and "experiments" in outputs))
     if task_text.strip():
         request_text += "\n\n## Implementation task\n\n" + task_text.strip()
     from simple_ar.report.templates import MATERIAL_REPORT_TEMPLATE
@@ -618,6 +626,10 @@ def _print_research_session(args: argparse.Namespace) -> None:
             writing_template if task_kind == "writing" else "survey" if args.report_template == "experiment" else args.report_template
         ),
     )
+    if code_delivery and report_requested:
+        report_config["mode"] = "supplied_materials"
+        if args.report_template == "experiment":
+            report_config["template"] = MATERIAL_REPORT_TEMPLATE
     config: dict[str, object] = {
         "research_max_documents": args.max_results,
         "research_max_iterations": args.max_research_iterations,
@@ -671,7 +683,7 @@ def _print_research_session(args: argparse.Namespace) -> None:
     if data_analysis is not None:
         asset_requests.append({"locator": data_analysis["file"], "kind": "file", "role": "dataset",
                                "mutability": "read_only", "allowed_uses": ["read"]})
-    if task_kind == "bug_fix" and code_task_spec is not None:
+    if code_delivery and code_task_spec is not None and code_task_spec.code_root is not None:
         asset_requests.append({
             "asset_id": "code_project",
             "locator": str(code_task_spec.code_root.resolve()),
@@ -711,7 +723,7 @@ def _print_research_session(args: argparse.Namespace) -> None:
     requested_outputs = (
         tuple(outputs) if outputs is not None
         else ("data_analysis",) if task_kind == "data_analysis"
-        else ("bug_fix",) if task_kind == "bug_fix"
+        else (("bug_fix", "report") if report_requested else ("bug_fix",)) if task_kind == "bug_fix"
         else ("experiments", "report") if execution is not None and report_requested
         else ("experiments",) if execution is not None
         else ("report",) if report_requested
@@ -1404,7 +1416,8 @@ def _load_code_task_spec_for_cli(config_path: Path):
         {
             "code_task_config": str(config_path),
             "safety_allow_large_edits": execute_options.allow_large_edits,
-        }
+        },
+        allow_greenfield=True,
     )
     return spec, execute_options
 
@@ -2533,6 +2546,235 @@ def _stage_status(item: dict[str, object]) -> str:
     if isinstance(value, str) and value:
         return value
     return "done" if item.get("completed") else "pending"
+
+
+def _render_native_result(app: Any, status: dict[str, Any]) -> None:
+    """Read the existing owners; never commit, reconcile or certify a result."""
+    from simple_ar.core.console import make_console
+    from rich.console import Group
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+
+    root = app.session.store.root
+    def location(path: Path) -> str:
+        try:
+            return str(path.relative_to(root))
+        except ValueError:
+            return str(path)
+
+    pending = app.state.get("pending") or {}
+    reason = str(status.get("status_reason") or "")
+    # Exception messages can contain provider URLs, headers or credentials.
+    if reason.startswith("BudgetExceededError:") or (
+        reason.startswith("RuntimeError: Operation failed; inspect saved diagnostics: LLMError: ")
+        and "LLM budget prevented provider attempt " in reason
+    ):
+        reason = "Insufficient remaining budget before dispatch / 发送前剩余额度不足"
+    elif reason.startswith("BudgetUnknownError:"):
+        reason = "Prior usage is unknown / 先前用量未核清"
+    elif ":" in reason:
+        reason = "Saved stop detail withheld; inspect session_manifest.json locally"
+    elif reason.startswith("Process requires explicit approval"):
+        reason = "Process awaits explicit approval / 执行等待明确授权"
+    elif reason not in {
+        "", "Delivery manifest saved; scientific quality requires independent checking",
+        "Model returned prose without a delivery or question; inspect the saved reply before continuing",
+        "Shared model request allowance exhausted, including professional calls; existing artifacts are retained, not marked complete",
+    }:
+        reason = "See saved status_reason in session_manifest.json / 原因见已保存状态记录"
+    lines = [f"Status: {status['status']}", f"Reason / 原因: {reason or 'not recorded'}",
+             f"Saved session / 会话: {root}", "Locations below are relative to this session unless absolute.",
+             f"Workspace / 工作区: {location(app.workspace.workspace)}", "Attempts / 尝试记录: attempts"]
+    if pending.get("kind") in {"model", "tool"}:
+        lines.append(f"Pending action / 待处理动作: {pending['kind']}")
+    attempt = pending.get("attempt") or status.get("current_attempt")
+    if isinstance(attempt, str) and attempt not in {".", ".."} and Path(attempt).name == attempt and "\\" not in attempt:
+        lines.append(f"Selected attempt / 当前尝试: attempts/{attempt}")
+    if status['status'] not in {"completed", "partial"}:
+        lines.append("Current request has no confirmed delivery / 当前请求未确认交付")
+    else:
+        lines.append("Session status is terminal; partial retains unresolved work. Delivery binding and quality are not certified.")
+    if app.session.store.exists("delivery.json"):
+        lines.append("Saved delivery record / 已保存交付记录: delivery.json")
+        lines.append("Request/version binding not checked here; this record may precede the current feedback.")
+        try:
+            delivery = app.session.store.read_json("delivery.json")
+            artifacts = delivery["artifacts"]
+            if not isinstance(artifacts, list):
+                raise ValueError("Invalid saved artifact list")
+            for locator in artifacts[:4]:
+                try:
+                    path = app.workspace.resolve(locator)
+                    lines.append(f"Recorded artifact / 记录位置: {location(path)}" +
+                                 ("" if path.is_file() else " (missing or not a file)"))
+                except (OSError, ValueError, TypeError):
+                    lines.append("Recorded artifact location unavailable or outside allowed paths")
+            if len(artifacts) > 4:
+                lines.append(f"Other recorded locations: {len(artifacts) - 4}; see delivery.json")
+        except (OSError, ValueError, KeyError, TypeError):
+            lines.append("Saved delivery record unreadable; no delivery inferred")
+    else:
+        lines.append("No saved delivery record / 无已保存交付记录")
+
+    budget = app.ledger.snapshot()
+    entries = app.ledger.entries
+    table = Table("Resource", "Cumulative accounting / 累计账目", "Remaining / 剩余", expand=True)
+    for dimension, remaining in budget["remaining"].items():
+        settled = sum(entry.actual.get(dimension, 0) for entry in entries if entry.status == "settled")
+        held = sum(entry.reserved.get(dimension, 0) for entry in entries if entry.status == "reserved")
+        unknown = [entry for entry in entries if entry.status == "unknown" and dimension in entry.reserved]
+        accounting = f"settled={settled}; reserved={held}"
+        if unknown:
+            accounting += (f"; unreconciled={len(unknown)} "
+                           f"(known={sum(entry.actual.get(dimension, 0) for entry in unknown)}, "
+                           f"reservation={sum(entry.reserved[dimension] for entry in unknown)})")
+        available = str(remaining) if remaining is not None else (
+            "unknown" if dimension in budget["unknown_dimensions"] else "no finite limit")
+        table.add_row(Text(dimension), Text(accounting), Text(available))
+    note = Text("Settled includes recorded estimates. Unreconciled reservations are not measured usage. "
+                "Remaining follows the saved ledger allowance; it does not promise another request will fit. "
+                "Saved artifacts and successful tools do not establish acceptance.")
+    make_console().print(Panel(Group(Text("\n".join(lines)), table, note), title="Task result / 任务读出"))
+
+
+def _run_native_start(args: argparse.Namespace) -> None:
+    from simple_ar.app.session_roots import new_research_session_root
+    from simple_ar.app.tool_application import ToolApplication
+    from simple_ar.cli.start import select_start_model
+    from simple_ar.tools.workspace import resolve_source_mount
+    from simple_ar.core.console import make_console, print_line
+    from rich.panel import Panel
+    from rich.text import Text
+    interactive = sys.stdin.isatty()
+    try:
+        continuation = _continuation_parameters(args)
+        allowances = continuation["authorize_remaining"]
+        authorization_id = continuation["authorization_id"] or ""
+        authorization_reason = continuation["authorization_reason"] or ""
+        if args.retry_model:
+            if not args.resume_task:
+                raise ValueError('--retry-model requires --resume-task')
+            if (args.request or args.goal or args.approve_execution or args.source
+                    or args.allow_execution or args.allow_network or args.allow_vision
+                    or allowances or authorization_id or authorization_reason):
+                raise ValueError('Use --retry-model separately from feedback, access, resource or tool authorization')
+        if allowances or continuation["authorization_id"] is not None or continuation["authorization_reason"] is not None:
+            if not args.resume_task:
+                raise ValueError("Resource authorization requires --resume-task")
+            if not allowances:
+                raise ValueError("--authorization-id/--authorization-reason require --authorize-remaining")
+            if not authorization_id.strip() or not authorization_reason.strip():
+                raise ValueError("--authorize-remaining requires --authorization-id and --authorization-reason")
+            if args.approve_execution:
+                raise ValueError("Confirm resource authorization separately from --approve-execution")
+        if args.resume_task:
+            if args.max_images or args.project_python:
+                raise ValueError("Resume keeps the saved image allowance and interpreter; it cannot silently change them")
+            app = ToolApplication.load(args.resume_task.resolve())
+            feedback = args.request or args.goal or ""
+            explicit_model = 'model' in getattr(args, '_explicit_start_destinations', set())
+            replacement_model = args.model if args.retry_model and explicit_model else ''
+            if explicit_model and not args.retry_model and args.model != app.state['config']['model']:
+                raise ValueError('Resume retains its saved model. Change a terminated failed decision '
+                                 'explicitly with --retry-model --model profile:NAME or route:NAME')
+            if replacement_model:
+                target = LLMClient.from_env(replacement_model).connection_binding()
+                settings = target.get('settings') or {}
+                print_line(f"Explicit text connection replacement: {app.state['config']['model']} → "
+                           f"{replacement_model}; endpoint={settings.get('base_url')}; model={settings.get('model')}. "
+                           "Resolved code/writing routes are also pinned; vision, access and budgets remain unchanged.")
+                for purpose in ('code', 'writing'):
+                    route = target.get(f'{purpose}_route') or {}
+                    connection = route.get('connection') or settings
+                    print_line(f"{purpose}: {route.get('profile') or replacement_model}; "
+                               f"endpoint={connection.get('base_url')}; model={connection.get('model')}")
+                if not args.prepare_only and not args.yes:
+                    if not interactive or input('Confirm connection replacement / 确认连接替换? [y/N]: ').strip().lower() not in {'y', 'yes'}:
+                        return
+            if args.retry_model:
+                print_line("Explicit model continuation: one new decision attempt, not a task or tool replay. "
+                           "Old failures and unknown charges remain; original budgets, access and output cap are retained.")
+            if allowances:
+                entries = app.ledger.entries
+                recorded_usage = {dimension: sum(entry.actual.get(dimension, 0) for entry in entries
+                    if entry.status in {"settled", "unknown"}) for dimension in allowances}
+                make_console().print(Panel(Text(
+                    f"Authorization ID: {authorization_id}\nReason: {authorization_reason}\n"
+                    f"Recorded cumulative usage (requested dimensions): {recorded_usage}\n"
+                    f"Unknown usage dimensions: {app.ledger.unknown_dimensions()}\n"
+                    f"New remaining allowance: {allowances}\n"
+                    "Original cumulative usage is not cleared / 原累计用量不清零. "
+                    "New remaining is not a total historical limit / 新 remaining 不是总历史限额.\n"
+                    "Reusing the same authorization ID does not replenish spent capacity. "
+                    "Model binding and permissions remain unchanged; commands still need exact approval. "
+                    "Reconcile in-flight or unknown operations before authorization."),
+                    title="Confirm resource continuation / 确认资源续接"))
+                if not args.prepare_only and not args.yes:
+                    if not interactive or input("Authorize these resources / 授权这些资源? [y/N]: ").strip().lower() not in {"y", "yes"}:
+                        return
+            if args.source or args.allow_execution or args.allow_network or args.allow_vision:
+                if args.approve_execution:
+                    raise ValueError('Confirm added access separately from approving an existing command')
+                make_console().print(Panel(f'Additional read-only materials: {args.source}\n'
+                    f'Process proposals: {args.allow_execution}; public sources: {args.allow_network}; '
+                    f'vision: {args.allow_vision}\nExisting access remains; these access grants do not increase budgets. '
+                    'Commands still require individual approval; execution is not sandboxed.', title='Confirm added access'))
+                if not args.prepare_only and not args.yes:
+                    if not interactive or input('Grant this access / 授权这些访问? [y/N]: ').strip().lower() not in {'y', 'yes'}:
+                        return
+        else:
+            if args.goal and args.request:
+                raise ValueError("Use the positional request for a native task, not both request and --goal")
+            if not args.request:
+                args.request = args.goal or (input("Goal / 想完成什么任务: ").strip() if interactive else "")
+                args.goal = None
+            if not args.request:
+                raise ValueError("Provide a task request or --goal; use --source PATH for read-only materials")
+            args.source = [resolve_source_mount(path) for path in args.source]
+            select_start_model(args, interactive=interactive)
+            make_console().print(Panel(f"Goal: {args.request}\nRead-only sources: {args.source}\n"
+                f"Model: {args.model}\nAllowance: {args.max_turns} requests / {args.max_tokens} tokens\n"
+                f"Public source access: {args.allow_network}\n"
+                f"Rendered-image inspection: {args.allow_vision} (named vision route)\n"
+                f"Image submissions: {args.max_images} (named image route)\n"
+                f"Process proposals: {args.allow_execution}; commands need approval, not an OS sandbox.",
+                title="Task / 任务"))
+            if not args.yes and not args.prepare_only:
+                if not interactive or input("Start / 开始? [y/N]: ").strip().lower() not in {"y", "yes"}:
+                    return
+            root = new_research_session_root(args.output_root, args.request)
+            app = ToolApplication.create(root, args.request, model=args.model,
+                sources={f"source{index}": path for index, path in enumerate(args.source)},
+                allow_execution=args.allow_execution, allow_network=args.allow_network, allow_vision=args.allow_vision,
+                max_turns=args.max_turns, max_tokens=args.max_tokens, max_images=args.max_images,
+                project_python=args.project_python)
+            feedback = ""
+        print_line(f"Task session: {app.session.store.root}")
+        print_line(f"Saved process allowance (including search backends): {app.ledger.limits.get('process_invocations')}; "
+                   f"wall seconds: {app.ledger.limits.get('process_wall_seconds')}. Resume does not reset it.")
+        print_line("Resume: simple-ar start --resume-task SESSION [--approve-execution TOKEN]; append a request for feedback.")
+        if args.prepare_only:
+            return
+
+        def approve(call: dict[str, Any], token: str) -> bool:
+            print_line(f"Execution proposal ({call['function']['name']}): {call['function']['arguments']}")
+            print_line("Execution is not sandboxed. Inspect the generated code before approving.")
+            return interactive and input("Execute this command / 执行此命令? [y/N]: ").strip().lower() in {"y", "yes"}
+
+        status = app.run(feedback=feedback, approved_execution=args.approve_execution,
+                         retry_model=args.retry_model,
+                         retry_model_selector=replacement_model if args.resume_task else '',
+                         read_only_sources=tuple(args.source) if args.resume_task else (),
+                         allow_execution=args.allow_execution if args.resume_task else False,
+                         allow_network=args.allow_network if args.resume_task else False,
+                         allow_vision=args.allow_vision if args.resume_task else False,
+                         resource_allowances=allowances or None,
+                         authorization_id=authorization_id, authorization_reason=authorization_reason,
+                         approve=approve if interactive else None, progress=print_line)
+        _render_native_result(app, status)
+    except (OSError, ValueError, RuntimeError, LLMError) as exc:
+        raise SystemExit(f"Native task stopped; saved operations are not replayed: {exc}") from exc
 
 
 if __name__ == "__main__":

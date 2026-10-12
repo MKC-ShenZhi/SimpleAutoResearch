@@ -578,6 +578,7 @@ def _validate_document_reviews(
     reviews: list[ReportSectionReview] = []
     seen: set[str] = set()
     checked: set[tuple[str, str]] = set()
+    finding_keys: set[tuple[str, str]] = set()
     draft_by_id = review_draft_quote_sources(evidence_view) if evidence_view is not None else {
         row.section_id: (row.heading, row.draft_markdown) for row in sections}
     opinion_targets = {section_id for section_id, _ in prior_by_key}
@@ -604,6 +605,11 @@ def _validate_document_reviews(
             raise LLMResponseError("Whole-document reviewer targeted an unknown or repeated section.")
         if any(finding.section_id != review.section_id for finding in review.findings):
             raise LLMResponseError("Whole-document finding must identify its target section.")
+        for finding in review.findings:
+            key = (review.section_id, finding.finding_id)
+            if key in finding_keys:
+                raise LLMResponseError(f"Whole-document reviewer repeated a finding identity: {key}.")
+            finding_keys.add(key)
         validate_finding_anchors(review, draft_by_id, evidence_view or {})
         for check in review.finding_checks:
             key = (review.section_id, check.finding_id)
@@ -646,6 +652,7 @@ def _validated_document_review_subset(
         return []
     targets: set[str] = set()
     checked: set[tuple[str, str]] = set()
+    finding_keys: set[tuple[str, str]] = set()
     opinion_targets = {key[0] for key in prior_by_key}
     try:
         for raw in rows:
@@ -665,6 +672,10 @@ def _validated_document_review_subset(
             for finding in findings:
                 if not isinstance(finding, Mapping) or (finding.get("section_id") or target) != target:
                     return []
+                identifier = finding.get("finding_id")
+                if not isinstance(identifier, str) or (target, identifier) in finding_keys:
+                    return []
+                finding_keys.add((target, identifier))
             for check in checks:
                 if not isinstance(check, Mapping) or not isinstance(check.get("finding_id"), str):
                     return []

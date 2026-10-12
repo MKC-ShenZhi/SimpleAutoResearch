@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import re
-from pathlib import Path
 
-from simple_ar.core.artifacts import write_json
 from simple_ar.report.schema import (
     ClaimEvidenceRecord,
     ReportContext,
@@ -56,11 +54,6 @@ def initialize_report_memory(
             "Unsupported claims should be weakened or moved to limitations/future work.",
         ],
     )
-
-
-def write_report_memory(path: Path, memory: ReportMemory) -> None:
-    """Persist report memory as compact JSON."""
-    write_json(path, memory.model_dump(mode="json"))
 
 
 def _section_plan(template_markdown: str, context: ReportContext) -> list[ReportSectionPlan]:

@@ -42,6 +42,24 @@ simple-ar start --chat --model profile:daily
 `--model profile:NAME` selects a complete connection; `route:NAME` selects a route.
 Existing task TOML `[model].name` accepts these selectors too. Nested code tasks use the code route
 unless their own model selector is explicit. A selected code connection survives its child calls.
+Native `compose_document` uses an optional `writing` route for material selection,
+composition and feedback, sharing the original task ledger. It requires `text`
+capability, not a new model capability. Without this route the selected task
+connection is retained, including an explicit profile. This permits inexpensive
+coordination and a separately configured scientific writer; it does not guarantee
+correct interpretation. Named task snapshots pin an explicit writing route, so
+changing its model/endpoint requires a new task rather than a silent switch.
+The same optional route is available through `focus_work` with `purpose="writing"`
+and a concrete goal, for investigation, revision and delivery in the existing action
+loop. This consumer requires `openai_chat`; a Responses writing profile can still
+serve `compose_document`, but cannot be selected for native work. No route change
+automatically increases reasoning effort, tools or the shared budget.
+
+New whole-article composition makes one logical `ask_json` call using the selected
+connection's shared bounded retries, API mode and JSON policy. Physical attempts
+use the original ledger and allowance. Invalid JSON or article content is retained
+and fails without automatic redrafting; recovery uses frozen inputs and saved
+responses, never blindly resubmits. Historical Writer checkpoints keep their contract.
 
 Each profile requires `api`, `base_url`, `model`, `api_key_env` and `capabilities`.
 Text adapters are `openai_chat` and `openai_responses`; Chat supports `stream=true`.
@@ -50,19 +68,52 @@ Optional `http2=true` uses the SDK's HTTP/2 negotiation; install with
 It is disabled by default, never changes providers, and is not a guarantee against gateway stalls.
 Test longer input/output on the execution host before selecting it. Changing it on a saved named
 session is a connection change; old HTTP/1.1 bindings remain compatible when it is omitted/false.
-Supported optional fields: `request_timeout_sec`, `max_output_tokens`, `retry_attempts`,
+Supported optional fields: `request_timeout_sec`, `max_output_tokens`, `context_input_tokens`, `retry_attempts`,
 `retry_base_delay_sec`, `retry_max_delay_sec`, `reasoning_effort`, `thinking_mode`,
 `reasoning_output_tokens`, `json_response_format`, `chat_token_limit_param`,
 `input_price_per_million`, and `output_price_per_million`.
 Timeouts/delays and supplied token caps are positive; retry count includes the first request.
 Per-call output limits still apply. Provider support for reasoning/JSON parameters must be checked.
+`context_input_tokens` is the native action-loop input working-set target (default
+24,000), including schemas, reasoning history and observations. It is a local
+setting, not a provider request parameter or certified model context window.
+For longer work, a profile may set e.g. `context_input_tokens = 64000`, after
+checking the provider's combined input/output limit and the task's total budget.
+The active work connection owns this target; remaining tokens minus the output
+reservation can reduce it. Larger inputs increase repeated input costs and do not
+guarantee better decisions. Saved named tasks may retune it without changing
+their model identity, permissions or ledger; exhausted contracts remain exhausted.
+`reasoning_effort="low"` reduces effort; it does not disable provider thinking.
+Effort labels are not portable levels: [DeepSeek maps `medium` to `high`](https://api-docs.deepseek.com/guides/thinking_mode/).
+Its thinking-mode tool calls also carry prior `reasoning_content` into subsequent
+inputs. Higher effort can therefore increase both reasoning output and later input
+costs; do not assume it improves every inventory, edit or verification decision.
+Use separate named connections for distinct work when useful, and evaluate a whole
+delivery plus feedback before promoting a setting to the default.
+For a Chat provider supporting the switch, use `thinking_mode="disabled"` with
+empty effort or `reasoning_effort="none"`; active effort with disabled thinking is
+rejected. Explicit caller/profile output caps take precedence. The optional
+`reasoning_output_tokens` fallback applies only to active effort, not `none` or
+disabled thinking. Providers may count both reasoning and final text against the
+output cap: `finish_reason="length"` with reasoning but no final text is not a
+completed result. Check the provider's semantics rather than extending timeouts.
 For finite-timeout SDK Chat streaming, the timeout also bounds submission and
 stream consumption by elapsed time, followed by at most two seconds of local
 cleanup. A deadline without a completion marker retains unknown usage. Capped
 text requests may retry on the same API within `retry_attempts`, retaining the
 full failed-attempt reservation; uncapped and visual requests stop. This does
 not prove provider cancellation or no charge, and insufficient budget stops retries.
+`retry_attempts = 1` disables automatic retries; increasing the timeout alone
+does not change that policy. The example text profile uses a 600-second deadline
+and three total attempts. Choose an explicit provider-supported output cap when
+uncertain text retries must fit a finite task allowance; do not copy single-attempt
+image settings into text profiles without intending that restriction.
 Nonstreaming, Responses and LiteLLM retain their transport timeout semantics.
+For SDK requests with a positive finite timeout, TCP/TLS connection waiting is
+limited to the smaller of 20 seconds and that timeout; read, write and pool waits
+keep the configured value. A 600-second generation deadline therefore does not
+allow a single connection attempt to stall for ten minutes. SDK internal retries
+remain disabled; the existing `retry_attempts` budget governs new requests.
 Synchronous finite-timeout streaming inside an existing asyncio loop requires
 `await asyncio.to_thread(client.ask, ...)`, rather than nesting another loop.
 
@@ -73,6 +124,9 @@ after HTTP connection success. Increasing the timeout does not cure an immediate
 `overloaded` response. Bounded retries consume separate physical attempts and retain
 unknown usage; they do not reset a saved task's allowance. Compare SDK and framework
 requests on the execution host, including a longer response, before changing routes.
+Stream diagnostics retain SDK exception type, available HTTP status and allowlisted
+protocol error codes/types, not arbitrary provider text, request IDs or URLs. A
+missing code is unknown, not proof of timeout; incomplete output is not adopted.
 Timeout, output cap and retry tuning can be changed when resuming a saved task;
 model, endpoint and code-route identity remain pinned. Old snapshots are not rewritten.
 
@@ -81,6 +135,10 @@ profile for generation/editing; optional `image_size` and `image_quality` are pa
 provider. Provider support must be verified.
 An Images profile cannot be used as a text client.
 Image profiles do not accept text stream/token/JSON or token-price settings.
+Images with `http2=true` require the `simple-autoresearch[http2]` extra in the
+actual execution environment. Missing support is rejected before a reservation
+or submission record; intact completed images can still be restored offline.
+Older uncertain submissions are not reclassified or automatically resent.
 
 `simple-ar image-review` uses a separate `vision` route with an explicit
 `openai_chat` or `openai_responses` profile and `vision` capability. It sends
@@ -88,12 +146,25 @@ actual image pixels, not filenames; automatic API-mode fallback is disabled.
 Inspection accepts up to four static PNG/JPEG/WebP images, at most 20 MiB combined
 and 4,194,304 pixels per image. Provider usage is recorded when supplied; absent
 usage remains unknown, not zero. Feedback describes visible issues, not scientific validity.
+Local image admission failures report the applicable limits; resize a review copy
+while preserving the original. Review uses the named connection's output cap,
+falling back to a bounded 3,000-token default when none is configured. Unparseable
+final responses stay in the review directory's `rejected-response.json`, not in
+published findings, and are not automatically resent.
+
+In a native task, `--allow-vision` authorizes `inspect_images`; it consumes the
+shared model-call and token allowances, not the image-generation allowance.
+`--max-images 0` therefore disables generation/editing, not authorized inspection.
+The task context distinguishes availability from budget and provider health.
 
 For cctq's documented asynchronous image-task protocol, explicitly select
 `api = "cctq_images_async"`; `openai_images` remains the generic synchronous API.
 The async path uses the configured origin, saves one task ID, polls that task and
 authenticates its same-origin `files/0` download. It does not switch hosts/providers
-or fall back to another API. Saved-task recovery and one feedback edit were
+or fall back to another API. `request_timeout_sec` bounds the whole async invocation,
+including submission, polling and download, with at most two seconds of local cleanup.
+A saved task ID remains recoverable by GET only; interrupted submissions without an ID
+are not replayed. Saved-task recovery and one feedback edit were
 verified through a caller-configured proxy route; direct server transport remains
 unreliable. The prior synchronous timeout remains a failed request, not a success.
 
@@ -817,12 +888,12 @@ baselines remain errors; this is not a test-folder exemption or runtime success.
 | `[execute].baseline_metrics_file` | JSON or metric-line file used with `baseline_policy = "provided"`. Accepted JSON shapes include `{"accuracy": 0.8}`, `{"metrics": {...}}`, and `{"metric_values": {...}}`. |
 | `[execute].apply_proposed_edits` | Lets execute apply an already reviewed proposal. Keep false for review-first workflows. |
 | `[execute].allow_large_edits` | Allows application of reviewed proposals that exceed the normal budget but fit the large budget. |
-| `[execute].allow_planning_fallback` | Allows deterministic offline work/patch plans and greenfield architecture/file fallbacks after all LLM retries fail. Keep false for real LLM runs so malformed model output stops safely and can be retried. |
+| `[execute].allow_planning_fallback` | Permits explicit offline plans and greenfield fallbacks after known, complete response-format failures. It does not replace provider, budget, deadline or incomplete-stream failures with an offline success. Keep false when the task requires model-generated implementation. |
 | `[execute].planning_mode` | Greenfield planning: `tool_agent` uses requirements, architecture, interfaces, file plan, and bounded review (at least five calls); `compact` uses one architecture call before retries. Both share file generation and execution; call counts do not establish research quality. |
 | `[execute].planning_review_rounds` | Maximum reviewer-directed greenfield planning revision rounds for standalone code-task runs. Default `2`; lower to `1` for lightweight smoke examples, raise only when plan convergence matters more than token/time cost. |
-| `[execute].llm_retry_attempts` | Number of stage-level LLM work-plan, patch-plan, greenfield architecture, and greenfield file-generation attempts before stopping or explicitly falling back. Each stage attempt still uses the provider-level retry/backoff configured by `SIMPLE_AR_LLM_RETRY_ATTEMPTS`. |
+| `[execute].llm_retry_attempts` | Bounds completed-response corrections for work/patch planning and greenfield architecture/file generation, including the first attempt. Transport retry/backoff belongs only to the shared model connection's `retry_attempts` setting (legacy: `SIMPLE_AR_LLM_RETRY_ATTEMPTS`); stages do not multiply it. Unreconciled ledger operations prevent correction and fallback, even when their numeric dimensions are accounted. |
 | `[execute].repair_rounds` | Non-negative bound (default `0`) for technical repair after failed validation/benchmark execution. In `research-session` with a CodeTask project, this also bounds repair/retest after a failed single-condition research revision; each retest uses the accepted protocol and process budget. It does not authorize a scientific method change, seed extension, or paired-revision repair. Repairs still require review. |
-| `[execute].max_files` | Max files included in LLM context for plan/proposal/repair steps. |
+| `[execute].max_files` | Max files included in LLM context for plan/proposal/repair steps; also limits files in a new greenfield plan, including any inserted `main.py`. If a complete plan exceeds the limit, planning rejects it rather than silently discarding modules or dependencies. Saved plans are not rebuilt under a new limit. |
 | `[execute].max_source_chars_per_file` | Per-file source snippet budget for LLM context. |
 | `[execute].max_generated_lines` | Greenfield generation line budget. If omitted, execute falls back to `[resource].max_generated_lines`, then to a conservative default. |
 | `[models.code_task].planner` | Model used for work-plan, patch-plan, and greenfield architecture planning. |

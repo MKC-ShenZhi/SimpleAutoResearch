@@ -11,7 +11,7 @@ ResolutionStatus = Literal["available", "missing", "unavailable", "failed"]
 TEXT_SUFFIXES = {".md", ".markdown", ".txt"}
 HTML_SUFFIXES = {".html", ".htm"}
 SUPPORTED_DOCUMENT_SUFFIXES = TEXT_SUFFIXES | HTML_SUFFIXES | {".pdf"}
-MATERIAL_TEXT_SUFFIXES = TEXT_SUFFIXES | {".json", ".bib"}
+MATERIAL_TEXT_SUFFIXES = TEXT_SUFFIXES | {".json", ".bib", ".ipynb"}
 SUPPORTED_MATERIAL_SUFFIXES = MATERIAL_TEXT_SUFFIXES | HTML_SUFFIXES | {".pdf"}
 
 

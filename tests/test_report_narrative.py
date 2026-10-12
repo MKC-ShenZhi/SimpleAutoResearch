@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from simple_ar.integrations.llm import LLMResponseError
 from simple_ar.report.agent import _writer_prompt, _writer_recovery_prompt, _reviewer_prompt, run_report_agent
-from simple_ar.report.narrative import adopted_claims, narrative_context, report_objective, evidence_outline_context
+from simple_ar.report.narrative import adopted_claims, narrative_context, report_objective, evidence_outline_context, _prompt_handle_view
 from simple_ar.report.memory import initialize_report_memory
 from simple_ar.report.schema import (
     ClaimEvidenceRecord, ReportContext, ReportMemory, ReportRuntimeConfig,
@@ -45,6 +45,25 @@ class NarrativeTests(unittest.TestCase):
         self.assertNotIn("Use only recorded metrics and experiment artifacts", results.goal)
 
     def test_material_writing_does_not_starve_results_behind_many_papers(self):
+        source = SourceHandle(handle="material:directory", kind="material", metadata={
+            "source_directory": {"sections": [
+                {"heading": "Methods", "section_id": "methods-1", "chunk_id": "chunk-1", "retained_chunks": 2},
+                {"heading": "Methods", "section_id": "methods-2", "chunk_id": "chunk-2", "retained_chunks": 3}],
+                "total_sections": 2, "truncated": False},
+            "evidence_passages": [{"chunk_id": "chunk-1", "text": "first original"},
+                                  {"chunk_id": "chunk-2", "text": "second original"}]})
+        before = source.model_dump(mode="json")
+        full = _prompt_handle_view(source)
+        navigation = _prompt_handle_view(source, navigation=True)
+        self.assertEqual(full["metadata"]["source_directory"]["headings"],
+            ["Methods"])
+        self.assertEqual(full["metadata"]["source_directory"]["total_sections"], 2)
+        self.assertEqual(_prompt_handle_view(SourceHandle.model_validate(full))["metadata"]["source_directory"],
+                         full["metadata"]["source_directory"])
+        self.assertEqual(len(full["metadata"]["evidence_passages"]), 2)
+        self.assertEqual(len(navigation["metadata"]["evidence_passages"]), 1)
+        self.assertTrue(navigation["metadata"]["evidence_passages_truncated"])
+        self.assertEqual(source.model_dump(mode="json"), before)
         handles = [SourceHandle(handle=f"paper:{i}", kind="paper", citation_key=f"P{i}") for i in range(10)]
         handles.extend([SourceHandle(handle="material:results", kind="material"),
                         SourceHandle(handle="material:old-draft", kind="prior_draft", title="Previous report"),
@@ -320,6 +339,25 @@ class ReportObjectiveTests(unittest.TestCase):
         self.assertNotIn("template_markdown", recovery)
         self.assertNotIn("global_research_context", recovery)
         self.assertEqual(memory.model_dump(mode="json"), before)
+
+        source = SourceHandle(handle='material:comparison', kind='material', title='Original comparison',
+            metadata={'evidence_passages': [{'chunk_id': 'c1', 'text': 'Same conditions, recorded value 3.'}]})
+        memory.source_handles = [source]
+        section.evidence_handles = [source.handle]
+        duplicate = ReportToolResult(tool_name='get_paper_brief',
+            content={'handles': [source.model_dump(mode='json')]})
+        changed = duplicate.model_copy(deep=True)
+        changed.content['handles'][0]['metadata']['evidence_passages'][0]['text'] = 'New comparison condition.'
+        original = duplicate.model_dump(mode='json')
+        view = agent._writer_task_context(**{**common, 'extra_context': [duplicate, changed]})
+        self.assertEqual(view['extra_tool_context'][0]['content']['handles'],
+            [{'handle': source.handle, 'evidence_reference': 'source_handles'}])
+        self.assertEqual(view['extra_tool_context'][1]['content']['handles'][0]['metadata']['evidence_passages'][0]['text'],
+            'New comparison condition.')
+        reviewed = agent._reviewer_context(context=context, template=template, memory=memory,
+            section=section, draft=draft, config=config, extra_context=[duplicate])
+        self.assertEqual(reviewed['extra_tool_context'][0]['content']['handles'][0]['evidence_reference'], 'allowed_sources')
+        self.assertEqual(duplicate.model_dump(mode='json'), original)
 
     def objects(self):
         # Requirements in the middle and tail must not depend on an excerpt.

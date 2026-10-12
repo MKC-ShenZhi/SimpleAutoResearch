@@ -36,13 +36,32 @@ MAX_VISION_BYTES = 20 * 1024 * 1024
 MAX_VISION_PIXELS = 4_194_304
 ESTIMATED_IMAGE_INPUT_TOKENS = 8192
 
+# Public diagnostics contain event names only, never HTTPX trace payloads.
+_TRANSPORT_PHASES = frozenset({"unobserved"} | {
+    f"{operation}.{phase}" for operation in (
+        "connection.connect_tcp", "connection.start_tls",
+        "http11.send_request_headers", "http11.send_request_body",
+        "http11.receive_response_headers", "http2.send_request_headers",
+        "http2.send_request_body", "http2.receive_response_headers")
+    for phase in ("started", "complete", "failed")
+})
+
 
 class LLMError(RuntimeError):
     """Raised when the LLM layer cannot satisfy a request."""
 
 
+class LLMImageInputError(LLMError):
+    """Local image admission failure with a safe, actionable public message."""
+
+
 class LLMResponseError(LLMError):
     """A completed response cannot satisfy the requested output format."""
+
+    def __init__(self, message: str, *, raw_response: str = "") -> None:
+        super().__init__(message)
+        # Content is for task-local diagnostics, never part of error/log text.
+        self.raw_response = raw_response
 
 
 class LLMStreamError(LLMError):
@@ -51,6 +70,17 @@ class LLMStreamError(LLMError):
 
 class LLMDeadlineError(LLMError):
     """Chat stream wall-clock deadline elapsed; final usage is unknown."""
+
+    def __init__(self, message: str, *, transport_phase: str = "",
+                 stream_opened: bool | None = None) -> None:
+        super().__init__(message)
+        self.transport_phase = transport_phase if transport_phase in _TRANSPORT_PHASES else ""
+        self.stream_opened = stream_opened if type(stream_opened) is bool else None
+
+    def public_diagnostics(self) -> dict[str, Any]:
+        return {key: value for key, value in (
+            ("transport_phase", self.transport_phase), ("stream_opened", self.stream_opened))
+            if value is not None and value != ""}
 
 
 @dataclass(frozen=True)
@@ -74,6 +104,9 @@ class LLMSettings:
         max_output_tokens: Optional client-wide default output-token budget per
             request. ``None`` disables the client-wide default; an explicit
             per-call cap supplied by a pipeline step still applies.
+        context_input_tokens: Local native action-loop input working-set target,
+            including tool schemas and reasoning history. Not a provider context
+            limit or request parameter; total task budget still takes precedence.
         retry_attempts: Total provider attempts for transient transport/server
             failures. Includes the first request.
         retry_base_delay_sec: Initial exponential-backoff delay.
@@ -103,7 +136,8 @@ class LLMSettings:
             Chat Completions. Empty preserves provider defaults. Enable or
             disable only when the selected model documents support for it.
         reasoning_output_tokens: Optional fallback output cap used only when
-            ``reasoning_effort`` is configured and neither the caller nor the
+            an active ``reasoning_effort`` is configured, thinking is not
+            explicitly disabled, and neither the caller nor the
             client settings provide a cap. An explicit caller cap always wins;
             reasoning configuration never silently raises it.
         stream: Use streamed Chat Completions responses and assemble their
@@ -122,6 +156,7 @@ class LLMSettings:
     output_price_per_million: float | None = None
     request_timeout_sec: float | None = None
     max_output_tokens: int | None = None
+    context_input_tokens: int = 24000
     retry_attempts: int = 3
     retry_base_delay_sec: float = 1.0
     retry_max_delay_sec: float = 12.0
@@ -236,6 +271,8 @@ class LLMClient:
             raise LLMError("OPENAI_API_KEY is not configured")
         if settings.http2 and settings.transport_backend != "openai":
             raise LLMError("http2 is supported by the OpenAI SDK transport only")
+        if type(settings.context_input_tokens) is not int or settings.context_input_tokens <= 0:
+            raise LLMError("context_input_tokens must be a positive integer")
         self.model = settings.model
         self._openai_model = settings.model.strip()
         self._provider_model = _litellm_model(settings)
@@ -279,7 +316,9 @@ class LLMClient:
         Returns:
             Configured ``LLMClient`` instance.
         """
-        load_dotenv()
+        # Credentials belong to the invoking project/environment, not the
+        # installed package's directory discovered from the Python call stack.
+        load_dotenv(dotenv_path=Path.cwd() / ".env", override=False)
         try:
             catalog = load_model_catalog(models_config)
             if catalog is not None:
@@ -369,16 +408,65 @@ class LLMClient:
             else:
                 request["input"][0]["content"] = [{"type": "input_text", "text": user},
                     *({"type": "input_image", "image_url": url} for url in image_urls)]
-        if self._settings.base_url:
-            request["api_base"] = self._settings.base_url
-            request["base_url"] = self._settings.base_url
-        # An explicit per-request cap is meaningful even when the client-wide
-        # environment setting is unset.  The caller is allowed to bound one
-        # expensive or structurally sensitive request without imposing the
-        # same cap on every request made by this client.
+        response = self._complete_request(request, system, user, label=label,
+            max_output_tokens=max_output_tokens, response_format=response_format,
+            budget_call_id=budget_call_id, image_count=len(image_urls))
+        output = _content_from_response(response).strip()
+        if not output:
+            raise LLMResponseError(_empty_response_message(response))
+        return output
+
+    def chat_turn(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]],
+        label: str = "",
+        max_output_tokens: int | None = None,
+        budget_call_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Return a native assistant message, without executing its tool requests.
+
+        History belongs to the session caller, including tool results and provider
+        reasoning fields. Do not flatten it into a prompt or silently switch APIs.
+        This first migration slice supports text/tool Chat histories only; local
+        visual evidence continues to use the explicit named vision client.
+        """
+        if self._settings.api_mode != "chat":
+            raise LLMError("Native Chat turns require explicit chat API mode")
+        if not isinstance(messages, list) or not messages or any(not isinstance(row, dict) for row in messages):
+            raise LLMError("messages must be a nonempty list of native Chat messages")
+        if not isinstance(tools, list) or any(not isinstance(tool, dict) for tool in tools):
+            raise LLMError("tools must be a list of native function tool schemas")
+        request = self._build_request("", "")
+        request["messages"] = messages
+        if tools:
+            request["tools"] = tools
+        if _has_image_input(request):
+            raise LLMError("Use the named vision client for visual evidence")
+        history = json.dumps(messages, ensure_ascii=False)
+        contract = json.dumps(tools, ensure_ascii=False)
+        response = self._complete_request(request, contract, history, label=label,
+            max_output_tokens=max_output_tokens, budget_call_id=budget_call_id)
+        choices = _get_value(response, "choices")
+        message = _get_value(choices[0], "message") if isinstance(choices, list) and choices else None
+        if not isinstance(message, dict):
+            dump = getattr(message, "model_dump", None)
+            message = dump(exclude_none=True) if callable(dump) else None
+        if not isinstance(message, dict) or not (message.get("content") or message.get("tool_calls")):
+            raise LLMResponseError(_empty_response_message(response))
+        if _finish_reason_from_response(response) == "length":
+            raise LLMResponseError("Native Chat turn was truncated; do not execute partial tool arguments")
+        return {**message, "role": "assistant"}
+
+    def effective_output_limit(self, max_output_tokens: int | None = None) -> int | None:
+        """Resolve the actual request limit for transport and budget planning."""
         output_cap = max_output_tokens
         if output_cap is None:
             output_cap = self._settings.max_output_tokens
+        if (output_cap is None and self._settings.reasoning_effort not in {"", "none"}
+                and self._settings.thinking_mode != "disabled"):
+            output_cap = self._settings.reasoning_output_tokens
         if output_cap is not None:
             try:
                 output_cap = int(output_cap)
@@ -386,21 +474,34 @@ class LLMClient:
                 raise LLMError("max_output_tokens must be a positive integer") from exc
             if output_cap < 1:
                 raise LLMError("max_output_tokens must be a positive integer")
-            request["max_output_tokens"] = output_cap
-        elif self._settings.reasoning_effort and self._settings.reasoning_output_tokens:
-            # Keep precedence visible: per-call cap, client default, then the
-            # optional reasoning fallback.
-            output_cap = self._settings.reasoning_output_tokens
+        return output_cap
+
+    def _complete_request(
+        self, request: dict[str, Any], system: str, user: str, *,
+        label: str, max_output_tokens: int | None = None,
+        response_format: dict[str, Any] | None = None,
+        budget_call_id: str | None = None, image_count: int = 0,
+    ) -> object:
+        """Shared transport, deadline and accounting for text and native turns."""
+        if self._settings.base_url:
+            request["api_base"] = self._settings.base_url
+            request["base_url"] = self._settings.base_url
+        # An explicit per-request cap is meaningful even when the client-wide
+        # environment setting is unset.  The caller is allowed to bound one
+        # expensive or structurally sensitive request without imposing the
+        # same cap on every request made by this client.
+        output_cap = self.effective_output_limit(max_output_tokens)
+        if output_cap is not None:
             request["max_output_tokens"] = output_cap
         if response_format is not None:
             if self._settings.api_mode in {"responses", "auto"}:
                 request["text"] = {"format": response_format}
             else:
                 request["response_format"] = response_format
-        if image_urls and self._budget_ledger is not None and output_cap is None:
+        if image_count and self._budget_ledger is not None and output_cap is None:
             raise LLMError("Budgeted vision requests require an explicit max_output_tokens cap")
         prompt_tokens = (estimate_tokens(system) + estimate_tokens(user)
-                         + len(image_urls) * ESTIMATED_IMAGE_INPUT_TOKENS)
+                         + image_count * ESTIMATED_IMAGE_INPUT_TOKENS)
         logical_call_id = budget_call_id or label or self._next_budget_call_id()
         response, provider_attempts, reservation_id = self._request_with_retry(
             request,
@@ -411,6 +512,17 @@ class LLMClient:
         )
 
         output = _content_from_response(response).strip()
+        # Tool arguments and thinking are generated output too. Include them in
+        # the estimated path when the provider omits final usage metadata.
+        choices = _get_value(response, "choices")
+        message = _get_value(choices[0], "message") if isinstance(choices, list) and choices else None
+        tool_calls = _get_value(message, "tool_calls")
+        reasoning = _reasoning_content_from_response(response)
+        if tool_calls:
+            dump = getattr(message, "model_dump", None)
+            output = json.dumps(dump() if callable(dump) else message, ensure_ascii=False)
+        elif reasoning:
+            output += reasoning
         try:
             usage = self._build_usage_record(
                 response,
@@ -419,17 +531,15 @@ class LLMClient:
                 output,
                 label=label,
                 provider_attempts=provider_attempts,
-                visual=bool(image_urls),
-                estimated_image_input_tokens=len(image_urls) * ESTIMATED_IMAGE_INPUT_TOKENS,
+                visual=bool(image_count),
+                estimated_image_input_tokens=image_count * ESTIMATED_IMAGE_INPUT_TOKENS,
             )
         except Exception as exc:
             self._mark_budget_unknown(reservation_id, reason=f"usage reconciliation failed: {exc}")
             raise
         self._settle_budget(reservation_id, usage)
         self._notify_usage(usage)
-        if not output:
-            raise LLMResponseError(_empty_response_message(response))
-        return output
+        return response
 
     def _image_inputs(self, paths: tuple[Path, ...]) -> tuple[str, ...]:
         if not isinstance(paths, tuple) or len(paths) > 4:
@@ -465,7 +575,9 @@ class LLMClient:
                     image.load()
                 urls.append(f"data:{mime};base64," + base64.b64encode(content).decode("ascii"))
         except Exception:
-            raise LLMError("Use valid static local PNG/JPEG/WebP images: total <=20 MiB, each <=4 megapixels") from None
+            raise LLMImageInputError(
+                f"Use valid static local PNG/JPEG/WebP images: total <= {MAX_VISION_BYTES} bytes, "
+                f"each <= {MAX_VISION_PIXELS} pixels. Resize a review copy if needed; preserve the original.") from None
         return tuple(urls)
 
     def with_budget(
@@ -500,7 +612,7 @@ class LLMClient:
         code_name = (self._profile_name if self._purpose == "code"
                      else catalog.routes.get("code") or catalog.routes.get("default"))
         code = catalog.profiles.get(code_name or "")
-        return {
+        binding = {
             "profile": self._profile_name,
             "api_key_env": catalog.profiles[self._profile_name].api_key_env,
             "settings": {key: value for key, value in vars(self._settings).items()
@@ -508,6 +620,15 @@ class LLMClient:
             "code_route": {"profile": code_name, "connection": code.model_dump(
                 mode="json", exclude={"proxy_env"} | ({"http2"} if not code.http2 else set()))} if code else None,
         }
+        # An explicit writing route belongs to this task's possible consumers.
+        # With no route, preserve older snapshots and the explicitly selected
+        # parent connection; adding a profile alone must not reroute writing.
+        writing_name = catalog.routes.get("writing")
+        if writing_name:
+            writing = catalog.profiles[writing_name]
+            binding["writing_route"] = {"profile": writing_name, "connection": writing.model_dump(
+                mode="json", exclude={"proxy_env"} | ({"http2"} if not writing.http2 else set()))}
+        return binding
 
     @classmethod
     def for_task(
@@ -533,6 +654,8 @@ class LLMClient:
                 # command to combine that model with the code connection.
                 selector = None if model == client.model else model
                 if selector is None and client._purpose == purpose:
+                    selector = f"profile:{client._profile_name}"
+                if selector is None and purpose == "writing" and "writing" not in client._model_catalog.routes:
                     selector = f"profile:{client._profile_name}"
                 name, profile = client._model_catalog.select(selector, purpose=purpose)
                 settings = LLMSettings(**profile.text_settings())
@@ -594,6 +717,8 @@ class LLMClient:
         label: str = "",
     ) -> tuple[object, int, str | None]:
         """Call the provider with bounded backoff and optional accounting."""
+        if self._settings.transport_backend == "litellm":
+            _load_litellm()
         try:
             proxy = resolve_proxy_env(self._settings.proxy_env)
         except ModelConfigError as exc:
@@ -609,6 +734,8 @@ class LLMClient:
         visual = _has_image_input(request)
         reserved_total_tokens = prompt_tokens + (output_cap or 0)
         for api_mode in _api_attempt_order(self._settings.api_mode):
+            unbounded_chat_stream = (self._settings.transport_backend == 'openai'
+                and self._settings.stream and api_mode == 'chat' and (output_cap is None or visual))
             mode_request = _request_for_api_mode(
                 request,
                 api_mode,
@@ -619,14 +746,23 @@ class LLMClient:
             )
             attempted = 0
             for attempt in range(1, attempts + 1):
+                try:
+                    reservation_id = self._reserve_budget(
+                        logical_call_id=logical_call_id,
+                        label=label,
+                        provider_attempt=provider_attempts + 1,
+                        reserved_total_tokens=reserved_total_tokens,
+                    )
+                except LLMError as exc:
+                    if last_error is not None and isinstance(exc.__cause__, BudgetError):
+                        # Keep the budget stop as the cause. Chaining the raw
+                        # provider error here could expose bodies/credentials.
+                        exc.args = (f"{exc}; preceding provider failure after "
+                                    f"{provider_attempts} physical attempt(s): "
+                                    f"{_provider_failure_summary(last_error)}",)
+                    raise
                 attempted = attempt
                 provider_attempts += 1
-                reservation_id = self._reserve_budget(
-                    logical_call_id=logical_call_id,
-                    label=label,
-                    provider_attempt=provider_attempts,
-                    reserved_total_tokens=reserved_total_tokens,
-                )
                 try:
                     response = _call_provider(
                         self._settings.transport_backend,
@@ -656,6 +792,8 @@ class LLMClient:
                     # reservation. Uncapped/visual charges cannot be bounded.
                     if isinstance(exc, LLMDeadlineError) and (output_cap is None or visual):
                         raise
+                    if unbounded_chat_stream and _is_budget_consumption_unknown(exc):
+                        break  # Unbounded uncertain charges cannot justify automatic replay.
                     if attempt >= attempts or not _is_transient_llm_error(exc):
                         break
                     if (
@@ -675,7 +813,8 @@ class LLMClient:
             if isinstance(last_error, LLMDeadlineError):
                 raise last_error  # Retry the same API only; never switch after a deadline.
             mode_attempts.append((api_mode, attempted, last_error))
-            if not _is_transient_llm_error(last_error):
+            if (not _is_transient_llm_error(last_error)
+                    or (unbounded_chat_stream and _is_budget_consumption_unknown(last_error))):
                 break
         if (proxy or visual) and last_error is not None and _is_response_format_error(last_error):
             raise LLMError("Provider response_format is unsupported; transport details omitted") from None
@@ -685,10 +824,12 @@ class LLMClient:
             raise LLMError(
                 f"LLM request timed out after {_attempt_summary(mode_attempts)} attempt(s): {last_error}"
             ) from last_error
+        phase = _transport_failure_phase(last_error) if last_error is not None else ''
+        phase_detail = f"; transport phase={phase}" if phase else ''
         if proxy or visual:
-            raise LLMError(f"LLM request failed ({type(last_error).__name__}); transport details omitted") from None
+            raise LLMError(f"LLM request failed ({type(last_error).__name__}){phase_detail}; transport details omitted") from None
         raise LLMError(
-            f"LLM request failed after {_attempt_summary(mode_attempts)} attempt(s): {last_error}"
+            f"LLM request failed after {_attempt_summary(mode_attempts)} attempt(s): {last_error}{phase_detail}"
         ) from last_error
 
     def _reserve_budget(
@@ -736,7 +877,11 @@ class LLMClient:
         if not self._settings.proxy_env and not visual:
             reason += f": {error}"
         try:
-            if visual and not _is_known_provider_rejection(error):
+            if _transport_failure_phase(error) == 'not_dispatched':
+                self._budget_ledger.settle(reservation_id,
+                    {'llm_requests': 1, 'total_tokens': 0}, actual_source='transport_pre_dispatch',
+                    reason='Connection/pool acquisition failed before HTTP dispatch')
+            elif visual and not _is_known_provider_rejection(error):
                 self._budget_ledger.mark_unknown(reservation_id, reason=reason,
                     known_actual={"llm_requests": 1})
             elif _is_budget_consumption_unknown(error):
@@ -770,7 +915,13 @@ class LLMClient:
                     retain_reservation=has_output_cap,
                 )
         except BudgetError as exc:
-            raise LLMError(f"Could not reconcile failed LLM budget attempt: {exc}") from exc
+            # This runs inside the provider exception handler. The implicit
+            # context would otherwise print that error's raw SDK cause/body.
+            exc.__suppress_context__ = True
+            raise LLMError(
+                f"Could not reconcile failed LLM budget attempt: {exc}; "
+                f"provider failure: {_provider_failure_summary(error)}"
+            ) from exc
 
     def ask_json(
         self,
@@ -828,7 +979,7 @@ class LLMClient:
         if parsed is None:
             raise LLMResponseError(
                 "LLM response did not contain a JSON object "
-                f"(received {len(raw.strip())} characters)"
+                f"(received {len(raw.strip())} characters)", raw_response=raw,
             )
         return parsed
 
@@ -1246,10 +1397,14 @@ def _chat_accounting_tail(chunks: object) -> tuple[int, int, int] | None:
 class _ChatStreamState:
     """One normalization contract for synchronous and asynchronous chunks."""
     parts: list[str] = field(default_factory=list)
+    reasoning_parts: list[str] = field(default_factory=list)
+    tool_calls: dict[int, dict[str, Any]] = field(default_factory=dict)
     usage: tuple[int, int, int] | None = None
     finish_reason: str | None = None
+    received_chunks: int = 0
 
     def add(self, chunk: object) -> tuple[int, int, int] | None:
+        self.received_chunks += 1
         chunk_usage = _usage_from_response(chunk)
         self.usage = chunk_usage or self.usage
         choices = _get_value(chunk, "choices")
@@ -1260,10 +1415,34 @@ class _ChatStreamState:
             content = _get_value(choice, "text")
         if content is not None:
             self.parts.append(_text_from_content(content))
+        reasoning = _get_value(delta, "reasoning_content")
+        if reasoning is not None:
+            self.reasoning_parts.append(_text_from_content(reasoning))
+        for fragment in _get_value(delta, "tool_calls") or []:
+            index = _get_value(fragment, "index")
+            if not isinstance(index, int) or index < 0:
+                raise LLMStreamError("Tool stream omitted a valid call index")
+            call = self.tool_calls.setdefault(index, {
+                "id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+            call_id = _get_value(fragment, "id")
+            if call_id:
+                call["id"] = str(call_id)
+            function = _get_value(fragment, "function")
+            for key in ("name", "arguments"):
+                value = _get_value(function, key)
+                if value is not None:
+                    call["function"][key] += str(value)
         value = _get_value(choice, "finish_reason")
         if value is not None:
             self.finish_reason = str(value)
         return chunk_usage
+
+    def progress_description(self) -> str:
+        """Safe phase evidence, never partial provider prose or tool arguments."""
+        return (f"chunks={self.received_chunks}, content_chars={sum(map(len, self.parts))}, "
+                f"reasoning_chars={sum(map(len, self.reasoning_parts))}, "
+                f"tool_argument_chars={sum(len(c['function']['arguments']) for c in self.tool_calls.values())}, "
+                f"finish_received={self.finish_reason is not None}, usage_received={self.usage is not None}")
 
     def response(self) -> dict[str, Any]:
         if self.finish_reason is None:
@@ -1271,8 +1450,13 @@ class _ChatStreamState:
                 "Response stream ended without a completion marker: "
                 f"content_chars={sum(map(len, self.parts))}, usage_received={self.usage is not None}"
             )
+        message: dict[str, Any] = {"role": "assistant", "content": "".join(self.parts)}
+        if self.reasoning_parts:
+            message["reasoning_content"] = "".join(self.reasoning_parts)
+        if self.tool_calls:
+            message["tool_calls"] = [self.tool_calls[index] for index in sorted(self.tool_calls)]
         response: dict[str, Any] = {
-            "choices": [{"message": {"content": "".join(self.parts)},
+            "choices": [{"message": message,
                          "finish_reason": self.finish_reason}],
         }
         if self.usage is not None:
@@ -1292,8 +1476,22 @@ def _stream_error_description(exc: Exception) -> str:
     overloaded = isinstance(message, str) and any(
         marker in message.lower() for marker in ("overloaded", "over capacity")
     )
+    details = [type(exc).__name__]
+    status = _provider_error_status(exc)
+    if status is not None:
+        details.append(f"HTTP status={status}")
+    # Only known protocol identifiers are diagnostic facts. Arbitrary codes,
+    # messages, request IDs and URLs may themselves contain private input.
+    if isinstance(body, dict):
+        for key in ('code', 'type'):
+            value = body.get(key)
+            if value in ('server_error', 'internal_error', 'invalid_request_error',
+                         'authentication_error', 'invalid_api_key', 'model_not_found',
+                         'context_length_exceeded', 'rate_limit_exceeded',
+                         'insufficient_quota', 'content_filter', 'overloaded'):
+                details.append(f"provider {key}={value}")
     reason = "; provider reported overload" if overloaded else ""
-    return f"Response stream interrupted ({type(exc).__name__}){reason}; final usage unavailable"
+    return f"Response stream interrupted ({'; '.join(details)}){reason}; final usage unavailable"
 
 
 def _collect_chat_stream(stream_response: object) -> dict[str, Any]:
@@ -1329,8 +1527,7 @@ def _collect_chat_stream(stream_response: object) -> dict[str, Any]:
         # Never adopt the partial draft as a successfully completed response.
         if state.finish_reason is None:
             raise LLMStreamError(
-                f"Response stream interrupted: content_chars={sum(map(len, state.parts))}, "
-                f"finish_reason={state.finish_reason!r}, usage_received={state.usage is not None}; "
+                f"Response stream interrupted: {state.progress_description()}; "
                 f"{_stream_error_description(exc)}"
             ) from exc
         # Generation completed explicitly; a missing accounting tail must not
@@ -1669,8 +1866,21 @@ def _call_provider(backend: str, api_mode: str, request: dict[str, Any], *, http
     raise ValueError(f"Unsupported LLM transport backend: {backend}")
 
 
+def _load_litellm() -> Any:
+    try:
+        import litellm
+    except ModuleNotFoundError as exc:
+        if exc.name != "litellm":
+            raise
+        raise LLMError(
+            "The litellm backend requires the optional dependency: "
+            "install simple-autoresearch[litellm], or select the openai backend."
+        ) from None
+    return litellm
+
+
 def _call_litellm(api_mode: str, request: dict[str, Any]) -> object:
-    import litellm
+    litellm = _load_litellm()
 
     litellm.suppress_debug_info = True
     if api_mode == "responses":
@@ -1683,6 +1893,19 @@ def _call_litellm(api_mode: str, request: dict[str, Any]) -> object:
 def _finite_timeout(value: object) -> bool:
     return (isinstance(value, (int, float)) and not isinstance(value, bool)
             and math.isfinite(value) and value > 0)
+
+
+_SDK_CONNECT_TIMEOUT_SEC = 20.0
+
+
+def _sdk_timeout(value: object) -> object:
+    # A long generation deadline must not become a long TCP/TLS deadline.
+    # Leave read/write/pool and explicit non-finite values unchanged; use the
+    # normal client so certificate and environment/explicit proxy rules survive.
+    if not _finite_timeout(value):
+        return value
+    import httpx
+    return httpx.Timeout(value, connect=min(float(value), _SDK_CONNECT_TIMEOUT_SEC))
 
 
 def _require_no_running_loop() -> None:
@@ -1713,7 +1936,7 @@ async def _collect_chat_stream_async(stream: Any, state: _ChatStreamState) -> No
                         pass  # Explicitly completed content survives missing accounting.
                 return
     except Exception as exc:
-        raise LLMStreamError(_stream_error_description(exc)) from exc
+        raise LLMStreamError(f"{_stream_error_description(exc)}; {state.progress_description()}") from exc
 
 
 async def _call_openai_chat_stream(
@@ -1724,12 +1947,25 @@ async def _call_openai_chat_stream(
 
     state = _ChatStreamState()
     client = stream = http_client = None
+    transport_phase = 'unobserved'
+
+    async def trace_phase(event_name: str, _info: dict[str, Any]) -> None:
+        nonlocal transport_phase
+        # Never retain trace info: it can contain credentials, bodies, URLs and
+        # exceptions. Unknown library events are ignored, not a new failure.
+        if event_name in _TRANSPORT_PHASES:
+            transport_phase = event_name
+
+    async def attach_trace(request: Any) -> None:
+        request.extensions['trace'] = trace_phase
+
     deadline = asyncio.timeout(timeout)
     try:
         try:
             async with deadline:
                 try:
-                    http_client = DefaultAsyncHttpxClient(http2=http2, **({"proxy": proxy} if proxy else {}))
+                    http_client = DefaultAsyncHttpxClient(http2=http2,
+                        event_hooks={'request': [attach_trace]}, **({"proxy": proxy} if proxy else {}))
                 except ImportError:
                     raise LLMError("HTTP/2 requires the optional dependency: install simple-autoresearch[http2]") from None
                 client = AsyncOpenAI(**client_kwargs, http_client=http_client)
@@ -1740,7 +1976,10 @@ async def _call_openai_chat_stream(
                 raise  # Ordinary network timeouts keep the existing retry policy.
             if state.finish_reason is None:
                 raise LLMDeadlineError(
-                    "SDK Chat stream wall-clock deadline exceeded; usage unknown."
+                    "SDK Chat stream wall-clock deadline exceeded; usage unknown; "
+                    f"transport_phase={transport_phase}; "
+                    f"stream_opened={stream is not None}; {state.progress_description()}",
+                    transport_phase=transport_phase, stream_opened=stream is not None,
                 ) from None
             # Finish was observed: do not resend merely for an absent usage tail.
         return state.response()
@@ -1816,7 +2055,7 @@ def _call_openai_sdk_request(api_mode: str, request: dict[str, Any], *, http2: b
         "max_retries": 0,
     }
     if timeout is not None:
-        client_kwargs["timeout"] = timeout
+        client_kwargs["timeout"] = _sdk_timeout(timeout)
     if base_url:
         client_kwargs["base_url"] = str(base_url)
     if api_mode == "chat" and payload.get("stream") and _finite_timeout(timeout):
@@ -1961,13 +2200,13 @@ def _as_chat_request(
         text_config = request.get("text")
         if isinstance(text_config, dict) and isinstance(text_config.get("format"), dict):
             converted["response_format"] = text_config["format"]
-    output_cap = converted.pop("max_output_tokens", None)
+    output_cap = converted.pop("max_output_tokens", request.get("max_output_tokens"))
     if output_cap is not None:
         converted.pop("max_tokens", None)
         converted.pop("max_completion_tokens", None)
         converted[_chat_token_limit_param(chat_token_limit_param, str(converted.get("model") or ""))] = output_cap
-    if thinking_mode and reasoning_effort and thinking_mode == "disabled":
-        raise LLMError("Disable SIMPLE_AR_LLM_REASONING_EFFORT when provider thinking is disabled.")
+    if thinking_mode == "disabled" and reasoning_effort not in {"", "none"}:
+        raise LLMError("thinking_mode='disabled' requires reasoning_effort='' or 'none'.")
     if reasoning_effort or thinking_mode:
         provider_options = converted.get("extra_body")
         extra_body = dict(provider_options) if isinstance(provider_options, dict) else {}
@@ -2031,6 +2270,21 @@ def _attempt_summary(mode_attempts: Sequence[tuple[str, int, Exception]]) -> str
     if not mode_attempts:
         return "0"
     return ", ".join(f"{mode}={attempts}" for mode, attempts, _ in mode_attempts)
+
+
+def _provider_failure_summary(exc: Exception) -> str:
+    """Retain diagnostic facts without retaining raw provider text or causes."""
+    details = [type(exc).__name__]
+    status = _provider_error_status(exc)
+    if status is not None:
+        details.append(f"HTTP status={status}")
+    phase = _transport_failure_phase(exc)
+    if phase:
+        details.append(f"transport phase={phase}")
+    if ((isinstance(exc, LLMStreamError) and "provider reported overload" in str(exc))
+            or "provider reported overload" in _stream_error_description(exc)):
+        details.append("provider reported overload")
+    return "; ".join(details)
 
 
 def _json_response_format_request(mode: str) -> dict[str, Any] | None:
@@ -2166,8 +2420,35 @@ def _is_known_provider_rejection(exc: Exception) -> bool:
 def _is_budget_consumption_unknown(exc: Exception) -> bool:
     """Return whether a failed call may have reached the provider."""
 
-    return (isinstance(exc, LLMDeadlineError)
+    phase = _transport_failure_phase(exc)
+    if phase == 'not_dispatched':
+        return False
+    return (phase == 'possibly_dispatched' or isinstance(exc, LLMDeadlineError)
             or _is_response_transport_disconnect(exc) or _is_timeout_error(exc))
+
+
+def _transport_failure_phase(exc: Exception) -> str:
+    """Use typed transport causes, never an endpoint/body/message heuristic."""
+    import httpx
+
+    if isinstance(exc, LLMStreamError):
+        return 'possibly_dispatched'
+    seen = set()
+    current: BaseException | None = exc
+    uncertain = False
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)):
+            return 'not_dispatched'
+        if isinstance(current, (httpx.ReadError, httpx.ReadTimeout, httpx.WriteError,
+                                httpx.WriteTimeout, httpx.RemoteProtocolError)):
+            uncertain = True
+        # The SDK intentionally hides HTTPX details in its public error. If
+        # no classified cause is retained, lack of a response proves nothing.
+        if type(current).__name__ in {'APIConnectionError', 'APITimeoutError'}:
+            uncertain = True
+        current = current.__cause__
+    return 'possibly_dispatched' if uncertain else ''
 
 
 def _is_timeout_error(exc: Exception) -> bool:

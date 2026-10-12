@@ -130,6 +130,7 @@ def build_fulltext_manifest(
                             allow_pdf_download=source_plan.allow_pdf_download,
                             on_redirect=account_redirect,
                             page_backend=page_backend,
+                            public_only=bool(source_plan.budget.get("public_network_only", False)),
                         )
             if planned.status == "cached":
                 cached_count += 1
@@ -258,6 +259,7 @@ def _cache_selected_hint(
     allow_pdf_download: bool,
     on_redirect: Callable[[], None] | None = None,
     page_backend: str = "direct",
+    public_only: bool = False,
 ) -> FulltextHint:
     if hint.local_path:
         return _cache_local_hint(hint)
@@ -268,6 +270,7 @@ def _cache_selected_hint(
     try:
         cached = _fetch_remote_hint(hint, cache_dir=cache_dir, max_bytes=max_pdf_bytes,
                                     page_backend=page_backend,
+                                    public_only=public_only,
                                     allow_pdf_download=allow_pdf_download, keep_raw_pdf=keep_raw_pdf,
                                     on_redirect=on_redirect)
     except Exception as exc:
@@ -318,7 +321,7 @@ def _check_remote_pdf_policy(kind: str, *, allow_pdf_download: bool, keep_raw_pd
 def _fetch_remote_hint(hint: FulltextHint, *, cache_dir: Path, max_bytes: int,
                        allow_pdf_download: bool, keep_raw_pdf: bool,
                        on_redirect: Callable[[], None] | None = None,
-                       page_backend: str = "direct") -> FulltextHint:
+                       page_backend: str = "direct", public_only: bool = False) -> FulltextHint:
     """Enforce the shared max_pdf_mb byte budget for every remote content kind."""
     if page_backend == "tavily_basic" and hint.kind in {"html", "text", "landing"}:
         return _fetch_tavily_hint(hint, cache_dir=cache_dir, max_bytes=max_bytes)
@@ -351,7 +354,7 @@ def _fetch_remote_hint(hint: FulltextHint, *, cache_dir: Path, max_bytes: int,
     bytes_written = 0
     cache_path = None  # Only remove a file opened by this attempt, not prior cache.
     try:
-        if hint.source == "supporting_material":
+        if public_only or hint.source == "supporting_material":
             from simple_ar.research.preparation_assets import public_document_response
             response_context = public_document_response(str(hint.url), max_bytes=max_bytes,
                                                         on_redirect=on_redirect)

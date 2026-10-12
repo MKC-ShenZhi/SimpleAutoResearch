@@ -678,6 +678,32 @@ class TaskPlanTests(unittest.TestCase):
         self.assertEqual({step.capability for step in result.steps}, {"implement"})
         self.assertEqual(result.mode, "deterministic")
 
+        # The same authorized code deliverable can consume sources and write
+        # its results under different entry labels, without inventing a study.
+        for kind in ("bug_fix", "survey", "research"):
+            for config, prefix in (({}, []), ({"research_materials_only": True,
+                    "research_local_documents": ["guide.md"]}, ["document_ingest", "read"]),
+                    ({"research_materials_only": False}, ["search", "document_ingest", "read"])):
+                with self.subTest(kind=kind, config=config):
+                    combined = build_task_plan(replace(request, task_kind=kind, config=config,
+                        requested_outputs=("bug_fix", "report")))
+                    self.assertEqual([step.action for step in combined.steps],
+                        prefix + ["implement", "report_write", "report", "report_audit"])
+                    self.assertEqual(TaskPlanResult.from_handoff_dict(combined.to_handoff_dict()), combined)
+                    class Client:
+                        def ask_json(self, *args, **kwargs):
+                            return {"steps": [step.to_dict() for step in combined.steps
+                                if step.action not in {"search", "document_ingest", "read"}]}
+                    direct = build_task_plan(replace(request, task_kind=kind, config=config,
+                        requested_outputs=("bug_fix", "report"), use_llm=True, llm_client=Client()))
+                    self.assertEqual([step.action for step in direct.steps],
+                        ["implement", "report_write", "report", "report_audit"])
+                    if prefix and prefix[0] == "search":
+                        extended = insert_evidence_followup(combined, round_index=1, read_state="read", queries=["official API behavior"])
+                        self.assertLess([step.action for step in extended.steps].index("read_evidence:1"),
+                            [step.action for step in extended.steps].index("implement"))
+                        self.assertEqual(TaskPlanResult.from_handoff_dict(extended.to_handoff_dict()), extended)
+
     def test_llm_plan_is_validated_before_it_can_be_consumed(self) -> None:
         class Client:
             model = "fixture-task-planner"
@@ -1142,6 +1168,19 @@ class TaskPlanTests(unittest.TestCase):
                 (Path(resolved["cwd"]) / "benchmark.py").read_text(),
                 (project / "benchmark.py").read_text(),
             )
+            context, memory = app.report_inputs()
+            self.assertEqual(context.report_mode, "supplied_materials")
+            self.assertEqual(context.results["implementation"]["status"], "validated")
+            self.assertTrue(any(handle.handle == "artifact:implementation" for handle in memory.source_handles))
+            saved = finished.state_refs["implementation"]
+            process_entries = len(app.budget_ledger.entries)
+            app.request_report(report_config={"template": "material_report"})
+            with patch("simple_ar.integrations.llm._call_openai_sdk",
+                       side_effect=AssertionError("Adding a report must not rerun code or pay for dispatch planning")):
+                planned = app.advance(max_actions=1)
+            self.assertEqual(planned.next_action, "report_write")
+            self.assertEqual(planned.state_refs["implementation"], saved)
+            self.assertEqual(len(app.budget_ledger.entries), process_entries)
 
     def test_application_executes_an_optional_step_declared_by_the_accepted_plan(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

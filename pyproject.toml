@@ -6,7 +6,6 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "arxiv>=3.0.0",
-    "litellm>=1.86.2",
     "matplotlib>=3.10",
     "openai>=2.34.0",
     "packaging>=24.0",
@@ -19,6 +18,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+litellm = ["litellm>=1.86.2"]
 examples = ["scikit-learn>=1.8.0"]
 http2 = ["h2>=4,<5"]
 
@@ -34,6 +34,13 @@ build-backend = "hatchling.build"
 # Also safe to build from an exported tree without Git metadata.
 include = [
     "/src", "/templates/report", "/tests", "/examples", "/docs",
+    # Source-tree test and adapter consumers; never include benchmark outputs.
+    "/benchmark/__init__.py", "/benchmark/adapter_contract.py",
+    "/benchmark/arc_bench/adapter.py", "/benchmark/arc_bench/batch_runner.py",
+    "/benchmark/arc_bench/README.md", "/benchmark/arc_bench/README_zh.md",
+    "/benchmark/arc_bench/ADAPTER_CONTRACT.md", "/benchmark/arc_bench/config.example.toml",
+    "/benchmark/survey_bench/adapter.py",
+    "/benchmark/survey_bench/README.md", "/benchmark/survey_bench/README_zh.md",
     "/README.md", "/README_zh.md", "/CHANGELOG.md", "/CHANGELOG_zh.md",
     "/pyproject.toml", "/uv.lock", "/LICENSE*",
 ]

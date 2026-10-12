@@ -1,8 +1,8 @@
-"""Guided input adapter; generated TOML enters the canonical session CLI.
+"""Input adapters for native tasks and explicit structured compatibility.
 
-This module does not run agents, infer execution authority, or own sessions.
-Only implemented entry paths are offered. Advanced users can edit the generated
-files and run the same research-session command directly.
+This module adapts inputs without inferring execution authority or owning task
+state. Native creation delegates to main; structured compatibility writes TOML
+for the existing research-session command.
 """
 from __future__ import annotations
 
@@ -21,11 +21,12 @@ from simple_ar.result_analysis.table import TABLE_CHOICES, TABLE_MODE_DESCRIPTIO
 
 FUNCTION_LABELS = {
     "survey": "Direction survey / 方向调研 — compare sources and deliver a report",
-    "bug_fix": "Code repair / 修改代码 — project, allowed edits and validation required",
-    "reproduction": "Finite reproduction / 有限复现 — confirmed command and environment; optional task venv",
+    "bug_fix": "Code repair / 修改代码 — describe the fix and supply a read-only project",
+    "reproduction": "Finite reproduction / 有限复现 — describe the conclusion and supply paper/project/data",
     "writing": "Material writing / 材料写作 — use notes, drafts or an analysis package",
-    "data_analysis": "Data and plots / 分析绘图 — deterministic tables (no API needed); --scripted uses model and code execution",
+    "data_analysis": "Data and plots / 分析绘图 — investigate supplied data; explicit table columns retain the no-API shortcut",
     "figure": "Editable method figure / 方法图 — describe components and relationships; deliver code, SVG and PNG",
+    "code": "Code project / 代码项目 — create from a goal or modify a project, with authorized validation",
 }
 
 
@@ -38,7 +39,7 @@ def select_start_model(args: argparse.Namespace, *, interactive: bool) -> None:
     from rich.text import Text
     from simple_ar.core.console import make_console
     from simple_ar.integrations.model_profiles import catalog_path, load_model_catalog
-    load_dotenv()
+    load_dotenv(dotenv_path=Path.cwd() / ".env", override=False)
     catalog = load_model_catalog()
     if catalog is None:
         print_line("Model catalog not found. Using legacy environment settings; configure ~/.config/simple-ar/models.toml or SIMPLE_AR_MODELS_CONFIG.")
@@ -105,15 +106,36 @@ def add_data_options(parser: argparse.ArgumentParser) -> None:
 
 
 def add_start_parser(subparsers: argparse._SubParsersAction) -> None:
-    parser = subparsers.add_parser("start", help="Set up a survey, code fix, prepared reproduction, writing or descriptive data analysis without TOML.")
-    parser.add_argument("--kind", choices=tuple(FUNCTION_LABELS))
+    parser = subparsers.add_parser("start", help="Start a native goal-driven task; structured protocols retain explicit compatibility.")
+    native = parser.add_argument_group("Native task")
+    native.add_argument("request", nargs="?", help="Natural-language task using the native action loop; no function selection.")
+    native.add_argument("--resume-task", type=Path, help="Resume a native-tool session; never replays unknown operations.")
+    native.add_argument("--retry-model", action="store_true", help="With --resume-task, explicitly continue a terminated failed native model decision using a new attempt and remaining budget. Optionally select --model profile:NAME/route:NAME to record a compatible Chat connection change without clearing history or charges. Cached replies keep their saved connection; tools, in-flight requests and whole tasks are not resubmitted. Use separately from feedback or authorization changes.")
+    native.add_argument("--authorize-remaining", action="append", default=None, metavar="DIMENSION=AMOUNT", help="Native resume: explicitly authorize a new remaining resource allowance after confirmation; repeat for multiple dimensions.")
+    native.add_argument("--authorization-id", default=None, help="Native resume: stable idempotency key required for explicit continuation allowances.")
+    native.add_argument("--authorization-reason", default=None, help="Native resume: human-readable reason recorded with a continuation allowance.")
+    native.add_argument("--source", action="append", default=[], type=Path, help="Native task: read-only file/directory mount, repeatable; on resume, explicitly add materials after confirmation.")
+    native.add_argument("--allow-execution", action="store_true", help="Native task: allow proposing process commands; each command still needs approval. Not an OS sandbox.")
+    native.add_argument("--allow-network", action="store_true", help="Native task: authorize public source search/acquisition, including bounded PDFs; no installation or command authorization.")
+    native.add_argument("--allow-vision", action="store_true", help="Native task: authorize sending mounted rendered images to the named TOML vision route, sharing the task model budget.")
+    native.add_argument("--max-images", type=int, default=0, help="Native task: authorize this many image generation/edit submissions through the named image route (default: disabled); retained on resume.")
+    native.add_argument("--approve-execution", default="", help="Native resume: exact approval token printed for its pending process.")
+    native.add_argument("--max-turns", type=int, default=30, help="Native task: model request allowance, retained across feedback/resume.")
+    native.add_argument("--max-tokens", type=int, default=600000, help="Native task: shared model token allowance, retained across feedback/resume.")
+    parser.set_defaults(_native_start_destinations={action.dest for action in native._group_actions},
+        _shared_start_destinations={'goal', 'model', 'output_root', 'prepare_only', 'yes', 'project_python'},
+        _data_declaration_destinations={'value_column', 'group_column', 'observation_unit', 'value_unit',
+            'data_attribution', 'paired_baseline', 'x_column', 'x_unit', 'data_association',
+            'data_mode', 'data_missing', 'data_plot', 'series_layout', 'figure_width'})
+    parser.add_argument("--guided", action="store_true", help="Choose an outcome preference for the native task; explicit protocol controls retain structured compatibility.")
+    parser.add_argument("--kind", choices=tuple(FUNCTION_LABELS), help="Starting preference for native creation, or explicit structured protocol. Does not grant execution or network access.")
     parser.add_argument("--from-session", type=Path, help="Reuse registered results or a validated project from an existing session.")
     parser.add_argument("--reuse", action="append", default=[], choices=("data_analysis", "report", "summary", "code_analysis", "code_project"),
                         help="Result to reuse as writing material; repeatable. code_project also supports isolated code/figure revision or repeating a saved reproduction protocol. Inspect with results SESSION.")
-    parser.add_argument("--chat", action="store_true", help="Opt-in model-assisted natural-language setup; confirms semantic choices before ordinary task setup. Requires a terminal and model connection.")
+    parser.add_argument("--chat", action="store_true", help="Opt-in model-assisted technical setup for explicit structured protocols, not the ordinary native preference entry. Requires a terminal and model connection.")
     parser.add_argument("--resume-setup", type=Path, help="Resume a saved natural-language setup directory, retaining replies and setup model accounting; not execution recovery.")
     parser.add_argument("--with-report", action="store_true", help="Data analysis: also write and review a report from the saved analysis and figures in the same session; requires a model. Default: analysis only, no task API calls.")
-    parser.add_argument("--scripted", action="store_true", help="Data analysis: generate and execute an isolated analysis/plot project from the goal, instead of using a preset. Requires model and ordinary execution confirmation; not an OS sandbox.")
+    parser.add_argument("--scripted", action="store_true", help="Data analysis: native goal-driven code/analysis task, with read-only data. Use --allow-execution for individually approved commands; no scaffold or preset restriction.")
     add_data_options(parser)
     parser.add_argument("--data-path", action="append", default=[], type=Path,
                         help="Reproduction/code fix: existing data file/directory, repeatable. Project inputs enter isolated code workspaces; external paths never rewrite execution commands.")
@@ -133,7 +155,7 @@ def add_start_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--validate", help="Explicit code validation command; reproduction with --allow uses this independent check before formal measurement.")
     parser.add_argument("--allow", action="append", default=[], help="Editable project-relative path/glob; repeat as needed.")
     parser.add_argument("--project-python", type=Path,
-                        help="Existing Python for code repair/reproduction; preserves a venv entry. With reproduction --environment venv, selects the base Python for the explicitly authorized task environment.")
+                        help="Existing Python for native process execution or code repair/reproduction; preserves a venv entry. With reproduction --environment venv, selects the base Python for the explicitly authorized task environment.")
     parser.add_argument("--hypothesis", help="Prepared reproduction: the published conclusion to check.")
     parser.add_argument("--dataset", help="Prepared reproduction: data and any accepted adaptation.")
     parser.add_argument("--expected-outcome", help="Prepared reproduction: comparison criteria, not invented results.")
@@ -166,6 +188,154 @@ def _answer(prompt: str, current: str | None, *, interactive: bool) -> str:
     if not answer:
         raise ValueError(f"A value is required: {prompt}")
     return answer
+
+
+def _select_start_preference(args: argparse.Namespace, *, interactive: bool) -> None:
+    if interactive and args.kind is None:
+        from rich.panel import Panel
+        from rich.table import Table
+        from simple_ar.core.console import make_console
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column(style="cyan", no_wrap=True)
+        table.add_column()
+        for index, (name, label) in enumerate(FUNCTION_LABELS.items(), 1):
+            table.add_row(str(index), label)
+        make_console().print(Panel(table, title="SimpleAutoResearch · 科研助手", border_style="cyan",
+                                  subtitle="Choose an outcome preference / 选择成果偏好"))
+        print_line("For explicit technical protocol setup: simple-ar start --chat.")
+    kind = _answer("Preference number or name / 偏好编号或名称", args.kind, interactive=interactive)
+    numbers = {str(index): name for index, name in enumerate(FUNCTION_LABELS, 1)}
+    args.kind = numbers.get(kind, kind)
+    if args.kind not in FUNCTION_LABELS:
+        raise ValueError("Choose a displayed preference number or name.")
+
+
+def migrate_new_start(args: argparse.Namespace) -> bool:
+    """Translate ordinary preferences, never a saved or explicit protocol.
+
+    This only adapts inputs to _run_native_start. The native application remains
+    the sole task/configuration/authorization/ledger owner. Explicit unsupported
+    controls are rejected before any model selection or session creation.
+    """
+    if args.from_session or args.reuse:
+        return False  # Registered scope and validator belong to bounded reuse.
+    if args.chat or args.resume_setup or hasattr(args, "_setup_state"):
+        if args.kind == "figure" or args.scripted:
+            raise ValueError("Native creation cannot preserve chat/resume_setup structured controls; use ordinary preferences or an explicit supported protocol.")
+        return False  # Technical setup retains its confirmed structured protocol.
+    if args.kind is None:
+        if not args.guided:
+            if args.scripted:
+                raise ValueError("--scripted requires --kind data_analysis.")
+            return False  # Bare start and plain requests already use native main.
+        if args.resume_task:
+            raise ValueError("Creation preferences cannot change a saved task; use --resume-task without --guided.")
+        _select_start_preference(args, interactive=sys.stdin.isatty())
+    scripted = args.scripted
+    figure = args.kind == "figure"
+    if scripted and args.kind != "data_analysis":
+        raise ValueError("--scripted requires --kind data_analysis.")
+    if args.resume_task:
+        raise ValueError("Creation preferences cannot change a saved task; use --resume-task without --kind/--scripted.")
+    if args.approve_execution:
+        raise ValueError("--approve-execution requires --resume-task and its saved pending command.")
+    if args.retry_model:
+        raise ValueError("--retry-model requires --resume-task and its saved failed model decision.")
+    from simple_ar.cli.parser import build_parser
+    defaults = build_parser().parse_args(["start"])
+    explicit = set(getattr(args, "_explicit_start_destinations", ()))
+    explicit.update(name for name, value in vars(defaults).items()
+                    if not name.startswith("_") and getattr(args, name, value) != value)
+    supported = (args._native_start_destinations | args._shared_start_destinations
+                 | {"kind", "guided", "scripted", "project", "data_file", "data_path", "document", "material", "with_report"}
+                 | args._data_declaration_destinations)
+    protocol_controls = explicit - supported
+    # Explicit value/coordinate/baseline selectors request the table shortcut.
+    # Scripted declarations remain exact user intent for the native analysis.
+    table_protocol = args.kind == "data_analysis" and not scripted and bool(
+        explicit & {"value_column", "x_column", "paired_baseline"})
+    if protocol_controls or table_protocol:
+        if not (figure or scripted):
+            return False
+        raise ValueError("Native creation cannot preserve these structured controls: "
+                         + ", ".join(sorted(protocol_controls))
+                         + ". Use the explicit research-session/code-task protocol when required; no options were applied.")
+    if args.goal and args.request:
+        raise ValueError("Use either the positional request or --goal, not both.")
+    goal = args.request if args.request is not None else args.goal
+    if goal is None:
+        goal = _answer("Goal / 目标", None, interactive=sys.stdin.isatty())
+    if not goal.strip():
+        raise ValueError("Supply a nonempty task goal.")
+    interactive = sys.stdin.isatty()
+    if interactive and not (args.source or args.document or args.material or args.project or args.data_file or args.data_path):
+        print_line("Materials are read-only. Supply common file/project/data paths, one per line; blank finishes.")
+        while value := input("Material path / 材料路径（可留空）: ").strip():
+            args.source.append(Path(value))
+    from simple_ar.tools.workspace import resolve_source_mount
+    roles = {}
+    for name, values in (("source", args.source), ("document", args.document), ("material", args.material),
+                         ("project", [args.project] if args.project is not None else []), ("data_path", args.data_path),
+                         ("data_file", [args.data_file] if args.data_file is not None else [])):
+        for value in values:
+            if isinstance(value, str) and value.startswith(("http://", "https://")):
+                raise ValueError("--document requires local mounted material for native creation; put public URLs in the goal and authorize --allow-network separately.")
+            path = resolve_source_mount(Path(value))
+            roles.setdefault(name, []).append(str(path))
+    sources = list(dict.fromkeys(Path(value)
+        for name in ("source", "document", "material", "data_path", "project", "data_file")
+        for value in roles.get(name, ())))
+    if args.project is not None and not args.project.expanduser().resolve().is_dir():
+        raise ValueError("--project must be a read-only project directory.")
+    from simple_ar.research.documents.ingest import analysis_material_paths
+    analysis_material_paths(path.expanduser().resolve() for path in args.material if path.is_file())
+    if args.kind == "writing":
+        from simple_ar.research.documents.ports import SUPPORTED_DOCUMENT_SUFFIXES, SUPPORTED_MATERIAL_SUFFIXES
+        if set(path.expanduser().resolve() for path in args.document) & set(path.expanduser().resolve() for path in args.material):
+            raise ValueError("Each writing file must have one role; do not repeat papers as material.")
+        if any(path.is_file() and path.suffix.lower() not in suffixes
+               for paths, suffixes in ((args.document, SUPPORTED_DOCUMENT_SUFFIXES), (args.material, SUPPORTED_MATERIAL_SUFFIXES))
+               for path in paths):
+            raise ValueError("Writing material must be text/HTML/PDF/JSON or a validated analysis package; use read-only --source for other investigation inputs.")
+    if args.data_file is not None:
+        data = args.data_file.expanduser().absolute()
+        from simple_ar.result_analysis.script_project import MAX_DATA_BYTES
+        if not data.is_file() or data.stat().st_size > MAX_DATA_BYTES:
+            raise ValueError("Creation --data-file must be a regular file of at most 20 MiB; use --source for larger bounded investigation.")
+    declarations = {name: getattr(args, name) for name in sorted(args._data_declaration_destinations)
+                    if name in explicit or getattr(args, name) != getattr(defaults, name)}
+    additions = []
+    if roles:
+        additions.append("Supplied material roles (user declarations, not independently verified evidence):\n"
+                         + json.dumps(roles, ensure_ascii=False))
+    if declarations:
+        additions.append("User-declared data meanings and requested presentation (preserve exactly; clarify unsupported scientific assumptions):\n"
+                         + json.dumps(declarations, ensure_ascii=False))
+    delivery = {
+        "survey": "Compare relevant sources and conditions, answer the question and deliver an evidence-based report. Distinguish original sources from supplied unverified notes.",
+        "writing": "Deliver an editable draft grounded in supplied materials; distinguish observations from independently verified evidence and preserve unresolved gaps.",
+        "bug_fix": "Investigate the supplied project and requested fix; deliver revised source and an explanation with actual validation status. Preserve supplied evaluation/checker files.",
+        "code": "Deliver source addressing the goal, a usable entry and an explanation with actual validation status.",
+        "reproduction": "Investigate the supplied paper/project/data and clarify necessary measurement conditions. Deliver reproducible source and an honest account of actual checks and remaining gaps; preparation or short checks do not establish a published conclusion.",
+        "figure": "Deliver an editable method figure, its code/layout source, PNG preview, vector SVG and explanation. Verify actual exports before delivery. Distinguish conceptual relationships from measured evidence; do not invent data.",
+        "data_analysis": "Deliver analysis source or a rebuildable analysis package, actually computed results and explanation, with figures when useful to the goal. Inspect data meanings and units; never infer pairing from row order. Record assumptions, missing/excluded rows and provenance; verify actual outputs before delivery. File readability does not establish statistical correctness.",
+    }
+    additions.append("Requested outcome preference (not an access grant): " + delivery[args.kind])
+    if args.with_report:
+        additions.append("Include a report based on the actual materials and results.")
+    additions.append("All mounted materials, including data and supplied evaluation/checker files, are read-only. Keep new source and outputs in the task workspace. No installation or destructive action is authorized by this creation preference; commands need separate approval.")
+    if interactive and not args.yes and not args.prepare_only and not (args.allow_network or args.allow_execution):
+        print_line("If needed for your goal, authorize public source acquisition or process proposals. Each process command still needs its own approval; this is not an OS sandbox.")
+        access = input("Access / 所需访问 [none / network / process / both; default none]: ").strip().lower()
+        if access not in {"", "none", "network", "process", "both"}:
+            raise ValueError("Choose none, network, process or both; no access was granted.")
+        args.allow_network = access in {"network", "both"}
+        args.allow_execution = access in {"process", "both"}
+    args.request = goal + "\n\n" + "\n\n".join(additions)
+    args.goal = None
+    args.source = sources
+    print_line("Ordinary preferences use the native task owner. Materials remain read-only; --allow-execution permits proposals only, and --yes accepts the summary only.")
+    return True
 
 
 def _quote(value: str) -> str:
@@ -204,7 +374,7 @@ def _literature_rows(args: argparse.Namespace, sources: str, documents: list[Pat
             "", "[assets]", f"papers = {_array([str(path) for path in documents])}"]
 
 
-def _code_task_files(goal: str, project: Path, validation: str, allowed: list[str],
+def _code_task_files(goal: str, project: Path | None, validation: str, allowed: list[str],
                      python_executable: Path | None = None, *, generated_script: bool = False,
                      protected: list[str] | None = None, edit_policy: dict | None = None,
                      timeout_sec: int = 300) -> dict[str, str]:
@@ -224,9 +394,9 @@ def _code_task_files(goal: str, project: Path, validation: str, allowed: list[st
     budget_rows = ("\n[budget]\n" + ''.join(f"{key} = {value}\n" for key, value in overrides.items())) if overrides else ""
     return {
         "task.md": goal + "\n",
-        "code_task.toml": "[code_task]\n" + f"code_root = {_quote(str(project))}\n"
-        'task_file = "{config_dir}/task.md"\noutput_root = "{config_dir}/sessions"\n'
-        '\n[workspace]\nmode = "auto"\n\n[environment]\n' + environment
+        "code_task.toml": "[code_task]\n" + (f"code_root = {_quote(str(project))}\n" if project else 'kind = "greenfield"\n')
+        + 'task_file = "{config_dir}/task.md"\noutput_root = "{config_dir}/sessions"\n'
+        + '\n[workspace]\nmode = ' + _quote("auto" if project else "empty") + '\n\n[environment]\n' + environment
         + "\n[edit_scope]\n" + f"allowed_patterns = {_array(allowed)}\n"
         + 'protected_patterns = ' + _array(list(dict.fromkeys([
             "tests/**", "**/tests/**", "test_*.py", "**/test_*.py", ".env", ".env.*", *(protected or [])]))) + '\n'
@@ -306,9 +476,9 @@ def _reproduction_rows(args: argparse.Namespace, *, interactive: bool) -> list[s
                     or shlex.split(args.validate) != creation["validation_argv"]):
                 raise ValueError("Confirmed adapter creation scope/checker no longer matches setup.")
             initial_files = list(creation["allowed_paths"])
-            # Like a requested analysis/figure script, a confirmed new adapter
-            # is whole-file creation, not a small patch to author algorithms.
-            # Reuse the existing bounded script edit policy; do not broaden
+            # A confirmed legacy adapter is whole-file creation, not a small
+            # patch to author algorithms. Retain its bounded creation policy;
+            # do not broaden
             # editable paths or apply this to ordinary repository repairs.
             args._generated_script = True
             print_line("Authorized new adapter creation uses the bounded script edit policy; author files remain read-only.")
@@ -362,6 +532,19 @@ def session_materials(root: Path) -> dict[str, list[Path]]:
     from simple_ar.core.capabilities import CapabilityRegistry
     from simple_ar.core.session import SessionController
     session = SessionController.load(root, registry=CapabilityRegistry())
+    from simple_ar.app.tool_application import ToolApplication
+    if session.manifest.transition_recipe == ToolApplication.RECIPE:
+        # A previous delivery remains on disk during feedback. It is not the
+        # current completion while the revised task is active or paused.
+        if session.manifest.status not in {"completed", "partial"}:
+            return {}
+        from simple_ar.tools.workspace import resolve_mounted_path, validate_workspace_arguments
+        delivery = validate_workspace_arguments("deliver_result", session.store.read_json("delivery.json"))
+        paths = [resolve_mounted_path({"workspace": root / "workspace"}, value, write=True)
+                 for value in delivery.artifacts]
+        if not all(path.is_file() for path in paths):
+            raise ValueError("Registered native delivery references a missing workspace file.")
+        return {"artifacts": paths} if paths else {}
     available: dict[str, list[Path]] = {}
     project = _session_project(session)
     if project is not None:
@@ -540,77 +723,56 @@ def reuse_session_materials(args: argparse.Namespace) -> None:
             args._reuse_report_drafts = [str(available[name][0])]
     args.material = list(dict.fromkeys(args.material))
     args.kind = "writing"
-    # Idempotent when called both before chat and by the ordinary entry point.
     args.from_session = None
     args.reuse = []
 
 
 def prepare_start(args: argparse.Namespace) -> Path | None:
-    """Collect bounded user choices and write one canonical, editable input set."""
+    """Adapt public start inputs once, retaining exact structured protocols."""
+    interactive = sys.stdin.isatty()
+    migrated = migrate_new_start(args)
+    native_destinations = getattr(args, "_native_start_destinations", None)
+    if native_destinations is None:
+        # Saved technical setup excludes parser-private metadata. Reconstruct
+        # the option contract from its existing owner, not from saved guesses.
+        from simple_ar.cli.parser import build_parser
+        contract = build_parser().parse_args(["start"])
+    else:
+        contract = args
+    supplied = set(getattr(args, "_explicit_start_destinations", ()))
+    native_options = supplied & contract._native_start_destinations
+    legacy = supplied - contract._native_start_destinations - contract._shared_start_destinations
+    if not migrated and legacy and (args.request or native_options):
+        raise ValueError("Do not mix native task and legacy setup options: " + ", ".join(sorted(legacy)))
+    if migrated or (not hasattr(args, "_setup_state") and
+                    (args.request or args.resume_task or (not legacy and args.kind is None
+                        and not (args.chat or args.resume_setup or args.from_session or args.reuse)))):
+        from simple_ar.cli.main import _run_native_start
+        _run_native_start(args)
+        return None
+    if native_options:
+        raise ValueError("Do not mix native access/budget options with a structured protocol: "
+                         + ", ".join(sorted(native_options)))
+    reuse_session_materials(args)
+    if (args.chat or args.resume_setup) and not hasattr(args, "_setup_state"):
+        from simple_ar.cli.intake_dialogue import discuss_start
+        select_start_model(args, interactive=interactive)
+        args = discuss_start(args)
+        if args is None:
+            return None
     if getattr(args, "asset_max_mb", None) is not None and not hasattr(args, "_setup_state"):
         raise ValueError("--asset-max-mb applies to confirmed --chat downloads, not ordinary task preparation.")
-    reuse_session_materials(args)
-    interactive = sys.stdin.isatty()
-    if interactive and args.kind is None:
-        from rich.panel import Panel
-        from rich.table import Table
-        from simple_ar.core.console import make_console
-        table = Table(show_header=False, box=None, padding=(0, 2))
-        table.add_column(style="cyan", no_wrap=True)
-        table.add_column()
-        for index, (name, label) in enumerate(FUNCTION_LABELS.items(), 1):
-            table.add_row(str(index), label)
-        make_console().print(Panel(table, title="SimpleAutoResearch · 科研助手", border_style="cyan",
-                                  subtitle="Choose a task / 选择要完成的工作"))
-        print_line("Concept images: simple-ar image. For conversational setup: simple-ar start --chat.")
-    kind = _answer("Function number or name / 功能编号或名称", args.kind, interactive=interactive)
-    numbers = {str(index): name for index, name in enumerate(FUNCTION_LABELS, 1)}
-    kind = numbers.get(kind, kind)
-    if kind not in FUNCTION_LABELS:
-        raise ValueError("Choose a displayed function number or name.")
-    if kind != "data_analysis" or args.with_report or args.scripted or args.chat:
+    _select_start_preference(args, interactive=interactive)
+    kind = args.kind
+    if kind == "figure" or args.scripted:
+        raise ValueError("Figure/scripted preferences require native entry; technical setup cannot preserve their controls as a structured protocol.")
+    if kind == "code" and args.project is None:
+        print_line("Structured code creation compatibility: retaining the explicit edit scope/validator and CodeTask protocol. Use a natural-language start goal for native creation.")
+    if kind != "data_analysis" or args.with_report or args.chat:
         select_start_model(args, interactive=interactive)
-    if args.scripted or kind == "figure":
-        if args.scripted and kind != "data_analysis":
-            raise ValueError("--scripted requires --kind data_analysis.")
-        if args.with_report or args.project or args.validate or args.allow or args.document or args.material:
-            raise ValueError("Scripted analysis takes data and a goal; it delivers its own explanation. Reuse the resulting report for later writing.")
-        from copy import copy
-        from simple_ar.cli.parser import build_parser
-        from simple_ar.cli.research_config import FIELDS
-        from simple_ar.result_analysis.script_project import SCRIPT_EDIT_PATTERNS, prepare_script_project
-        goal = _answer("Goal / 目标", args.goal, interactive=interactive)
-        data = args.data_file
-        if kind == "data_analysis" and data is None:
-            data = Path(_answer("Data file / 数据路径", None, interactive=interactive))
-        root = getattr(args, "_start_root", None) or new_research_session_root(args.output_root, goal)
-        project, validation = prepare_script_project(Path(root) / "source", data=data, goal=goal, diagram=kind == "figure")
-        forwarded = copy(args)
-        defaults = build_parser().parse_args(["start"])
-        for destination, _ in FIELDS["analysis"].values():
-            setattr(forwarded, destination, getattr(defaults, destination))
-        forwarded.kind = "bug_fix"
-        forwarded.scripted = False
-        forwarded.goal = goal
-        forwarded.project = project
-        forwarded.validate = _command(list(validation))
-        forwarded.allow = list(SCRIPT_EDIT_PATTERNS)
-        forwarded.data_path = [project / "data"]
-        forwarded._code_task_text = (project / "README.md").read_text(encoding="utf-8")
-        meanings = {name: getattr(args, name) for name in (
-            "value_column", "group_column", "observation_unit", "value_unit",
-            "data_attribution", "paired_baseline", "x_column", "x_unit") if getattr(args, name)}
-        if meanings:
-            forwarded._code_task_text += "\n## User-declared data meanings\n\n" + json.dumps(meanings, ensure_ascii=False) + "\n"
-        forwarded._start_root = root
-        forwarded._generated_script = True
-        forwarded._reuse_protected = ["data/**"]
-        print_line("Scripted analysis uses the existing CodeTask execution boundary; supplied data and the delivery checker are protected. File checks do not establish statistical correctness.")
-        print_line("Generation uses the bounded large edit profile (up to 16,000 characters per new block), only in the newly created script project. Ordinary project-repair limits are unchanged.")
-        return prepare_start(forwarded)
     project_python = getattr(args, "project_python", None)
     if project_python is not None:
-        if kind not in {"bug_fix", "reproduction"}:
+        if kind not in {"bug_fix", "code", "reproduction"}:
             raise ValueError("--project-python requires --kind bug_fix; reproduction uses its command/environment options.")
         from simple_ar.code_task.execution.environment import _resolve_external_python
         try:
@@ -623,7 +785,7 @@ def prepare_start(args: argparse.Namespace) -> Path | None:
     if getattr(args, "check_argv", None) is not None and kind != "reproduction":
         raise ValueError("--check-argv requires --kind reproduction.")
     data_paths = [path.expanduser().resolve() for path in getattr(args, "data_path", [])]
-    if data_paths and kind not in {"reproduction", "bug_fix"}:
+    if data_paths and kind not in {"reproduction", "bug_fix", "code"}:
         raise ValueError("--data-path requires --kind reproduction or bug_fix; table analysis uses --data-file.")
     for path in data_paths:
         if not path.exists():
@@ -755,21 +917,30 @@ def prepare_start(args: argparse.Namespace) -> Path | None:
                 validation = args.validate
             reproduction_rows = _reproduction_rows(args, interactive=interactive)
     else:
-        if documents or sources or args.fulltext or args.max_cited_sources is not None:
-            raise ValueError("bug_fix does not consume literature inputs or a search scope.")
-        project = Path(_answer("Project path / 项目路径", str(args.project) if args.project else None,
-                               interactive=interactive)).expanduser().resolve()
-        if not project.is_dir():
+        if sources not in {None, "materials", "search"}:
+            raise ValueError("Source scope must be materials or search.")
+        if sources is None and documents:
+            sources = "materials"
+        if args.fulltext and sources != "search":
+            raise ValueError("--fulltext requires explicit --sources search.")
+        if kind == "code" and args.project is None:
+            project = None
+            if data_paths:
+                raise ValueError("A new code project does not copy external data; provide a scaffold with --project to preserve declared data paths.")
+        else:
+            project = Path(_answer("Project path / 项目路径", str(args.project) if args.project else None,
+                                   interactive=interactive)).expanduser().resolve()
+        if project is not None and not project.is_dir():
             raise ValueError(f"Project directory not found: {project}")
         validation = _answer("Validation command / 验证命令", args.validate, interactive=interactive)
         if not allowed:
             allowed = [_answer("Editable path/glob / 允许修改的路径（例如 src/**）", None, interactive=interactive)]
-    if project:
+    if project or kind == "code":
         for pattern in allowed:
             if not pattern.strip() or Path(pattern).is_absolute() or ".." in pattern.replace("\\", "/").split("/"):
                 raise ValueError("Editable paths must be nonempty project-relative patterns without '..'.")
-    if args.with_report and kind != "data_analysis":
-        raise ValueError("start --with-report requires --kind data_analysis; survey, reproduction and writing already request reports.")
+    if args.with_report and kind not in {"data_analysis", "bug_fix", "code"}:
+        raise ValueError("start --with-report requires data_analysis or bug_fix; survey, reproduction and writing already request reports.")
     if args.with_report and not args.model:
         raise ValueError("--with-report requires a model connection; analysis alone needs no model.")
     from rich.panel import Panel
@@ -791,6 +962,9 @@ def prepare_start(args: argparse.Namespace) -> Path | None:
         if data_paths:
             print_line("Declared data inputs: " + ", ".join(str(path) for path in dict.fromkeys(data_paths)))
             print_line("Project data is copied at the same relative location and protected from automated edits; external data paths are not copied or injected into commands.")
+    elif kind == "code":
+        print_line(f"New empty CodeTask workspace; edit scope: {', '.join(allowed)}; validation: {validation}")
+        print_line("Generated project files live under generated_project/. Validation is authorized; no dependency installation or network access is implied. Workspace isolation is not an OS sandbox.")
     elif kind == "data_analysis":
         print_line(f"Data: {analysis['file']}; values: {', '.join(args.value_column)}; mode: {args.data_mode}; missing: {args.data_missing}")
         print_line("The analysis itself makes no model/API calls or project-code execution and does not verify experiments. Descriptive statistics only; copied data may be sensitive. Optional chat setup has separate model usage.")
@@ -830,15 +1004,15 @@ def prepare_start(args: argparse.Namespace) -> Path | None:
             write_json(package, bundle.to_handoff_dict())
             materials = [package if path == draft else path for path in materials]
     config = root / "research.toml"
-    outputs = {"survey": ["report"], "bug_fix": ["bug_fix"], "reproduction": ["experiments", "report"], "writing": ["report"], "data_analysis": ["data_analysis"]}
+    outputs = {"survey": ["report"], "bug_fix": ["bug_fix"], "code": ["code_task"], "reproduction": ["experiments", "report"], "writing": ["report"], "data_analysis": ["data_analysis"]}
     if args.with_report:
         outputs[kind].append("report")
     model = "" if kind == "data_analysis" and not args.with_report else args.model
-    rows = ["[task]", f"goal = {_quote(goal)}", f"kind = {_quote(kind)}",
+    rows = ["[task]", f"goal = {_quote(goal)}", f"kind = {_quote('auto' if kind == 'code' else kind)}",
             f"outputs = {_array(outputs[kind])}",
             'output_root = "sessions"', "", "[model]", f"name = {_quote(model)}", "",
             "[research]", f"interaction = {_quote(args.interaction)}"]
-    if kind in {"survey", "reproduction", "writing"} or (kind == "data_analysis" and args.with_report):
+    if kind in {"survey", "reproduction", "writing"} or (kind == "data_analysis" and args.with_report) or (kind in {"bug_fix", "code"} and (sources or documents)):
         rows.extend(_literature_rows(args, sources, documents))
         if data_paths:
             rows.append(f"data = {_array([str(path) for path in dict.fromkeys(data_paths)])}")
@@ -863,7 +1037,7 @@ def prepare_start(args: argparse.Namespace) -> Path | None:
             rows.append(f"max_cited_sources = {args.max_cited_sources}")
         if kind == "reproduction":
             rows.append('template = "reproduction"')
-        elif kind in {"writing", "data_analysis"}:
+        elif kind in {"writing", "data_analysis", "bug_fix", "code"}:
             rows.append(f"template = {_quote(writing_template)}")
         # New built-in tasks share evidence planning; custom templates and
         # existing TOML/checkpoints retain their author's structure.
@@ -873,8 +1047,8 @@ def prepare_start(args: argparse.Namespace) -> Path | None:
     if kind == "data_analysis":
         rows.extend(["", "[analysis]", *[f"{key} = {_array(list(value)) if isinstance(value, tuple) else str(value) if type(value) is int else _quote(value)}"
                                              for key, value in analysis.items()]])
-    if project:
-        if data_paths and kind == "bug_fix":
+    if project or kind == "code":
+        if data_paths and kind in {"bug_fix", "code"}:
             rows.extend(["", "[assets]", f"data = {_array([str(path) for path in dict.fromkeys(data_paths)])}"])
         implementation_goal = getattr(args, "_code_task_text", goal)
         if getattr(args, "_analysis_project", False):
@@ -895,7 +1069,7 @@ def prepare_start(args: argparse.Namespace) -> Path | None:
                                          edit_policy=getattr(args, "_reuse_edit_policy", None),
                                          timeout_sec=args.timeout_sec or 300).items():
             (root / name).write_text(text, encoding="utf-8")
-        if kind == "bug_fix":
+        if kind in {"bug_fix", "code"}:
             rows.extend(["", "[execution]", 'code_task_config = "code_task.toml"'])
     config.write_text("\n".join(rows) + "\n", encoding="utf-8")
     # Validate through the existing parser, not an independent wizard schema.

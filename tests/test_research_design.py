@@ -388,7 +388,7 @@ class ResearchDesignTests(unittest.TestCase):
                 supplied=first, max_files=1, max_chars=1000)
             self.assertIn("predictions = scores.mean(1)", second[0]["text"])
 
-    def test_source_followup_skips_near_duplicate_symbol_window(self):
+    def test_source_followup_preserves_unseen_symbol_gap_then_reaches_query(self):
         from simple_ar.code_task.analysis.source_context import requested_source_context, source_file_inventory
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -402,13 +402,24 @@ class ResearchDesignTests(unittest.TestCase):
                 {"path": "model.py", "text": source[:6000], "source_offset": 0},
                 {"path": "model.py", "text": source[6869:12869], "source_offset": 6869},
             ]
-            found = requested_source_context(workspace, index,
-                {"files": ["model.py"], "symbols": ["Model.forward", "LinearEfficientEnsemble"],
-                 "query": "How are predictions currently aggregated?"},
+            request = {"files": ["model.py"], "symbols": ["Model.forward", "LinearEfficientEnsemble"],
+                       "query": "How are predictions currently aggregated?"}
+            found = requested_source_context(workspace, index, request,
                 supplied=supplied, max_files=1, max_chars=6000)
             self.assertEqual(len(found), 1)
-            self.assertIn("predictions = heads.mean(1)", found[0]["text"])
-            self.assertGreater(found[0]["source_offset"], 10921)
+            # An unseen named gap is still evidence, even when neighboring
+            # windows overlap heavily. Do not restore a novelty quota that
+            # discards it; the next request must make progress to the query.
+            self.assertEqual(found[0]["source_offset"], 6000)
+            self.assertEqual(found[0]["text"], source[6000:6869])
+            self.assertIn("LinearEfficientEnsemble", found[0]["text"])
+            followup = requested_source_context(workspace, index, request,
+                supplied=[*supplied, *found], max_files=1, max_chars=6000,
+                max_total_chars=6000 - sum(len(row["text"]) for row in found))
+            self.assertEqual(len(followup), 1)
+            self.assertIn("predictions = heads.mean(1)", followup[0]["text"])
+            self.assertGreaterEqual(followup[0]["source_offset"], 12869)
+            self.assertLessEqual(sum(len(row["text"]) for row in [*found, *followup]), 6000)
 
     def test_exact_source_lookup_reaches_a_downstream_consumer(self):
         from simple_ar.code_task.analysis.source_context import requested_source_context, source_file_inventory

@@ -10,7 +10,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, call, patch
 
@@ -18,11 +20,12 @@ from PIL import Image
 
 from simple_ar.integrations.usage import record_usage, summarize_usage
 from simple_ar.core.artifacts import read_json, read_jsonl
-from simple_ar.core.budget import BudgetLedger
+from simple_ar.core.budget import BudgetConflictError, BudgetExceededError, BudgetLedger, BudgetUnknownError
 from simple_ar.integrations.llm import (
     LLMClient,
     LLMDeadlineError,
     LLMError,
+    LLMImageInputError,
     LLMResponseError,
     LLMRequest,
     LLMSettings,
@@ -35,6 +38,11 @@ from simple_ar.integrations.llm import (
 
 
 class LLMParsingTests(unittest.TestCase):
+    def setUp(self):
+        catalog = patch('simple_ar.integrations.llm.load_model_catalog', return_value=None)
+        catalog.start()
+        self.addCleanup(catalog.stop)
+
     def test_local_vision_payloads_and_provider_or_unknown_usage(self):
         from simple_ar.integrations.model_profiles import ModelCatalog, ModelProfile
         from simple_ar.integrations.llm import ESTIMATED_IMAGE_INPUT_TOKENS
@@ -144,8 +152,12 @@ class LLMParsingTests(unittest.TestCase):
                     client = LLMClient(LLMSettings(api_key='fixture', api_mode=mode, max_output_tokens=cap),
                         model_catalog=ModelCatalog(profiles={'view': selected}), profile_name='view', purpose=purpose,
                         budget_ledger=ledger)
-                    with patch('simple_ar.integrations.llm._call_openai_sdk') as sdk, self.assertRaises(LLMError):
+                    with patch('simple_ar.integrations.llm._call_openai_sdk') as sdk, self.assertRaises(LLMError) as failure:
                         client.ask_json('review', 'goal', image_paths=paths)
+                    if paths == (large,):
+                        self.assertIsInstance(failure.exception, LLMImageInputError)
+                        self.assertIn('4194304 pixels', str(failure.exception))
+                        self.assertIn('preserve the original', str(failure.exception))
                     self.assertEqual(ledger.entries, ())
                     sdk.assert_not_called()
             with patch('simple_ar.integrations.llm.MAX_VISION_BYTES', 1), self.assertRaises(LLMError):
@@ -185,7 +197,11 @@ class LLMParsingTests(unittest.TestCase):
                     sdk.chat.completions.create.return_value = {"choices": [{"message": {"content": "ok"}}]}
                     sdk.responses.create.return_value = {"output_text": "ok"}
                 self.assertEqual(client.ask("system", "user"), "ok")
-                transport.assert_called_once_with(http2=False, proxy=proxy)
+                transport.assert_called_once()
+                self.assertEqual(transport.call_args.kwargs['http2'], False)
+                self.assertEqual(transport.call_args.kwargs['proxy'], proxy)
+                self.assertEqual(set(transport.call_args.kwargs),
+                    {'http2', 'proxy', 'event_hooks'} if streamed else {'http2', 'proxy'})
                 create = sdk.responses.create if mode == "responses" else sdk.chat.completions.create
                 self.assertNotIn("proxy", create.call_args.kwargs)
                 self.assertNotIn("proxy_env", create.call_args.kwargs)
@@ -202,6 +218,15 @@ class LLMParsingTests(unittest.TestCase):
             'from simple_ar.integrations.llm import LLMClient, LLMSettings; '
             'LLMClient(LLMSettings(api_key="fixture")); assert "litellm" not in sys.modules'],
             check=True, timeout=20, capture_output=True)
+        ledger = BudgetLedger({"llm_requests": 1})
+        client = LLMClient(LLMSettings(api_key="fixture", transport_backend="litellm"),
+                           budget_ledger=ledger)
+        with patch.dict(sys.modules, {"litellm": None}), \
+                patch("simple_ar.integrations.llm._call_provider") as send:
+            with self.assertRaisesRegex(LLMError, r"simple-autoresearch\[litellm\]"):
+                client.ask("system", "user")
+            send.assert_not_called()
+            self.assertEqual(ledger.entries, ())
         for value in (None, "http://secret@proxy", "https://proxy/?secret"):
             with self.subTest(value=value), patch.dict(os.environ, {}, clear=True):
                 if value is not None:
@@ -257,7 +282,7 @@ class LLMParsingTests(unittest.TestCase):
             self.assertEqual(send.call_count, 2)
 
     def test_sdk_stream_deadline_retains_charges_and_bounds_retries_without_api_switch(self):
-        for blocked_at in ("headers", "partial", "heartbeats"):
+        for blocked_at in ("connect", "headers", "partial", "heartbeats"):
             with self.subTest(blocked_at=blocked_at), patch("openai.AsyncOpenAI") as factory, \
                     patch("openai.DefaultAsyncHttpxClient") as transport, \
                     patch("openai.OpenAI") as sync_factory, \
@@ -277,7 +302,16 @@ class LLMParsingTests(unittest.TestCase):
                         return chunks()
 
                 async def create(**kwargs):
-                    if blocked_at == "headers":
+                    request = SimpleNamespace(extensions={})
+                    await transport.call_args.kwargs['event_hooks']['request'][0](request)
+                    trace = request.extensions['trace']
+                    await trace('connection.connect_tcp.started', {'secret': 'secret-trace-fixture'})
+                    if blocked_at != 'connect':
+                        await trace('http11.send_request_body.complete', {'secret': 'secret-trace-fixture'})
+                        await trace('http11.receive_response_headers.started', {})
+                    # Unrecognized event names and their contents must not leak.
+                    await trace('secret-trace-fixture', {'secret': 'secret-trace-fixture'})
+                    if blocked_at in {'connect', 'headers'}:
                         await asyncio.Event().wait()
                     return Stream()
 
@@ -291,6 +325,17 @@ class LLMParsingTests(unittest.TestCase):
                 with self.assertRaises(LLMDeadlineError) as caught:
                     client.ask_json("system", "user")
                 self.assertNotIn("looks_complete", str(caught.exception))
+                self.assertNotIn('secret-trace-fixture', str(caught.exception))
+                self.assertEqual(caught.exception.public_diagnostics(), {
+                    'transport_phase': 'connection.connect_tcp.started' if blocked_at == 'connect'
+                        else 'http11.receive_response_headers.started',
+                    'stream_opened': blocked_at not in {'connect', 'headers'}})
+                self.assertIn('transport_phase=' + ('connection.connect_tcp.started'
+                    if blocked_at == 'connect' else 'http11.receive_response_headers.started'), str(caught.exception))
+                self.assertIn(f"stream_opened={blocked_at not in {'connect', 'headers'}}", str(caught.exception))
+                self.assertIn('finish_received=False', str(caught.exception))
+                self.assertIn('tool_argument_chars=0', str(caught.exception))
+                self.assertIn(f"content_chars={0 if blocked_at in {'connect', 'headers'} else 23}", str(caught.exception))
                 self.assertEqual([row.status for row in ledger.entries], ["unknown"])
                 self.assertEqual(ledger.entries[0].actual, {"llm_requests": 1})
                 self.assertEqual(ledger.unknown_dimensions(), ("total_tokens",))
@@ -299,10 +344,12 @@ class LLMParsingTests(unittest.TestCase):
                 sdk.chat.completions.create.assert_awaited_once()
                 sdk.close.assert_awaited_once()
                 self.assertEqual(factory.call_args.kwargs["max_retries"], 0)
-                transport.assert_called_once_with(http2=True)
+                transport.assert_called_once()
+                self.assertEqual(transport.call_args.kwargs['http2'], True)
+                self.assertEqual(set(transport.call_args.kwargs), {'http2', 'event_hooks'})
                 sync_factory.assert_not_called()
                 retry_sleep.assert_not_called()
-                if blocked_at != "headers":
+                if blocked_at not in {'connect', 'headers'}:
                     Stream.close.assert_awaited_once()
 
         for cap in (None, 10):
@@ -394,15 +441,23 @@ class LLMParsingTests(unittest.TestCase):
         # overload but must not disclose arbitrary provider text or secrets.
         for body in ({"message": "upstream overloaded secret-fixture"},
                      {"error": {"message": "upstream overloaded secret-fixture"}},
-                     {"message": "other failure secret-fixture"}):
+                     {"message": "other failure secret-fixture"},
+                     {"error": {"code": "server_error", "type": "internal_error",
+                                "message": "other failure secret-fixture"}},
+                     {"code": "secret-fixture", "type": "secret-fixture",
+                      "message": "other failure secret-fixture"}):
             with self.subTest(body=body):
                 error = APIError("generic stream failure", request=httpx.Request("POST", "https://invalid.test"), body=body)
+                error.status_code = 503
                 async def failed_chunks():
                     yield {"choices": [{"delta": {"role": "assistant"}}]}
                     raise error
                 with self.assertRaises(LLMStreamError) as caught:
                     asyncio.run(_collect_chat_stream_async(failed_chunks(), _ChatStreamState()))
                 self.assertNotIn("secret-fixture", str(caught.exception))
+                self.assertIn("HTTP status=503", str(caught.exception))
+                self.assertEqual("provider code=server_error" in str(caught.exception),
+                                 body.get('error', {}).get('code') == 'server_error')
                 self.assertEqual("provider reported overload" in str(caught.exception),
                                  "overloaded" in str(body))
                 self.assertIs(caught.exception.__cause__, error)
@@ -426,6 +481,38 @@ class LLMParsingTests(unittest.TestCase):
         self.assertEqual(sdk.close.await_count, 2)
         backoff.assert_called_once()
         self.assertEqual([row.status for row in ledger.entries], ["unknown", "settled"])
+
+        # SDK wrappers can hide the phase in __cause__. A proven connection
+        # failure has no generated tokens; read/write/opaque failures do not.
+        from openai import APIConnectionError
+        request = httpx.Request('POST', 'https://invalid.test')
+        for cause_type in (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout,
+                           httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError, None):
+            with self.subTest(transport_cause=cause_type):
+                error = APIConnectionError(request=request)
+                if cause_type:
+                    error.__cause__ = cause_type('secret-fixture', request=request)
+                ledger = BudgetLedger({'llm_requests': 3, 'total_tokens': 100})
+                client = LLMClient(LLMSettings(api_key='fixture', api_mode='chat', stream=True,
+                    retry_attempts=2), budget_ledger=ledger)
+                with patch('simple_ar.integrations.llm._call_provider', side_effect=[error,
+                        {'choices': [{'message': {'content': 'ok'}}],
+                         'usage': {'prompt_tokens': 2, 'completion_tokens': 1, 'total_tokens': 3}}]) as send, \
+                        patch('simple_ar.integrations.llm.time.sleep') as backoff:
+                    if cause_type in (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
+                        self.assertEqual(client.ask('system', 'user'), 'ok')
+                        self.assertEqual(send.call_count, 2)
+                        self.assertEqual(ledger.entries[0].actual['total_tokens'], 0)
+                        self.assertEqual(ledger.entries[0].actual_source, 'transport_pre_dispatch')
+                        self.assertEqual(ledger.remaining('total_tokens'), 97)
+                        backoff.assert_called_once()
+                    else:
+                        with self.assertRaises(LLMError):
+                            client.ask('system', 'user')
+                        send.assert_called_once()
+                        backoff.assert_not_called()
+                        self.assertEqual(ledger.entries[0].status, 'unknown')
+                        self.assertIsNone(ledger.remaining('total_tokens'))
 
     def test_sdk_stream_loop_preflight_and_synchronous_paths_unchanged(self):
         ledger = BudgetLedger({"llm_requests": 1})
@@ -578,6 +665,12 @@ class LLMParsingTests(unittest.TestCase):
                 {"draft_markdown": r"\(x\in R\)", "nested": {"value": 4}})
         self.assertEqual(call.call_count, 1)
         self.assertEqual(response["choices"][0]["message"]["content"], raw)
+        with patch.object(client, 'ask', return_value='{"edits": [broken code response') as call:
+            with self.assertRaises(LLMResponseError) as failure:
+                client.ask_json('system', 'user')
+            self.assertEqual(failure.exception.raw_response, '{"edits": [broken code response')
+            self.assertNotIn('broken code response', str(failure.exception))
+            self.assertEqual(call.call_count, 1)  # Format recovery belongs to the task, not transport.
 
     def test_ask_json_reads_chat_content_blocks(self) -> None:
         client = LLMClient(LLMSettings(api_key="test-key", api_mode="chat"))
@@ -607,6 +700,55 @@ class LLMParsingTests(unittest.TestCase):
         request = call.call_args.args[1]
         self.assertTrue(request["stream"])
         self.assertEqual(request["extra_headers"]["Accept-Encoding"], "identity")
+
+        # Same transport contract for native history: multiple fragmented calls,
+        # thinking round-trip, tool-only output and accounting without a tail.
+        tools = [{"type": "function", "function": {"name": "read_file",
+                  "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}]
+        history = [{"role": "system", "content": "inspect"},
+                   {"role": "user", "content": "read relevant sources"}]
+        observed = []
+        ledger = BudgetLedger({"llm_requests": 4, "total_tokens": 10000})
+        native = LLMClient(LLMSettings(api_key="test-key", api_mode="chat", stream=True),
+                           usage_callback=observed.append, budget_ledger=ledger)
+        fragments = [
+            {"choices": [{"delta": {"reasoning_content": "inspect first", "tool_calls": [
+                {"index": 1, "id": "second", "function": {"name": "read_file", "arguments": '{"path":'}},
+                {"index": 0, "id": "first", "function": {"name": "read_file", "arguments": '{"path":'}}]},
+                "finish_reason": None}]},
+            {"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": '"README.md"}'}},
+                {"index": 1, "function": {"arguments": '"src/main.py"}'}}]},
+                "finish_reason": "tool_calls"}],
+             "usage": {"prompt_tokens": 40, "completion_tokens": 20, "total_tokens": 60}},
+        ]
+        with patch("simple_ar.integrations.llm._call_openai_sdk", return_value=iter(fragments)):
+            message = native.chat_turn(history, tools=tools, max_output_tokens=500)
+        self.assertEqual(message["reasoning_content"], "inspect first")
+        self.assertEqual([row["id"] for row in message["tool_calls"]], ["first", "second"])
+        self.assertEqual(json.loads(message["tool_calls"][1]["function"]["arguments"]), {"path": "src/main.py"})
+        history += [message, {"role": "tool", "tool_call_id": "first", "content": "readme"},
+                    {"role": "tool", "tool_call_id": "second", "content": "source"}]
+        with patch("simple_ar.integrations.llm._call_openai_sdk", return_value=iter([
+            {"choices": [{"delta": {"content": "done", "reasoning_content": ""}, "finish_reason": "stop"}]},
+        ])) as call:
+            final = native.chat_turn(history, tools=tools, max_output_tokens=500)
+        self.assertEqual(final["content"], "done")
+        self.assertIn("reasoning_content", final)
+        self.assertEqual(call.call_args.args[1]["messages"], history)
+        self.assertEqual(observed[0].total_tokens, 60)
+        self.assertEqual(observed[1].source, "estimated")
+        for reason, delta in (("length", {"tool_calls": [
+            {"index": 0, "id": "cut", "function": {"name": "read_file", "arguments": '{"path":'}}]}),
+            ("stop", {"reasoning_content": "no answer"})):
+            with patch("simple_ar.integrations.llm._call_openai_sdk", return_value=iter([
+                {"choices": [{"delta": delta, "finish_reason": reason}]}
+            ])), self.assertRaises(LLMResponseError):
+                native.chat_turn(history, tools=tools, max_output_tokens=500)
+        wrong_mode = LLMClient(LLMSettings(api_key="test-key", api_mode="responses"))
+        with patch("simple_ar.integrations.llm._call_openai_sdk") as call, self.assertRaises(LLMError):
+            wrong_mode.chat_turn(history, tools=tools)
+        call.assert_not_called()
 
     def test_completed_stream_with_final_usage_does_not_wait_for_transport_eof(self):
         observed = []
@@ -719,19 +861,34 @@ class LLMParsingTests(unittest.TestCase):
                 client.close.assert_called_once()
 
     def test_optional_chat_thinking_switch_reaches_provider(self) -> None:
-        client = LLMClient(LLMSettings(api_key="test-key", api_mode="chat", thinking_mode="disabled"))
         response = {"choices": [{"message": {"content": "ok"}}]}
-        with patch("simple_ar.integrations.llm._call_openai_sdk", return_value=response) as call:
-            self.assertEqual(client.ask("system", "user"), "ok")
-        self.assertEqual(call.call_args.args[1]["extra_body"], {"thinking": {"type": "disabled"}})
+        for effort in ("", "none"):
+            with self.subTest(effort=effort):
+                client = LLMClient(LLMSettings(api_key="test-key", api_mode="chat",
+                    thinking_mode="disabled", reasoning_effort=effort))
+                with patch("simple_ar.integrations.llm._call_openai_sdk", return_value=response) as call:
+                    self.assertEqual(client.ask("system", "user"), "ok")
+                expected = {"thinking": {"type": "disabled"}}
+                if effort:
+                    expected["reasoning_effort"] = effort
+                self.assertEqual(call.call_args.args[1]["extra_body"], expected)
 
     def test_thinking_switch_rejects_incompatible_api_or_effort(self) -> None:
-        for settings in (
-            LLMSettings(api_key="test-key", api_mode="responses", thinking_mode="disabled"),
-            LLMSettings(api_key="test-key", api_mode="chat", thinking_mode="disabled", reasoning_effort="low"),
-        ):
-            with self.subTest(settings=settings), self.assertRaises(LLMError):
-                LLMClient(settings).ask("system", "user")
+        cases = [("responses", thinking, effort) for thinking in ("disabled", "enabled", "auto")
+                 for effort in ("", "none")]
+        cases += [("chat", "disabled", effort) for effort in
+                  ("minimal", "low", "medium", "high", "xhigh", "max", "ultra")]
+        for mode, thinking, effort in cases:
+            with self.subTest(mode=mode, thinking=thinking, effort=effort):
+                client = LLMClient(LLMSettings(api_key="test-key", api_mode=mode,
+                    thinking_mode=thinking, reasoning_effort=effort, reasoning_output_tokens=8192))
+                if thinking == "disabled":
+                    self.assertIsNone(client.effective_output_limit())
+                    self.assertEqual(client.effective_output_limit(1200), 1200)
+                with patch("simple_ar.integrations.llm._call_openai_sdk") as provider:
+                    with self.assertRaises(LLMError):
+                        client.ask("system", "user")
+                provider.assert_not_called()
 
     def test_from_env_reads_optional_thinking_switch(self) -> None:
         with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key", "SIMPLE_AR_LLM_THINKING": "disabled"}, clear=True):
@@ -824,40 +981,59 @@ class LLMParsingTests(unittest.TestCase):
         self.assertEqual(client._settings.reasoning_output_tokens, 8192)
         openai_call.assert_not_called()
 
-    def test_reasoning_provider_options_do_not_raise_an_explicit_output_cap(self) -> None:
-        client = LLMClient(
-            LLMSettings(
-                model="glm-5.3-flash",
-                api_key="test-key",
-                api_mode="chat",
-                reasoning_effort="low",
-                reasoning_output_tokens=8192,
-            )
+    def test_effective_output_limit_matches_transport_and_budget_reservation(self) -> None:
+        # One table owns precedence, uncapped behavior and API token-field mapping.
+        cases = (
+            ('native', 'chat', 'glm-5.3-flash', 1200, 2000, 'low', '', 1200, 'max_tokens'),
+            ('ask', 'chat', 'gpt-5.1', 80, 1000, 'low', '', 80, 'max_completion_tokens'),
+            ('ask', 'responses', 'gpt-5.1', None, 2000, 'low', '', 2000, 'max_output_tokens'),
+            ('ask', 'chat', 'glm-5.3-flash', None, None, 'low', '', 8192, 'max_tokens'),
+            ('ask', 'responses', 'gpt-5.1', None, None, '', '', None, None),
+            ('ask', 'chat', 'gpt-5.1', None, None, 'none', '', None, None),
+            ('ask', 'responses', 'gpt-5.1', None, None, 'none', '', None, None),
+            ('native', 'chat', 'glm-5.3-flash', None, None, '', 'disabled', None, None),
+            ('ask', 'chat', 'gpt-5.1', None, None, 'none', 'disabled', None, None),
+            ('ask', 'chat', 'gpt-5.1', None, 2000, 'none', '', 2000, 'max_completion_tokens'),
+            ('ask', 'chat', 'gpt-5.1', 80, 1000, 'none', '', 80, 'max_completion_tokens'),
+            ('ask', 'chat', 'glm-5.3-flash', None, 2000, '', 'disabled', 2000, 'max_tokens'),
+            ('native', 'chat', 'glm-5.3-flash', 1200, 2000, 'none', 'disabled', 1200, 'max_tokens'),
         )
-        response = {"choices": [{"message": {"content": "ok"}}]}
-        with patch("simple_ar.integrations.llm._call_openai_sdk", return_value=response) as call:
-            self.assertEqual(client.ask("system", "user", max_output_tokens=1200), "ok")
-
-        request = call.call_args.args[1]
-        self.assertEqual(request["max_tokens"], 1200)
-        self.assertEqual(request["extra_body"], {"reasoning_effort": "low"})
-
-    def test_reasoning_output_cap_is_used_only_when_no_other_cap_exists(self) -> None:
-        client = LLMClient(
-            LLMSettings(
-                model="glm-5.3-flash",
-                api_key="test-key",
-                api_mode="chat",
-                reasoning_effort="low",
-                reasoning_output_tokens=8192,
-            )
-        )
-        response = {"choices": [{"message": {"content": "ok"}}]}
-        with patch("simple_ar.integrations.llm._call_openai_sdk", return_value=response) as call:
-            self.assertEqual(client.ask("system", "user"), "ok")
-
-        request = call.call_args.args[1]
-        self.assertEqual(request["max_tokens"], 8192)
+        response = {'choices': [{'message': {'content': 'ok'}}],
+            'usage': {'prompt_tokens': 4, 'completion_tokens': 1, 'total_tokens': 5}}
+        for entry, mode, model, override, configured, effort, thinking, expected, field in cases:
+            with self.subTest(entry=entry, mode=mode, override=override, configured=configured,
+                              effort=effort, thinking=thinking):
+                ledger = BudgetLedger({'total_tokens': 20000, 'llm_requests': 1})
+                client = LLMClient(LLMSettings(api_key='test-key', model=model, api_mode=mode,
+                    max_output_tokens=configured, reasoning_effort=effort, thinking_mode=thinking,
+                    reasoning_output_tokens=8192),
+                    budget_ledger=ledger)
+                settings_before = client.connection_binding()
+                self.assertEqual(client.effective_output_limit(override), expected)
+                with patch('simple_ar.integrations.llm._call_openai_sdk', return_value=response) as provider:
+                    if entry == 'native':
+                        messages = [{'role': 'system', 'content': 'system'}, {'role': 'user', 'content': 'user'}]
+                        self.assertEqual(client.chat_turn(messages, tools=[], max_output_tokens=override)['content'], 'ok')
+                        prompt_cost = estimate_tokens('[]') + estimate_tokens(json.dumps(messages, ensure_ascii=False))
+                    else:
+                        self.assertEqual(client.ask('system', 'user', max_output_tokens=override), 'ok')
+                        prompt_cost = estimate_tokens('system') + estimate_tokens('user')
+                provider.assert_called_once()
+                actual_mode, request = provider.call_args.args
+                self.assertEqual(actual_mode, mode)
+                self.assertEqual(request['model'], model)
+                self.assertEqual({key: request[key] for key in
+                    ('max_tokens', 'max_completion_tokens', 'max_output_tokens') if key in request},
+                    {} if field is None else {field: expected})
+                if mode == 'chat' and (effort or thinking):
+                    expected_options = {'reasoning_effort': effort} if effort else {}
+                    if thinking:
+                        expected_options['thinking'] = {'type': thinking}
+                    self.assertEqual(request['extra_body'], expected_options)
+                self.assertEqual(ledger.entries[0].reserved['total_tokens'],
+                    prompt_cost + (expected or 0))
+                self.assertEqual(ledger.entries[0].actual['total_tokens'], 5)
+                self.assertEqual(client.connection_binding(), settings_before)
 
     def test_reasoning_option_is_added_only_when_chat_mode_is_selected(self) -> None:
         request = {
@@ -970,6 +1146,9 @@ class LLMParsingTests(unittest.TestCase):
                 retry_attempts=2,
                 retry_base_delay_sec=0.25,
                 retry_max_delay_sec=2.0,
+                max_output_tokens=2000,
+                reasoning_effort='low',
+                reasoning_output_tokens=8192,
             ),
             usage_callback=usage.append,
         )
@@ -982,12 +1161,20 @@ class LLMParsingTests(unittest.TestCase):
             "litellm.completion",
             return_value=response,
         ) as completion, patch("simple_ar.integrations.llm.time.sleep") as sleep:
-            output = client.ask("system", "user", label="compat-test")
+            output = client.ask("system", "user", max_output_tokens=1200, label="compat-test")
 
         self.assertEqual(output, "ok")
         self.assertEqual(responses.call_count, 1)
         self.assertEqual(completion.call_count, 1)
         completion_request = completion.call_args.kwargs
+        self.assertEqual(client.effective_output_limit(1200), 1200)
+        self.assertEqual(responses.call_args.kwargs['max_output_tokens'], 1200)
+        chat_caps = {key: completion_request[key] for key in
+            ('max_tokens', 'max_completion_tokens') if key in completion_request}
+        self.assertEqual(len(chat_caps), 1)
+        self.assertEqual(list(chat_caps.values()), [1200])
+        self.assertNotIn('max_output_tokens', completion_request)
+        self.assertEqual(completion_request['model'], responses.call_args.kwargs['model'])
         self.assertEqual(
             completion_request["messages"],
             [
@@ -1074,26 +1261,6 @@ class LLMParsingTests(unittest.TestCase):
         self.assertEqual(request["timeout"], 180.0)
         self.assertEqual(request["max_completion_tokens"], 999)
 
-    def test_chat_cap_uses_completion_token_param_for_newer_models(self) -> None:
-        client = LLMClient(
-            LLMSettings(
-                model="gpt-5.1",
-                api_key="test-key",
-                api_mode="chat",
-                max_output_tokens=1000,
-            )
-        )
-        response = {"choices": [{"message": {"content": "ok"}}]}
-
-        with patch("simple_ar.integrations.llm._call_openai_sdk", return_value=response) as openai_call:
-            output = client.ask("system", "user", max_output_tokens=80, label="cap-test")
-
-        self.assertEqual(output, "ok")
-        api_mode, request = openai_call.call_args.args
-        self.assertEqual(api_mode, "chat")
-        self.assertEqual(request["max_completion_tokens"], 80)
-        self.assertNotIn("max_tokens", request)
-
     def test_invalid_per_call_output_cap_fails_before_provider_request(self) -> None:
         client = LLMClient(
             LLMSettings(
@@ -1103,8 +1270,12 @@ class LLMParsingTests(unittest.TestCase):
         )
 
         with patch("simple_ar.integrations.llm._call_openai_sdk") as openai_call:
-            with self.assertRaisesRegex(LLMError, "positive integer"):
-                client.ask("system", "user", max_output_tokens=0)
+            for invalid in (0, -1, 'invalid'):
+                with self.subTest(cap=invalid):
+                    with self.assertRaisesRegex(LLMError, "positive integer"):
+                        client.effective_output_limit(invalid)
+                    with self.assertRaisesRegex(LLMError, "positive integer"):
+                        client.ask("system", "user", max_output_tokens=invalid)
 
         openai_call.assert_not_called()
 
@@ -1198,61 +1369,73 @@ class LLMParsingTests(unittest.TestCase):
         )
 
         with patch("simple_ar.integrations.llm._call_openai_sdk") as openai_call:
-            with self.assertRaises(LLMError):
+            with self.assertRaises(LLMError) as caught:
                 client.ask("system", "user", label="blocked")
 
         openai_call.assert_not_called()
         self.assertEqual(ledger.entries, ())
+        self.assertIsInstance(caught.exception.__cause__, BudgetExceededError)
+        self.assertNotIn("preceding provider failure", str(caught.exception))
 
     def test_retryable_provider_failure_is_counted_before_retry(self) -> None:
-        ledger = BudgetLedger({"llm_requests": 3, "total_tokens": 100})
-        client = LLMClient(
-            LLMSettings(
-                api_key="test-key",
-                api_mode="chat",
-                max_output_tokens=10,
-                retry_attempts=2,
-                retry_base_delay_sec=0.25,
-            ),
-            budget_ledger=ledger,
-        )
         response = {"choices": [{"message": {"content": "ok"}}]}
-
-        with patch(
-            "simple_ar.integrations.llm._call_openai_sdk",
-            side_effect=[RuntimeError("503 Service Unavailable"), response],
-        ) as openai_call, patch("simple_ar.integrations.llm.time.sleep"):
-            self.assertEqual(client.ask("system", "user", label="retry"), "ok")
-
-        self.assertEqual(openai_call.call_count, 2)
-        self.assertEqual([entry.status for entry in ledger.entries], ["settled", "settled"])
-        self.assertEqual(ledger.entries[0].actual_source, "estimated")
-        self.assertEqual(ledger.entries[0].actual["llm_requests"], 1)
-        self.assertEqual(ledger.entries[1].actual["llm_requests"], 1)
-        self.assertEqual(ledger.remaining("llm_requests"), 1)
+        for stop in (None, "llm_requests", "total_tokens", "auto_mode"):
+            with self.subTest(stop=stop):
+                ledger = BudgetLedger({
+                    "llm_requests": 1 if stop in {"llm_requests", "auto_mode"} else 3,
+                    "total_tokens": (10 + estimate_tokens("system") + estimate_tokens("user")
+                                     if stop == "total_tokens" else 100),
+                })
+                client = LLMClient(LLMSettings(api_key="test-key",
+                    api_mode="auto" if stop == "auto_mode" else "chat",
+                    max_output_tokens=10, retry_attempts=1 if stop == "auto_mode" else 2,
+                    retry_base_delay_sec=0.25), budget_ledger=ledger)
+                failure = RuntimeError("503 Service Unavailable secret-fixture")
+                failure.status_code = 503
+                with patch("simple_ar.integrations.llm._call_openai_sdk",
+                           side_effect=[failure, response]) as openai_call, patch(
+                           "simple_ar.integrations.llm.time.sleep"):
+                    if stop is None:
+                        self.assertEqual(client.ask("system", "user", label="retry"), "ok")
+                    else:
+                        with self.assertRaises(LLMError) as caught:
+                            client.ask("system", "user", label="retry")
+                        self.assertIsInstance(caught.exception.__cause__, BudgetExceededError)
+                        diagnostic = "".join(traceback.format_exception(caught.exception))
+                        self.assertIn("preceding provider failure after 1 physical attempt(s)", diagnostic)
+                        self.assertIn("RuntimeError; HTTP status=503", diagnostic)
+                        self.assertNotIn("secret-fixture", diagnostic)
+                        self.assertIn("total_tokens" if stop == "total_tokens" else "llm_requests",
+                                      str(caught.exception.__cause__))
+                self.assertEqual(openai_call.call_count, 2 if stop is None else 1)
+                self.assertEqual([entry.status for entry in ledger.entries],
+                                 ["settled", "settled"] if stop is None else ["settled"])
+                self.assertEqual(ledger.entries[0].actual_source, "estimated")
+                self.assertEqual(ledger.entries[0].actual["llm_requests"], 1)
+                if stop is None:
+                    self.assertEqual(ledger.entries[1].actual["llm_requests"], 1)
+                    self.assertEqual(ledger.remaining("llm_requests"), 1)
 
     def test_provider_timeout_marks_attempt_unknown(self) -> None:
-        ledger = BudgetLedger({"llm_requests": 3, "total_tokens": 100})
-        client = LLMClient(
-            LLMSettings(
-                api_key="test-key",
-                api_mode="chat",
-                retry_attempts=1,
-            ),
-            budget_ledger=ledger,
-        )
-
-        with patch(
-            "simple_ar.integrations.llm._call_openai_sdk",
-            side_effect=RuntimeError("Request timed out."),
-        ) as openai_call:
-            with self.assertRaises(LLMError):
-                client.ask("system", "user", label="timeout")
-
-        openai_call.assert_called_once()
-        self.assertEqual(ledger.entries[0].status, "unknown")
-        self.assertEqual(ledger.remaining("llm_requests"), 2)
-        self.assertIsNone(ledger.remaining("total_tokens"))
+        for attempts in (1, 3):
+            with self.subTest(attempts=attempts):
+                ledger = BudgetLedger({"llm_requests": 3, "total_tokens": 100})
+                client = LLMClient(LLMSettings(api_key="test-key", api_mode="chat",
+                    retry_attempts=attempts), budget_ledger=ledger)
+                with patch("simple_ar.integrations.llm._call_openai_sdk",
+                           side_effect=RuntimeError("Request timed out.")) as openai_call, patch(
+                           "simple_ar.integrations.llm.time.sleep"):
+                    with self.assertRaises(LLMError) as caught:
+                        client.ask("system", "user", label="timeout")
+                if attempts == 3:
+                    self.assertIsInstance(caught.exception.__cause__, BudgetUnknownError)
+                    self.assertIn("preceding provider failure after 1 physical attempt(s): RuntimeError",
+                                  str(caught.exception))
+                openai_call.assert_called_once()
+                self.assertEqual(len(ledger.entries), 1)
+                self.assertEqual(ledger.entries[0].status, "unknown")
+                self.assertEqual(ledger.remaining("llm_requests"), 2)
+                self.assertIsNone(ledger.remaining("total_tokens"))
 
     def test_capped_timeout_can_retry_with_reserved_unknown_usage(self) -> None:
         ledger = BudgetLedger({"llm_requests": 3, "total_tokens": 100})
@@ -1377,35 +1560,72 @@ class LLMParsingTests(unittest.TestCase):
         self.assertNotIn("timeout", client_kwargs)
 
     def test_stream_failure_retries_without_adopting_partial_text(self) -> None:
-        ledger = BudgetLedger({"llm_requests": 3, "total_tokens": 200})
-        client = LLMClient(
-            LLMSettings(api_key="test-key", api_mode="chat", stream=True,
-                        max_output_tokens=10, retry_attempts=2), budget_ledger=ledger,
-        )
+        from openai import APIError
+        import httpx
 
         class InterruptedStream:
             closed = False
 
             def __iter__(self):
                 yield {"choices": [{"delta": {"content": "unfinished"}}]}
-                raise RuntimeError("gateway decoder stopped unexpectedly")
+                raise APIError("gateway decoder secret-fixture", request=httpx.Request(
+                    "POST", "https://invalid.test"), body={"error": {
+                        "message": ("other failure secret-fixture" if stop == "other"
+                                    else "upstream overloaded secret-fixture")}})
 
             def close(self):
                 self.closed = True
 
-        interrupted = InterruptedStream()
-        complete = iter([
-            {"choices": [{"delta": {"content": "complete"}, "finish_reason": "stop"}]},
-            {"choices": [], "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}},
-        ])
-        with patch("simple_ar.integrations.llm._call_openai_sdk",
-                   side_effect=[interrupted, complete]) as call, patch(
-                       "simple_ar.integrations.llm.time.sleep"):
-            self.assertEqual(client.ask("system", "user"), "complete")
-        self.assertTrue(interrupted.closed)
-        self.assertEqual(call.call_count, 2)
-        self.assertEqual([row.status for row in ledger.entries], ["unknown", "settled"])
-        self.assertEqual(ledger.entries[1].actual["total_tokens"], 5)
+        for stop in (None, "requests", "tokens", "proxy", "other", "reconciliation"):
+            with self.subTest(stop=stop):
+                ledger = BudgetLedger({
+                    "llm_requests": 1 if stop in {"requests", "proxy", "other"} else 3,
+                    "total_tokens": (10 + estimate_tokens("system") + estimate_tokens("user")
+                                     if stop == "tokens" else 200),
+                })
+                client = LLMClient(LLMSettings(api_key="test-key", api_mode="chat", stream=True,
+                    max_output_tokens=10, retry_attempts=3,
+                    proxy_env="API_PROXY" if stop == "proxy" else ""), budget_ledger=ledger)
+                interrupted = InterruptedStream()
+                complete = iter([
+                    {"choices": [{"delta": {"content": "complete"}, "finish_reason": "stop"}]},
+                    {"choices": [], "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}},
+                ])
+                with patch("simple_ar.integrations.llm._call_openai_sdk",
+                           side_effect=[interrupted, complete]) as call, patch(
+                           "simple_ar.integrations.llm.time.sleep"), patch.dict(
+                           os.environ, {"API_PROXY": "http://127.0.0.1:7890"}), patch.object(
+                           ledger, "mark_unknown", wraps=ledger.mark_unknown,
+                           side_effect=BudgetConflictError("fixture conflict")
+                           if stop == "reconciliation" else None):
+                    if stop is None:
+                        self.assertEqual(client.ask("system", "user"), "complete")
+                    else:
+                        with self.assertRaises(LLMError) as caught:
+                            client.ask("system", "user")
+                        self.assertIsInstance(caught.exception.__cause__,
+                            BudgetConflictError if stop == "reconciliation" else BudgetExceededError)
+                        diagnostic = "".join(traceback.format_exception(caught.exception))
+                        self.assertIn("LLMStreamError", diagnostic)
+                        self.assertEqual("provider reported overload" in diagnostic, stop != "other")
+                        self.assertIn("transport phase=possibly_dispatched", diagnostic)
+                        self.assertNotIn("secret-fixture", diagnostic)
+                        self.assertNotIn("unfinished", diagnostic)
+                        self.assertNotIn("http://127.0.0.1:7890", diagnostic)
+                        if stop != "reconciliation":
+                            self.assertIn("provider attempt 2", str(caught.exception))
+                            self.assertIn("after 1 physical attempt(s)", str(caught.exception))
+                self.assertTrue(interrupted.closed)
+                self.assertEqual(call.call_count, 2 if stop is None else 1)
+                self.assertEqual([row.status for row in ledger.entries],
+                    ["unknown", "settled"] if stop is None else
+                    ["reserved"] if stop == "reconciliation" else ["unknown"])
+                if stop != "reconciliation":
+                    self.assertEqual(ledger.entries[0].actual, {"llm_requests": 1})
+                    self.assertEqual(ledger.unknown_dimensions(), ("total_tokens",))
+                    self.assertIn("LLMStreamError", ledger.entries[0].reason)
+                if stop is None:
+                    self.assertEqual(ledger.entries[1].actual["total_tokens"], 5)
 
     def test_gateway_http2_failure_before_stream_iteration_is_uncertain_and_retryable(self) -> None:
         ledger = BudgetLedger({"llm_requests": 3, "total_tokens": 200})
@@ -1463,24 +1683,147 @@ class LLMParsingTests(unittest.TestCase):
         self.assertEqual(call.call_count, 2)
 
     def test_openai_sdk_backend_passes_explicit_timeout_only(self) -> None:
-        with patch("openai.OpenAI") as openai_cls:
-            openai_cls.return_value.chat.completions.create.return_value = {
-                "choices": [{"message": {"content": "ok"}}]
-            }
+        import httpx
 
-            _call_openai_sdk(
-                "chat",
-                {
-                    "model": "gpt-5.1",
-                    "api_key": "test-key",
-                    "timeout": 123,
-                    "messages": [{"role": "user", "content": "hello"}],
-                },
-            )
+        async def chunks():
+            yield {"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}
 
-        openai_cls.assert_called_once()
-        client_kwargs = openai_cls.call_args.kwargs
-        self.assertEqual(client_kwargs["timeout"], 123)
+        class Stream:
+            def __init__(self):
+                self.close = AsyncMock()
+
+            def __aiter__(self):
+                return chunks()
+
+        for value, connect in ((123, 20.0), (0.5, 0.5)):
+            for mode, streamed in (("chat", False), ("responses", False), ("chat", True)):
+                with self.subTest(timeout=value, mode=mode, streamed=streamed), \
+                        patch("openai.OpenAI") as sync_factory, \
+                        patch("openai.AsyncOpenAI") as async_factory, \
+                        patch("openai.DefaultAsyncHttpxClient"):
+                    factory = async_factory if streamed else sync_factory
+                    sdk = factory.return_value
+                    create = sdk.responses.create if mode == "responses" else sdk.chat.completions.create
+                    if streamed:
+                        stream = Stream()
+                        sdk.chat.completions.create = create = AsyncMock(return_value=stream)
+                        sdk.close = AsyncMock()
+                    else:
+                        create.return_value = {"output_text": "ok"} if mode == "responses" else {
+                            "choices": [{"message": {"content": "ok"}}]}
+                    request = {"model": "fixture", "api_key": "test-key", "timeout": value,
+                               "input" if mode == "responses" else "messages": [
+                                   {"role": "user", "content": "hello"}]}
+                    if streamed:
+                        request["stream"] = True
+
+                    result = _call_openai_sdk(mode, request)
+
+                    self.assertIn("ok", str(result))
+                    factory.assert_called_once()
+                    (sync_factory if streamed else async_factory).assert_not_called()
+                    timeout = factory.call_args.kwargs["timeout"]
+                    self.assertIsInstance(timeout, httpx.Timeout)
+                    self.assertEqual(timeout.connect, connect)
+                    self.assertEqual((timeout.read, timeout.write, timeout.pool), (value,) * 3)
+                    self.assertEqual(factory.call_args.kwargs["max_retries"], 0)
+                    create.assert_called_once()
+                    self.assertNotIn("timeout", create.call_args.kwargs)
+                    self.assertEqual(request["timeout"], value)
+                    if streamed:
+                        create.assert_awaited_once()
+                        stream.close.assert_awaited_once()
+                        sdk.close.assert_awaited_once()
+                    else:
+                        sdk.close.assert_called_once()
+
+    def test_installed_sdk_connect_cap_and_slow_stream_on_loopback(self) -> None:
+        from contextlib import contextmanager
+        import socket
+        import threading
+        import httpx
+        from openai import APITimeoutError, AsyncOpenAI, DefaultAsyncHttpxClient
+        from simple_ar.integrations.llm import _transport_failure_phase
+
+        @contextmanager
+        def loopback(stall_tls):
+            stop = threading.Event()
+            accepted, failures = [], []
+            listener = socket.socket()
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            listener.settimeout(0.1)
+
+            def serve():
+                try:
+                    while not stop.is_set():
+                        try:
+                            connection, _ = listener.accept()
+                        except socket.timeout:
+                            continue
+                        with connection:
+                            accepted.append(1)
+                            connection.settimeout(1)
+                            if stall_tls:
+                                # Accept TCP but never answer the TLS ClientHello.
+                                stop.wait(3)
+                                continue
+                            with connection.makefile("rb") as incoming:
+                                headers = []
+                                while line := incoming.readline():
+                                    if line == b"\r\n":
+                                        break
+                                    headers.append(line)
+                                length = next(int(line.split(b":", 1)[1]) for line in headers
+                                              if line.lower().startswith(b"content-length:"))
+                                incoming.read(length)
+                            connection.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                                               b"Connection: close\r\n\r\n")
+                            # A read gap exceeds the connect cap, within the read allowance.
+                            if stop.wait(0.15):
+                                return
+                            chunk = {"id": "fixture", "object": "chat.completion.chunk", "created": 0,
+                                     "model": "fixture", "choices": [{"index": 0,
+                                     "delta": {"content": "ok"}, "finish_reason": "stop"}]}
+                            connection.sendall(b"data: " + json.dumps(chunk).encode()
+                                               + b"\n\ndata: [DONE]\n\n")
+                except Exception as exc:
+                    failures.append(exc)
+
+            thread = threading.Thread(target=serve, daemon=True)
+            thread.start()
+            try:
+                scheme = "https" if stall_tls else "http"
+                yield f"{scheme}://127.0.0.1:{listener.getsockname()[1]}/v1", accepted
+            finally:
+                stop.set()
+                thread.join(2)
+                listener.close()
+                self.assertFalse(thread.is_alive(), "loopback server did not stop")
+                self.assertEqual(failures, [])
+
+        for stall_tls in (True, False):
+            with self.subTest(stall_tls=stall_tls), loopback(stall_tls) as (url, accepted), \
+                    patch("simple_ar.integrations.llm._SDK_CONNECT_TIMEOUT_SEC", 0.05), \
+                    patch("openai.AsyncOpenAI", wraps=AsyncOpenAI) as factory, \
+                    patch("openai.DefaultAsyncHttpxClient", side_effect=lambda **kwargs:
+                          DefaultAsyncHttpxClient(trust_env=False, **kwargs)):
+                request = {"api_key": "local-fixture", "base_url": url, "model": "fixture",
+                           "messages": [{"role": "user", "content": "hello"}],
+                           "stream": True, "timeout": 2.0}
+                started = time.monotonic()
+                if stall_tls:
+                    with self.assertRaises(APITimeoutError) as caught:
+                        _call_openai_sdk("chat", request)
+                    self.assertIsInstance(caught.exception.__cause__, httpx.ConnectTimeout)
+                    self.assertEqual(_transport_failure_phase(caught.exception), "not_dispatched")
+                    self.assertLess(time.monotonic() - started, request["timeout"])
+                else:
+                    self.assertIn("ok", str(_call_openai_sdk("chat", request)))
+                    self.assertGreater(time.monotonic() - started, 0.05)
+                factory.assert_called_once()
+                self.assertEqual(factory.call_args.kwargs["max_retries"], 0)
+                self.assertEqual(accepted, [1])
 
     def test_estimate_tokens_is_deterministic_and_nonzero_for_text(self) -> None:
         self.assertEqual(estimate_tokens(""), 0)

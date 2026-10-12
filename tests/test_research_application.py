@@ -24,6 +24,20 @@ from simple_ar.research.implementation import ImplementationRequest
 
 
 class ResearchApplicationTests(unittest.TestCase):
+    def _paper_session(self, root, text, *, filename="paper.md", services=None, **brief_fields):
+        """Create a real session with one supplied paper; callers own the protocol."""
+        paper = root / filename
+        paper.write_text(text, encoding="utf-8")
+        app = create_session(
+            ResearchBrief(
+                asset_requests=({"locator": str(paper), "role": "paper"},),
+                **brief_fields,
+            ),
+            root=root / "session",
+            services=services,
+        )
+        return app, paper
+
     def test_empty_ingest_remains_pending_and_explicit_resume_retries_it(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -652,68 +666,63 @@ class ResearchApplicationTests(unittest.TestCase):
                                  refs["experiment_revision_1_repair_10"])
                 self.assertIsNone(app._failed_followup_measurement(1))
 
-    def test_model_backed_resume_cannot_silently_change_to_deterministic(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            session = Path(tmp) / "session"
-            app = create_session(ResearchBrief(
-                request_text="Study the supplied question.",
-                requested_outputs=("summary",),
-            ), root=session, services=ResearchApplicationServices(llm_client=object()))
-            self.assertTrue(app.controller.store.read_json(
-                app.view().state_refs["runtime_config"])["llm_required"])
-            resumed = load_session(session)
-            before = resumed.view()
-            with self.assertRaisesRegex(ResearchApplicationError, "cannot silently continue"):
-                resumed.advance()
-            with self.assertRaisesRegex(ResearchApplicationError, "cannot silently continue"):
-                resumed.continue_session()
-            self.assertEqual(resumed.view().state_refs, before.state_refs)
-            self.assertEqual(resumed.view().attempts, before.attempts)
-            resumed = load_session(session, services=ResearchApplicationServices(llm_client=object()))
-            resumed.require_llm_binding()
+    def test_resume_requires_model_binding_from_runtime_or_legacy_usage_not_allowance(self):
+        for origin in ("runtime", "legacy_usage", "authorized_allowance"):
+            with self.subTest(origin=origin), tempfile.TemporaryDirectory() as tmp:
+                session = Path(tmp) / "session"
+                app = create_session(
+                    ResearchBrief(request_text="Study the supplied question.", requested_outputs=("summary",)),
+                    root=session,
+                    services=ResearchApplicationServices(
+                        llm_client=object() if origin == "runtime" else None,
+                    ),
+                )
+                self.assertEqual(app.controller.store.read_json(
+                    app.view().state_refs["runtime_config"])["llm_required"], origin == "runtime")
+                if origin == "legacy_usage":
+                    app.budget_ledger.reserve("legacy-call", {"llm_requests": 1})
+                    app.budget_ledger.save()
+                elif origin == "authorized_allowance":
+                    app.budget_ledger.authorize_remaining(
+                        {"llm_requests": 3}, authorization_id="additional-allowance",
+                        reason="Allow future model calls if explicitly configured.",
+                    )
+                resumed = load_session(session)
+                if origin == "authorized_allowance":
+                    resumed.require_llm_binding(include_legacy_usage=True)
+                elif origin == "legacy_usage":
+                    with self.assertRaisesRegex(ResearchApplicationError, "cannot silently continue"):
+                        resumed.require_llm_binding(include_legacy_usage=True)
+                else:
+                    before = resumed.view()
+                    with self.assertRaisesRegex(ResearchApplicationError, "cannot silently continue"):
+                        resumed.advance()
+                    with self.assertRaisesRegex(ResearchApplicationError, "cannot silently continue"):
+                        resumed.continue_session()
+                    self.assertEqual(resumed.view().state_refs, before.state_refs)
+                    self.assertEqual(resumed.view().attempts, before.attempts)
+                    load_session(session, services=ResearchApplicationServices(
+                        llm_client=object(),
+                    )).require_llm_binding()
 
-    def test_legacy_llm_ledger_also_requires_client_on_resume(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            session = Path(tmp) / "session"
-            app = create_session(ResearchBrief(
-                request_text="Study the supplied question.",
-                requested_outputs=("summary",),
-            ), root=session)
-            self.assertFalse(app.controller.store.read_json(
-                app.view().state_refs["runtime_config"])["llm_required"])
-            app.budget_ledger.reserve("legacy-call", {"llm_requests": 1})
-            app.budget_ledger.save()
-            with self.assertRaisesRegex(ResearchApplicationError, "cannot silently continue"):
-                load_session(session).require_llm_binding(include_legacy_usage=True)
-
-    def test_llm_budget_authorization_is_not_evidence_of_a_model_call(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            session = Path(tmp) / "session"
-            app = create_session(ResearchBrief(
-                request_text="Study the supplied question.",
-                requested_outputs=("summary",),
-            ), root=session)
-            app.budget_ledger.authorize_remaining(
-                {"llm_requests": 3}, authorization_id="additional-allowance",
-                reason="Allow future model calls if explicitly configured.",
-            )
-            load_session(session).require_llm_binding(include_legacy_usage=True)
 
     def test_prepared_reproduction_runs_fixed_command_and_preserves_paper_report_inputs(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            paper = root / "paper.md"
-            paper.write_text("# A source claim\nThe stated method has a reference value under stated conditions.\n", encoding="utf-8")
             protocol = {"contract_id": "reproduce-source-subset", "hypothesis": "Check one published conclusion",
                         "dataset": "Declared synthetic adaptation", "expected_outcome": "Observed value near 0.7; not a full paper reproduction",
                         "metrics": ["observed"], "comparison_conditions": {"scope": "adapted", "seed": 3}}
-            app = create_session(ResearchBrief(request_text="Reproduce the supplied conclusion without innovation.",
-                intents=("reproduction",), requested_outputs=("experiments",),
-                asset_requests=({"locator": str(paper), "role": "paper"},)), root=root / "session",
+            app, paper = self._paper_session(
+                root,
+                "# A source claim\nThe stated method has a reference value under stated conditions.\n",
+                request_text="Reproduce the supplied conclusion without innovation.",
+                intents=("reproduction",),
+                requested_outputs=("experiments",),
                 services=ResearchApplicationServices(config={"research_task_kind": "reproduction", "research_materials_only": True,
                     "interaction": "autonomous", "execution": {"command": [sys.executable, "-c", "print('observed: 0.7')"],
                     "cwd": str(root), "timeout_sec": 5, "protocol": protocol, "result_schema": {"primary_metric": "observed"}}},
-                    budget_limits={"process_invocations": 1, "process_wall_seconds": 10}))
+                    budget_limits={"process_invocations": 1, "process_wall_seconds": 10}),
+            )
             view = app.advance(max_actions=12)
             self.assertEqual(view.status, "completed", view.status_reason)
             self.assertNotIn("design", view.state_refs)
@@ -859,16 +868,17 @@ class ResearchApplicationTests(unittest.TestCase):
     def test_uncertain_goal_uses_analysis_report_and_writer_recovery_keeps_measurement(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            paper = root / "paper.md"
-            paper.write_text("# Classifier\nAccuracy measures correct predictions.", encoding="utf-8")
-            app = create_session(ResearchBrief(request_text="Evaluate this classifier.",
+            app, paper = self._paper_session(
+                root,
+                "# Classifier\nAccuracy measures correct predictions.",
+                request_text="Evaluate this classifier.",
                 requested_outputs=("experiments",),
-                asset_requests=({"locator": str(paper), "role": "paper"},)), root=root / "session",
                 services=ResearchApplicationServices(config={"research_materials_only": True,
                     "interaction": "checkpoints", "execution": {
                     "command": [sys.executable, "-c", "print('accuracy: 0.7')"],
                     "cwd": str(root), "timeout_sec": 5,
-                }}, budget_limits={"process_invocations": 1, "process_wall_seconds": 10}))
+                }}, budget_limits={"process_invocations": 1, "process_wall_seconds": 10}),
+            )
             initial = app.advance(max_actions=20)
             first_gate = initial.work_plan["interaction"]["decision"]
             if isinstance(first_gate, dict) and first_gate.get("stage") == "execution_protocol":
@@ -912,12 +922,11 @@ class ResearchApplicationTests(unittest.TestCase):
     def test_input_request_stops_before_report_and_survives_reload(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            paper = root / "paper.md"
-            paper.write_text("# Replay\nMemory retains previous examples.", encoding="utf-8")
-            app = create_session(
-                ResearchBrief(request_text="Summarize replay", requested_outputs=("report",),
-                    asset_requests=({"locator": str(paper), "role": "paper"},)),
-                root=root / "session",
+            app, paper = self._paper_session(
+                root,
+                "# Replay\nMemory retains previous examples.",
+                request_text="Summarize replay",
+                requested_outputs=("report",),
                 services=ResearchApplicationServices(config={"research_materials_only": True}),
             )
             self.advance_to(app, "report_write")
@@ -989,15 +998,16 @@ class ResearchApplicationTests(unittest.TestCase):
     def test_interaction_reply_replay_finishes_revision_without_overwriting_proposal(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            paper = root / "paper.md"
-            paper.write_text("# Replay\nA local source for a narrow report.", encoding="utf-8")
             session = root / "session"
-            app = create_session(ResearchBrief(
-                request_text="Summarize the supplied source.", requested_outputs=("report",),
-                asset_requests=({"locator": str(paper), "role": "paper"},),
-            ), root=session, services=ResearchApplicationServices(
+            app, paper = self._paper_session(
+                root,
+                "# Replay\nA local source for a narrow report.",
+                request_text="Summarize the supplied source.",
+                requested_outputs=("report",),
+                services=ResearchApplicationServices(
                 config={"research_materials_only": True},
-            ))
+            ),
+            )
             self.advance_to(app, "report_write")
             decision_id = "0123456789abcdef"
             proposal_payload = {
@@ -1060,8 +1070,6 @@ class ResearchApplicationTests(unittest.TestCase):
     def test_assisted_confirms_protocol_once_then_runs_pair_after_reload(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            paper = root / "paper.md"
-            paper.write_text("# Paired test\nMeasure accuracy on the supplied fixed examples.", encoding="utf-8")
             calls = root / "calls.txt"
             def command(role, value):
                 code = (
@@ -1071,12 +1079,13 @@ class ResearchApplicationTests(unittest.TestCase):
                 )
                 return [sys.executable, "-c", code]
 
-            app = create_session(ResearchBrief(
+            app, paper = self._paper_session(
+                root,
+                "# Paired test\nMeasure accuracy on the supplied fixed examples.",
                 request_text="Compare the supplied classifier with its baseline.",
                 objective="Compare the supplied classifier with its baseline.",
                 requested_outputs=("experiments",),
-                asset_requests=({"locator": str(paper), "role": "paper"},),
-            ), root=root / "session", services=ResearchApplicationServices(
+                services=ResearchApplicationServices(
                 config={"interaction": "assisted", "research_materials_only": True, "execution": {
                     "command": command("candidate", 0.5),
                     "baseline": {"command": command("baseline", 0.6)},
@@ -1084,7 +1093,8 @@ class ResearchApplicationTests(unittest.TestCase):
                     "result_schema": {"primary_metric": "accuracy", "required_metrics": ["accuracy"]},
                 }},
                 budget_limits={"process_invocations": 2, "process_wall_seconds": 10},
-            ))
+            ),
+            )
             pending = app.advance(max_actions=30)
             self.assertEqual(pending.status, "paused", pending.status_reason)
             gate = pending.work_plan["interaction"]["decision"]
@@ -1167,8 +1177,6 @@ class ResearchApplicationTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            paper = root / "paper.md"
-            paper.write_text("# Fixture\nA small measured comparison.\n", encoding="utf-8")
             seen = {}
             real = design_module.build_research_design
 
@@ -1176,13 +1184,11 @@ class ResearchApplicationTests(unittest.TestCase):
                 seen["boundary"] = dict(request.execution_boundary)
                 return real(request, **kwargs)
 
-            app = create_session(
-                ResearchBrief(
-                    request_text="Measure the supplied fixture.",
-                    requested_outputs=("experiments",),
-                    asset_requests=({"locator": str(paper), "role": "paper"},),
-                ),
-                root=root / "session",
+            app, paper = self._paper_session(
+                root,
+                "# Fixture\nA small measured comparison.\n",
+                request_text="Measure the supplied fixture.",
+                requested_outputs=("experiments",),
                 services=ResearchApplicationServices(
                     config={
                         "research_materials_only": True,
@@ -1235,8 +1241,6 @@ class ResearchApplicationTests(unittest.TestCase):
             self.assertFalse(fixed_protocol["can_extend_seed_condition"])
 
     def test_revision_preparation_preserves_original_step_reference(self):
-        from types import SimpleNamespace
-        from simple_ar.research.task_plan import TaskPlanResult, TaskPlanStep
 
         with tempfile.TemporaryDirectory() as tmp:
             app = create_session(ResearchBrief(request_text="Compare candidates."), root=Path(tmp))
@@ -1332,8 +1336,14 @@ class ResearchApplicationTests(unittest.TestCase):
             )
             self.assertIsNone(app.controller.store.read_json(unlinked_collection_ref)["implementation_ref"])
 
-    def test_real_code_task_modification_is_measured_by_application_once(self):
-        self._exercise_code_task_lifecycle()
+    def test_code_task_lifecycle_preserves_measurement_refinement_and_repair(self):
+        for scenario, options in (
+            ("modification", {}),
+            ("design_gap", {"refine": True}),
+            ("failed_revision", {"revised_failure": True}),
+        ):
+            with self.subTest(scenario=scenario):
+                self._exercise_code_task_lifecycle(**options)
 
     def test_verification_only_work_is_not_a_scientific_candidate_revision(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1353,11 +1363,6 @@ class ResearchApplicationTests(unittest.TestCase):
             proposal["revision_intent"] = "Change the candidate rule based on the observed error class."
             self.assertEqual(app._validate_revision_recommendation(proposal), "")
 
-    def test_design_gap_refines_in_fresh_workspace_and_preserves_baseline(self):
-        self._exercise_code_task_lifecycle(refine=True)
-
-    def test_failed_research_revision_repairs_then_remeasures_once(self):
-        self._exercise_code_task_lifecycle(revised_failure=True)
 
     def _exercise_code_task_lifecycle(self, *, refine=False, revised_failure=False):
         """Keep the old real bridge check, but exercise the formal lifecycle."""
@@ -1399,7 +1404,6 @@ class ResearchApplicationTests(unittest.TestCase):
                     assert "def predict" in _user, "Design refinement must receive the inspected source, not just the model's complaint."
                     self.refinement_calls += 1
                     if self.refinement_calls == 1:
-                        from simple_ar.integrations.llm import LLMError
                         raise LLMError("simulated transport interruption")
                     if self.refinement_calls == 2:
                         return {"status": "inspect_source", "context_request": {
@@ -1940,8 +1944,6 @@ class ResearchApplicationTests(unittest.TestCase):
     def test_explicit_pairs_recover_each_measurement_without_repeating_baselines(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            paper = root / "paper.md"
-            paper.write_text("# Classification\nCompare measured classifier outcomes.\n", encoding="utf-8")
             script = root / "evaluate.py"
             script.write_text(
                 "import sys\nfrom pathlib import Path\n"
@@ -1954,8 +1956,11 @@ class ResearchApplicationTests(unittest.TestCase):
             pairs = [{"seed": seed,
                 "baseline_command": [sys.executable, str(script), f"baseline-{seed}"],
                 "candidate_command": [sys.executable, str(script), f"candidate-{seed}"]} for seed in (0, 1)]
-            app = create_session(ResearchBrief(request_text="Compare classifiers.", requested_outputs=("experiments", "report"),
-                asset_requests=({"locator": str(paper), "role": "paper"},)), root=root / "session",
+            app, paper = self._paper_session(
+                root,
+                "# Classification\nCompare measured classifier outcomes.\n",
+                request_text="Compare classifiers.",
+                requested_outputs=("experiments", "report"),
                 services=ResearchApplicationServices(max_results=1, max_attempts=24, config={"execution": {
                     "pairs": pairs, "cwd": str(root), "timeout_sec": 5,
                     "result_schema": {"primary_metric": "accuracy", "direction": "higher"},
@@ -1966,7 +1971,8 @@ class ResearchApplicationTests(unittest.TestCase):
                     # This fixture asserts inline aggregate rows; the default
                     # linked presentation keeps them in the evidence package.
                     "report": {"data_tables": "full", "figures": {"enabled": True, "max_figures": 1}}},
-                    budget_limits={"process_invocations": 4, "process_wall_seconds": 20}))
+                    budget_limits={"process_invocations": 4, "process_wall_seconds": 20}),
+            )
             plan = app.controller.store.read_json(app.view().state_refs["work_plan"])
             self.assertEqual(plan["requested_outputs"][0]["status"], "pending")
             self.advance_to(app, "research_design")
@@ -2034,7 +2040,6 @@ class ResearchApplicationTests(unittest.TestCase):
             self.assertEqual(len({m.artifact for m in measured_sources}), 4)
             derived = [m for m in context.metric_sources if m.source_kind == "derived_comparison"]
             self.assertEqual([m.value for m in derived], [-0.25, -0.25])
-            from dataclasses import replace
             from simple_ar.report.schema import AgentReportResult, ReportSectionDraft
             app.services = replace(app.services, llm_client=LLMClient(LLMSettings(api_key="fixture-key", api_mode="chat")))
             def writer(**kwargs):
@@ -2070,8 +2075,6 @@ class ResearchApplicationTests(unittest.TestCase):
     def test_compact_seed_protocol_skips_baseline_and_reloads_without_rerun(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            paper = root / "paper.md"
-            paper.write_text("# Seed comparison\nA bounded fixture supports two measured conditions.\n", encoding="utf-8")
             script = root / "measure.py"
             script.write_text(
                 "import sys\nfrom pathlib import Path\n"
@@ -2079,13 +2082,11 @@ class ResearchApplicationTests(unittest.TestCase):
                 "print('accuracy:', 0.5 + int(sys.argv[-1]) / 10)\n",
                 encoding="utf-8",
             )
-            app = create_session(
-                ResearchBrief(
-                    request_text="Run two different seeds for this bounded fixture.",
-                    requested_outputs=("experiments",),
-                    asset_requests=({"locator": str(paper), "role": "paper"},),
-                ),
-                root=root / "session",
+            app, paper = self._paper_session(
+                root,
+                "# Seed comparison\nA bounded fixture supports two measured conditions.\n",
+                request_text="Run two different seeds for this bounded fixture.",
+                requested_outputs=("experiments",),
                 services=ResearchApplicationServices(
                     max_results=1,
                     max_chunks=10,
@@ -2126,8 +2127,6 @@ class ResearchApplicationTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            paper = root / "paper.md"
-            paper.write_text("# Supplement\nA bounded result supports one extra seed.\n", encoding="utf-8")
             script = root / "measure.py"
             script.write_text(
                 "import sys\nfrom pathlib import Path\n"
@@ -2156,13 +2155,11 @@ class ResearchApplicationTests(unittest.TestCase):
                     "protected_assets": [{"asset_id": "evaluator", "path": str(script)}],
                 },
             }
-            app = create_session(
-                ResearchBrief(
-                    request_text="Compare the supplied fixture under accepted seed conditions.",
-                    requested_outputs=("experiments",),
-                    asset_requests=({"locator": str(paper), "role": "paper"},),
-                ),
-                root=root / "session",
+            app, paper = self._paper_session(
+                root,
+                "# Supplement\nA bounded result supports one extra seed.\n",
+                request_text="Compare the supplied fixture under accepted seed conditions.",
+                requested_outputs=("experiments",),
                 services=ResearchApplicationServices(
                     max_results=1, max_chunks=10, max_attempts=40,
                     config={
@@ -2270,145 +2267,106 @@ class ResearchApplicationTests(unittest.TestCase):
                 ],
             )
 
-    def test_same_condition_baseline_can_be_reused_after_plan_revision(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            paper = root / "paper.md"
-            paper.write_text("# Baseline reuse\nA fixture keeps the comparison boundary explicit.\n", encoding="utf-8")
-            script = root / "measure.py"
-            script.write_text(
-                "import sys\nfrom pathlib import Path\n"
-                "with Path('calls.txt').open('a') as handle: handle.write(sys.argv[1] + '\\n')\n"
-                "print('accuracy: 0.7')\n",
-                encoding="utf-8",
-            )
-            execution = {
-                "command": [sys.executable, str(script), "candidate"],
-                "baseline": {"command": [sys.executable, str(script), "baseline"]},
-                "cwd": str(root), "timeout_sec": 5,
-                "result_schema": {"primary_metric": "accuracy", "direction": "higher"},
-                "protocol": {
-                    "contract_id": "reuse-fixture-v1",
-                    "hypothesis": "The same evaluator condition remains comparable.",
-                    "dataset_refs": [{"asset_id": "fixture", "revision": "v1"}],
-                    "split_spec": {"name": "test"},
-                    "metric_specs": [{"name": "accuracy", "unit": "fraction"}],
-                    "comparison_conditions": {"method": "fixture"},
-                    "protected_assets": [{"asset_id": "evaluator", "path": "measure.py"}],
-                },
-            }
-            app = create_session(
-                ResearchBrief(request_text="Measure the fixture.", requested_outputs=("experiments",),
-                              asset_requests=({"locator": str(paper), "role": "paper"},)),
-                root=root / "session",
-                services=ResearchApplicationServices(
-                    max_results=1, max_chunks=10, max_attempts=20,
-                    config={"research_materials_only": True, "execution": execution},
-                    budget_limits={"process_invocations": 2, "process_wall_seconds": 20},
-                ),
-            )
-            for _ in range(20):
-                if app.view().next_action == "baseline":
-                    break
-                app.advance(max_actions=1)
-            self.assertEqual(app.view().next_action, "baseline")
-            after_baseline = app.advance(max_actions=1)
-            baseline_ref = after_baseline.state_refs["baseline"]
-            self.assertEqual((root / "calls.txt").read_text(encoding="utf-8").splitlines(), ["baseline"])
-            original_evaluator = script.read_text(encoding="utf-8")
-            script.write_text(original_evaluator + "\n# protected evaluator changed\n", encoding="utf-8")
-            self.assertFalse(app._measurement_ref_matches(baseline_ref, execution))
-            script.write_text(original_evaluator, encoding="utf-8")
-            self.assertTrue(app._measurement_ref_matches(baseline_ref, execution))
-            reuse_execution = {
-                **execution, "baseline_policy": "reuse", "baseline_ref": baseline_ref.path,
-            }
-            revised = replace(app.brief, request_text="Measure the fixture again without repeating a valid baseline.")
-            app.controller.pause("Stop at the baseline before accepting a plan revision.")
-            app.continue_session(
-                reason="Reuse the passed same-condition baseline.", revised_brief=revised,
-                revised_execution=reuse_execution,
-            )
-            finished = app.advance(max_actions=20)
-            self.assertEqual(finished.status, "completed", finished.status_reason)
-            self.assertEqual(finished.work_plan["execution_decision"]["baseline"]["mode"], "reuse")
-            self.assertEqual((root / "calls.txt").read_text(encoding="utf-8").splitlines(), ["baseline", "candidate"])
-            candidate_step = next(step for step in app._load_task_plan().steps if step.action == "experiment")
-            self.assertTrue(app._step_completed(candidate_step))
-            script.write_text(original_evaluator + "\n# protected evaluator changed after measurement\n", encoding="utf-8")
-            self.assertTrue(app._step_completed(candidate_step))
-            completed_services = app.services
-            app.services = replace(app.services, config={
-                **app.services.config,
-                "execution": {**reuse_execution, "command": [sys.executable, str(script), "candidate-v2"]},
-            })
-            self.assertTrue(app._step_completed(candidate_step))
-            app.services = completed_services
-            script.write_text(original_evaluator, encoding="utf-8")
-            self.assertTrue(app._step_completed(candidate_step))
+    def test_baseline_reuse_preserves_condition_and_protected_asset_rules(self):
+        for protected in (True, False):
+            with self.subTest(protected=protected), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                script = root / "measure.py"
+                script.write_text(
+                    "import sys\nfrom pathlib import Path\n"
+                    "with Path('calls.txt').open('a') as handle: handle.write(sys.argv[1] + '\\n')\n"
+                    "print('accuracy: 0.7')\n" if protected else "import sys\nprint('accuracy: 0.7')\n",
+                    encoding="utf-8",
+                )
+                execution = {
+                    "command": [sys.executable, str(script), "candidate"],
+                    "baseline": {"command": [sys.executable, str(script), "baseline"]},
+                    "cwd": str(root), "timeout_sec": 5,
+                    "result_schema": {"primary_metric": "accuracy", "direction": "higher"},
+                    "protocol": {
+                        "contract_id": "reuse-fixture-v1" if protected else "same-session-reuse-v1",
+                        "hypothesis": "The same evaluator condition remains comparable.",
+                        "dataset_refs": [{"asset_id": "fixture", "revision": "v1"}],
+                        "split_spec": {"name": "test"},
+                        "metric_specs": [{"name": "accuracy", "unit": "fraction"}],
+                        "comparison_conditions": {"method": "fixture"},
+                    },
+                }
+                if protected:
+                    execution["protocol"]["protected_assets"] = [
+                        {"asset_id": "evaluator", "path": "measure.py"},
+                    ]
+                app, paper = self._paper_session(
+                    root,
+                    ("# Baseline reuse\nA fixture keeps the comparison boundary explicit.\n" if protected else
+                     "# Baseline reuse\nThe evaluator is fixed for this session.\n"),
+                    request_text="Measure the fixture.",
+                    requested_outputs=("experiments",),
+                    services=ResearchApplicationServices(
+                        max_results=1, max_chunks=10, max_attempts=20,
+                        config={"research_materials_only": True, "execution": execution},
+                        budget_limits={"process_invocations": 2, "process_wall_seconds": 20},
+                    ),
+                )
+                self.advance_to(app, "baseline")
+                after_baseline = app.advance(max_actions=1)
+                baseline_ref = after_baseline.state_refs["baseline"]
+                if not protected:
+                    self.assertTrue(app._measurement_ref_matches(baseline_ref, execution))
+                    continue
+                self.assertEqual((root / "calls.txt").read_text(encoding="utf-8").splitlines(), ["baseline"])
+                original_evaluator = script.read_text(encoding="utf-8")
+                script.write_text(original_evaluator + "\n# protected evaluator changed\n", encoding="utf-8")
+                self.assertFalse(app._measurement_ref_matches(baseline_ref, execution))
+                script.write_text(original_evaluator, encoding="utf-8")
+                self.assertTrue(app._measurement_ref_matches(baseline_ref, execution))
+                reuse_execution = {
+                    **execution, "baseline_policy": "reuse", "baseline_ref": baseline_ref.path,
+                }
+                revised = replace(app.brief, request_text="Measure the fixture again without repeating a valid baseline.")
+                app.controller.pause("Stop at the baseline before accepting a plan revision.")
+                app.continue_session(
+                    reason="Reuse the passed same-condition baseline.", revised_brief=revised,
+                    revised_execution=reuse_execution,
+                )
+                finished = app.advance(max_actions=20)
+                self.assertEqual(finished.status, "completed", finished.status_reason)
+                self.assertEqual(finished.work_plan["execution_decision"]["baseline"]["mode"], "reuse")
+                self.assertEqual((root / "calls.txt").read_text(encoding="utf-8").splitlines(), ["baseline", "candidate"])
+                candidate_step = next(step for step in app._load_task_plan().steps if step.action == "experiment")
+                self.assertTrue(app._step_completed(candidate_step))
+                script.write_text(original_evaluator + "\n# protected evaluator changed after measurement\n", encoding="utf-8")
+                self.assertTrue(app._step_completed(candidate_step))
+                completed_services = app.services
+                app.services = replace(app.services, config={
+                    **app.services.config,
+                    "execution": {**reuse_execution, "command": [sys.executable, str(script), "candidate-v2"]},
+                })
+                self.assertTrue(app._step_completed(candidate_step))
+                app.services = completed_services
+                script.write_text(original_evaluator, encoding="utf-8")
+                self.assertTrue(app._step_completed(candidate_step))
 
-            mismatched_protocol = {
-                **execution["protocol"],
-                "dataset_refs": [{"asset_id": "different", "revision": "v2"}],
-            }
-            mismatched_execution = {
-                **reuse_execution,
-                "protocol": mismatched_protocol,
-            }
-            app.continue_session(
-                reason="Check that a changed protocol cannot reuse the old baseline.",
-                revised_brief=replace(app.brief, request_text="Measure the fixture under a changed dataset reference."),
-                revised_execution=mismatched_execution,
-            )
-            self.assertNotIn("baseline", app.controller.manifest.state_refs)
-            self.assertNotIn("experiment", app.controller.manifest.state_refs)
-            rejected = app.advance(max_actions=20)
-            self.assertEqual(rejected.status, "paused")
-            self.assertIn("Baseline reuse requested", rejected.status_reason)
-            self.assertEqual((root / "calls.txt").read_text(encoding="utf-8").splitlines(), ["baseline", "candidate"])
+                mismatched_protocol = {
+                    **execution["protocol"],
+                    "dataset_refs": [{"asset_id": "different", "revision": "v2"}],
+                }
+                mismatched_execution = {
+                    **reuse_execution,
+                    "protocol": mismatched_protocol,
+                }
+                app.continue_session(
+                    reason="Check that a changed protocol cannot reuse the old baseline.",
+                    revised_brief=replace(app.brief, request_text="Measure the fixture under a changed dataset reference."),
+                    revised_execution=mismatched_execution,
+                )
+                self.assertNotIn("baseline", app.controller.manifest.state_refs)
+                self.assertNotIn("experiment", app.controller.manifest.state_refs)
+                rejected = app.advance(max_actions=20)
+                self.assertEqual(rejected.status, "paused")
+                self.assertIn("Baseline reuse requested", rejected.status_reason)
+                self.assertEqual((root / "calls.txt").read_text(encoding="utf-8").splitlines(), ["baseline", "candidate"])
 
-    def test_same_session_baseline_reuse_allows_missing_protected_asset_snapshot(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            paper = root / "paper.md"
-            paper.write_text("# Baseline reuse\nThe evaluator is fixed for this session.\n", encoding="utf-8")
-            script = root / "measure.py"
-            script.write_text(
-                "import sys\nprint('accuracy: 0.7')\n",
-                encoding="utf-8",
-            )
-            execution = {
-                "command": [sys.executable, str(script), "candidate"],
-                "baseline": {"command": [sys.executable, str(script), "baseline"]},
-                "cwd": str(root), "timeout_sec": 5,
-                "result_schema": {"primary_metric": "accuracy", "direction": "higher"},
-                "protocol": {
-                    "contract_id": "same-session-reuse-v1",
-                    "hypothesis": "The same evaluator condition remains comparable.",
-                    "dataset_refs": [{"asset_id": "fixture", "revision": "v1"}],
-                    "split_spec": {"name": "test"},
-                    "metric_specs": [{"name": "accuracy", "unit": "fraction"}],
-                    "comparison_conditions": {"method": "fixture"},
-                },
-            }
-            app = create_session(
-                ResearchBrief(request_text="Measure the fixture.", requested_outputs=("experiments",),
-                              asset_requests=({"locator": str(paper), "role": "paper"},)),
-                root=root / "session",
-                services=ResearchApplicationServices(
-                    max_results=1, max_chunks=10, max_attempts=20,
-                    config={"research_materials_only": True, "execution": execution},
-                    budget_limits={"process_invocations": 2, "process_wall_seconds": 20},
-                ),
-            )
-            for _ in range(20):
-                if app.view().next_action == "baseline":
-                    break
-                app.advance(max_actions=1)
-            self.assertEqual(app.view().next_action, "baseline")
-            after_baseline = app.advance(max_actions=1)
-            baseline_ref = after_baseline.state_refs["baseline"]
-            self.assertTrue(app._measurement_ref_matches(baseline_ref, execution))
 
     def test_revised_code_root_drops_old_preparation_before_execution_resolution(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2622,18 +2580,18 @@ class ResearchApplicationTests(unittest.TestCase):
             ])
 
     def test_literature_report_does_not_require_or_launch_experiments(self):
-        from dataclasses import replace
         from simple_ar.report.schema import AgentReportResult, ReportSectionDraft
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            paper = root / "paper.md"
-            paper.write_text("# Calibration\n\nCalibration compares confidence with accuracy. Evidence remains limited.", encoding="utf-8")
-            app = create_session(ResearchBrief(
-                request_text="Review calibration evidence.", requested_outputs=("report",),
-                asset_requests=({"locator": str(paper), "role": "paper"},),
-            ), root=root / "session", services=ResearchApplicationServices(max_results=1,
-                budget_limits={"process_invocations": 0}))
+            app, paper = self._paper_session(
+                root,
+                "# Calibration\n\nCalibration compares confidence with accuracy. Evidence remains limited.",
+                request_text="Review calibration evidence.",
+                requested_outputs=("report",),
+                services=ResearchApplicationServices(max_results=1,
+                budget_limits={"process_invocations": 0}),
+            )
             self.advance_to(app, "report_write")
             view = app.view()
             self.assertEqual(view.next_action, "report_write")
@@ -2667,17 +2625,17 @@ class ResearchApplicationTests(unittest.TestCase):
             self.assertIn("References", report)
 
     def test_report_audit_warning_is_deliverable_but_failed_audit_is_not(self):
-        from dataclasses import replace
         from simple_ar.report.schema import AgentReportResult, ReportSectionDraft, ReviewerFinding
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            paper = root / "paper.md"
-            paper.write_text("# Calibration\n\nCalibration evidence is limited.\n", encoding="utf-8")
-            app = create_session(ResearchBrief(
-                request_text="Review calibration evidence.", requested_outputs=("report",),
-                asset_requests=({"locator": str(paper), "role": "paper"},),
-            ), root=root / "session", services=ResearchApplicationServices(max_results=1))
+            app, paper = self._paper_session(
+                root,
+                "# Calibration\n\nCalibration evidence is limited.\n",
+                request_text="Review calibration evidence.",
+                requested_outputs=("report",),
+                services=ResearchApplicationServices(max_results=1),
+            )
             self.advance_to(app, "report_write")
             app.services = replace(app.services, llm_client=LLMClient(LLMSettings(api_key="fixture")))
 
@@ -2770,17 +2728,13 @@ class ResearchApplicationTests(unittest.TestCase):
     def test_request_report_reopens_completed_prefix_without_rerunning_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            paper = root / "paper.md"
-            paper.write_text("# Classification\n\nThe fixture describes an accuracy metric.\n", encoding="utf-8")
             script = root / "evaluate.py"
             script.write_text("print('accuracy: 0.75')\n", encoding="utf-8")
-            app = create_session(
-                ResearchBrief(
-                    request_text="Evaluate the fixture.",
-                    requested_outputs=("experiments",),
-                    asset_requests=({"locator": str(paper), "role": "paper"},),
-                ),
-                root=root / "session",
+            app, paper = self._paper_session(
+                root,
+                "# Classification\n\nThe fixture describes an accuracy metric.\n",
+                request_text="Evaluate the fixture.",
+                requested_outputs=("experiments",),
                 services=ResearchApplicationServices(
                     max_results=1,
                     config={
@@ -2834,15 +2788,11 @@ class ResearchApplicationTests(unittest.TestCase):
     def test_brief_revision_reuses_unaffected_source_steps(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            paper = root / "paper.md"
-            paper.write_text("# Replay\n\nA small memory retains earlier examples.\n", encoding="utf-8")
-            app = create_session(
-                ResearchBrief(
-                    request_text="Study replay methods.",
-                    requested_outputs=("summary",),
-                    asset_requests=({"locator": str(paper), "role": "paper"},),
-                ),
-                root=root / "session",
+            app, paper = self._paper_session(
+                root,
+                "# Replay\n\nA small memory retains earlier examples.\n",
+                request_text="Study replay methods.",
+                requested_outputs=("summary",),
                 services=ResearchApplicationServices(
                     max_results=1, max_chunks=10, max_attempts=16,
                     config={"research_materials_only": True},
@@ -2892,7 +2842,6 @@ class ResearchApplicationTests(unittest.TestCase):
                 app = load_session(root / "session")
                 view = app.advance(max_actions=2)
                 if not swapped:
-                    from dataclasses import replace
                     from simple_ar.report.schema import AgentReportResult, ReportSectionDraft
                     from simple_ar.core.artifacts import read_json
                     self.assertEqual(view.next_action, "report_write")
@@ -2985,8 +2934,6 @@ class ResearchApplicationTests(unittest.TestCase):
     def test_paired_experiment_recovers_baseline_and_finishes_negative_result(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            paper = root / "paper.md"
-            paper.write_text("# Classification\n\nEvaluate threshold classifiers on held-out data.\n", encoding="utf-8")
             evaluator = root / "evaluate.py"
             evaluator.write_text(
                 "import sys\nfrom pathlib import Path\n"
@@ -3009,13 +2956,16 @@ class ResearchApplicationTests(unittest.TestCase):
                              "comparison_conditions": {"seed": 0},
                              "protected_assets": [{"asset_id": "evaluator", "path": str(evaluator)}]},
             }
-            app = create_session(ResearchBrief(
-                request_text="Compare threshold classifiers.", requested_outputs=("experiments",),
-                asset_requests=({"locator": str(paper), "role": "paper"},),
-            ), root=root / "session", services=ResearchApplicationServices(
+            app, paper = self._paper_session(
+                root,
+                "# Classification\n\nEvaluate threshold classifiers on held-out data.\n",
+                request_text="Compare threshold classifiers.",
+                requested_outputs=("experiments",),
+                services=ResearchApplicationServices(
                 max_results=1, config={"execution": execution},
                 budget_limits={"process_invocations": 2, "process_wall_seconds": 10},
-            ))
+            ),
+            )
             self.advance_to(app, "baseline")
             with patch.object(app, "_persist_application_views", side_effect=RuntimeError("interrupted baseline")):
                 with self.assertRaisesRegex(RuntimeError, "interrupted baseline"):
@@ -3049,15 +2999,16 @@ class ResearchApplicationTests(unittest.TestCase):
     def test_experiment_budget_exhaustion_preserves_research_without_launch(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            paper = root / "paper.md"
-            paper.write_text("# Evaluation\n\nValidation measures accuracy.\n", encoding="utf-8")
-            app = create_session(ResearchBrief(
-                request_text="Evaluate validation.", requested_outputs=("experiment", "research_summary"),
-                asset_requests=({"locator": str(paper), "role": "paper"},),
-            ), root=root / "session", services=ResearchApplicationServices(max_results=1, config={
+            app, paper = self._paper_session(
+                root,
+                "# Evaluation\n\nValidation measures accuracy.\n",
+                request_text="Evaluate validation.",
+                requested_outputs=("experiment", "research_summary"),
+                services=ResearchApplicationServices(max_results=1, config={
                 "execution": {"command": [sys.executable, "-c", "from pathlib import Path; Path('ran').touch()"],
                               "cwd": str(root), "timeout_sec": 5},
-            }, budget_limits={"process_invocations": 0, "process_wall_seconds": 5}))
+            }, budget_limits={"process_invocations": 0, "process_wall_seconds": 5}),
+            )
             view = app.advance(max_actions=10)
             self.assertEqual(view.status, "paused")
             self.assertIn("summary", view.state_refs)
@@ -3068,8 +3019,6 @@ class ResearchApplicationTests(unittest.TestCase):
     def test_explicit_retry_reuses_research_and_reanalyzes_corrected_command(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            paper = root / "paper.md"
-            paper.write_text("# Evaluation\n\nMeasure classifier accuracy.\n", encoding="utf-8")
             services = ResearchApplicationServices(max_results=1, config={
                 "execution": {
                     "command": [sys.executable, "-c", "print('accuracy: 0.2'); raise SystemExit(1)"],
@@ -3084,10 +3033,13 @@ class ResearchApplicationTests(unittest.TestCase):
                     },
                 },
             }, budget_limits={"process_invocations": 2, "process_wall_seconds": 10})
-            app = create_session(ResearchBrief(
-                request_text="Evaluate classifier accuracy.", requested_outputs=("experiment",),
-                asset_requests=({"locator": str(paper), "role": "paper"},),
-            ), root=root / "session", services=services)
+            app, paper = self._paper_session(
+                root,
+                "# Evaluation\n\nMeasure classifier accuracy.\n",
+                request_text="Evaluate classifier accuracy.",
+                requested_outputs=("experiment",),
+                services=services,
+            )
             self.advance_to(app, "experiment")
             failed = app.advance()
             self.assertEqual(failed.next_action, "analysis")
@@ -3174,8 +3126,6 @@ class ResearchApplicationTests(unittest.TestCase):
                 self.assertEqual(view.status, "completed")
 
     def test_model_assessment_drives_design_once_and_abstention_keeps_summary(self):
-        import json
-        from dataclasses import replace
 
         for recommend in (True, False, "provider_error"):
             with self.subTest(recommend=recommend), tempfile.TemporaryDirectory() as tmp:
@@ -3299,12 +3249,11 @@ class ResearchApplicationTests(unittest.TestCase):
     def test_continue_retries_failed_analysis_without_repeating_measurement(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            paper = root / "paper.md"
-            paper.write_text("# Evaluation\nMeasure classifier accuracy.\n", encoding="utf-8")
-            app = create_session(
-                ResearchBrief(request_text="Measure classifier accuracy.", requested_outputs=("experiments",),
-                              asset_requests=({"locator": str(paper), "role": "paper"},)),
-                root=root / "session",
+            app, paper = self._paper_session(
+                root,
+                "# Evaluation\nMeasure classifier accuracy.\n",
+                request_text="Measure classifier accuracy.",
+                requested_outputs=("experiments",),
                 services=ResearchApplicationServices(budget_limits={"process_invocations": 1, "process_wall_seconds": 5}, config={"execution": {
                     "command": [sys.executable, "-c", "print('accuracy: 0.5')"],
                     "cwd": str(root), "timeout_sec": 5,
@@ -3330,39 +3279,35 @@ class ResearchApplicationTests(unittest.TestCase):
             self.assertIn("provider budget exhausted", " ".join(failed_analysis["diagnostics"]))
             self.assertEqual(context["remaining_authorized_rounds"], 1)
 
-    def test_reload_reuses_completed_result_before_state_reference_is_saved(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            app = create_session(ResearchBrief(request_text="Study agents"), root=tmp)
-            with patch.object(app.controller, "attempt_output_ref", side_effect=RuntimeError("interrupted")):
-                with self.assertRaisesRegex(RuntimeError, "interrupted"):
-                    app.advance()
-            resumed = load_session(tmp)
-            # Stop at the next boundary: recovery itself must not invoke plan.
-            with patch.object(resumed, "_run_action", return_value=False) as next_action:
-                view = resumed.advance()
-            next_action.assert_called_once_with("search")
-            self.assertEqual(len(view.attempts), 1)
-            self.assertEqual(view.budget["attempts"], 1)
-            self.assertIn("plan", view.state_refs)
+    def test_reload_reconciles_completed_plan_at_each_persistence_boundary(self):
+        for boundary in ("state_reference", "attempt_budget"):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as tmp:
+                app = create_session(ResearchBrief(request_text="Study agents"), root=tmp)
+                save = app.controller.save
 
-    def test_reload_reconciles_terminal_attempt_before_budget_save(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            app = create_session(ResearchBrief(request_text="Study agents"), root=tmp)
-            save = app.controller.save
-            def interrupted_save():
-                if app.controller.manifest.budget.attempts:
-                    raise RuntimeError("interrupted budget save")
-                return save()
-            with patch.object(app.controller, "save", side_effect=interrupted_save):
-                with self.assertRaisesRegex(RuntimeError, "interrupted budget save"):
-                    app.advance()
-            resumed = load_session(tmp)
-            self.assertEqual(resumed.controller.manifest.budget.attempts, 0)
-            with patch.object(resumed, "_run_action", return_value=False):
-                view = resumed.advance()
-            self.assertEqual(view.budget["attempts"], 1)
-            self.assertEqual(len(view.attempts), 1)
-            self.assertIn("plan", view.state_refs)
+                def interrupted_save():
+                    if app.controller.manifest.budget.attempts:
+                        raise RuntimeError("interrupted budget save")
+                    return save()
+
+                method, failure, message = (
+                    ("attempt_output_ref", RuntimeError("interrupted"), "interrupted")
+                    if boundary == "state_reference" else
+                    ("save", interrupted_save, "interrupted budget save")
+                )
+                with patch.object(app.controller, method, side_effect=failure):
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        app.advance()
+                resumed = load_session(tmp)
+                if boundary == "attempt_budget":
+                    self.assertEqual(resumed.controller.manifest.budget.attempts, 0)
+                # Recover the durable result, then stop before executing the next action.
+                with patch.object(resumed, "_run_action", return_value=False) as next_action:
+                    view = resumed.advance()
+                next_action.assert_called_once_with("search")
+                self.assertEqual(len(view.attempts), 1)
+                self.assertEqual(view.budget["attempts"], 1)
+                self.assertIn("plan", view.state_refs)
 
     def test_reload_services_preserve_limits_and_missing_config_is_visible(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3381,24 +3326,16 @@ class ResearchApplicationTests(unittest.TestCase):
     def test_application_advances_local_research_to_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            paper = root / "reliable_agents.md"
-            paper.write_text(
+            app, paper = self._paper_session(
+                root,
                 "# Method\n\n"
                 "Validation improves reliable agent behavior.\n\n"
                 "# Results\n\n"
                 "The AgentBench dataset reports accuracy: 0.75.\n",
-                encoding="utf-8",
-            )
-            app = create_session(
-                ResearchBrief(
-                    request_text="Study validation methods for reliable agents.",
-                    objective="Understand how validation affects reliable agents.",
-                    requested_outputs=("research_summary",),
-                    asset_requests=(
-                        {"locator": str(paper), "role": "paper"},
-                    ),
-                ),
-                root=root / "session",
+                filename="reliable_agents.md",
+                request_text="Study validation methods for reliable agents.",
+                objective="Understand how validation affects reliable agents.",
+                requested_outputs=("research_summary",),
                 services=ResearchApplicationServices(max_results=2, max_chunks=20),
             )
 
@@ -3462,18 +3399,12 @@ class ResearchApplicationTests(unittest.TestCase):
     def test_application_can_be_advanced_in_small_steps(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            paper = root / "agents.txt"
-            paper.write_text(
+            app, paper = self._paper_session(
+                root,
                 "Reliable agents use validation and report accuracy metrics.\n",
-                encoding="utf-8",
-            )
-            app = create_session(
-                ResearchBrief(
-                    request_text="Study reliable agents.",
-                    requested_outputs=("research_summary",),
-                    asset_requests=({"locator": str(paper), "role": "paper"},),
-                ),
-                root=root / "session",
+                filename="agents.txt",
+                request_text="Study reliable agents.",
+                requested_outputs=("research_summary",),
                 services=ResearchApplicationServices(max_results=1, max_chunks=10),
             )
 
@@ -3490,18 +3421,12 @@ class ResearchApplicationTests(unittest.TestCase):
     def test_requested_experiment_preserves_summary_and_design_without_execution(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            paper = root / "agents.md"
-            paper.write_text(
+            app, paper = self._paper_session(
+                root,
                 "# Results\n\nValidation reports accuracy 0.75 for reliable agents.\n",
-                encoding="utf-8",
-            )
-            app = create_session(
-                ResearchBrief(
-                    request_text="Study reliable agents.",
-                    requested_outputs=("experiment", "report", "research_summary"),
-                    asset_requests=({"locator": str(paper), "role": "paper"},),
-                ),
-                root=root / "session",
+                filename="agents.md",
+                request_text="Study reliable agents.",
+                requested_outputs=("experiment", "report", "research_summary"),
                 services=ResearchApplicationServices(max_results=1, max_chunks=10),
             )
 
@@ -3527,12 +3452,14 @@ class ResearchApplicationTests(unittest.TestCase):
     def test_continue_retries_invalid_assessment_without_replaying_research(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            paper = root / "agents.md"
-            paper.write_text("# Results\n\nValidation reports accuracy 0.75 for reliable agents.\n", encoding="utf-8")
-            app = create_session(
-                ResearchBrief(request_text="Study reliable agents.", requested_outputs=("experiment", "report"),
-                              asset_requests=({"locator": str(paper), "role": "paper"},)),
-                root=root / "session", services=ResearchApplicationServices(max_results=1))
+            app, paper = self._paper_session(
+                root,
+                "# Results\n\nValidation reports accuracy 0.75 for reliable agents.\n",
+                filename="agents.md",
+                request_text="Study reliable agents.",
+                requested_outputs=("experiment", "report"),
+                services=ResearchApplicationServices(max_results=1),
+            )
             self.advance_to(app, "research_design")
             self.assertEqual(app.view().next_action, "research_design")
             retained = {k: app.view().state_refs[k] for k in ("plan", "search", "read", "synthesis")}

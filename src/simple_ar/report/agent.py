@@ -112,7 +112,8 @@ Use the registered execution results for local baseline, candidate and compariso
 values. Ground execution/resource claims in their recorded owner: requested
 conditions are declarations, executor records are observations, and producer
 outputs are attributed measurements. A result's presence does not validate its method.
-Use short citation keys exactly as provided, in Pandoc-style form like [@P1].
+Use only registered citation keys. When none are supplied, attribute materials
+by their actual names and supplied public URLs; do not invent citation markers.
 Write an argument, not a pipeline run log. State supported conclusions directly;
 give each result or comparison a purpose in answering the reader's question.
 Keep scientific methods and material comparison conditions in the main text.
@@ -186,6 +187,7 @@ def run_report_agent(
     emit: Callable[[str], None] | None = None,
     checkpoint_sink: Callable[[dict[str, Any]], None] | None = None,
     completed_checkpoint: Mapping[str, Any] | None = None,
+    assemble_body: bool = True,
 ) -> AgentReportResult | None:
     """Run the bounded Writer/Reviewer loop for the report stage.
 
@@ -199,6 +201,8 @@ def run_report_agent(
         emit: Optional progress callback.
         checkpoint_sink: Save accepted plan, completed sections, pending drafts and revision diagnostics.
         completed_checkpoint: Previously completed prefix; the caller verifies input identity.
+        assemble_body: Preserve the direct-call report body by default. Capability
+            callers publish sections through the assembly owner instead.
 
     Returns:
         Agent-generated report body and updated memory, or ``None`` when agent
@@ -223,8 +227,9 @@ def run_report_agent(
         all_findings = [ReviewerFinding.model_validate(row) for row in completed_checkpoint["reviewer_findings"]]
         # Old checkpoints marked an unavailable inspection as finished. Keep
         # its drafts and consumed rounds, but resume the unfinished work.
-        if any(row.type in {"document_review_unavailable", "document_revision_unavailable"}
-               for row in current.reviewer_findings):
+        if (any(row.type in {"document_review_unavailable", "document_revision_unavailable"}
+                for row in current.reviewer_findings)
+                and not any(row.rejected_review.get("format_correction") for row in iterations)):
             document_review_done = False
         all_tool_results = [ReportToolResult.model_validate(row) for row in completed_checkpoint["tool_results"]]
         # Reuse the persisted results as the read-call ledger. Resuming must
@@ -294,7 +299,7 @@ def run_report_agent(
             selection = client.ask_json(WRITER_SYSTEM, _json_prompt({
                 "task": "Identify the reader's decisions and questions, then select necessary source reads before planning an answer; do not draft sections or an outline.",
                 "objective": report_objective(context, current),
-                "sources": [_prompt_handle_view(h) for h in current.source_handles if h.kind != "prior_draft"][:40],
+                "sources": [_prompt_handle_view(h, navigation=True) for h in current.source_handles if h.kind != "prior_draft"][:40],
                 "tools": [spec.model_dump(mode="json") for spec in report_tool_specs()],
                 "context_request_schema": ReportToolCall.model_json_schema(),
                 "output_schema": {"context_requests": []},
@@ -454,6 +459,13 @@ def run_report_agent(
             revision_request, revision_baseline = pending_revision_review(iterations, section.section_id)
             revisions_used = sum(row.action == "revise" for row in iterations if row.section_id == section.section_id)
             remaining_revisions = max(0, config.max_review_iterations - revisions_used)
+            last_event = next((row for row in reversed(iterations)
+                if row.section_id == section.section_id), None)
+            saved_review = (ReportSectionReview(section_id=section.section_id,
+                verdict=last_event.status, findings=last_event.findings,
+                revision_instructions=last_event.revision_instructions)
+                if last_event is not None and last_event.action in {"review", "review_revision"}
+                and not any(row.type == "review_agent_fallback" for row in last_event.findings) else None)
             # A review pass is always recorded. Each allowed correction then
             # receives another review, so max_review_iterations means actual
             # review -> revise cycles rather than extra reviews without edits.
@@ -462,7 +474,8 @@ def run_report_agent(
                 action = "review" if review_round == 0 else "review_revision"
                 label_suffix = "" if review_round == 0 else f"-round-{review_round + 1}"
                 _emit(emit, f"Reviewer checking `{section.heading}` (round {review_round + 1}).")
-                review = _review_section_with_recovery(
+                reused_review = saved_review is not None and remaining_round == 0
+                review = saved_review if reused_review else _review_section_with_recovery(
                     client=client,
                     context=context,
                     template=template,
@@ -476,10 +489,10 @@ def run_report_agent(
                     adopted_sections=sections,
                     revision_review=revision_request, previous_draft=revision_baseline,
                 )
-                tool_results = _run_context_requests(gateway, review, config)
+                tool_results = [] if reused_review else _run_context_requests(gateway, review, config)
                 all_tool_results.extend(tool_results)
                 lookup_failed = any(row.status in {"not_found", "error"} for row in tool_results)
-                needs_evidence_recheck = _needs_evidence_recheck(review) or lookup_failed
+                needs_evidence_recheck = not reused_review and (_needs_evidence_recheck(review) or lookup_failed)
                 if tool_results or needs_evidence_recheck:
                     # Save completed reads before either consumer can fail.
                     # Mixed corrections skip the extra review, not persistence.
@@ -514,19 +527,24 @@ def run_report_agent(
                 # only new reads enter all_tool_results and consume allowance.
                 review_context = [*review_context, *tool_results]
                 section_findings.extend(review.findings)
-                all_findings.extend(review.findings)
-                iterations.append(
-                    _iteration(
-                        section_index,
-                        section,
-                        action,
-                        review.verdict,
-                        draft.used_sources,
-                        findings=review.findings,
-                        tool_results=tool_results,
-                        revision_instructions=review.revision_instructions,
+                if not reused_review:
+                    all_findings.extend(review.findings)
+                    iterations.append(
+                        _iteration(
+                            section_index,
+                            section,
+                            action,
+                            review.verdict,
+                            draft.used_sources,
+                            findings=review.findings,
+                            tool_results=tool_results,
+                            revision_instructions=review.revision_instructions,
+                        )
                     )
-                )
+                # Persist the completed opinion before revision can fail its
+                # budget/transport check. Resume reuses this event, not another
+                # review request or a fresh source-read allowance.
+                checkpoint()
                 if not _needs_revision(review) or remaining_round >= remaining_revisions:
                     break
 
@@ -590,22 +608,20 @@ def run_report_agent(
             )
         if (config.document_review and config.reviewer != "disabled"
                 and len(sections) > 1 and not document_review_done):
-            _edit_whole_document(
+            document_review_done = _edit_whole_document(
                 client=client, context=context, template=template, memory=current,
                 config=config, sections=sections, iterations=iterations,
                 all_findings=all_findings, emit=emit,
                 checkpoint=checkpoint, gateway=gateway, all_tool_results=all_tool_results,
             )
-            document_review_done = not any(
-                row.type in {"document_review_unavailable", "document_revision_unavailable"}
-                for row in current.reviewer_findings
-            )
         # Final section-review reconciliation also matters when whole-document
         # review is disabled or inapplicable. Persist the memory we return,
         # not the earlier append-only history from the last section checkpoint.
         checkpoint()
-        title = current.document_plan.title if current.document_plan and current.document_plan.title else context.topic
-        body = assemble_report_sections(title=title, sections=_final_sequence(current.section_plan, sections))
+        body = ""
+        if assemble_body:
+            title = current.document_plan.title if current.document_plan and current.document_plan.title else context.topic
+            body = assemble_report_sections(title=title, sections=_final_sequence(current.section_plan, sections))
         return AgentReportResult(
             report_body=body,
             memory=current,
@@ -631,8 +647,9 @@ def _edit_whole_document(
     emit: Callable[[str], None] | None,
     checkpoint: Callable[[], None], gateway: ReportToolGateway,
     all_tool_results: list[ReportToolResult],
-) -> None:
+) -> bool:
     """Correct frozen targets within their configured, recoverable allowance."""
+    review_finished = True
     plans = {plan.section_id: plan for plan in memory.section_plan}
     by_id = {draft.section_id: index for index, draft in enumerate(sections)}
     pending = pending_document_revisions(iterations)
@@ -647,15 +664,22 @@ def _edit_whole_document(
     pending_inspection: list[ReportSectionReview] = []
     pending_opinions: list[ReviewerFinding] | None = None
     partial_review_owners: set[str] = set()
+    completed_opinion_reviews: list[ReportSectionReview] = []
     if not continuations:
         owners = {"document_context": "report-document-reviewer",
                   "document_finding_context": "report-document-finding-checker",
                   "document_verifier_context": "report-document-verifier"}
         for event in reversed(iterations):
-            if event.action in {"document_review_rejected", "document_finding_check_rejected",
+            if event.action == "document_finding_check":
+                completed_opinion_reviews[0:0] = event.section_reviews or [ReportSectionReview(
+                    section_id=event.section_id, verdict=event.status, findings=event.findings,
+                    finding_checks=event.finding_checks)]
+            elif event.action in {"document_review_rejected", "document_finding_check_rejected",
                                 "document_format_correction", "document_finding_format_correction"}:
                 owner = event.rejected_review.get("label", "")
                 if owner:
+                    if completed_opinion_reviews and owner.startswith("report-document-finding-checker"):
+                        continue  # Applied checks already own closure and retained opinions.
                     pending_rejections.setdefault(owner, event)
                     if owner.startswith("report-document-finding-checker") and pending_opinions is None:
                         pending_opinions = event.requested_findings or [ReviewerFinding.model_validate(row)
@@ -665,12 +689,18 @@ def _edit_whole_document(
                 if event.action == "document_finding_context" and pending_opinions is None:
                     pending_opinions = event.requested_findings or None
             elif event.action == "document_inspection" and (
-                    "report-document-finding-checker" in pending_contexts or any(
+                    completed_opinion_reviews or "report-document-finding-checker" in pending_contexts or any(
                         owner.startswith("report-document-finding-checker") for owner in pending_rejections)):
                 pending_inspection.insert(0, ReportSectionReview(section_id=event.section_id,
                     verdict=event.status, findings=event.findings, revision_instructions=event.revision_instructions))
             else:
                 break
+
+    def correction_consumed(label: str) -> bool:
+        event = next((row for row in reversed(iterations)
+                      if row.rejected_review.get("label", "").removesuffix("-evidence") == label), None)
+        return bool(event and event.rejected_review.get("format_correction")
+                    and not (event.status == "started" and "rejection_iteration" in event.rejected_review))
 
     def checkpointed_context(requests: list[ReportToolCall], event: ReportIterationRecord) -> None:
         checkpointed_report_reads(gateway, requests, event, all_tool_results, checkpoint)
@@ -708,13 +738,20 @@ def _edit_whole_document(
 
         def call(review_label: str) -> list[ReportSectionReview]:
             rejected = pending_rejections.pop(review_label, None)
+            saved_correction = None
             if (rejected and rejected.status == "started"
-                    and rejected.rejected_review.get("format_correction")):
+                    and rejected.rejected_review.get("format_correction")
+                    and "rejection_iteration" in rejected.rejected_review):
                 # A checkpoint records intent before budget/transport. Only a
                 # returned invalid response consumes the bounded correction.
                 rejection_iteration = rejected.rejected_review["rejection_iteration"]
-                rejected = next(row for row in iterations
-                                if row.iteration == rejection_iteration)
+                parent = next((row for row in iterations if row.iteration == rejection_iteration), None)
+                if (parent is None or parent.rejected_review.get("label") != review_label
+                        or "response" not in parent.rejected_review
+                        or parent.rejected_review.get("format_correction")):
+                    raise LLMResponseError("Saved format correction has no matching rejected response; no replay is authorized.")
+                saved_correction = rejected
+                rejected = parent
             if rejected and rejected.status == "completed" and "validated_reviews" in rejected.rejected_review:
                 return [ReportSectionReview.model_validate(row) for row in rejected.rejected_review["validated_reviews"]]
             if rejected and rejected.rejected_review.get("partial_ready"):
@@ -749,17 +786,18 @@ def _edit_whole_document(
             for _ in range(2 if correction is None else 1):
                 validated_subset = []
                 before = len(iterations)
-                correction_record = None
+                correction_record = saved_correction
                 if correction is not None:
-                    correction_record = ReportIterationRecord(
-                        iteration=len(iterations) + 1, section_id="",
-                        action="document_finding_format_correction" if historical_findings else "document_format_correction",
-                        status="started", summary=correction["validation_error"],
-                        rejected_review={"label": review_label, "format_correction": True,
-                            "rejection_iteration": iterations[-1].iteration},
-                        requested_findings=historical_findings or [],
-                    )
-                    iterations.append(correction_record)
+                    if correction_record is None:
+                        correction_record = ReportIterationRecord(
+                            iteration=len(iterations) + 1, section_id="",
+                            action="document_finding_format_correction" if historical_findings else "document_format_correction",
+                            status="started", summary=correction["validation_error"],
+                            rejected_review={"label": review_label, "format_correction": True,
+                                "rejection_iteration": rejected.iteration},
+                            requested_findings=historical_findings or [],
+                        )
+                        iterations.append(correction_record)
                     checkpoint()
                 try:
                     validated = review_document(client=client, template=template, memory=memory,
@@ -792,8 +830,9 @@ def _edit_whole_document(
                     if correction is not None or len(iterations) == before or not iterations[-1].rejected_review:
                         raise
                     prepare_rejected_context(iterations[-1])
-                    correction = {"validation_error": iterations[-1].summary,
-                                  "rejected_response": iterations[-1].rejected_review["response"]}
+                    rejected = iterations[-1]
+                    correction = {"validation_error": rejected.summary,
+                                  "rejected_response": rejected.rejected_review["response"]}
                     _emit(emit, "Reviewer correcting rejected document-review JSON once.")
             raise AssertionError("Document review correction did not terminate")
 
@@ -831,7 +870,7 @@ def _edit_whole_document(
         return [_mark_pending_evidence(row) if row in provisional else row for row in reviews]
 
     try:
-        recovering_opinions = ("report-document-finding-checker" in pending_contexts or
+        recovering_opinions = (bool(completed_opinion_reviews) or "report-document-finding-checker" in pending_contexts or
                               any(owner.startswith("report-document-finding-checker") for owner in pending_rejections))
         recovering_verifier = ("report-document-verifier" in pending_contexts or
                               any(owner.startswith("report-document-verifier") for owner in pending_rejections))
@@ -853,7 +892,7 @@ def _edit_whole_document(
         )
         all_findings.append(finding)
         memory.reviewer_findings = _dedupe_findings([*memory.reviewer_findings, finding])
-        return
+        return correction_consumed("report-document-reviewer")
     adopted_revision = recovering_verifier
     # New observations about an interrupted candidate's target do not replace
     # its saved verification contract. Keep them as separate, unresolved work;
@@ -874,7 +913,7 @@ def _edit_whole_document(
                       if finding_requires_resolution(row) and row.section_id in plans
                       and row.type not in DOCUMENT_CONTROL_FINDING_TYPES
                       and row.section_id not in continuations]
-    if recovering_verifier or pending_joint is not None:
+    if recovering_verifier or pending_joint is not None or completed_opinion_reviews:
         prior_findings = []
     elif recovering_opinions and pending_opinions is not None:
         prior_findings = pending_opinions
@@ -913,6 +952,7 @@ def _edit_whole_document(
                     "document_finding_check", review.verdict, sections[by_id[review.section_id]].used_sources,
                     findings=review.findings, finding_checks=review.finding_checks,
                     requested_findings=prior_findings))
+                iterations[-1].section_reviews = [review.model_copy(deep=True)]
                 all_findings.extend(review.findings)
                 closed.extend(originals[(review.section_id, check.finding_id)] for check in review.finding_checks
                               if check.status != "unresolved" and not review.context_requests)
@@ -932,18 +972,20 @@ def _edit_whole_document(
             for review in opinion_reviews:
                 memory.reviewer_findings = _dedupe_findings([*memory.reviewer_findings, *review.findings])
             checkpoint()
-            reviews.extend(review for review in opinion_reviews if not review.context_requests and (
-                review.verdict in {"revise_required", "fail"}
-                or any(finding_requires_resolution(finding) and finding.required_action != "verify"
-                       for finding in review.findings)
-            ))
+            completed_opinion_reviews.extend(opinion_reviews)
         except (LLMError, ValidationError, ValueError) as exc:
+            review_finished = correction_consumed("report-document-finding-checker")
             finding = ReviewerFinding(finding_id="document-finding-check-unavailable",
                 type="document_review_unavailable", severity="major",
                 message=f"Historical opinions were not checked: {exc}",
                 suggested_action="Inspect retained opinions against current draft and original evidence.")
             all_findings.append(finding)
             memory.reviewer_findings = _dedupe_findings([*memory.reviewer_findings, finding])
+    reviews.extend(review for review in completed_opinion_reviews if not review.context_requests and (
+        review.verdict in {"revise_required", "fail"}
+        or any(finding_requires_resolution(finding) and finding.required_action != "verify"
+               for finding in review.findings)
+    ))
     # Finish persisted candidates first; a fresh review cannot change the
     # correction contract midway or cause the Writer to regenerate that draft.
     # Inspection coverage is not the correction allowance. Keep every finding,
@@ -981,7 +1023,8 @@ def _edit_whole_document(
         edit_joint_document(memory=memory, config=config, sections=sections, iterations=iterations,
             reviews=reviews, all_findings=all_findings, checkpoint=checkpoint,
             draft=joint_draft, inspect=joint_inspect)
-        return
+        return review_finished and not any(row.type == "document_revision_unavailable"
+                                           for row in memory.reviewer_findings)
     # This bounded queue also handles a new defect introduced by a correction.
     # A candidate is not adopted until it passes; subsequent corrections retain
     # the original contract and consume the same section allowance.
@@ -1099,6 +1142,7 @@ def _edit_whole_document(
             # recheck, not only when the entire editing pass finishes.
             checkpoint()
         except (LLMError, ValidationError, ValueError) as exc:
+            review_finished = False
             unresolved = ReviewerFinding(
                 finding_id=f"{plan.section_id}-document-revision-unavailable",
                 type="document_revision_unavailable", severity="major",
@@ -1133,6 +1177,7 @@ def _edit_whole_document(
                     *memory.reviewer_findings, *unresolved,
                 ])
         except (LLMError, ValidationError, ValueError) as exc:
+            review_finished = review_finished and correction_consumed("report-document-verifier")
             unavailable = ReviewerFinding(
                 finding_id="document-recheck-unavailable", type="document_review_unavailable",
                 severity="major", message=f"Whole-document recheck did not complete: {exc}",
@@ -1140,6 +1185,9 @@ def _edit_whole_document(
             )
             all_findings.append(unavailable)
             memory.reviewer_findings = _dedupe_findings([*memory.reviewer_findings, unavailable])
+    # Completion records the bounded operation, not a successful assessment.
+    # Rejected peers and service diagnostics remain visible in the same memory.
+    return review_finished
 
 
 def _maybe_adapt_outline(
@@ -1953,7 +2001,8 @@ def _draft_document_with_recovery(
         payload["response_rules"].append("Choose either complete sections or a nonempty context_requests batch, never both.")
     if saved_reads:
         combined = [*(extra_context or []), *saved_reads]
-        payload["extra_tool_context"] = [report_tool_context(row) for row in combined]
+        payload["extra_tool_context"] = [report_tool_context(row,
+            source_evidence=payload['source_handles'], evidence_reference='source_handles') for row in combined]
         payload["extra_tool_context_omitted"] = 0
     wanted = {row.section_id: row for row in sections}
     for attempt in range(2):
@@ -1971,7 +2020,8 @@ def _draft_document_with_recovery(
                 saved_reads = read_context(calls)
                 can_read = False
                 combined = [*(extra_context or []), *saved_reads]
-                payload["extra_tool_context"] = [report_tool_context(row) for row in combined]
+                payload["extra_tool_context"] = [report_tool_context(row,
+                    source_evidence=payload['source_handles'], evidence_reference='source_handles') for row in combined]
                 payload["extra_tool_context_omitted"] = 0
                 payload["source_reading"].update(available=False, max_requests=0, tools=[])
                 payload["output_schema"].pop("context_requests", None)
@@ -2223,6 +2273,8 @@ def _writer_task_context(
     additions = (neighbors.pop("assembly_owned_content", []) if neighbors is not None else
         supplied_data_delivery(context, config=config, plan=memory.document_plan,
             section_ids=[row.section_id for row in memory.section_plan]) + _experiment_delivery_view(context, config))
+    sources = list({row["handle"]: row for target in selected
+        for row in _handles_for_section(memory, target)}.values())
     view = {
         "objective": report_objective(context, memory),
         "document_plan": document_plan_context(memory),
@@ -2230,12 +2282,13 @@ def _writer_task_context(
         "source_comparisons": context.source_comparisons,
         "comparison_status": dict(DERIVED_CONTEXT_STATUS),
         "assembly_owned_content": additions,
-        "source_handles": list({row["handle"]: row for target in selected
-            for row in _handles_for_section(memory, target)}.values()),
+        "source_handles": sources,
+        "registered_citation_keys": sorted(context.citation_key_map),
         "metric_sources": _prompt_metrics(memory, section_id=section.section_id if section else None),
         # Reads are already bounded by the gateway and session token budget.
         # A second last-N filter can discard the conditions of an earlier claim.
-        "extra_tool_context": [report_tool_context(row) for row in tools],
+        "extra_tool_context": [report_tool_context(row, source_evidence=sources,
+            evidence_reference='source_handles') for row in tools],
         "extra_tool_context_omitted": 0,
         "review_findings": [finding.model_dump(mode="json") for finding in (review.findings if review else [])],
         "review_findings_status": dict(REVIEW_OPINIONS_STATUS),
@@ -2316,14 +2369,14 @@ def _writer_payload(
             "Cover the planned analytical scope and then stop; do not add generic background merely to hit a number.",
             "For reviewer-directed revision, preserve supported content needed for the section; removing redundancy, unsupported claims or irrelevant details may shorten it substantially. For source-batch integration, preserve valid prior coverage.",
             "Use planned subsections as meaningful `###` headings in body sections when they improve navigation; do not add them to Abstract, Introduction or Conclusion just for uniformity.",
-            "Do not add Markdown image links unless a real generated image artifact exists; deterministic rendering handles planned figures separately.",
+            "Embed only real supplied or generated image artifacts using their provided paths; never invent figure files. Deterministic rendering handles planned figures separately.",
             "Draft front-matter as if it is written after the body: Abstract and Introduction should summarize the actual synthesis, not generic background.",
             "Keep conclusions within the recorded evidence. Add a local qualification when it changes that assertion's interpretation; keep shared limits in the argument plan's scope section instead of repeating them throughout the article.",
             "Prepared execution context declares the requested project, dataset, benchmark and limits; it is not an observation. Describe actual execution from executor records or attributed producer outputs, retaining unverified conditions. Neither a declaration nor a literature setting overrides a recorded observation.",
             "Use verified_execution_results for local baseline/candidate metrics, comparison verdicts, deltas, and resource changes. Do not use literature citations to support local benchmark outcomes.",
             "If verified_execution_results shows that more than one implementation factor changed, describe that as a limitation or scope boundary rather than presenting a single-factor causal claim.",
             "Keep paragraphs under roughly 120 words; split dense synthesis into short paragraphs or concise bullets.",
-            "Use only `cite_as` values such as [@P1] for body citations; never cite long source handles or raw paper ids.",
+            "Use only registered_citation_keys for body citation markers. Materials without keys use their supplied names or public URLs, not invented keys or internal handles.",
             "The final renderer will map short citation keys back to verified source ids and numeric citations.",
         ],
     }
@@ -2418,7 +2471,7 @@ def _writer_recovery_prompt(
             "Write evidence-bounded prose appropriate to the requested section purpose using only supplied sources.",
             "The original user's whole-document requirements and current revision instructions take precedence over approximate section targets. Read document_plan.length_budget when present: assembly text is reserved, section shares are not minima, and unresolved future costs still need final checking.",
             "Prepared execution context declares requested conditions, not observed execution. Keep executor observations and attributed producer measurements distinct; do not change a recorded value to agree with a declaration.",
-            "Use only supplied short citation keys such as [@P1].",
+            "Use only registered_citation_keys. Materials without keys use their supplied names or public URLs, never invented markers.",
             "Do not include a References section.",
             "`draft_markdown` is mandatory; optional metadata may be empty arrays.",
         ],
@@ -2513,7 +2566,8 @@ def _reviewer_context(
         "verified_execution_results": _compact_execution_results(context.results),
         "execution_evidence": report_execution_evidence(context),
         "draft": draft.model_dump(mode="json"),
-        "extra_tool_context": [report_tool_context(row, source_evidence=source_evidence)
+        "extra_tool_context": [report_tool_context(row, source_evidence=source_evidence,
+            evidence_reference='allowed_sources')
             for row in review_context],
         "extra_tool_context_omitted": len(extra_context or []) - len(review_context),
         "tool_policy": {

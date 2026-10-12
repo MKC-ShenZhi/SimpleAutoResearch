@@ -9,10 +9,11 @@ existing old/new patch flow: ambiguous edits fail instead of guessing.
 
 import ast
 import hashlib
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Mapping
 
 from simple_ar.code_task.analysis.interfaces import public_api
+from simple_ar.code_task.generation.common import safe_relative_path
 
 
 def looks_like_diff_fragment(text: str) -> bool:
@@ -109,11 +110,7 @@ def apply_repair_actions(
 
 
 def normalize_action_path(value: str) -> str:
-    text = value.replace("\\", "/").strip().lstrip("/")
-    path = PurePosixPath(text)
-    if not text or path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
-        return ""
-    return path.as_posix()
+    return safe_relative_path(value)
 
 
 def _allowed_path_set(workspace_dir: Path, paths: set[str]) -> set[str]:

@@ -3,9 +3,10 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from simple_ar.literature.arxiv_client import _TimeoutSession, is_rate_limit_message
+from simple_ar.literature.arxiv_client import _TimeoutSession, _paper_from_result, is_rate_limit_message
 from simple_ar.literature.bibtex import papers_to_bibtex
 from simple_ar.literature.cache import get_cached, put_cache
 from simple_ar.literature.models import Paper, normalize_paper_id
@@ -18,6 +19,19 @@ class LiteratureTests(unittest.TestCase):
     def test_normalize_paper_id_keeps_citation_safe_text(self) -> None:
         self.assertEqual(normalize_paper_id("https://arxiv.org/abs/cs/9901001v1"), "cs_9901001v1")
         self.assertEqual(normalize_paper_id("2401.12345v2"), "2401.12345v2")
+        from simple_ar.research.preparation_assets import validate_public_url
+        for source_id in ("2401.12345v2", "cs/9901001v1"):
+            with self.subTest(source_id=source_id):
+                result = SimpleNamespace(get_short_id=lambda: source_id,
+                    entry_id=f"http://arxiv.org/abs/{source_id}", title="A  Paper",
+                    authors=["Ada Lovelace"], summary="Exact source abstract",
+                    published=None, categories=["cs.LG"], doi=None)
+                paper = _paper_from_result(result)
+                self.assertEqual(paper.url, f"https://arxiv.org/abs/{source_id}")
+                self.assertEqual(validate_public_url(paper.url), paper.url)
+                self.assertEqual(paper.id, normalize_paper_id(source_id))
+                self.assertEqual(paper.source_id, source_id)
+                self.assertEqual(paper.abstract, result.summary)
 
     def test_bibtex_uses_paper_id_as_key(self) -> None:
         paper = Paper(

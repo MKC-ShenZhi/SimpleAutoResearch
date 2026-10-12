@@ -97,7 +97,7 @@ SimpleAutoResearch 同时要避免两种失控：不断增加暂时没有消费�
 
 ### 当前 research-session 扩展边界
 
-以下是当前开发契约，不是所有 provider、项目或科研循环都已经通过 live acceptance 的声明。
+以下是结构化研究的开发契约，不是所有 provider、项目或科研循环都已经通过 live acceptance 的声明。
 
 `research-session` 把任务/资产/约束解释成有界 accepted plan，再接到 typed capability。Design 和 execution
 复用 supplied entrypoint、protocol、CodeTask 修改范围和 process budget。模型只能在检查过且已授权的边界内
@@ -122,10 +122,16 @@ Analysis、实现、实验、报告写作和审计各自拥有不同事实。pla
 
 ### 兼容性审计
 
-仓库保留一条正式研究入口、分段命令和历史读取；旧八阶段执行器已经删除：
+普通新任务使用目标驱动的原生入口；精确结构化协议、分段命令和历史恢复仍有实际消费者。
+旧八阶段执行器已经删除：
 
 ```text
-research-session（正式用户主线）
+start（普通原生目标与可迁新建偏好）
+  -> ToolApplication -> CommonToolGateway -> 共享专业模块
+  -> SessionController -> ArtifactStore
+
+research-session（精确结构化协议与已保存会话恢复）
+  -> ResearchApplication
   -> typed research capabilities -> SessionController -> ArtifactStore
 
 research-brief（分段/开发接口）
@@ -135,9 +141,12 @@ simple-ar status / inspect / search-artifacts
   -> 历史产物读取（不启动旧流程）
 ```
 
-`research-session` 是共享执行入口，`start` 为它准备普通任务配置。按实际输入选择文献、代码修复、
-描述分析、材料写作或准备好的复现路径。有命令不代表必须走全套科研动作，无命令也不代表
-必须做文献综述；应用层校验实际需要的输入与权限。
+`start` 将普通目标和可迁新建偏好交给 `ToolApplication`，经现有专业工具组合调查、实现、
+分析、写作、视觉/图像及出版。`cli/start.py` 只适配输入，不拥有执行。精确表格列、固定
+编辑/验证范围及复现协议仍沿 TOML/`research-session` 和 `ResearchApplication` 执行。
+已保存任务按原所有者和协议恢复，结构化执行不是原生失败后的隐式 fallback。目标和偏好
+不授予权限：挂载输入只读，访问与资源须明确授权，进程命令仍需精确批准；这不是操作系统
+沙箱，也不证明可靠交付或科学质量。
 `research-brief`
 仍保留，但只用于分段调试、已有 handoff 接续和库级组合，不与完整主线
 并列作为产品入口。`simple-ar run/resume` 已退出，不静默转换旧参数。新的 capability 应
@@ -164,8 +173,8 @@ facade、registry 分支和 projection 应直接删除，不继续保留“以�
 4. 直接列出 provider、环境、数据和 live 项目限制，不削弱 gate；
 5. 删除被替代分支和重复职责，不为保留旧路径再造一套 lifecycle。
 
-这里的“一个入口”指用户正式入口只有 `research-session`；内部 capability 仍然保持模块化，
-供测试、恢复、开发者和未来其他 workflow 组合使用。
+普通任务由同一原生行动主干组合专业能力；精确结构化新任务和历史续接保留原语义。
+内部 capability 仍然保持模块化，复用既有 session、产物与账本，不另建竞争状态或记忆。
 
 ### 清理规则
 
@@ -277,7 +286,7 @@ capability result。两者都不会自动重试、覆盖已有的 result envelop
 工作；父节点缺失或链路成环时会显式报错。
 
 application 层负责给出有序 capability 序列，并显式调用
-`SessionController.execute_attempt()`。当前的正式 P04 入口是
+`SessionController.execute_attempt()`。精确结构化入口为
 `simple_ar.app.research_application.ResearchApplication`：它保存 `ResearchBrief` 和归一化
 资产，再按 `plan -> search -> document_ingest -> read -> synthesize -> summarize` 每次推进
 一个有界动作，并将已接受产物写入 `SessionManifest.state_refs`。重新加载后不需要重建前面
@@ -1008,6 +1017,20 @@ uv run --extra examples python -m unittest tests.test_experiment_runner
 ```bash
 uv run python -m unittest tests.test_run_config
 ```
+
+## 预览收尾重点
+
+当前预览不是已完成的V2.9发布。下一阶段的验收应集中于：
+
+- 完成从论文到有限复现的完整任务，包括准备、实测、一次实质反馈修改和便携交付。
+  已准备命令或初稿PDF不能单独关闭该要求。
+- 按用户要求核对概念图反馈后的含义和布局，并在同一安装候选验证跨模块使用。
+  其他候选已完成的报告或图形保留原有证据范围，不拼接成新版通过。
+- 查清公开与历史消费者后，同批退出被替代实现、模板和重复测试。
+  权限、实际执行、未知用量及恢复行为保留；移动文件不等于降低复杂度。
+
+命名连接认证只是部署检查，不证明长流稳定或任务质量。冻结依据完整用户成果，
+不是测试数量、编译成功或多个演示的集合。
 
 ## Git 卫生
 
