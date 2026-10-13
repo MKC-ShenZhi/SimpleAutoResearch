@@ -6,16 +6,25 @@ This is the field reference for task configuration. Start with [Usage](USAGE.md)
 
 ## Guided setup
 
-`start` saves ordinary research TOML and, for repair, a referenced CodeTask TOML. Chat and structured setup share this serializer; a setup draft is not an execution session.
+Ordinary natural-language `start`, `--guided`, and outcome preferences without exact protocol controls
+create a saved native session, rather than an editable research TOML. The model catalog TOML below
+still owns named connections. Startup arguments provide the goal, mounts, authorization and allowances;
+resume retains saved values. Only explicit structured protocols save research TOML and, when needed,
+a referenced CodeTask TOML. `--chat` uses this structured setup serializer; a setup draft is not an execution session.
+Follow the [complete ordinary workflow](USAGE.md#a-copyable-ordinary-user-workflow).
 
 | Setting | Location |
 | --- | --- |
 | Named provider connections and routing | Model catalog TOML (optional) |
 | Provider secrets / legacy single connection | Environment or private `.env` |
-| Goal, inputs, delivery and resource limits | Research TOML |
-| Editable project, protection and project interpreter | Referenced CodeTask TOML |
+| Native goal, read-only materials, access and resource limits | `start` arguments; resume retains the saved session |
+| Exact protocol goal, inputs, delivery and resource limits | Structured research TOML |
+| Structured editable project, protection and project interpreter | Referenced CodeTask TOML |
 
-Precedence is built-in defaults → TOML → explicit CLI options. CLI lists replace file lists. Paths resolve from the configuration location where documented; command argv remains literal. Confirmed chat settings cannot silently replace explicit user choices.
+Structured research precedence is built-in defaults → TOML → explicit CLI options. CLI lists replace file lists.
+Paths resolve from the configuration location where documented; command argv remains literal.
+Confirmed chat settings cannot silently replace explicit user choices. This is not the native resume override rule:
+resume retains the model, interpreter and allowances; adding materials/access or resources uses explicit continuation options.
 
 ### Named model connections
 
@@ -29,12 +38,15 @@ It shows the model, endpoint, streaming, timeout and credential availability, th
 in the task configuration. An explicit `--model` is retained; descriptive analysis does not require a model.
 With a catalog, do not duplicate model or endpoint settings in `.env`: keep only the referenced secrets
 and, when not using the global path, `SIMPLE_AR_MODELS_CONFIG`. Without a catalog, legacy fallback is
-explicitly labelled. `--prepare-only` can save a configuration even if its credential is not yet set.
+explicitly labelled. Structured `--prepare-only` can save TOML before credentials are set.
+Native `--prepare-only` preflights the connection and credentials before saving a session, without model requests or process execution.
+`start`, `models` and the model client read only the command's current-directory `.env`, preserving existing environment variables.
+After changing directories, ensure the catalog and credentials remain discoverable.
 
 ```bash
 simple-ar models                       # local inspection, no API calls
 simple-ar models --config /path/models.toml
-simple-ar start --chat --model profile:daily
+simple-ar start "Explain these materials" --source materials/ --model profile:daily
 ```
 
 `--config` on `models` inspects a file; it does not activate it for later commands.
@@ -334,7 +346,18 @@ This verifies the calculation, not data collection or scientific claims.
 Raw tables are not automatically treated as verified experiment results. Execution configuration
 is rejected. Extracted text is persisted and reused on resume; search, synthesis and experiments
 are not prerequisites. Supplied results remain unverified external assertions.
-Guided writing defaults to `report.template = "material_report"` and `report.document_review = true`.
+New `research-session` reports select `[report].writing_method = "article"`
+unless explicit section/planning/review controls require `"sections"`. Article
+writing uses the shared complete-article Writer, then the existing deterministic
+assembly and audit; it does not claim independent model review or backtracking.
+`max_section_tokens` bounds that complete response when positive. A saved report
+retains its method and checkpoint owner; resume cannot silently change methods.
+Explicit incompatible controls with `writing_method = "article"` are rejected.
+Explicit refresh or goal revision supplies the last accepted article as editable
+prose, separately from evidence; earlier drafts, responses and charges remain.
+
+The structured guided compatibility path selects `report.template = "material_report"`
+and `report.document_review = true`, retaining the controlled section Writer.
 Experts can add `review_scope = "document"` to draft the multi-section body before
 the existing whole-document inspection/revision, avoiding mandatory preliminary
 section reviews. It requires `document_review = true`; default `section` retains
@@ -589,7 +612,8 @@ external parsers must declare their own observed coverage.
 | `[execution]` | `output_files` | Optional mapping of attachment names to relative POSIX files under the process-owned `SIMPLE_AR_OUTPUT_DIR`. Only declared UTF-8 regular files up to 2 MiB each receive bounded previews and registered read handles; missing/unreadable attachments are recorded separately from execution success. |
 | `[execution]` | `pairs`, `seeds`, `seed_flag`, `seed_count` | Optional explicit comparison inputs. `pairs` contains unique integer `seed` plus literal `baseline_command` and `candidate_command`; compact seed expansion requires a literal command and explicit seed flag/count. Natural-language seed requests are not parsed. |
 | `[execution]` | `baseline_policy`, `baseline_ref`, `protocol` | Policy is `run`, `skip`, or `reuse`; `reuse` requires a passed current-session artifact whose command, schema, protocol conditions, protected assets and preparation lineage match. `protocol` uses the existing experiment contract and does not certify data contents. |
-| `[report]` | `template`, `reviewer`, `max_review_iterations`, `document_review`, `max_section_tokens`, `max_cited_sources`, `figures` | `template` defaults to `auto`; `reviewer` defaults to `llm`; CLI review iterations default to `1`. Optional `document_review = true` adds cross-section review: argument-led plans can correct their frozen sections; legacy plans retain two targets. Each target has at most `max_review_iterations` corrections; rejected candidates consume the allowance and recovery does not reset it. Document review is off by default. `max_section_tokens = 0` omits a per-call output cap. Positive `max_cited_sources` bounds distinct final citations without truncating the reading pool; final audit records excess. Omit it for no source-count cap. Figures are deterministic by default; set `[report.figures].enabled = false` or `mode = "off"` for text-only output. |
+| `[report]` | `writing_method` | New structured reports use `article` unless explicit section/review controls select `sections`. Article drafting shares the complete-body Writer; assembly and deterministic audit remain separate. Explicit `sections` retains planning, inspection and partial checkpoints. Historical sessions without this field remain sectional; saved owners do not switch on resume. |
+| `[report]` | `template`, `reviewer`, `max_review_iterations`, `document_review`, `max_section_tokens`, `max_cited_sources`, `figures` | `template` defaults to `auto`. The controlled `sections` method defaults to `reviewer = "llm"`, with CLI review iterations `1`; `article` disables model inspection. Optional `document_review = true` selects the controlled method and adds cross-section review: argument-led plans can correct their frozen sections; legacy plans retain two targets. Each target has at most `max_review_iterations` corrections; rejected candidates consume the allowance and recovery does not reset it. `max_section_tokens = 0` omits a per-call output cap. Positive `max_cited_sources` selects controlled writing and bounds distinct final citations without truncating the reading pool; final audit records excess. Omit it for no source-count cap. Figures are deterministic by default; set `[report.figures].enabled = false` or `mode = "off"` for text-only output. |
 | `[report]` | `max_document_review_prompt_chars` | Optional expert complete-request character cap; default `0` adds no hidden assembled-prompt cap. Existing retrieval windows, 60,000-character manuscript window, model capacity and cumulative session budget still apply. A positive cap refuses an oversized review rather than truncating evidence or claiming it was performed. |
 
 Explicit `outputs` cannot be combined with `--with-report`/`--no-report`. Report structure
@@ -888,9 +912,9 @@ baselines remain errors; this is not a test-folder exemption or runtime success.
 | `[execute].baseline_metrics_file` | JSON or metric-line file used with `baseline_policy = "provided"`. Accepted JSON shapes include `{"accuracy": 0.8}`, `{"metrics": {...}}`, and `{"metric_values": {...}}`. |
 | `[execute].apply_proposed_edits` | Lets execute apply an already reviewed proposal. Keep false for review-first workflows. |
 | `[execute].allow_large_edits` | Allows application of reviewed proposals that exceed the normal budget but fit the large budget. |
-| `[execute].allow_planning_fallback` | Permits explicit offline plans and greenfield fallbacks after known, complete response-format failures. It does not replace provider, budget, deadline or incomplete-stream failures with an offline success. Keep false when the task requires model-generated implementation. |
-| `[execute].planning_mode` | Greenfield planning: `tool_agent` uses requirements, architecture, interfaces, file plan, and bounded review (at least five calls); `compact` uses one architecture call before retries. Both share file generation and execution; call counts do not establish research quality. |
-| `[execute].planning_review_rounds` | Maximum reviewer-directed greenfield planning revision rounds for standalone code-task runs. Default `2`; lower to `1` for lightweight smoke examples, raise only when plan convergence matters more than token/time cost. |
+| `[execute].allow_planning_fallback` | Permits explicit offline plans and greenfield scaffolds after known, complete response-format failures. Scaffolds emit no invented measurements; the unimplemented runner fails until replaced by an actual experiment. It does not replace provider, budget, deadline or incomplete-stream failures with an offline success. Keep false when the task requires model-generated implementation. |
+| `[execute].planning_mode` | Complete greenfield architecture work unit; default `compact`. `tool_agent` is a deprecated alias. Historical unfinished planning receives a method migration receipt; original stages and failures are retained without resetting the ledger. |
+| `[execute].planning_review_rounds` | Deprecated; default `0`. Nonzero saved values emit a migration notice and grant no review calls. Remove stage selectors and choose one existing `[models.code_task].planner` connection; named profiles are not silently replaced. |
 | `[execute].llm_retry_attempts` | Bounds completed-response corrections for work/patch planning and greenfield architecture/file generation, including the first attempt. Transport retry/backoff belongs only to the shared model connection's `retry_attempts` setting (legacy: `SIMPLE_AR_LLM_RETRY_ATTEMPTS`); stages do not multiply it. Unreconciled ledger operations prevent correction and fallback, even when their numeric dimensions are accounted. |
 | `[execute].repair_rounds` | Non-negative bound (default `0`) for technical repair after failed validation/benchmark execution. In `research-session` with a CodeTask project, this also bounds repair/retest after a failed single-condition research revision; each retest uses the accepted protocol and process budget. It does not authorize a scientific method change, seed extension, or paired-revision repair. Repairs still require review. |
 | `[execute].max_files` | Max files included in LLM context for plan/proposal/repair steps; also limits files in a new greenfield plan, including any inserted `main.py`. If a complete plan exceeds the limit, planning rejects it rather than silently discarding modules or dependencies. Saved plans are not rebuilt under a new limit. |
@@ -1020,8 +1044,8 @@ baseline_policy = "auto"
 apply_proposed_edits = false
 allow_large_edits = false
 allow_planning_fallback = false
-planning_mode = "tool_agent"
-planning_review_rounds = 2
+planning_mode = "compact"
+planning_review_rounds = 0
 llm_retry_attempts = 3
 max_files = 8
 max_source_chars_per_file = 4000
@@ -1133,7 +1157,7 @@ baseline_policy = "auto"
 apply_proposed_edits = false
 allow_large_edits = false
 allow_planning_fallback = false
-planning_review_rounds = 2
+planning_review_rounds = 0
 llm_retry_attempts = 3
 
 [models.code_task]

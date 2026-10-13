@@ -601,11 +601,13 @@ class ResearchApplication:
         report_config_changed = False
         if revised_report_config is not None:
             from simple_ar.report.schema import ReportRuntimeConfig
+            from simple_ar.report.writing import validate_report_writing_config
             old_report = updated_config.get("report", {})
             old_report = dict(old_report) if isinstance(old_report, Mapping) else {}
             merged_report = {**old_report, **dict(revised_report_config)}
             try:
-                ReportRuntimeConfig.model_validate(merged_report)
+                validate_report_writing_config(ReportRuntimeConfig.model_validate(merged_report),
+                    method=str(self.services.config.get("report_writing_method", "sections")))
             except (TypeError, ValueError) as exc:
                 raise ResearchApplicationError(f"Invalid revised report configuration: {exc}") from exc
             report_config_changed = merged_report != old_report
@@ -925,9 +927,11 @@ class ResearchApplication:
         report_config_changed = updated_report_config != dict(previous_report_config)
         if report_config is not None:
             from simple_ar.report.schema import ReportRuntimeConfig
+            from simple_ar.report.writing import validate_report_writing_config
 
             try:
-                ReportRuntimeConfig.model_validate(updated_report_config)
+                validate_report_writing_config(ReportRuntimeConfig.model_validate(updated_report_config),
+                    method=str(self.services.config.get("report_writing_method", "sections")))
             except (TypeError, ValueError) as exc:
                 raise ResearchApplicationError(f"Invalid report configuration: {exc}") from exc
         if requested & {"report", "paper", "full_paper"} and not refresh and not report_config_changed:
@@ -1775,7 +1779,7 @@ class ResearchApplication:
         )
 
     def _run_report_write_action(self) -> bool:
-        from simple_ar.report.writing import ReportWritingRequest
+        from simple_ar.report.writing import ReportWritingRequest, resolve_report_writing_resume
         try:
             report_context, memory, config, template, _ = self._report_writing_parts()
         except ResearchApplicationError as exc:
@@ -1797,17 +1801,17 @@ class ResearchApplication:
             and str(Path("attempts") / attempt.attempt_id / ref.path).replace("\\", "/") in output_paths
         )
         sources += attachments
-        resume_ref = None
-        for attempt in reversed(self.controller.list_attempts()):
-            if attempt.capability == "report_write":
-                checkpoint_path = Path("attempts") / attempt.attempt_id / "sections.json"
-                if self.controller.store.resolve(checkpoint_path).is_file():
-                    resume_ref = self.controller.store.ref(checkpoint_path, kind="report_checkpoint", schema="report_checkpoint.v1")
-                    break
+        resume_ref, prior_draft = resolve_report_writing_resume(
+            report_context=report_context, memory=memory, config=config, template=template,
+            sources=sources, store=self.controller.store, attempts=self.controller.list_attempts(),
+            method=str(self.services.config.get("report_writing_method", "sections")),
+        )
         return self._execute(
             "report_write", "writer",
             ReportWritingRequest(report_context, memory, config, template, self.services.llm_client, resume_ref,
-                                 self.services.message_callback),
+                                 self.services.message_callback,
+                                 method=str(self.services.config.get("report_writing_method", "sections")),
+                                 prior_draft=prior_draft),
             sources + ((resume_ref,) if resume_ref else ()),
         )
 
@@ -2287,6 +2291,7 @@ class ResearchApplication:
             return self._execute("report", "report",
                 ReportAssemblyRequest(title=report_context.topic,
                     sections=tuple(writer["sections"]),
+                    assembly_mode="whole_article" if writer.get("schema_version") == "direct_article.v1" else "section_drafts",
                     config=snapshot["config"], document_plan=memory.document_plan,
                     template_name=snapshot["template"]["name"], papers=tuple(report_context.papers),
                     citation_key_map=report_context.citation_key_map,
@@ -2870,6 +2875,12 @@ class ResearchApplication:
                 ("summary", "research_summary", "research_summary.v1"),
                 ("summary_snapshot", "research_summary_snapshot", "research_summary.v1"),
             ]
+        elif capability == "report_write":
+            declared = [ref for ref in result.artifacts if ref.kind == "report_writer_result"
+                        and ref.schema in {"report_agent_result.v1", "direct_article.v1"}]
+            if len(declared) != 1:
+                raise ResearchApplicationError("Writer must declare exactly one bound result owner.")
+            outputs = [(state_name, declared[0].kind, declared[0].schema)]
         else:
             outputs = [(state_name, kind, schema)]
         if capability == "assess_ideas":

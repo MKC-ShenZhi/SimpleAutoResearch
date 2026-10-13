@@ -31,6 +31,29 @@ from simple_ar.code_task.execution.environment import resolve_code_task_command
 from simple_ar.core.artifacts import read_json, read_jsonl, write_json, write_text
 
 
+def project_bytes(project: Path) -> dict:
+    return {p.relative_to(project): p.read_bytes() for p in project.rglob("*") if p.is_file()}
+
+
+def generation_client(response: dict) -> Mock:
+    return Mock(ask_json=Mock(return_value=response), _budget_ledger=None)
+
+
+def generated_review(project: Path, rows: list[dict], **overrides) -> dict:
+    inputs = dict(project_dir=project, code_artifacts={"generated_files": rows},
+        result_schema={"primary_metric": "score", "required_metrics": ["score"]},
+        resource_plan={"max_files": 4, "max_generated_lines": 200}, use_llm=False)
+    return review_generated_project(**(inputs | overrides))
+
+
+def generate_project(project_dir: Path, **overrides) -> dict:
+    """Use a fresh one-entrypoint request; scenarios state only their differences."""
+    inputs = dict(project_dir=project_dir,
+        architecture_plan={"files": [{"path": "main.py", "kind": "source", "entrypoint": True}]},
+        result_schema={}, contract={}, memory={})
+    return write_generated_project(**(inputs | overrides))
+
+
 class CodeTaskInterfaceTests(unittest.TestCase):
     def test_source_loader_attributes_are_not_missing_local_apis_but_typos_still_are(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -163,8 +186,7 @@ class CodeTaskInterfaceTests(unittest.TestCase):
     def test_writer_treats_runtime_output_paths_as_placeholders(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp) / "generated_project"
-            artifacts = write_generated_project(
-                project_dir=project,
+            artifacts = generate_project(project,
                 architecture_plan={
                     "files": [
                         {"path": "main.py", "kind": "source", "entrypoint": True},
@@ -174,11 +196,7 @@ class CodeTaskInterfaceTests(unittest.TestCase):
                         {"path": "submission/results/metrics.json", "purpose": "Runtime metric mirror."},
                     ]
                 },
-                result_schema={"required_metrics": []},
-                contract={},
-                memory={},
-                client=None,
-                allow_fallback=True,
+                result_schema={"required_metrics": []}, client=None, allow_fallback=True,
             )
 
             by_path = {row["path"]: row for row in artifacts["generated_files"]}
@@ -189,36 +207,22 @@ class CodeTaskInterfaceTests(unittest.TestCase):
             self.assertEqual(by_path["artifacts/results.json"]["line_count"], 0)
 
     def test_writer_strips_single_markdown_fence_from_file_content(self) -> None:
-        class FakeClient:
-            def ask_json(self, _system: str, _prompt: str, **_kwargs: object) -> dict[str, str]:
-                return {"files": [{"path": "main.py", "content": "```python\nprint('score: 1.0')\n```"}], "summary": "Fenced but valid Python."}
-
+        client = generation_client({"files": [{"path": "main.py",
+            "content": "```python\nprint('score: 1.0')\n```"}], "summary": "Fenced but valid Python."})
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp) / "generated_project"
-            artifacts = write_generated_project(
-                project_dir=project,
-                architecture_plan={"files": [{"path": "main.py", "kind": "source", "entrypoint": True}]},
-                result_schema={"required_metrics": ["score"]},
-                contract={},
-                memory={},
-                client=FakeClient(),  # type: ignore[arg-type]
-                allow_fallback=False,
+            artifacts = generate_project(project, result_schema={"required_metrics": ["score"]}, client=client, allow_fallback=False,
                 agent_step_dir=Path(tmp) / "steps",
             )
 
             self.assertEqual(artifacts["generated_files"][0]["mode"], "llm_repaired")
             self.assertEqual((project / "main.py").read_text(encoding="utf-8"), "print('score: 1.0')\n")
             write_text(project / "user-notes.md", "Keep the previous delivered project.\n")
-            before = {p.relative_to(project): p.read_bytes() for p in project.rglob("*") if p.is_file()}
-            write_generated_project(
-                project_dir=project,
-                architecture_plan={"files": [{"path": "main.py", "kind": "source", "entrypoint": True}]},
-                result_schema={"required_metrics": ["score"]}, contract={}, memory={},
-                client=FakeClient(), allow_fallback=False,
-            )
+            before = project_bytes(project)
+            generate_project(project, result_schema={"required_metrics": ["score"]}, client=client, allow_fallback=False)
             previous = list(Path(tmp).glob(".generated_project.previous-*"))
             self.assertEqual(len(previous), 1)
-            self.assertEqual({p.relative_to(previous[0]): p.read_bytes() for p in previous[0].rglob("*") if p.is_file()}, before)
+            self.assertEqual(project_bytes(previous[0]), before)
             self.assertFalse((project / "user-notes.md").exists())
             self.assertFalse(list(Path(tmp).glob(".generated_project.candidate-*")))
             current = (project / "main.py").read_bytes()
@@ -230,11 +234,7 @@ class CodeTaskInterfaceTests(unittest.TestCase):
                 return rename(source, target)
 
             with patch.object(Path, "rename", reject_candidate), self.assertRaisesRegex(OSError, "publication failure"):
-                write_generated_project(
-                    project_dir=project,
-                    architecture_plan={"files": [{"path": "main.py", "kind": "source", "entrypoint": True}]},
-                    result_schema={}, contract={}, memory={}, client=FakeClient(),
-                )
+                generate_project(project, client=client)
             self.assertEqual((project / "main.py").read_bytes(), current)
             self.assertEqual(len(list(Path(tmp).glob(".generated_project.previous-*"))), 1)
             self.assertEqual(len(list(Path(tmp).glob(".generated_project.candidate-*"))), 1)
@@ -242,42 +242,43 @@ class CodeTaskInterfaceTests(unittest.TestCase):
                 alias = Path(tmp) / "alias"
                 alias.symlink_to(project, target_is_directory=True)
                 with self.assertRaisesRegex(ValueError, "non-symlink"):
-                    write_generated_project(
-                        project_dir=alias,
-                        architecture_plan={}, result_schema={}, contract={}, memory={},
-                    )
+                    generate_project(alias, architecture_plan={})
                 self.assertEqual((project / "main.py").read_bytes(), current)
 
-    def test_writer_records_invalid_file_generation_diagnostics(self) -> None:
-        class FakeClient:
-            def ask_json(self, _system: str, _prompt: str, **_kwargs: object) -> dict[str, str]:
-                return {"files": [{"path": "main.py", "content": "def broken(:\n    pass\n"}], "summary": "Invalid Python."}
+    def test_writer_rejections_preserve_project_memory_and_diagnostics(self) -> None:
+        from simple_ar.integrations.llm import LLMError
 
-        with tempfile.TemporaryDirectory() as tmp:
-            project = Path(tmp) / "generated_project"
-            steps = Path(tmp) / "steps"
-            write_text(project / "main.py", "print('original result')\n")
-            write_text(project / "outputs" / "measurement.json", '{"actual": 7}\n')
-            before = {p.relative_to(project): p.read_bytes() for p in project.rglob("*") if p.is_file()}
-            with self.assertRaises(Exception):
-                write_generated_project(
-                    project_dir=project,
-                    architecture_plan={"files": [{"path": "main.py", "kind": "source", "entrypoint": True}]},
-                    result_schema={"required_metrics": ["score"]},
-                    contract={},
-                    memory={},
-                    client=FakeClient(),  # type: ignore[arg-type]
-                    retry_attempts=2,
-                    allow_fallback=False,
-                    agent_step_dir=steps,
-                )
-
-            failure = read_json(steps / "invalid_files" / "main.py" / "attempt-001.json")
-            self.assertEqual(failure["validation"]["reason"], "syntax_error")
-            self.assertTrue((steps / "invalid_files" / "main.py" / "attempt-001.py").is_file())
-            self.assertEqual({p.relative_to(project): p.read_bytes() for p in project.rglob("*") if p.is_file()}, before)
-            self.assertEqual(len(list(Path(tmp).glob(".generated_project.candidate-*"))), 1)
-            self.assertFalse(list(Path(tmp).glob(".generated_project.previous-*")))
+        cases = (
+            ("syntax", [{"path": "main.py", "content": "def broken(:\n    pass\n"}], 100),
+            ("line_limit", [{"path": "main.py", "content": "a = 1\n"},
+                            {"path": "helper.py", "content": "a = 1\nb = 2\n"}], 2),
+            ("traversal", [{"path": "../escape.py", "content": "a = 1\n"}], 100),
+            ("empty", [], 100),
+        )
+        for name, rows, limit in cases:
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project, steps = root / "project", root / "steps"
+                write_text(project / "main.py", "print('original result')\n")
+                write_text(project / "outputs/measurement.json", '{"actual": 7}\n')
+                before = project_bytes(project)
+                memory = {"prior": True}
+                client = generation_client({"files": rows})
+                plan = {"files": [{"path": row["path"], "kind": "source"} for row in rows]} if limit == 2 else {
+                    "files": [{"path": "main.py", "kind": "source", "entrypoint": True}]}
+                with self.assertRaises(LLMError):
+                    generate_project(project, architecture_plan=plan, memory=memory, client=client, max_generated_lines=limit,
+                        retry_attempts=2, allow_fallback=False, agent_step_dir=steps,
+                    )
+                self.assertEqual(memory, {"prior": True})
+                self.assertEqual(project_bytes(project), before)
+                self.assertFalse((root / "escape.py").exists())
+                self.assertEqual(len(list(root.glob(".project.candidate-*"))), 1)
+                self.assertFalse(list(root.glob(".project.previous-*")))
+                if name == "syntax":
+                    failure = read_json(steps / "invalid_files/main.py/attempt-001.json")
+                    self.assertEqual(failure["validation"]["reason"], "syntax_error")
+                    self.assertTrue((steps / "invalid_files/main.py/attempt-001.py").is_file())
 
     def test_writer_generates_related_batches_without_a_twelve_file_project_limit(self) -> None:
         class Client:
@@ -296,9 +297,9 @@ class CodeTaskInterfaceTests(unittest.TestCase):
             memory = {"retained": "prior decisions"}
             files = [{"path": "main.py", "kind": "source"}] + [
                 {"path": f"module_{index}.py", "kind": "source"} for index in range(12)]
-            artifacts = write_generated_project(project_dir=Path(tmp) / "project",
-                architecture_plan={"files": files}, result_schema={}, contract={},
-                memory=memory, client=client, files_per_batch=4)
+            artifacts = generate_project(Path(tmp) / "project", architecture_plan={"files": files}, memory=memory, client=client,
+                files_per_batch=4,
+            )
             self.assertEqual([len(request["planned_files"]) for request, _ in client.requests], [4, 4, 4, 1])
             self.assertEqual(len(artifacts["generated_files"]), 13)
             self.assertEqual(artifacts["schema_version"], "greenfield_code_artifacts.v1")
@@ -309,9 +310,9 @@ class CodeTaskInterfaceTests(unittest.TestCase):
             self.assertEqual(len(client.requests[1][0]["implementation_memory"]["file_summaries"]), 4)
             self.assertTrue(all(kwargs["max_output_tokens"] is None for _, kwargs in client.requests))
             single_unit = Client()
-            large = write_generated_project(project_dir=Path(tmp) / "large_unit",
-                architecture_plan={"files": files}, result_schema={}, contract={},
-                memory={}, client=single_unit, files_per_batch=13)
+            large = generate_project(Path(tmp) / "large_unit", architecture_plan={"files": files}, client=single_unit,
+                files_per_batch=13,
+            )
             self.assertEqual(len(single_unit.requests), 1)
             self.assertEqual(len(large["generated_files"]), 13)
 
@@ -342,26 +343,26 @@ class CodeTaskInterfaceTests(unittest.TestCase):
             options = dict(project_dir=project, architecture_plan=plan,
                 result_schema={}, contract={}, retry_attempts=3)
             client = Client(True)
-            artifacts = write_generated_project(**options, memory={}, client=client)
+            artifacts = generate_project(**options, client=client)
             self.assertEqual(client.calls, 2)
             self.assertEqual(client._budget_ledger.remaining('llm_requests'), 1)
             self.assertEqual(client._budget_ledger.remaining('total_tokens'), 250)
             self.assertEqual(json.loads((project / "config.json").read_text()), {})
             self.assertTrue(all(row["mode"] == "llm" for row in artifacts["generated_files"]))
-            before = {p.relative_to(project): p.read_bytes() for p in project.rglob("*") if p.is_file()}
+            before = project_bytes(project)
             memory = {"retained": ["original"]}
             failed = Client(False)
             from simple_ar.integrations.llm import LLMError
             with self.assertRaises(LLMError):
-                write_generated_project(**options, memory=memory, client=failed)
+                generate_project(**options, memory=memory, client=failed)
             self.assertEqual(failed.calls, 3)
             self.assertEqual(memory, {"retained": ["original"]})
-            self.assertEqual({p.relative_to(project): p.read_bytes() for p in project.rglob("*") if p.is_file()}, before)
+            self.assertEqual(project_bytes(project), before)
             fallback = Client(False)
-            artifacts = write_generated_project(**options, memory={}, client=fallback, allow_fallback=True)
+            artifacts = generate_project(**options, client=fallback, allow_fallback=True)
             self.assertEqual(fallback.calls, 3)
             self.assertTrue(all(row["mode"] == "fallback" for row in artifacts["generated_files"]))
-            before = {p.relative_to(project): p.read_bytes() for p in project.rglob("*") if p.is_file()}
+            before = project_bytes(project)
             for status in ('unknown', 'unknown_accounted', 'reserved'):
                 with self.subTest(status=status):
                     uncertain = Mock()
@@ -377,11 +378,11 @@ class CodeTaskInterfaceTests(unittest.TestCase):
                         self.assertEqual(ledger.unknown_dimensions(), ())
                     ledger_before = ledger.to_dict()
                     with self.assertRaises(ValueError):
-                        write_generated_project(**options, memory=memory, client=uncertain, allow_fallback=True)
+                        generate_project(**options, memory=memory, client=uncertain, allow_fallback=True)
                     self.assertEqual(uncertain.ask_json.call_count, 1)
                     self.assertEqual(ledger.to_dict(), ledger_before)
                     self.assertEqual(memory, {"retained": ["original"]})
-                    self.assertEqual({p.relative_to(project): p.read_bytes() for p in project.rglob("*") if p.is_file()}, before)
+                    self.assertEqual(project_bytes(project), before)
 
     def test_generation_failure_ownership_and_completed_json_correction(self) -> None:
         from simple_ar.code_task.generation.agent_step import run_json_agent_step
@@ -436,10 +437,10 @@ class CodeTaskInterfaceTests(unittest.TestCase):
                                     domain_profile={}, client=client, planning_mode=owner,
                                     retry_attempts=3, allow_fallback=True, planning_dir=root / owner)
                             elif owner == 'legacy_writer':
-                                write_generated_project(project_dir=project,
-                                    architecture_plan={'files': [{'path': 'main.py', 'kind': 'source'}]},
-                                    result_schema={}, contract={}, memory=memory, client=client,
-                                    retry_attempts=3, allow_fallback=True, agent_step_dir=root / owner)
+                                generate_project(project, architecture_plan={'files': [{'path': 'main.py', 'kind': 'source'}]},
+                                    memory=memory, client=client, retry_attempts=3, allow_fallback=True,
+                                    agent_step_dir=root / owner,
+                                )
                             else:
                                 write_implementation_unit(project_dir=project, goal='goal',
                                     files=[{'path': 'main.py'}], source_windows=[], client=client,
@@ -474,57 +475,37 @@ class CodeTaskInterfaceTests(unittest.TestCase):
             self.assertEqual([row['status'] for row in rows], ['failed', 'passed'])
             self.assertNotEqual(rows[0]['prompt_sha256'], rows[1]['prompt_sha256'])
 
-    def test_writer_line_limit_and_bad_file_set_never_publish_or_register_memory(self) -> None:
-        class Client:
-            def __init__(self, rows):
-                self.rows = rows
-                self.calls = 0
-
-            def ask_json(self, *_args, **_kwargs):
-                self.calls += 1
-                return {"files": self.rows}
-
+    def test_retired_stage_profiles_require_one_existing_named_planner(self) -> None:
+        from simple_ar.code_task.runtime.config import load_code_task_execute_options, CodeTaskConfigError
+        from simple_ar.code_task.generation.greenfield import _llm_client
         from simple_ar.integrations.llm import LLMError
         with tempfile.TemporaryDirectory() as tmp:
-            project = Path(tmp) / "project"
-            write_text(project / "main.py", "print('original')\n")
-            for rows, limit in (
-                ([{"path": "main.py", "content": "a = 1\n"},
-                  {"path": "helper.py", "content": "a = 1\nb = 2\n"}], 2),
-                ([{"path": "../escape.py", "content": "a = 1\n"}], 100),
-                ([], 100),
-            ):
-                with self.subTest(rows=rows):
-                    client = Client(rows)
-                    memory = {"prior": True}
-                    with self.assertRaises(LLMError):
-                        write_generated_project(project_dir=project,
-                            architecture_plan={"files": [{"path": row["path"], "kind": "source"}
-                                for row in rows] if limit == 2 else [{"path": "main.py", "kind": "source"}]},
-                            result_schema={}, contract={}, memory=memory,
-                            client=client, max_generated_lines=limit, retry_attempts=2)
-                    self.assertEqual(memory, {"prior": True})
-                    self.assertEqual((project / "main.py").read_text(), "print('original')\n")
-                    self.assertFalse((Path(tmp) / "escape.py").exists())
+            root = Path(tmp)
+            config = root / "config.toml"
+            for stage in ("requirements", "architecture", "interfaces", "file_plan", "planning_review"):
+                write_text(config, f'[models.code_task]\n{stage} = "profile:saved"\n')
+                with self.subTest(stage=stage), self.assertRaisesRegex(CodeTaskConfigError, "stage model routes are retired"):
+                    load_code_task_execute_options(config_path=str(config))
+            write_text(config, '[models.code_task]\nplanner = "profile:saved"\n')
+            options = load_code_task_execute_options(config_path=str(config))
+            self.assertEqual(options.planner_model, "profile:saved")
+            self.assertEqual(options.planning_mode, "compact")
+            self.assertEqual(options.planning_review_rounds, 0)
+            with patch("simple_ar.code_task.generation.greenfield.LLMClient.for_task",
+                       side_effect=LLMError("selected connection unavailable")) as select:
+                with self.assertRaises(LLMError):
+                    _llm_client(root, model=options.planner_model, use_llm=True,
+                                allow_fallback=True, message_callback=None)
+                self.assertEqual(select.call_args.kwargs["model"], "profile:saved")
+
 
     def test_shared_unit_retains_exact_replacements_and_single_attempt_policy(self) -> None:
         from simple_ar.code_task.generation.writer import write_implementation_unit
-        class Client:
-            def __init__(self, rows):
-                self.rows = rows
-                self.calls = 0
-                self.requests = []
-
-            def ask_json(self, *_args, **_kwargs):
-                self.calls += 1
-                self.requests.append(json.loads(_args[1]))
-                return {"files": self.rows, "unresolved": []}
-
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             original = "VALUE = 1\n# preserve this note\n"
-            client = Client([{"path": "module.py", "replacements": [
-                {"old_text": "VALUE = 1", "new_text": "VALUE = 2"}]}])
+            client = generation_client({"files": [{"path": "module.py", "replacements": [
+                {"old_text": "VALUE = 1", "new_text": "VALUE = 2"}]}], "unresolved": []})
             observations = [{'record': 'records/failed/native_result.json',
                 'arguments': {'argv': ['python', 'check.py'], 'cwd': '/candidate'},
                 'result': {'status': 'ok', 'data': {'returncode': 1,
@@ -533,15 +514,15 @@ class CodeTaskInterfaceTests(unittest.TestCase):
                 files=[{"path": "module.py"}], source_windows=[], client=client,
                 artifact_dir=root / "steps", original_files={"module.py": {"text": original}},
                 execution_observations=observations)
-            self.assertEqual(client.calls, 1)
-            self.assertEqual(client.requests[0]['execution_observations'], observations)
+            client.ask_json.assert_called_once()
+            self.assertEqual(json.loads(client.ask_json.call_args.args[1])['execution_observations'], observations)
             self.assertEqual((root / "unit/module.py").read_text(), "VALUE = 2\n# preserve this note\n")
             self.assertEqual(result["unresolved"], [])
-            invalid = Client([{"path": "module.py", "content": "def broken(:\n"}])
+            invalid = generation_client({"files": [{"path": "module.py", "content": "def broken(:\n"}], "unresolved": []})
             with self.assertRaises(SyntaxError):
                 write_implementation_unit(project_dir=root / "unit", goal="New module",
                     files=[{"path": "module.py"}], source_windows=[], client=invalid, artifact_dir=root / "failed")
-            self.assertEqual(invalid.calls, 1)
+            invalid.ask_json.assert_called_once()
             self.assertEqual((root / "unit/module.py").read_text(), "VALUE = 2\n# preserve this note\n")
 
     def test_implementation_owner_selects_new_files_and_preserves_input_recovery(self) -> None:
@@ -713,47 +694,17 @@ class CodeTaskInterfaceTests(unittest.TestCase):
             (project / "artifacts").mkdir()
             write_text(project / "artifacts" / "results.json", "{}\n")
 
-            review = review_generated_project(
-                project_dir=project,
-                code_artifacts={
-                    "generated_files": [
-                        {"path": "main.py", "kind": "source", "mode": "llm", "line_count": 2},
-                        {"path": "artifacts", "kind": "runtime_dir", "mode": "deterministic_runtime_placeholder", "line_count": 0},
-                        {
-                            "path": "artifacts/results.json",
-                            "kind": "output_placeholder",
-                            "mode": "deterministic_runtime_placeholder",
-                            "line_count": 0,
-                        },
-                    ]
-                },
-                result_schema={"primary_metric": "score", "required_metrics": ["score"]},
+            review = generated_review(project,
+                [
+                {"path": "main.py", "kind": "source", "mode": "llm", "line_count": 2},
+                {"path": "artifacts", "kind": "runtime_dir", "mode": "deterministic_runtime_placeholder", "line_count": 0},
+                {"path": "artifacts/results.json", "kind": "output_placeholder",
+                 "mode": "deterministic_runtime_placeholder", "line_count": 0},
+                ],
                 resource_plan={"max_files": 8, "max_generated_lines": 200},
-                use_llm=False,
             )
 
             self.assertNotIn("missing_file", {row["category"] for row in review["findings"]})
-
-    def test_entrypoint_static_analysis_flags_suppressed_traceback(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            project = Path(tmp)
-            write_text(
-                project / "main.py",
-                (
-                    "import sys\n\n"
-                    "def main():\n"
-                    "    try:\n"
-                    "        raise RuntimeError('hidden')\n"
-                    "    except Exception as exc:\n"
-                    "        print(f'ERROR: {exc}', file=sys.stderr)\n"
-                    "        return 1\n"
-                ),
-            )
-
-            analysis = analyze_entrypoint_debuggability(project)
-
-            self.assertEqual(len(analysis["findings"]), 1)
-            self.assertEqual(analysis["findings"][0]["path"], "main.py")
 
     def test_valid_unicode_identifiers_survive_generation_review_and_repair_guards(self) -> None:
         import subprocess
@@ -770,13 +721,7 @@ class CodeTaskInterfaceTests(unittest.TestCase):
             self.assertTrue(_validate_file_content(source, filename="main.py").valid)
             self.assertEqual(_post_write_static_guard(target=project / "main.py", rel_path="main.py"), "")
 
-            review = review_generated_project(
-                project_dir=project,
-                code_artifacts={"generated_files": [{"path": "main.py", "mode": "llm", "line_count": 5}]},
-                result_schema={"primary_metric": "score", "required_metrics": ["score"]},
-                resource_plan={"max_files": 4, "max_generated_lines": 200},
-                use_llm=False,
-            )
+            review = generated_review(project, [{"path": "main.py", "mode": "llm", "line_count": 5}])
 
             self.assertFalse(any(row["severity"] == "blocking" for row in review["findings"]))
             executed = subprocess.run([sys.executable, str(project / "main.py")], capture_output=True, text=True, timeout=5)
@@ -802,61 +747,31 @@ class CodeTaskInterfaceTests(unittest.TestCase):
             )
         )
 
-    def test_review_blocks_entrypoint_that_suppresses_traceback(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            project = Path(tmp)
-            write_text(
-                project / "main.py",
-                (
-                    "def main():\n"
-                    "    try:\n"
-                    "        print('score: 1.0')\n"
-                    "    except Exception as exc:\n"
-                    "        print(f'ERROR: {exc}')\n"
-                    "        return 1\n"
-                ),
-            )
-
-            review = review_generated_project(
-                project_dir=project,
-                code_artifacts={"generated_files": [{"path": "main.py", "mode": "llm", "line_count": 7}]},
-                result_schema={"primary_metric": "score", "required_metrics": ["score"]},
-                resource_plan={"max_files": 4, "max_generated_lines": 200},
-                use_llm=False,
-            )
-
-            self.assertEqual(review["status"], "failed")
-            self.assertTrue(
-                any(row["category"] == "entrypoint_exception_suppresses_traceback" for row in review["findings"])
-            )
-
-    def test_review_accepts_entrypoint_that_preserves_traceback(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            project = Path(tmp)
-            write_text(
-                project / "main.py",
-                (
-                    "import traceback\n\n"
-                    "def main():\n"
-                    "    try:\n"
-                    "        print('score: 1.0')\n"
-                    "    except Exception:\n"
-                    "        traceback.print_exc()\n"
-                    "        return 1\n"
-                ),
-            )
-
-            review = review_generated_project(
-                project_dir=project,
-                code_artifacts={"generated_files": [{"path": "main.py", "mode": "llm", "line_count": 8}]},
-                result_schema={"primary_metric": "score", "required_metrics": ["score"]},
-                resource_plan={"max_files": 4, "max_generated_lines": 200},
-                use_llm=False,
-            )
-
-            self.assertFalse(
-                any(row["category"] == "entrypoint_exception_suppresses_traceback" for row in review["findings"])
-            )
+    def test_entrypoint_review_requires_preserved_traceback(self) -> None:
+        cases = (
+            ("stderr_summary", "import sys\n\ndef main():\n    try:\n"
+             "        raise RuntimeError('hidden')\n    except Exception as exc:\n"
+             "        print(f'ERROR: {exc}', file=sys.stderr)\n        return 1\n", True),
+            ("stdout_summary", "def main():\n    try:\n        print('score: 1.0')\n"
+             "    except Exception as exc:\n        print(f'ERROR: {exc}')\n        return 1\n", True),
+            ("traceback", "import traceback\n\ndef main():\n    try:\n        print('score: 1.0')\n"
+             "    except Exception:\n        traceback.print_exc()\n        return 1\n", False),
+        )
+        for name, source, blocked in cases:
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as tmp:
+                project = Path(tmp)
+                write_text(project / "main.py", source)
+                analysis = analyze_entrypoint_debuggability(project)
+                self.assertEqual([row["path"] for row in analysis["findings"]],
+                                 ["main.py"] if blocked else [])
+                review = generated_review(project,
+                    [{"path": "main.py", "mode": "llm",
+                    "line_count": len(source.splitlines())}],
+                )
+                self.assertEqual(any(row["category"] == "entrypoint_exception_suppresses_traceback"
+                                     for row in review["findings"]), blocked)
+                if blocked:
+                    self.assertEqual(review["status"], "failed")
 
     def test_existing_context_snippets_expose_api_without_extra_repo_reads(self) -> None:
         contract = snippet_api_contract(
@@ -978,12 +893,8 @@ class CodeTaskInterfaceTests(unittest.TestCase):
             }
 
             mismatches = find_local_api_mismatches(project)
-            review = review_generated_project(
-                project_dir=project,
-                code_artifacts=artifacts,
-                result_schema={"primary_metric": "score", "required_metrics": ["score"]},
+            review = generated_review(project, artifacts["generated_files"],
                 resource_plan={"max_files": 8, "max_generated_lines": 200},
-                use_llm=False,
             )
 
             self.assertEqual(mismatches[0]["missing_symbol"], "load_text_classification_dataset")
@@ -1030,24 +941,20 @@ class CodeTaskInterfaceTests(unittest.TestCase):
             write_text(project / "pkg" / "__init__.py", "")
             write_text(project / "pkg" / "data.py", "def load_rows():\n    return []\n")
 
-            review = review_generated_project(
-                project_dir=project,
-                code_artifacts={
-                    "generated_files": [
-                        {"path": "main.py", "mode": "llm", "line_count": 2},
-                        {"path": "pkg/__init__.py", "mode": "llm", "line_count": 1},
-                        {"path": "pkg/data.py", "mode": "llm", "line_count": 2},
-                    ]
-                },
+            review = generated_review(project,
+                [
+                    {"path": "main.py", "mode": "llm", "line_count": 2},
+                    {"path": "pkg/__init__.py", "mode": "llm", "line_count": 1},
+                    {"path": "pkg/data.py", "mode": "llm", "line_count": 2},
+                ],
+
                 architecture_plan={
                     "files": [
                         {"path": "main.py", "public_api": ["main(argv=None)"]},
                         {"path": "pkg/data.py", "public_api": ["load_dataset(config)"]},
                     ]
                 },
-                result_schema={"primary_metric": "score", "required_metrics": ["score"]},
                 resource_plan={"max_files": 8, "max_generated_lines": 200},
-                use_llm=False,
             )
 
             self.assertTrue(any(row["category"] == "planned_api_not_exported" for row in review["findings"]))
@@ -1065,13 +972,9 @@ class CodeTaskInterfaceTests(unittest.TestCase):
                 ),
             )
 
-            review = review_generated_project(
-                project_dir=project,
-                code_artifacts={"generated_files": [{"path": "main.py", "mode": "llm", "line_count": 3}]},
+            review = generated_review(project, [{"path": "main.py", "mode": "llm", "line_count": 3}],
                 result_schema={"primary_metric": "accuracy", "required_metrics": ["accuracy"]},
-                resource_plan={"max_files": 4, "max_generated_lines": 200},
                 contract={"objective": "Run an experiment and evaluate metrics without placeholder values."},
-                use_llm=False,
             )
 
             self.assertFalse(any(row["category"] == "placeholder_execution_path" for row in review["findings"]))
@@ -1081,17 +984,12 @@ class CodeTaskInterfaceTests(unittest.TestCase):
             project = Path(tmp)
             write_text(project / "main.py", "def main():\n    return 0\n")
             write_text(project / "pkg" / "models.py", "# Reserved generated module.\n")
-            review = review_generated_project(
-                project_dir=project,
-                code_artifacts={
-                    "generated_files": [
-                        {"path": "main.py", "mode": "llm", "line_count": 2},
-                        {"path": "pkg/models.py", "mode": "fallback", "line_count": 1},
-                    ]
-                },
-                result_schema={},
-                resource_plan={"max_files": 8, "max_generated_lines": 200},
-                use_llm=False,
+            review = generated_review(project,
+                [
+                    {"path": "main.py", "mode": "llm", "line_count": 2},
+                    {"path": "pkg/models.py", "mode": "fallback", "line_count": 1},
+                ],
+                result_schema={}, resource_plan={"max_files": 8, "max_generated_lines": 200},
             )
 
             self.assertEqual(review["status"], "failed")
@@ -1145,7 +1043,6 @@ class CodeTaskInterfaceTests(unittest.TestCase):
             for name, task in tasks.items():
                 with self.subTest(name=name):
                     review = review_generated_project(**inputs, contract={"task": task})
-                    self.assertFalse(any(row["severity"] == "blocking" for row in review["findings"]))
                     self.assertFalse(review["findings"])
                     self.assertEqual(review["metadata"]["task_acceptance"], "not_verified")
                     self.assertEqual(review["metadata"]["deterministic_review_scope"],

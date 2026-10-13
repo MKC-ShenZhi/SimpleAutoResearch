@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 from urllib.parse import unquote, urlsplit
 
 
@@ -128,14 +128,18 @@ def _plain_inlines(inlines: list[dict]) -> str:
     return " ".join(str(node.get("c", "")) for node in _nodes(inlines) if node.get("t") == "Str")
 
 
-def _bind_figure_captions(ast: dict, captions: dict[str, list[dict]]) -> list[str]:
+def _bind_figure_captions(ast: dict, captions: dict[str, list[dict]], *,
+                          caption_owner: Literal['manifest', 'markdown'] = 'manifest') -> list[str]:
     """Bind recorded figure captions, for both legacy and modern Pandoc ASTs.
 
-    Manifest captions override standalone figures. Without a manifest, Pandoc's
-    authored caption remains the owner. Only an AST-identical adjacent paragraph
+    Managed exports retain manifest precedence; canonical Markdown exports use
+    recorded captions only when Pandoc has no authored caption. Only an
+    AST-identical adjacent paragraph
     (optionally wrapped in emphasis) is redundant; never infer caption prose.
     Walk block containers too, without rebinding a modern Figure's inner image.
     """
+    if caption_owner not in {'manifest', 'markdown'}:
+        raise ReportExportError('Unknown figure caption owner')
     bound, blocks = [], []
     pending_caption = None
     for block in ast["blocks"]:
@@ -153,32 +157,30 @@ def _bind_figure_captions(ast: dict, captions: dict[str, list[dict]]) -> list[st
         if len(images) == 1:
             image = images[0]
             path = image["c"][-1][0]
-            if path in captions:
+            # Modern Figure captions are separate from accessibility alt text.
+            # Legacy implicit figures render the image alt only with the fig: marker.
+            caption = image['c'][1] if image['c'][-1][1].startswith('fig:') else []
+            authored = bool(caption)
+            if block['t'] == 'Figure':
+                short_caption, long_caption = block['c'][1]
+                authored = bool(short_caption) or any(row.get('c') for row in long_caption)
+                caption = (long_caption[0]['c'] if len(long_caption) == 1
+                           and long_caption[0].get('t') in {'Para', 'Plain'} else [])
+            if path in captions and (caption_owner == 'manifest' or not authored):
                 caption = deepcopy(captions[path])
                 image["c"][1] = caption
                 if block["t"] == "Figure":
                     block["c"][1] = [None, [{"t": "Plain", "c": deepcopy(caption)}]]
                 else:
                     image["c"][-1][1] = "fig:"  # legacy implicit-figure marker
-                pending_caption = caption
                 bound.append(path)
-            else:
-                # Modern Pandoc owns the caption separately from image alt.
-                # Legacy implicit figures use alt directly. Keep both intact.
-                caption = image['c'][1] if image['c'][-1][1].startswith('fig:') else []
-                if block['t'] == 'Figure':
-                    long_caption = block['c'][1][1]
-                    if len(long_caption) == 1 and long_caption[0].get('t') in {'Para', 'Plain'}:
-                        caption = long_caption[0]['c']
-                    else:
-                        caption = []  # Empty/multi-block captions are not one paragraph.
-                pending_caption = caption or None
+            pending_caption = caption or None
         if not standalone:
             def visit(value: Any) -> None:
                 if isinstance(value, list):
                     if any(isinstance(row, dict) and row.get('t') in {'Para', 'Plain', 'Figure'} for row in value):
                         nested = {'blocks': value}
-                        bound.extend(_bind_figure_captions(nested, captions))
+                        bound.extend(_bind_figure_captions(nested, captions, caption_owner=caption_owner))
                         value[:] = nested['blocks']
                     else:
                         for row in value:
@@ -258,13 +260,18 @@ def _scientific_unicode_preamble(*fragments: str) -> str:
 
 def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None = None,
                       compile_pdf: bool = False, render_preview: bool = False, body_name: str = "report_body.md",
-                      runner: Callable | None = None, validate_asset: Callable[[Path], None] | None = None) -> dict[str, Any]:
+                      runner: Callable | None = None, validate_asset: Callable[[Path], None] | None = None,
+                      caption_owner: Literal['manifest', 'markdown'] = 'manifest') -> dict[str, Any]:
     """Create a new editable acmart manuscript from the canonical citation body.
 
     Pandoc and optional TeX/librsvg are external rendering dependencies. No
     model is called and no upstream evidence or session state is changed.
+    Managed report consumers keep manifest captions by default; direct canonical
+    workspace publication explicitly selects Markdown ownership.
     """
     root, output = report_dir.resolve(), output_dir.resolve()
+    if caption_owner not in {'manifest', 'markdown'}:
+        raise ReportExportError('Unknown figure caption owner')
     if render_preview and not compile_pdf:
         raise ReportExportError("render_preview requires compile_pdf=true")
     if Path(body_name).name != body_name:
@@ -301,7 +308,7 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
             if row['path'] in captions and captions[row['path']] != parsed[0]['c']:
                 raise ReportExportError("Conflicting recorded captions for the same figure path.")
             captions[row["path"]] = parsed[0]["c"]
-    bound_captions = _bind_figure_captions(ast, captions)
+    bound_captions = _bind_figure_captions(ast, captions, caption_owner=caption_owner)
     source_ast = deepcopy(ast)
     blocks = ast["blocks"]
     # Explicit titles are literal prose, not one unbreakable identifier.
@@ -346,6 +353,7 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
     manifest: dict[str, Any] = {"schema_version": "report_export.v1", "format": "acmart-manuscript",
                                "source_report": str(body_path), "status": "exporting",
                                "compiled": False, "quality_checked": False,
+                               "figure_caption_owner": caption_owner,
                                "bound_figure_captions": bound_captions}
     if render_preview:
         manifest['pdf_preview'] = {'rendered': False, 'visual_reviewed': False,

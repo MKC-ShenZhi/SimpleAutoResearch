@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import copy
 import json
+import hashlib
+import shutil
+import warnings
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from simple_ar.integrations.llm import LLMClient, LLMError, LLMResponseError
-from simple_ar.code_task.generation.agent_step import run_json_agent_step, response_accounting_known, write_agent_step_artifact
+from simple_ar.code_task.generation.agent_step import (
+    run_completed_response_corrections, run_json_agent_step,
+    response_accounting_known, write_agent_step_artifact,
+)
 from simple_ar.code_task.generation.common import scalar_list, text as clean_text
 from simple_ar.code_task.generation.task_contract import contract_prompt_view
-from simple_ar.code_task.generation.planning_tools import build_tool_agent_architecture_plan
+from simple_ar.core.artifacts import read_json, write_json
 from simple_ar.code_task.generation.file_specs import (
     dedupe_file_rows,
     entrypoint_first,
@@ -31,9 +37,10 @@ def build_architecture_plan(
     client: LLMClient | None = None,
     allow_fallback: bool = False,
     retry_attempts: int = 1,
-    planning_mode: str = "tool_agent",
+    planning_mode: str = "compact",
     planning_dir: Path | None = None,
-    planning_review_rounds: int = 2,
+    planning_review_rounds: int = 0,
+    planner_selector: str = "",
     message_callback: Callable[[str], None] | None = None,
 ) -> tuple[dict[str, Any], str]:
     """Build a bounded plan; retry_attempts bounds completed format corrections.
@@ -45,62 +52,45 @@ def build_architecture_plan(
     retry_attempts = max(1, int(retry_attempts or 1))
     last_error: LLMError | None = None
     mode = _normalize_planning_mode(planning_mode)
+    planning_dir = prepare_architecture_work_unit(
+        planning_dir, requested_mode=mode, review_rounds=planning_review_rounds,
+        message_callback=message_callback, planner_selector=planner_selector,
+    )
     if client is not None:
-        if mode == "tool_agent":
-            try:
-                plan = build_tool_agent_architecture_plan(
-                    contract=contract,
-                    result_schema=result_schema,
-                    resource_plan=resource_plan,
-                    domain_profile=domain_profile,
-                    client=client,
-                    retry_attempts=retry_attempts,
-                    review_rounds=planning_review_rounds,
-                    planning_dir=planning_dir,
-                    message_callback=message_callback,
-                )
-            except LLMResponseError as exc:
-                if not response_accounting_known(client):
-                    raise
-                last_error = exc
-                _emit(message_callback, f"Greenfield tool-agent planning failed. {exc}")
-            else:
-                return plan, "tool_agent"
-        elif mode == "compact":
-            for attempt in range(1, retry_attempts + 1):
-                try:
-                    prompt = greenfield_architecture_prompt(
-                        contract=contract,
-                        result_schema=result_schema,
-                        resource_plan=resource_plan,
-                        domain_profile=domain_profile,
-                        retry_feedback=_retry_feedback(last_error, attempt),
-                    )
-                    raw = run_json_agent_step(
-                        client=client, system=GREENFIELD_ARCHITECT_SYSTEM, prompt=prompt,
-                        label="greenfield-architecture" if attempt == 1 else f"greenfield-architecture-retry-{attempt}",
-                        stage="compact", attempt_index=attempt, retry_attempts=1,
-                        max_output_tokens=_architecture_output_tokens(resource_plan),
-                        artifact_dir=planning_dir, message_callback=message_callback,
-                    )
-                    write_agent_step_artifact(planning_dir, stage="compact", attempt_index=attempt, value=raw)
-                    return normalize_architecture_plan(raw, contract=contract, resource_plan=resource_plan), "compact"
-                except LLMResponseError as exc:
-                    if not response_accounting_known(client):
-                        raise
-                    last_error = exc
-                    if attempt < retry_attempts:
-                        _emit(
-                            message_callback,
-                            "Greenfield architecture planning failed "
-                            f"(attempt {attempt}/{retry_attempts}); correcting the completed response. {exc}",
-                        )
-                    else:
-                        _emit(
-                            message_callback,
-                            "Greenfield architecture planning failed "
-                            f"(attempt {attempt}/{retry_attempts}); no retries left. {exc}",
-                        )
+        def operation(attempt: int, error: LLMError | None) -> dict[str, Any]:
+            prompt = greenfield_architecture_prompt(
+                contract=contract, result_schema=result_schema,
+                resource_plan=resource_plan, domain_profile=domain_profile,
+                retry_feedback=_retry_feedback(error, attempt),
+            )
+            raw = run_json_agent_step(
+                client=client, system=GREENFIELD_ARCHITECT_SYSTEM, prompt=prompt,
+                label="greenfield-architecture" if attempt == 1 else f"greenfield-architecture-retry-{attempt}",
+                stage="compact", attempt_index=attempt, retry_attempts=1,
+                max_output_tokens=_architecture_output_tokens(resource_plan),
+                artifact_dir=planning_dir, message_callback=message_callback,
+            )
+            write_agent_step_artifact(planning_dir, stage="compact", attempt_index=attempt, value=raw)
+            return normalize_architecture_plan(raw, contract=contract, resource_plan=resource_plan)
+
+        def on_failure(exc: LLMError, attempt: int, correct: bool) -> None:
+            if isinstance(exc, LLMResponseError) and response_accounting_known(client):
+                action = "correcting the completed response" if correct else "no retries left"
+                _emit(message_callback, "Greenfield architecture planning failed "
+                      f"(attempt {attempt}/{retry_attempts}); {action}. {exc}")
+
+        try:
+            plan = run_completed_response_corrections(
+                client=client, operation=operation, retry_attempts=retry_attempts,
+                on_failure=on_failure,
+            )
+            if planning_dir is not None:
+                write_json(planning_dir / "final_plan.json", plan)
+            return plan, "compact"
+        except LLMResponseError as exc:
+            if not response_accounting_known(client):
+                raise
+            last_error = exc
     if client is not None and not allow_fallback:
         assert last_error is not None
         raise last_error
@@ -118,7 +108,7 @@ def build_architecture_plan(
 
 
 def _normalize_planning_mode(value: object) -> str:
-    text = str(value or "tool_agent").strip().lower().replace("-", "_")
+    text = str(value or "compact").strip().lower().replace("-", "_")
     aliases = {
         "tools": "tool_agent",
         "tool": "tool_agent",
@@ -134,6 +124,90 @@ def _normalize_planning_mode(value: object) -> str:
     return aliases[text]
 
 
+def prepare_architecture_work_unit(
+    planning_dir: Path | None, *, requested_mode: str, review_rounds: int,
+    message_callback: Callable[[str], None] | None = None,
+    planner_selector: str = "",
+) -> Path | None:
+    """Record method retirement before dispatch, retaining historical bytes.
+
+    This receipt authorizes no calls or retries and does not settle prior usage.
+    Old stage files remain in place; mutable plan outputs are copied before reuse.
+    """
+    if review_rounds < 0:
+        raise ValueError("planning_review_rounds must be non-negative")
+    notices = []
+    if requested_mode == "tool_agent":
+        notices.append("tool_agent is deprecated: using one complete architecture work unit; "
+                       "the four-stage planner and planning review have been retired.")
+    if review_rounds:
+        notices.append("planning_review_rounds is deprecated and does not grant review calls. "
+                       "Use planning_mode=compact and planning_review_rounds=0.")
+    if planning_dir is not None:
+        receipt = planning_dir / "method_migration.json"
+        if not receipt.exists():
+            original = [p for p in planning_dir.rglob("*") if p.is_file()
+                        and "architecture_unit" not in p.relative_to(planning_dir).parts]
+            meta = planning_dir.parent
+            saved = [meta / name for name in (
+                "architecture_plan.json", "architecture_plan.md", "file_plan.json",
+                "implementation_plan.json") if (meta / name).is_file()]
+            retained = {}
+            for path in original + saved:
+                retained[path.relative_to(meta).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in saved:
+                backup = planning_dir / "retired_method" / path.name
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, backup)
+            previous = read_json(meta / "implementation_plan.json") if (meta / "implementation_plan.json").is_file() else {}
+            previous_mode = previous.get("planning_mode") or previous.get("architecture_mode")
+            old_models = previous.get("models") or {}
+            old_selector = old_models.get("planner") or old_models.get("default") or ""
+            if str(old_selector).startswith(("profile:", "route:")) and old_selector != planner_selector:
+                raise ValueError("Historical named planner conflicts with this request. Set "
+                                 "[models.code_task] planner = " + repr(old_selector) +
+                                 " and [execute] planning_mode = 'compact' to migrate on the original connection.")
+            staged = any(p.relative_to(planning_dir).parts[0] in {
+                "requirements", "architecture", "interfaces", "file_plan", "review"} for p in original)
+            previous_mode = previous_mode or ("tool_agent" if staged else "unknown")
+            write_json(receipt, {
+                "schema_version": "greenfield_planning_method_migration.v1",
+                "from_method": previous_mode,
+                "to_method": "complete_architecture.v1", "requested_mode": requested_mode,
+                "retired_review_rounds": review_rounds, "planner_selector": planner_selector,
+                "retained_artifacts": retained, "old_workflow_success": False,
+                "budget_policy": "continue_existing_ledger_without_reset_or_extra_authorization",
+            })
+        else:
+            saved_receipt = read_json(receipt)
+            if saved_receipt.get("to_method") != "complete_architecture.v1":
+                raise ValueError("Unknown planning method receipt; inspect planning/method_migration.json before continuing")
+            if saved_receipt.get("planner_selector", "") != planner_selector:
+                raise ValueError("Planner selector conflicts with the saved method migration receipt. "
+                                 "Resume using planner_selector=" + repr(saved_receipt.get("planner_selector", "")) +
+                                 "; use [models.code_task].planner to select that existing connection.")
+        if read_json(receipt).get("retained_artifacts"):
+            notices.append("Continuing historical ungenerated planning with complete_architecture.v1; "
+                           "original stages and failures are retained in planning/method_migration.json. "
+                           "This does not mark the retired workflow successful or increase its budget.")
+    for notice in notices:
+        if message_callback is not None:
+            message_callback(notice)
+        else:
+            warnings.warn(notice, FutureWarning, stacklevel=2)
+    if planning_dir is None:
+        return None
+    unit_dir = planning_dir / "architecture_unit"
+    unit_dir.mkdir(parents=True, exist_ok=True)
+    # Each invocation retains its failed/corrected responses across resume.
+    index = 1
+    while (unit_dir / f"attempt-{index:03d}").exists():
+        index += 1
+    output_dir = unit_dir / f"attempt-{index:03d}"
+    output_dir.mkdir()
+    return output_dir
+
+
 def normalize_architecture_plan(
     value: Mapping[str, Any],
     *,
@@ -142,7 +216,7 @@ def normalize_architecture_plan(
 ) -> dict[str, Any]:
     """Canonicalize a newly produced plan once, before publishing or consuming it.
 
-    Both planning producers use this owner for files and shared contracts.
+    The complete architecture work unit owns files and shared contracts.
     Saved planning snapshots are deliberately not passed through this function.
     """
     max_files = _positive_int(resource_plan.get("max_files"), 8)
@@ -420,6 +494,10 @@ def greenfield_architecture_prompt(
         "declared in the dependency file's public_api; do not use vague prose as an interface contract.\n"
         "- Convert explicit task requirements into concrete module responsibilities, data structures, and "
         "artifact flows. Do not rely on later files to rediscover global requirements from prose.\n"
+        "- Each file must list contract_obligations using the implementation_contract obligation IDs it owns. "
+        "Preserve every evidence_plan hypothesis, comparison and required artifact in a concrete producer/output.\n"
+        "- interfaces may be an object with shared_schemas, module_apis, cross_file_contracts and stdout_contract; "
+        "declare exact producers, consumers, APIs and record fields for downstream implementation.\n"
         "- For multi-step or experimental tasks, define the shared record/result schema that runner, analysis, "
         "reporting, and validation will use. This schema must come from the task contract, not from a benchmark-specific template.\n"
         "- Make `main.py` a thin CLI wrapper when possible; put reusable logic in "

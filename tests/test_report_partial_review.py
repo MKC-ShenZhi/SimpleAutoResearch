@@ -3,6 +3,8 @@ import copy
 import json
 import unittest
 
+from pydantic import ValidationError
+
 from tests.report_review_fixtures import finding_check_objects, prompt_payload
 from simple_ar.integrations.llm import LLMError, LLMResponseError
 from simple_ar.report.agent import run_report_agent
@@ -49,7 +51,7 @@ class PartialReviewTests(unittest.TestCase):
         self.assertEqual(subset[0].findings[1].evidence_quotes[0].quote, "5")
         self.assertEqual(response, before)
 
-    def test_ambiguous_or_foreign_envelope_never_salvages_a_peer(self):
+    def test_complete_and_partial_review_share_identity_and_role_rejections(self):
         _, _, old, drafts = finding_check_objects()
         valid = self.mixed()["section_reviews"][0]
         check = {"finding_id": old.finding_id, "status": "resolved", "explanation": "Current uncertainty is explicit.",
@@ -59,6 +61,10 @@ class PartialReviewTests(unittest.TestCase):
                  ([valid, {"section_id": "unknown"}], {}),
                  ([{**valid, "findings": [{**valid["findings"][0], "section_id": "limits"}]}], {}),
                  ([{**valid, "section_id": []}], {}),
+                 ([{**valid, "findings": "not a list"}], {}),
+                 ([{**valid, "findings": [None]}], {}),
+                 ([{**valid, "finding_checks": None}], {}),
+                 ([{**valid, "context_requests": "not a list"}], {}),
                  ([{**valid, "finding_checks": [{**check, "finding_id": "foreign"}]}], {}),
                  ([{"section_id": "scope", "finding_checks": [check, check]}], {("scope", old.finding_id): old}),
                  ([valid], {("scope", old.finding_id): old}),
@@ -67,8 +73,35 @@ class PartialReviewTests(unittest.TestCase):
                  ([{"section_id": "limits", "finding_checks": []}], {("scope", old.finding_id): old})]
         for rows, prior in cases:
             with self.subTest(rows=rows):
-                self.assertEqual(_validated_document_review_subset({"section_reviews": rows},
+                response = {"section_reviews": rows}
+                before = copy.deepcopy(response)
+                with self.assertRaises((LLMResponseError, ValidationError)):
+                    _validate_document_reviews(response, sections=drafts,
+                        prior_by_key=prior, evidence_view=self.view(drafts))
+                self.assertEqual(_validated_document_review_subset(response,
                     sections=drafts, prior_by_key=prior, evidence_view=self.view(drafts)), [])
+                self.assertEqual(response, before)
+
+    def test_complete_and_partial_review_bind_legacy_finding_target_on_copies(self):
+        _, _, old, drafts = finding_check_objects()
+        finding = self.mixed()["section_reviews"][0]["findings"][0]
+        for target in (None, ""):
+            response = {"section_reviews": [{"section_id": "scope", "verdict": "revise_required",
+                "findings": [{**finding, "section_id": target}]}]}
+            before = copy.deepcopy(response)
+            reviews = _validate_document_reviews(response, sections=drafts, prior_by_key={}, evidence_view=self.view(drafts))
+            self.assertEqual(reviews[0].findings[0].section_id, "scope")
+            self.assertEqual(_validated_document_review_subset(response, sections=drafts,
+                prior_by_key={}, evidence_view=self.view(drafts)), reviews)
+            self.assertEqual(response, before)
+        # Full validation retains legacy instruction coercion; salvage must
+        # not release raw instructions from a rejected historical response.
+        response = {"section_reviews": [{"section_id": "scope", "verdict": "pass",
+            "revision_instructions": [" "]}]}
+        prior = {("scope", old.finding_id): old}
+        self.assertTrue(_validate_document_reviews(response, sections=drafts, prior_by_key=prior))
+        self.assertEqual(_validated_document_review_subset(response, sections=drafts,
+            prior_by_key=prior, evidence_view=self.view(drafts)), [])
 
     def test_historical_subset_closes_only_exact_valid_opinions(self):
         kwargs, checkpoint, old, drafts = finding_check_objects()

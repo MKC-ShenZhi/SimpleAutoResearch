@@ -23,6 +23,7 @@ from simple_ar.research.task_plan import TaskPlanRequest
 
 
 class PlanningCapabilityTests(unittest.TestCase):
+
     def test_quote_backed_temporal_scope_survives_plan_and_search_recovery(self) -> None:
         topic = "Survey interval methods published from 2010 through 2014."
         scope = {"start_year": 2010, "end_year": 2014,

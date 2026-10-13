@@ -37,6 +37,9 @@ controls cannot be mixed with native access/budget options.
 
 ```bash
 simple-ar start "Inspect these results and explain the comparison" --source results/ --model profile:NAME --yes
+simple-ar start --resume-task "SESSION" --approve-execution "TOKEN"
+simple-ar status "SESSION"
+simple-ar results "SESSION"
 simple-ar start --resume-task SESSION "Shorten the explanation without rerunning"
 simple-ar start --resume-task SESSION --retry-model
 simple-ar start --resume-task SESSION "Use these additional notes" --source notes/ --allow-network --yes
@@ -52,12 +55,19 @@ The same private-name policy applies inside mounted roots regardless of letter
 case, including listing, search and inspection before source reads.
 Creation and added-access requests use the same checks before changing the task;
 an invalid addition leaves the existing mounts, permissions and ledger unchanged.
-`--prepare-only` saves a task without
-model calls. `--max-turns` (30) and `--max-tokens` (600000) bound the whole saved task,
+`--prepare-only` saves a task without model calls or execution, but native creation still preflights the connection and credentials.
+`--max-turns` (30) and `--max-tokens` (600000) bound the whole saved task,
 including feedback; resume does not reset them. This entry currently supports local
 text investigation, source search/acquisition, code creation, result explanation and
 publication export. Image tools require explicit named routes and allowances.
 Complete research acceptance has not passed; tool availability is not task success.
+For the complete installation and secret-reference flow, follow [Usage](USAGE.md#a-copyable-ordinary-user-workflow).
+`SESSION` is the full printed task path; `TOKEN` is the exact current `Approval token`.
+`--approve-execution` requires `--resume-task`; `--yes` accepts a summary, not a command.
+Inspect generated source and the proposal before approving. `status` and `results` read saved state without model calls.
+Use an ordinary `--resume-task SESSION` without feedback to resume a saved boundary;
+a completed task with no pending action returns saved terminal state without replaying work.
+Feedback shares the original budget; an older delivery during a pause is not the current request's delivery.
 Token accounting reserves the estimated input before dispatch. Without an output
 cap, the final response can exceed the remaining estimate; actual usage is still
 recorded and further requests stop. A task token allowance is not a strict
@@ -96,8 +106,10 @@ usage is preserved, and the new remaining amount is not a total historical limit
 or runs the task. Reusing an authorization ID does not replenish spent
 capacity. Ordinary `--max-tokens`/`--max-turns` do not add resources on resume.
 Model bindings and permissions remain unchanged; commands still need exact approval.
-Confirm resource continuation separately from `--approve-execution`, and reconcile
-started or unknown operations first.
+Confirm resource continuation separately from `--approve-execution`. Closed text
+calls with finite retained charges may continue under explicit new allowances;
+their unknown usage and original ledger entries are not settled or released.
+In-flight calls, unbounded usage and unconfirmed side effects must be reconciled first.
 File tools accept short authorized mount locators, such as `source0/README.md` and
 `workspace/project`, as well as observed absolute paths within those roots.
 Observations provide filesystem addresses for generated code and argv; mount names
@@ -148,6 +160,15 @@ observation is not original-paper evidence, execution authorization or proof
 that the task interpreter is ready; no project code is imported or run.
 `copy_project` prepares an editable project from an authorized source directory
 using the existing CodeTask copy owner through the same workspace gateway.
+Optional `archive_name` (a simple `.zip` filename, such as `project.zip`) also creates a ZIP
+inside the new copy, containing exactly the copied files at relative paths. It shares the
+existing copy operation, accounting and recovery receipt; no packaging script or process is needed.
+The ZIP inherits the copy exclusions and size limits below. Inspect the `copy` report's
+omissions and reasons before treating it as a complete package; the returned `files` includes
+the ZIP's SHA256. A name conflicting with a copied file is refused. Recovery checks the
+published files and ZIP against the saved receipt rather than repacking changed content.
+Users can request a portable ZIP in their ordinary natural-language goal or feedback;
+they do not need to invoke this internal tool themselves. A ZIP is not validation or delivery by itself.
 Set `source` to the directory and `path` to a nonexistent subdirectory of the
 writable workspace; absolute authorized paths and legacy mount aliases are accepted.
 For example, tool arguments `{"source":"source0/project","path":"workspace/project"}`
@@ -176,6 +197,14 @@ under the existing SessionController owner.
 artifacts must already exist in the writable workspace. Invalid paths are rejected
 before writing. A successful final write uses the existing delivery/terminal-state
 owner; ordinary writes and standalone `deliver_result` retain their behavior.
+`run_process` accepts the same optional `delivery` for authorized final work.
+The command must exit successfully without stopping, and its declared artifacts
+must exist afterward. The process receipt binds the request and output hashes;
+interrupted recovery consumes that binding without rerunning the command.
+Changed outputs, missing bindings, failed commands and invalid terminal ordering
+block delivery. The declaration is included in exact execution approval; an
+ordinary successful process does not automatically complete a task. This combines
+final work and explicit handoff, not scientific verification or an automatic archive.
 Artifacts may also name workspace project directories. The existing inventory
 expands each directory to an explicit snapshot of at most 200 accessible files,
 excluding private paths, virtual environments, Python bytecode caches and symlinks.
@@ -357,6 +386,9 @@ bind output file digests before reuse; changed or missing files cannot inherit a
 old compilation result. Historical input-only receipts remain readable as history,
 not present-byte certification or automatic delivery. Interrupted exports without
 a successful output binding are not blindly repeated. Earlier versions remain.
+Workspace Markdown owns its authored figure captions; figure metadata supplies
+missing captions and editable variants, not replacements for revised prose.
+Controlled assembled reports retain their registered-caption ownership.
 
 `--allow-execution` permits process proposals, not automatic execution. Each command
 needs terminal approval or the printed `--approve-execution TOKEN` on resume; `--yes`
@@ -589,7 +621,10 @@ edit scope/validator, reproduction command/metrics/environment, physical table
 limits and interaction settings. Even explicitly supplying a parser default
 selects that contract; no strict field is silently translated into a preference.
 `--chat`/`--resume-setup` keep technical setup and its confirmed historical settings;
-`--from-session`/`--reuse` keep bounded registered scope and validators. The
+Ordinary writing reuse through `--from-session`/`--reuse` mounts the selected
+registered result packages in the native task; it does not rerun valid measurements
+or import the previous ledger. Explicit templates, survey-source filtering and
+`code_project` scope/validators retain their structured compatibility contracts. The
 recognized preference set is `survey`, `bug_fix`, `reproduction`, `writing`,
 `data_analysis`, `figure`, `code`; `--scripted` requires `--kind data_analysis`.
 Creation preferences cannot be applied to `--resume-task`.
@@ -602,6 +637,13 @@ mix native access/budget controls. Direct `research-session` and `code-task init
 remain explicit structured interfaces; their saved sessions continue under their
 original execution owner. This migration does not equate their planning, baseline,
 review or measurement settings to a natural-language native task.
+
+New `research-session` reports default to the shared complete-article Writer.
+`--report-writing-method sections` retains controlled sectional planning and review;
+explicit section/review options select it when no method is given. Incompatible
+options with `article` fail rather than being ignored. Assembly, citations and
+deterministic audit remain active; one draft is not independently model-reviewed.
+Historical reports keep their saved Writer/checkpoint owner on resume.
 
 ## Reuse deliveries
 
@@ -1461,7 +1503,7 @@ uv run simple-ar code-task execute runs/<run-id> --apply-proposed-edits --timeou
 | `--timeout N` | int | Benchmark timeout. |
 | `--baseline-policy MODE` | enum | Existing-project baseline handling: `auto`, `run`, `skip`, `provided`, or `none`. Use `skip`/`none` for expensive baselines, or `provided` with a metrics file. |
 | `--baseline-metrics-file PATH` | path | JSON or metric-line file used when `--baseline-policy provided`. |
-| `--planning-mode MODE` | enum | Greenfield planning: `tool_agent` uses staged planning and bounded review; `compact` uses a single architecture call before retries. |
+| `--planning-mode MODE` | enum | Greenfield complete architecture work unit; default `compact`. `tool_agent` is a deprecated alias with a visible method migration notice. |
 | `--yes` | flag | Auto-approve inline review gates in normal execute mode; with `--interactive`, auto-continue primitive prompts. Use only after you are comfortable approving the reviewed plan/proposal. |
 | `--interactive` | flag | Debug mode: confirm each primitive step instead of running continuously to the next review gate. |
 | `--no-review-inline` | flag | Disable inline review prompts and stop at review gates instead. |
@@ -1527,10 +1569,20 @@ planning. The JSON contains a full scan of installed Python distributions; the
 terminal output and model context use the compact task-relevant subset. This is
 advice-only and never installs packages automatically.
 
-Greenfield planning defaults to `tool_agent`, which writes intermediate
-requirements, architecture, interface, file-plan, and planning-review artifacts
-under `code_task/meta/planning/`. Use `--planning-mode compact` for a lower-call
-planning path; subsequent file generation, review, and execution are shared.
+Greenfield planning uses one complete architecture work unit (`compact`).
+`tool_agent` is a deprecated alias; the mandatory four-stage planner and planning
+review are retired. `--planning-review-rounds` is deprecated: nonzero values emit
+a notice and grant no calls; use `0`. Completed-response correction and explicit
+fallback retain their existing budget and unknown-usage protections.
+New attempts are retained under `code_task/meta/planning/architecture_unit/`.
+Before an ungenerated historical task enters this method, `planning/method_migration.json`
+records the original method (or unknown), planner selector and retained artifact
+hashes. Old stages and failures remain; previous mutable plan outputs are copied
+to `planning/retired_method/`. This receipt does not certify the old workflow or
+reset its ledger. Generated projects skip generation; immutable snapshots are
+imported as saved, without replanning. Select a named planner with
+`[models.code_task] planner = "profile:NAME"`; retired stage selectors are rejected,
+not mapped to another profile. Writer, generated-code review and execution remain shared.
 
 Generated-project review checks structure and scaffold risks; it does not
 certify task acceptance. Natural-language command names, output paths and
@@ -1538,6 +1590,12 @@ library preferences are assessed contextually, not by a fixed phrase-matching
 gate. Model findings remain advisory; actual validation and benchmark evidence
 are separate. When a review contract changes, resume preserves the previous
 report under `code_task/meta/review_history/` before refreshing the active report.
+
+Explicit offline generation creates a development scaffold, not an implemented
+experiment. Its unimplemented runner stops with an actionable error and emits no
+measurement values. Implement and verify the experiment before benchmarking;
+offline mode does not manufacture scores to satisfy the result schema. Previously
+generated projects and their saved execution records are not rewritten.
 
 Bounded greenfield review/runtime repair selects related files from the actual
 diagnostics and prepares one isolated candidate through the shared code owner.

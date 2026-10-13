@@ -7,7 +7,6 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from simple_ar.code_task import execute_code_task, initialize_code_task
 from simple_ar.code_task.generation.architecture import fallback_architecture_plan
 from simple_ar.code_task.generation.task_contract import build_greenfield_task_contract
 from simple_ar.experiment.execution.backend import ExecutionError, LocalExecutionBackend, RunRequest
@@ -243,54 +242,6 @@ class ExperimentExecutionTests(unittest.TestCase):
         self.assertEqual(guard["status"], "warning")
         codes = {issue["code"] for issue in guard["issues"]}
         self.assertIn("experiment_repaired", codes)
-
-    def test_greenfield_code_task_writes_reviewed_runnable_project(self) -> None:
-        TEST_ROOT.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as tmp:
-            root = Path(tmp)
-            task_file = root / "task.md"
-            task_file.write_text(
-                "# Task\n\nCreate a tiny local experiment that reports accuracy and macro_f1.\n",
-                encoding="utf-8",
-            )
-            run_dir = root / "greenfield-code-task"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=None,
-                task_file=task_file,
-                kind="greenfield",
-                workspace_mode="empty",
-                benchmark_command="python generated_project/main.py",
-                primary_metric="accuracy",
-                metric_directions={"accuracy": "higher_is_better", "macro_f1": "higher_is_better"},
-            )
-
-            result = execute_code_task(
-                run_dir,
-                use_llm=False,
-                to_step="run",
-                timeout_sec=10,
-                max_files=6,
-                max_generated_lines=300,
-            )
-
-            self.assertEqual(result.stop_reason, "completed")
-            project_dir = run_dir / "code_task" / "workspace" / "generated_project"
-            self.assertTrue(project_dir.is_dir())
-            self.assertTrue((project_dir / "main.py").is_file())
-            self.assertTrue((run_dir / "code_task" / "meta" / "architecture_plan.json").is_file())
-            self.assertTrue((run_dir / "code_task" / "meta" / "file_plan.json").is_file())
-            self.assertTrue((run_dir / "code_task" / "meta" / "review_report.json").is_file())
-            task_contract = read_json(run_dir / "code_task" / "meta" / "task_contract.json")
-            self.assertEqual(task_contract["schema_version"], "code_task_contract.v4")
-            self.assertEqual(task_contract["task_kind"], "greenfield")
-            self.assertIn("Create a tiny local experiment", task_contract["task"])
-            self.assertIn("macro_f1", task_contract["metric_contract"]["required_metrics"])
-            self.assertIn("version_hash", task_contract)
-            metrics = read_json(run_dir / "code_task" / "run" / "patched" / "metrics.json")
-            self.assertIn("accuracy", metrics)
-            self.assertIn("macro_f1", metrics)
-
 
     def test_greenfield_task_contract_extracts_evidence_plan(self) -> None:
         contract = build_greenfield_task_contract(

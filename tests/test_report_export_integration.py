@@ -93,8 +93,19 @@ class PortableExportIntegrationTests(unittest.TestCase):
                     bibliography = ('@misc{p0, title={Explicitly incomplete metadata fixture}}\n'
                         if case == 'legacy' else papers_to_bibtex([paper]))
                     (original / "references.bib").write_text(bibliography, encoding="utf-8")
+                    (original / 'figures').mkdir()
+                    (original / 'figures/figures_manifest.json').write_text(json.dumps({'figures': [
+                        {'path': 'plot.svg', 'caption': 'Superseded recorded plot',
+                            'exports': {'svg': 'plot.svg'}}]}), encoding='utf-8')
                     exported = root / "export"
-                    manifest = export_acm_report(original, exported, compile_pdf=True)
+                    # The old managed entry point keeps its default; direct
+                    # canonical publication explicitly owns its revised caption.
+                    options = {} if case == 'legacy' else {'caption_owner': 'markdown'}
+                    manifest = export_acm_report(original, exported, compile_pdf=True, **options)
+                    expected_caption = 'Superseded recorded plot' if case == 'legacy' else 'Fixture plot'
+                    other_caption = 'Fixture plot' if case == 'legacy' else 'Superseded recorded plot'
+                    self.assertEqual(manifest['figure_caption_owner'], 'manifest' if case == 'legacy' else 'markdown')
+                    self.assertEqual(manifest['bound_figure_captions'], ['plot.svg'] if case == 'legacy' else [])
                     self.assertTrue(manifest["compiled"], manifest)
                     self.assertFalse(any('Overfull \\hbox' in row for row in manifest['compile_warnings']), manifest)
                     self.assertFalse(any("undefined citation" in row.lower() or ("citation `" + key + "'") in row.lower()
@@ -103,6 +114,8 @@ class PortableExportIntegrationTests(unittest.TestCase):
                         ['pdftotext', '-layout', str(exported / 'main.pdf'), '-'], text=True)
                     self.assertIn('Fixturecitation[1]', ''.join(initial_text.split()))
                     self.assertNotIn('[?]', ''.join(initial_text.split()))
+                    self.assertIn(''.join(expected_caption.split()), ''.join(initial_text.split()))
+                    self.assertNotIn(''.join(other_caption.split()), ''.join(initial_text.split()))
                     self.assertEqual((original / "references.bib").read_text(), bibliography)
                     self.assertEqual((original / 'report_body.md').read_bytes(), original_body)
                     moved = root / "moved"
@@ -132,12 +145,19 @@ class PortableExportIntegrationTests(unittest.TestCase):
                     self.assertTrue(images)
                     self.assertTrue(all((moved / name).is_file() for name in images))
                     self.assertTrue((moved / "figures/figure-1.svg").is_file())
+                    variant = manifest['figure_exports']['plot.svg']['svg']
+                    self.assertTrue((moved / variant).is_file())
+                    source_text = ' '.join(str(row['c']) for row in _nodes(ast) if row.get('t') == 'Str')
+                    self.assertIn(expected_caption, source_text)
+                    self.assertNotIn(other_caption, source_text)
                     self.assertEqual((moved / 'code/block-1.txt').read_bytes(), LITERAL_CODE.encode('utf-8'))
                     self.assertEqual([row['c'][1] for row in _nodes(ast) if row.get('t') == 'CodeBlock'], [LITERAL_CODE])
                     extracted = subprocess.check_output(['pdftotext', '-layout', str(moved / 'main.pdf'), '-'], text=True)
                     readable = ''.join(extracted.split())
                     self.assertIn('Fixturecitation[1]', readable)
                     self.assertNotIn('[?]', readable)
+                    self.assertIn(''.join(expected_caption.split()), readable)
+                    self.assertNotIn(''.join(other_caption.split()), readable)
                     self.assertNotIn(']]' + key, readable)
                     for literal in (IDENTIFIER, LONG_PATH, r'\end{Verbatim}\input{missing-file}', '%$&#_^~{}'):
                         self.assertIn(literal, readable)

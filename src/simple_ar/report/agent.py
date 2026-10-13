@@ -1641,11 +1641,9 @@ def _outline_planner_prompt(
     compact_contract = _compact_survey_contract(memory.survey_contract)
     # Role groups help the Writer balance sources, but exposing them as
     # ``taxonomy_facets`` anchors the outline agent to provenance labels.
-    compact_contract["taxonomy_facets"] = []
     # The deterministic contract outline is a coverage fallback, not a gold
     # outline. Showing it to the planner made weaker models copy its generic
     # headings verbatim and still appear to have produced an "adapted" plan.
-    compact_contract["outline_sections"] = []
     payload = {
         "task": "plan_topic_specific_survey_outline",
         "topic": context.topic,
@@ -1845,70 +1843,6 @@ def _dedupe_section_ids(sections: list[ReportSectionPlan]) -> list[ReportSection
     return result
 
 
-def _draft_section(
-    *,
-    client: LLMClient,
-    context: ReportContext,
-    template: ReportTemplateBundle,
-    memory: ReportMemory,
-    section: ReportSectionPlan,
-    config: ReportRuntimeConfig,
-    extra_context: list[ReportToolResult],
-    label: str,
-    previous_draft: ReportSectionDraft | None = None,
-    review: ReportSectionReview | None = None,
-    source_batch_index: int = 1,
-    source_batch_count: int = 1,
-    prompt_suffix: str = "",
-    include_previous_draft: bool = True,
-    draft_mode: str = "section",
-    recovery: bool = False,
-    adopted_sections: list[ReportSectionDraft] | None = None,
-    source_front_matter: list[dict[str, Any]] | None = None,
-) -> ReportSectionDraft:
-    if recovery:
-        prompt = _writer_recovery_prompt(
-            context=context,
-            memory=memory,
-            section=section,
-            config=config,
-            previous_draft=previous_draft,
-            review=review,
-            draft_mode=draft_mode,
-            extra_context=extra_context,
-            adopted_sections=adopted_sections,
-            source_front_matter=source_front_matter,
-        )
-    else:
-        prompt = _writer_prompt(
-            context=context,
-            template=template,
-            memory=memory,
-            section=section,
-            config=config,
-            extra_context=extra_context,
-            previous_draft=previous_draft,
-            review=review,
-            source_batch_index=source_batch_index,
-            source_batch_count=source_batch_count,
-            include_previous_draft=include_previous_draft,
-            draft_mode=draft_mode,
-            adopted_sections=adopted_sections,
-            source_front_matter=source_front_matter,
-        )
-    if prompt_suffix:
-        prompt = prompt + "\n\n" + prompt_suffix
-    response = client.ask_json(
-        WRITER_SYSTEM,
-        prompt,
-        label=label,
-        max_output_tokens=config.max_section_tokens if config.max_section_tokens > 0 else None,
-    )
-    draft = _parse_section_draft(response, section)
-    _retain_bibliography_notes(memory, response, source_front_matter)
-    return draft
-
-
 def _parse_section_draft(response: dict[str, Any], section: ReportSectionPlan) -> ReportSectionDraft:
     """One parser for section-wise and jointly generated section bodies."""
     if _is_claim_record_response(response):
@@ -1958,9 +1892,8 @@ def _draft_document_with_recovery(
     payload = _writer_payload(context=context, template=template, memory=memory,
         section=None, document_sections=sections, config=config, extra_context=extra_context or [], previous_draft=None, review=None,
         source_batch_index=1, source_batch_count=1, include_previous_draft=False,
-        draft_mode="document", adopted_sections=adopted_sections)
-    if reviews is None:
-        payload = _source_bibliography_context(payload, source_front_matter or [], rules_key="response_rules")
+        draft_mode="document", adopted_sections=adopted_sections,
+        source_front_matter=source_front_matter if reviews is None else None)
     if reviews is not None:
         requests = {row.section_id: row for row in reviews}
         baselines = {row.section_id: row for row in adopted_sections}
@@ -2070,49 +2003,82 @@ def _review_section(
     previous_draft: ReportSectionDraft | None = None,
     extra_context: list[ReportToolResult] | None = None,
     config: ReportRuntimeConfig | None = None,
+    _recover: bool = False,
+    emit: Callable[[str], None] | None = None,
 ) -> ReportSectionReview:
-    view = _reviewer_context(
-        context=context,
-        template=template,
-        memory=memory,
-        section=section,
-        draft=draft,
-        adopted_sections=adopted_sections,
-        revision_review=revision_review, previous_draft=previous_draft,
-        extra_context=extra_context,
-        config=config,
+    """Independent review; its existing owner also handles bounded format correction."""
+    for attempt in range(2 if _recover else 1):
+        try:
+            view = _reviewer_context(
+                context=context,
+                template=template,
+                memory=memory,
+                section=section,
+                draft=draft,
+                adopted_sections=adopted_sections,
+                revision_review=revision_review, previous_draft=previous_draft,
+                extra_context=extra_context,
+                config=config,
+            )
+            prompt = _json_prompt(view)
+            if prompt_suffix:
+                prompt = prompt + "\n\n" + prompt_suffix
+            if attempt:
+                prompt += "\n\nReturn exactly one JSON object matching the reviewer schema, with `revision_instructions` as a list of strings."
+            response = client.ask_json(
+                REVIEWER_SYSTEM,
+                prompt,
+                label=f"{label}-retry" if attempt else label,
+                max_output_tokens=(config.max_section_tokens if config.max_section_tokens > 0 else None) if _recover else max_output_tokens,
+            )
+            review = ReportSectionReview.model_validate(resolve_review_evidence(_normalize_review_response(response, section), view))
+            current = review_draft_quote_sources(view)
+            validate_finding_anchors(review, current, view)
+            if revision_review is not None and previous_draft is not None and config is not None:
+                # A model pass cannot adopt a correction that makes a complete,
+                # previously fitting delivery violate its frozen length contract.
+                # Reuse the assembler/check; no new draft, quota or persisted state.
+                candidate = view.get("narrative_context", {}).get("delivery_text_observation", {})
+                old_sections = [row for row in (adopted_sections or []) if row.section_id != draft.section_id]
+                previous = delivery_text_observation(context, memory, [*old_sections, previous_draft], config)
+                before = previous.get("length_check", {})
+                after = candidate.get("length_check", {})
+                if (memory.section_plan and not previous.get("pending_draft_sections") and not candidate.get("pending_draft_sections")
+                        and previous.get("preview_status") == candidate.get("preview_status") == "pre_render_text_preview"
+                        and before.get("status") == "within_range"
+                        and after.get("status") in {"above_range", "below_range"}):
+                    finding = ReviewerFinding(finding_id=f"{draft.section_id}-delivery-length-regression",
+                        type="delivery_length", severity="major", required_action="revise", section_id=draft.section_id,
+                        message=f"This candidate changes the canonical delivery from {before['markdown_token_count']} to {after['markdown_token_count']} whitespace-separated Markdown tokens, outside the frozen range {after['min_words']}–{after['max_words']}. Task quotation: {after['request_quote']}",
+                        suggested_action="Revise this candidate within the existing allowance, preserving required evidence and assembly-owned text. Do not pad, truncate, expand the contract or edit other adopted sections to pass.")
+                    review = review.model_copy(update={"verdict": "revise_required", "findings": [*review.findings, finding]})
+            return review
+
+        except (LLMError, ValueError) as exc:
+            if not _recover:
+                raise
+            failure = exc
+            if attempt or (isinstance(exc, LLMError) and not isinstance(exc, LLMResponseError)):
+                break
+            _emit(emit, f"Reviewer JSON validation failed for `{section.heading}`; retrying once. {exc}")
+    if not config.allow_llm_fallback:
+        raise LLMError(f"Reviewer failed for `{section.heading}` and LLM fallback is disabled: {failure}") from failure
+    _emit(emit, f"Reviewer fallback used for `{section.heading}`. {failure}")
+    return ReportSectionReview(
+        section_id=section.section_id,
+        verdict="warning",
+        findings=[ReviewerFinding(
+            finding_id=f"{section.section_id}-review-fallback",
+            type="review_agent_fallback",
+            severity="minor",
+            message=f"Reviewer could not complete: {failure}. Section kept with fallback warning.",
+            section_id=section.section_id,
+            evidence_handles=section.evidence_handles[:5],
+            suggested_action="Manually inspect this section before publishing.",
+        )],
+        revision_instructions=["Manually inspect this section before publishing."],
+        notes="Reviewer fallback used; semantic review is incomplete.",
     )
-    prompt = _json_prompt(view)
-    if prompt_suffix:
-        prompt = prompt + "\n\n" + prompt_suffix
-    response = client.ask_json(
-        REVIEWER_SYSTEM,
-        prompt,
-        label=label,
-        max_output_tokens=max_output_tokens,
-    )
-    review = ReportSectionReview.model_validate(resolve_review_evidence(_normalize_review_response(response, section), view))
-    current = review_draft_quote_sources(view)
-    validate_finding_anchors(review, current, view)
-    if revision_review is not None and previous_draft is not None and config is not None:
-        # A model pass cannot adopt a correction that makes a complete,
-        # previously fitting delivery violate its frozen length contract.
-        # Reuse the assembler/check; no new draft, quota or persisted state.
-        candidate = view.get("narrative_context", {}).get("delivery_text_observation", {})
-        old_sections = [row for row in (adopted_sections or []) if row.section_id != draft.section_id]
-        previous = delivery_text_observation(context, memory, [*old_sections, previous_draft], config)
-        before = previous.get("length_check", {})
-        after = candidate.get("length_check", {})
-        if (memory.section_plan and not previous.get("pending_draft_sections") and not candidate.get("pending_draft_sections")
-                and previous.get("preview_status") == candidate.get("preview_status") == "pre_render_text_preview"
-                and before.get("status") == "within_range"
-                and after.get("status") in {"above_range", "below_range"}):
-            finding = ReviewerFinding(finding_id=f"{draft.section_id}-delivery-length-regression",
-                type="delivery_length", severity="major", required_action="revise", section_id=draft.section_id,
-                message=f"This candidate changes the canonical delivery from {before['markdown_token_count']} to {after['markdown_token_count']} whitespace-separated Markdown tokens, outside the frozen range {after['min_words']}–{after['max_words']}. Task quotation: {after['request_quote']}",
-                suggested_action="Revise this candidate within the existing allowance, preserving required evidence and assembly-owned text. Do not pad, truncate, expand the contract or edit other adopted sections to pass.")
-            review = review.model_copy(update={"verdict": "revise_required", "findings": [*review.findings, finding]})
-    return review
 
 
 def _draft_section_with_recovery(
@@ -2136,20 +2102,24 @@ def _draft_section_with_recovery(
     adopted_sections: list[ReportSectionDraft] | None = None,
     source_front_matter: list[dict[str, Any]] | None = None,
 ) -> ReportSectionDraft:
+    # This existing owner controls both calls. The removed one-call wrapper
+    # duplicated the full parameter contract solely to switch prompt formats.
+    prompt_inputs = dict(context=context, memory=memory, section=section, config=config,
+        extra_context=extra_context, previous_draft=previous_draft, review=review,
+        draft_mode=draft_mode, adopted_sections=adopted_sections, source_front_matter=source_front_matter,
+        template=template, source_batch_index=source_batch_index, source_batch_count=source_batch_count)
     for attempt in range(2):
         try:
-            return _draft_section(
-                client=client, context=context, template=template, memory=memory,
-                section=section, config=config, extra_context=extra_context,
+            prompt = _json_prompt(_writer_payload(**prompt_inputs, recovery=bool(attempt),
+                include_previous_draft=True if attempt else include_previous_draft))
+            if prompt_suffix:
+                prompt += "\n\n" + prompt_suffix
+            response = client.ask_json(WRITER_SYSTEM, prompt,
                 label=f"{label}-retry" if attempt else label,
-                previous_draft=previous_draft, review=review,
-                source_batch_index=source_batch_index, source_batch_count=source_batch_count,
-                prompt_suffix=prompt_suffix,
-                include_previous_draft=include_previous_draft, draft_mode=draft_mode,
-                recovery=bool(attempt),
-                adopted_sections=adopted_sections,
-                source_front_matter=source_front_matter,
-            )
+                max_output_tokens=config.max_section_tokens if config.max_section_tokens > 0 else None)
+            draft = _parse_section_draft(response, section)
+            _retain_bibliography_notes(memory, response, source_front_matter)
+            return draft
         except (LLMError, ValueError) as exc:
             failure = exc
             # Transport retries belong to the provider. A format retry requires
@@ -2163,61 +2133,9 @@ def _draft_section_with_recovery(
     return _fallback_section_draft(section)
 
 
-def _review_section_with_recovery(
-    *,
-    client: LLMClient,
-    context: ReportContext,
-    template: ReportTemplateBundle,
-    memory: ReportMemory,
-    section: ReportSectionPlan,
-    draft: ReportSectionDraft,
-    config: ReportRuntimeConfig,
-    label: str,
-    emit: Callable[[str], None] | None = None,
-    extra_context: list[ReportToolResult] | None = None,
-    adopted_sections: list[ReportSectionDraft] | None = None,
-    revision_review: ReportSectionReview | None = None,
-    previous_draft: ReportSectionDraft | None = None,
-) -> ReportSectionReview:
-    for attempt in range(2):
-        try:
-            return _review_section(
-                client=client, context=context, template=template, memory=memory,
-                section=section, draft=draft,
-                adopted_sections=adopted_sections,
-                revision_review=revision_review, previous_draft=previous_draft,
-                extra_context=extra_context,
-                config=config,
-                max_output_tokens=config.max_section_tokens if config.max_section_tokens > 0 else None,
-                label=f"{label}-retry" if attempt else label,
-                prompt_suffix=((
-                    "Return exactly one JSON object matching the reviewer schema, "
-                    "with `revision_instructions` as a list of strings."
-                ) if attempt else ""),
-            )
-        except (LLMError, ValueError) as exc:
-            failure = exc
-            if attempt or (isinstance(exc, LLMError) and not isinstance(exc, LLMResponseError)):
-                break
-            _emit(emit, f"Reviewer JSON validation failed for `{section.heading}`; retrying once. {exc}")
-    if not config.allow_llm_fallback:
-        raise LLMError(f"Reviewer failed for `{section.heading}` and LLM fallback is disabled: {failure}") from failure
-    _emit(emit, f"Reviewer fallback used for `{section.heading}`. {failure}")
-    return ReportSectionReview(
-        section_id=section.section_id,
-        verdict="warning",
-        findings=[ReviewerFinding(
-            finding_id=f"{section.section_id}-review-fallback",
-            type="review_agent_fallback",
-            severity="minor",
-            message=f"Reviewer could not complete: {failure}. Section kept with fallback warning.",
-            section_id=section.section_id,
-            evidence_handles=section.evidence_handles[:5],
-            suggested_action="Manually inspect this section before publishing.",
-        )],
-        revision_instructions=["Manually inspect this section before publishing."],
-        notes="Reviewer fallback used; semantic review is incomplete.",
-    )
+def _review_section_with_recovery(**kwargs: Any) -> ReportSectionReview:
+    """Compatibility entry for controlled callers; the reviewer owns both calls."""
+    return _review_section(**kwargs, _recover=True)
 
 
 def _fallback_section_draft(section: ReportSectionPlan) -> ReportSectionDraft:
@@ -2252,19 +2170,33 @@ def _writer_prompt(**kwargs: Any) -> str:
     return _json_prompt(_writer_payload(**kwargs))
 
 
-def _writer_task_context(
-    *, context: ReportContext, memory: ReportMemory, section: ReportSectionPlan | None,
-    config: ReportRuntimeConfig, extra_context: list[ReportToolResult] | None,
-    previous_draft: ReportSectionDraft | None, review: ReportSectionReview | None,
-    adopted_sections: list[ReportSectionDraft] | None,
-    document_sections: list[ReportSectionPlan] | None = None,
-) -> dict[str, Any]:
-    """The same saved requirements/evidence in normal and format-recovery calls.
+def _writer_task_context(**kwargs: Any) -> dict[str, Any]:
+    """Expose the controlled evidence view without constructing a request."""
+    return _writer_payload(**kwargs, _context_only=True)
 
-    Recovery keeps its smaller schema and prose instructions. It must not own a
-    second projection of the task, accepted prose, review opinions or tool reads.
-    This is a transient view, not another memory or checkpoint.
-    """
+
+def _writer_payload(
+    *,
+    context: ReportContext,
+    template: ReportTemplateBundle | None = None,
+    memory: ReportMemory,
+    section: ReportSectionPlan | None,
+    config: ReportRuntimeConfig,
+    extra_context: list[ReportToolResult] | None = None,
+    previous_draft: ReportSectionDraft | None = None,
+    review: ReportSectionReview | None = None,
+    source_batch_index: int = 1,
+    source_batch_count: int = 1,
+    include_previous_draft: bool = True,
+    draft_mode: str = "section",
+    adopted_sections: list[ReportSectionDraft] | None = None,
+    document_sections: list[ReportSectionPlan] | None = None,
+    source_front_matter: list[dict[str, Any]] | None = None,
+    recovery: bool = False,
+    _context_only: bool = False,
+) -> dict[str, Any]:
+    # Normal, joint and schema-first correction share this transient input view.
+    context_draft = previous_draft if include_previous_draft else None
     tools = extra_context or []
     selected = document_sections if section is None else [section]
     if not selected:
@@ -2275,7 +2207,7 @@ def _writer_task_context(
             section_ids=[row.section_id for row in memory.section_plan]) + _experiment_delivery_view(context, config))
     sources = list({row["handle"]: row for target in selected
         for row in _handles_for_section(memory, target)}.values())
-    view = {
+    task_context = {
         "objective": report_objective(context, memory),
         "document_plan": document_plan_context(memory),
         "previous_document": prior_draft_context(context),
@@ -2295,39 +2227,64 @@ def _writer_task_context(
         "review_instructions": effective_revision_instructions(review),
     }
     if section is not None:
-        view.update(narrative_context=neighbors,
+        task_context.update(narrative_context=neighbors,
             section_constraints=_section_constraints(section), length_requirement=_section_length_requirement(section),
             visual_requirements=visual_requirements(memory.document_plan, section),
             revision_preservation_requirement=_revision_preservation_requirement(
-                section=section, previous_draft=previous_draft, review=review))
+                section=section, previous_draft=context_draft, review=review))
         # One shared writing input, including joint drafting and recovery;
         # neighboring-prose context must not duplicate the same comparisons.
         for key in ("source_comparisons", "comparison_status", "assembly_owned_content"):
-            view["narrative_context"].pop(key, None)
-    return view
-
-
-def _writer_payload(
-    *,
-    context: ReportContext,
-    template: ReportTemplateBundle,
-    memory: ReportMemory,
-    section: ReportSectionPlan | None,
-    config: ReportRuntimeConfig,
-    extra_context: list[ReportToolResult],
-    previous_draft: ReportSectionDraft | None,
-    review: ReportSectionReview | None,
-    source_batch_index: int,
-    source_batch_count: int,
-    include_previous_draft: bool,
-    draft_mode: str,
-    adopted_sections: list[ReportSectionDraft] | None = None,
-    document_sections: list[ReportSectionPlan] | None = None,
-    source_front_matter: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    task_context = _writer_task_context(context=context, memory=memory, section=section,
-        config=config, extra_context=extra_context, previous_draft=previous_draft if include_previous_draft else None,
-        review=review, adopted_sections=adopted_sections, document_sections=document_sections)
+            task_context["narrative_context"].pop(key, None)
+    if _context_only:
+        return task_context
+    if recovery:
+        # The small outer-object schema is a distinct correction protocol;
+        # requirements, evidence and bibliography still have one projection owner.
+        payload = {
+            "task": "recover_one_report_section",
+            "draft_mode": draft_mode,
+            "instruction": (
+                "The previous response was not a usable section draft. Return one outer JSON object "
+                "whose required `draft_markdown` field contains the requested Markdown prose. "
+                "Do not return a claim record, a nested object, an explanation, or Markdown fences."
+            ),
+            "topic": context.topic,
+            **task_context,
+            "execution_context": _compact_execution_context(context.execution_context),
+            "experiment_plan": _compact_experiment_plan(context.experiment_plan),
+            "verified_execution_results": _compact_execution_results(context.results),
+            "execution_evidence": report_execution_evidence(context),
+            "section": {
+                "section_id": section.section_id,
+                "heading": section.heading,
+                "goal": section.goal,
+            },
+            "previous_draft": (
+                {
+                    "draft_markdown": previous_draft.draft_markdown,
+                    "citations": previous_draft.citations,
+                }
+                if previous_draft is not None
+                else {}
+            ),
+            "style_rules": [
+                "Write evidence-bounded prose appropriate to the requested section purpose using only supplied sources.",
+                "The original user's whole-document requirements and current revision instructions take precedence over approximate section targets. Read document_plan.length_budget when present: assembly text is reserved, section shares are not minima, and unresolved future costs still need final checking.",
+                "Prepared execution context declares requested conditions, not observed execution. Keep executor observations and attributed producer measurements distinct; do not change a recorded value to agree with a declaration.",
+                "Use only registered_citation_keys. Materials without keys use their supplied names or public URLs, never invented markers.",
+                "Do not include a References section.",
+                "`draft_markdown` is mandatory; optional metadata may be empty arrays.",
+            ],
+            "output_schema": _writer_response_contract(section),
+        }
+        if payload["visual_requirements"]["tables"]:
+            payload["style_rules"].append(
+                "Include every required visual_requirements table using a `**Table: <planned title>**` caption and a compact Markdown table."
+            )
+        return _source_bibliography_context(payload, source_front_matter or [], rules_key="style_rules")
+    if template is None:
+        raise ValueError("Ordinary drafting requires its template guidance.")
     payload = {
         "task": "draft_or_revise_one_report_section",
         "draft_mode": draft_mode,
@@ -2416,72 +2373,9 @@ def _writer_payload(
     return _source_bibliography_context(payload, source_front_matter or [], rules_key="response_rules")
 
 
-def _writer_recovery_prompt(
-    *,
-    context: ReportContext,
-    memory: ReportMemory,
-    section: ReportSectionPlan,
-    config: ReportRuntimeConfig,
-    previous_draft: ReportSectionDraft | None,
-    review: ReportSectionReview | None,
-    draft_mode: str,
-    extra_context: list[ReportToolResult] | None = None,
-    adopted_sections: list[ReportSectionDraft] | None = None,
-    source_front_matter: list[dict[str, Any]] | None = None,
-) -> str:
-    """Build a small, schema-first retry after a Writer output mismatch.
-
-    The ordinary Writer prompt deliberately carries rich planning context.  When
-    a model returns a nested claim record or a truncated object, sending that
-    same nested schema again is counterproductive.  This retry retains only
-    the evidence needed to write the section and makes the outer response
-    contract unambiguous.
-    """
-    task_context = _writer_task_context(context=context, memory=memory, section=section, config=config,
-        extra_context=extra_context, previous_draft=previous_draft, review=review,
-        adopted_sections=adopted_sections)
-    payload = {
-        "task": "recover_one_report_section",
-        "draft_mode": draft_mode,
-        "instruction": (
-            "The previous response was not a usable section draft. Return one outer JSON object "
-            "whose required `draft_markdown` field contains the requested Markdown prose. "
-            "Do not return a claim record, a nested object, an explanation, or Markdown fences."
-        ),
-        "topic": context.topic,
-        **task_context,
-        "execution_context": _compact_execution_context(context.execution_context),
-        "experiment_plan": _compact_experiment_plan(context.experiment_plan),
-        "verified_execution_results": _compact_execution_results(context.results),
-        "execution_evidence": report_execution_evidence(context),
-        "section": {
-            "section_id": section.section_id,
-            "heading": section.heading,
-            "goal": section.goal,
-        },
-        "previous_draft": (
-            {
-                "draft_markdown": previous_draft.draft_markdown,
-                "citations": previous_draft.citations,
-            }
-            if previous_draft is not None
-            else {}
-        ),
-        "style_rules": [
-            "Write evidence-bounded prose appropriate to the requested section purpose using only supplied sources.",
-            "The original user's whole-document requirements and current revision instructions take precedence over approximate section targets. Read document_plan.length_budget when present: assembly text is reserved, section shares are not minima, and unresolved future costs still need final checking.",
-            "Prepared execution context declares requested conditions, not observed execution. Keep executor observations and attributed producer measurements distinct; do not change a recorded value to agree with a declaration.",
-            "Use only registered_citation_keys. Materials without keys use their supplied names or public URLs, never invented markers.",
-            "Do not include a References section.",
-            "`draft_markdown` is mandatory; optional metadata may be empty arrays.",
-        ],
-        "output_schema": _writer_response_contract(section),
-    }
-    if payload["visual_requirements"]["tables"]:
-        payload["style_rules"].append(
-            "Include every required visual_requirements table using a `**Table: <planned title>**` caption and a compact Markdown table."
-        )
-    return _json_prompt(_source_bibliography_context(payload, source_front_matter or [], rules_key="style_rules"))
+def _writer_recovery_prompt(**kwargs: Any) -> str:
+    """Keep the schema-first correction view available to controlled callers."""
+    return _json_prompt(_writer_payload(**kwargs, recovery=True))
 
 
 def _writer_response_contract(section: ReportSectionPlan) -> dict[str, Any]:
@@ -2651,7 +2545,6 @@ def _compact_survey_contract(contract: dict[str, Any]) -> dict[str, Any]:
     selection = contract.get("paper_selection") if isinstance(contract.get("paper_selection"), dict) else {}
     selected_papers = selection.get("selected_papers") if isinstance(selection.get("selected_papers"), list) else []
     taxonomy = contract.get("taxonomy") if isinstance(contract.get("taxonomy"), dict) else {}
-    outline = contract.get("outline_plan") if isinstance(contract.get("outline_plan"), dict) else {}
     return {
         "schema_version": contract.get("schema_version", "survey_contract.v1"),
         "topic": contract.get("topic", ""),
@@ -2669,15 +2562,7 @@ def _compact_survey_contract(contract: dict[str, Any]) -> dict[str, Any]:
             for item in selected_papers[:20]
             if isinstance(item, dict)
         ],
-        "taxonomy_facets": [
-            {
-                "label": facet.get("label") or "",
-                "paper_keys": _string_items(facet.get("paper_keys"))[:8],
-                "evidence_count": facet.get("evidence_count") or 0,
-            }
-            for facet in (taxonomy.get("facets") if isinstance(taxonomy.get("facets"), list) else [])[:10]
-            if isinstance(facet, dict)
-        ],
+        "taxonomy_facets": [],
         "coverage_requirements": [
             {
                 "label": facet.get("label") or "",
@@ -2686,18 +2571,7 @@ def _compact_survey_contract(contract: dict[str, Any]) -> dict[str, Any]:
             for facet in (taxonomy.get("coverage_facets") if isinstance(taxonomy.get("coverage_facets"), list) else [])[:10]
             if isinstance(facet, dict)
         ],
-        "outline_sections": [
-            {
-                "heading": section.get("heading") or "",
-                "goal": section.get("goal") or "",
-                "target_words": section.get("target_words") or "",
-                "min_citations": section.get("min_citations") or "",
-                "subsections": _string_items(section.get("subsections"))[:6],
-                "citation_keys": _string_items(section.get("citation_keys"))[:10],
-            }
-            for section in (outline.get("sections") if isinstance(outline.get("sections"), list) else [])[:12]
-            if isinstance(section, dict)
-        ],
+        "outline_sections": [],
         "citation_policy": contract.get("citation_policy") if isinstance(contract.get("citation_policy"), dict) else {},
         "boundaries": _string_items(contract.get("boundaries"))[:6],
     }

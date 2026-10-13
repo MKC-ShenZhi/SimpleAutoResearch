@@ -3,7 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 
-from tests.legacy_session_fixture import historical_session
+from tests.legacy_session_fixture import historical_session, session_files
 from pathlib import Path
 
 from simple_ar.app.research_report import build_research_session_report_inputs
@@ -266,16 +266,18 @@ class ResearchReportApplicationTests(unittest.TestCase):
 
 
     def test_research_session_report_inputs_keep_execution_and_analysis_evidence(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            session = historical_session(root / "session")
-
-            context, memory = build_research_session_report_inputs(session)
-
-            self.assertEqual(context.topic, "reliable agents")
-            self.assertEqual(context.results["status"], "passed")
-            self.assertTrue(any(item.name == "accuracy" for item in context.metric_sources))
-            self.assertTrue(any(item.kind == "analysis" for item in memory.source_handles))
+        for aggregate in (False, True):
+            with self.subTest(aggregate=aggregate), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                session = historical_session(root, aggregate_brief=aggregate)
+                before = session_files(root)
+                context, memory = build_research_session_report_inputs(session)
+                self.assertEqual(context.topic, "reliable agents")
+                self.assertEqual(context.results["status"], "passed")
+                self.assertTrue(any(item.name == "accuracy" for item in context.metric_sources))
+                self.assertTrue(any(item.kind == "analysis" for item in memory.source_handles))
+                self.assertEqual(memory.source_handles, context.source_handles)
+                self.assertEqual(session_files(root), before)
 
     def test_report_projection_prefers_the_measured_execution_contract(self) -> None:
         from dataclasses import replace

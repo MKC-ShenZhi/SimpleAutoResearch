@@ -4,7 +4,7 @@ import json
 import tempfile
 import unittest
 
-from tests.legacy_session_fixture import historical_session
+from tests.legacy_session_fixture import historical_session, session_files
 from pathlib import Path
 
 from simple_ar.app.research_session import (
@@ -15,85 +15,39 @@ from simple_ar.app.research_session import (
 
 class ResearchSessionApplicationTests(unittest.TestCase):
     def test_historical_outputs_restore_without_executing_workflow(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-
-            result = historical_session(root / "session")
-
-            self.assertEqual(result.status, "ready_for_report")
-            self.assertEqual(result.next_capability, "report")
-            self.assertEqual(result.execution["status"], "passed")
-            self.assertEqual(result.analysis.status, "passed")
-
-            self.assertEqual(
-                [attempt.capability for attempt in result.attempts],
-                [
-                    "analysis",
-                    "research_design",
-                    "document_ingest",
-                    "experiment",
-                    "plan",
-                    "read",
-                    "search",
-                    "synthesize",
-                ],
-            )
-            self.assertEqual(
-                [decision.action for decision in result.decisions],
-                ["accept"],
-            )
-            self.assertTrue(
-                (root / "session" / "attempts" / "read-001" / "read_result.json").is_file()
-            )
-            self.assertTrue(
-                (root / "session" / "attempts" / "synthesize-001" / "synthesis_result.json").is_file()
-            )
-            self.assertTrue(
-                (root / "session" / "attempts" / "design-001" / "research_design.json").is_file()
-            )
-            self.assertIsNotNone(result.design)
-            self.assertIsNotNone(result.design_ref)
-            self.assertTrue(str(result.execution_ref.path).startswith("attempts/"))
-            self.assertTrue(str(result.analysis_ref.path).startswith("attempts/"))
-            manifest = json.loads(
-                (root / "session" / "session_manifest.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual(manifest["profile"], "full_research")
-            self.assertEqual(manifest["status"], "running")
-
-            restored = load_research_session_result(root / "session")
-            self.assertEqual(restored.status, result.status)
-            self.assertEqual(restored.brief_ref, result.brief_ref)
-            self.assertEqual(restored.design_ref, result.design_ref)
-            self.assertEqual(restored.design, result.design)
-            self.assertEqual(restored.execution_ref, result.execution_ref)
-            self.assertEqual(restored.analysis_ref, result.analysis_ref)
-            self.assertEqual(restored.execution, result.execution)
-            self.assertEqual(restored.analysis, result.analysis)
-            self.assertEqual(restored.attempts, result.attempts)
-            self.assertEqual(restored.decisions, result.decisions)
+        for aggregate, design, failed in ((False, True, False), (True, False, False),
+                                           (False, False, True), (True, True, True)):
+            with self.subTest(aggregate=aggregate, design=design, failed=failed), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                result = historical_session(root, aggregate_brief=aggregate, with_design=design, failed=failed)
+                before = session_files(root)
+                restored = load_research_session_result(root)
+                self.assertEqual(restored, result)
+                self.assertEqual(session_files(root), before)
+                self.assertEqual(result.status, "incomplete" if failed else "ready_for_report")
+                self.assertEqual(result.report_ready, not failed)
+                self.assertEqual(result.next_capability, "experiment" if failed else "report")
+                self.assertEqual(result.execution["status"], "failed" if failed else "passed")
+                self.assertEqual(result.analysis.status, "incomplete" if failed else "passed")
+                self.assertEqual([a.attempt_id for a in result.attempts], sorted([
+                    "analysis-001", "document-001", "experiment-001", "plan-001", "search-001",
+                    *(["brief-001"] if aggregate else ["read-001", "synthesize-001"]),
+                    *(["design-001"] if design else []),
+                ]))
+                self.assertEqual([d.action for d in result.decisions], ["accept"])
+                self.assertEqual(result.design is not None, design)
+                self.assertEqual(result.design_ref is not None, design)
+                for ref in (result.brief_ref, result.execution_ref, result.analysis_ref):
+                    self.assertTrue(ref.path.startswith("attempts/"))
+                    self.assertIn(Path(ref.path), before)
+                manifest = json.loads((root / "session_manifest.json").read_text(encoding="utf-8"))
+                self.assertEqual((manifest["profile"], manifest["status"]), ("full_research", "running"))
 
     def test_restore_rejects_a_missing_typed_handoff(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "missing-session"
             with self.assertRaises(ResearchSessionError):
                 load_research_session_result(root)
-
-    def test_failed_execution_reads_recorded_handoff_without_retrying(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-
-            result = historical_session(root / "session", failed=True)
-
-            self.assertNotEqual(result.status, "ready_for_report")
-            self.assertEqual(result.next_capability, "experiment")
-            self.assertEqual(
-                [attempt.attempt_id for attempt in result.attempts].count(
-                    "experiment-001"
-                ),
-                1,
-            )
-
 
 
 if __name__ == "__main__":

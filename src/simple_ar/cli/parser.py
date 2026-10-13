@@ -99,6 +99,8 @@ def build_parser(
         help="Run a bounded literature-only or literature-to-experiment research session.",
     )
     session_parser.add_argument("--config", type=Path, help="Research TOML; explicit CLI options override file values.")
+    session_parser.add_argument("--report-writing-method", choices=("article", "sections"), default=None,
+        help="New reports use a complete article work unit; explicit section/review controls retain sections. Saved sessions keep their method.")
     session_parser.add_argument("--session-root", type=Path, help="Continue this session; unchanged evidence and measurements are reused, while explicitly revised inputs invalidate only dependent results.")
     session_parser.add_argument(
         "--recover-interrupted", action="store_true",
@@ -799,7 +801,7 @@ def build_parser(
         "--planning-mode",
         choices=("tool_agent", "compact"),
         default=None,
-        help="Greenfield planning: tool_agent uses staged planning and review; compact uses one architecture call before retries.",
+        help="Greenfield complete architecture work unit (compact); tool_agent is a deprecated alias, with migration receipts for historical plans.",
     )
     code_task_execute.add_argument(
         "--llm-retry-attempts",
@@ -811,7 +813,7 @@ def build_parser(
         "--planning-review-rounds",
         type=int,
         default=None,
-        help="Override greenfield planning reviewer revision rounds for this execute call.",
+        help="Deprecated: planning review has been retired. Nonzero values emit a migration notice and grant no calls; use 0.",
     )
     code_task_execute.add_argument("--repair-rounds", type=int, default=None)
     code_task_execute.add_argument(

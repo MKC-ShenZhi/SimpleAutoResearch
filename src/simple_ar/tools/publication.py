@@ -175,7 +175,7 @@ class PublicationToolGateway:
                 try:
                     manifest = export_acm_report(source.parent, output, title=request.title or None,
                         body_name=source.name, compile_pdf=request.compile_pdf, render_preview=request.render_preview, runner=render,
-                        validate_asset=validate_asset)
+                        validate_asset=validate_asset, caption_owner='markdown')
                 except ReportExportError:
                     if not (output / 'export.json').is_file():
                         raise

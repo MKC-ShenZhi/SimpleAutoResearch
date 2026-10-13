@@ -204,8 +204,8 @@ def generate_greenfield_code_task(
     implementation_agent_timeout_sec: int = 600,
     allow_planning_fallback: bool = False,
     llm_retry_attempts: int = 1,
-    planning_mode: str = "tool_agent",
-    planning_review_rounds: int = 2,
+    planning_mode: str = "compact",
+    planning_review_rounds: int = 0,
     planning_snapshot_from: str | Path | None = None,
     message_callback: MessageCallback | None = None,
 ) -> GreenfieldCodeTaskResult:
@@ -223,6 +223,20 @@ def generate_greenfield_code_task(
     manifest = load_code_task_manifest(root)
     if _code_task_kind(manifest) != "greenfield":
         raise RuntimeError("generate_greenfield_code_task requires [code_task].kind = greenfield")
+    if manifest_section(manifest, "implementation").get("status") == "generated":
+        # Public direct callers have the same no-regeneration contract as execute.
+        meta = paths.meta_dir
+        artifacts = read_json(meta / "code_artifacts.json")
+        review = read_json(meta / "review_report.json")
+        return GreenfieldCodeTaskResult(
+            run_dir=root, project_dir=paths.workspace_dir / "generated_project",
+            implementation_plan_path=meta / "implementation_plan.json",
+            architecture_plan_path=meta / "architecture_plan.json",
+            file_plan_path=meta / "file_plan.json", code_artifacts_path=meta / "code_artifacts.json",
+            review_report_path=meta / "review_report.json", review_status=str(review.get("status", "unknown")),
+            generated_files=tuple(str(row["path"]) for row in artifacts.get("generated_files", [])
+                                  if isinstance(row, dict) and row.get("path")),
+        )
     paths.meta_dir.mkdir(parents=True, exist_ok=True)
     memory_dir = paths.task_dir / "memory"
     memory_dir.mkdir(parents=True, exist_ok=True)
@@ -315,16 +329,17 @@ def generate_greenfield_code_task(
             retry_attempts=llm_retry_attempts,
             planning_mode=planning_mode,
             planning_review_rounds=planning_review_rounds,
+            planner_selector=planner_model or model or "",
             planning_dir=planning_dir,
             message_callback=message_callback,
         )
     implementation_plan_path = paths.meta_dir / "implementation_plan.json"
     architecture_plan_path = paths.meta_dir / "architecture_plan.json"
     file_plan_path = paths.meta_dir / "file_plan.json"
-    effective_planning_mode = str((planning_snapshot or {}).get("source_planning_mode") or planning_mode)
+    effective_planning_mode = str((planning_snapshot or {}).get("source_planning_mode") or "compact")
     effective_planning_review_rounds = (planning_snapshot or {}).get(
         "source_planning_review_rounds",
-        planning_review_rounds,
+        0,
     )
     write_json(
         implementation_plan_path,
@@ -337,6 +352,7 @@ def generate_greenfield_code_task(
             "project_dir": "code_task/workspace/generated_project",
             "entrypoint": benchmark_command,
             "planning_mode": effective_planning_mode,
+            "requested_planning_mode": planning_mode,
             "planning_review_rounds": effective_planning_review_rounds,
             "ablation": {
                 "planning_snapshot": planning_snapshot,
@@ -487,7 +503,7 @@ def _llm_client(
             ),
         )
     except LLMError as exc:
-        if allow_fallback:
+        if allow_fallback and not (model or "").startswith(("profile:", "route:")):
             _emit(message_callback, f"LLM unavailable; using bounded fallback generation. {exc}")
             return None
         raise LLMError(

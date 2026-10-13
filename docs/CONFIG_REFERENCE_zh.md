@@ -6,16 +6,24 @@
 
 ## 引导设置
 
-`start` 保存普通研究 TOML，改码另引用 CodeTask TOML。对话和结构化入口共用序列化；设置草稿不是执行会话。
+普通自然语言 `start`、`--guided` 及无精确协议控制的成果偏好创建原生保存会话，
+不生成供用户编辑的研究 TOML。命名连接仍由下面的模型目录 TOML 管理；
+目标、挂载、授权及额度由启动参数提供，恢复使用保存值。
+显式结构化协议的 `start` 才保存研究 TOML，改码可另引用 CodeTask TOML；
+`--chat` 使用这一结构化设置序列化，设置草稿不是执行会话。
+普通完整操作见[使用流程](USAGE_zh.md#可复制的普通用户流程)。
 
 | 设置 | 位置 |
 | --- | --- |
 | 命名连接和用途路由 | 可选模型目录 TOML |
 | 连接密钥／旧单连接配置 | 环境变量或私有 `.env` |
-| 目标、输入、交付、资源限制 | 研究 TOML |
-| 编辑项目、保护、项目解释器 | 引用的 CodeTask TOML |
+| 原生目标、只读材料、权限、资源限制 | `start` 参数；续接保留保存会话 |
+| 精确协议目标、输入、交付、资源限制 | 结构化研究 TOML |
+| 结构化编辑项目、保护、项目解释器 | 引用的 CodeTask TOML |
 
-优先级为默认值 → TOML → 明确 CLI；CLI 列表替换文件列表。路径按对应字段从配置位置解析，命令 argv 保持字面含义；对话不能暗改用户明确选择。
+结构化研究配置优先级为默认值 → TOML → 明确 CLI；CLI 列表替换文件列表。
+路径按对应字段从配置位置解析，命令 argv 保持字面含义；对话不能暗改用户明确选择。
+这不是原生恢复的覆盖规则：恢复保留原模型、解释器和额度，追加材料/访问或续额须走明确续接参数。
 
 ### 命名模型连接
 
@@ -28,12 +36,15 @@ TOML 保存名称、URL、模型及密钥变量名，不保存密钥本身。
 流式、超时及密钥是否已配置，并将 `profile:名称` 写入任务配置。明确指定的 `--model`
 不会被替换；纯描述统计不要求模型。有目录时无需在 `.env` 重复填写模型和端点，只需保留
 被引用的密钥，以及不使用全局路径时的 `SIMPLE_AR_MODELS_CONFIG`。没有目录会明确提示
-正在使用旧环境配置；`--prepare-only` 允许在尚未设置密钥时先保存任务。
+正在使用旧环境配置。结构化 `--prepare-only` 可在尚未设置密钥时先保存 TOML；
+原生 `--prepare-only` 会预检连接与凭据，再保存会话，但不调用模型或执行进程。
+`start`、`models` 和模型客户端只读取命令当前目录的 `.env`，不覆盖已有环境变量；
+换目录运行时请确保目录路径和凭据仍可发现。
 
 ```bash
 simple-ar models                       # 本地检查，不调用 API
 simple-ar models --config /path/models.toml
-simple-ar start --chat --model profile:daily
+simple-ar start "解释这些材料" --source materials/ --model profile:daily
 ```
 
 `models --config` 只检查指定文件，不会替后续命令启用它。`--model env` 选 `text` 路由，
@@ -246,7 +257,16 @@ JSON 语法错误会在引导保存前失败；声明 `table_analysis.*` 的文�
 默认 `report.template = "material_report"`，整理已有材料，不要求不存在的实验或失败目标；
 `"analysis_report"` 保留为目标未达成/不确定的实验分析，`"experiment"` 请求论文体草稿，而不授权实验。
 已保存的显式模板继续有效；已经开始写作的自动模板沿用原输入快照的解析结果，不因升级重选。
-引导写作默认开启 `report.document_review = true`。执行配置、在线搜索及研究创新不属于此任务。
+新 `research-session` 报告默认选择 `[report].writing_method = "article"`，复用整篇 Writer，
+再由已有装配与确定性审计交付；不冒充独立模型审阅或原文补读。
+显式分节、规划、审阅或引用数量控制自动选择 `"sections"`；明确选择 `article` 时，
+不兼容控制在执行前拒绝，不静默忽略。正数 `max_section_tokens` 限制整篇响应。
+保存任务沿原方法和检查点所有者恢复，不在续跑时隐含换方法。
+明确刷新或修改目标时，上一份接受的整篇正文作为待编辑稿提供，不充当原始证据；
+旧稿、原响应及费用记录保留。
+
+结构化引导兼容路径保留 `report.document_review = true` 和受控分节 Writer。
+执行配置、在线搜索及研究创新不属于材料写作任务。
 专家可加 `review_scope = "document"`，先完成多节正文，再沿原整稿审阅/修订执行，
 不强制先逐节重复审阅；必须同时开启 `document_review = true`。默认 `section` 保持旧顺序，
 单节稿仍审阅该节。检查点、证据工具和每节修订上限共用原机制，草稿不认证为已逐节审阅；
@@ -442,7 +462,8 @@ value_unit = "秒"
 | `[execution]` | `output_files` | 可选映射，附件名称对应进程 `SIMPLE_AR_OUTPUT_DIR` 内的相对 POSIX 文件路径。仅登记每个不超过 2 MiB 的 UTF-8 普通文件，提供有界预览与读取句柄；缺失或不可读附件独立于执行成功状态记录。 |
 | `[execution]` | `pairs`、`seeds`、`seed_flag`、`seed_count` | 可选的显式比较输入。`pairs` 每行包含唯一整数 `seed` 与 literal `baseline_command`/`candidate_command`；compact seed 必须有 literal command 和显式 seed flag/count，不解析自然语言 seed。 |
 | `[execution]` | `baseline_policy`、`baseline_ref`、`protocol` | policy 为 `run`、`skip` 或 `reuse`；`reuse` 要求当前 session 中通过且命令、schema、协议条件、保护资产和准备 lineage 都匹配的产物。`protocol` 复用已有实验合同，但不证明数据内容。 |
-| `[report]` | `template`、`reviewer`、`max_review_iterations`、`document_review`、`max_section_tokens`、`max_cited_sources`、`figures` | `template` 默认 `auto`，`reviewer` 默认 `llm`，CLI 修订次数默认 `1`。可选 `document_review = true` 增加整稿审查：新论证计划可纠正冻结的各章节，旧计划保留两处目标；每处最多修订 `max_review_iterations` 次，被拒候选计入额度，恢复不重置。整稿审查默认关闭。`max_section_tokens = 0` 取消单次输出上限；正整数 `max_cited_sources` 限制最终不同引用数，不提前截断阅读池，超出在终审记录；省略即不设此上限。图表默认确定性生成，可设 `[report.figures].enabled = false` 或 `mode = "off"`。 |
+| `[report]` | `writing_method` | 新结构化报告默认 `article`，显式分节/审阅控制选择 `sections`。整篇起草共享正文所有者，装配与确定性审计保持；显式 `sections` 保留规划、审阅与部分检查点。历史未记录此字段的任务仍走分节方法，保存的所有者不在恢复时切换。 |
+| `[report]` | `template`、`reviewer`、`max_review_iterations`、`document_review`、`max_section_tokens`、`max_cited_sources`、`figures` | `template` 默认 `auto`；受控 `sections` 方法的 `reviewer` 默认 `llm`，CLI 修订次数默认 `1`，整篇方法关闭模型审阅。显式 `document_review = true` 选择受控方法并增加整稿审查：新论证计划可纠正冻结的各章节，旧计划保留两处目标；每处最多修订 `max_review_iterations` 次，被拒候选计入额度，恢复不重置。`max_section_tokens = 0` 取消单次输出上限；正整数 `max_cited_sources` 选择受控方法并限制最终不同引用数，不提前截断阅读池，超出在终审记录；省略即不设此上限。图表默认确定性生成，可设 `[report.figures].enabled = false` 或 `mode = "off"`。 |
 | `[report]` | `max_document_review_prompt_chars` | 专家可选的完整审阅请求字符上限，默认 `0` 不添加隐藏的拼接请求限制。已有检索窗口、60,000 字符稿件窗口、模型容量及累计会话预算仍有效。正数上限拒绝超量审阅，不截断证据、不假称已经审完。 |
 
 `report.figures.max_figures = 0` 选择自动生成，不表示纯文字。自适应文章只生成
@@ -646,9 +667,9 @@ CodeTask TOML 旧有的相对路径仍以运行时 cwd 为基准，不会被静�
 | `[execute].baseline_metrics_file` | `baseline_policy = "provided"` 时使用的 JSON 或 `metric=0.82` 文本指标文件。JSON 支持 `{"accuracy": 0.8}`、`{"metrics": {...}}` 和 `{"metric_values": {...}}`。 |
 | `[execute].apply_proposed_edits` | 允许 execute 应用已经审核过的 proposal。review-first 流程建议保持 false。 |
 | `[execute].allow_large_edits` | 允许应用超过 normal 预算但落在 large 预算内的已审核 proposal。 |
-| `[execute].allow_planning_fallback` | 允许明确的离线规划，以及完整、用量已知的响应格式失败后的 greenfield fallback；不把提供方、预算、时限或未完成流失败替换成离线成功。要求模型实施的任务保持 false。 |
-| `[execute].planning_mode` | Greenfield 规划：`tool_agent` 分需求、架构、接口、文件计划及有限审阅，正常至少五次调用；`compact` 在重试前仅一次架构调用。两者共用文件生成和执行，调用数不代表研究质量。 |
-| `[execute].planning_review_rounds` | standalone code-task 中 greenfield planning reviewer 可触发的最大回修轮数。默认 `2`；轻量 smoke example 可设为 `1`，大型服务器任务可按需调大。 |
+| `[execute].allow_planning_fallback` | 允许明确的离线规划，以及完整、用量已知的响应格式失败后的 greenfield 模板；模板不造测量值，未实现 runner 会失败，须以真实实验替代。不把提供方、预算、时限或未完成流失败替换成离线成功。要求模型实施的任务保持 false。 |
+| `[execute].planning_mode` | Greenfield 完整架构工作单元，默认 `compact`；`tool_agent` 为弃用别名。历史未完成规划先保存方法迁移回执，保留旧阶段及失败，不重置账本。 |
+| `[execute].planning_review_rounds` | 弃用，默认 `0`；历史非零值显示迁移说明，不授予复审调用。移除阶段选择字段，改用一个既有 `[models.code_task].planner` 连接；不静默替换命名 profile。 |
 | `[execute].llm_retry_attempts` | work/patch 规划和 greenfield 架构/文件生成的完整响应纠正上限，含首次尝试。运输重试和等待只由共享连接的 `retry_attempts`（旧环境变量 `SIMPLE_AR_LLM_RETRY_ATTEMPTS`）负责，不再由阶段乘倍。账本有未核清操作时不纠正或 fallback，即使用量维度已记全。 |
 | `[execute].repair_rounds` | 技术性验证/运行失败后的有限修复次数（非负整数，默认 `0`）。带 CodeTask 项目的 `research-session` 也用它限制单条件科研修订失败后的修复/复测；复测沿用既定协议与进程预算，不授权科研方法变更、增种子或配对修订的自动修复。修复仍需审核。 |
 | `[execute].max_files` | plan/proposal/repair 步骤纳入 LLM 上下文的最大文件数，也限制新 greenfield 规划的文件数，包括补入的 `main.py`。完整规划超限时明确拒绝，不静默丢弃模块或依赖；已保存规划不按新上限重建。 |
@@ -762,8 +783,8 @@ baseline_policy = "auto"
 apply_proposed_edits = false
 allow_large_edits = false
 allow_planning_fallback = false
-planning_mode = "tool_agent"
-planning_review_rounds = 2
+planning_mode = "compact"
+planning_review_rounds = 0
 llm_retry_attempts = 3
 max_files = 8
 max_source_chars_per_file = 4000
@@ -871,7 +892,7 @@ baseline_policy = "auto"
 apply_proposed_edits = false
 allow_large_edits = false
 allow_planning_fallback = false
-planning_review_rounds = 2
+planning_review_rounds = 0
 llm_retry_attempts = 3
 
 [execute.ablation]

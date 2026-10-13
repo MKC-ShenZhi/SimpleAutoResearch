@@ -11,7 +11,10 @@ from pathlib import Path
 from simple_ar.app.research_session import load_research_session_result
 
 
-def historical_session(root: Path, *, failed: bool = False):
+def historical_session(
+    root: Path, *, failed: bool = False, code_task: bool = False,
+    aggregate_brief: bool = False, with_design: bool = True,
+):
     topic = "reliable agents"
     status = "failed" if failed else "passed"
     contract = {
@@ -64,6 +67,24 @@ def historical_session(root: Path, *, failed: bool = False):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(value, indent=2), encoding="utf-8")
 
+    synthesis = next(row[4] for row in payloads if row[0] == "synthesize-001")
+    if aggregate_brief:
+        read = next(row[4] for row in payloads if row[0] == "read-001")
+        payloads = [row for row in payloads if row[0] not in {"read-001", "synthesize-001"}]
+        payloads.append(("brief-001", "research_brief", "research_brief", "research_brief.v1", {
+            "status": "ready", "topic": topic,
+            "read": {"schema_version": "read_result.v1", **read},
+            "synthesis": {"schema_version": "synthesis_result.v1", **synthesis},
+        }))
+    if not with_design:
+        payloads = [row for row in payloads if row[0] != "design-001"]
+    source_ref = {"path": "inputs/code_task_input.json", "kind": "research_input",
+                  "schema": "research_code_task_input.v1"}
+    if code_task:
+        write(source_ref["path"], {
+            "schema_version": source_ref["schema"], "topic": topic,
+            "synthesis": {"schema_version": "synthesis_result.v1", **synthesis},
+        })
     for attempt, capability, kind, schema, body in payloads:
         filename = {"experiment": "results.json", "analysis": "analysis.json"}.get(capability, f"{kind}.json")
         relative = f"attempts/{attempt}/{filename}"
@@ -73,6 +94,10 @@ def historical_session(root: Path, *, failed: bool = False):
             "status": "failed" if failed and capability == "experiment" else "completed",
             "parent_attempt": "experiment-001" if capability == "analysis" else None,
             "outputs": [{"path": filename, "kind": kind, "schema": schema}],
+            **({"inputs": [source_ref] + ([{
+                "path": "attempts/design-001/research_design.json", "kind": "research_design",
+                "schema": "research_design.v1",
+            }] if with_design else [])} if code_task and capability == "experiment" else {}),
         })
     write("session_manifest.json", {
         "schema_version": "session_manifest.v1", "session_id": "historical-fixture", "topic": topic,
@@ -81,4 +106,12 @@ def historical_session(root: Path, *, failed: bool = False):
         "decisions": [{"capability": "analysis", "attempt_id": "analysis-001", "action": "accept",
                        "result_status": "completed", "next_capability": "experiment" if failed else "report"}],
     })
+    if code_task:
+        from simple_ar.app.research_code_task import load_research_code_task_session_result
+        return load_research_code_task_session_result(root)
     return load_research_session_result(root)
+
+
+def session_files(root: Path):
+    """Snapshot all saved evidence, including manifests and failed records."""
+    return {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}

@@ -301,7 +301,7 @@ class WritingToolGateway:
         from simple_ar.report.projection import build_material_report_inputs, apply_report_bibliography
         from simple_ar.report.schema import ReportRuntimeConfig, ReportSectionPlan, ReportDocumentPlan, SourceHandle, ReportMemory
         from simple_ar.report.templates import load_report_template_bundle, intended_use_guidance
-        from simple_ar.report.writing import ARTICLE_OWNER, write_whole_article
+        from simple_ar.report.writing import ARTICLE_OWNER, article_writing_inputs, write_whole_article
         from simple_ar.research.documents.ingest import DocumentBundle
         from simple_ar.research.contracts import DocumentRecord, TextChunk
         from simple_ar.research.store.retrieval import rank_source_chunks
@@ -590,19 +590,9 @@ class WritingToolGateway:
             config.figures.enabled = False
             writer_store = ArtifactStore(owner.root / 'writer')
             if writing_owner == ARTICLE_OWNER:
-                article_handles = []
-                for handle in context.source_handles:
-                    view = handle.model_dump(mode='json', exclude_defaults=True)
-                    metadata = view.get('metadata', {})
-                    if metadata.get('evidence_passages') or metadata.get('caption'):
-                        view.pop('summary', None)
-                    article_handles.append(view)
-                inputs = {'binding': binding, 'assembly_config': config.model_dump(mode='json'),
-                    'article': {'goal': request.goal, 'title': request.title, 'target_words': request.target_words,
-                        'source_handles': article_handles,
-                        'front_matter': [section.to_row() for section in documents.sections],
-                        'bibliography': context.papers, 'citation_key_map': context.citation_key_map,
-                        'prior_draft': previous}}
+                inputs = article_writing_inputs(report_context=context, documents=documents, binding=binding,
+                    config=config, title=request.title, goal=request.goal,
+                    target_words=request.target_words, prior_draft=previous)
                 if not recovering:
                     client = client or (self.client_factory(identity) if self.client_factory else LLMClient.from_env(
                         self.model, budget_ledger=self.ledger, budget_session_id=self.session_id, budget_attempt_id=identity))

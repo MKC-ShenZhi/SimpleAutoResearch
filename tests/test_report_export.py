@@ -61,16 +61,27 @@ class ReportExportTests(unittest.TestCase):
                     self.assertEqual(authored['c'][1], authored_alt)
                     # Containers preserve the same ownership and do not bind
                     # modern Figure content a second time.
-                    for container in ('Div', 'BlockQuote', 'BulletList'):
-                        children = [deepcopy(figure), deepcopy(duplicate), deepcopy(discussion)]
-                        content = ([['topic', [], []], children] if container == 'Div' else
-                            [children] if container == 'BulletList' else children)
-                        wrapped = {'t': container, 'c': content}
-                        nested = {'blocks': [wrapped]}
-                        self.assertEqual(_bind_figure_captions(nested, {'figures/raw.svg': caption}),
-                            ['figures/raw.svg'])
-                        self.assertEqual(len(children), 2)
-                        self.assertEqual(children[-1], discussion)
+                    stale = [{'t': 'Str', 'c': 'Superseded manifest caption.'}]
+                    for owner in ('manifest', 'markdown'):
+                        for container in ('Div', 'BlockQuote', 'BulletList'):
+                            children = [deepcopy(figure), deepcopy(duplicate), deepcopy(discussion)]
+                            content = ([['topic', [], []], children] if container == 'Div' else
+                                [children] if container == 'BulletList' else children)
+                            wrapped = {'t': container, 'c': content}
+                            nested = {'blocks': [wrapped]}
+                            self.assertEqual(_bind_figure_captions(nested, {'figures/raw.svg': stale},
+                                caption_owner=owner), ['figures/raw.svg'] if owner == 'manifest' else [])
+                            # Deduplicate only the selected owner's caption; old
+                            # managed exports must not delete different prose.
+                            self.assertEqual(len(children), 3 if owner == 'manifest' else 2)
+                            self.assertEqual(children[-1], discussion)
+                            selected = children[0]
+                            selected_image = selected['c'][2][0]['c'][0] if modern else selected['c'][0]
+                            self.assertEqual(selected_image['c'][1],
+                                stale if owner == 'manifest' else authored_alt)
+                            if modern:
+                                self.assertEqual(selected['c'][1][1][0]['c'],
+                                    stale if owner == 'manifest' else caption)
 
     def test_caption_binding_leaves_unregistered_and_inline_images_unchanged(self):
         from copy import deepcopy
@@ -105,6 +116,36 @@ class ReportExportTests(unittest.TestCase):
             ast = {'blocks': [figure, {'t': 'Para', 'c': deepcopy(image['c'][1])}]}
             before = deepcopy(ast)
             self.assertEqual(_bind_figure_captions(ast, {}), [])
+            self.assertEqual(ast, before)
+
+            # Non-caption alt text is not an author caption. Manifest fallback
+            # is still required for both legacy images and modern Figures.
+            fallback = [{'t': 'Str', 'c': 'Recorded fallback.'}]
+            ast = {'blocks': [deepcopy(figure), {'t': 'Para', 'c': deepcopy(fallback)}]}
+            self.assertEqual(_bind_figure_captions(ast, {'unknown.png': fallback},
+                caption_owner='markdown'), ['unknown.png'])
+            self.assertEqual(len(ast['blocks']), 1)
+            selected = ast['blocks'][0]
+            if modern:
+                self.assertEqual(selected['c'][1], [None, [{'t': 'Plain', 'c': fallback}]])
+            else:
+                self.assertEqual(selected['c'][0]['c'][1], fallback)
+                self.assertEqual(selected['c'][0]['c'][-1][1], 'fig:')
+
+        # Short-only and multi-block modern captions are authored too, but do
+        # not authorize single-paragraph deduplication or rewriting alt text.
+        for caption in (
+                [[{'t': 'Str', 'c': 'Short caption'}], []],
+                [None, [{'t': 'Plain', 'c': image['c'][1]},
+                    {'t': 'Para', 'c': [{'t': 'Str', 'c': 'Second paragraph'}]}]]):
+            captioned_image = deepcopy(image)
+            captioned_image['c'][1] = []
+            ast = {'blocks': [{'t': 'Figure', 'c': [['', [], []], deepcopy(caption),
+                [{'t': 'Para', 'c': [captioned_image]}]]},
+                {'t': 'Para', 'c': deepcopy(image['c'][1])}]}
+            before = deepcopy(ast)
+            self.assertEqual(_bind_figure_captions(ast, {'unknown.png': fallback},
+                caption_owner='markdown'), [])
             self.assertEqual(ast, before)
 
     def test_scientific_unicode_support_is_fixed_and_only_for_present_symbols(self):
@@ -283,6 +324,7 @@ class ReportExportTests(unittest.TestCase):
                     patch("simple_ar.tools.publication.run_process", side_effect=render) as processes:
                 published = gateway.call("export_report", {"markdown": "workspace/draft.md", "compile_pdf": False}, identity="export")
                 self.assertEqual(published.status, "ok", published.error)
+                self.assertEqual(published.data['manifest']['figure_caption_owner'], 'markdown')
                 count = processes.call_count
                 self.assertGreater(count, 1)
                 self.assertEqual(gateway.call("export_report", {"markdown": "workspace/draft.md", "compile_pdf": False}, identity="export").data,
@@ -316,8 +358,9 @@ class ReportExportTests(unittest.TestCase):
                 self.assertEqual(gateway.call('export_report', bad_delivery, identity='private-delivery').status, 'error')
                 self.assertEqual(processes.call_count, after_delivery)
                 with patch('simple_ar.tools.publication.export_acm_report', return_value={
-                        'status': 'compile_failed', 'compiled': False, 'error': 'Renderer failure'}):
+                        'status': 'compile_failed', 'compiled': False, 'error': 'Renderer failure'}) as exporter:
                     failed_delivery = gateway.call('export_report', delivery_request, identity='failed-delivery')
+                self.assertEqual(exporter.call_args.kwargs['caption_owner'], 'markdown')
                 self.assertEqual(failed_delivery.status, 'error')
                 self.assertNotIn('delivery', failed_delivery.data)
                 count = after_delivery
@@ -481,12 +524,18 @@ class ReportExportTests(unittest.TestCase):
                     if key in {'draft.md', 'references.bib', 'figures/figures_manifest.json'}}
                 markdown_only = {key: value for key, value in input_only.items() if key != 'inputs'}
                 markdown_only['sha256'] = saved['inputs']['draft.md']
+                # Older terminal manifests have no caption-owner field. Reading
+                # them must neither migrate their bytes nor infer a new policy.
+                manifest = {key: value for key, value in manifest.items() if key != 'figure_caption_owner'}
+                historical_bytes = json.dumps(manifest).encode('utf-8')
+                (output / 'export.json').write_bytes(historical_bytes)
                 for historic in (saved, input_only, markdown_only):
                     with self.subTest(historic=historic):
                         (owner / 'request.json').write_text(json.dumps(historic), encoding='utf-8')
                         legacy = gateway.call('export_report', bound_request, identity='bound')
                         self.assertEqual(legacy.status, 'blocked', legacy.error)
                         self.assertEqual(legacy.data['historical_manifest'], manifest)
+                        self.assertEqual((output / 'export.json').read_bytes(), historical_bytes)
                         self.assertEqual(legacy.data['output_integrity'], 'historical_unbound')
                         self.assertNotIn('manifest', legacy.data)
                         self.assertNotIn('delivery', legacy.data)
@@ -625,6 +674,18 @@ class ReportExportTests(unittest.TestCase):
             original_body = (source / 'report_body.md').read_bytes()
             with patch("simple_ar.report.export.shutil.which", return_value="pandoc"), patch("simple_ar.report.export._run", side_effect=convert):
                 result = export_acm_report(source, root / "acm")
+                self.assertEqual(result['figure_caption_owner'], 'manifest')
+                # A later canonical edit must not require editing the recorded
+                # manifest. The same pipeline still exports its vector variant.
+                caption = [{'t': 'Str', 'c': 'Revised canonical comparison.'}]
+                document['blocks'][-3]['c'][0]['c'][1] = caption
+                document['blocks'][-3]['c'][0]['c'][-1][1] = 'fig:'
+                document['blocks'][-2]['c'] = [{'t': 'Emph', 'c': caption}]
+                revised = export_acm_report(source, root / 'canonical', caption_owner='markdown')
+                self.assertEqual(revised['figure_caption_owner'], 'markdown')
+                self.assertEqual(revised['bound_figure_captions'], [])
+                self.assertEqual(revised['figure_exports'], result['figure_exports'])
+                self.assertEqual((root / 'canonical' / revised['figure_exports']['original.png']['svg']).read_text(), vector)
                 # Two different declared owners for one path must fail before
                 # creating a project; retaining the last row would hide a conflict.
                 manifest_path = source / 'figures/figures_manifest.json'

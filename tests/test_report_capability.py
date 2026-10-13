@@ -5,6 +5,7 @@ from dataclasses import replace
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from simple_ar.core import CapabilityRegistry, SessionController
 from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
@@ -26,7 +27,10 @@ from simple_ar.report.schema import (
     ReportArgumentPlan,
     ReportArgumentPoint,
     MetricSource,
+    ReportTemplateBundle,
+    SourceHandle,
 )
+from simple_ar.report.writing import ARTICLE_OWNER, ReportWritingRequest, resolve_report_writing_resume, run_report_writing_capability
 
 
 class ReportAuditCapabilityTests(unittest.TestCase):
@@ -635,6 +639,298 @@ class ReportAuditCapabilityTests(unittest.TestCase):
                 )["status"],
                 "failed",
             )
+
+
+class ArticleClient:
+    def __init__(self, response=None):
+        self.calls = []
+        self.response = response if response is not None else {
+            'draft_markdown': '## Observations\n\nRecorded value: 0.75.\n\n## Limits\n\nOne declared condition.'}
+
+    def ask_json(self, system, prompt, **kwargs):
+        self.calls.append((system, json.loads(prompt), kwargs))
+        return self.response
+
+
+class StructuredArticleWritingTests(unittest.TestCase):
+    def request(self, client=None):
+        config = ReportRuntimeConfig(reviewer='disabled', max_review_iterations=0,
+            allow_source_backtracking=False, outline_strategy='template', max_section_tokens=900)
+        context = ReportContext(topic='Recorded observations', report_mode='supplied_materials',
+            goal_markdown='Explain the observed result and its limits.',
+            source_handles=[SourceHandle(handle='material:result', kind='material',
+                summary='Recorded result under one declared condition.',
+                metadata={'evidence_passages': [{'text': 'Recorded value: 0.75.'}],
+                          'evidence_passages_truncated': True})],
+            metric_sources=[MetricSource(metric_id='observed', name='score', value=.75,
+                artifact='result.json', source_kind='measurement')],
+            results={'status': 'partial', 'conditions': ['declared condition']})
+        template = ReportTemplateBundle(name='custom', mode='supplied_materials',
+            template_path='custom.md', criteria_path='criteria.md',
+            template_markdown='# Writing instructions\n\nExplain Observations then Limits.',
+            criteria_markdown='Do not claim an inspection occurred.')
+        return ReportWritingRequest(context, ReportMemory(limitations=['Input coverage is partial.']),
+            config, template, client or ArticleClient(), method='article')
+
+    def test_article_uses_one_shared_request_and_structured_projection_without_section_runtime(self):
+        request = self.request()
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ArtifactStore(Path(tmp))
+            with patch('simple_ar.report.writing.run_report_agent', side_effect=AssertionError('legacy runtime')):
+                result = run_report_writing_capability(
+                    context=CapabilityContext(store, AttemptManifest('article-1')), request=request)
+            self.assertEqual(result.status, 'completed')
+            self.assertEqual(len(request.llm_client.calls), 1)
+            _, article, options = request.llm_client.calls[0]
+            self.assertEqual(options['max_output_tokens'], 900)
+            self.assertEqual(options['budget_call_id'], 'article-1:article')
+            self.assertEqual(article['template_guidance'], request.template.template_markdown)
+            self.assertEqual(article['metric_sources'][0]['value'], .75)
+            self.assertEqual(article['results']['status'], 'partial')
+            self.assertTrue(article['source_handles'][0]['metadata']['evidence_passages_truncated'])
+            # The existing structured snapshot is still exact input data, not
+            # the sparse composition contract or a new projection version.
+            binding = store.read_json('report_inputs.json')['inputs']['binding']
+            self.assertEqual(article['source_handles'], binding['context']['source_handles'])
+            self.assertEqual(set(article), {'goal', 'title', 'target_words', 'template_guidance', 'style',
+                'sections', 'document_plan', 'source_handles', 'front_matter', 'bibliography',
+                'citation_key_map', 'problem', 'synthesis', 'hypothesis', 'evidence_summary',
+                'source_comparisons', 'metric_sources', 'execution_context', 'experiment_plan',
+                'results', 'limitations', 'open_questions', 'revision_findings'})
+            writer_ref = next(ref for ref in result.artifacts if ref.kind == 'report_writer_result')
+            self.assertEqual(writer_ref.schema, ARTICLE_OWNER)
+            writer = store.read_json(writer_ref)
+            projection = store.read_json(writer['input_snapshot']['path'])
+            self.assertEqual(projection['context'], request.report_context.model_dump(mode='json'))
+            self.assertEqual(projection['config'], request.config.model_dump(mode='json'))
+            self.assertEqual(projection['template'], request.template.model_dump(mode='json'))
+            self.assertEqual(projection['memory'], request.memory.model_dump(mode='json'))
+            self.assertEqual(writer['snapshot_id'], store.read_json('report_inputs.json')['snapshot_id'])
+            self.assertNotIn('report_body', writer)
+            self.assertFalse(store.exists('sections.json'))
+        # Article validation shares transport, but owns no format-correction call.
+        for response in ({'draft_markdown': ''}, {'sections': []}, {'raw_response': 'not JSON'},
+                {'draft_markdown': 'Article.', 'source_notes': {}},
+                {'draft_markdown': 'Article.', 'extra': 'unrecognized'}):
+            with self.subTest(response=response), tempfile.TemporaryDirectory() as tmp:
+                store = ArtifactStore(Path(tmp))
+                rejected = self.request(ArticleClient(response))
+                with self.assertRaisesRegex(ValueError, 'no automatic correction'):
+                    run_report_writing_capability(
+                        context=CapabilityContext(store, AttemptManifest('invalid')), request=rejected)
+                self.assertEqual(len(rejected.llm_client.calls), 1)
+                self.assertEqual(store.read_json('response.json'), response)
+                self.assertFalse(store.exists('writer.json'))
+                with self.assertRaisesRegex(ValueError, 'no automatic correction'):
+                    run_report_writing_capability(context=CapabilityContext(store, AttemptManifest('invalid')),
+                        request=replace(rejected, llm_client=None))
+                self.assertEqual(len(rejected.llm_client.calls), 1)
+
+    def test_article_recovery_preserves_original_identity_and_never_calls_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = ArtifactStore(Path(tmp) / 'first')
+            request = self.request()
+            result = run_report_writing_capability(context=CapabilityContext(first, AttemptManifest('original')),
+                request=request)
+            original = {name: first.resolve(name).read_bytes() for name in
+                ('report_inputs.json', 'response.json', 'writer.json', 'report_snapshot.json')}
+            for resume_ref in result.artifacts:
+                with self.subTest(kind=resume_ref.kind):
+                    output = ArtifactStore(Path(tmp) / resume_ref.kind)
+                    with patch('simple_ar.report.writing.run_report_agent', side_effect=AssertionError('legacy runtime')):
+                        recovered = run_report_writing_capability(context=CapabilityContext(output,
+                            AttemptManifest('recovery'), inputs=(resume_ref,), input_store=first),
+                            request=replace(request, llm_client=None, method='sections', resume_ref=resume_ref))
+                    self.assertEqual(recovered.status, 'completed')
+                    self.assertEqual(output.read_json('writer.json')['source_attempt'], 'original')
+                    self.assertEqual(output.read_json('writer.json'), first.read_json('writer.json'))
+            # Rejected source/destination records cannot partly transplant an
+            # article, erase its original projection or trigger another call.
+            resume_ref = result.artifacts[0]
+            for corrupt in ('report_snapshot.json', 'writer.json', 'response.json'):
+                with self.subTest(corrupt=corrupt):
+                    output = ArtifactStore(Path(tmp) / ('blocked-' + corrupt))
+                    output.write_json(corrupt, {'changed': True})
+                    with self.assertRaises(ValueError):
+                        run_report_writing_capability(context=CapabilityContext(output, AttemptManifest('blocked'),
+                            inputs=(resume_ref,), input_store=first),
+                            request=replace(request, llm_client=None, resume_ref=resume_ref))
+                    self.assertEqual([row.name for row in output.root.iterdir()], [corrupt])
+            self.assertEqual(len(request.llm_client.calls), 1)
+            for name, raw in original.items():
+                self.assertEqual(first.resolve(name).read_bytes(), raw)
+
+    def test_interrupted_article_uses_retained_response_but_missing_response_never_replays(self):
+        for response_saved in (False, True):
+            with self.subTest(response_saved=response_saved), tempfile.TemporaryDirectory() as tmp:
+                session = ArtifactStore(Path(tmp))
+                store = ArtifactStore(session.root / 'attempts' / 'original')
+                request = self.request()
+                def interrupted(system, prompt, **kwargs):
+                    if response_saved:
+                        store.write_json('response.json', request.llm_client.response)
+                    raise RuntimeError('interrupted after request')
+                with patch.object(request.llm_client, 'ask_json', side_effect=interrupted):
+                    with self.assertRaisesRegex(RuntimeError, 'interrupted'):
+                        run_report_writing_capability(context=CapabilityContext(store, AttemptManifest('original')),
+                            request=request)
+                offline = replace(request, llm_client=None)
+                selected, prior = resolve_report_writing_resume(report_context=request.report_context,
+                    memory=request.memory, config=request.config, template=request.template,
+                    sources=(), store=session, attempts=[AttemptManifest('original', capability='report_write')],
+                    method='sections')
+                self.assertEqual(selected.path, 'attempts/original/report_inputs.json')
+                self.assertEqual(prior, '')
+                if response_saved:
+                    recovered = run_report_writing_capability(
+                        context=CapabilityContext(store, AttemptManifest('original')), request=offline)
+                    self.assertEqual(recovered.status, 'completed')
+                else:
+                    with self.assertRaisesRegex(ValueError, 'no blind replay'):
+                        run_report_writing_capability(
+                            context=CapabilityContext(store, AttemptManifest('original')), request=offline)
+
+    def test_resume_selection_shares_binding_and_uses_only_completed_article_body_for_revision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            session = ArtifactStore(Path(tmp))
+            store = ArtifactStore(session.root / 'attempts' / 'original')
+            source = session.write_json('material.json', {'value': .75}, kind='material')
+            request = replace(self.request(), prior_draft='Previously accepted prose.')
+            result = run_report_writing_capability(
+                context=CapabilityContext(store, AttemptManifest('original'), inputs=(source,), input_store=session),
+                request=request)
+            attempt = AttemptManifest('original', capability='report_write', status='completed', outputs=result.artifacts)
+            common = dict(report_context=request.report_context, memory=request.memory, config=request.config,
+                template=request.template, sources=(source,), store=session, attempts=[attempt], method='article')
+            original = {path: path.read_bytes() for path in store.root.iterdir() if path.is_file()}
+            selected, prior = resolve_report_writing_resume(**common)
+            self.assertEqual(selected.path, 'attempts/original/report_inputs.json')
+            self.assertEqual(prior, request.prior_draft)
+            changes = {
+                'report_context': request.report_context.model_copy(update={'goal_markdown': 'Changed goal'}),
+                'memory': request.memory.model_copy(update={'limitations': ['Changed limit']}),
+                'config': request.config.model_copy(update={'max_section_tokens': 800}),
+                'template': request.template.model_copy(update={'template_markdown': 'Changed template'}),
+                'sources': (),
+            }
+            body = store.read_json('writer.json')['sections'][0]['draft_markdown']
+            for key, value in changes.items():
+                with self.subTest(binding=key):
+                    changed = {**common, key: value}
+                    self.assertEqual(resolve_report_writing_resume(**changed), (None, body))
+                    self.assertEqual(resolve_report_writing_resume(**{**changed, 'method': 'sections'}), (None, ''))
+                    self.assertEqual(resolve_report_writing_resume(**{**changed,
+                        'attempts': [replace(attempt, status='failed')]}), (None, ''))
+            newer = AttemptManifest('newer', capability='report_write')
+            checkpoint = session.write_json('attempts/newer/sections.json', {},
+                kind='report_checkpoint', schema='report_checkpoint.v1')
+            self.assertEqual(resolve_report_writing_resume(**{**common, 'attempts': [attempt, newer]}),
+                (checkpoint, ''))
+            self.assertEqual(len(request.llm_client.calls), 1)
+            for path, raw in original.items():
+                self.assertEqual(path.read_bytes(), raw)
+
+    def test_article_rejects_changed_binding_unknown_owner_and_changed_writer(self):
+        for change in ('goal', 'config', 'template', 'owner', 'system', 'writer', 'identity'):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as tmp:
+                store = ArtifactStore(Path(tmp))
+                request = self.request()
+                run_report_writing_capability(context=CapabilityContext(store, AttemptManifest('original')), request=request)
+                if change == 'goal':
+                    request = replace(request, report_context=request.report_context.model_copy(update={'goal_markdown': 'Changed'}))
+                elif change == 'config':
+                    request = replace(request, config=request.config.model_copy(update={'max_section_tokens': 800}))
+                elif change == 'template':
+                    request = replace(request, template=request.template.model_copy(update={'template_markdown': 'Changed'}))
+                elif change == 'writer':
+                    writer = store.read_json('writer.json')
+                    writer['sections'][0]['draft_markdown'] = 'Changed'
+                    store.write_json('writer.json', writer)
+                else:
+                    snapshot = store.read_json('report_inputs.json')
+                    snapshot[{'identity': 'source_attempt'}.get(change, change)] = 'Changed'
+                    store.write_json('report_inputs.json', snapshot)
+                with self.assertRaises(ValueError):
+                    run_report_writing_capability(context=CapabilityContext(store, AttemptManifest('original')), request=request)
+                self.assertEqual(len(request.llm_client.calls), 1)
+
+    def test_unsupported_article_controls_fail_before_any_request_or_snapshot(self):
+        for key, value in [('reviewer', 'llm'), ('document_review', True), ('source_strategy', 'batch_refine'),
+                ('allow_source_backtracking', True), ('outline_strategy', 'adaptive'),
+                ('max_cited_sources', 2), ('allow_llm_fallback', True), ('criteria', 'custom.md'),
+                ('max_section_sources', 2), ('max_source_batches', 2)]:
+            with self.subTest(control=key), tempfile.TemporaryDirectory() as tmp:
+                request = self.request()
+                request = replace(request, config=request.config.model_copy(update={key: value}))
+                store = ArtifactStore(Path(tmp))
+                with self.assertRaisesRegex(ValueError, key):
+                    run_report_writing_capability(context=CapabilityContext(store, AttemptManifest('new')), request=request)
+                self.assertFalse(store.exists('report_inputs.json'))
+                self.assertEqual(request.llm_client.calls, [])
+
+    def test_article_supplies_front_matter_and_source_notes_without_review_or_output_cap(self):
+        from types import SimpleNamespace
+        from simple_ar.research.contracts import DocumentRecord, DocumentSection, TextChunk
+        from simple_ar.research.documents.ingest import DocumentBundle
+        from simple_ar.report.projection import build_material_report_inputs, apply_report_bibliography
+
+        record = DocumentRecord('doc', 'input paper', 'local_files', source_id='/input/paper.pdf',
+            extraction_status='parsed')
+        front = DocumentSection('front', 'doc', 'front_matter', 'Front matter',
+            'Original study\nAda Example\n2025-04-03')
+        documents = DocumentBundle([record], {}, {}, [front], [TextChunk('body', 'doc', 'Recorded observations.')])
+        notes = [{'paper_id': 'doc', 'bibliographic_fields': [
+            {'field': 'authors', 'value': ['Ada Example'], 'quote': 'Ada Example',
+             'section_id': 'front', 'complete': True},
+            {'field': 'doi', 'value': '10.1234/invented', 'quote': 'Absent original text',
+             'section_id': 'front', 'complete': True}]}]
+        request = self.request(ArticleClient({'draft_markdown': 'Article.', 'source_notes': notes}))
+        request = replace(request, config=request.config.model_copy(update={'max_section_tokens': 0}))
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ArtifactStore(Path(tmp))
+            document_ref = store.write_json('documents.json', documents.to_handoff_dict(), schema='document_bundle.v1')
+            report_context, memory = build_material_report_inputs(topic='Explain the study', documents=documents,
+                documents_ref=document_ref, assets=[SimpleNamespace(locator=record.source_id, role='paper')], selected_evidence=True)
+            request = replace(request, report_context=report_context, memory=memory)
+            run_report_writing_capability(context=CapabilityContext(store, AttemptManifest('article'),
+                inputs=(document_ref,)), request=request)
+            view = request.llm_client.calls[0][1]['front_matter'][0]
+            self.assertEqual(view['text'], front.text)
+            self.assertEqual(view['section_id'], 'front')
+            self.assertNotIn(request.template.criteria_markdown, json.dumps(request.llm_client.calls[0][1]))
+            self.assertNotIn('max_output_tokens', request.llm_client.calls[0][2])
+            writer = store.read_json('writer.json')
+            self.assertEqual(writer['source_notes'], notes)
+            self.assertEqual(writer['memory']['outline_planning']['source_notes'], notes)
+            self.assertEqual(writer['memory']['reviewer_findings'], [])
+            adopted, _ = apply_report_bibliography(report_context, documents=documents, notes=writer['source_notes'])
+            self.assertEqual(adopted.papers[0]['authors'], ['Ada Example'])
+            self.assertNotEqual(adopted.papers[0].get('doi'), '10.1234/invented')
+
+    def test_sections_default_and_historical_checkpoint_override_article_even_for_input_revision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ArtifactStore(Path(tmp) / 'legacy')
+            request = replace(self.request(), method='sections', memory=ReportMemory(section_plan=[
+                ReportSectionPlan(section_id='scope', heading='Scope', goal='Explain scope')]))
+            self.assertEqual(ReportWritingRequest(request.report_context, request.memory, request.config,
+                request.template, request.llm_client).method, 'sections')
+            saved = {'sections': [{'section_id': 'scope', 'draft_markdown': 'Saved section.'}]}
+            def legacy(**kwargs):
+                kwargs['checkpoint_sink'](saved)
+                return None
+            with patch('simple_ar.report.writing.run_report_agent', side_effect=legacy):
+                first = run_report_writing_capability(context=CapabilityContext(store, AttemptManifest('legacy')), request=request)
+            checkpoint = next(ref for ref in first.artifacts if ref.kind == 'report_checkpoint')
+            for changed in (False, True):
+                with self.subTest(changed=changed):
+                    output = ArtifactStore(Path(tmp) / str(changed))
+                    revised = request.report_context.model_copy(update={'topic': 'Revised'}) if changed else request.report_context
+                    with patch('simple_ar.report.writing.run_report_agent', side_effect=legacy) as agent:
+                        run_report_writing_capability(context=CapabilityContext(output, AttemptManifest('next'),
+                            inputs=(checkpoint,), input_store=store), request=replace(request, method='article',
+                            resume_ref=checkpoint, report_context=revised))
+                    self.assertEqual(agent.call_args.kwargs['completed_checkpoint'], None if changed else saved)
+                    self.assertEqual(request.llm_client.calls, [])
 
 
 class _MissingFigureRenderer:

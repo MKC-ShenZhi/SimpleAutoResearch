@@ -48,7 +48,8 @@ FIELDS = {
                   "timeout_sec": ("timeout_sec", int), "code_task_config": ("code_task_config", str),
                   "primary_metric": ("primary_metric", str), "metrics": ("metric", list),
                   "metric_directions": ("metric_direction", list)},
-    "report": {"template": ("report_template", str), "reviewer": ("report_reviewer", str),
+    "report": {"writing_method": ("report_writing_method", str),
+               "template": ("report_template", str), "reviewer": ("report_reviewer", str),
                "outline_strategy": ("report_outline_strategy", str),
                "data_tables": ("report_data_tables", str),
                "max_review_iterations": ("max_review_iterations", int),
@@ -137,6 +138,8 @@ def report_settings(args: argparse.Namespace, *, explicit_destinations: set[str]
     """
     settings = {}
     for key, (destination, _) in FIELDS["report"].items():
+        if key == "writing_method":
+            continue  # Execution owner, not a ReportRuntimeConfig field.
         if args.command == "research-report":
             destination = key
         if explicit_destinations is not None and destination not in explicit_destinations:
@@ -148,6 +151,40 @@ def report_settings(args: argparse.Namespace, *, explicit_destinations: set[str]
             raise SystemExit(f"--{key.replace('_', '-')} cannot be negative; use 0 to omit the cap.")
         settings[key] = value
     return settings
+
+
+def report_writing_method(args: argparse.Namespace, settings: dict) -> tuple[str, dict]:
+    """Select a new Writer method without silently discarding explicit controls.
+
+    Historical sessions select their saved method in the application. Defaults
+    here describe new public tasks only; precise section/review requests retain
+    their established execution contract rather than being prompt suggestions.
+    """
+    requested = getattr(args, "report_writing_method", None)
+    explicit = set(getattr(args, "_explicit_resume_destinations", ()))
+    control_keys = {"reviewer", "max_review_iterations", "document_review",
+                    "review_scope", "draft_scope", "outline_strategy",
+                    "max_document_review_prompt_chars", "max_cited_sources"}
+    # Both public commands consume the same config keys, even though argparse
+    # uses prefixed destinations for research-session and bare ones for report.
+    legacy_controls = {key: settings.get(key) for key in control_keys
+        if (key if getattr(args, "command", None) == "research-report"
+            else FIELDS["report"][key][0]) in explicit}
+    method = requested or ("sections" if legacy_controls else "article")
+    if method not in {"article", "sections"}:
+        raise ValueError("report.writing_method must be article or sections")
+    if method == "article":
+        active = {key for key, value in legacy_controls.items()
+                  if key not in {"reviewer", "max_review_iterations", "document_review", "max_cited_sources"}
+                  or value not in {"disabled", 0, False}}
+        if active:
+            raise ValueError("Article writing does not execute section planning/review controls: "
+                             + ", ".join(sorted(active)) + "; select writing_method=sections explicitly.")
+        settings = {**settings, "reviewer": "disabled", "document_review": False,
+                    "max_review_iterations": 0, "outline_strategy": "template",
+                    "draft_scope": "section", "review_scope": "section",
+                    "allow_source_backtracking": False}
+    return method, settings
 
 
 @dataclass(frozen=True)
@@ -384,6 +421,8 @@ def research_defaults(
                 raise ValueError("research.web_extract_backend must be direct or tavily_basic")
             if dest == "report_outline_strategy" and value not in {"auto", "template", "adaptive"}:
                 raise ValueError("report.outline_strategy must be auto, template or adaptive")
+            if dest == "report_writing_method" and value not in {"article", "sections"}:
+                raise ValueError("report.writing_method must be article or sections")
             if dest == "report_review_scope" and value not in {"section", "document"}:
                 raise ValueError("report.review_scope must be section or document")
             if dest == "report_draft_scope" and value not in {"section", "document", "auto"}:

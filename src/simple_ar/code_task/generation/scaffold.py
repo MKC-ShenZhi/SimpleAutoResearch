@@ -34,7 +34,6 @@ def fallback_file_content(path: str, result_schema: Mapping[str, Any], contract:
             ensure_ascii=False,
         ) + "\n"
     if path == "generated_experiment/runner.py":
-        metric_rows = ",\n        ".join(f"{metric!r}: {score:.6f}" for metric, score in metric_values(metrics).items())
         return (
             "from __future__ import annotations\n\n"
             "import json\n"
@@ -42,43 +41,14 @@ def fallback_file_content(path: str, result_schema: Mapping[str, Any], contract:
             "def run_experiment() -> dict[str, float]:\n"
             "    config_path = Path(__file__).resolve().parents[1] / \"config.json\"\n"
             "    _config = json.loads(config_path.read_text(encoding=\"utf-8\"))\n"
-            "    # Conservative fallback: produce deterministic, schema-compliant metrics.\n"
-            "    # Domain-specific generated code may replace this runner when LLM generation succeeds.\n"
-            "    return {\n"
-            f"        {metric_rows}\n"
-            "    }\n"
+            "    raise RuntimeError(\n"
+            "        'Offline scaffold has no implemented measurement. Implement the requested '\n"
+            "        'experiment and compute its metrics before running the benchmark.'\n"
+            "    )\n"
         )
     if path.endswith(".py"):
         return "from __future__ import annotations\n\n# Reserved generated module.\n"
     return ""
-
-
-def metric_values(metrics: list[str]) -> dict[str, float]:
-    if not metrics:
-        metrics = ["score"]
-    result: dict[str, float] = {}
-    for index, metric in enumerate(metrics):
-        lowered = metric.lower()
-        if "baseline" in lowered:
-            value = 0.60
-        elif "accuracy" in lowered or "f1" in lowered or "score" in lowered or "quality" in lowered:
-            value = min(0.95, 0.82 + index * 0.01)
-        elif "gain" in lowered or "delta" in lowered or "margin" in lowered or "improvement" in lowered:
-            value = 0.05 + index * 0.01
-        elif "count" in lowered or "size" in lowered or "items" in lowered or "samples" in lowered:
-            value = float(2 + index)
-        elif "param" in lowered:
-            value = 128.0 + index * 16.0
-        elif "loss" in lowered or "error" in lowered:
-            value = max(0.01, 0.20 - index * 0.01)
-        elif "time" in lowered or "latency" in lowered:
-            value = 0.01 + index * 0.005
-        elif "passed" in lowered:
-            value = 1.0
-        else:
-            value = min(0.99, 0.80 + index * 0.02)
-        result[metric] = value
-    return result
 
 
 def required_metrics(schema: Mapping[str, Any]) -> list[str]:

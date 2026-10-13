@@ -977,6 +977,25 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             'linked.py', 'linked-docs'}.issubset(skipped))
         self.assertTrue(all(skipped.values()))
         self.assertEqual(report['skipped_count'], len(skipped))
+        packaged_request = {**request, 'path': 'workspace/packaged', 'archive_name': 'project.zip'}
+        with patch('subprocess.run', side_effect=AssertionError('packaging must not execute')):
+            packaged = standalone.call('copy_project', packaged_request, identity='project-package')
+        self.assertEqual(packaged.status, 'ok', packaged.error)
+        import zipfile
+        archive_path = standalone.workspace / 'packaged/project.zip'
+        with zipfile.ZipFile(archive_path) as archive:
+            self.assertIsNone(archive.testzip())
+            self.assertEqual({name: archive.read(name) for name in archive.namelist()}, materials)
+        self.assertEqual(packaged.data['files']['project.zip'],
+                         hashlib.sha256(archive_path.read_bytes()).hexdigest())
+        self.assertEqual(standalone.call('copy_project', packaged_request,
+                         identity='project-package').data, packaged.data)
+        archive_path.write_bytes(b'changed archive')
+        self.assertEqual(standalone.call('copy_project', packaged_request,
+                         identity='project-package').status, 'blocked')
+        for name in ('../escape.zip', '.env.zip', 'nested/result.zip'):
+            self.assertEqual(standalone.call('copy_project',
+                {**packaged_request, 'archive_name': name}, identity='invalid-archive').status, 'blocked')
         empty = inputs / 'empty'
         empty.mkdir()
         private_only = inputs / 'private-only'
@@ -1508,6 +1527,66 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 self.assertEqual(app.session.store.exists('delivery.json'), expected != 'paused')
                 self.assertEqual(fake.chat_turn.call_count, 3 if expected == 'paused' else 2)
 
+    def test_native_final_process_delivers_only_bound_successful_outputs(self) -> None:
+        for mode in ('success', 'failed', 'missing', 'stopped', 'late-change'):
+            with self.subTest(mode=mode):
+                _, _, fake, _, app, _ = self._native_fixture(mount_inputs=False, max_turns=1)
+                arguments = {'argv': ['python', '-c',
+                    "from pathlib import Path; Path('result.txt').write_text('retained'); "
+                    + ("import time; time.sleep(2); " if mode == 'stopped' else '') +
+                    f"raise SystemExit({int(mode == 'failed')})"],
+                    'timeout_sec': 1,
+                    'delivery': {'summary': 'Final authorized work',
+                        'artifacts': ['workspace/missing.txt' if mode == 'missing' else 'workspace/result.txt'],
+                        'unresolved': ['Not scientifically reviewed']}}
+                fake.chat_turn.side_effect = [self._native_message('run_process', arguments, 'final')]
+                self.assertEqual(app.run(progress=lambda _: None)['status'], 'paused')
+                token = app.approval_token(app.state['pending']['call'])
+                changed = self._native_message('run_process', {**arguments,
+                    'delivery': {**arguments['delivery'], 'summary': 'Different claim'}}, 'final')['tool_calls'][0]
+                self.assertNotEqual(app.approval_token(changed), token)
+                self.assertEqual(app.run(approved_execution='wrong', progress=lambda _: None)['status'], 'paused')
+                self.assertFalse((app.workspace.workspace / 'result.txt').exists())
+                original_delivery = app.workspace._process_delivery
+                def changed_after_pin(*args, **kwargs):
+                    result = original_delivery(*args, **kwargs)
+                    (app.workspace.workspace / 'result.txt').write_text('changed after pin')
+                    return result
+                with (patch.object(app.workspace, '_process_delivery', side_effect=changed_after_pin)
+                        if mode == 'late-change' else nullcontext()):
+                    self.assertEqual(app.run(approved_execution=token, progress=lambda _: None)['status'],
+                        'partial' if mode == 'success' else 'paused')
+                self.assertEqual(fake.chat_turn.call_count, 1)
+                observed = app.state['turns'][-1]['tools'][-1]
+                payload = app.session.store.read_json(observed['result'])
+                self.assertEqual(payload['status'], 'ok' if mode == 'success' else 'blocked')
+                identity = Path(observed['result']).parts[1]
+                receipt = app.session.store.root / 'tools/processes' / identity / 'invocation.json'
+                if mode == 'stopped':
+                    self.assertTrue(read_json(receipt)['stop_reason'])
+                else:
+                    self.assertEqual(read_json(receipt)['returncode'], int(mode == 'failed'))
+                bound = receipt.with_name('terminal_delivery.json')
+                self.assertEqual(bound.exists(), mode in {'success', 'late-change'})
+                self.assertEqual(app.session.store.exists('delivery.json'), mode == 'success')
+                ledger = app.ledger.to_dict()
+                with patch('simple_ar.tools.workspace.run_process', side_effect=AssertionError('No replay')):
+                    if mode == 'success':
+                        replay = app.workspace.call('run_process', arguments, identity=identity)
+                        self.assertTrue(replay.ok, replay.error)
+                        self.assertEqual(replay.data, payload['data'])
+                        self.assertEqual(app.workspace.call('run_process', json.loads(changed['function']['arguments']),
+                            identity=identity).status, 'blocked')
+                        (app.workspace.workspace / 'result.txt').write_text('changed')
+                        self.assertEqual(app.workspace.call('run_process', arguments, identity=identity).status, 'blocked')
+                        # Losing the bound output record cannot retrofit an old
+                        # successful execution into a fresh terminal claim.
+                        with _changed_record(bound, None):
+                            self.assertEqual(app.workspace.call('run_process', arguments, identity=identity).status, 'blocked')
+                    else:
+                        self.assertEqual(app.workspace.call('run_process', arguments, identity=identity).status, 'blocked')
+                self.assertEqual(app.ledger.to_dict(), ledger)
+
     def test_native_invalid_terminal_queue_blocks_side_effects_and_can_be_corrected(self) -> None:
         for multiple in (False, True):
             with self.subTest(multiple=multiple):
@@ -1519,6 +1598,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     for name, args, identity in (
                             ('export_report', {'markdown': 'workspace/wrong.md', 'delivery': {
                                 'summary': 'Premature export'}}, 'wrong-export'),
+                            ('run_process', {'argv': ['python', '-c', 'raise AssertionError()'],
+                                'delivery': {'summary': 'Premature process'}}, 'wrong-process'),
                             ('deliver_result', {'summary': 'Premature delivery'}, 'wrong-deliver'),
                             ('ask_user', {'question': 'Premature question?'}, 'wrong-question')):
                         wrong['tool_calls'] += self._native_message(name, args, identity)['tool_calls']
@@ -1541,7 +1622,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
     def test_native_terminal_commit_recovers_bound_receipts_and_separates_feedback(self) -> None:
         from simple_ar.tools.specs import ToolResult
-        for name in ('deliver_result', 'write_file', 'export_report', 'ask_user'):
+        for name in ('deliver_result', 'write_file', 'export_report', 'run_process', 'ask_user'):
             with self.subTest(name=name):
                 _, _, fake, _, app, _ = self._native_fixture(mount_inputs=False, max_turns=1)
                 draft = app.workspace.workspace / 'draft.md'
@@ -1552,6 +1633,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                         'write_file': {'path': 'workspace/final.md', 'content': 'Final result',
                             'delivery': {**delivery, 'artifacts': ['workspace/final.md']}},
                         'export_report': {'markdown': 'workspace/draft.md', 'compile_pdf': False,
+                            'delivery': delivery},
+                        'run_process': {'argv': ['python', '-c', "from pathlib import Path; Path('draft.md').write_text('Bound result')"],
                             'delivery': delivery},
                         'ask_user': {'question': 'Which result is wanted?'}}[name]
                 fake.chat_turn.side_effect = [self._native_message(name, args, 'terminal')]
@@ -2659,6 +2742,27 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     self.assertEqual(app.state['pending'], failed_pending)
             provider.assert_not_called()
 
+        # A completed text operation with an unavailable usage payload keeps
+        # its conservative charge and identity across explicit authorization.
+        prior_id = Path(original_turns[0]['reply']).parent.name
+        app.ledger.reserve('closed-text-charge', {'llm_requests': 1, 'total_tokens': 100},
+            session_id=app.session.manifest.session_id, attempt_id=prior_id)
+        retained = app.ledger.mark_unknown('closed-text-charge', reason='Missing provider usage',
+            known_actual={'llm_requests': 1}, retain_reservation=True).to_dict()
+        for field, value in (('session_id', 'another-session'), ('attempt_id', 'missing-attempt'),
+                             ('reserved', {'process_invocations': 1}), ('actual', {})):
+            with self.subTest(invalid_closed_charge=field):
+                rows = app.ledger.to_dict()
+                rows['entries'][-1][field] = value
+                app.session.store.write_json('invalid-continuation-ledger.json', rows)
+                invalid = BudgetLedger.load(app.session.store.resolve('invalid-continuation-ledger.json'))
+                before, budget = invalid.to_dict(), app.session.manifest.budget.to_dict()
+                with patch.object(app, 'ledger', invalid), self.assertRaisesRegex(ValueError, 'in-flight or unknown'):
+                    app.run(**grant, progress=lambda _: None)
+                self.assertEqual(invalid.to_dict(), before)
+                self.assertEqual(app.session.manifest.budget.to_dict(), budget)
+                self.assertEqual(app.state['pending'], failed_pending)
+
         # Two new decisions cross the original five-turn ceiling. The grant
         # supplies the extra capacity; real LLMClient accounting spends it.
         execute = self._native_message('run_process', {'argv': ['python', '-c',
@@ -2742,6 +2846,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             if row.attempt_id == failed_id), failed_record)
         self.assertEqual([entry.to_dict() for entry in app.ledger.entries[:len(original_ledger['entries'])]],
             original_ledger['entries'])
+        self.assertEqual(next(entry.to_dict() for entry in app.ledger.entries
+            if entry.reservation_id == 'closed-text-charge'), retained)
         self.assertEqual(self._native_receipts(app, original_turns), records)
 
     def test_native_retained_text_windows_deduplicate_and_invalidate_on_mutation(self) -> None:
@@ -3361,15 +3467,15 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
     def test_composition_rejects_invalid_articles_without_resubmission(self) -> None:
         _, fake, app, _, arguments = self._writing_fixture()
         call = ToolCall(tool_name='compose_document', arguments=arguments, trace_id='invalid-article')
-        for response in ({'draft_markdown': ''}, {'draft_markdown': 'Body', 'heading': 'Unbound title'},
-                         {'draft_markdown': 'Body', 'source_notes': {}}, {'raw_response': 'not JSON'}):
-            fake.ask_json.return_value = response
-            rejected_call = call.model_copy(update={'trace_id': f"invalid-article-{fake.ask_json.call_count}"})
-            self.assertEqual(app.gateway.call(rejected_call).status, 'error')
-            count = fake.ask_json.call_count
-            self.assertEqual(app.gateway.call(rejected_call).status, 'error')
-            self.assertEqual(fake.ask_json.call_count, count)
-            self.assertEqual(read_json(app.session.store.root / 'tools/writing' / rejected_call.trace_id / 'writer/response.json'), response)
+        # Shared response-shape cases live with the Writer capability; retain
+        # this public tool's error receipt and no-resubmission behavior here.
+        response = {'draft_markdown': 'Body', 'heading': 'Unbound title'}
+        fake.ask_json.return_value = response
+        self.assertEqual(app.gateway.call(call).status, 'error')
+        count = fake.ask_json.call_count
+        self.assertEqual(app.gateway.call(call).status, 'error')
+        self.assertEqual(fake.ask_json.call_count, count)
+        self.assertEqual(read_json(app.session.store.root / 'tools/writing' / call.trace_id / 'writer/response.json'), response)
 
     def test_composition_recovery_rejects_partial_changed_and_failed_writer_records(self) -> None:
         fake, app, arguments, call, owner = self._interrupted_composition()

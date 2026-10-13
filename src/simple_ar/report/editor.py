@@ -564,23 +564,26 @@ def review_document(
         raise
 
 
-def _validate_document_reviews(
+def _document_review_envelope(
     response: Any, *, sections: list[ReportSectionDraft],
     prior_by_key: Mapping[tuple[str, str], ReviewerFinding],
-    evidence_view: Mapping[str, Any] | None = None,
-) -> list[ReportSectionReview]:
+) -> list[dict[str, Any]]:
+    """Bind the entire response before validating or salvaging observations.
+
+    Identity collisions and role violations reject the whole batch. Only
+    evidence errors may be isolated by the existing correction owner. Return
+    fresh rows so neither path changes the retained rejected model response.
+    """
     known = {row.section_id for row in sections}
     if not isinstance(response, Mapping) or not isinstance(response.get("section_reviews"), list):
         raise LLMResponseError("Whole-document reviewer did not return section_reviews.")
     raw_reviews = response["section_reviews"]
     if prior_by_key and len(raw_reviews) > len(known):
         raise LLMResponseError("Whole-document reviewer returned more reviews than supplied sections.")
-    reviews: list[ReportSectionReview] = []
+    rows: list[dict[str, Any]] = []
     seen: set[str] = set()
     checked: set[tuple[str, str]] = set()
     finding_keys: set[tuple[str, str]] = set()
-    draft_by_id = review_draft_quote_sources(evidence_view) if evidence_view is not None else {
-        row.section_id: (row.heading, row.draft_markdown) for row in sections}
     opinion_targets = {section_id for section_id, _ in prior_by_key}
     for raw in raw_reviews:
         if (not isinstance(raw, Mapping) or not isinstance(raw.get("section_id"), str)
@@ -595,45 +598,77 @@ def _validate_document_reviews(
             if isinstance(finding, Mapping) else finding
             for finding in raw_findings
         ]
-        review = ReportSectionReview.model_validate(resolve_review_evidence(normalized, evidence_view or {}))
-        if prior_by_key and (review.findings or review.revision_instructions):
+        checks = raw.get("finding_checks", [])
+        if not isinstance(checks, list):
+            raise LLMResponseError("Whole-document finding checks must be a list.")
+        target = raw["section_id"]
+        shell = ReportSectionReview.model_validate({**normalized, "findings": [], "finding_checks": []})
+        if prior_by_key and (raw_findings or shell.revision_instructions):
             raise LLMResponseError("Historical opinion checking cannot add new findings or rewrite instructions; independent inspection owns discovery.")
-        if (review.verdict in {"revise_required", "fail"} and not review.findings
-                and not any(check.status == "unresolved" for check in review.finding_checks)):
-            raise LLMResponseError("Whole-document revision needs a concrete finding.")
-        if review.section_id not in known or (prior_by_key and review.section_id in seen):
+        if prior_by_key and target in seen:
             raise LLMResponseError("Whole-document reviewer targeted an unknown or repeated section.")
-        if any(finding.section_id != review.section_id for finding in review.findings):
-            raise LLMResponseError("Whole-document finding must identify its target section.")
-        for finding in review.findings:
-            key = (review.section_id, finding.finding_id)
+        for finding in normalized["findings"]:
+            if not isinstance(finding, Mapping) or finding.get("section_id") != target:
+                raise LLMResponseError("Whole-document finding must identify its target section.")
+            identifier = finding.get("finding_id")
+            if not isinstance(identifier, str):
+                raise LLMResponseError("Whole-document finding must identify its opinion.")
+            key = (target, identifier)
             if key in finding_keys:
                 raise LLMResponseError(f"Whole-document reviewer repeated a finding identity: {key}.")
             finding_keys.add(key)
-        validate_finding_anchors(review, draft_by_id, evidence_view or {})
-        for check in review.finding_checks:
-            key = (review.section_id, check.finding_id)
+        for check in checks:
+            if not isinstance(check, Mapping) or not isinstance(check.get("finding_id"), str):
+                raise LLMResponseError("Historical finding check must identify its opinion.")
+            key = (target, check["finding_id"])
             if key not in prior_by_key or key in checked:
                 raise LLMResponseError(f"Historical finding check targeted an unknown or repeated opinion: {key}.")
-            if not check.explanation.strip():
-                raise LLMResponseError("Historical finding check needs a reason.")
-            for citation in check.draft_quotes:
-                quote_section = citation.section_id if isinstance(citation, ReportDraftQuote) else review.section_id
-                quote = (citation.quote if isinstance(citation, ReportDraftQuote) else citation).strip()
-                if not draft_quote_present(draft_by_id, quote_section, quote):
-                    raise LLMResponseError(f"Historical finding check quoted text absent from the current section: {quote_section!r}, opinion {key}.")
-            if check.status != "unresolved" and not check.draft_quotes:
-                raise LLMResponseError("Closing a historical finding requires a current-draft quotation.")
-            validate_evidence_quotes(check.evidence_quotes, evidence_view or {})
             checked.add(key)
-        if opinion_targets and review.section_id not in opinion_targets:
+        if opinion_targets and target not in opinion_targets:
             raise LLMResponseError("Historical finding check returned an unrequested target section.")
-        seen.add(review.section_id)
-        reviews.append(review)
+        seen.add(target)
+        rows.append(normalized)
+    return rows
+
+
+def _validate_document_reviews(
+    response: Any, *, sections: list[ReportSectionDraft],
+    prior_by_key: Mapping[tuple[str, str], ReviewerFinding],
+    evidence_view: Mapping[str, Any] | None = None,
+) -> list[ReportSectionReview]:
+    rows = _document_review_envelope(response, sections=sections, prior_by_key=prior_by_key)
+    draft_by_id = review_draft_quote_sources(evidence_view) if evidence_view is not None else {
+        row.section_id: (row.heading, row.draft_markdown) for row in sections}
+    reviews = [_document_review_record(raw, draft_by_id=draft_by_id, evidence_view=evidence_view or {})
+               for raw in rows]
     # Inspection observations can legitimately share a target. Validate every
     # record before merging; a later pass must not erase an earlier defect.
     # Historical closure keeps its one-target/one-opinion identity contract.
     return reviews if prior_by_key else coalesce_document_reviews(reviews)
+
+
+def _document_review_record(raw: Mapping[str, Any], *,
+    draft_by_id: Mapping[str, str | tuple[str, ...]], evidence_view: Mapping[str, Any],
+) -> ReportSectionReview:
+    """Validate one observation after the complete batch has been bound."""
+    review = ReportSectionReview.model_validate(resolve_review_evidence(raw, evidence_view))
+    if (review.verdict in {"revise_required", "fail"} and not review.findings
+            and not any(check.status == "unresolved" for check in review.finding_checks)):
+        raise LLMResponseError("Whole-document revision needs a concrete finding.")
+    validate_finding_anchors(review, draft_by_id, evidence_view)
+    for check in review.finding_checks:
+        key = (review.section_id, check.finding_id)
+        if not check.explanation.strip():
+            raise LLMResponseError("Historical finding check needs a reason.")
+        for citation in check.draft_quotes:
+            quote_section = citation.section_id if isinstance(citation, ReportDraftQuote) else review.section_id
+            quote = (citation.quote if isinstance(citation, ReportDraftQuote) else citation).strip()
+            if not draft_quote_present(draft_by_id, quote_section, quote):
+                raise LLMResponseError(f"Historical finding check quoted text absent from the current section: {quote_section!r}, opinion {key}.")
+        if check.status != "unresolved" and not check.draft_quotes:
+            raise LLMResponseError("Closing a historical finding requires a current-draft quotation.")
+        validate_evidence_quotes(check.evidence_quotes, evidence_view)
+    return review
 
 
 def _validated_document_review_subset(
@@ -644,55 +679,22 @@ def _validated_document_review_subset(
 
     This does not make a rejected response successful. The owner keeps that
     failure and its raw response, and may use this subset only within the same
-    correction allowance. All record checks reuse the strict validator above.
+    correction allowance. Record checks are identical to complete validation.
     """
-    known = {row.section_id for row in sections}
-    rows = response.get("section_reviews") if isinstance(response, Mapping) else None
-    if not isinstance(rows, list) or (prior_by_key and len(rows) > len(known)):
-        return []
-    targets: set[str] = set()
-    checked: set[tuple[str, str]] = set()
-    finding_keys: set[tuple[str, str]] = set()
-    opinion_targets = {key[0] for key in prior_by_key}
     try:
-        for raw in rows:
-            if (not isinstance(raw, Mapping) or not isinstance(raw.get("section_id"), str)
-                    or raw["section_id"] not in known or (prior_by_key and raw["section_id"] in targets)):
-                return []
-            target = raw["section_id"]
-            targets.add(target)
-            findings, checks = raw.get("findings") or [], raw.get("finding_checks", [])
-            if not isinstance(findings, list) or not isinstance(checks, list):
-                return []
-            # Ambiguous identities and role violations invalidate the envelope,
-            # not just one opinion. Evidence errors alone can be isolated.
-            if prior_by_key and (findings or raw.get("revision_instructions") or
-                                 target not in opinion_targets):
-                return []
-            for finding in findings:
-                if not isinstance(finding, Mapping) or (finding.get("section_id") or target) != target:
-                    return []
-                identifier = finding.get("finding_id")
-                if not isinstance(identifier, str) or (target, identifier) in finding_keys:
-                    return []
-                finding_keys.add((target, identifier))
-            for check in checks:
-                if not isinstance(check, Mapping) or not isinstance(check.get("finding_id"), str):
-                    return []
-                key = (target, check["finding_id"])
-                if key not in prior_by_key or key in checked:
-                    return []
-                checked.add(key)
-            ReportSectionReview.model_validate({**raw, "findings": [], "finding_checks": [],
-                                                "revision_instructions": []})
-    except ValidationError:
+        rows = _document_review_envelope(response, sections=sections, prior_by_key=prior_by_key)
+    except (LLMResponseError, ValidationError):
+        return []
+    # Retain the stricter salvage contract: even instructions that the legacy
+    # schema coerces to empty cannot be released from a rejected opinion check.
+    if prior_by_key and any(raw.get("revision_instructions") for raw in rows):
         return []
 
+    draft_by_id = review_draft_quote_sources(evidence_view)
     result: list[ReportSectionReview] = []
     for raw in rows:
         try:
-            result.extend(_validate_document_reviews({"section_reviews": [raw]}, sections=sections,
-                prior_by_key=prior_by_key, evidence_view=evidence_view))
+            result.append(_document_review_record(raw, draft_by_id=draft_by_id, evidence_view=evidence_view))
             continue
         except (LLMResponseError, ValidationError):
             pass
@@ -704,8 +706,7 @@ def _validated_document_review_subset(
             for item in raw.get(field) or []:
                 single = {**shell, field: [item]}
                 try:
-                    validated = _validate_document_reviews({"section_reviews": [single]}, sections=sections,
-                        prior_by_key=prior_by_key, evidence_view=evidence_view)[0]
+                    validated = _document_review_record(single, draft_by_id=draft_by_id, evidence_view=evidence_view)
                 except (LLMResponseError, ValidationError):
                     continue
                 getattr(accepted, field).extend(getattr(validated, field))

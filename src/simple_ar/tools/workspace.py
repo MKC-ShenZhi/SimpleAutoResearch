@@ -11,6 +11,7 @@ import re
 import shutil
 import sys
 import tempfile
+import zipfile
 from typing import Any, Iterable
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -90,6 +91,9 @@ class _Copy(_Path):
 
 class _CopyProject(_Path):
     source: str = Field(description='Authorized project directory; originals remain unchanged.')
+    archive_name: str | None = Field(default=None, pattern=r'^[A-Za-z0-9][A-Za-z0-9_.-]*\.zip$', max_length=100,
+        exclude_if=lambda value: value is None,
+        description='Optionally create a portable ZIP inside the new copy, containing exactly the copied files with relative paths. Existing copy exclusions and reported omissions apply; inspect them before claiming a complete package. No generated packaging script or process is needed.')
     max_files: int = Field(default=1000, ge=1, le=4096)
     max_total_bytes: int = Field(default=128 * 1024 * 1024, ge=1, le=512 * 1024 * 1024)
     max_file_bytes: int = Field(default=2_000_000, ge=1, le=64 * 1024 * 1024)
@@ -108,6 +112,8 @@ class _Run(BaseModel):
     argv: list[str] = Field(min_length=1, max_length=40)
     cwd: str = "workspace"
     timeout_sec: int = Field(default=60, ge=1, le=300)
+    delivery: DeliveryRequest | None = Field(default=None, exclude_if=lambda value: value is None,
+        description="Optional explicit final delivery after this authorized process succeeds. Select actual output paths, including files produced by the command, and disclose unresolved work. Nonzero exit, stopping or missing artifacts never delivers. Does not certify scientific correctness. Use only as the last action, not instead of inspecting unknown results.")
 
 
 class _Question(BaseModel):
@@ -122,9 +128,9 @@ _TOOLS = {
     "inspect_project": (_Project, "Read project instructions, dependency declarations and Python entry candidates using the existing preparation inspector. Returns a compact overview and a retained full observation. No imports of project code, installation, downloads or execution; metadata describes the inspecting interpreter, not readiness of the task environment. Use its evidence to choose the next necessary preparation or validation action, not to repeat an inventory.", "read_only"),
     "write_file": (_Write, "Create or replace a workspace text file; existing files require the observed digest. If this is the final file, an explicit delivery can complete the task in the same operation.", "write_patch"),
     "copy_file": (_Copy, "Copy an observed file or generated candidate into the workspace without retransmitting its contents. Source digest must match; read_file with full_digest=true and a small max_bytes obtains a streamed full-file digest up to 64 MiB. Existing destinations require their digest and retain a byte backup through the shared atomic writer. Original sources stay unchanged. Does not execute or certify a repair.", "write_patch"),
-    "copy_project": (_CopyProject, "Prepare a writable project copy in one operation, including ordinary source, tests, configuration, documentation and binary assets. Destination must be a new workspace subdirectory. Uses existing conservative code-workspace copying: private/runtime paths, symlinks, caches/build outputs and oversized files are omitted and reported. Total bounds are checked before publishing. Keeps originals unchanged, records copied file hashes, and can reconcile the same interrupted operation only when its published files still match. Not a complete Git clone, dependency install, execution or correctness certificate.", "write_patch"),
+    "copy_project": (_CopyProject, "Prepare a writable project copy and optional portable ZIP in one operation, including ordinary source, tests, configuration, documentation and binary assets. Destination must be a new workspace subdirectory. Uses existing conservative code-workspace copying: private/runtime paths, symlinks, caches/build outputs and oversized files are omitted and reported. Total bounds are checked before publishing. Keeps originals unchanged, records copied file and archive hashes, and reconciles the same interrupted operation only when its published files still match. Inspect omissions before claiming a complete deliverable. Not a complete Git clone, dependency install, execution or correctness certificate.", "write_patch"),
     "edit_file": (_Edit, "Replace one or multiple exact unique, non-overlapping spans in a workspace file atomically, with one observed digest and backup. Batch related changes rather than repeating calls.", "write_patch"),
-    "run_process": (_Run, "Execute an argv without a shell in the workspace. Bare python/python3 use the task interpreter; its directory leads the filtered PATH for child commands. Use sys.executable for portable Python children. Requires explicit process authorization, not a sandbox.", "execution"),
+    "run_process": (_Run, "Execute an argv without a shell in the workspace. Bare python/python3 use the task interpreter; its directory leads the filtered PATH for child commands. Use sys.executable for portable Python children. Requires explicit process authorization, not a sandbox. Optional explicit delivery completes the task after successful final work and binds actual output bytes without another model decision; execution alone is not delivery or verification.", "execution"),
     "deliver_result": (DeliveryRequest, "Deliver actual workspace artifacts and optional retained task-evidence references; name unresolved work honestly.", "plan"),
     "ask_user": (_Question, "Ask a concentrated question only when needed to proceed; pause with all work preserved.", "plan"),
 }
@@ -354,6 +360,7 @@ class WorkspaceToolGateway:
             if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,100}", identity):
                 raise ValueError("Invalid durable tool invocation identity")
             model = validate_workspace_arguments(name, arguments)
+            metadata = {}
             if name == 'copy_project':
                 return self._copy_project(model, identity)
             if name == "copy_file":
@@ -378,7 +385,13 @@ class WorkspaceToolGateway:
             elif name == "ask_user":
                 data = model.model_dump()
             elif name == "run_process":
+                recovering = (self.root / "tools" / "processes" / identity / "invocation.json").exists()
                 data = self._run(model, identity)
+                if model.delivery is not None:
+                    if data.get('returncode') != 0 or data.get('stop_reason'):
+                        return ToolResult(tool_name=name, status='blocked', data=data,
+                            error='Final process failed or stopped; no delivery. Inspect the retained process receipt and correct or explicitly deliver existing work separately.')
+                    data['delivery'], metadata['delivery_hashes'] = self._process_delivery(model, identity, recovering=recovering)
             elif name == "search_files":
                 data = self._search(model, identity)
             elif name == "inspect_project":
@@ -494,7 +507,7 @@ class WorkspaceToolGateway:
                         data["delivery"] = delivery
             if name in {"read_file", "write_file", "edit_file", "list_directory"}:
                 data["absolute_path"] = str(target)
-            return ToolResult(tool_name=name, data=data)
+            return ToolResult(tool_name=name, data=data, metadata=metadata)
         except (ValueError, KeyError, BudgetError) as exc:
             return ToolResult(tool_name=name, status="blocked", error=str(exc))
         except OSError as exc:
@@ -588,6 +601,15 @@ class WorkspaceToolGateway:
                 raise ValueError('Project selection contains no copyable files')
             hashes = self.artifact_hashes(paths)
             files = {str(Path(path).relative_to(candidate)): digest for path, digest in hashes.items()}
+            if request.archive_name is not None:
+                archive = candidate / request.archive_name
+                if archive.exists():
+                    raise ValueError('Archive name conflicts with a copied input; choose another name')
+                with zipfile.ZipFile(archive, 'x', compression=zipfile.ZIP_DEFLATED) as package:
+                    for relative in sorted(files):
+                        package.write(candidate / relative, arcname=Path(relative).as_posix())
+                with archive.open('rb') as handle:
+                    files[request.archive_name] = hashlib.file_digest(handle, 'sha256').hexdigest()
             data = {'absolute_path': str(target), 'source': str(source), 'copy': report.to_json(), 'files': files}
             # The existing attempt owns this receipt. Save before publishing so
             # a lost outer result can validate the tree, not blindly copy again.
@@ -721,6 +743,32 @@ class WorkspaceToolGateway:
             env=self.process_environment(), output_dir=output, invocation_id=identity, tail_bytes=12000, log_bytes=200000),
             budget_ledger=self.ledger)
         return {**process_observation(result.record, output), "receipt": str(receipt.relative_to(self.root))}
+
+    def _process_delivery(self, request: _Run, identity: str, *, recovering: bool) -> tuple[dict[str, Any], dict[str, str]]:
+        """The process owner pins its declared final outputs before the outer observation.
+
+        Never attach a new success claim to an old or interrupted unbound run.
+        Recovery consumes recorded output bytes, not another process or model.
+        """
+        from simple_ar.core.artifacts import write_json
+
+        record = self.root / 'tools' / 'processes' / identity / 'terminal_delivery.json'
+        binding = request.model_dump(exclude_none=True)
+        if recovering:
+            if not record.is_file():
+                raise ValueError('Successful process has no bound terminal delivery; retain its receipt and inspect outputs. No replay or retroactive delivery')
+            saved = read_json(record)
+            if saved['request'] != binding:
+                raise ValueError('Retained terminal process request changed; no replay or delivery')
+            delivery = self.resolve_delivery(DeliveryRequest.model_validate(saved['delivery']))
+            if self.artifact_hashes(delivery['artifacts']) != saved['artifact_sha256']:
+                raise ValueError('Terminal process outputs changed or are missing; no replay or delivery')
+            return delivery, saved['artifact_sha256']
+        assert request.delivery is not None
+        delivery = self.resolve_delivery(request.delivery)
+        hashes = self.artifact_hashes(delivery['artifacts'])
+        write_json(record, {'request': binding, 'delivery': delivery, 'artifact_sha256': hashes})
+        return delivery, hashes
 
     def process_argv(self, argv: list[str]) -> list[str]:
         """Bind the task interpreter and whole mount arguments, never source text."""

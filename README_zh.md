@@ -52,7 +52,9 @@
 
 ## 快速开始
 
-需要 **Python 3.12+**、Git 和 [uv](https://docs.astral.sh/uv/)。
+需要 **Python 3.12+**、Git 和 [uv](https://docs.astral.sh/uv/)。原生源码检索还需要执行主机安装 ripgrep（`rg`）。
+按[普通用户完整流程](docs/USAGE_zh.md#可复制的普通用户流程)完成安装、命名 TOML/秘密引用、材料启动、批准、查看、反馈和恢复；
+其中包含最小模型目录及 Bash/PowerShell 配置方式。
 
 ### 1. 安装
 
@@ -121,6 +123,23 @@ uv run simple-ar start "解释这些实验结果" --source results/ --model prof
 可重复提供 `--source PATH` 挂载只读材料；公开检索需要 `--allow-network`，
 进程提案需要 `--allow-execution`，实际命令仍单独批准。
 `--prepare-only` 只保存任务，不执行或调用模型；完整跨任务验收尚未通过。
+原生保存仍会预检模型连接和凭据；缺密钥先保存 TOML 是结构化设置的行为。
+收到待执行提案后先检查源码、命令与副作用。交互终端逐条确认；暂停时复制本次
+`Approval token`，并用终端打印的完整 `Task session` 路径替换下列 `SESSION`：
+
+```bash
+uv run simple-ar start --resume-task "SESSION" --approve-execution "TOKEN"
+uv run simple-ar status "SESSION"
+uv run simple-ar results "SESSION"
+uv run simple-ar start --resume-task "SESSION" "保留初版，补充证据限制，交付独立反馈版本"
+uv run simple-ar results "SESSION"
+uv run simple-ar start --resume-task "SESSION"
+```
+
+`TOKEN` 是当前提案的精确 token，`--yes` 不替代命令批准。查看实际成果后再反馈；
+反馈保留原预算，可能需要更多批准。最后一条恢复保存边界；完成且无待处理动作时读取
+保存终态。中断后先确认旧进程已停止，未知副作用不盲重放。失败模型的显式续接见 CLI 参考。
+
 `start --guided` 提供成果偏好，普通 `--kind` 也使用同一原生循环。显式 `--template`、
 `--sources`、`--allow`/`--validate` 或复现协议控制保留结构化兼容路径。
 `--kind data_analysis` 不加 `--scripted` 且显式提供 `--value-column`、`--x-column`

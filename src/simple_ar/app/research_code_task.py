@@ -66,7 +66,12 @@ def load_research_code_task_session_result(
             root,
             registry=CapabilityRegistry(),
         )
-        experiment_attempt = _attempt_by_id(controller, "experiment-001")
+        attempts = controller.list_attempts()
+        experiment_attempt = next(
+            (item for item in attempts if item.attempt_id == "experiment-001"), None
+        )
+        if experiment_attempt is None:
+            raise KeyError("Unknown attempt: experiment-001")
         if len(experiment_attempt.inputs) not in {1, 2}:
             raise ValueError(
                 "Code-task experiment must declare one synthesis input and an optional design input."
@@ -127,21 +132,8 @@ def load_research_code_task_session_result(
         source_ref=source_ref,
         execution_ref=execution_ref,
         analysis_ref=analysis_ref,
-        attempts=controller.list_attempts(),
+        attempts=attempts,
         decisions=tuple(controller.manifest.decisions),
         design=design,
         design_ref=design_ref,
     )
-
-
-def _attempt_by_id(controller: SessionController, attempt_id: str) -> AttemptManifest:
-    """Return one declared attempt without searching for substitutes."""
-
-    wanted = attempt_id.strip()
-    attempt = next(
-        (item for item in controller.list_attempts() if item.attempt_id == wanted),
-        None,
-    )
-    if attempt is None:
-        raise KeyError(f"Unknown attempt: {wanted}")
-    return attempt

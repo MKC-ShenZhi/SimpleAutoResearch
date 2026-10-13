@@ -157,8 +157,8 @@ def execute_code_task(
     approval_note: str = "",
     allow_large_edits: bool = False,
     allow_planning_fallback: bool = False,
-    planning_mode: str = "tool_agent",
-    planning_review_rounds: int = 2,
+    planning_mode: str = "compact",
+    planning_review_rounds: int = 0,
     llm_retry_attempts: int = 1,
     repair_rounds: int = 0,
     planning_snapshot_from: str | Path | None = None,
@@ -227,12 +227,11 @@ def execute_code_task(
             and greenfield fallbacks after LLM attempts fail. By default, LLM
             failures stop the run without writing fallback plans so the same
             execute command can retry cleanly.
-        planning_mode: Greenfield planning mode. ``tool_agent`` decomposes
-            planning into requirements/architecture/interfaces/file-plan tools
-            with bounded review revision; ``compact`` keeps the older single
-            architecture call for compatibility.
-        planning_review_rounds: Maximum reviewer-directed greenfield planning
-            revision rounds before continuing with recorded planning risks.
+        planning_mode: Complete greenfield architecture work unit. ``tool_agent``
+            is a deprecated alias for ``compact``; historical stages are retained
+            with a visible method migration receipt before new planning.
+        planning_review_rounds: Deprecated. Nonzero values produce a migration
+            notice, never additional calls. Set to zero for the replacement.
         llm_retry_attempts: Number of stage-level attempts for LLM-backed work
             planning, patch planning, greenfield architecture/file generation,
             and repair before stopping or explicitly falling back.

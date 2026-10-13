@@ -269,7 +269,7 @@ class ReviewSourceContextTests(unittest.TestCase):
             def capture(**kwargs):
                 prompts.append(kwargs['prompt'])
                 return []
-            with patch.object(review, 'run_llm_review', side_effect=capture):
+            with patch('simple_ar.code_task.reviewing.run_llm_review', side_effect=capture):
                 result = review.review_code_task_changes(run, use_llm=True, max_source_chars_per_file=700)
             self.assertTrue(prompts)
             context = json.loads(prompts[0].split('Context JSON:\n', 1)[1].split('\n\nEvidence snippets:', 1)[0])

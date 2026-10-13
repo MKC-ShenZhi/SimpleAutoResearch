@@ -70,15 +70,8 @@ class ResearchSessionResult:
         return self.decisions[-1].next_capability if self.decisions else None
 
 
-
 class ResearchSessionError(RuntimeError):
     """Raised when historical session outputs cannot be read."""
-
-
-
-
-
-
 
 
 def _attempt_sequence(attempt_id: str) -> tuple[int, str]:
@@ -206,7 +199,7 @@ def load_research_session_result(
 
         design: ResearchDesignResult | None = None
         design_ref: ArtifactRef | None = None
-        if any(item.attempt_id == "design-001" for item in controller.list_attempts()):
+        if any(item.attempt_id == "design-001" for item in attempts):
             design_ref = controller.attempt_output_ref(
                 "design-001",
                 kind="research_design",
@@ -254,7 +247,7 @@ def load_research_session_result(
         analysis=analysis,
         execution_ref=execution_ref,
         analysis_ref=analysis_ref,
-        attempts=controller.list_attempts(),
+        attempts=attempts,
         decisions=tuple(controller.manifest.decisions),
         design=design,
         design_ref=design_ref,

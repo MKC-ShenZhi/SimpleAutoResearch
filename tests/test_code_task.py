@@ -694,24 +694,21 @@ class CodeTaskTests(unittest.TestCase):
                 ),
             )
 
-            report = review_generated_project(
-                project_dir=root,
-                code_artifacts={
-                    "generated_files": [
-                        {"path": "main.py", "line_count": 1, "mode": "llm"},
-                        {"path": "strategies.py", "line_count": 8, "mode": "llm"},
-                    ]
-                },
+            report = _generated_review(root,
+                [
+                    {"path": "main.py", "line_count": 1, "mode": "llm"},
+                    {"path": "strategies.py", "line_count": 8, "mode": "llm"},
+                ],
                 result_schema={"primary_metric": "score", "required_metrics": []},
                 resource_plan={
                     "max_files": 10,
                     "max_generated_lines": 200,
                 },
+
                 contract={
                     "task": "Run a pool-based active learning query strategy benchmark with an unlabeled pool and label budget.",
                     "success_criteria": [],
                 },
-                use_llm=False,
             )
 
             categories = {item.get("category") for item in report.get("findings", [])}
@@ -752,19 +749,15 @@ class CodeTaskTests(unittest.TestCase):
                 ),
             )
 
-            report = review_generated_project(
-                project_dir=root,
-                code_artifacts={
-                    "generated_files": [
-                        {"path": "producer.py", "mode": "llm"},
-                        {"path": "metrics.py", "mode": "llm"},
-                        {"path": "main.py", "mode": "llm"},
-                    ]
-                },
+            report = _generated_review(root,
+                [
+                    {"path": "producer.py", "mode": "llm"},
+                    {"path": "metrics.py", "mode": "llm"},
+                    {"path": "main.py", "mode": "llm"},
+                ],
                 result_schema={"primary_metric": "accuracy", "required_metrics": ["accuracy"]},
                 resource_plan={"max_files": 10, "max_generated_lines": 300},
                 contract={"task": "Run an experiment and aggregate seed summaries."},
-                use_llm=False,
             )
 
             categories = {item.get("category") for item in report.get("findings", [])}
@@ -1151,68 +1144,41 @@ class CodeTaskTests(unittest.TestCase):
             self.assertIn("review.md", rows)
             self.assertEqual(artifacts["total_lines"], 4)
 
-    def test_greenfield_review_repair_does_not_invent_resource_policy_without_llm(self) -> None:
-        with _temporary_root() as root:
-            project = root / "generated_project"
-            package = project / "generated_experiment"
-            package.mkdir(parents=True)
-            resources = package / "resources.py"
-            write_text(resources, "from __future__ import annotations\n\n# Reserved generated module.\n")
-            review = {
-                "status": "failed",
-                "findings": [
-                    {
-                        "severity": "blocking",
-                        "category": "mixed_generation_fallback",
-                        "summary": "Core file `generated_experiment/resources.py` fell back.",
-                    }
-                ],
-            }
-            artifacts = {
-                "generated_files": [
-                    {"path": "generated_experiment/resources.py", "mode": "fallback", "line_count": 3}
-                ]
-            }
-
-            repair = repair_generated_project_from_review(
-                project_dir=project,
-                review_report=review,
-                output_path=root / "review_repair.json",
-                code_artifacts=artifacts,
-                client=None,
-            )
-
-            self.assertEqual(repair["status"], "skipped")
-            self.assertEqual(repair["changed_files"], [])
-            self.assertEqual(repair["review_status"], "failed")
-            self.assertEqual(
-                read_text(resources),
-                "from __future__ import annotations\n\n# Reserved generated module.\n",
-            )
-
-    def test_review_repair_without_model_preserves_files_and_missing_artifacts(self) -> None:
-        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as tmp:
-            root = Path(tmp)
-            project = root / "project"
-            project.mkdir()
-            write_text(project / "__init__.py", "def broken(:\n    pass\n")
-            write_text(project / "helpers.py", "def _normalize(x):\n    return x\n")
-            write_text(project / "consumer.py", "from helpers import normalize\n")
-            before = {p.name: p.read_bytes() for p in project.iterdir()}
-            review = {"status": "failed", "findings": [
-                {"category": "missing_local_api", "summary": "Missing `helpers.normalize`."},
+    def test_review_repair_without_model_preserves_source_and_missing_deliverables(self) -> None:
+        cases = (
+            ("fallback_resource", {
+                "generated_experiment/resources.py": "from __future__ import annotations\n\n# Reserved generated module.\n",
+            }, [{"category": "mixed_generation_fallback",
+                 "summary": "Core file generated_experiment/resources.py fell back."}]),
+            ("structural_defects", {
+                "__init__.py": "def broken(:\n    pass\n",
+                "helpers.py": "def _normalize(x):\n    return x\n",
+                "consumer.py": "from helpers import normalize\n",
+            }, [
+                {"category": "missing_local_api", "summary": "Missing helpers.normalize."},
                 {"category": "syntax_error", "summary": "__init__.py does not compile."},
                 {"category": "missing_entrypoint", "summary": "Missing main.py."},
                 {"category": "missing_required_artifact", "summary": "Missing README and config."},
-            ]}
-            repair = repair_generated_project_from_review(
-                project_dir=project, review_report=review,
-                output_path=root / "repair.json", client=None,
-            )
-            self.assertEqual(repair["status"], "skipped")
-            self.assertEqual(repair["review_status"], "failed")
-            self.assertEqual(repair["changed_files"], [])
-            self.assertEqual({p.name: p.read_bytes() for p in project.iterdir()}, before)
+            ]),
+        )
+        for name, files, findings in cases:
+            with self.subTest(case=name), _temporary_root() as root:
+                project = root / "project"
+                for path, content in files.items():
+                    write_text(project / path, content)
+                before = _project_bytes(project)
+                repair = repair_generated_project_from_review(project_dir=project,
+                    review_report={"status": "failed", "findings": [
+                        dict(row, severity="blocking") for row in findings]},
+                    code_artifacts={"generated_files": [
+                        {"path": path, "mode": "fallback", "line_count": len(content.splitlines())}
+                        for path, content in files.items()]},
+                    output_path=root / "repair.json", client=None)
+                self.assertEqual(repair["status"], "skipped")
+                self.assertEqual(repair["review_status"], "failed")
+                self.assertEqual(repair["changed_files"], [])
+                self.assertEqual(_project_bytes(project), before)
+
 
     def test_init_copies_workspace_and_indexes_python_ast(self) -> None:
         with _temporary_root() as root:
@@ -1372,92 +1338,90 @@ primary_metric = "accuracy"
                             _greenfield_repair_available(run_dir, 1, phase="run")
                     self.assertEqual(manifest_path.read_bytes(), before)
 
-    def test_multistep_planning_preserves_file_scope_without_inventing_modules(self) -> None:
-        from simple_ar.code_task.generation.planning_tools import build_tool_agent_architecture_plan
-
-        for paths in ([], ["main.py"], ["main.py", "custom_model.py"]):
-            with self.subTest(paths=paths):
+    def test_greenfield_method_migration_retains_history_connection_and_budget(self) -> None:
+        for original_mode in ("tool_agent", "compact", "unknown"):
+            with self.subTest(original_mode=original_mode), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                planning = root / "planning"
+                stage = "interfaces" if original_mode == "tool_agent" else "compact"
+                write_json(planning / stage / "attempt-001.json", {"original": True})
+                if original_mode != "unknown":
+                    write_json(root / "implementation_plan.json", {"planning_mode": original_mode,
+                        "models": {"planner": "profile:saved"}})
+                before = {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
+                ledger = BudgetLedger({"llm_requests": 3, "total_tokens": 1000})
+                ledger.reserve("prior", {"llm_requests": 1, "total_tokens": 100})
+                ledger.mark_unknown("prior", reason="original incomplete stream")
+                budget_before = ledger.to_dict()
                 client = Mock()
-                client.ask_json.side_effect = [
-                    {"objective": "Small experiment"},
-                    {"architecture_summary": "A bounded experiment", "modules": [{"name": "model"}, {"name": "evaluation"}]},
-                    {},
-                    {"files": [{"path": path} for path in [*paths, "../escape.py"]]},
-                    {"status": "needs_revision", "findings": [{
-                        "severity": "critical", "target_stage": "file_plan",
-                        "issue": "Generalization outside the measured domain is unknown.",
-                        "required_change": "State this research limitation.",
-                    }]},
-                ]
-                kwargs = dict(contract={}, result_schema={}, resource_plan={}, domain_profile={},
-                              client=client, review_rounds=0)
-                if not paths:
-                    with self.assertRaisesRegex(LLMError, "no usable file specifications"):
-                        build_tool_agent_architecture_plan(**kwargs)
-                else:
-                    plan = build_tool_agent_architecture_plan(**kwargs)
-                    self.assertEqual([row["path"] for row in plan["files"]], paths)
-                    self.assertTrue(any("outside the measured domain" in risk for risk in plan["risks"]))
-                    self.assertEqual(plan["planning_status"], "needs_revision")
-                    if paths == ["main.py"]:
-                        from simple_ar.code_task.generation.writer import write_generated_project
+                client._budget_ledger = ledger
+                client.ask_json.side_effect = LLMError("provider unavailable")
+                messages = []
+                kwargs = dict(contract={"objective": "Keep evidence"}, result_schema={},
+                    resource_plan={}, domain_profile={}, client=client, planning_mode="tool_agent",
+                    planning_review_rounds=2, planning_dir=planning, retry_attempts=3,
+                    planner_selector="profile:saved", message_callback=messages.append)
+                with self.assertRaisesRegex(LLMError, "provider unavailable"):
+                    _architecture_plan(**kwargs, allow_fallback=True)
+                client.ask_json.assert_called_once()
+                receipt = read_json(planning / "method_migration.json")
+                self.assertEqual(receipt["from_method"], original_mode)
+                self.assertEqual(receipt["planner_selector"], "profile:saved")
+                self.assertFalse(receipt["old_workflow_success"])
+                self.assertEqual(ledger.to_dict(), budget_before)
+                self.assertTrue(any("deprecated" in m for m in messages))
+                with self.assertRaisesRegex(ValueError, "Planner selector conflicts"):
+                    _architecture_plan(**{**kwargs, "planner_selector": "profile:other"})
+                client.ask_json.assert_called_once()
+                self.assertEqual({p: p.read_bytes() for p in before}, before)
+                retained_receipt = (planning / "method_migration.json").read_bytes()
+                # A later explicit attempt uses the same ledger and retains the
+                # failed attempt, rather than regenerating retired stages.
+                client.ask_json.side_effect = None
+                client.ask_json.return_value = {"files": [{"path": "main.py"}]}
+                plan, mode = _architecture_plan(**kwargs)
+                self.assertEqual(mode, "compact")
+                self.assertEqual(plan, read_json(planning / "architecture_unit/attempt-002/final_plan.json"))
+                self.assertTrue((planning / "architecture_unit/attempt-001/agent_steps.jsonl").is_file())
+                self.assertEqual((planning / "method_migration.json").read_bytes(), retained_receipt)
+                self.assertEqual({p: p.read_bytes() for p in before}, before)
+                self.assertEqual(ledger.to_dict(), budget_before)
 
-                        writer = Mock()
-                        writer.ask_json.return_value = {"files": [{"path": "main.py",
-                            "content": "def main():\n    print('accuracy: 0.75')\n\nmain()\n"}]}
-                        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as tmp:
-                            project = Path(tmp) / "project"
-                            artifacts = write_generated_project(
-                                project_dir=project, architecture_plan=plan,
-                                result_schema={"primary_metric": "accuracy"}, contract={},
-                                memory={}, client=writer,
-                            )
-                            self.assertEqual([row["path"] for row in artifacts["generated_files"]], ["main.py"])
-                            self.assertEqual([p.relative_to(project).as_posix() for p in project.rglob("*.py")], ["main.py"])
-                            completed = subprocess.run(
-                                [sys.executable, str(project / "main.py")], cwd=project,
-                                capture_output=True, text=True, timeout=10, check=True,
-                            )
-                            self.assertEqual(completed.stdout.strip(), "accuracy: 0.75")
 
-    def test_planning_modes_share_file_contract_with_different_call_costs(self) -> None:
-        from simple_ar.code_task.generation.architecture import build_architecture_plan
+    def test_architecture_alias_preserves_scope_and_explicit_empty_plan_fallback(self) -> None:
+        for paths in ([], ["main.py"], ["main.py", "custom_model.py"]):
+            plans = []
+            for mode in ("compact", "tool_agent"):
+                with self.subTest(paths=paths, mode=mode):
+                    client = Mock()
+                    client.ask_json.return_value = {
+                        "architecture_summary": "A bounded experiment",
+                        "files": [{"path": path, "public_api": ["main(argv=None)"] if path == "main.py" else []}
+                                  for path in [*paths, "../escape.py"]],
+                        "risks": ["Generalization outside the measured domain is unknown."],
+                        "status": "pass", "findings": [],
+                    }
+                    if not paths:
+                        with self.assertRaisesRegex(LLMError, "no usable file specifications"):
+                            _architecture_plan(client=client, planning_mode=mode)
+                        client.ask_json.assert_called_once()
+                        plan, source = _architecture_plan(client=client, planning_mode=mode, allow_fallback=True)
+                        self.assertEqual(source, "fallback")
+                        self.assertTrue(plan["files"])
+                        self.assertEqual(client.ask_json.call_count, 2)
+                    else:
+                        plan, source = _architecture_plan(client=client, planning_mode=mode)
+                        client.ask_json.assert_called_once()
+                        self.assertEqual(source, "compact")
+                        self.assertEqual([row["path"] for row in plan["files"]], paths)
+                        self.assertTrue(plan["files"][0]["entrypoint"])
+                        self.assertTrue(any("outside the measured domain" in risk for risk in plan["risks"]))
+                        plans.append(plan["files"])
+            if paths:
+                self.assertEqual(plans[0], plans[1])
 
-        plans = []
-        for mode, expected_calls in (("compact", 1), ("tool_agent", 5)):
-            client = Mock()
-            client.ask_json.return_value = {
-                "files": [{"path": "main.py", "public_api": ["main(argv=None)"]}],
-                "status": "pass", "findings": [],
-            }
-            plan, source = build_architecture_plan(
-                contract={}, result_schema={}, resource_plan={}, domain_profile={},
-                client=client, planning_mode=mode, planning_review_rounds=0,
-            )
-            self.assertEqual(source, mode)
-            self.assertEqual(client.ask_json.call_count, expected_calls)
-            self.assertTrue(plan["files"][0]["entrypoint"])
-            plans.append(plan)
-        self.assertEqual(plans[0]["files"], plans[1]["files"])
-
-    def test_empty_architecture_plan_requires_explicit_fallback(self) -> None:
-        from simple_ar.code_task.generation.architecture import build_architecture_plan
-
-        client = Mock()
-        client.ask_json.return_value = {"files": []}
-        for mode in ("compact", "tool_agent"):
-            with self.subTest(mode=mode):
-                kwargs = dict(contract={}, result_schema={}, resource_plan={}, domain_profile={},
-                              client=client, planning_mode=mode)
-                with self.assertRaisesRegex(LLMError, "no usable file specifications"):
-                    build_architecture_plan(**kwargs)
-                plan, source = build_architecture_plan(**kwargs, allow_fallback=True)
-                self.assertEqual(source, "fallback")
-                self.assertTrue(plan["files"])
 
     def test_plan_factory_owns_file_boundary_for_both_producers(self) -> None:
-        from simple_ar.code_task.generation.architecture import build_architecture_plan
-
         rows = [
             {"path": "alternate.py", "entrypoint": True, "dependencies": ["discarded.py", "../secret"]},
             {"path": "generated_project/alternate.py", "contract_obligations": ["O1"]},
@@ -1474,11 +1438,11 @@ primary_metric = "accuracy"
                         domain_profile={}, client=client, planning_mode=mode, planning_review_rounds=0)
                     if limit < 3:
                         with self.assertRaisesRegex(LLMError, 'requires 3 files but max_files'):
-                            build_architecture_plan(**kwargs)
+                            _architecture_plan(**kwargs)
                         self.assertEqual(json.dumps(rows, sort_keys=True), before)
                         continue
-                    plan, source = build_architecture_plan(**kwargs)
-                    self.assertEqual(source, mode)
+                    plan, source = _architecture_plan(**kwargs)
+                    self.assertEqual(source, "compact")
                     self.assertEqual([row["path"] for row in plan["files"]],
                         ["main.py", "alternate.py", "discarded.py"])
                     self.assertTrue(plan["files"][0]["entrypoint"])
@@ -1486,15 +1450,13 @@ primary_metric = "accuracy"
                     self.assertEqual(plan["files"][1]["contract_obligations"], ["O1"])
                     self.assertEqual(json.dumps(rows, sort_keys=True), before)
         with self.assertRaisesRegex(LLMError, 'max_files is 1'):
-            build_architecture_plan(contract={}, result_schema={},
-                resource_plan={"max_files": 1}, domain_profile={}, allow_fallback=True)
-        offline, source = build_architecture_plan(contract={}, result_schema={},
-            resource_plan={"max_files": 4}, domain_profile={}, allow_fallback=True)
+            _architecture_plan(resource_plan={"max_files": 1}, allow_fallback=True)
+        offline, source = _architecture_plan(resource_plan={"max_files": 4}, allow_fallback=True)
         self.assertEqual(source, "fallback")
         self.assertEqual(len(offline['files']), 4)
         self.assertEqual(offline['files'][0]['path'], 'main.py')
 
-    def test_tool_agent_plan_reaches_generation_and_snapshot_without_reconstruction(self) -> None:
+    def test_complete_architecture_reaches_generation_and_snapshot_without_reconstruction(self) -> None:
         from simple_ar.code_task.generation.greenfield import generate_greenfield_code_task
         from simple_ar.code_task.generation.task_contract import (
             build_greenfield_task_contract, save_task_contract,
@@ -1506,9 +1468,7 @@ primary_metric = "accuracy"
             write_text(task, "Generate a bounded CPU project printing score.")
             source_run, restored_run = root / "source", root / "restored"
             for run in (source_run, restored_run):
-                initialize_code_task(run_dir=run, code_root=None, task_file=task,
-                    kind="greenfield", workspace_mode="empty", primary_metric="score",
-                    benchmark_command="python generated_project/main.py")
+                _initialize_greenfield(run_dir=run, task_file=task, primary_metric="score")
             contract = build_greenfield_task_contract(read_text(task),
                 benchmark_command="python generated_project/main.py", max_files=3,
                 max_generated_lines=1600, result_schema={"primary_metric": "score"},
@@ -1539,13 +1499,9 @@ primary_metric = "accuracy"
                         else "def records():\n    return []\n"}
                         for row in context["planned_files"]]}
                 return {
-                    "greenfield-plan-requirements": {"objective": "Preserve records."},
-                    "greenfield-plan-architecture": {"architecture_summary": "Shared records."},
-                    "greenfield-plan-interfaces": interfaces,
-                    "greenfield-plan-file_plan": {"files": file_rows},
-                    "greenfield-plan-review": {"status": "needs_revision", "summary": "Recorded limitation.",
-                        "findings": [{"severity": "high", "target_stage": "interfaces",
-                            "issue": "Coverage remains bounded.", "required_change": "Retain the limitation."}]},
+                    "greenfield-architecture": {"objective": "Preserve records.",
+                        "architecture_summary": "Shared records.", "interfaces": interfaces,
+                        "files": file_rows, "risks": ["Coverage remains bounded."]},
                 }[label]
 
             client = Mock()
@@ -1554,10 +1510,12 @@ primary_metric = "accuracy"
                 "simple_ar.code_task.generation.greenfield.review_generated_project",
                 return_value={"status": "passed", "findings": []},
             ) as reviewer:
-                generate_greenfield_code_task(source_run, max_files=3, planning_review_rounds=0)
+                generate_greenfield_code_task(source_run, max_files=3, planning_review_rounds=0,
+                                             planner_model="profile:saved")
             meta = source_run / "code_task/meta"
             plan = read_json(meta / "architecture_plan.json")
-            self.assertEqual(plan, read_json(meta / "planning/final_plan.json"))
+            self.assertEqual(plan, read_json(meta / "planning/architecture_unit/attempt-001/final_plan.json"))
+            self.assertEqual(read_json(meta / "planning/method_migration.json")["planner_selector"], "profile:saved")
             self.assertEqual(requests[0]["architecture"], plan)
             self.assertEqual(reviewer.call_args.kwargs["architecture_plan"], plan)
             self.assertEqual(plan["interface_registry"]["shared_schemas"], interfaces["shared_schemas"])
@@ -1566,19 +1524,23 @@ primary_metric = "accuracy"
             self.assertTrue(any(row["id"] == "o1" for row in plan["implementation_contract"]["obligations"]))
             self.assertTrue(any(row["id"] == "o1" for row in requests[0]["obligations"]["records.py"]))
             self.assertEqual(plan["files"][2]["kind"], "runtime_dir")
-            self.assertEqual(plan["planning_status"], "needs_revision")
-            self.assertEqual(plan["planning"]["patch_request_count"], 1)
-            self.assertEqual(plan["planning"]["revision_count"], 0)
-            self.assertEqual(plan["planning"]["review_summary"], "Recorded limitation.")
-            self.assertEqual(plan["result_schema"]["primary_metric"], "score")
+            self.assertIn("Coverage remains bounded.", plan["risks"])
             self.assertEqual([row["path"] for row in read_json(meta / "file_plan.json")["files"]],
                 [row["path"] for row in plan["files"]])
+            generated_bytes = {p: p.read_bytes() for p in source_run.rglob("*") if p.is_file()}
+            with patch("simple_ar.code_task.generation.greenfield._llm_client",
+                       side_effect=AssertionError("Completed projects must not select a connection")):
+                generate_greenfield_code_task(source_run, planning_mode="tool_agent", planning_review_rounds=2)
+            self.assertEqual({p: p.read_bytes() for p in generated_bytes}, generated_bytes)
 
             # An old saved plan is imported as-is, including absent modern fields.
             legacy = {key: value for key, value in plan.items()
                 if key not in {"implementation_contract", "planning", "planning_status", "result_schema"}}
             legacy["historical_extension"] = {"keep": ["original shape"]}
             write_json(meta / "architecture_plan.json", legacy)
+            old_implementation = read_json(meta / "implementation_plan.json")
+            old_implementation.update(planning_mode="tool_agent", architecture_mode="tool_agent", planning_review_rounds=2)
+            write_json(meta / "implementation_plan.json", old_implementation)
             source_bytes = {path: path.read_bytes() for path in meta.rglob("*") if path.is_file()}
             requests.clear()
             client.reset_mock()
@@ -1590,12 +1552,14 @@ primary_metric = "accuracy"
                 generate_greenfield_code_task(restored_run, max_files=3,
                     planning_snapshot_from=source_run)
             self.assertEqual(read_json(restored_run / "code_task/meta/architecture_plan.json"), legacy)
+            self.assertEqual(read_json(restored_run / "code_task/meta/implementation_plan.json")["planning_mode"], "tool_agent")
+            self.assertFalse((restored_run / "code_task/meta/planning/method_migration.json").exists())
             self.assertEqual(requests[0]["architecture"], legacy)
             self.assertTrue(all(call.kwargs["label"].startswith("greenfield-unit-")
                 for call in client.ask_json.call_args_list))
             self.assertEqual({path: path.read_bytes() for path in meta.rglob("*") if path.is_file()}, source_bytes)
 
-    def test_greenfield_execute_generates_validates_and_runs_project(self) -> None:
+    def test_offline_greenfield_requires_implemented_measurement_before_run_and_recovery(self) -> None:
         with _temporary_root() as root:
             task_file = root / "task.md"
             write_text(
@@ -1603,27 +1567,58 @@ primary_metric = "accuracy"
                 "# Task\n\nGenerate a deterministic project that prints accuracy and macro_f1 metrics.\n",
             )
             run_dir = root / "runs" / "greenfield-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=None,
-                task_file=task_file,
-                kind="greenfield",
-                benchmark_command="python generated_project/main.py",
-                workspace_mode="empty",
-                primary_metric="accuracy",
-                metric_directions={"accuracy": "higher_is_better"},
+            _initialize_greenfield(run_dir=run_dir, task_file=task_file, primary_metric="accuracy",
+                metric_directions={"accuracy": "higher_is_better", "macro_f1": "higher_is_better"},
             )
 
             result = execute_code_task(
                 run_dir,
                 use_llm=False,
-                to_step="run",
+                to_step="work-plan",
                 timeout_sec=30,
                 max_files=8,
             )
 
+            project = run_dir / "code_task/workspace/generated_project"
+            self.assertTrue((project / "main.py").is_file())
+            self.assertTrue((run_dir / "code_task/meta/architecture_plan.json").is_file())
+            self.assertTrue((run_dir / "code_task/meta/file_plan.json").is_file())
+            self.assertEqual(validate_code_task(run_dir).status, "passed")
+            config = read_json(project / "config.json")
+            self.assertIn("accuracy", config["required_metrics"])
+            self.assertIn("macro_f1", config["required_metrics"])
+            # A standalone process cannot turn an unimplemented template into evidence.
+            external = subprocess.run([sys.executable, str(project / "main.py")],
+                cwd=project.parent, capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(external.returncode, 0)
+            self.assertIn("RuntimeError", external.stderr)
+            self.assertIn("no implemented measurement", external.stderr.lower())
+            self.assertNotRegex(external.stdout, r"(?m)^\s*(?:accuracy|macro_f1)\s*:\s*[-+]?\d")
+            blocked = execute_code_task(run_dir, use_llm=False, to_step="run",
+                timeout_sec=30, max_files=8, repair_rounds=0)
+            self.assertIn(blocked.stop_reason, ("review_failed", "benchmark_failed"))
+            metrics_path = run_dir / "code_task/run/patched/metrics.json"
+            if metrics_path.exists():
+                self.assertEqual(read_json(metrics_path), {})
+            # This fixture implements a measurement; success below belongs to that code.
+            write_text(project / "generated_experiment/runner.py",
+                "def run_experiment():\n"
+                "    truth = [1, 0, 1, 0]\n    predicted = [1, 0, 0, 0]\n"
+                "    accuracy = sum(a == b for a, b in zip(truth, predicted)) / len(truth)\n"
+                "    tp = sum(a == b == 1 for a, b in zip(truth, predicted))\n"
+                "    fp = sum(a == 0 and b == 1 for a, b in zip(truth, predicted))\n"
+                "    fn = sum(a == 1 and b == 0 for a, b in zip(truth, predicted))\n"
+                "    positive_f1 = 2 * tp / (2 * tp + fp + fn)\n"
+                "    tn = sum(a == b == 0 for a, b in zip(truth, predicted))\n"
+                "    negative_f1 = 2 * tn / (2 * tn + fp + fn)\n"
+                "    return {'accuracy': accuracy, 'macro_f1': (positive_f1 + negative_f1) / 2}\n")
+            review_path = run_dir / "code_task/meta/review_report.json"
+            review = read_json(review_path)
+            review["metadata"]["review_contract_version"] = GREENFIELD_REVIEW_CONTRACT_VERSION - 1
+            write_json(review_path, review)
+            result = execute_code_task(run_dir, use_llm=False, to_step="run",
+                timeout_sec=30, max_files=8)
             self.assertEqual(result.stop_reason, "completed")
-            self.assertTrue((run_dir / "code_task" / "workspace" / "generated_project" / "main.py").is_file())
             self.assertTrue((run_dir / "code_task" / "meta" / "resource_probe.json").is_file())
             self.assertTrue((run_dir / "code_task" / "meta" / "resource_decision.json").is_file())
             advice = read_json(run_dir / "code_task" / "meta" / "dependency_advice.json")
@@ -1633,6 +1628,7 @@ primary_metric = "accuracy"
             self.assertEqual(task_contract["schema_version"], "code_task_contract.v4")
             self.assertEqual(task_contract["task_kind"], "greenfield")
             self.assertEqual(task_contract["metric_contract"]["primary_metric"], "accuracy")
+            self.assertIn("macro_f1", task_contract["metric_contract"]["required_metrics"])
             self.assertIn("version_hash", task_contract)
             coverage = read_json(run_dir / "code_task" / "meta" / "task_contract_coverage.json")
             self.assertEqual(coverage["version_hash"], task_contract["version_hash"])
@@ -1661,7 +1657,8 @@ primary_metric = "accuracy"
             self.assertTrue(any(step.step == "review" and step.detail.startswith("refreshed status")
                                 for step in refreshed.steps))
             self.assertEqual(metrics_path.read_bytes(), measured_bytes)
-            historical = list((review_path.parent / "review_history").glob("*.json"))
+            historical = [path for path in (review_path.parent / "review_history").glob("*.json")
+                          if read_json(path) == prior_review]
             self.assertEqual(len(historical), 1)
             self.assertEqual(read_json(historical[0]), prior_review)
             current_review = read_json(review_path)
@@ -1709,14 +1706,7 @@ primary_metric = "accuracy"
                 "# Task\n\nGenerate a deterministic project that prints accuracy and macro_f1 metrics.\n",
             )
             run_dir = root / "runs" / "greenfield-review-repair"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=None,
-                task_file=task_file,
-                kind="greenfield",
-                benchmark_command="python generated_project/main.py",
-                workspace_mode="empty",
-                primary_metric="accuracy",
+            _initialize_greenfield(run_dir=run_dir, task_file=task_file, primary_metric="accuracy",
                 metric_directions={"accuracy": "higher_is_better", "macro_f1": "higher_is_better"},
             )
 
@@ -1768,58 +1758,6 @@ primary_metric = "accuracy"
             self.assertEqual(read_text(init_file), '__"""generated_experiment package."""\n')
             self.assertFalse((run_dir / "code_task" / "run" / "patched" / "metrics.json").exists())
 
-    def test_runtime_repair_does_not_invent_presets_or_ignore_parameters(self) -> None:
-        with _temporary_root() as root:
-            project_dir = root / "generated_project"
-            package_dir = project_dir / "generated_experiment"
-            package_dir.mkdir(parents=True)
-            write_json(
-                project_dir / "config.json",
-                {
-                    "objective": "Greenfield run repair test.",
-                    "presets": {
-                        "{preset_name}": {
-                            "conditions": ["baseline", "candidate"],
-                            "max_items": 32,
-                        }
-                    },
-                },
-            )
-            write_text(
-                package_dir / "runner.py",
-                (
-                    "def run_experiment(preset='smoke'):\n"
-                    "    return {'score': 1.0}\n"
-                ),
-            )
-
-            preset_repair = repair_generated_project_from_run_failure(
-                project_dir=project_dir,
-                failure_analysis={"status": "needs_repair"},
-                stderr_text=(
-                    "raise KeyError(f\"Unknown preset '{preset_name}'. Available presets: {available}\")\n"
-                    "KeyError: \"Unknown preset 'smoke'. Available presets: {preset_name}\"\n"
-                ),
-                output_path=root / "run_repair_preset.json",
-            )
-
-            self.assertEqual(preset_repair["status"], "skipped")
-            self.assertEqual(preset_repair["changed_files"], [])
-            config = read_json(project_dir / "config.json")
-            self.assertNotIn("smoke", config["presets"])
-            self.assertIn("{preset_name}", config["presets"])
-
-            signature_repair = repair_generated_project_from_run_failure(
-                project_dir=project_dir,
-                failure_analysis={"status": "needs_repair"},
-                stderr_text="TypeError: run_experiment() got an unexpected keyword argument 'data_source'",
-                output_path=root / "run_repair_signature.json",
-            )
-
-            self.assertEqual(signature_repair["status"], "skipped")
-            self.assertEqual(signature_repair["changed_files"], [])
-            self.assertEqual(read_text(package_dir / "runner.py"),
-                             "def run_experiment(preset='smoke'):\n    return {'score': 1.0}\n")
 
     def _assert_greenfield_artifact_guard(
         self, root: Path, run_name: str, script: str, expected_reason: str,
@@ -1831,14 +1769,7 @@ primary_metric = "accuracy"
             "# Task\n\nWrite artifacts/results.json and artifacts/report.md with measured rows.\n",
         )
         run_dir = root / "runs" / run_name
-        initialize_code_task(
-            run_dir=run_dir,
-            code_root=None,
-            task_file=task_file,
-            kind="greenfield",
-            benchmark_command="python generated_project/main.py",
-            workspace_mode="empty",
-            primary_metric="score",
+        _initialize_greenfield(run_dir=run_dir, task_file=task_file, primary_metric="score",
             metric_directions={"score": "higher"},
         )
         project_dir = run_dir / "code_task" / "workspace" / "generated_project"
@@ -1857,14 +1788,7 @@ primary_metric = "accuracy"
             task_file = root / "task.md"
             write_text(task_file, "# Task\n\nRun a greenfield experiment with condition-level evidence.\n")
             run_dir = root / "runs" / "empty-greenfield-evidence"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=None,
-                task_file=task_file,
-                kind="greenfield",
-                benchmark_command="python generated_project/main.py",
-                workspace_mode="empty",
-                primary_metric="test_accuracy",
+            _initialize_greenfield(run_dir=run_dir, task_file=task_file, primary_metric="test_accuracy",
                 metric_directions={
                     "test_accuracy": "higher",
                     "macro_f1": "higher",
@@ -1973,14 +1897,7 @@ primary_metric = "accuracy"
                 ),
             )
             run_dir = root / "runs" / "downstream-signals"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=None,
-                task_file=task_file,
-                kind="greenfield",
-                benchmark_command="python generated_project/main.py",
-                workspace_mode="empty",
-                primary_metric="score",
+            _initialize_greenfield(run_dir=run_dir, task_file=task_file, primary_metric="score",
                 metric_directions={"score": "higher"},
             )
             project_dir = run_dir / "code_task" / "workspace" / "generated_project"
@@ -2031,53 +1948,55 @@ primary_metric = "accuracy"
                 ),
             )
 
-            report = review_generated_project(
-                project_dir=project_dir,
-                code_artifacts={
-                    "generated_files": [
-                        {"path": "main.py", "mode": "llm"},
-                        {"path": "types.py", "mode": "llm"},
-                        {"path": "writer.py", "mode": "llm"},
-                    ]
-                },
+            report = _generated_review(project_dir,
+                [
+                    {"path": "main.py", "mode": "llm"},
+                    {"path": "types.py", "mode": "llm"},
+                    {"path": "writer.py", "mode": "llm"},
+                ],
                 result_schema={"required_metrics": ["accuracy"]},
                 resource_plan={"max_files": 10, "max_generated_lines": 500},
                 contract={"objective": "Write artifacts/results.json with measured accuracy."},
-                use_llm=False,
             )
 
             categories = {finding["category"] for finding in report["findings"]}
             self.assertIn("stdlib_module_shadow", categories)
             self.assertIn("nested_artifact_path_risk", categories)
 
-    def test_runtime_repair_without_model_does_not_guess_imports_or_output_paths(self) -> None:
-        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as tmp:
-            root = Path(tmp)
+    def test_runtime_repair_without_model_preserves_presets_apis_and_artifact_paths(self) -> None:
+        with _temporary_root() as root:
             project = root / "project"
-            project.mkdir()
-            write_text(project / "types.py", "class ConditionSpec:\n    pass\n")
-            write_text(project / "main.py", "from types import ConditionSpec\nLABEL = 'types'\n")
-            (project / "io").mkdir()
-            write_text(project / "io" / "__init__.py", "")
-            write_text(project / "writer.py", 'from pathlib import Path\nCANONICAL_RESULTS = Path("artifacts/results.json")\ndef write(results_dir):\n    base = Path(results_dir)\n    return base / CANONICAL_RESULTS\n')
-            before = {p.relative_to(project): p.read_bytes() for p in project.rglob("*") if p.is_file()}
+            files = {
+                "types.py": "class ConditionSpec:\n    pass\n",
+                "main.py": "from types import ConditionSpec\nLABEL = 'types'\n",
+                "io/__init__.py": "",
+                "writer.py": 'from pathlib import Path\nCANONICAL_RESULTS = Path("artifacts/results.json")\ndef write(results_dir):\n    base = Path(results_dir)\n    return base / CANONICAL_RESULTS\n',
+                "generated_experiment/runner.py": "def run_experiment(preset='smoke'):\n    return {'score': 1.0}\n",
+            }
+            for path, content in files.items():
+                write_text(project / path, content)
+            write_json(project / "config.json", {
+                "objective": "Greenfield run repair test.",
+                "presets": {"{preset_name}": {"conditions": ["baseline", "candidate"], "max_items": 32}},
+            })
+            before = _project_bytes(project)
             failures = [
                 f"ImportError: cannot import name 'ConditionSpec' from 'types' ({project / 'types.py'})",
                 "ModuleNotFoundError: No module named 'io.artifacts'; 'io' is not a package",
                 "ERROR: artifacts/results.json was not written",
+                "raise KeyError(f\"Unknown preset '{preset_name}'. Available presets: {available}\")\n"
+                "KeyError: \"Unknown preset 'smoke'. Available presets: {preset_name}\"\n",
+                "TypeError: run_experiment() got an unexpected keyword argument 'data_source'",
             ]
             for index, stderr in enumerate(failures):
                 with self.subTest(stderr=stderr):
                     repair = repair_generated_project_from_run_failure(
                         project_dir=project, failure_analysis={"status": "needs_repair"},
-                        stderr_text=stderr, output_path=root / f"repair-{index}.json", client=None,
-                    )
+                        stderr_text=stderr, output_path=root / f"repair-{index}.json", client=None)
                     self.assertEqual(repair["status"], "skipped")
                     self.assertEqual(repair["failure_status"], "needs_repair")
                     self.assertEqual(repair["changed_files"], [])
-                    self.assertEqual({p.relative_to(project): p.read_bytes() for p in project.rglob("*") if p.is_file()}, before)
-
-
+                    self.assertEqual(_project_bytes(project), before)
 
 
     def test_greenfield_execute_can_use_fake_agent_backend(self) -> None:
@@ -2088,15 +2007,7 @@ primary_metric = "accuracy"
                 "# Task\n\nUse an external handoff backend to generate a runnable metric project.\n",
             )
             run_dir = root / "runs" / "greenfield-agent-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=None,
-                task_file=task_file,
-                kind="greenfield",
-                benchmark_command="python generated_project/main.py",
-                workspace_mode="empty",
-                primary_metric="accuracy",
-            )
+            _initialize_greenfield(run_dir=run_dir, task_file=task_file, primary_metric="accuracy")
 
             result = execute_code_task(
                 run_dir,
@@ -2792,26 +2703,9 @@ protected_patterns = ["pyproject.toml"]
 
     def test_work_plan_and_batch_cli_create_attempt_state(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            output_root = root / "runs"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nImprove spam classifier accuracy.\n")
-
-            with contextlib.redirect_stdout(io.StringIO()):
-                main(
-                    [
-                        "code-task",
-                        "init",
-                        "--code-root",
-                        str(code_root),
-                        "--task-file",
-                        str(task_file),
-                        "--output-root",
-                        str(output_root),
-                    ]
-                )
-            run_dir = next(output_root.iterdir())
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nImprove spam classifier accuracy.\n", init_cli=True,
+            )
 
             work_plan_stdout = io.StringIO()
             with contextlib.redirect_stdout(work_plan_stdout):
@@ -2915,65 +2809,41 @@ protected_patterns = ["pyproject.toml"]
             self.assertEqual(batch_state["work_item_id"], "W2")
             self.assertIn("Implement", batch_state["work_item"]["objective"])
 
-    def test_create_code_task_batch_merges_serial_dependent_items(self) -> None:
-        with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(code_root / "extra.py", "VALUE = 1\n")
-            write_text(task_file, "# Task\n\nImplement a coupled feature, scorer, and config change.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=code_root,
-                task_file=task_file,
-                benchmark_command="python -m unittest discover -s tests",
-            )
-            _write_dependent_work_plan(run_dir)
+    def test_create_code_task_batch_respects_serial_merge_choice(self) -> None:
+        cases = (
+            (True, "Implement a coupled feature, scorer, and config change.",
+             ["W1", "W2", "W3"], "merged_dependent_chain",
+             ["spam_model.py", "extra.py", "pyproject.toml"], "large"),
+            (False, "Implement a coupled feature safely.",
+             ["W1"], "single_work_item", ["spam_model.py"], "normal"),
+        )
+        for merge, task, source_ids, scope, targets, budget in cases:
+            with self.subTest(merge_dependent_chain=merge), _temporary_root() as root:
+                # extra.py must exist before initialization copies the source.
+                code_root = root / "toy_project"
+                _write_toy_project(code_root)
+                write_text(code_root / "extra.py", "VALUE = 1\n")
+                task_file = root / "task.md"
+                write_text(task_file, f"# Task\n\n{task}\n")
+                run_dir = root / "runs" / "code-task-run"
+                initialize_code_task(
+                    run_dir=run_dir, code_root=code_root, task_file=task_file,
+                    benchmark_command=TOY_BENCHMARK_COMMAND,
+                )
+                _write_dependent_work_plan(run_dir)
 
-            result = create_code_task_batch(run_dir, work_item_id="W1")
+                # The merged case also protects the public default.
+                options = {} if merge else {"merge_dependent_chain": False}
+                result = create_code_task_batch(run_dir, work_item_id="W1", **options)
 
-            batch_state = read_json(result.batch_state_path)
-            self.assertEqual(batch_state["work_item_id"], "W1")
-            work_item = batch_state["work_item"]
-            self.assertEqual(work_item["source_work_item_ids"], ["W1", "W2", "W3"])
-            self.assertEqual(work_item["execution_scope"], "merged_dependent_chain")
-            self.assertEqual(
-                work_item["target_files"],
-                ["spam_model.py", "extra.py", "pyproject.toml"],
-            )
-            self.assertEqual(work_item["budget_profile"], "large")
-            self.assertTrue(work_item["requires_budget_override"])
-
-    def test_create_code_task_batch_can_disable_serial_merge(self) -> None:
-        with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            _write_toy_project(code_root)
-            write_text(code_root / "extra.py", "VALUE = 1\n")
-            write_text(task_file, "# Task\n\nImplement a coupled feature safely.\n")
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=code_root,
-                task_file=task_file,
-                benchmark_command="python -m unittest discover -s tests",
-            )
-            _write_dependent_work_plan(run_dir)
-
-            result = create_code_task_batch(
-                run_dir,
-                work_item_id="W1",
-                merge_dependent_chain=False,
-            )
-
-            batch_state = read_json(result.batch_state_path)
-            work_item = batch_state["work_item"]
-            self.assertEqual(work_item["source_work_item_ids"], ["W1"])
-            self.assertEqual(work_item["execution_scope"], "single_work_item")
-            self.assertEqual(work_item["target_files"], ["spam_model.py"])
-            self.assertEqual(work_item["budget_profile"], "normal")
-            self.assertFalse(work_item["requires_budget_override"])
+                batch_state = read_json(result.batch_state_path)
+                self.assertEqual(batch_state["work_item_id"], "W1")
+                work_item = batch_state["work_item"]
+                self.assertEqual(work_item["source_work_item_ids"], source_ids)
+                self.assertEqual(work_item["execution_scope"], scope)
+                self.assertEqual(work_item["target_files"], targets)
+                self.assertEqual(work_item["budget_profile"], budget)
+                self.assertEqual(work_item["requires_budget_override"], merge)
 
     def test_record_plan_decision_updates_work_plan_approval(self) -> None:
         with _temporary_root() as root:
@@ -3020,26 +2890,9 @@ protected_patterns = ["pyproject.toml"]
 
     def test_code_task_probe_cli_prints_environment_summary(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            output_root = root / "runs"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nProbe from CLI.\n")
-
-            with contextlib.redirect_stdout(io.StringIO()):
-                main(
-                    [
-                        "code-task",
-                        "init",
-                        "--code-root",
-                        str(code_root),
-                        "--task-file",
-                        str(task_file),
-                        "--output-root",
-                        str(output_root),
-                    ]
-                )
-            run_dir = next(output_root.iterdir())
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nProbe from CLI.\n", init_cli=True,
+            )
 
             probe_stdout = io.StringIO()
             with contextlib.redirect_stdout(probe_stdout):
@@ -3689,26 +3542,9 @@ protected_patterns = ["pyproject.toml"]
 
     def test_code_task_plan_and_decide_cli(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            output_root = root / "runs"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nImprove spam classifier accuracy.\n")
-
-            with contextlib.redirect_stdout(io.StringIO()):
-                main(
-                    [
-                        "code-task",
-                        "init",
-                        "--code-root",
-                        str(code_root),
-                        "--task-file",
-                        str(task_file),
-                        "--output-root",
-                        str(output_root),
-                    ]
-                )
-            run_dir = next(output_root.iterdir())
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nImprove spam classifier accuracy.\n", init_cli=True,
+            )
 
             plan_stdout = io.StringIO()
             with contextlib.redirect_stdout(plan_stdout):
@@ -4044,25 +3880,9 @@ protected_patterns = ["pyproject.toml"]
 
     def test_code_task_propose_and_apply_cli_with_manual_edits_file(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            output_root = root / "runs"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nDetect prize messages as spam.\n")
-            with contextlib.redirect_stdout(io.StringIO()):
-                main(
-                    [
-                        "code-task",
-                        "init",
-                        "--code-root",
-                        str(code_root),
-                        "--task-file",
-                        str(task_file),
-                        "--output-root",
-                        str(output_root),
-                    ]
-                )
-            run_dir = next(output_root.iterdir())
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nDetect prize messages as spam.\n", init_cli=True,
+            )
             with contextlib.redirect_stdout(io.StringIO()):
                 main(["code-task", "plan", str(run_dir), "--no-llm"])
                 main(["code-task", "decide-plan", str(run_dir), "--decision", "approve"])
@@ -4087,25 +3907,9 @@ protected_patterns = ["pyproject.toml"]
 
     def test_code_task_apply_cli_reports_validation_errors_without_traceback(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            output_root = root / "runs"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nDetect prize messages as spam.\n")
-            with contextlib.redirect_stdout(io.StringIO()):
-                main(
-                    [
-                        "code-task",
-                        "init",
-                        "--code-root",
-                        str(code_root),
-                        "--task-file",
-                        str(task_file),
-                        "--output-root",
-                        str(output_root),
-                    ]
-                )
-            run_dir = next(output_root.iterdir())
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nDetect prize messages as spam.\n", init_cli=True,
+            )
             with contextlib.redirect_stdout(io.StringIO()):
                 main(["code-task", "plan", str(run_dir), "--no-llm"])
                 main(["code-task", "decide-plan", str(run_dir), "--decision", "approve"])
@@ -4634,27 +4438,10 @@ protected_patterns = ["pyproject.toml"]
 
     def test_code_task_cli_can_override_env_mode_for_baseline(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            output_root = root / "runs"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nRun CLI baseline with explicit env.\n")
-            with contextlib.redirect_stdout(io.StringIO()):
-                main(
-                    [
-                        "code-task",
-                        "init",
-                        "--code-root",
-                        str(code_root),
-                        "--task-file",
-                        str(task_file),
-                        "--output-root",
-                        str(output_root),
-                        "--benchmark-command",
-                        "python -m unittest discover -s tests",
-                    ]
-                )
-            run_dir = next(output_root.iterdir())
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nRun CLI baseline with explicit env.\n", init_cli=True,
+                benchmark_command=TOY_BENCHMARK_COMMAND,
+            )
 
             stdout = io.StringIO()
             with contextlib.redirect_stdout(stdout):
@@ -5507,27 +5294,10 @@ protected_patterns = ["pyproject.toml"]
 
     def test_code_task_validate_run_and_failure_cli(self) -> None:
         with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            output_root = root / "runs"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nRun CLI validation and tests.\n")
-            with contextlib.redirect_stdout(io.StringIO()):
-                main(
-                    [
-                        "code-task",
-                        "init",
-                        "--code-root",
-                        str(code_root),
-                        "--task-file",
-                        str(task_file),
-                        "--output-root",
-                        str(output_root),
-                        "--benchmark-command",
-                        "python -m unittest discover -s tests",
-                    ]
-                )
-            run_dir = next(output_root.iterdir())
+            code_root, task_file, run_dir = _initialize_toy_task(
+                root, "# Task\n\nRun CLI validation and tests.\n", init_cli=True,
+                benchmark_command=TOY_BENCHMARK_COMMAND,
+            )
 
             validate_stdout = io.StringIO()
             with contextlib.redirect_stdout(validate_stdout):
@@ -5555,16 +5325,52 @@ def _temporary_root():
         yield Path(tmp)
 
 
-def _initialize_toy_task(root: Path, task_text: str, **options) -> tuple[Path, Path, Path]:
+def _generated_review(project: Path, rows: list[dict], **overrides) -> dict:
+    inputs = dict(project_dir=project, code_artifacts={"generated_files": rows},
+        result_schema={}, resource_plan={"max_files": 10, "max_generated_lines": 200},
+        use_llm=False)
+    return review_generated_project(**(inputs | overrides))
+
+
+def _architecture_plan(**overrides):
+    from simple_ar.code_task.generation.architecture import build_architecture_plan
+
+    inputs = dict(contract={}, result_schema={}, resource_plan={}, domain_profile={})
+    return build_architecture_plan(**(inputs | overrides))
+
+
+def _project_bytes(project: Path) -> dict:
+    return {p.relative_to(project): p.read_bytes() for p in project.rglob("*") if p.is_file()}
+
+
+def _initialize_greenfield(run_dir: Path, task_file: Path, **overrides):
+    """Shared empty-project boundary, with metric and resource choices explicit."""
+    return initialize_code_task(run_dir=run_dir, code_root=None, task_file=task_file,
+        kind="greenfield", workspace_mode="empty",
+        benchmark_command="python generated_project/main.py", **overrides)
+
+
+def _initialize_toy_task(
+    root: Path, task_text: str, *, init_cli: bool = False, **options,
+) -> tuple[Path, Path, Path]:
     """Create the shared project without supplying implicit task authorization."""
     code_root = root / "toy_project"
     task_file = root / "task.md"
     _write_toy_project(code_root)
     write_text(task_file, task_text)
     run_dir = root / "runs" / "code-task-run"
-    initialize_code_task(
-        run_dir=run_dir, code_root=code_root, task_file=task_file, **options,
-    )
+    if init_cli:
+        args = ["code-task", "init", "--code-root", str(code_root),
+                "--task-file", str(task_file), "--output-root", str(root / "runs")]
+        for name, value in options.items():
+            args.extend(["--" + name.replace("_", "-"), str(value)])
+        with contextlib.redirect_stdout(io.StringIO()):
+            main(args)
+        run_dir = next((root / "runs").iterdir())
+    else:
+        initialize_code_task(
+            run_dir=run_dir, code_root=code_root, task_file=task_file, **options,
+        )
     return code_root, task_file, run_dir
 
 

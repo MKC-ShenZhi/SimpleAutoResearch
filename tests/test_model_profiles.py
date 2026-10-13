@@ -41,44 +41,34 @@ capabilities = ["image_generate", "image_edit"]
 '''
 
 
+def png_bytes(size):
+    from PIL import Image
+    payload = io.BytesIO()
+    Image.new("RGB", size, "white").save(payload, format="PNG")
+    return payload.getvalue()
+
+
 class ModelProfileTests(unittest.TestCase):
     def test_run_image_async_pending_reservation_resume_and_completed_restore(self):
         from PIL import Image
         from simple_ar.core.budget import BudgetLedger
         from simple_ar.core.capabilities import ArtifactStore
         from simple_ar.integrations.image_tasks import ImageTaskError
-        from simple_ar.integrations.images import ImagesError, run_image
+        from simple_ar.integrations.images import run_image
         sync_catalog = load_model_catalog(self.path)
         os.environ["IMAGE_KEY"] = "image-secret"
         for api in ("openai_images", "cctq_images_async"):
             with self.subTest(preflight_api=api):
                 artist = sync_catalog.profiles["artist"].model_copy(update={"api": api, "http2": True})
                 preflight_catalog = sync_catalog.model_copy(update={"profiles": {**sync_catalog.profiles, "artist": artist}})
-                preflight_store = ArtifactStore(self.root / (api + "-preflight"))
-                preflight_ledger = BudgetLedger({"image_requests": 2}, storage_path=self.root / (api + "-budget.json"))
-                with patch("simple_ar.integrations.images.import_module", side_effect=ImportError), \
-                        patch("simple_ar.integrations.image_tasks.request_task_image") as async_send, \
-                        patch("simple_ar.integrations.images.OpenAI") as sync_send:
-                    with self.assertRaisesRegex(ImagesError, "no image submission attempted"):
-                        run_image(preflight_catalog, "Draw an overview", store=preflight_store,
-                            ledger=preflight_ledger, reservation_id="preflight", reserves={"image_requests": 1})
-                    async_send.assert_not_called()
-                    sync_send.assert_not_called()
-                self.assertFalse(preflight_ledger.entries)
-                self.assertFalse(preflight_store.root.exists())
-        with self.assertRaises(ModelConfigError):
-            sync_catalog.select("profile:artist", purpose="text")
-        with self.assertRaises(ModelConfigError):
-            sync_catalog.profiles["artist"].text_settings()
-        self.path.write_text(CATALOG.replace('api = "openai_images"',
-                                            'api = "cctq_images_async"\nproxy_env = "IMAGE_PROXY"'), encoding="utf-8")
+                with patch("simple_ar.integrations.images.import_module", side_effect=ImportError):
+                    store = self._assert_image_preflight_rejected(preflight_catalog, api + "-preflight",
+                        capacity=2, message="no image submission attempted")
+                self.assertFalse(store.root.exists())
+        self._write_catalog('api = "openai_images"', 'api = "cctq_images_async"\nproxy_env = "IMAGE_PROXY"')
         os.environ["IMAGE_PROXY"] = "http://127.0.0.1:7890"
         catalog = load_model_catalog(self.path)
-        with self.assertRaises(ModelConfigError):
-            catalog.select("profile:artist", purpose="text")
-        os.environ["IMAGE_KEY"] = "image-secret"
-        payload = io.BytesIO()
-        Image.new("RGB", (8, 8), "white").save(payload, format="PNG")
+        payload = png_bytes((8, 8))
         store = ArtifactStore(self.root / "async-integration")
         ledger_path = self.root / "async-integration.budget.json"
         kwargs = dict(store=store, reservation_id="image", reserves={"image_requests": 1},
@@ -94,7 +84,7 @@ class ModelProfileTests(unittest.TestCase):
                 raise ImageTaskError("Polling interrupted; saved task retained")
             self.assertEqual(store.read_json("image_task.json")["id"], "pending_1")
             store.write_json("image_task.json", {"id": "pending_1", "status": "completed"})
-            return payload.getvalue(), {"total_tokens": 5}, "pending_1"
+            return payload, {"total_tokens": 5}, "pending_1"
 
         with patch("simple_ar.integrations.image_tasks.request_task_image", side_effect=helper) as send, \
                 patch("simple_ar.integrations.images.import_module") as http2_dependency, \
@@ -143,10 +133,10 @@ class ModelProfileTests(unittest.TestCase):
                     "status": "in_progress"})
                 raise ImageTaskError("Polling interrupted")
             if request["source"]:
-                self.assertEqual(request["source"].read_bytes(), payload.getvalue())
+                self.assertEqual(request["source"].read_bytes(), payload)
             image_store.write_json("image_task.json", {"id": image_store.root.parent.name,
                 "status": "completed"})
-            return payload.getvalue(), {}, image_store.root.parent.name
+            return payload, {}, image_store.root.parent.name
 
         with patch("simple_ar.tools.images.load_model_catalog", return_value=catalog), \
                 patch("simple_ar.integrations.images.import_module"), \
@@ -312,8 +302,7 @@ class ModelProfileTests(unittest.TestCase):
                 image_tasks.request_task_image(**kwargs)
         self.assertEqual(calls, ["POST"])
         source = self.root / "input.png"
-        from PIL import Image
-        Image.new("RGB", (2, 2), "white").save(source)
+        source.write_bytes(png_bytes((2, 2)))
         edit_store = ArtifactStore(self.root / "async-edit")
         kwargs.update(source=source, store=edit_store)
 
@@ -347,17 +336,13 @@ class ModelProfileTests(unittest.TestCase):
     def test_images_generate_edit_and_saved_recovery_use_one_request_each(self):
         import base64
         from types import SimpleNamespace
-        from PIL import Image
         from simple_ar.core.budget import BudgetLedger
         from simple_ar.core.capabilities import ArtifactStore
         from simple_ar.integrations.images import run_image
         os.environ["IMAGE_KEY"] = "image-secret"
         os.environ["IMAGE_PROXY"] = "http://127.0.0.1:7890"
-        self.path.write_text(CATALOG.replace('api = "openai_images"',
-                            'api = "openai_images"\nproxy_env = "IMAGE_PROXY"'), encoding="utf-8")
-        payload = io.BytesIO()
-        Image.new("RGB", (8, 8), "white").save(payload, format="PNG")
-        response = SimpleNamespace(data=[SimpleNamespace(b64_json=base64.b64encode(payload.getvalue()).decode())],
+        self._write_catalog('api = "openai_images"', 'api = "openai_images"\nproxy_env = "IMAGE_PROXY"')
+        response = SimpleNamespace(data=[SimpleNamespace(b64_json=base64.b64encode(png_bytes((8, 8))).decode())],
             usage=None, _request_id="request-test")
         catalog = load_model_catalog(self.path)
         with patch("simple_ar.integrations.images.OpenAI") as factory, \
@@ -398,6 +383,26 @@ class ModelProfileTests(unittest.TestCase):
             "SIMPLE_AR_MODEL": "legacy-model"}, clear=True))
         self.stack.enter_context(patch("simple_ar.integrations.llm.load_dotenv"))
         self.stack.enter_context(patch("simple_ar.integrations.model_profiles.Path.home", return_value=self.root))
+
+    def _write_catalog(self, original, replacement, count=-1):
+        self.path.write_text(CATALOG.replace(original, replacement, count), encoding="utf-8")
+
+    def _assert_image_preflight_rejected(self, catalog, name, *, capacity=1, message=""):
+        from simple_ar.core.budget import BudgetLedger
+        from simple_ar.core.capabilities import ArtifactStore
+        from simple_ar.integrations.images import ImagesError, run_image
+        store = ArtifactStore(self.root / name)
+        ledger = BudgetLedger({"image_requests": capacity}, storage_path=self.root / (name + "-budget.json"))
+        with patch("simple_ar.integrations.images.OpenAI") as sync_send, \
+                patch("simple_ar.integrations.image_tasks.request_task_image") as async_send:
+            with self.assertRaisesRegex(ImagesError, message):
+                run_image(catalog, "Draw an overview", store=store, ledger=ledger,
+                    reservation_id="preflight", reserves={"image_requests": 1})
+            sync_send.assert_not_called()
+            async_send.assert_not_called()
+        self.assertEqual(ledger.entries, ())
+        self.assertFalse(store.exists("request.json"))
+        return store
 
     def test_routed_requests_use_whole_connection_and_preserve_usage(self):
         parent_usage, task_usage = [], []
@@ -441,8 +446,9 @@ class ModelProfileTests(unittest.TestCase):
         self.assertEqual(LLMClient.for_task(client=selected, purpose="writing").model, "coder-model")
 
     def test_named_selection_is_explicit_and_never_falls_back(self):
-        self.assertEqual(LLMClient.from_env(model="profile:coder").model, "coder-model")
-        self.assertEqual(LLMClient.from_env(model="route:code").model, "coder-model")
+        for selector in ("profile:coder", "route:code"):
+            with self.subTest(selector=selector):
+                self.assertEqual(LLMClient.from_env(model=selector).model, "coder-model")
         for selector in ["profile:missing", "different-raw-model", "profile:artist"]:
             with self.subTest(selector=selector), self.assertRaises(LLMError):
                 LLMClient.from_env(model=selector)
@@ -469,10 +475,10 @@ class ModelProfileTests(unittest.TestCase):
         self.assertNotIn("proxy_env", binding["code_route"]["connection"])
         os.environ["WRITER_KEY"] = "rotated"
         self.assertEqual(LLMClient.from_env().connection_binding(), binding)
-        self.path.write_text(CATALOG.replace("image-model", "new-image-model"), encoding="utf-8")
+        self._write_catalog("image-model", "new-image-model")
         self.assertEqual(LLMClient.from_env().connection_binding(), binding)
-        self.path.write_text(CATALOG.replace('retry_attempts = 1',
-            'retry_attempts = 3\nrequest_timeout_sec = 1200.0\nmax_output_tokens = 16384\ncontext_input_tokens = 64000'), encoding="utf-8")
+        self._write_catalog('retry_attempts = 1',
+            'retry_attempts = 3\nrequest_timeout_sec = 1200.0\nmax_output_tokens = 16384\ncontext_input_tokens = 64000')
         tuned = LLMClient.from_env().connection_binding()
         self.assertNotEqual(tuned, binding)
         self.assertTrue(model_connections_compatible(binding, tuned))
@@ -482,21 +488,28 @@ class ModelProfileTests(unittest.TestCase):
         legacy_binding['settings'].pop('context_input_tokens')
         legacy_binding['code_route']['connection'].pop('context_input_tokens')
         self.assertTrue(model_connections_compatible(legacy_binding, tuned))
-        self.path.write_text(CATALOG.replace("coder-model", "next-model"), encoding="utf-8")
+        self._write_catalog("coder-model", "next-model")
         self.assertNotEqual(LLMClient.from_env().connection_binding(), binding)
         self.assertFalse(model_connections_compatible(binding, LLMClient.from_env().connection_binding()))
-        self.path.write_text(CATALOG.replace('code = "coder"', 'code = "coder"\nwriting = "writer"'), encoding="utf-8")
+        self._write_catalog('code = "coder"', 'code = "coder"\nwriting = "writer"')
         routed = LLMClient.from_env().connection_binding()
         self.assertNotIn("writer-secret", json.dumps(routed))
         self.assertFalse(model_connections_compatible(binding, routed))
-        self.path.write_text(CATALOG.replace('code = "coder"', 'code = "coder"\nwriting = "coder"'), encoding="utf-8")
+        self._write_catalog('code = "coder"', 'code = "coder"\nwriting = "coder"')
         self.assertFalse(model_connections_compatible(routed, LLMClient.from_env().connection_binding()))
 
     def test_catalog_inspection_needs_no_credentials_and_images_are_not_text(self):
         catalog = load_model_catalog()
         self.assertEqual(catalog.select(purpose="image")[0], "artist")
-        with self.assertRaises(ModelConfigError):
-            catalog.select("profile:artist")
+        for api in ("openai_images", "cctq_images_async"):
+            with self.subTest(api=api):
+                self._write_catalog('api = "openai_images"', f'api = "{api}"')
+                image_catalog = load_model_catalog()
+                with self.assertRaises(ModelConfigError):
+                    image_catalog.select("profile:artist", purpose="text")
+                with self.assertRaises(ModelConfigError):
+                    image_catalog.profiles["artist"].text_settings()
+        self.path.write_text(CATALOG, encoding="utf-8")
         from simple_ar.cli.main import main
         output = io.StringIO()
         with patch("sys.argv", ["simple-ar", "models", "--config", str(self.path)]), contextlib.redirect_stdout(output):
@@ -505,9 +518,9 @@ class ModelProfileTests(unittest.TestCase):
         self.assertNotIn("writer-secret", output.getvalue())
         for effort in ("", "none"):
             with self.subTest(thinking="disabled", effort=effort):
-                self.path.write_text(CATALOG.replace('api_key_env = "WRITER_KEY"',
+                self._write_catalog('api_key_env = "WRITER_KEY"',
                     'api_key_env = "WRITER_KEY"\nthinking_mode = "disabled"\n'
-                    f'reasoning_effort = "{effort}"', 1), encoding="utf-8")
+                    f'reasoning_effort = "{effort}"', 1)
                 with patch.dict(os.environ, {}, clear=True):
                     profile = load_model_catalog(self.path).profiles["writer"]
                 self.assertEqual(profile.thinking_mode, "disabled")
@@ -529,18 +542,14 @@ class ModelProfileTests(unittest.TestCase):
             for effort in ("minimal", "low", "medium", "high", "xhigh", "max", "ultra")
         ]:
             with self.subTest(replacement=replacement):
-                self.path.write_text(CATALOG.replace(original, replacement, 1), encoding="utf-8")
+                self._write_catalog(original, replacement, 1)
                 with self.assertRaises(ModelConfigError) as caught:
                     load_model_catalog()
                 self.assertNotIn("accidental-secret", str(caught.exception))
 
     def test_proxy_reference_validation_and_invalid_image_preflight_never_reserve(self):
-        from simple_ar.core.budget import BudgetLedger
-        from simple_ar.core.capabilities import ArtifactStore
-        from simple_ar.integrations.images import ImagesError, run_image
         self.assertIsNone(load_model_catalog().profiles["artist"].resolve_proxy())
-        self.path.write_text(CATALOG.replace('api = "openai_images"',
-                            'api = "openai_images"\nproxy_env = "IMAGE_PROXY"'), encoding="utf-8")
+        self._write_catalog('api = "openai_images"', 'api = "openai_images"\nproxy_env = "IMAGE_PROXY"')
         catalog = load_model_catalog()
         profile = catalog.profiles["artist"]
         os.environ["IMAGE_KEY"] = "image-secret"
@@ -555,14 +564,7 @@ class ModelProfileTests(unittest.TestCase):
                 with self.assertRaises(ModelConfigError) as caught:
                     profile.resolve_proxy()
                 self.assertNotIn("accidental-secret", str(caught.exception))
-                ledger = BudgetLedger({"image_requests": 1}, storage_path=self.root / "bad-proxy-budget.json")
-                with patch("simple_ar.integrations.images.OpenAI") as send:
-                    with self.assertRaises(ImagesError):
-                        run_image(catalog, "Draw a source map", store=ArtifactStore(self.root / "bad-proxy"),
-                                  ledger=ledger, reservation_id="bad", reserves={"image_requests": 1})
-                self.assertEqual(ledger.entries, ())
-                send.assert_not_called()
-                self.assertFalse((self.root / "bad-proxy" / "request.json").exists())
+                self._assert_image_preflight_rejected(catalog, "bad-proxy")
         for value in ("http://127.0.0.1:7890", "https://proxy.example:8443"):
             os.environ["IMAGE_PROXY"] = value
             self.assertEqual(profile.resolve_proxy(), value)
@@ -585,19 +587,19 @@ class ModelProfileTests(unittest.TestCase):
         os.environ["WRITER_KEY"] = "rotated"
         restored = load_session(root, services=ResearchApplicationServices(llm_client=LLMClient.from_env()))
         restored.require_llm_binding()
-        self.path.write_text(CATALOG.replace("writer-model", "changed-model"), encoding="utf-8")
+        self._write_catalog("writer-model", "changed-model")
         changed = load_session(root, services=ResearchApplicationServices(llm_client=LLMClient.from_env()))
         with self.assertRaisesRegex(ResearchApplicationError, "connections differ"):
             changed.require_llm_binding()
 
     def test_explicit_code_connection_survives_nested_task_clients(self):
-        self.path.write_text(CATALOG.replace('code = "coder"', 'code = "writer"'), encoding="utf-8")
+        self._write_catalog('code = "coder"', 'code = "writer"')
         chosen = LLMClient.from_env(model="profile:coder", purpose="code")
         self.assertEqual(LLMClient.for_task(client=chosen, model=chosen.model).model, "coder-model")
 
     def test_http2_is_opt_in_transport_not_provider_payload(self):
         original_binding = LLMClient.from_env().connection_binding()
-        self.path.write_text(CATALOG.replace('stream = true', 'stream = true\nhttp2 = true'), encoding="utf-8")
+        self._write_catalog('stream = true', 'stream = true\nhttp2 = true')
         client = LLMClient.from_env()
         self.assertNotEqual(client.connection_binding(), original_binding)
         with patch("simple_ar.integrations.llm._call_openai_chat_stream", new_callable=AsyncMock) as transport:

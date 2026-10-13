@@ -23,8 +23,8 @@ class ReportDocumentArgumentsTests(unittest.TestCase):
         for command in ("research-session", "research-report"):
             with self.subTest(command=command):
                 destinations = {key if command == "research-report" else destination: values[key]
-                    for key, (destination, _) in FIELDS["report"].items()}
-                args = Namespace(command=command, **destinations)
+                    for key, (destination, _) in FIELDS["report"].items() if key != "writing_method"}
+                args = Namespace(command=command, report_writing_method="article", **destinations)
                 original = vars(args).copy()
                 self.assertEqual(report_settings(args), values)
                 self.assertEqual(report_settings(args, explicit_destinations=set()), {})

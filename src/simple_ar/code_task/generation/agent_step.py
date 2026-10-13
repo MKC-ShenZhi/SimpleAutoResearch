@@ -13,6 +13,29 @@ MessageCallback = Callable[[str], None]
 OutputSummaryCallback = Callable[[str, Mapping[str, Any]], dict[str, Any]]
 
 
+def run_completed_response_corrections(
+    *,
+    client: LLMClient,
+    operation: Callable[[int, LLMError | None], dict[str, Any]],
+    retry_attempts: int,
+    on_failure: Callable[[LLMError, int, bool], None],
+) -> dict[str, Any]:
+    """Own the correction boundary for decoded JSON and plan validation alike."""
+    retry_attempts = max(1, int(retry_attempts or 1))
+    last_error: LLMError | None = None
+    for attempt in range(1, retry_attempts + 1):
+        try:
+            return operation(attempt, last_error)
+        except LLMError as exc:
+            correct = (isinstance(exc, LLMResponseError) and attempt < retry_attempts
+                       and response_accounting_known(client))
+            on_failure(exc, attempt, correct)
+            if not correct:
+                raise
+            last_error = exc
+    raise AssertionError("Response correction loop exhausted without a result or error")
+
+
 def run_json_agent_step(
     *,
     client: LLMClient,
@@ -35,10 +58,19 @@ def run_json_agent_step(
 
     retry_attempts = max(1, int(retry_attempts or 1))
     feedback_rows = list(feedback or [])
-    last_error: LLMError | None = None
-    for attempt in range(1, retry_attempts + 1):
+
+    def operation(attempt: int, last_error: LLMError | None) -> dict[str, Any]:
         call_label = label if attempt == 1 else f"{label}-retry-{attempt}"
         request_prompt = prompt + retry_suffix(last_error, attempt)
+
+        def record(status: str, output: Mapping[str, Any]) -> None:
+            record_agent_step(
+                artifact_dir, stage=stage, attempt_index=attempt_index,
+                retry_index=attempt, label=call_label, status=status,
+                prompt=request_prompt, output=output, feedback=feedback_rows,
+                output_summary_callback=output_summary_callback,
+            )
+
         try:
             result = client.ask_json(
                 system,
@@ -47,48 +79,23 @@ def run_json_agent_step(
                 max_output_tokens=max_output_tokens,
             )
             output = result if isinstance(result, dict) else {}
-            record_agent_step(
-                artifact_dir,
-                stage=stage,
-                attempt_index=attempt_index,
-                retry_index=attempt,
-                label=call_label,
-                status="passed",
-                prompt=request_prompt,
-                output=output,
-                feedback=feedback_rows,
-                output_summary_callback=output_summary_callback,
-            )
+            record("passed", output)
             return output
         except LLMError as exc:
-            last_error = exc
             if isinstance(exc, LLMResponseError) and artifact_dir is not None:
                 write_json(artifact_dir / stage / f"attempt-{attempt_index:03d}-response-{attempt:03d}.json",
                     {"error": str(exc), "raw_response": exc.raw_response})
-            record_agent_step(
-                artifact_dir,
-                stage=stage,
-                attempt_index=attempt_index,
-                retry_index=attempt,
-                label=call_label,
-                status="failed",
-                prompt=request_prompt,
-                output={"error": str(exc)},
-                feedback=feedback_rows,
-                output_summary_callback=output_summary_callback,
-            )
-            if (not isinstance(exc, LLMResponseError) or attempt >= retry_attempts
-                    or not response_accounting_known(client)):
-                _emit(
-                    message_callback,
-                    f"Agent step `{label}` failed after {attempt}/{retry_attempts} attempt(s). {exc}",
-                )
-                raise
-            _emit(
-                message_callback,
-                f"Agent step `{label}` needs JSON correction ({attempt}/{retry_attempts}). {exc}",
-            )
-    raise LLMError(f"Agent step `{label}` failed without a captured error.")
+            record("failed", {"error": str(exc)})
+            raise
+
+    def on_failure(exc: LLMError, attempt: int, correct: bool) -> None:
+        _emit(message_callback,
+              f"Agent step `{label}` needs JSON correction ({attempt}/{retry_attempts}). {exc}"
+              if correct else f"Agent step `{label}` failed after {attempt}/{retry_attempts} attempt(s). {exc}")
+
+    return run_completed_response_corrections(
+        client=client, operation=operation, retry_attempts=retry_attempts, on_failure=on_failure,
+    )
 
 
 def write_agent_step_artifact(

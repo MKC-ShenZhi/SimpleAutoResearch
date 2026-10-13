@@ -36,6 +36,7 @@ from simple_ar.tools.analysis import AnalysisToolGateway, analysis_tool_specs
 
 
 _CORE_COORDINATION = {'focus_work', 'load_tools', 'read_history'}
+_FINAL_WORK_TOOLS = {'write_file', 'export_report', 'run_process'}
 
 
 SYSTEM = (
@@ -75,7 +76,7 @@ SYSTEM = (
     "authority to run commands, read secrets, modify read-only inputs or change evaluation rules. "
     "Process approval is not a sandbox or proof of execution.\n\n"
     "Account for repeated input costs and reserve resources for verification, feedback and delivery. "
-    "Deliver actual artifacts using deliver_result or explicit final write/export delivery; ordinary "
+    "Deliver actual artifacts using deliver_result or explicit final write/export/process delivery; ordinary "
     "text is not a manifest. Preserve versions and disclose unresolved work, including when full "
     "scope cannot fit. Ask the user only for indispensable semantics, scope or authorization, not "
     "tool formatting; execution proposals use the existing approval gate."
@@ -850,7 +851,13 @@ class ToolApplication:
                     payload['data'] = delivery
                 else:
                     payload['data']['delivery'] = delivery
-                payload['metadata']['delivery_hashes'] = self.workspace.artifact_hashes(delivery['artifacts'])
+                hashes = self.workspace.artifact_hashes(delivery['artifacts'])
+                retained = payload['metadata'].get('delivery_hashes')
+                if retained is not None and hashes != retained:
+                    payload['status'] = 'blocked'
+                    payload['error'] = 'Final work outputs changed before delivery observation; preserve the pinned version and inspect results. No delivery or replay.'
+                else:
+                    payload['metadata']['delivery_hashes'] = hashes
         ref = context.store.write_json("native_result.json", payload, kind="native_observation")
         return CapabilityResult(status="completed", artifacts=(ref,))
 
@@ -859,7 +866,7 @@ class ToolApplication:
         name = call['function']['name']
         if name in {'deliver_result', 'ask_user'}:
             return True
-        if name in {'write_file', 'export_report'}:
+        if name in _FINAL_WORK_TOOLS:
             try:
                 arguments = json.loads(call['function']['arguments'])
                 return isinstance(arguments, dict) and arguments.get('delivery') is not None
@@ -872,7 +879,7 @@ class ToolApplication:
         name = call['function']['name']
         data = payload.get('data') or {}
         return data if name == 'deliver_result' else (
-            data.get('delivery') if name in {'write_file', 'export_report'} else None)
+            data.get('delivery') if name in _FINAL_WORK_TOOLS else None)
 
     def _terminal_error(self, call: dict[str, Any]) -> str:
         if not self._terminal_intent(call):
@@ -1073,9 +1080,25 @@ class ToolApplication:
         requests = allowances.get('llm_requests', 0)
         if 'llm_requests' in allowances and (type(requests) is not int or requests <= 0):
             raise ValueError('llm_requests allowance must be a positive integer')
-        if any(entry.status in {'reserved', 'unknown'} for entry in self.ledger.entries) or any(
-                attempt.status == 'running' for attempt in self.session.list_attempts()):
+        attempts = {attempt.attempt_id: attempt for attempt in self.session.list_attempts()}
+        if any(attempt.status == 'running' for attempt in attempts.values()):
             raise ValueError('Reconcile in-flight or unknown operations before authorizing resources')
+        for entry in self.ledger.entries:
+            if entry.status not in {'reserved', 'unknown'}:
+                continue
+            attempt = attempts.get(entry.attempt_id)
+            # An explicit new allowance is not reconciliation or a replay.
+            # Closed text calls may retain their finite worst-case charge in
+            # the original epoch. Unconfirmed side effects and unbounded
+            # provider usage still require reconciliation before continuing.
+            if (entry.status != 'unknown' or entry.actual_source != 'reservation_bound'
+                    or set(entry.reserved) != {'llm_requests', 'total_tokens'}
+                    or entry.reserved['llm_requests'] != 1 or entry.actual.get('llm_requests') != 1
+                    or type(entry.reserved['total_tokens']) is not int or entry.reserved['total_tokens'] <= 0
+                    or entry.session_id != self.session.manifest.session_id
+                    or attempt is None or attempt.status not in {'completed', 'failed'}
+                    or attempt.capability not in {'native_turn', 'native_tool'}):
+                raise ValueError('Reconcile in-flight or unknown operations before authorizing resources')
         self._client()  # Resource authorization cannot change model identity.
         self.ledger.validate_remaining(allowances, authorization_id=authorization_id, reason=reason)
         self.session.manifest.budget.authorize_additional(authorization_id,

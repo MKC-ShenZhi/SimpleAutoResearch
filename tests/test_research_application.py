@@ -200,6 +200,72 @@ class ResearchApplicationTests(unittest.TestCase):
                 self.assertNotIn("synthesis", view.state_refs)
                 self.assertEqual(app.budget_ledger.remaining("process_invocations"), 0)
 
+    def test_article_writer_recovers_then_refreshes_with_prior_draft_and_retained_ledger(self):
+        from simple_ar.report.writing import ARTICLE_OWNER, write_whole_article
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            material = root / "observations.md"
+            material.write_text("# Observations\nOne recorded observation under one declared condition.\n", encoding="utf-8")
+            client = LLMClient(LLMSettings(api_key="fixture"))
+            config = {"research_task_kind": "writing", "research_materials_only": True,
+                      "research_plan_mode": "deterministic", "report_writing_method": "article",
+                      "report": {"reviewer": "disabled", "max_review_iterations": 0,
+                                 "allow_source_backtracking": False, "outline_strategy": "template"}}
+            app = create_session(ResearchBrief(request_text="Explain the observation without claiming verification",
+                requested_outputs=("report",), asset_requests=({"locator": str(material), "role": "material"},)),
+                root=root / "session", services=ResearchApplicationServices(config=config,
+                    llm_client=client, budget_limits={"process_invocations": 0}))
+            self.assertEqual(app.advance(max_actions=2).next_action, "report_write")
+            material.write_text("Changed external source, not accepted evidence.", encoding="utf-8")
+            article = "## Observations\n\nThe supplied material records one observation under one declared condition.\n\n## Interpretation and limits\n\nThis task did not run an experiment or independently verify the observation. It cannot establish comparative performance or reliability."
+            def write(system, prompt, **kwargs):
+                inputs = json.loads(prompt)
+                self.assertIn("recorded observation", json.dumps(inputs))
+                self.assertNotIn("Changed external source", json.dumps(inputs))
+                return {"draft_markdown": article}
+            def persist_then_interrupt(**kwargs):
+                write_whole_article(**kwargs)
+                raise RuntimeError("Worker interrupted after saving the original response")
+            with patch.object(LLMClient, "ask_json", side_effect=write) as model, patch(
+                    "simple_ar.report.writing.write_whole_article", side_effect=persist_then_interrupt):
+                view = app.advance(max_actions=1)
+            self.assertEqual(model.call_count, 1)
+            self.assertEqual(view.status, "paused")
+            app = load_session(root / "session", services=ResearchApplicationServices(llm_client=client))
+            app.continue_session()
+            with patch.object(LLMClient, "ask_json", side_effect=AssertionError("cached article replayed")), patch(
+                    "simple_ar.report.writing.run_report_agent", side_effect=AssertionError("old Writer scheduled")):
+                view = app.advance(max_actions=3)
+            self.assertEqual(view.status, "completed", view.status_reason)
+            self.assertEqual(view.state_refs["writer"].schema, ARTICLE_OWNER)
+            report = app.controller.store.read_text(app.controller.manifest.state_refs["report"])
+            self.assertIn("Interpretation and limits", report)
+            self.assertNotIn("experiment", view.state_refs)
+            app.budget_ledger.reserve("retained-unknown", {"llm_requests": 1})
+            app.budget_ledger.save()
+            ledger = (root / "session" / "budget_ledger.json").read_bytes()
+            attempts = view.attempts
+            restored = load_session(root / "session", services=ResearchApplicationServices(llm_client=client))
+            with patch.object(LLMClient, "ask_json", side_effect=AssertionError("terminal recovery calls model")):
+                recovered = restored.advance(max_actions=3)
+            self.assertEqual(recovered.attempts, attempts)
+            self.assertEqual((root / "session" / "budget_ledger.json").read_bytes(), ledger)
+            initial_ref = restored.controller.manifest.state_refs["report"]
+            with self.assertRaises(ResearchApplicationError):
+                restored.request_report(report_config={"reviewer": "llm"})
+            self.assertEqual(restored.controller.manifest.state_refs["report"], initial_ref)
+            restored.request_report(refresh=True)
+            def revise(system, prompt, **kwargs):
+                self.assertEqual(json.loads(prompt)["prior_draft"], article)
+                return {"draft_markdown": article.replace("## Observations", "## Decision note")}
+            with patch.object(LLMClient, "ask_json", side_effect=revise) as model:
+                refreshed = restored.advance(max_actions=3)
+            self.assertEqual(model.call_count, 1)
+            self.assertEqual(refreshed.status, "completed", refreshed.status_reason)
+            self.assertNotEqual(refreshed.state_refs["report"], initial_ref)
+            self.assertEqual(restored.controller.store.read_text(initial_ref), report)
+
     def test_writing_preserves_paper_material_roles_and_missing_text(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

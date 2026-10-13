@@ -19,6 +19,17 @@ from simple_ar.code_task.runtime.config import load_code_task_init_options, load
 
 
 class StartTests(unittest.TestCase):
+    def test_native_approval_without_saved_task_stops_before_setup(self):
+        from simple_ar.cli.main import main
+        with patch("sys.stdin.isatty", return_value=False), \
+                patch("simple_ar.cli.start.select_start_model") as selection, \
+                patch("simple_ar.app.tool_application.ToolApplication.create") as create:
+            for request in ([], ["Explain the supplied notes"]):
+                with self.subTest(request=request), self.assertRaisesRegex(SystemExit, "--resume-task"):
+                    main(["start", *request, "--approve-execution", "stale-token", "--yes"])
+            selection.assert_not_called()
+            create.assert_not_called()
+
     def setUp(self):
         # User-global connections must not change offline CLI fixtures.
         catalog = patch('simple_ar.integrations.model_profiles.load_model_catalog', return_value=None)
@@ -364,8 +375,23 @@ class StartTests(unittest.TestCase):
             self.assertIn(session.store.resolve(evidence).resolve(), files)
             self.assertIn(session.store.resolve(current_documents).resolve(), files)
             self.assertNotIn(session.store.resolve(documents).resolve(), files)
+            # Ordinary result reuse enters the same native task owner, with
+            # complete result packages mounted read-only. It never creates a
+            # second structured report plan or changes the original session.
+            native_args = build_parser().parse_args(["start", "--from-session", str(session.store.root),
+                "--reuse", "report", "--goal", "Reorganize from the existing results", "--prepare-only"])
+            with patch("sys.stdin.isatty", return_value=False), \
+                 patch("simple_ar.cli.main._run_native_start") as native:
+                self.assertIsNone(prepare_start(native_args))
+            native.assert_called_once_with(native_args)
+            self.assertIn("Prior prose is editable material, not primary evidence", native_args.request)
+            self.assertIn(str(files[0]), native_args.request)
+            self.assertIn(files[0].parent, native_args.source)
+            self.assertIn(session.store.resolve(current_documents).resolve(), native_args.source)
+            self.assertEqual((session.store.root / "session_manifest.json").read_bytes(), original)
+            self.assertFalse(list(root.glob("new/**/research.toml")))
             config = self.prepare("--from-session", str(session.store.root), "--reuse", "report",
-                "--goal", "Reorganize the argument and replace the chapter structure", "--output-root", str(root / "new"), "--prepare-only")
+                "--goal", "Reorganize the argument and replace the chapter structure", "--template", "material_report", "--output-root", str(root / "new"), "--prepare-only")
             defaults = research_defaults(["research-session", "--config", str(config)])
             self.assertEqual(defaults["task_kind"], "writing")
             self.assertEqual(defaults["report_outline_strategy"], "adaptive")

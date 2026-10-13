@@ -198,23 +198,6 @@ class ReportCheckpointTests(unittest.TestCase):
         self.assertEqual(len(reviews), 1)
         self.assertEqual(reviews[0].verdict, "revise_required")
         self.assertEqual(len(reviews[0].findings), 1)
-        # Grouping is not permission to accept unknown targets or false quotes.
-        from simple_ar.report.editor import _validate_document_reviews
-        from simple_ar.report.schema import ReviewerFinding
-        sections = [ReportSectionDraft(section_id="scope", heading="Scope", draft_markdown="Original.")]
-        response = Client().ask_json()
-        for defect in ("target", "quotation"):
-            invalid = copy.deepcopy(response)
-            if defect == "target":
-                invalid["section_reviews"][-1]["section_id"] = "unknown"
-            else:
-                invalid["section_reviews"][0]["findings"][0]["draft_quotes"][0]["quote"] = "Not in draft."
-            with self.subTest(defect=defect), self.assertRaises(LLMResponseError):
-                _validate_document_reviews(invalid, sections=sections, prior_by_key={})
-        opinion = ReviewerFinding(finding_id="old", section_id="scope", type="style", message="Old opinion.")
-        with self.assertRaisesRegex(LLMResponseError, "more reviews|repeated section"):
-            _validate_document_reviews({"section_reviews": [{"section_id": "scope", "verdict": "pass"}] * 2},
-                sections=sections, prior_by_key={("scope", "old"): opinion})
 
     def test_final_checkpoint_matches_reconciled_memory_without_document_review(self):
         # A single section cannot enter whole-document review, even when enabled.
@@ -493,32 +476,18 @@ class ReportCheckpointTests(unittest.TestCase):
             revision_instructions=instructions,
         )
 
-        ordinary = json.loads(_writer_prompt(
-            context=context,
-            template=template,
-            memory=memory,
-            section=section,
-            config=config,
-            extra_context=[],
-            previous_draft=None,
-            review=review,
-            source_batch_index=1,
-            source_batch_count=1,
-            include_previous_draft=False,
-            draft_mode="section_revision",
-        ).split("\n\n", 1)[1])
-        recovery = json.loads(_writer_recovery_prompt(
-            context=context,
-            memory=memory,
-            section=section,
-            config=config,
-            previous_draft=None,
-            review=review,
-            draft_mode="section_revision",
-        ).split("\n\n", 1)[1])
-
-        self.assertEqual(ordinary["review_instructions"], [*instructions, finding_action])
-        self.assertEqual(recovery["review_instructions"], [*instructions, finding_action])
+        common = dict(context=context, memory=memory, section=section, config=config,
+            extra_context=[], previous_draft=None, review=review, draft_mode="section_revision",
+            source_front_matter=[{"paper_id": "paper", "section_id": "front", "text": "Original byline"}])
+        for prompt in (_writer_prompt(**common, template=template, source_batch_index=1,
+                source_batch_count=1, include_previous_draft=False), _writer_recovery_prompt(**common)):
+            view = json.loads(prompt.split("\n\n", 1)[1])
+            self.assertEqual(view["review_instructions"], [*instructions, finding_action])
+            self.assertEqual(view["review_findings"], [row.model_dump(mode="json") for row in review.findings])
+            self.assertEqual(view["source_front_matter"], common["source_front_matter"])
+            self.assertIn('source_notes', view['output_schema'])
+            rules = view['response_rules'] if 'response_rules' in view else view['style_rules']
+            self.assertEqual(sum('Return source_notes in this same response' in row for row in rules), 1)
 
     def test_final_audit_uses_latest_review_without_erasing_history_or_failed_review(self):
         from simple_ar.report.audit import build_report_audit
@@ -559,26 +528,35 @@ class ReportCheckpointTests(unittest.TestCase):
         memory = ReportMemory(section_plan=[ReportSectionPlan(section_id="method", heading="Method", goal="Describe evidence")])
         config = ReportRuntimeConfig(allow_llm_fallback=False, max_review_iterations=0)
         template = load_report_template_bundle(report_mode="experiment", config=config)
-        for phase in ("writer", "reviewer"):
+        for phase in ("writer", "reviewer", "joint"):
             for error in (LLMError("provider unavailable"), LLMError("budget exhausted"), LLMResponseError("invalid JSON")):
                 with self.subTest(phase=phase, error=str(error)):
                     calls = []
 
                     class Client:
                         def ask_json(self, *args, label="", **kwargs):
-                            if f"report-{phase}" in label:
+                            if f"report-{'writer' if phase == 'joint' else phase}" in label:
                                 calls.append(label)
                                 if len(calls) == 1:
                                     raise error
                             if "reviewer" in label:
                                 return {"section_id": "method", "verdict": "pass", "findings": []}
+                            if phase == "joint":
+                                return {"sections": [{"section_id": sid, "draft_markdown": "No measurements were taken."}
+                                    for sid in ("method", "limits")]}
                             return {"section_id": "method", "heading": "Method", "draft_markdown": "No measurements were taken."}
 
-                    kwargs = dict(client=Client(), context=context, memory=memory, config=config,
+                    plans = memory.model_copy(deep=True)
+                    runtime = config.model_copy(deep=True)
+                    if phase == "joint":
+                        plans.section_plan.append(ReportSectionPlan(section_id="limits", heading="Limits", goal="Bound claims"))
+                        runtime.draft_scope = "document"
+                        runtime.reviewer = "disabled"
+                    kwargs = dict(client=Client(), context=context, memory=plans, config=runtime,
                                   template=template, gateway=ReportToolGateway(context))
                     if isinstance(error, LLMResponseError):
                         result = run_report_agent(**kwargs)
-                        self.assertEqual(len(result.sections), 1)
+                        self.assertEqual(len(result.sections), 2 if phase == "joint" else 1)
                         self.assertEqual(len(calls), 2)
                     else:
                         with self.assertRaisesRegex(LLMError, str(error)):

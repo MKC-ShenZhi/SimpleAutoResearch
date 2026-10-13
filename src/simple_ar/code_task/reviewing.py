@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from simple_ar.integrations.usage import record_usage
 from simple_ar.integrations.llm import LLMClient, LLMError, LLMResponseError
 from simple_ar.reviewing.schema import ReviewFinding, normalize_review_findings, review_report
 from simple_ar.core.capabilities import ArtifactStore
+from simple_ar.core.artifacts import write_json
+from simple_ar.code_task.review_pipeline import (
+    build_review_index, build_review_clusters, compact_review_index, snippets_for_cluster,
+)
 
 
 MessageCallback = Callable[[str], None]
@@ -17,6 +21,55 @@ CODE_TASK_REVIEW_SYSTEM = (
     "You cannot edit files. Review scope, runtime correctness, result validity, benchmark integrity, "
     "resource risk, and repair risk. Return only JSON."
 )
+
+
+def run_project_review(
+    *, project_dir: Path, result_schema: Mapping[str, Any], contract: Mapping[str, Any],
+    deterministic: list[ReviewFinding], reviewer: str, subject: str,
+    prompt: Callable[[dict[str, Any], Mapping[str, Any], list[str]], str],
+    metadata: Callable[[list[dict[str, Any]]], dict[str, Any]],
+    request_options: dict[str, Any], total_findings: int, use_llm: bool,
+    meta_dir: Path | None, artifact_suffix: str = '',
+    cluster_metadata: dict[str, Any] | None = None,
+    cluster_options: dict[str, Any] | None = None,
+    snippet_options: dict[str, Any] | None = None,
+    save_report: bool = False, before_save: Callable[[Path], None] | None = None,
+) -> dict[str, Any]:
+    """Own the project-review lifecycle; callers supply domain facts and policy.
+
+    Preserve each consumer's paths, scope, source windows and usage ownership.
+    The total finding cap does not stop later clusters from being inspected.
+    """
+    index = build_review_index(project_dir, result_schema=result_schema, contract=contract)
+    clusters = build_review_clusters(index, deterministic_findings=deterministic,
+                                    **(cluster_options or {}))
+    if meta_dir is not None:
+        if before_save is not None:
+            before_save(meta_dir)
+        write_json(meta_dir / f'review_index{artifact_suffix}.json', index)
+        write_json(meta_dir / f'review_clusters{artifact_suffix}.json', {
+            'schema_version': 'code_task_review_clusters.v1', **(cluster_metadata or {}),
+            'cluster_count': len(clusters), 'clusters': clusters,
+        })
+    findings: list[ReviewFinding] = []
+    if use_llm:
+        compact_index = compact_review_index(index)
+        for cluster in clusters:
+            snippets = snippets_for_cluster(project_dir, cluster, **(snippet_options or {}))
+            if not snippets:
+                continue
+            cluster_id = str(cluster.get('cluster_id') or 'cluster')
+            options = {**request_options,
+                'label': request_options['label'].replace('{cluster_id}', cluster_id),
+                'source': request_options['source'].replace('{cluster_id}', cluster_id)}
+            findings.extend(run_llm_review(meta_dir=meta_dir,
+                prompt=prompt(compact_index, cluster, snippets), use_llm=True,
+                allow_blocking=False, **options))
+    report = build_review_artifact(reviewer=reviewer, subject=subject,
+        findings=[*deterministic, *findings[:total_findings]], metadata=metadata(clusters))
+    if save_report and meta_dir is not None:
+        write_json(meta_dir / f'review_report{artifact_suffix}.json', report)
+    return report
 
 
 def run_visual_review(*, client: LLMClient, image_paths: tuple[Path, ...],

@@ -4,8 +4,28 @@
 
 This file records implemented, user-visible changes in reverse chronological order. Usage and technical references live in `docs/`; future plans and private acceptance records are not release claims.
 
+## 2026-10-13
+
+- Project copies can include a portable ZIP in the same operation, using the
+  existing exclusion report and byte-bound recovery. Model inspection reads the
+  current directory's private `.env`, consistently with task startup.
+- Workspace Markdown exports preserve authored figure captions instead of replacing
+  them with stale figure metadata. Empty captions can still use registered metadata;
+  controlled assembled reports and historical export receipts keep their existing ownership.
+- Offline code-project generation now produces a development scaffold without
+  fabricated measurement values. The unimplemented runner fails with actionable
+  guidance instead of reporting preset scores; existing projects and historical
+  execution records remain unchanged.
+
 ## 2026-10-12
 
+- Explicit resource continuation accepts closed text calls with finite retained
+  charges, without settling unknown usage or clearing earlier ledger entries.
+  In-flight calls and unconfirmed side effects still block authorization.
+- Authorized final processes can explicitly deliver their outputs in the same
+  operation, sharing the existing terminal-state owner with final writes and exports.
+  Failed or stopped commands do not deliver; recovery checks the original request
+  and output hashes without reexecution or retroactively certifying old runs.
 - Writing can combine explicit original sources with delegated material directories.
   Directory selection indexes authorized candidates without pre-reading unrelated
   data or weights; selected inputs and source previews retain content-version checks.
@@ -40,12 +60,18 @@ This file records implemented, user-visible changes in reverse chronological ord
   allowances without reopening review because unresolved findings remain.
   Interrupted corrections require their matching parent response; duplicate finding
   identities are rejected, while original replies and unresolved opinions are retained.
-- New code-project plans use one assembly owner for compact and staged planning,
-  retaining file obligations, interfaces and review status through generation.
-  Insufficient file budgets reject the plan instead of dropping required modules;
-  saved planning snapshots retain their original meaning.
-  Staged planning and review share step execution and normalized-result recording;
-  patch feedback has one converter, preserving revision routing and saved history.
+- New code-project plans use one complete architecture work unit, retiring the
+  mandatory four-stage planner and planning review. `tool_agent` is a deprecated
+  alias for `compact`; unfinished historical plans record method migration before
+  dispatch, retaining stages, failures, planner selection and the original budget.
+  Generated projects and immutable snapshots do not replan; file obligations,
+  interfaces, file-budget rejection and unknown-usage protections remain.
+- New structured reports share complete-article drafting with the native Writer,
+  retaining canonical assembly, citations and deterministic audit. Explicit
+  section/review controls keep the controlled method; historical checkpoints
+  retain their owner and budget. Refresh uses the accepted article as editable
+  prose without replacing primary evidence. Ordinary registered report/material reuse starts
+  a native task without rerunning accepted measurements or importing an old ledger.
 - New native material mounts are checked before connection selection or task/access
   changes. Private paths, symlinks and non-regular inputs are rejected through the
   same admission rule for direct entry, guided preferences and additional materials.

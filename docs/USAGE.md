@@ -8,6 +8,96 @@ It is the practical user guide; workflow concepts and artifact details live in
 [CLI Reference](CLI_REFERENCE.md), and TOML fields live in
 [Configuration Reference](CONFIG_REFERENCE.md).
 
+## A copyable ordinary user workflow
+
+Use public commands for installation → named TOML and secret references → a natural-language goal and materials → approval → inspection → feedback → recovery.
+You need Python 3.12+, Git, uv, and ripgrep (`rg`) on the execution host for native source search.
+Install the preview branch and check the installed help; unpublished working-tree changes are not necessarily on that branch.
+
+```bash
+git clone --branch feat/v2.9-task-driven-research https://github.com/Wchanging/SimpleAutoResearch.git
+cd SimpleAutoResearch
+uv sync
+uv run simple-ar start --help
+rg --version
+```
+
+Save `models.toml` privately, replacing the endpoint and model ID with values your provider supports.
+This minimal catalog supplies text and code connections; the full image catalog example is optional.
+
+```toml
+version = 1
+
+[profiles.daily]
+api = "openai_chat"
+base_url = "https://your-provider.example/v1"
+model = "your_model_id"
+api_key_env = "RESEARCH_API_KEY"
+capabilities = ["text", "code"]
+max_output_tokens = 8192
+
+[routes]
+default = "daily"
+code = "daily"
+```
+
+The output cap is an example to adapt to the provider and task, not a completion guarantee.
+Create or edit a private `.env` in the command's current directory, preserving existing entries.
+Add only the catalog location and the actual value of the referenced secret; do not duplicate global model, endpoint or API settings:
+
+```dotenv
+SIMPLE_AR_MODELS_CONFIG=/absolute/private/path/models.toml
+RESEARCH_API_KEY=your_actual_secret
+```
+
+On Windows, use a path such as `C:/private/models.toml`. Alternatively set the catalog variable in the terminal:
+Bash: `export SIMPLE_AR_MODELS_CONFIG=/absolute/private/path/models.toml`;
+PowerShell: `$env:SIMPLE_AR_MODELS_CONFIG = 'C:/private/models.toml'`.
+Credentials come from the environment or the current directory's `.env`; existing environment variables take precedence.
+Do not commit or mount these private files. After changing directories or terminals, ensure the same catalog and credentials remain discoverable.
+
+```bash
+uv run simple-ar models --profile daily --purpose text
+uv run simple-ar models --profile daily --purpose code
+uv run simple-ar start "Investigate these materials and deliver a short explanation; propose commands before computing, and retain the initial version" --source "materials" --model profile:daily --allow-execution --yes
+```
+
+Replace `materials` with an actual file or directory on the execution host; originals stay read-only.
+Your goal and material content go to the selected model. You do not need to choose internal files or an analysis plan first.
+`models` checks local configuration only; `credential=set` does not verify the remote provider.
+Ordinary tasks require a Chat connection and credentials. Native `--prepare-only` also preflights the connection and credentials,
+but makes no model request or process invocation. Structured setup can save TOML before credentials are available.
+
+`--yes` accepts the task summary; `--allow-execution` permits proposals, without approving a command.
+In an interactive terminal, inspect the proposed command, source, paths and side effects before confirming.
+Without interactive approval, or after declining, the task pauses and prints an `Approval token`.
+After checking the proposal, copy that exact token:
+
+```bash
+uv run simple-ar start --resume-task "SESSION" --approve-execution "TOKEN"
+uv run simple-ar status "SESSION"
+uv run simple-ar results "SESSION"
+```
+
+Replace `SESSION` with the full printed `Task session` path and `TOKEN` with the current proposal's exact token;
+these are placeholders. Each new command may need approval. Workspace isolation is not an OS sandbox.
+Open the actual artifacts printed by `results`, checking content and unresolved work.
+During a pause, an older delivery record does not establish completion of the current request.
+Record the initial artifact paths, then request substantive feedback in the same task:
+
+```bash
+uv run simple-ar start --resume-task "SESSION" "Keep the initial version; add a section on disagreements between the materials and evidence limits, and deliver a separate feedback version"
+uv run simple-ar results "SESSION"
+uv run simple-ar start --resume-task "SESSION"
+```
+
+Feedback may call the model and propose commands, sharing the same budget, materials, connection and approval rules.
+The last command resumes a saved boundary without feedback; a completed task with no pending action returns its saved terminal state
+without creating a task or rerunning completed work. After interruption, confirm the previous process has stopped;
+in-flight or unknown side effects must not be blindly replayed.
+For a terminated model failure, follow the separate `--retry-model` rules in [CLI recovery](CLI_REFERENCE.md#native-task-entry-experimental).
+Keep retries separate from feedback and new authorization, and do not restart to refresh allowances.
+
 ## Start with a task
 
 `uv run simple-ar start` asks for a natural-language goal and enters the experimental

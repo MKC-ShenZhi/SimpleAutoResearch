@@ -217,20 +217,24 @@ def migrate_new_start(args: argparse.Namespace) -> bool:
     the sole task/configuration/authorization/ledger owner. Explicit unsupported
     controls are rejected before any model selection or session creation.
     """
-    if args.from_session or args.reuse:
-        return False  # Registered scope and validator belong to bounded reuse.
+    reuse_inputs = bool(args.from_session or args.reuse)
+    if reuse_inputs and ("code_project" in args.reuse or args.kind not in {None, "writing"}):
+        return False  # Registered editing/measurement contracts remain exact.
     if args.chat or args.resume_setup or hasattr(args, "_setup_state"):
         if args.kind == "figure" or args.scripted:
             raise ValueError("Native creation cannot preserve chat/resume_setup structured controls; use ordinary preferences or an explicit supported protocol.")
         return False  # Technical setup retains its confirmed structured protocol.
     if args.kind is None:
-        if not args.guided:
+        if reuse_inputs:
+            args.kind = "writing"
+        elif not args.guided:
             if args.scripted:
                 raise ValueError("--scripted requires --kind data_analysis.")
             return False  # Bare start and plain requests already use native main.
         if args.resume_task:
             raise ValueError("Creation preferences cannot change a saved task; use --resume-task without --guided.")
-        _select_start_preference(args, interactive=sys.stdin.isatty())
+        if args.kind is None:
+            _select_start_preference(args, interactive=sys.stdin.isatty())
     scripted = args.scripted
     figure = args.kind == "figure"
     if scripted and args.kind != "data_analysis":
@@ -247,7 +251,7 @@ def migrate_new_start(args: argparse.Namespace) -> bool:
     explicit.update(name for name, value in vars(defaults).items()
                     if not name.startswith("_") and getattr(args, name, value) != value)
     supported = (args._native_start_destinations | args._shared_start_destinations
-                 | {"kind", "guided", "scripted", "project", "data_file", "data_path", "document", "material", "with_report"}
+                 | {"kind", "guided", "scripted", "project", "data_file", "data_path", "document", "material", "with_report", "from_session", "reuse"}
                  | args._data_declaration_destinations)
     protocol_controls = explicit - supported
     # Explicit value/coordinate/baseline selectors request the table shortcut.
@@ -260,6 +264,16 @@ def migrate_new_start(args: argparse.Namespace) -> bool:
         raise ValueError("Native creation cannot preserve these structured controls: "
                          + ", ".join(sorted(protocol_controls))
                          + ". Use the explicit research-session/code-task protocol when required; no options were applied.")
+    reuse_origin = None
+    if reuse_inputs:
+        reuse_origin = {"session": str(args.from_session.resolve()) if args.from_session else None,
+                        "results": list(args.reuse)}
+        reuse_session_materials(args)
+        # Mount complete registered result packages, not just their JSON index
+        # or Markdown body. Their source data/figures must remain available to
+        # the common inventory and writing owners. Never mount the whole old
+        # session or import its execution state/allowances into a new task.
+        args.source.extend(path.parent for path in args.material)
     if args.goal and args.request:
         raise ValueError("Use either the positional request or --goal, not both.")
     goal = args.request if args.request is not None else args.goal
@@ -323,6 +337,10 @@ def migrate_new_start(args: argparse.Namespace) -> bool:
     additions.append("Requested outcome preference (not an access grant): " + delivery[args.kind])
     if args.with_report:
         additions.append("Include a report based on the actual materials and results.")
+    if reuse_origin:
+        additions.append("Reuse registered prior results in this new task, not their execution state or budget:\n"
+                         + json.dumps({**reuse_origin, "prior_drafts": getattr(args, "_reuse_report_drafts", [])}, ensure_ascii=False)
+                         + "\nPrior prose is editable material, not primary evidence. Inspect the mounted result packages and original-source identities; do not rerun valid measurements merely to rewrite or plot them.")
     additions.append("All mounted materials, including data and supplied evaluation/checker files, are read-only. Keep new source and outputs in the task workspace. No installation or destructive action is authorized by this creation preference; commands need separate approval.")
     if interactive and not args.yes and not args.prepare_only and not (args.allow_network or args.allow_execution):
         print_line("If needed for your goal, authorize public source acquisition or process proposals. Each process command still needs its own approval; this is not an OS sandbox.")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import sqlite3
 import sys
 import tempfile
@@ -24,6 +25,36 @@ TEST_ROOT = Path(__file__).resolve().parents[1] / ".tmp_tests"
 
 
 class CliTests(unittest.TestCase):
+    def test_models_discovers_local_env_and_preserves_process_credentials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            catalog = root / "models.toml"
+            catalog.write_text('''version = 1
+[profiles.daily]
+api = "openai_chat"
+base_url = "https://example.invalid/v1"
+model = "local-test-model"
+api_key_env = "LOCAL_TEST_KEY"
+capabilities = ["text", "code"]
+[routes]
+default = "daily"
+code = "daily"
+''', encoding="utf-8")
+            (root / ".env").write_text(
+                f'SIMPLE_AR_MODELS_CONFIG="{catalog.as_posix()}"\nLOCAL_TEST_KEY=local-file-secret\n',
+                encoding="utf-8")
+            with patch.dict(os.environ, {"LOCAL_TEST_KEY": "process-secret"}, clear=True), \
+                    patch("simple_ar.cli.main.Path.cwd", return_value=root), \
+                    patch("simple_ar.cli.main.LLMClient.from_env") as client, \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                main(["models", "--profile", "daily", "--purpose", "code"])
+                self.assertIn("local-test-model", output.getvalue())
+                self.assertIn("credential=set", output.getvalue())
+                self.assertEqual(os.environ["LOCAL_TEST_KEY"], "process-secret")
+                self.assertNotIn("process-secret", output.getvalue())
+                self.assertNotIn("local-file-secret", output.getvalue())
+                client.assert_not_called()
+
     def test_native_retry_model_cli_routes_only_explicit_selector_and_confirms_once(self):
         from simple_ar.core.budget import BudgetLedger
 
@@ -176,8 +207,29 @@ class CliTests(unittest.TestCase):
             self.assertEqual(brief.requested_outputs, ("report",))
             self.assertEqual(brief.asset_requests[0]["role"], "material")
             self.assertEqual(services.config["report"]["template"], "experiment")
+            self.assertEqual(services.config["report_writing_method"], "article")
+            self.assertEqual(services.config["report"]["reviewer"], "disabled")
+            self.assertFalse(services.config["report"]["document_review"])
             self.assertNotIn("execution", services.config)
             self.assertIn("Implementation: not requested (supplied-material writing)", stream.getvalue())
+            from simple_ar.cli.research_config import report_writing_method
+            selected = SimpleNamespace(_explicit_resume_destinations={"report_reviewer"},
+                                       report_reviewer="llm", report_writing_method=None)
+            self.assertEqual(report_writing_method(selected, {"reviewer": "llm"})[0], "sections")
+            selected.report_writing_method = "article"
+            with self.assertRaisesRegex(ValueError, "does not execute"):
+                report_writing_method(selected, {"reviewer": "llm"})
+            selected.command = "research-report"
+            selected._explicit_resume_destinations = {"reviewer"}
+            with self.assertRaisesRegex(ValueError, "does not execute"):
+                report_writing_method(selected, {"reviewer": "llm"})
+            article_app = SimpleNamespace(services=SimpleNamespace(config={
+                "report_writing_method": "article", "report": {"reviewer": "disabled"}}))
+            selected.reviewer = "llm"
+            from simple_ar.cli.main import _report_config_overrides
+            from simple_ar.app.research_application import ResearchApplicationError
+            with self.assertRaises(ResearchApplicationError):
+                _report_config_overrides(selected, article_app)
             bundle = Path(tmp) / "sources.json"
             write_json(bundle, {"schema_version": "document_bundle.v1", "documents": [{
                 "document_id": "source", "source": "arxiv", "source_id": "1234.5678",

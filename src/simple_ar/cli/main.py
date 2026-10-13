@@ -93,7 +93,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.command == "models":
         from dotenv import load_dotenv
         from simple_ar.integrations.model_profiles import load_model_catalog, ModelConfigError
-        load_dotenv()
+        load_dotenv(dotenv_path=Path.cwd() / ".env", override=False)
         try:
             catalog = load_model_catalog(args.config)
             if catalog is None:
@@ -450,10 +450,16 @@ def _print_research_session(args: argparse.Namespace) -> None:
         except (OSError, RuntimeError, ValueError) as exc:
             raise SystemExit(f"Could not restore the saved session goal: {exc}") from exc
 
-    from simple_ar.cli.research_config import report_settings, validate_session_arguments
+    from simple_ar.cli.research_config import report_settings, report_writing_method, validate_session_arguments
 
     inputs = validate_session_arguments(args)
     report_config = report_settings(args)
+    writing_method = None
+    if getattr(args, "session_root", None) is None:
+        try:
+            writing_method, report_config = report_writing_method(args, report_config)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
     task_kind, command = inputs.task_kind, inputs.command
     execution_details, outputs = inputs.execution_details, inputs.outputs
     materials, data_analysis = inputs.materials, inputs.data_analysis
@@ -635,6 +641,8 @@ def _print_research_session(args: argparse.Namespace) -> None:
         "research_max_iterations": args.max_research_iterations,
         "report": report_config,
     }
+    if writing_method is not None:
+        config["report_writing_method"] = writing_method
     if review_model and resume_root is None:
         config["feasibility_review_model"] = review_model
     if getattr(args, "read_max_shortlist", None) is not None:
@@ -748,6 +756,10 @@ def _print_research_session(args: argparse.Namespace) -> None:
         raise SystemExit("Continuation allowances require --session-root.")
     try:
         if resume_root is None:
+            if report_requested:
+                print_line(f"Report writing: {writing_method}; " + (
+                    "one complete article, deterministic assembly/audit; no automatic planning or model review."
+                    if writing_method == "article" else "explicit section/planning/review compatibility controls retained."))
             app = create_session(brief, root=session_root, services=services)
         else:
             from simple_ar.app.research_application import load_session
@@ -768,6 +780,9 @@ def _print_research_session(args: argparse.Namespace) -> None:
                     app.budget_ledger, session_id=app.controller.manifest.session_id,
                 ))
             explicit = getattr(args, "_explicit_resume_destinations", set())
+            if ("report_writing_method" in explicit and args.report_writing_method
+                    != app.services.config.get("report_writing_method", "sections")):
+                raise ResearchApplicationError("Saved reports keep their writing method and checkpoint owner; start a new task to change the method.")
             interaction_update = (
                 args.interaction
                 if "interaction" in explicit and args.interaction != app.services.config.get("interaction")
@@ -1178,6 +1193,16 @@ def _report_config_overrides(args: argparse.Namespace, app: Any) -> dict[str, ob
         supplied["template"] = "survey"
     saved = app.services.config.get("report", {})
     saved = saved if isinstance(saved, dict) else {}
+    if app.services.config.get("report_writing_method", "sections") == "article":
+        # The retained owner cannot acquire section-review semantics on resume.
+        # Validate before request_report writes configuration or invalidates work.
+        from simple_ar.report.schema import ReportRuntimeConfig
+        from simple_ar.report.writing import validate_report_writing_config
+        from simple_ar.app.research_application import ResearchApplicationError
+        try:
+            validate_report_writing_config(ReportRuntimeConfig.model_validate({**saved, **supplied}), method="article")
+        except ValueError as exc:
+            raise ResearchApplicationError(str(exc)) from exc
     return {key: value for key, value in supplied.items() if saved.get(key) != value}
 
 
@@ -2649,6 +2674,8 @@ def _run_native_start(args: argparse.Namespace) -> None:
     interactive = sys.stdin.isatty()
     try:
         continuation = _continuation_parameters(args)
+        if args.approve_execution and not args.resume_task:
+            raise ValueError("--approve-execution requires --resume-task and its saved pending command")
         allowances = continuation["authorize_remaining"]
         authorization_id = continuation["authorization_id"] or ""
         authorization_reason = continuation["authorization_reason"] or ""
@@ -2708,7 +2735,8 @@ def _run_native_start(args: argparse.Namespace) -> None:
                     "New remaining is not a total historical limit / 新 remaining 不是总历史限额.\n"
                     "Reusing the same authorization ID does not replenish spent capacity. "
                     "Model binding and permissions remain unchanged; commands still need exact approval. "
-                    "Reconcile in-flight or unknown operations before authorization."),
+                    "Closed text calls with finite retained charges stay unknown in the original ledger. "
+                    "In-flight, unbounded or unconfirmed side-effect operations require reconciliation."),
                     title="Confirm resource continuation / 确认资源续接"))
                 if not args.prepare_only and not args.yes:
                     if not interactive or input("Authorize these resources / 授权这些资源? [y/N]: ").strip().lower() not in {"y", "yes"}:

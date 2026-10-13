@@ -57,7 +57,10 @@ under validation.
 
 ## Quick start
 
-Requirements: **Python 3.12+**, Git and [uv](https://docs.astral.sh/uv/).
+Requirements: **Python 3.12+**, Git and [uv](https://docs.astral.sh/uv/). Native source search also needs ripgrep (`rg`) on the execution host.
+Follow the [complete ordinary workflow](docs/USAGE.md#a-copyable-ordinary-user-workflow) for installation,
+named TOML/secret references, materials, approval, inspection, feedback and recovery;
+it includes a minimal catalog and Bash/PowerShell configuration.
 
 ### 1. Install
 
@@ -137,6 +140,25 @@ uv run simple-ar start "Explain these results" --source results/ --model profile
 Repeat `--source PATH` for read-only materials. Public retrieval requires
 `--allow-network`; process proposals require `--allow-execution` and separate
 command approval. `--prepare-only` saves the task without model calls or execution.
+Native preparation still preflights the model connection and credentials; saving TOML before setting a key is structured setup behavior.
+Inspect the proposed source, command and side effects. Confirm each command in an interactive terminal,
+or copy the current `Approval token` after a pause. Replace `SESSION` below with the full printed `Task session` path:
+
+```bash
+uv run simple-ar start --resume-task "SESSION" --approve-execution "TOKEN"
+uv run simple-ar status "SESSION"
+uv run simple-ar results "SESSION"
+uv run simple-ar start --resume-task "SESSION" "Keep the initial version, add evidence limits, and deliver a separate feedback version"
+uv run simple-ar results "SESSION"
+uv run simple-ar start --resume-task "SESSION"
+```
+
+`TOKEN` is the exact token for the current proposal; `--yes` does not approve commands.
+Inspect actual artifacts before feedback, which retains the budget and may need more approvals.
+The last command resumes a saved boundary; completed tasks without pending actions return saved terminal state.
+After interruption, confirm the previous process has stopped; do not blindly replay unknown side effects.
+See the CLI reference for explicit continuation of failed model decisions.
+
 Complete cross-task acceptance is still pending. `start --guided` offers outcome
 preferences; ordinary `--kind` choices use the same native loop. Explicit controls
 such as `--template`, `--sources`, `--allow`/`--validate` or a reproduction protocol

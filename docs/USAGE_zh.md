@@ -4,6 +4,93 @@
 
 本文说明如何安装、配置和运行 SimpleAutoResearch。它是面向用户的实践指南；工作流概念和产物结构见 [工作流与产物](WORKFLOWS_zh.md)，完整命令表见 [CLI 参考](CLI_REFERENCE_zh.md)，TOML 字段见 [配置参考](CONFIG_REFERENCE_zh.md)。
 
+## 可复制的普通用户流程
+
+下面只使用公开命令：安装 → 命名 TOML 与秘密引用 → 自然语言材料 → 批准 → 查看 → 反馈 → 恢复。
+需 Python 3.12+、Git、uv，以及执行主机上的 ripgrep（`rg`，供原生源码检索使用）。
+当前预览分支安装如下；检查当前安装的帮助，不把工作区未发布改动当作远端已有功能。
+
+```bash
+git clone --branch feat/v2.9-task-driven-research https://github.com/Wchanging/SimpleAutoResearch.git
+cd SimpleAutoResearch
+uv sync
+uv run simple-ar start --help
+rg --version
+```
+
+在私有位置保存 `models.toml`，替换端点和模型 ID 为服务商实际支持的值。
+此最小目录足够提供文本和代码连接；不需要复制含图像连接的完整示例。
+
+```toml
+version = 1
+
+[profiles.daily]
+api = "openai_chat"
+base_url = "https://your-provider.example/v1"
+model = "your_model_id"
+api_key_env = "RESEARCH_API_KEY"
+capabilities = ["text", "code"]
+max_output_tokens = 8192
+
+[routes]
+default = "daily"
+code = "daily"
+```
+
+`max_output_tokens` 是示例上限，须按服务商和任务调整；不是完成保证。
+在运行命令的当前目录下创建或编辑私有 `.env`，只加入目录路径和密钥引用的实际值，
+不要覆盖已有文件，也无需重复设置全局模型、端点或 API 模式：
+
+```dotenv
+SIMPLE_AR_MODELS_CONFIG=/absolute/private/path/models.toml
+RESEARCH_API_KEY=your_actual_secret
+```
+
+Windows 的目录路径可写为 `C:/private/models.toml`。也可在终端设置变量：
+Bash 用 `export SIMPLE_AR_MODELS_CONFIG=/absolute/private/path/models.toml`；
+PowerShell 用 `$env:SIMPLE_AR_MODELS_CONFIG = 'C:/private/models.toml'`。
+密钥由环境或当前目录的 `.env` 提供；已有环境变量优先。不要提交或挂载这些私有文件。
+换目录或换终端时须确保同一目录和凭据仍可发现。
+
+```bash
+uv run simple-ar models --profile daily --purpose text
+uv run simple-ar models --profile daily --purpose code
+uv run simple-ar start "调查这些材料，整理一份简短说明；如需计算先提出命令，交付保留初版" --source "materials" --model profile:daily --allow-execution --yes
+```
+
+将 `materials` 替换为实际文件或目录；该位置在执行主机，原材料只读。
+材料和目标会发送给所选模型。无须预先指定内部文件或分析方案。
+`models` 只做本地配置检查，`credential=set` 不证明远端可用。
+普通任务需要 Chat 连接和有效密钥；普通原生 `--prepare-only` 也会预检连接和凭据，
+仅省去模型请求及进程执行。结构化设置可在缺密钥时先保存 TOML。
+
+`--yes` 接受任务摘要，`--allow-execution` 允许提出进程，不批准任何具体命令。
+交互终端会显示命令供确认；先检查将执行的源码、路径和副作用。
+没有交互确认或拒绝时，任务暂停并打印 `Approval token`。核查提案后，复制本次 token：
+
+```bash
+uv run simple-ar start --resume-task "SESSION" --approve-execution "TOKEN"
+uv run simple-ar status "SESSION"
+uv run simple-ar results "SESSION"
+```
+
+`SESSION` 替换为终端打印的完整 `Task session` 路径，`TOKEN` 替换为当前待执行提案的精确值；
+两者是占位符。每个新命令可能需要新的批准。工作区隔离不是 OS 沙箱。
+查看 `results` 打印的实际成果，检查内容与未解决项；暂停时旧交付记录不代表当前请求完成。
+先保存初版成果路径，再在同一任务提出一次实质反馈，例如：
+
+```bash
+uv run simple-ar start --resume-task "SESSION" "保留初版，增加一节材料之间的分歧与证据限制，并交付独立反馈版本"
+uv run simple-ar results "SESSION"
+uv run simple-ar start --resume-task "SESSION"
+```
+
+反馈可能继续调用模型并提出命令，沿用同一预算、材料、连接和批准机制。
+最后一条无反馈的命令用于恢复保存边界；已完成且没有待处理动作时读取保存终态，
+不另开任务或重跑已完成工作。中断后先确认旧进程已停止；在途或结果未知的副作用不能盲重放。
+终止的模型失败须按 [CLI 恢复规则](CLI_REFERENCE_zh.md#原生任务入口实验性) 单独使用 `--retry-model`；
+不要把重试、反馈和新授权混在一起，也不要靠重新 `start` 刷新额度。
+
 ## 从一个任务开始
 
 `uv run simple-ar start` 询问自然语言目标，进入实验性原生工具循环。

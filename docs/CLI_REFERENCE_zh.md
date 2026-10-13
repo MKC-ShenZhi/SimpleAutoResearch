@@ -8,6 +8,9 @@
 
 ```bash
 simple-ar start "检查这些结果并解释比较" --source results/ --model profile:NAME --yes
+simple-ar start --resume-task "SESSION" --approve-execution "TOKEN"
+simple-ar status "SESSION"
+simple-ar results "SESSION"
 simple-ar start --resume-task SESSION "缩短解释，不重新运行"
 simple-ar start --resume-task SESSION --retry-model
 simple-ar start --resume-task SESSION "结合这些补充笔记" --source notes/ --allow-network --yes
@@ -23,10 +26,17 @@ simple-ar start --resume-task SESSION --authorize-remaining llm_requests=10 --au
 新挂载须为普通文件或目录，不接受符号链接及 `.aws`、`.env` 等私有/运行时路径。
 挂载内枚举、搜索及读取也按大小写无关的私有名称规则处理；项目调查在读取前过滤。
 新建与追加材料共用准入检查；追加无效材料不会改变原挂载、权限或账本。
-`--prepare-only` 只保存任务，不调用模型。`--max-turns`（30）与 `--max-tokens`（600000）
+`--prepare-only` 只保存任务，不调用模型或执行进程，但原生创建仍预检连接和凭据。
+`--max-turns`（30）与 `--max-tokens`（600000）
 约束整个保存任务，包括反馈；恢复不刷新额度。目前接通本地调查、来源检索/获取、代码创建和成果解释；
 出版导出也已接通；图像工具需要明确命名路由与提交额度。工具可调用不代表任务成功，
 完整科研助手验收尚未通过。
+从安装和秘密引用开始的完整操作见[使用流程](USAGE_zh.md#可复制的普通用户流程)。
+`SESSION` 为打印的完整任务路径，`TOKEN` 为当前精确 `Approval token`。
+`--approve-execution` 必须配合 `--resume-task`；`--yes` 接受摘要，不批准命令。
+批准前检查生成源码和提案。`status`、`results` 只读取保存状态，不调用模型。
+无反馈的 `--resume-task SESSION` 恢复保存边界；完成且没有待处理动作时读取保存终态，不重放工作。
+反馈共享原预算，暂停时的旧交付记录不代表当前请求交付。
 实验性 `focus_work` 允许模型以具体工作目标选择 TOML `code` 或可选 `writing` 路由，或选择 `task` 返回原任务连接。
 它只改变下一轮的模型连接，不创建子任务；调查、编辑、验证继续使用同一历史、权限、批准和账本。
 切换须单独请求，恢复从已保存结果读取焦点；不重新给额度，也不代表代码任务已完成。
@@ -54,7 +64,8 @@ simple-ar start --resume-task SESSION --authorize-remaining llm_requests=10 --au
 确认摘要展示已记录的累计用量和拟授权 remaining：原累计用量不清零，新 remaining 不是总历史限额。
 `--yes` 可接受摘要；`--prepare-only` 只预览，不授权、不执行任务。相同授权 ID 重用不会补回已消耗额度；
 普通 `--max-tokens`/`--max-turns` 在恢复时不能续额。模型绑定与权限保持不变，执行仍需精确批准。
-资源续接不能与单次 `--approve-execution` 混用，须分开确认；已启动或用量未知的操作须先核对。
+资源续接不能与单次 `--approve-execution` 混用，须分开确认。已结束且保留有限费用上界的文本调用可在
+明确的新额度下继续；旧未知用量及账本记录不结算、不释放。在途调用、无界用量及未确认副作用须先核对。
 文件工具可使用短挂载定位，如 `source0/README.md`、`workspace/project`，也接受观察到的授权根内绝对路径。
 生成代码及进程argv使用观察到的文件系统地址或真实工作目录下的相对路径；挂载名不是实际目录，不重写程序字符串。
 绝对路径不扩大授权根，也不授予修改来源的权限。
@@ -65,6 +76,13 @@ simple-ar start --resume-task SESSION --authorize-remaining llm_requests=10 --au
 私有路径在建立索引前排除；派生观察不能当作论文原文、执行授权或任务解释器已就绪的证明，
 不导入或运行项目代码。
 `copy_project` 经同一 workspace 网关复用既有 CodeTask 复制所有者，将授权来源目录准备为可编辑项目。
+可选 `archive_name` 为简单 `.zip` 文件名，例如 `project.zip`，在新副本内一并生成 ZIP，
+仅包含实际复制的文件，使用相对路径。ZIP 沿同一复制操作、账本及恢复回执，
+无需生成打包脚本或执行进程；继承下列复制排除规则与大小限制。
+应检查 `copy` 报告中的遗漏及原因，再判断是否足够交付；返回的 `files` 包含 ZIP 的 SHA256。
+归档名称与复制输入冲突时拒绝。恢复按保存回执核对已发布文件和 ZIP，不重新打包变化后的内容。
+用户只需在普通自然语言目标或反馈中要求可搬迁 ZIP，无须自己调用内部工具。
+生成 ZIP 本身不代表验证通过或正式交付。
 `source` 指定来源目录，`path` 指定可写 workspace 内尚不存在的子目录；支持挂载定位和授权绝对路径。
 例如工具参数 `{"source":"source0/project","path":"workspace/project"}` 复制普通源码、测试、配置、文档及二进制资源，
 不使用 shell、网络或执行项目，原材料保持不变。
@@ -81,6 +99,11 @@ simple-ar start --resume-task SESSION --authorize-remaining llm_requests=10 --au
 `write_file` 可选 `delivery` 包含 `summary`、`artifacts` 和 `unresolved`。
 必须引用本次写入的文件，其余产物须已存在于可写工作区；路径不合法时先拒绝，不写文件。
 成功的最终写入复用既有交付与终态所有者；普通写入及独立 `deliver_result` 行为不变。
+`run_process` 同样可显式指定 `delivery`，用于授权范围内的最后工作。
+进程必须成功退出且未被停止，所声明的产物须在执行后实际存在。
+进程回执绑定请求和产物摘要，中断恢复消费原绑定，不重跑命令；产物变化、缺少绑定、
+命令失败或终态位置不合法时拒绝交付。交付声明包含在精确执行批准中；普通进程成功
+不会自动结束任务。这是合并最终工作与明确交付，不是科学核验或自动打包。
 产物也可指定工作区项目目录；沿已有清单展开为每目录最多200个可访问文件的明确快照，
 排除私有路径、虚拟环境、Python字节码缓存及符号链接。空清单或超限拒绝，不悄悄截断。
 这是实际文件记录，不是归档，也不证明项目可搬迁或内容正确。
@@ -196,6 +219,8 @@ Semantic Scholar 和可选 Tavily（需要对应凭据）。搜索记录和取�
 导出清单包含完整工程、图形与重建说明。新导出绑定实际文件摘要后才可复用，文件变化或缺失
 不能沿用旧编译结果。历史仅绑定输入的回执仍可查看，但不追认当前字节或自动交付；缺少成功
 输出绑定的中断导出不盲目重跑。原文与旧版本保留。
+工作区 Markdown 拥有其当前作者图注；图形元数据只补空图注并提供可编辑变体，不覆盖已修订正文。
+受控装配报告继续采用登记图注的原所有权。
 
 `--allow-execution` 允许提出命令，不自动批准执行；需要终端确认，或恢复时提供显示的
 `--approve-execution TOKEN`。`--yes` 仅确认创建任务。工作区不是操作系统沙箱：时限和日志
@@ -305,7 +330,10 @@ simple-ar start --kind code --material requirements.md --goal "创建可复用CS
 原生/共用/材料/声明参数之外的显式控制选择结构化兼容：来源/获取政策、报告模板/上限、
 编辑范围/验证器、复现命令/指标/环境、物理表格上限与交互设置。
 即使显式提供解析器默认值也选择该协议，不把严格字段静默改成偏好文字。
-`--chat`/`--resume-setup` 保留技术设置及历史确认参数；`--from-session`/`--reuse`
+`--chat`/`--resume-setup` 保留技术设置及历史确认参数；普通写作的
+`--from-session`/`--reuse` 将所选登记成果包挂载到原生任务，不重跑有效测量或导入旧账本。
+显式模板、调研原文过滤及 `code_project` 的范围/验证仍保留结构化兼容合同。
+这些兼容路线
 保留登记范围和验证器。偏好取值为 `survey`、`bug_fix`、`reproduction`、`writing`、`data_analysis`、
 `figure`、`code`；`--scripted` 必须配 `--kind data_analysis`，创建偏好不能用于 `--resume-task`。
 data_analysis 不加 `--scripted` 且显式提供 `--value-column`、`--x-column` 或 `--paired-baseline`
@@ -583,6 +611,11 @@ LLM 模式仍使用正常的 `.env` provider 配置。缺少 key、模型请求�
 旧 `--synthesis-file` 参数不作隐式兼容。领域能力仍可在库级组合，历史产物保持可读。
 
 ### `simple-ar research-session`（任务驱动的 canonical 入口）
+
+新报告默认复用整篇 Writer，继续沿规范装配、引用和确定性审计交付。
+`--report-writing-method sections` 保留受控分节规划与审阅；未指定方法时，
+显式分节/审阅参数自动选择它。明确选择 `article` 时，不兼容参数被拒绝而非忽略。
+一次整篇起草不代表独立模型审阅，历史报告沿保存的 Writer/检查点所有者恢复。
 
 LLM 任务计划校验失败时最多自动纠正一次，不静默改用固定计划。
 返回提案与校验错误保存在该次 `attempts/plan-*/task_plan_proposals.json`；仍无有效计划时暂停，不执行后续动作。
@@ -1085,7 +1118,7 @@ uv run simple-ar code-task execute runs/<run-id> --apply-proposed-edits --timeou
 | `--timeout N` | int | benchmark timeout。 |
 | `--baseline-policy MODE` | enum | 已有项目 baseline 策略：`auto`、`run`、`skip`、`provided` 或 `none`。昂贵 baseline 可用 `skip`/`none` 跳过，或用 `provided` 记录已有指标。 |
 | `--baseline-metrics-file PATH` | path | `--baseline-policy provided` 时读取的 JSON 或 `metric=0.82` 文本指标文件。 |
-| `--planning-mode MODE` | enum | Greenfield 规划：`tool_agent` 分步规划并做有限审阅；`compact` 在重试前只调用一次架构规划。 |
+| `--planning-mode MODE` | enum | Greenfield 完整架构工作单元，默认 `compact`；`tool_agent` 为弃用别名，进入替代方法前显示迁移说明。 |
 | `--yes` | flag | 普通 execute 模式下自动批准 inline 审核门；与 `--interactive` 一起使用时，自动继续 primitive prompts。只有明确接受审核风险、想自动化跑通时才使用。 |
 | `--interactive` | flag | 调试模式：逐个 primitive step 确认，而不是连续运行到下一个审核门。 |
 | `--no-review-inline` | flag | 禁用 inline 审核提示，在审核门直接停止。 |
@@ -1146,10 +1179,22 @@ provider-specific CLI 参数。
 完整 installed distributions snapshot；终端输出和模型上下文只使用紧凑的任务相关子集。
 这只是建议，不会自动安装依赖。
 
-Greenfield 默认使用 `tool_agent` planning，会把 requirements、architecture、
-interfaces、file plan 和 planning review 的中间产物写到
-`code_task/meta/planning/`。需要减少规划调用时可使用
-`--planning-mode compact`；后续文件生成、审阅与执行共用同一实现。
+Greenfield 默认使用完整架构工作单元 `compact`。`tool_agent` 为弃用别名，
+原四阶段规划及强制 planning review 已退役。`--planning-review-rounds` 弃用：
+非零值显示说明，不授予额外调用；请设为 `0`。完整响应纠正、显式 fallback
+仍沿既有预算和未知用量保护执行。
+新尝试保存在 `code_task/meta/planning/architecture_unit/`。历史未生成任务进入
+替代方法前，`planning/method_migration.json` 记录原方法（或 unknown）、planner
+选择及保留产物摘要；旧阶段和失败原件保留，原可变计划另存至
+`planning/retired_method/`。回执不认证旧流程成功，也不重置账本。
+已生成项目跳过生成，不可变 snapshot 按保存内容导入、不重规划。
+命名 planner 继续使用 `[models.code_task] planner = "profile:NAME"`；
+退役阶段选择字段会明确拒绝，请移除并选择一个既有 planner profile。
+后续 Writer、生成代码审阅及执行共用原实现。
+
+明确离线生成只创建开发模板，不代表实验已实现。未实现的 runner 会报错停止，
+不输出测量值；正式 benchmark 前应完成实现和验证，不能用预设分数满足结果 schema。
+既有生成项目及其保存的执行记录不会被改写。
 
 生成项目审查检查结构及脚手架风险，不证明任务验收通过。自然语言中的命令名、
 输出路径和库偏好由上下文审阅处理，不再通过固定短语猜测并阻断。模型意见仍是

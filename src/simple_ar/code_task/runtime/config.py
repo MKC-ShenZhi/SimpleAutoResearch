@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from simple_ar.code_task.execution.baseline_policy import normalize_baseline_policy
 from simple_ar.code_task.execution.comparison import normalize_metric_direction
@@ -149,6 +149,18 @@ class LLMSection(_ConfigModel):
 
 
 class CodeTaskModelsSection(_ConfigModel):
+    @model_validator(mode="before")
+    @classmethod
+    def reject_retired_stage_profiles(cls, value: Any) -> Any:
+        if isinstance(value, dict) and set(value) & {
+            "requirements", "architecture", "interfaces", "file_plan", "planning_review",
+            "stages", "stage_profiles", "stage_routes",
+        }:
+            raise ValueError("Greenfield stage model routes are retired. Select one existing "
+                             "connection with [models.code_task] planner = 'profile:NAME'; "
+                             "remove stage selectors and set [execute] planning_mode = 'compact'.")
+        return value
+
     default: str | None = None
     planner: str | None = None
     writer: str | None = None
@@ -395,7 +407,7 @@ def load_code_task_execute_options(
         planning_mode=_planning_mode(execute.planning_mode),
         planning_review_rounds=_non_negative_int(
             _config_int(execute.planning_review_rounds),
-            2,
+            0,
         ),
         llm_retry_attempts=_positive_int(_config_int(execute.llm_retry_attempts), 3),
         repair_rounds=_non_negative_int(_config_int(execute.repair_rounds), 0),
@@ -770,7 +782,7 @@ def _baseline_policy(value: str | None) -> str:
 
 
 def _planning_mode(value: str | None) -> str:
-    text = (_config_string(value) or "tool_agent").lower().replace("-", "_")
+    text = (_config_string(value) or "compact").lower().replace("-", "_")
     aliases = {
         "tool": "tool_agent",
         "tools": "tool_agent",
