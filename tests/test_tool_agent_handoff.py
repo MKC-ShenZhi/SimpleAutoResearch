@@ -1665,6 +1665,175 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 with self.subTest(change=change), self.assertRaises(ValueError):
                     app.scientific.approval_binding({**batch[0]['arguments'], **change}, identity='changed-condition')
 
+    def test_real_baseline_reuse_shares_selection_analysis_reporting_feedback_and_recovery(self):
+        from simple_ar.tools.scientific import (freeze_measurement_set, measurement_conditions,
+            MeasurementAnalysisRequest, ScientificToolGateway, validate_reused_baseline)
+
+        # Use the same caller/CPU/approval fixture as the frozen-condition test.
+        for seeds in (None, [4, 9]):
+            with self.subTest(seeds=seeds), _temporary_run() as directory, patch(
+                    'simple_ar.app.tool_application.LLMClient.from_env',
+                    side_effect=AssertionError('Reuse needs no model')):
+                root = directory.resolve()
+                project = root / 'project'
+                project.mkdir()
+                data = project / 'data.txt'
+                data.write_text('heldout data\n', encoding='utf-8')
+                evaluator = project / 'evaluate.py'
+                evaluator.write_text("import sys\nfrom pathlib import Path\n"
+                    "assert Path('data.txt').read_text() == 'heldout data\\n'\n"
+                    "with Path('calls.txt').open('a') as f: f.write(' '.join(sys.argv[1:])+'\\n')\n"
+                    "print('score:', float(sys.argv[1]))\n", encoding='utf-8')
+                execution = {'command': [sys.executable, 'evaluate.py', '3'], 'cwd': str(project),
+                    'timeout_sec': 5, 'baseline': {'command': [sys.executable, 'evaluate.py', '1']},
+                    'baseline_policy': 'run',
+                    **({'seeds': seeds, 'seed_flag': '--seed'} if seeds else {}),
+                    'result_schema': {'primary_metric': 'score', 'required_metrics': ['score'],
+                        'metric_directions': {'score': 'max'}},
+                    'protocol': {'contract_id': 'reuse-comparison', 'dataset_refs': [{'asset_id': 'heldout'}],
+                        'split_spec': {'name': 'heldout'}, 'comparison_conditions': {'split': 'fixed'},
+                        'metric_specs': [{'name': 'score', 'direction': 'higher'}],
+                        'protected_assets': [{'asset_id': 'data', 'path': 'data.txt'},
+                            {'asset_id': 'evaluator', 'path': 'evaluate.py'}]}}
+                contract = freeze_measurement_set(execution)
+                baseline_rows = [row for row in measurement_conditions(contract) if row['role'] == 'baseline']
+                count = len(baseline_rows)
+                def action(name, **arguments):
+                    return {'tool_name': name, 'arguments': arguments}
+                old = ToolApplication.create(root / 'original', 'Record original controls', model=None,
+                    sources={}, allow_execution=True, max_turns=0, max_tokens=0, max_attempts=12,
+                    execution_contract=contract,
+                    process_limits={'process_invocations': count, 'process_wall_seconds': count * 5})
+                old.run(actions=[action('measure_experiment', **row['execution'], condition_id=row['id'])
+                    for row in baseline_rows], approve=lambda *_: True, progress=lambda _: None)
+                originals = [old.session.store.read_json(item['result']) for turn in old.state['turns']
+                    for item in turn['tools']]
+                self.assertTrue(all(item['status'] == 'ok' for item in originals), originals)
+                paths = [old.workspace.resolve(item['data']['result_ref']) for item in originals]
+                old_bytes = {path: path.read_bytes() for path in old.session.store.root.rglob('*') if path.is_file()}
+                old_ledger = old.ledger.to_dict()
+                refs = ['prior/' + path.relative_to(old.session.store.root).as_posix() for path in paths]
+                reused = freeze_measurement_set({**execution, 'baseline_policy': 'reuse',
+                    'baseline_ref': refs if seeds else refs[0]})
+                unbound = ScientificToolGateway(old.session.store.root, old.workspace, old.ledger,
+                    old.session.manifest.session_id, execution_contract=reused)
+                self.assertIn('hash-bound task snapshot', unbound.execution_issues()[0])
+                app = ToolApplication.create(root / 'reused', 'Compare using retained controls', model=None,
+                    sources={'prior': old.session.store.root}, allow_execution=True,
+                    max_turns=0, max_tokens=0, max_attempts=20, execution_contract=reused,
+                    process_limits={'process_invocations': count, 'process_wall_seconds': count * 5})
+                frozen = app.scientific.execution_contract
+                rows = measurement_conditions(frozen)
+                imported = [row for row in rows if row.get('reuse_ref')]
+                for row, original_path in zip(imported, paths):
+                    snapshot = app.workspace.resolve(row['reuse_ref'])
+                    self.assertEqual(snapshot.read_bytes(), original_path.read_bytes())
+                    self.assertEqual(row['reuse_sha256'], hashlib.sha256(snapshot.read_bytes()).hexdigest())
+                    with self.assertRaisesRegex(ValueError, 'cannot execute'):
+                        app.scientific.approval_binding({**row['execution'], 'condition_id': row['id']},
+                            identity='forbidden-reused-execution')
+                app.run(actions=[action('measure_experiment', **row['execution'], condition_id=row['id'])
+                    for row in rows if not row.get('reuse_ref')], approve=lambda *_: True, progress=lambda _: None)
+                measured = [app.session.store.read_json(item['result']) for turn in app.state['turns']
+                    for item in turn['tools']]
+                self.assertTrue(all(item['status'] == 'ok' for item in measured), measured)
+                locators = [item['data']['result_ref'] for item in measured]
+                selected = app.scientific._condition_results(locators)
+                self.assertEqual(len(selected), count * 2)
+                self.assertEqual({selected[row['id']] for row in imported}, {row['reuse_ref'] for row in imported})
+                completion = app.measurement_completion_actions()
+                self.assertEqual(len(completion), 1)
+                self.assertEqual(completion[0]['tool_name'], 'analyze_measurements')
+                before = app.ledger.to_dict()
+                with patch('simple_ar.experiment.execution.backend.run_process') as process:
+                    app.run(actions=completion, progress=lambda _: None)
+                    self.assertEqual(app.session.manifest.status, 'completed')
+                    analysis_record = app.state['turns'][-1]['tools'][-1]['result']
+                    analyzed = app.session.store.read_json(analysis_record)
+                    self.assertEqual(analyzed['status'], 'ok', analyzed.get('error'))
+                    sources = analyzed['data']['measurement_sources']
+                    self.assertEqual([item['measurement_id'] for item in sources],
+                        [json.loads(path.read_bytes())['measurement']['measurement_id'] for path in paths])
+                    self.assertTrue(all(item['origin'] == 'reused' for item in sources))
+                    markdown = next(path for path in analyzed['artifacts'] if path.endswith('/analysis.md'))
+                    self.assertIn('No execution, approval or process accounting was created',
+                        app.workspace.resolve(markdown).read_text(encoding='utf-8'))
+                    evidence = app.scientific.report_evidence(locators, [], analysis_records=[analysis_record])
+                    self.assertEqual(evidence['measurement_sources'], sources)
+                    self.assertTrue(evidence['analysis_records'])
+                    self.assertEqual(app.scientific.evidence_requirement(locators, [analysis_record]), [])
+                    self.assertTrue(app.scientific.evidence_requirement(locators[:-1], [analysis_record]))
+                    delivery = app.session.store.read_json('delivery.json')
+                    app = ToolApplication.load(root / 'reused')
+                    app.run(progress=lambda _: None)
+                    app.run(feedback='Change the explanation only; retain original controls', actions=[
+                        action('deliver_result', summary='Retained comparison and original baseline identity',
+                            artifacts=delivery['artifacts'])], progress=lambda _: None)
+                    self.assertEqual(app.session.manifest.status, 'completed')
+                    self.assertEqual(app.ledger.to_dict(), before)
+                    self.assertEqual(app.scientific.evidence_requirement(locators, [analysis_record]), [])
+                    process.assert_not_called()
+                self.assertEqual(len(app.ledger.entries), count)
+                self.assertEqual(len(list((app.session.store.root / 'attempts').glob('*/results.json'))), count)
+                self.assertFalse(list((app.session.store.root / 'evidence').rglob('scientific_request.json')))
+                self.assertFalse(list((app.session.store.root / 'evidence').rglob('scientific_result.json')))
+                calls = (project / 'calls.txt').read_text().splitlines()
+                self.assertEqual(calls, ([f'1 --seed {seed}' for seed in seeds] +
+                    [f'3 --seed {seed}' for seed in seeds]) if seeds else ['1', '3'])
+                self.assertEqual(old.ledger.to_dict(), old_ledger)
+                self.assertEqual({path: path.read_bytes() for path in old_bytes}, old_bytes)
+
+                # Failed/forged/lineage-bearing facts and changed protected files
+                # are rejected by the same validator used before task creation.
+                canonical = json.loads(paths[0].read_bytes())
+                flat = imported[0]['execution']
+                supplied = root / 'supplied'
+                supplied.mkdir()
+                for index, change in enumerate(({'status': 'failed'}, {'execution_status': 'failed'},
+                        {'command': [sys.executable, 'evaluate.py', '99']},
+                        {'preparation': {'source_ref': {'path': 'old/execution.json'}}},
+                        {'implementation_ref': {'path': 'old/implementation.json'}},
+                        {'measurement': {**canonical['measurement'], 'source_kind': 'unverified_backend'}},
+                        {'measurement': {**canonical['measurement'], 'measurement_id': 'invented'}})):
+                    with self.subTest(change=change), self.assertRaises(ValueError):
+                        validate_reused_baseline({**canonical, **change}, flat)
+                    (supplied / 'results.json').write_text(json.dumps({**canonical, **change}), encoding='utf-8')
+                    invalid = freeze_measurement_set({**execution, 'baseline_policy': 'reuse',
+                        'baseline_ref': ['bad/results.json', *refs[1:]] if seeds else 'bad/results.json'})
+                    rejected = root / f'rejected-{index}'
+                    with self.subTest(factory_change=change), self.assertRaises(ValueError):
+                        ToolApplication.create(rejected, 'Reject invalid historical baseline', model=None,
+                            sources={'bad': supplied, 'prior': old.session.store.root}, allow_execution=True,
+                            max_turns=0, max_tokens=0, max_attempts=8, execution_contract=invalid,
+                            process_limits={'process_invocations': count, 'process_wall_seconds': count * 5})
+                    self.assertFalse((rejected / 'actions.json').exists())
+                for asset in (data, evaluator):
+                    content = asset.read_bytes()
+                    try:
+                        asset.write_bytes(content + b'\nchanged')
+                        with self.assertRaises(ValueError):
+                            app.scientific._condition_results(locators)
+                    finally:
+                        asset.write_bytes(content)
+                snapshot = app.workspace.resolve(imported[0]['reuse_ref'])
+                content = snapshot.read_bytes()
+                try:
+                    snapshot.write_bytes(content + b'\n')
+                    with self.assertRaisesRegex(ValueError, 'digest'):
+                        app.scientific.report_evidence(locators, [])
+                    with self.assertRaises(ValueError):
+                        app.scientific._measurement_input(imported[0]['reuse_ref'])
+                finally:
+                    snapshot.write_bytes(content)
+                if seeds is None:
+                    # Unfrozen legacy readers also reject the same physical
+                    # result supplied in both roles, independently of aliases.
+                    reader = ScientificToolGateway(app.session.store.root, app.workspace, app.ledger,
+                        app.session.manifest.session_id)
+                    alias = str(app.workspace.resolve(locators[0]))
+                    with self.assertRaisesRegex(ValueError, 'physical measurement'):
+                        reader._analysis_inputs(MeasurementAnalysisRequest(result_refs=[locators[0]], baseline_ref=alias))
+
     def test_shared_condition_environment_reuses_venv_and_blocks_changed_or_unfinished_preparation(self):
         from simple_ar.tools.scientific import freeze_measurement_set
         for scenario in ('venv', 'budget', 'mutation', 'interrupted', 'failed'):
@@ -6252,6 +6421,29 @@ class ScientificToolTests(unittest.TestCase):
             for controls in ({'baseline_policy': 'reuse'}, {'baseline_ref': 'old/results.json'}):
                 with self.assertRaises(ValueError):
                     freeze_measurement_set({**flat, **controls})
+            # Freezing retains locators and original execution fields; it never
+            # opens historical files (these references deliberately do not exist).
+            for refs in ('old/results.json', ['old/4/results.json', 'old/9/results.json']):
+                reused = freeze_measurement_set({**flat, 'baseline_policy': 'reuse', 'baseline_ref': refs,
+                    'seeds': [4, 9], 'seed_flag': '--seed'})
+                run = freeze_measurement_set({**flat, 'baseline_policy': 'run',
+                    'seeds': [4, 9], 'seed_flag': '--seed'})
+                baseline = [row for row in reused['conditions'] if row['role'] == 'baseline']
+                self.assertEqual([row['reuse_ref'] for row in baseline],
+                    refs if isinstance(refs, list) else [refs, refs])
+                self.assertEqual([{key: value for key, value in row.items() if key != 'reuse_ref'}
+                    for row in reused['conditions']], run['conditions'])
+                self.assertEqual(measurement_contract(reused), reused)
+                for change in ({'reuse_ref': ''}, {'reuse_ref': False}, {'role': 'candidate'},
+                        {'source': 'preparation'}, {'reuse_sha256': 'bad'}):
+                    invalid = json.loads(json.dumps(reused))
+                    invalid['conditions'][0].update(change)
+                    with self.subTest(change=change), self.assertRaises(ValueError):
+                        measurement_contract(invalid)
+            for refs in ([], ['only-one'], ['first', 'second', 'third'], ['first', '']):
+                with self.subTest(refs=refs), self.assertRaises(ValueError):
+                    freeze_measurement_set({**flat, 'baseline_policy': 'reuse', 'baseline_ref': refs,
+                        'seeds': [4, 9], 'seed_flag': '--seed'})
 
     def test_scoped_preparation_routes_exact_source_without_asset_authorization_bypass(self):
         from simple_ar.tools.scientific import ScientificToolGateway, MeasurementRequest
@@ -6332,6 +6524,7 @@ class ScientificToolTests(unittest.TestCase):
                     'execution_approval': {'binding': {'source': source}}})
                 write_json(store / 'results.json', {'implementation_ref': implemented,
                     'preparation': {'source_ref': prepared}, 'status': 'passed', 'execution_status': 'passed',
+                    'measurement': {'measurement_id': identity},
                     'result_schema': flat['result_schema'], 'metrics': {'score': 1}})
                 return f'records/{identity}/results.json'
             baseline = observation('baseline', 'baseline')

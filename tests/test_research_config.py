@@ -380,6 +380,30 @@ class ResearchConfigTests(unittest.TestCase):
             self.assertEqual(defaults["execution_details"]["seed_flag"], "--seed")
             self.assertEqual(defaults["execution_details"]["baseline_policy"], "skip")
 
+    def test_config_preserves_reused_baseline_paths_as_scalar_or_list(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'research.toml'
+            for references in ('prior result.json', ['seed-4.json', 'archive/../seed-9.json']):
+                with self.subTest(references=references):
+                    path.write_text('[task]\ngoal="Reuse supplied baseline evidence"\n'
+                        '[execution]\nbaseline_policy="reuse"\n'
+                        f'baseline_ref={json.dumps(references)}\nseeds=[4,9]\nseed_flag="--seed"\n'
+                        'baseline={command=["python", "baseline.py"]}\n',
+                        encoding='utf-8')
+                    original = path.read_bytes()
+                    argv = ['research-session', '--config', str(path)]
+                    with patch('simple_ar.app.research_execution.normalize_execution_config',
+                               side_effect=AssertionError('Declarations must not expand execution')):
+                        defaults = research_defaults(argv)
+                    self.assertEqual(defaults['execution_details'], {
+                        'baseline_policy': 'reuse', 'baseline_ref': references,
+                        'baseline': {'command': ['python', 'baseline.py']},
+                        'seeds': [4, 9], 'seed_flag': '--seed'})
+                    args = build_parser(research_defaults=defaults).parse_args(argv)
+                    self.assertEqual(args.execution_details, defaults['execution_details'])
+                    self.assertNotIn('command_argv', defaults)
+                    self.assertEqual(path.read_bytes(), original)
+
     def test_config_pair_protocol_real_processes_and_completed_resume(self):
         from simple_ar.cli.main import main
         from simple_ar.app.research_application import load_session
@@ -888,8 +912,18 @@ class ResearchConfigTests(unittest.TestCase):
                     ('baseline_policy=false', 'baseline_policy'),
                     ('baseline_policy=""', 'baseline_policy'),
                     ('baseline_policy=" "', 'baseline_policy'),
+                    ('baseline="wrong"', 'baseline'),
                     ('baseline_ref=3', 'baseline_ref'),
-                    ('baseline_ref=" "', 'baseline_ref')):
+                    ('baseline_ref=false', 'baseline_ref'),
+                    ('baseline_ref={path="prior.json"}', 'baseline_ref'),
+                    ('baseline_ref=" "', 'baseline_ref'),
+                    ('baseline_ref=[]', 'baseline_ref'),
+                    ('baseline_ref=[""]', 'baseline_ref'),
+                    ('baseline_ref=["prior.json", " "]', 'baseline_ref'),
+                    ('baseline_ref=["prior.json", 3]', 'baseline_ref'),
+                    ('baseline_ref=["prior.json", false]', 'baseline_ref'),
+                    ('baseline_ref=[["prior.json"]]', 'baseline_ref'),
+                    ('baseline_ref=[{path="prior.json"}]', 'baseline_ref')):
                 with self.subTest(fields=fields):
                     path.write_text('[execution]\n' + fields, encoding='utf-8')
                     with self.assertRaisesRegex(ValueError, message):

@@ -41,8 +41,10 @@ def measurement_reuse_matches(
             return False
         expected_contract = expected.normalized_experiment_contract()
         actual_contract = payload.get("experiment_contract")
+        integrity = (payload.get("measurement") or {}).get("asset_integrity")
         if (not isinstance(expected_contract, Mapping) or not isinstance(actual_contract, Mapping)
-                or comparable_protocol(actual_contract) != comparable_protocol(expected_contract)):
+                or comparable_protocol(actual_contract, observed_assets=integrity)
+                != comparable_protocol(expected_contract, observed_assets=integrity)):
             return False
         preparation = payload.get("preparation")
         if current_source is not None:
@@ -57,7 +59,6 @@ def measurement_reuse_matches(
                 return False
         elif preparation is not None or actual_source is not None:
             return False  # A claimed producing preparation cannot lose its current lineage.
-        integrity = (payload.get("measurement") or {}).get("asset_integrity")
         if (payload.get("validity_status") == "invalid"
                 or isinstance(integrity, Mapping) and integrity.get("status") == "changed"):
             return False

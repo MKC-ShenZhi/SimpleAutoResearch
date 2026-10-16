@@ -194,11 +194,14 @@ papers = ["paper.md"]
 | `primary_metric`、`metrics`、`metric_directions` | 可选结果合同，方向列表如 ["accuracy=higher"]；higher/lower/resource/ignore |
 | `output_files`、`metric_sources` | 登记附件／明确有限数值选择器 |
 | `pairs`、`seeds`、`seed_flag`、`seed_count` | 明确成对 argv 或紧凑展开，不混用 |
-| `baseline_policy`、`baseline_ref` | run/skip/reuse；复用需当前会话已通过且匹配产物 |
+| `baseline` | 可选表，声明控制条件的 `command` 及覆盖字段；未单独声明时沿用主命令 |
+| `baseline_policy`、`baseline_ref` | run/skip/reuse；固定测量可引用已通过的同条件 canonical 结果文件，配对条件可提供按条件顺序排列的路径列表 |
 | `protocol` | contract_id/hypothesis、dataset_refs、split_spec、metric_specs、comparison_conditions、protected_assets；复现还需 dataset/expected_outcome |
 | `initial_files` | 须显式 CodeTask 准备；明确允许、尚不存在、不受保护的 Python 路径，不限复现任务。已支持的原生任务交由 CodeTask 直接创建，不先写占位实现；历史及未迁移合同仍由原所有者执行。 |
 
 仅文献任务省略 command 和 CodeTask。
+
+固定测量使用 `reuse` 时，`baseline_ref` 路径相对配置文件（无配置文件时相对当前目录）。框架核对命令、指标 schema、比较协议与明确保护文件的原始哈希，并把原结果保存为任务内只读快照；只执行候选条件，基线保留原测量身份、不新增进程或用量记录。缺少保护文件证据、条件不匹配、失败结果或已变化的输入会阻断复用。需要 CodeTask 来源血缘或研究设计的旧复用合同仍由原所有者处理；历史恢复不改写原结果与账本。
 
 | `[execution.environment]` 字段 | 默认值／约束 |
 | --- | --- |

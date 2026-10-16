@@ -21,7 +21,7 @@ from simple_ar.app.research_execution import execution_request, normalize_execut
 from simple_ar.core.capabilities import ArtifactRef, ArtifactStore, CapabilityContext
 from simple_ar.core.process import verify_process_accounting
 from simple_ar.experiment.execution.backend import LocalExecutionBackend
-from simple_ar.experiment.execution.measurement import snapshot_protocol_assets, representative_measurement_execution
+from simple_ar.experiment.execution.measurement import measurement_reuse_matches, snapshot_protocol_assets, representative_measurement_execution
 from simple_ar.experiment.execution.outputs import metric_sources
 from simple_ar.research.analysis import analyze_experiment_capability
 from simple_ar.research.experiment import run_experiment_capability
@@ -116,7 +116,7 @@ def scientific_tool_specs() -> list[CommonToolSpec]:
         CommonToolSpec(name='analyze_measurements', domain='scientific',
             permission_level='write_patch', risk_level='low',
             input_schema=MeasurementAnalysisRequest.model_json_schema(),
-            description='Deterministically analyze receipt-verified measurements from this task: one candidate with optional baseline, or explicit seed/baseline/candidate pairs including missing conditions. Existing collection analysis owns protocol grouping and descriptive paired summaries; no inferred pairing, new statistics, process or model call. Saves experiment_set.json for pairs, canonical analysis.json, analysis.md and comparison evidence. Optional delivery includes actual outputs and discloses incomplete/failed evidence; frozen condition coverage is independently enforced.'),
+            description='Deterministically analyze receipt-verified task measurements and caller-frozen, hash-bound reused baselines: one candidate with optional baseline, or explicit seed/baseline/candidate pairs including missing conditions. Imports retain original measurement identity and disclose their origin, without new process accounting. Existing collection analysis owns protocol grouping and descriptive paired summaries; no inferred pairing, new statistics, process or model call. Saves experiment_set.json for pairs, canonical analysis.json, analysis.md and comparison evidence. Optional delivery includes actual outputs and discloses incomplete/failed evidence; frozen condition coverage is independently enforced.'),
     ]
 
 
@@ -129,7 +129,7 @@ def measurement_contract(execution: dict[str, Any]) -> dict[str, Any]:
         seen = set()
         normalized = []
         for row in rows:
-            if (not isinstance(row, dict) or set(row) - {'id', 'role', 'seed', 'execution', 'source', 'before_implementation'}
+            if (not isinstance(row, dict) or set(row) - {'id', 'role', 'seed', 'execution', 'source', 'before_implementation', 'reuse_ref', 'reuse_sha256'}
                     or not {'id', 'role', 'seed', 'execution'}.issubset(row)
                     or not isinstance(row['id'], str) or not row['id'].strip() or row['id'] in seen
                     or row['role'] not in {'baseline', 'candidate'}
@@ -139,6 +139,14 @@ def measurement_contract(execution: dict[str, Any]) -> dict[str, Any]:
                     or row['seed'] is not None and type(row['seed']) is not int
                     or not isinstance(row['execution'], dict) or 'conditions' in row['execution']):
                 raise ValueError('Conditions require unique identities, explicit roles, integer/null seeds and flat execution')
+            if 'reuse_ref' in row and (row['role'] != 'baseline'
+                    or not isinstance(row['reuse_ref'], str) or not row['reuse_ref'].strip()
+                    or row.get('source', 'declared') != 'declared' or row.get('before_implementation')):
+                raise ValueError('Reuse requires a nonempty baseline locator with declared source')
+            if 'reuse_sha256' in row and ('reuse_ref' not in row
+                    or not isinstance(row['reuse_sha256'], str)
+                    or not re.fullmatch(r'[0-9a-f]{64}', row['reuse_sha256'])):
+                raise ValueError('Reuse digest requires a baseline locator and SHA256')
             seen.add(row['id'])
             flat = measurement_contract(row['execution'])
             seed = (flat.get('protocol') or {}).get('comparison_conditions', {}).get('seed')
@@ -181,14 +189,23 @@ def measurement_conditions(contract: dict[str, Any]) -> list[dict[str, Any]]:
 def freeze_measurement_set(execution: dict[str, Any]) -> dict[str, Any]:
     """Expand caller-declared conditions through the existing sole argv owner."""
     if set(execution) - {'command', 'cwd', 'timeout_sec', 'label', 'result_schema', 'protocol',
-            'baseline', 'baseline_policy', 'pairs', 'seeds', 'seed_count', 'seed_flag',
+            'baseline', 'baseline_policy', 'baseline_ref', 'pairs', 'seeds', 'seed_count', 'seed_flag',
             'protocol_seed_reason', 'protocol_seed_flag', 'environment'}:
         raise ValueError('Condition-set migration cannot discard unsupported preparation/reuse controls')
     config = normalize_execution_config(execution)
-    if config.get('baseline_policy') not in {'run', 'skip'} or config.get('baseline_ref'):
-        raise ValueError('Condition-set migration requires declared run/skip conditions, not historical reuse')
     rows = []
     pairs = config.get('pairs') or [None]
+    reuse = config['baseline_policy'] == 'reuse'
+    references = config.get('baseline_ref')
+    if reuse:
+        references = [references] * len(pairs) if isinstance(references, str) else references
+        if isinstance(references, tuple):
+            references = list(references)
+        if (not isinstance(references, list) or len(references) != len(pairs)
+                or any(not isinstance(ref, str) or not ref.strip() for ref in references)):
+            raise ValueError('Reuse requires a baseline_ref or one nonempty locator per baseline condition')
+    elif references is not None:
+        raise ValueError('baseline_ref requires baseline_policy=reuse')
     for index, pair in enumerate(pairs):
         for role in (('candidate',) if config['baseline_policy'] == 'skip' else ('baseline', 'candidate')):
             request = execution_request(config, condition=role, pair_index=index if pair else None)
@@ -198,7 +215,7 @@ def freeze_measurement_set(execution: dict[str, Any]) -> dict[str, Any]:
                 'protocol': request.experiment_contract.to_row() if request.experiment_contract else None,
                 **({'environment': config['environment']} if config.get('environment') is not None else {})}
             rows.append({'id': f'{role}:{index}', 'role': role, 'seed': pair['seed'] if pair else None,
-                'execution': flat})
+                'execution': flat, **({'reuse_ref': references[index]} if reuse and role == 'baseline' else {})})
     return measurement_contract({'conditions': rows})
 
 
@@ -222,6 +239,23 @@ def fixed_measurement_issues(declaration: dict[str, Any], accepted: dict[str, An
                 != (right['execution'].get('protocol') or {}).get(key) for key in protocol):
             return ['Accepted design differs from an explicit fixed execution protocol field.']
     return []
+
+
+def validate_reused_baseline(canonical: dict[str, Any], execution: dict[str, Any]) -> None:
+    """Validate imported domain facts without claiming this task's process ownership."""
+    try:
+        measurement = canonical.get('measurement') or {}
+        physical = measurement.get('measurement_id')
+        valid = (measurement.get('source_kind') == 'measured' and isinstance(physical, str)
+            and re.fullmatch(r'[0-9a-f]{32}', physical)
+            and canonical.get('implementation_ref') is None and canonical.get('preparation') is None
+            and not ScientificToolGateway._measurement_issues(canonical)
+            and measurement_reuse_matches(canonical, execution_request(execution), same_session_result=False))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError):
+        valid = False
+    if not valid:
+        raise ValueError('Reused baseline is not a passed same-condition measurement with unchanged protected assets '
+            'and an original physical identity without producing-source lineage')
 
 
 def _hash(path: Path) -> str:
@@ -266,6 +300,10 @@ class ScientificToolGateway:
                     return ['Accepted research design differs from the fixed scientific execution contract.']
             except (OSError, ValueError, KeyError, TypeError) as exc:
                 return [str(exc)]
+        contract = self.execution_contract
+        if contract is not None and any(row.get('reuse_ref') and not row.get('reuse_sha256')
+                for row in measurement_conditions(contract)):
+            return ['Baseline reuse requires a hash-bound task snapshot before any new execution.']
         return []
 
     @property
@@ -284,11 +322,11 @@ class ScientificToolGateway:
 
     def _locator(self, path: Path) -> str:
         locator = self.workspace.locator(str(path))
-        if not locator.startswith('records/'):
+        if not locator.startswith(('records/', 'evidence/reused-baselines/')):
             raise ValueError('Task attempts must be exposed through the readonly records mount')
         return locator
 
-    def _condition(self, parsed: MeasurementRequest) -> dict[str, Any]:
+    def _condition(self, parsed: MeasurementRequest, *, allow_reused: bool = False) -> dict[str, Any]:
         """Bind a proposal to its explicit source kind, independently of comparison role."""
         scoped = self.implementation is not None and self.implementation.exact is not None
         contract = self.execution_contract
@@ -305,6 +343,8 @@ class ScientificToolGateway:
             row = {'source': 'implementation' if scoped else 'declared', 'execution': contract}
         if (parsed.condition_id is not None and (contract is None or 'conditions' not in contract)):
             raise ValueError('Condition identity requires an explicitly frozen condition set')
+        if row.get('reuse_ref') and not allow_reused:
+            raise ValueError('Reused baseline conditions cannot execute a new measurement')
         kind = row['source']
         if (kind == 'declared' and (parsed.implementation_ref is not None or parsed.preparation_ref is not None)
                 or kind == 'implementation' and parsed.implementation_ref is None
@@ -759,7 +799,7 @@ class ScientificToolGateway:
     def report_evidence(self, locators: list[str], implementation_refs: list[str],
                         *, analysis_records: list[str] | None = None) -> dict[str, Any]:
         """Verify accepted physical measurements for the selected code lineage."""
-        refs, hashes = [], {}
+        refs, hashes, measurement_sources = [], {}, []
         if 'conditions' in (self.execution_contract or {}):
             locators = list(self._condition_results(locators, implementation_refs=implementation_refs).values())
         for locator in dict.fromkeys(locators):
@@ -771,9 +811,13 @@ class ScientificToolGateway:
                 continue  # Select lineage before validating unrelated old output bytes.
             ref, receipt = self._measurement_input(locator)
             refs.append(ref.path)
+            if saved.get('origin') == 'reused':
+                measurement_sources.append(saved['measurement_source'])
             hashes.update({self.workspace.resolve(path).relative_to(self.root).as_posix(): digest
                 for path, digest in receipt['hashes'].items()})
         evidence = {'measurement_refs': refs, 'evidence_sha256': hashes}
+        if measurement_sources:
+            evidence['measurement_sources'] = measurement_sources
         if analysis_records is not None:
             # A report consumes the actual matching analysis, not whichever
             # analysis directory happens to be newest. The original owner
@@ -854,15 +898,47 @@ class ScientificToolGateway:
         return self._measurement_issues(ArtifactStore(self.root).read_json(refs[-1]), receipt['result']['data'])
 
     def _measurement_request(self, locator: str) -> dict[str, Any]:
+        """Project a verified source for readers; imports never create requests or processes."""
         path = self.workspace.resolve(locator)
+        rows = [row for row in measurement_conditions(self.execution_contract or {})
+            if row.get('reuse_ref') and self.workspace.resolve(row['reuse_ref']) == path]
+        if rows:
+            if len(rows) != 1:
+                raise ValueError('A reused result cannot occupy multiple frozen conditions')
+            row = rows[0]
+            expected = self.root / 'evidence' / 'reused-baselines'
+            if (path.name != 'results.json' or path.parent.parent != expected
+                    or not re.fullmatch(r'0|[1-9][0-9]*', path.parent.name)):
+                raise ValueError('Reuse must select the task-owned frozen baseline snapshot')
+            _reject_links(path)
+            raw = path.read_bytes()
+            digest = hashlib.sha256(raw).hexdigest()
+            if digest != row.get('reuse_sha256'):
+                raise ValueError('Reused baseline snapshot digest changed or is missing')
+            canonical = json.loads(raw)
+            validate_reused_baseline(canonical, row['execution'])
+            physical = canonical['measurement']['measurement_id']
+            if self.implementation is not None and self.implementation.exact is not None:
+                raise ValueError('Reused baseline cannot bypass scoped producing-source lineage')
+            process = (canonical.get('execution') or {}).get('process') or {}
+            return {'origin': 'reused', 'arguments': MeasurementRequest.model_validate({
+                    **row['execution'], 'condition_id': row['id']}).model_dump(),
+                'hashes': {self.workspace.locator(str(path)): digest},
+                'measurement_source': {'origin': 'reused', 'condition_id': row['id'],
+                    'result_ref': self.workspace.locator(str(path)), 'sha256': digest,
+                    'measurement_id': physical, 'source_session_id': process.get('session_id'),
+                    'source_attempt_id': process.get('attempt_id'),
+                    'declaration': 'Imported canonical measurement; original identity retained. '
+                        'No execution, approval or process accounting was created in this task.'}}
         if path.name != 'results.json' or path.parent.parent != self.root / 'attempts':
             raise ValueError('Measurement must belong to this task')
         return ArtifactStore(path.parent).read_json('scientific_request.json')
 
     def _condition_results(self, locators: list[str], *, implementation_refs: list[str] | None = None) -> dict[str, str]:
-        """Select latest actual observations, never invent missing/reused runs."""
+        """Select actual observations and frozen imports through the same source reader."""
         selected, sources, pending = {}, {}, []
-        for locator in dict.fromkeys(locators):
+        reused = [row['reuse_ref'] for row in measurement_conditions(self.execution_contract or {}) if row.get('reuse_ref')]
+        for locator in dict.fromkeys([*locators, *reused]):
             request = self._measurement_request(locator)
             source = request.get('execution_approval', request.get('implementation_approval', {})).get('binding', {}).get('source')
             implementation = ((source or {}).get('implementation_ref') or {}).get('path')
@@ -887,12 +963,16 @@ class ScientificToolGateway:
                     and source.get('preparation_origin') not in origins):
                 continue
             parsed = MeasurementRequest.model_validate(request['arguments'])
-            self._condition(parsed)
+            self._condition(parsed, allow_reused=request.get('origin') == 'reused')
             self._measurement_input(locator)
             identity = parsed.condition_id or 'candidate'
             selected[identity] = locator
             sources[identity] = source
         self._check_preparation_ancestry(list(sources.values()))
+        physicals = [ArtifactStore(self.root).read_json(self._measurement_input(locator)[0])[
+            'measurement']['measurement_id'] for locator in selected.values()]
+        if len(physicals) != len(set(physicals)):
+            raise ValueError('A physical measurement cannot satisfy multiple frozen conditions')
         return selected
 
     def _check_preparation_ancestry(self, sources: list[dict[str, Any] | None]) -> None:
@@ -955,6 +1035,14 @@ class ScientificToolGateway:
 
     def _measurement_input(self, locator: str) -> tuple[ArtifactRef, dict[str, Any]]:
         path = self.workspace.resolve(locator)
+        projected = self._measurement_request(locator)
+        if projected.get('origin') == 'reused':
+            # In-memory evidence projection only: no imported scientific receipt,
+            # approval, finalized process or budget entry is persisted.
+            return ArtifactRef(path.relative_to(self.root).as_posix(), kind='experiment_result',
+                schema='canonical_results.2.5', producer='research.experiment'), {
+                    'origin': 'reused', 'hashes': projected['hashes'],
+                    'result': {'data': {'measurement_source': projected['measurement_source']}}}
         if path.name != 'results.json' or path.parent.parent != self.root / 'attempts':
             raise ValueError('Only canonical results from current task attempts are accepted')
         receipt = self._receipt(path.parent.name, 'measure_experiment')
@@ -974,14 +1062,19 @@ class ScientificToolGateway:
             if locator is None:
                 continue
             ref, receipt = self._measurement_input(locator)
-            saved = self._store(Path(ref.path).parent.name).read_json('scientific_request.json')
+            saved = self._measurement_request(locator)
             source = saved.get('execution_approval', saved.get('implementation_approval', {})).get('binding', {}).get('source')
             if 'conditions' in (self.execution_contract or {}):
-                condition = self._condition(MeasurementRequest.model_validate(saved['arguments']))
+                condition = self._condition(MeasurementRequest.model_validate(saved['arguments']),
+                    allow_reused=saved.get('origin') == 'reused')
                 if condition['role'] != role or parsed.pairs is not None and condition['seed'] != seed:
                     raise ValueError('Analysis role/seed differs from the frozen measurement slot')
             sources.setdefault(seed, []).append(source)
             canonical = ArtifactStore(self.root).read_json(ref)
+            physical = canonical['measurement']['measurement_id']
+            if physical in seen:
+                raise ValueError('A physical measurement may appear only once in an analysis')
+            seen.add(physical)
             for row in (canonical.get('implementation_ref'),
                     (canonical.get('preparation') or {}).get('source_ref')):
                 if row is not None:
@@ -992,10 +1085,6 @@ class ScientificToolGateway:
                 declared = canonical.get('experiment_contract', {}).get('comparison_conditions', {}).get('seed')
                 if type(declared) is not int or declared != seed or canonical['measurement'].get('seed') != seed:
                     raise ValueError('Pair seed must equal the original canonical comparison_conditions.seed; no inferred seed')
-                physical = canonical['measurement']['measurement_id']
-                if physical in seen:
-                    raise ValueError('A physical measurement may appear only once in an explicit pair collection')
-                seen.add(physical)
                 pairs[-1][role] = ref.to_dict()
             refs.append(ref)
             inputs[locator] = receipt['hashes']
@@ -1123,7 +1212,7 @@ class ScientificToolGateway:
                     raise ValueError('Execution approval binding changed')
                 setup = binding.get('environment_preparation')
                 steps = len(setup['steps']) if setup else 0
-                formal = (measurement_conditions(self.execution_contract)
+                formal = ([row for row in measurement_conditions(self.execution_contract) if not row.get('reuse_ref')]
                     if setup and 'conditions' in (self.execution_contract or {}) else
                     [{'execution': {'timeout_sec': parsed.timeout_sec}}])
                 for key, required in (('process_invocations', len(formal) + steps),
@@ -1253,6 +1342,15 @@ class ScientificToolGateway:
                     analysis_context={'task_id': self.session_id, 'research_question': parsed.question,
                         'existing_writeup': parsed.context}, use_llm=False)
                 analysis = store.read_json('analysis.json')
+                reused_sources = [saved['measurement_source'] for locator in inputs
+                    if (saved := self._measurement_request(locator)).get('origin') == 'reused']
+                if reused_sources:
+                    analysis['measurement_sources'] = reused_sources
+                    analysis['analysis']['readme_markdown'] += '\n\nReused baseline evidence:\n' + '\n'.join(
+                        f"- {item['condition_id']}: {item['result_ref']}; original measurement_id="
+                        f"{item['measurement_id']}; SHA256={item['sha256']}. {item['declaration']}"
+                        for item in reused_sources) + '\n'
+                    store.write_json('analysis.json', analysis)
                 markdown = store.write_text('analysis.md', analysis['analysis']['readme_markdown'],
                     kind='analysis_markdown', producer='research.analysis')
                 capability = replace(capability, artifacts=(*capability.artifacts, markdown, *collection_artifacts))
@@ -1263,6 +1361,8 @@ class ScientificToolGateway:
                     'comparison_granularity': 'explicit seed pairs grouped by existing protocol rules'
                         if collection is not None else 'one candidate with optional baseline',
                     'diagnostics': list(capability.diagnostics)}
+                if reused_sources:
+                    data['measurement_sources'] = reused_sources
                 if collection is not None:
                     paired = store.read_json('paired_analysis.json')
                     data.update(collection_ref=self._locator(store.root / 'experiment_set.json'),

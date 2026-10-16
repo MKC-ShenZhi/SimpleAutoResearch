@@ -1208,9 +1208,11 @@ class StartTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'explicit interpreters'):
                     migrate_measurement_creation(args, execution={**execution, 'environment': {'mode': 'venv'}},
                         request='Do not replace the selected interpreter', outputs=('experiments',), root=root, limits=limits)
-                for extra in ({'baseline_ref': 'historical.json'}, {'baseline_policy': 'reuse'}):
-                    self.assertFalse(migrate_measurement_creation(args, execution={**execution, **extra},
-                        request='Keep the complex owner', outputs=('experiments',), root=root, limits=limits))
+                with self.assertRaisesRegex(ValueError, 'baseline_ref requires baseline_policy=reuse'):
+                    migrate_measurement_creation(args, execution={**execution, 'baseline_ref': 'historical.json'},
+                        request='Reject an unrequested baseline', outputs=('experiments',), root=root, limits=limits)
+                self.assertFalse(migrate_measurement_creation(args, execution={**execution, 'baseline_policy': 'reuse'},
+                    request='Keep historical reuse with its owner', outputs=('experiments',), root=root, limits=limits))
                 self.assertFalse(migrate_measurement_creation(args, execution=execution,
                     request='Keep explicit outputs', outputs=('report',), root=root, limits=limits))
                 if model is None:
@@ -1370,19 +1372,107 @@ class StartTests(unittest.TestCase):
                     self.assertEqual({path: path.read_bytes() for path in originals}, originals)
             create.reset_mock()
             # Missing comparison semantics and non-autonomous/no-model research
-            # remain with the original owner; reuse never migrates.
+            # remain with the original owner, including research with explicit reuse.
             for model, interaction, declared_execution in (
                     ('fixture', 'autonomous', execution),
                     (None, 'autonomous', research_execution),
                     ('fixture', 'checkpoints', research_execution),
                     ('fixture', 'assisted', research_execution),
-                    ('fixture', 'autonomous', {**research_execution, 'baseline_policy': 'reuse'})):
+                    ('fixture', 'autonomous', {**research_execution, 'baseline_policy': 'reuse'}),
+                    ('fixture', 'autonomous', {**research_execution, 'baseline_policy': 'reuse',
+                                             'baseline_ref': str(data)})):
                 research_args.model, research_args.interaction = model, interaction
                 self.assertFalse(migrate_measurement_creation(research_args, execution=declared_execution,
                     request='Keep the original owner', outputs=('experiments',), root=root,
                     limits=limits, sources=sources, research_config=research))
             create.assert_not_called()
             self.assertEqual(json.dumps([research_execution, research, limits, sources], sort_keys=True), frozen_inputs)
+
+    def test_measurement_reuse_maps_read_only_sources_and_only_authorizes_initial_candidates(self):
+        from copy import deepcopy
+        from simple_ar.cli.start import migrate_measurement_creation
+        from simple_ar.tools.scientific import freeze_measurement_set
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            config_dir = root / 'config'
+            config_dir.mkdir()
+            (config_dir / 'archive').mkdir()
+            config = config_dir / 'research.toml'
+            config.write_text('[task]\ngoal="Reuse evidence"\n', encoding='utf-8')
+            baselines = [config_dir / f'seed-{seed}.json' for seed in (4, 9)]
+            notes = root / 'notes.md'
+            notes.write_text('Supplied read-only material', encoding='utf-8')
+            # Opaque inputs at the CLI boundary; the mocked factory owns canonical validation.
+            for path in baselines:
+                path.write_text('{"retained": true}\n', encoding='utf-8')
+            originals = {path: path.read_bytes() for path in (config, notes, *baselines)}
+            limits = {'llm_requests': 3, 'total_tokens': 24000,
+                      'process_invocations': 2, 'process_wall_seconds': 10}
+            for with_config, paired in ((True, False), (False, False), (True, True), (False, True)):
+                with self.subTest(with_config=with_config, paired=paired):
+                    args = build_parser().parse_args(['research-session', '--topic', 'Reuse evidence',
+                        '--task-kind', 'measurement', *(['--config', str(config)] if with_config else [])])
+                    args._explicit_resume_destinations = {'task_kind'}
+                    prefix = '' if with_config else 'config/'
+                    references = [prefix + 'archive/../seed-4.json', str(baselines[1])]
+                    execution = {'command': [sys.executable, 'measure.py'], 'cwd': str(root),
+                        'timeout_sec': 5, 'result_schema': {'primary_metric': 'score'},
+                        'baseline_policy': 'reuse', 'baseline_ref': references if paired else references[0]}
+                    if paired:
+                        execution.update(seeds=[4, 9], seed_flag='--seed')
+                    # The first baseline is already mounted through a different lexical path.
+                    sources = ({'locator': str(notes), 'role': 'material'},
+                               {'locator': str(config_dir / 'archive' / '..' / baselines[0].name),
+                                'role': 'dataset'})
+                    original = deepcopy((vars(args), execution, sources, limits))
+                    with patch('pathlib.Path.cwd', return_value=root), \
+                            patch('simple_ar.app.tool_application.ToolApplication.create') as create, \
+                            patch('simple_ar.tools.scientific.freeze_measurement_set',
+                                  wraps=freeze_measurement_set) as freeze, \
+                            patch('simple_ar.cli.main._render_native_result'), \
+                            patch('simple_ar.cli.start.print_line'), \
+                            patch('subprocess.run') as process:
+                        app = create.return_value
+                        app.state = {'turns': [{'origin': 'caller'}], 'pending': None}
+                        app.run.return_value = {'status': 'completed'}
+                        app.measurement_completion_actions.return_value = []
+                        self.assertTrue(migrate_measurement_creation(args, execution=execution,
+                            request='Reuse evidence', outputs=('experiments',), root=root,
+                            limits=limits, sources=sources))
+                        self.assertEqual(freeze.call_args.args[0]['baseline_ref'],
+                                         ['source1', 'source2'] if paired else 'source1')
+                        options = create.call_args.kwargs
+                        self.assertEqual({name: path.resolve() for name, path in options['sources'].items()},
+                            {'source0': notes, 'source1': baselines[0],
+                             **({'source2': baselines[1]} if paired else {})})
+                        self.assertIsNone(options['code_task'])
+                        conditions = options['execution_contract']['conditions']
+                        self.assertEqual([(row['seed'], row['reuse_ref']) for row in conditions
+                                          if row['role'] == 'baseline'],
+                                         [(4, 'source1'), (9, 'source2')] if paired else [(None, 'source1')])
+                        app.run.assert_called_once()
+                        actions = app.run.call_args.kwargs['actions']
+                        self.assertEqual([row['arguments']['condition_id'] for row in actions],
+                                         ['candidate:0', 'candidate:1'] if paired else ['candidate:0'])
+                        if paired:
+                            self.assertEqual([row['arguments']['command'] for row in actions],
+                                [[sys.executable, 'measure.py', '--seed', str(seed)] for seed in (4, 9)])
+                        approve = app.run.call_args.kwargs['approve']
+                        for index, action in enumerate(actions):
+                            call = {'id': f'caller-0-{index}', 'function': {
+                                'name': action['tool_name'], 'arguments': json.dumps(action['arguments'])}}
+                            altered = deepcopy(call)
+                            altered['function']['arguments'] = json.dumps({**action['arguments'], 'timeout_sec': 99})
+                            self.assertFalse(approve(altered, 'altered'))
+                            app.state['turns'][0]['origin'] = 'model'
+                            self.assertFalse(approve(call, 'model'))
+                            app.state['turns'][0]['origin'] = 'caller'
+                            self.assertTrue(approve(call, 'initial'))
+                            self.assertFalse(approve(call, 'retry'))
+                        process.assert_not_called()
+                    self.assertEqual((vars(args), execution, sources, limits), original)
+                    self.assertEqual({path: path.read_bytes() for path in originals}, originals)
 
     def test_prepared_reproduction_uses_existing_config_and_preserves_argv(self):
         with tempfile.TemporaryDirectory() as directory:

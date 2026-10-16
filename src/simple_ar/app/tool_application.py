@@ -460,6 +460,33 @@ class ToolApplication:
                 raise ValueError("Invalid or reserved source alias")
             path = resolve_source_mount(path)
             mounts[name] = str(path)
+        # A reused result is retained user evidence, not a new physical run.
+        # Validate every declared slot before creating the session, then bind
+        # the original bytes into the existing read-only evidence mount.
+        reused_inputs = []
+        if execution_contract is not None:
+            from simple_ar.tools.scientific import measurement_conditions, _reject_links, validate_reused_baseline
+            from simple_ar.tools.workspace import resolve_mounted_path
+            for row in measurement_conditions(execution_contract):
+                if 'reuse_ref' not in row:
+                    continue
+                path = resolve_mounted_path({name: Path(path) for name, path in mounts.items()}, row['reuse_ref'])
+                _reject_links(path)
+                if not path.is_file() or path.stat().st_size > 16 * 1024 * 1024:
+                    raise ValueError('Reused baseline must be a canonical result file of at most 16 MiB')
+                content = path.read_bytes()
+                canonical = json.loads(content)
+                validate_reused_baseline(canonical, row['execution'])
+                relative = f'evidence/reused-baselines/{len(reused_inputs)}/results.json'
+                digest = hashlib.sha256(content).hexdigest()
+                if row.get('reuse_sha256') is not None and row['reuse_sha256'] != digest:
+                    raise ValueError('Reused baseline differs from its declared digest')
+                destination = Path(root) / relative
+                _reject_links(destination)
+                if destination.exists():
+                    raise ValueError('Retained baseline destination already exists')
+                reused_inputs.append((relative, content))
+                row['reuse_ref'], row['reuse_sha256'] = relative, digest
         if research_policy is not None:
             research_policy = SourcePolicy.model_validate(research_policy).model_dump(mode='json')
         if table_analysis is not None:
@@ -516,6 +543,10 @@ class ToolApplication:
         session = SessionController.create(root, session_id=root.name, topic=goal,
             registry=CapabilityRegistry(), budget=BudgetState(max_attempts=attempt_limit, max_no_progress=6))
         session.manifest.transition_recipe = cls.RECIPE
+        from simple_ar.core.artifacts import write_atomically
+        for relative, content in reused_inputs:
+            destination = session.store.resolve(relative)
+            write_atomically(destination, content)
         session.store.write_json("actions.json", {"config": {"model": model,
             "model_connection": client.connection_binding() if client is not None else None,
             "vision_connection": vision_connection,

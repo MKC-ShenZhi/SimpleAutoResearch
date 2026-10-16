@@ -295,9 +295,11 @@ def validate_session_arguments(args: argparse.Namespace) -> SessionArguments:
     if task_kind == "measurement":
         if not outputs or 'experiments' not in outputs or set(outputs) - {'experiments', 'report'}:
             raise SystemExit("--task-kind measurement requires --outputs experiments and optionally report.")
-        if (not command and not execution_details.get("pairs") or getattr(args, "code_task_config", None)
-                or execution_details.get("baseline_policy") == "reuse"):
-            raise SystemExit("--task-kind measurement requires explicit command(s), without CodeTask or historical baseline reuse.")
+        if not command and not execution_details.get("pairs") or getattr(args, "code_task_config", None):
+            raise SystemExit("--task-kind measurement requires explicit command(s), without CodeTask.")
+        if (execution_details.get('baseline_policy') == 'reuse' and not execution_details.get('baseline_ref')
+                and not getattr(args, 'session_root', None)):
+            raise SystemExit('Measurement baseline reuse requires an explicit baseline_ref result file.')
     if task_kind == "reproduction":
         if not outputs or "experiments" not in outputs or set(outputs) - {"experiments", "report"}:
             raise SystemExit("--task-kind reproduction requires outputs experiments and optionally report.")
@@ -348,7 +350,7 @@ def research_defaults(
             validate_execution_declaration(values)
         for name, value in values.items():
             if section == "execution" and name in {
-                "pairs", "protocol", "seeds", "seed_flag", "seed_count", "baseline_policy", "baseline_ref", "output_files", "metric_sources", "environment", "initial_files",
+                "baseline", "pairs", "protocol", "seeds", "seed_flag", "seed_count", "baseline_policy", "baseline_ref", "output_files", "metric_sources", "environment", "initial_files",
             }:
                 if name == "initial_files":
                     if not isinstance(value, list) or not value or any(not isinstance(item, str) or not item.strip() for item in value):
@@ -359,6 +361,9 @@ def research_defaults(
                 elif name == "metric_sources":
                     from simple_ar.experiment.execution.outputs import metric_sources
                     metric_sources({"output_files": values.get("output_files", {}), "metric_sources": value})
+                elif name == "baseline":
+                    if not isinstance(value, dict):
+                        raise ValueError("execution.baseline must be a table")
                 elif name == "protocol":
                     if not isinstance(value, dict):
                         raise ValueError("execution.protocol must be a table")

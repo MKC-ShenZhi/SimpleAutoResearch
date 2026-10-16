@@ -119,8 +119,11 @@ def validate_execution_declaration(config: Mapping) -> tuple[tuple[Mapping, ...]
         raise ValueError("execution.seed_count must be a positive integer.")
     if "seed_flag" in config and (not isinstance(config["seed_flag"], str) or not config["seed_flag"].strip()):
         raise ValueError("execution.seed_flag must be a non-empty string.")
-    if "baseline_ref" in config and (not isinstance(config["baseline_ref"], str) or not config["baseline_ref"].strip()):
-        raise ValueError("execution.baseline_ref must be a non-empty artifact path.")
+    if "baseline_ref" in config:
+        refs = config['baseline_ref']
+        refs = refs if isinstance(refs, (list, tuple)) else [refs]
+        if not refs or any(not isinstance(ref, str) or not ref.strip() for ref in refs):
+            raise ValueError("execution.baseline_ref must be a non-empty artifact path or list of paths.")
     if "baseline_policy" in config:
         raw = config["baseline_policy"]
         if not isinstance(raw, str) or raw.strip().lower() not in {"run", "skip", "reuse"}:

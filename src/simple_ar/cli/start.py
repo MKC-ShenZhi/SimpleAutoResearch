@@ -750,14 +750,14 @@ def migrate_measurement_creation(args: argparse.Namespace, *, execution: dict,
     research_work = autonomous and (any(row['role'] != 'dataset' for row in sources)
         or bool(explicit & (research_fields - {'interaction'})))
     if research_work and (not args.model or research_config is None
+            or execution.get('baseline_policy') == 'reuse'
             or not {'baseline_policy', 'baseline', 'pairs'}.intersection(execution)):
         # An omitted comparison policy permits design to propose new conditions.
         # Such a request is not a fixed measurement contract.
         return False
     if (args.task_kind != 'measurement' and not autonomous or 'experiments' not in outputs
             or set(outputs) - {'experiments', 'report'}
-            or set(execution) - (flat_fields | {'baseline', 'pairs', 'seeds', 'seed_count', 'seed_flag', 'baseline_policy'})
-            or execution.get('baseline_policy') == 'reuse'):
+            or set(execution) - (flat_fields | {'baseline', 'pairs', 'seeds', 'seed_count', 'seed_flag', 'baseline_policy', 'baseline_ref'})):
         return False
     extended = set(execution) - flat_fields
     from simple_ar.app.research_execution import normalize_execution_config
@@ -798,14 +798,30 @@ def migrate_measurement_creation(args: argparse.Namespace, *, execution: dict,
     from simple_ar.app.tool_application import ToolApplication
     from simple_ar.tools.scientific import freeze_measurement_set, measurement_contract, measurement_conditions
     from simple_ar.cli.main import _render_native_result, _ensure_research_cli_success
+    mounts = [Path(row['locator']) for row in sources]
+    if execution.get('baseline_policy') == 'reuse':
+        values = execution.get('baseline_ref')
+        if values is None:
+            return False  # Historical same-session reuse remains with its saved owner.
+        base = Path(args.config).resolve().parent if getattr(args, 'config', None) else Path.cwd()
+        refs = []
+        for value in values if isinstance(values, (list, tuple)) else [values]:
+            named = (base / value).absolute() if not Path(value).is_absolute() else Path(value).absolute()
+            from simple_ar.tools.scientific import _reject_links
+            _reject_links(named)
+            path = named.resolve()
+            if path not in [item.resolve() for item in mounts]:
+                mounts.append(path)
+            refs.append(f'source{[item.resolve() for item in mounts].index(path)}')
+        execution = {**execution, 'baseline_ref': refs if isinstance(values, (list, tuple)) else refs[0]}
     contract = freeze_measurement_set(execution) if extended else measurement_contract(execution)
     conditions = measurement_conditions(contract)
     grouped = 'conditions' in contract
     actions = [{'tool_name': 'measure_experiment', 'arguments':
         {**row['execution'], 'condition_id': row['id']} if grouped else
         row['execution'] if args.model else {**row['execution'], 'delivery': {'summary': request, 'artifacts': []}}}
-        for row in conditions]
-    native.model, native.source, native.allow_execution = args.model, [Path(row['locator']) for row in sources], True
+        for row in conditions if 'reuse_ref' not in row]
+    native.model, native.source, native.allow_execution = args.model, mounts, True
     native.max_turns, native.max_tokens = (limits['llm_requests'], limits['total_tokens']) if args.model else (0, 0)
     native._task_output_limit = getattr(args, 'max_output_tokens', None)
     native._task_attempt_limit = max(20, len(conditions) + int(grouped) + native.max_turns * 10)

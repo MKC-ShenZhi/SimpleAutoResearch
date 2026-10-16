@@ -193,11 +193,14 @@ Fields below are under `[execution]`.
 | `primary_metric`, `metrics`, `metric_directions` | Optional schema; direction list e.g. `["accuracy=higher"]`; higher/lower/resource/ignore |
 | `output_files`, `metric_sources` | Registered attachments / explicit finite numeric selectors |
 | `pairs`, `seeds`, `seed_flag`, `seed_count` | Explicit paired argv or compact expansion; do not mix |
-| `baseline_policy`, `baseline_ref` | run/skip/reuse; passed matching current-session artifact required for reuse |
+| `baseline` | Optional table declaring the control `command` and overrides; otherwise uses the main command |
+| `baseline_policy`, `baseline_ref` | run/skip/reuse; fixed measurements can reference passed same-condition canonical result files, with a path list in condition order for paired runs |
 | `protocol` | contract_id/hypothesis, dataset_refs, split_spec, metric_specs, comparison_conditions, protected_assets; reproduction also dataset/expected_outcome |
 | `initial_files` | With explicit CodeTask preparation: exact allowed, absent, unprotected Python paths, not limited to reproduction. Supported native tasks pass these as required creations to CodeTask, not initializer stubs. Historical and unmigrated contracts retain their owner. |
 
 Omit command and CodeTask for literature-only work.
+
+For fixed measurements with `reuse`, `baseline_ref` paths are relative to the configuration file, or the current directory when no configuration is supplied. The framework checks the command, metric schema, comparison protocol and original hashes of explicitly protected files, then retains the original result as a read-only task snapshot. Only candidate conditions execute; the baseline keeps its original measurement identity and creates no new process or usage entry. Missing protected-file evidence, mismatched conditions, failed results or changed inputs block reuse. Existing reuse contracts requiring CodeTask source lineage or research design retain their original owner; historical results and ledgers are preserved.
 
 | `[execution.environment]` field | Default / constraint |
 | --- | --- |
