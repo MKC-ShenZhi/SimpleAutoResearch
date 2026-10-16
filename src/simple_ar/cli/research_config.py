@@ -244,6 +244,7 @@ def validate_session_arguments(args: argparse.Namespace) -> SessionArguments:
     data_analysis = None
     data_report = task_kind == "data_analysis" and ("report" in (outputs or ()) or args.with_report)
     measurement_report = task_kind == 'measurement' and 'report' in (outputs or ())
+    execution_materials = bool(command or execution_details or getattr(args, 'code_task_config', None))
     if task_kind == "data_analysis":
         if command or execution_details or args.code_task_config or args.queries or args.providers or (outputs is not None and set(outputs) not in ({"data_analysis"}, {"data_analysis", "report"})):
             raise SystemExit("Data analysis accepts a supplied table, descriptive settings and an optional report, without research, CodeTask or experiment execution.")
@@ -267,22 +268,23 @@ def validate_session_arguments(args: argparse.Namespace) -> SessionArguments:
             raise SystemExit(str(exc)) from exc
         if any(path.suffix.lower() != ".json" for path in supplied) or len(valid_sources) != len(supplied):
             raise SystemExit("Survey materials must be saved original-source document bundles; use --local-document for ordinary sources.")
-    elif materials and task_kind not in {"writing", "data_analysis", "reproduction"} and not measurement_report:
-        raise SystemExit("--material/assets.materials requires survey source bundles, writing, reproduction preparation or data_analysis with a report.")
+    elif materials and task_kind not in {"writing", "data_analysis", "reproduction"} and not (measurement_report or execution_materials):
+        raise SystemExit("--material/assets.materials requires research sources, writing, analysis or an explicit execution declaration.")
     if task_kind == "writing":
         if command or execution_details or getattr(args, "code_task_config", None) or args.no_report or outputs not in (None, ["report"]):
             raise SystemExit("Writing requests only a report without execution or CodeTask configuration.")
         if not getattr(args, "session_root", None) and not (materials or args.local_document):
             raise SystemExit("Writing requires --material and/or --local-document.")
-    if task_kind == "writing" or data_report or measurement_report:
+    if task_kind == "writing" or data_report:
         if args.queries or args.providers or getattr(args, "research_materials_only", None) is False or getattr(args, "research_allow_pdf_download", None):
             raise SystemExit("Material-based reports use supplied local material only; online research is a survey task.")
+    if task_kind == "writing" or data_report or measurement_report or execution_materials:
         supplied = [Path(path).expanduser().resolve() for path in [*materials, *args.local_document]]
         if len(supplied) != len(set(supplied)):
             raise SystemExit("Writing material must have one unambiguous role per file; do not repeat a paper as material.")
         from simple_ar.research.documents.ports import SUPPORTED_DOCUMENT_SUFFIXES, SUPPORTED_MATERIAL_SUFFIXES
         for paths, suffixes in ((args.local_document, SUPPORTED_DOCUMENT_SUFFIXES),
-                               (materials, SUPPORTED_MATERIAL_SUFFIXES if task_kind == "writing" or measurement_report else SUPPORTED_DOCUMENT_SUFFIXES)):
+                               (materials, SUPPORTED_MATERIAL_SUFFIXES if task_kind == "writing" or measurement_report or execution_materials else SUPPORTED_DOCUMENT_SUFFIXES)):
             if any(not Path(path).expanduser().is_file() or Path(path).suffix.lower() not in suffixes for path in paths):
                 raise SystemExit("Report inputs must be local text/HTML/PDF; writing also accepts JSON material and table_analysis.v1 packages.")
     code_delivery = bool(getattr(args, "code_task_config", None) and outputs and set(outputs) & {"bug_fix", "code_task"} and "experiments" not in outputs)
@@ -293,8 +295,8 @@ def validate_session_arguments(args: argparse.Namespace) -> SessionArguments:
     if task_kind == "survey" and not code_delivery and (command or execution_details or getattr(args, "code_task_config", None)):
         raise SystemExit("--task-kind survey cannot include execution or CodeTask configuration.")
     if task_kind == "measurement":
-        if not outputs or 'experiments' not in outputs or set(outputs) - {'experiments', 'report'}:
-            raise SystemExit("--task-kind measurement requires --outputs experiments and optionally report.")
+        if not outputs or 'experiments' not in outputs or set(outputs) - {'experiments', 'report', 'summary'}:
+            raise SystemExit("--task-kind measurement requires --outputs experiments, with optional report or summary.")
         if not command and not execution_details.get("pairs") or getattr(args, "code_task_config", None):
             raise SystemExit("--task-kind measurement requires explicit command(s), without CodeTask.")
         if (execution_details.get('baseline_policy') == 'reuse' and not execution_details.get('baseline_ref')

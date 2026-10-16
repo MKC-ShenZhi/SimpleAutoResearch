@@ -633,7 +633,7 @@ def _print_research_session(args: argparse.Namespace) -> None:
             config[name] = value
     asset_requests = [
         {
-            "locator": str(Path(path)),
+            "locator": str(Path(path).expanduser().resolve()),
             "kind": "file",
             "role": "paper",
             "mutability": "read_only",
@@ -641,7 +641,7 @@ def _print_research_session(args: argparse.Namespace) -> None:
         }
         for path in args.local_document
     ]
-    asset_requests.extend({"locator": str(Path(path)), "kind": "file", "role": "material",
+    asset_requests.extend({"locator": str(Path(path).expanduser().resolve()), "kind": "file", "role": "material",
                            "mutability": "read_only", "allowed_uses": ["read", "reference"]}
                           for path in materials)
     asset_requests.extend({"locator": str(Path(path).expanduser().resolve()), "kind": "dataset", "role": "dataset",

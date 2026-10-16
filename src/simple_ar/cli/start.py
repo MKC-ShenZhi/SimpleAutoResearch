@@ -423,61 +423,6 @@ def native_creation_options(args: argparse.Namespace) -> dict:
         max_output_tokens=getattr(args, '_task_output_limit', None))
 
 
-def _mount_baseline_references(execution: dict, mounts: list[Path], config: str | Path | None) -> dict:
-    """Use the same read-only caller reference binding for code and fixed runs."""
-    values = execution.get('baseline_ref')
-    if execution.get('baseline_policy') != 'reuse' or values is None:
-        return execution
-    from simple_ar.tools.scientific import _reject_links
-    base = Path(config).resolve().parent if config else Path.cwd()
-    refs = []
-    for value in values if isinstance(values, (list, tuple)) else [values]:
-        named = (base / value).absolute() if not Path(value).is_absolute() else Path(value).absolute()
-        _reject_links(named)
-        path = named.resolve()
-        if path not in [item.resolve() for item in mounts]:
-            mounts.append(path)
-        refs.append(f'source{[item.resolve() for item in mounts].index(path)}')
-    return {**execution, 'baseline_ref': refs if isinstance(values, (list, tuple)) else refs[0]}
-
-
-def _configure_research(native: argparse.Namespace, args: argparse.Namespace, *,
-                        sources: tuple, research_config: dict, outputs: tuple,
-                        require_design: bool, review_model: str | None = None,
-                        online: bool = True) -> list[str]:
-    """Bind source work independently of the requested execution capability."""
-    from simple_ar.tools.sources import SourcePolicy
-    aliases = {str(path.resolve()): f'source{index}' for index, path in enumerate(native.source)}
-    material_paths = [aliases[str(Path(row['locator']).resolve())] for row in sources if row['role'] != 'dataset']
-    native.allow_network = online and not research_config.get('research_materials_only', False)
-    policy = dict(queries=list(args.queries or ()),
-        providers=list(args.providers or ('openalex', 'semantic_scholar', 'arxiv')),
-        materials=material_paths, max_results=args.max_results,
-        max_documents=research_config.get('research_max_documents', args.max_results),
-        max_chunks=args.max_chunks, idea_limit=args.idea_limit,
-        cache_dir=str(Path(args.cache_dir).resolve()) if args.cache_dir else None,
-        require_fulltext=research_config.get('research_use_fulltext', False),
-        allow_pdf_download=research_config.get('research_allow_pdf_download', False),
-        keep_raw_pdf=research_config.get('research_keep_raw_pdf', False),
-        allow_network=not research_config.get('research_materials_only', False),
-        max_fulltext_documents=research_config.get('research_max_fulltext_documents',
-            min(research_config.get('research_max_documents', args.max_results), args.max_results)),
-        max_pdf_mb=research_config.get('research_max_pdf_mb', 20),
-        max_pdf_pages=research_config.get('research_max_pdf_pages', 100),
-        read_max_shortlist=research_config.get('research_read_max_shortlist', args.max_results),
-        web_extract_backend=research_config.get('research_web_extract_backend', 'direct'),
-        feasibility_connection=review_model or '',
-        require_design=require_design,
-        execution_boundary={'timeout_sec': args.timeout_sec if args.timeout_sec is not None else 300},
-        max_iterations=research_config.get('research_max_iterations', 0),
-        interaction=research_config.get('interaction', 'checkpoints'),
-        require_summary='summary' in outputs,
-        selected_idea_id=research_config.get('research_selected_idea_id'))
-    native._research_policy = SourcePolicy.model_validate(policy).model_dump(mode='json')
-    # Search processes are network work, not permission to execute project code.
-    source_count = max(1, len(args.queries or ())) * len(policy['providers'])
-    native._source_operations = source_count + policy['max_documents'] * 3
-    return material_paths
 
 
 def migrate_structured_creation(args: argparse.Namespace, *, request: str, outputs: tuple,
@@ -568,233 +513,106 @@ def _fixed_execution_research(args: argparse.Namespace, sources: tuple, outputs:
         or bool((research_config or {}).get('research_selected_idea_id')))
 
 
+def _create_declared_execution(args: argparse.Namespace, *, execution: dict, request: str,
+                               outputs: tuple, sources: tuple, limits: dict, root: Path,
+                               research_config: dict | None, report_config: dict | None,
+                               writing_method: str | None, research_work: bool,
+                               confirm_protocol: bool = False):
+    """CLI defaults and domain inputs only; intake owns all creation contracts."""
+    from simple_ar.app.research_application import ResearchApplicationServices
+    from simple_ar.app.research_intake import create_research_task
+    from simple_ar.research.workflow_contracts import ResearchBrief
+    config = {**(research_config or {}), 'execution': execution,
+        'interaction': getattr(args, 'interaction', None) or (research_config or {}).get('interaction') or 'checkpoints',
+        'require_design': research_work, 'execution_confirmation': confirm_protocol,
+        'report': report_config or {}, 'report_writing_method': writing_method,
+        'max_output_tokens': getattr(args, 'max_output_tokens', None) if args.model else None}
+    if research_work:
+        config.update(queries=list(args.queries or ()),
+            providers=list(args.providers or ('openalex', 'semantic_scholar', 'arxiv')))
+    # Only explicitly supplied bounds are authorities. Computed legacy execution
+    # estimates are replaced by the common owner, including environment steps.
+    budgets = {**limits}
+    for name in ('process_invocations', 'process_wall_seconds'):
+        if getattr(args, name, None) is None and budgets.get(name) != 0:
+            budgets.pop(name, None)
+    for name, default in (('llm_requests', 30), ('total_tokens', 600000)):
+        if budgets.get(name) is None:
+            budgets[name] = default if args.model else 0
+        elif not args.model:
+            budgets[name] = 0
+    services = ResearchApplicationServices(config=config, budget_limits=budgets,
+        input_base_dir=Path(args.config).resolve().parent if getattr(args, 'config', None) else Path.cwd(),
+        max_results=args.max_results, max_chunks=args.max_chunks, idea_limit=args.idea_limit,
+        cache_dir=Path(args.cache_dir).resolve() if args.cache_dir else None,
+        max_attempts=max(20, budgets['llm_requests'] * 10 + 16), max_no_progress=6)
+    return create_research_task(ResearchBrief(request_text=request, objective=args.topic,
+        requested_outputs=outputs, asset_requests=sources), root=root, services=services,
+        model=args.model or None)
+
+
+def _print_execution_confirmation(app, root: Path) -> None:
+    """Display the caller protocol already saved by common creation."""
+    decision = app.sources.pending_decision()
+    print_line('Pending protocol decision: ' + json.dumps(decision, ensure_ascii=False))
+    print_line(f'Confirm protocol: simple-ar start --resume-task "{root}" '
+        f'--decision-id {decision["decision_id"]} --decision-response accept')
+
+
 def migrate_exact_code_creation(args: argparse.Namespace, *, execution: dict,
                                 request: str, outputs: tuple, sources: tuple,
                                 limits: dict, root: Path, report_config: dict | None = None,
                                 writing_method: str | None = None,
                                 research_config: dict | None = None) -> bool:
-    """Bind precise code, research and measurements to their shared owners."""
-    from simple_ar.research.task_plan import implementation_only
-    reproduction = getattr(args, 'task_kind', None) == 'reproduction'
-    flat_fields = {'command', 'cwd', 'timeout_sec', 'label', 'result_schema', 'protocol'}
-    controls = {'baseline', 'baseline_policy', 'baseline_ref', 'pairs', 'seeds', 'seed_count', 'seed_flag'}
-    if (not isinstance(execution.get('code_task'), dict)
-            or execution.get('baseline_policy', 'skip') not in {'run', 'skip', 'none', 'reuse'}
-            or execution.get('baseline_policy') == 'reuse' and execution.get('baseline_ref') is None):
-        return False
-    from simple_ar.cli.parser import build_parser
-    native = build_parser().parse_args(['start'])
-    limits = {**limits,
-        'llm_requests': native.max_turns if limits.get('llm_requests') is None else limits['llm_requests'],
-        'total_tokens': native.max_tokens if limits.get('total_tokens') is None else limits['total_tokens']}
-    task = execution['code_task']
-    if 'run_dir' in task:
-        return False  # Adoption of an initialized CodeTask retains its existing owner.
-    project = Path(task['code_root']).resolve() if task['code_root'] else None
-    mounts = list(dict.fromkeys([*([project] if project is not None else []),
-                                *(Path(row['locator']).resolve() for row in sources)]))
-    scientific = 'experiments' in outputs and not set(outputs) - {'experiments', 'report', 'summary'}
+    """Create through the Python owner; execution and display stay in the CLI."""
+    from simple_ar.app.research_intake import UnsupportedExecutionCreation
     from simple_ar.cli.research_config import FIELDS
+    from simple_ar.cli.main import _render_native_result, _ensure_research_cli_success
+    if not isinstance(execution.get('code_task'), dict) or 'run_dir' in execution['code_task']:
+        return False
     research_fields = {destination for destination, _ in FIELDS['research'].values()}
-    research_work = scientific and _fixed_execution_research(args, sources, outputs, research_config, research_fields)
+    research_work = 'experiments' in outputs and _fixed_execution_research(
+        args, sources, outputs, research_config, research_fields)
+    supported = {'config', 'topic', 'task_kind', 'outputs', 'command_argv', 'cwd', 'timeout_sec', 'label',
+        'primary_metric', 'metric', 'metric_direction', 'code_task_config', 'local_document', 'material', 'data_path',
+        'model', 'max_output_tokens', 'output_root', 'with_report', 'no_report',
+        'llm_requests', 'total_tokens', 'process_invocations', 'process_wall_seconds'}
+    supported.update(destination for destination, _ in FIELDS['report'].values())
+    if research_work:
+        supported.update(research_fields | {'selected_idea_id', 'feasibility_review_model'})
+    if (research_config or {}).get('research_materials_only') is True:
+        supported.add('research_materials_only')
+    scientific = 'experiments' in outputs
+    if scientific:
+        supported.add('interaction')
+    confirm_protocol = (scientific and not research_work
+        and 'interaction' in set(getattr(args, '_explicit_resume_destinations', ()))
+        and getattr(args, 'interaction', None) in {'assisted', 'checkpoints'})
+    if set(getattr(args, '_explicit_resume_destinations', ())) - supported:
+        return False
     if research_work and (not args.model or research_config is None):
         return False
-    preparation_names = ('kind', 'workspace_mode', 'max_file_bytes', 'workspace_include', 'workspace_exclude',
-        'workspace_reuse_source_venv', 'env_mode', 'python_executable', 'max_repairs')
-    formal = None
-    conditions = []
-    if scientific:
-        if (not reproduction and not {'baseline_policy', 'baseline', 'pairs'}.intersection(execution)
-                or set(execution) - (flat_fields | controls | {'code_task', 'environment'})
-                or set(task) - (set(preparation_names) | {'code_root', 'allowed_patterns', 'protected_patterns',
-                    'approval_note', 'budget_profile', 'edit_budget_overrides', 'allow_large_edits',
-                    'validation_command', 'validation_timeout_sec', 'initial_files'})):
+    if getattr(args, 'task_kind', None) == 'reproduction' and 'experiments' in outputs:
+        # Preserve this explicit shortcut's historical single-command promise.
+        # The public domain compiler supports comparisons independently of labels.
+        if 'pairs' in execution or execution.get('baseline_policy') == 'run' or 'baseline' in execution:
             return False
-        from simple_ar.cli.research_config import FIELDS
-        supported = {'config', 'topic', 'task_kind', 'outputs', 'command_argv', 'cwd', 'timeout_sec', 'label',
-            'primary_metric', 'metric', 'metric_direction', 'code_task_config', 'local_document', 'material', 'data_path',
-            'model', 'max_output_tokens', 'output_root', 'with_report', 'no_report',
-            'llm_requests', 'total_tokens', 'process_invocations', 'process_wall_seconds'}
-        supported.update(destination for destination, _ in FIELDS['report'].values())
-        if getattr(args, 'research_materials_only', None) is True:
-            supported.add('research_materials_only')  # Preserve the existing supplied-material-only restriction.
-        if research_work:
-            supported.update(research_fields | {'selected_idea_id', 'feasibility_review_model'})
-        if set(getattr(args, '_explicit_resume_destinations', ())) - supported:
-            return False
-        from simple_ar.app.research_execution import code_task_validation, normalize_execution_config
-        from simple_ar.tools.scientific import freeze_measurement_set, measurement_contract
-        if reproduction:
-            if 'pairs' in execution or execution.get('baseline_policy') == 'run' or 'baseline' in execution:
-                return False  # The structured reproduction entry retains its single-command policy.
-            code_task_validation(execution, required=True)
-        if reproduction and not (controls - {'baseline_policy'}).intersection(execution):
-            declaration = {**{key: value for key, value in execution.items() if key in flat_fields},
-                'command': list(execution['command']) if isinstance(execution['command'], tuple) else execution['command']}
-            formal = measurement_contract(declaration)
-            declaration = {**declaration, 'baseline_policy': 'skip'}
-        else:
-            declaration = {key: value for key, value in execution.items() if key in flat_fields | controls}
-            declaration['baseline_policy'] = normalize_execution_config(execution)['baseline_policy']
-            declaration = _mount_baseline_references(declaration, mounts, getattr(args, 'config', None))
-            # Materialize the existing CodeTask interpreter policy, not a new
-            # argv rule. freeze receives measurement fields only.
-            from simple_ar.code_task.execution.environment import resolve_code_task_command
-            from simple_ar.code_task.workspace.modes import _source_venv_python
-            reused = (_source_venv_python(Path(task['code_root'])) if task.get('code_root')
-                and task['workspace_reuse_source_venv'] and not task['python_executable'] else None)
-            commands = [(declaration, 'command')]
-            reuse = declaration['baseline_policy'] == 'reuse'
-            if reuse and not declaration.get('pairs'):
-                # A missing baseline command means the original caller argv,
-                # not the candidate's newly resolved CodeTask interpreter.
-                declaration['baseline'] = {'command': list(declaration['command']), **declaration.get('baseline', {})}
-            if 'baseline' in declaration:
-                declaration['baseline'] = dict(declaration['baseline'])
-                if not reuse:
-                    commands.append((declaration['baseline'], 'command'))
-            if 'pairs' in declaration:
-                declaration['pairs'] = [dict(pair) for pair in declaration['pairs']]
-            commands.extend((pair, key) for pair in declaration.get('pairs', [])
-                for key in (('candidate_command',) if reuse else ('baseline_command', 'candidate_command')))
-            for row, key in commands:
-                row[key] = (list(row[key]) if (execution.get('environment') or {}).get('mode') == 'venv' else
-                    resolve_code_task_command(row[key], env_mode='external' if reused else task['env_mode'],
-                        python_executable=str(reused) if reused else task['python_executable']))
-            formal = freeze_measurement_set(declaration)
-            if task['kind'] == 'greenfield' and any(row['role'] == 'baseline' and not row.get('reuse_ref')
-                    for row in formal['conditions']):
-                if (task['workspace_mode'] not in {'copy', 'sparse_copy'}
-                        or not task.get('code_root') or not Path(task['code_root']).is_dir()):
-                    return False  # A source baseline requires a real copied source project.
-            for row in formal['conditions']:
-                row['source'] = ('declared' if row.get('reuse_ref') else
-                    'preparation' if row['role'] == 'baseline' else 'implementation')
-                if row['source'] == 'preparation':
-                    row['before_implementation'] = True
-            formal = measurement_contract(formal)
-        if not getattr(args, 'model', None) or any(type(limits.get(name)) is not int or limits[name] < 1
-                for name in ('llm_requests', 'total_tokens')):
-            raise ValueError('Native code measurements require a model and finite positive llm_requests/total_tokens')
-    elif (not implementation_only(execution, outputs) or set(outputs) - {'bug_fix', 'code_task', 'report'}
-            or set(execution) - ((flat_fields - {'protocol'}) | {'code_task', 'baseline_policy', 'environment'})
-            or task['kind'] == 'greenfield' and execution.get('result_schema', {}).get('required_metrics')):
+        from simple_ar.app.research_execution import code_task_validation
+        code_task_validation(execution, required=True)
+    try:
+        app = _create_declared_execution(args, execution=execution, request=request,
+            outputs=outputs, sources=sources, limits=limits, root=root, research_config=research_config,
+            report_config=report_config, writing_method=writing_method, research_work=research_work,
+            confirm_protocol=confirm_protocol)
+    except UnsupportedExecutionCreation:
         return False
-    from simple_ar.tools.implementation import ExactCodeTask
-    from simple_ar.cli.main import _run_native_start
-    if scientific:
-        from simple_ar.experiment.execution.measurement import representative_measurement_execution
-        selected = representative_measurement_execution(formal)
-        conditions = [row for row in formal.get('conditions', [{'execution': selected}]) if not row.get('reuse_ref')]
-        if project is not None and (not project.is_dir() or any(
-                Path(row['execution']['cwd']).resolve() != project for row in conditions)):
-            raise ValueError('Reproduction measurement cwd must match the original code_root')
-        if project is None and (task['kind'] != 'greenfield' or task['workspace_mode'] != 'empty'):
-            raise ValueError('Source-less reproduction requires empty greenfield preparation')
-    # Exact argv explicitly names these file inputs. Mount only those files,
-    # never their parent directories or arbitrary directory-valued arguments.
-    # The implementation owner binds their bytes as protected external inputs.
-    commands = [task.get('validation_command') or execution['command']]
-    if (execution.get('environment') or {}).get('check_command'):
-        commands.append(execution['environment']['check_command'])
-    if formal is not None:
-        commands.extend(row['execution']['command'] for row in conditions)
-    for command in commands:
-        for argument in command[1:]:
-            value = argument.split('=', 1)[1] if argument.startswith('-') and '=' in argument else argument
-            try:
-                named = (Path(value) if Path(value).is_absolute() else Path(execution['cwd']) / value).absolute()
-                path = named.resolve()
-                if path.is_file() and (project is None or not path.is_relative_to(project)) and path not in mounts:
-                    from simple_ar.tools.scientific import _reject_links
-                    _reject_links(named)
-                    mounts.append(path)
-            except (OSError, ValueError):
-                pass  # Literal argv need not represent filesystem paths.
-    data = [Path(row['locator']).resolve().relative_to(project).as_posix() for row in sources
-            if project is not None and row['role'] == 'dataset' and Path(row['locator']).resolve().is_relative_to(project)]
-    if sources:
-        request += '\n\nSupplied material roles (read-only user declarations, not verified evidence):\n' + json.dumps(
-            [{'path': row['locator'], 'role': row['role']} for row in sources], ensure_ascii=False)
-    if scientific:
-        request += ('\n\nRun validation and formal measurements as separate physical calls, even when '
-            'their argv match; validator results are not measurements.')
-        if any(row.get('before_implementation') for row in conditions):
-            request += (' First prepare the unchanged source, then complete all declared baseline measurements '
-                'before implement(prepared_result). Pass the actual successful baseline facts to implementation; '
-                'failed or missing baselines do not authorize generation.')
-    preparation = {name: task[name] for name in preparation_names}
-    new_files = task.get('initial_files', [])
-    protected = task['protected_patterns']
-    if 'initial_files' in task:
-        if (task['kind'] != 'existing_project' or project is None
-                or task['workspace_mode'] not in {'auto', 'copy', 'git_worktree'}):
-            raise ValueError('initial_files requires an isolated existing project with auto/copy/git_worktree preparation')
-        if (not isinstance(new_files, (list, tuple)) or not new_files
-                or any(not isinstance(name, str) or Path(name).suffix != '.py'
-                       or name not in task['allowed_patterns'] for name in new_files)):
-            raise ValueError('initial_files requires explicit exact allowed new Python paths')
-        from simple_ar.code_task.editing.scope import default_edit_scope
-        protected = default_edit_scope(protected_patterns=protected)['protected_patterns']
-    exact = ExactCodeTask(project_path='source0' if project is not None else '', goal=request,
-        allowed_patterns=task['allowed_patterns'] or ['**'], protected_patterns=protected, new_files=list(new_files),
-        validation_command=list(task.get('validation_command') or execution['command']),
-        timeout_sec=task.get('validation_timeout_sec') or execution['timeout_sec'],
-        preparation={**preparation, 'data_inputs': list(dict.fromkeys(data))},
-        environment=execution.get('environment'),
-        edit_policy={name: task[name] for name in ('budget_profile', 'edit_budget_overrides', 'allow_large_edits')})
-    for name in exact.new_files:
-        target = project / name
-        if target.exists():
-            raise ValueError('initial_files must not replace an original project path')
-        for part in (target, *target.parents):
-            if part == project:
-                break
-            reparse = part.exists() and (getattr(part.lstat(), 'st_file_attributes', 0)
-                & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0))
-            if part.is_symlink() or reparse:
-                raise ValueError('initial_files cannot traverse links')
-    native.request, native.goal, native.source = request, None, mounts
-    native.model, native._model_confirmed = args.model, True
-    native.max_turns, native.max_tokens = limits['llm_requests'], limits['total_tokens']
-    native.allow_execution, native.yes = True, True  # Creation is requested; a command is NOT approved.
-    native._code_task, native._native_root = exact.model_dump(), root
-    if formal is not None:
-        native._execution_contract = formal
-        native._task_attempt_limit = max(20, limits['llm_requests'] * 10 + len(conditions) + 2)
-    if research_work:
-        _configure_research(native, args, sources=sources, research_config=research_config,
-            outputs=outputs, require_design=True, review_model=research_config.get('feasibility_review_model'))
-        native._research_policy.update(execution_boundary={**declaration, 'code_task': task},
-            execution_schema=selected['result_schema'], source_workspace=exact.project_path)
-    native._report_requirement = None
-    if 'report' in outputs:
-        from simple_ar.tools.writing import freeze_report_requirement
-        native._report_requirement = freeze_report_requirement(report_config or {}, method=writing_method)
-    native._task_output_limit = getattr(args, 'max_output_tokens', None)
-    native._process_limits = {name: limits[name] for name in ('process_invocations', 'process_wall_seconds')}
-    if research_work and native.allow_network:
-        source_count = max(1, len(args.queries or ())) * len(native._research_policy['providers'])
-        for name, extra in (('process_invocations', source_count * 4), ('process_wall_seconds', source_count * 120)):
-            if getattr(args, name, None) is None:
-                native._process_limits[name] += extra
-    if scientific or exact.environment is not None:
-        validators = 1 + preparation['max_repairs']
-        required = {'process_invocations': len(conditions) + validators,
-            'process_wall_seconds': sum(row['execution']['timeout_sec'] for row in conditions)
-                + validators * exact.timeout_sec}
-        if exact.environment is not None:
-            from simple_ar.research.project_environment import project_environment_plan
-            plan = project_environment_plan(exact.environment, project or Path(execution['cwd']),
-                Path('__attempt__') / 'environment', selected['command'] if scientific else exact.validation_command)
-            required['process_invocations'] += len(plan['steps'])
-            required['process_wall_seconds'] += len(plan['steps']) * plan['profile']['timeout_sec']
-        for name, minimum in required.items():
-            if getattr(args, name, None) is None:
-                native._process_limits[name] = max(native._process_limits[name], minimum)
-    print_line('Code/measurement/report creation uses the common task owner; no second research plan is created. '
-               'Exact source, environment and validator approval is still required; resume with simple-ar start --resume-task.')
-    _run_native_start(native)
+    print_line(f'Code/measurement creation uses the common Python owner. Task session: {root}')
+    print_line(f'Resume: simple-ar start --resume-task "{root}"')
+    if confirm_protocol:
+        _print_execution_confirmation(app, root)
+    status = app.run(progress=print_line)
+    _render_native_result(app, status)
+    _ensure_research_cli_success(status['status'], operation='Code task', root=root)
     return True
 
 
@@ -803,7 +621,7 @@ def migrate_measurement_creation(args: argparse.Namespace, *, execution: dict,
                                 sources: tuple = (), report_config: dict | None = None,
                                 writing_method: str | None = None,
                                 research_config: dict | None = None) -> bool:
-    """Adapt an explicit fixed execution, without another plan or resume owner."""
+    """Create through intake; retain the literal caller's one-use approval."""
     flat_fields = {'command', 'cwd', 'timeout_sec', 'label', 'result_schema', 'protocol', 'environment'}
     from simple_ar.cli.research_config import FIELDS
     research_fields = {destination for destination, _ in FIELDS['research'].values()}
@@ -818,13 +636,6 @@ def migrate_measurement_creation(args: argparse.Namespace, *, execution: dict,
             or set(outputs) - {'experiments', 'report', 'summary'}
             or set(execution) - (flat_fields | {'baseline', 'pairs', 'seeds', 'seed_count', 'seed_flag', 'baseline_policy', 'baseline_ref'})):
         return False
-    extended = set(execution) - flat_fields
-    from simple_ar.app.research_execution import normalize_execution_config
-    if extended:
-        policy = normalize_execution_config(execution)['baseline_policy']
-        if not research_work and policy == 'skip' and extended == {'baseline_policy'}:
-            execution = {key: value for key, value in execution.items() if key in flat_fields}
-            extended = set()
     supported = {'config', 'topic', 'task_kind', 'outputs', 'command_argv', 'cwd', 'timeout_sec',
         'label', 'primary_metric', 'metric', 'metric_direction', 'output_root', 'data_path',
         'process_invocations', 'process_wall_seconds', 'total_tokens', 'llm_requests', 'no_report', 'model'}
@@ -845,77 +656,27 @@ def migrate_measurement_creation(args: argparse.Namespace, *, execution: dict,
             return False  # Preserve other explicitly requested research/interaction work.
         raise ValueError('Fixed measurement creation cannot reinterpret these explicit controls: '
                          + ', '.join(sorted(unsupported)))
-    from simple_ar.cli.parser import build_parser
-    native = build_parser().parse_args(['start'])
-    limits = {**limits,
-        'llm_requests': native.max_turns if limits.get('llm_requests') is None else limits['llm_requests'],
-        'total_tokens': native.max_tokens if limits.get('total_tokens') is None else limits['total_tokens']}
-    if args.model and any(type(limits.get(name)) is not int or limits[name] < 1
-                          for name in ('llm_requests', 'total_tokens')):
-        raise ValueError('Model-assisted fixed measurement requires finite positive --llm-requests and --total-tokens')
-    from simple_ar.app.tool_application import ToolApplication
-    from simple_ar.tools.scientific import freeze_measurement_set, measurement_contract, measurement_conditions
+    from simple_ar.app.research_intake import UnsupportedExecutionCreation
+    from simple_ar.tools.scientific import measurement_conditions
     from simple_ar.cli.main import _render_native_result, _ensure_research_cli_success
-    mounts = [Path(row['locator']) for row in sources]
-    if execution.get('baseline_policy') == 'reuse':
-        if execution.get('baseline_ref') is None:
-            return False  # Historical same-session reuse remains with its saved owner.
-        execution = _mount_baseline_references(execution, mounts, getattr(args, 'config', None))
-    contract = freeze_measurement_set(execution) if extended else measurement_contract(execution)
+    confirm_protocol = (not research_work and 'interaction' in explicit
+        and getattr(args, 'interaction', None) in {'assisted', 'checkpoints'})
+    try:
+        app = _create_declared_execution(args, execution=execution, request=request,
+            outputs=outputs, sources=sources, limits=limits, root=root, research_config=research_config,
+            report_config=report_config, writing_method=writing_method,
+            research_work=research_work, confirm_protocol=confirm_protocol)
+    except UnsupportedExecutionCreation:
+        return False
+    contract = app.state['config']['execution_contract']
     conditions = [row for row in measurement_conditions(contract) if 'reuse_ref' not in row]
     grouped = 'conditions' in contract
     actions = [{'tool_name': 'measure_experiment', 'arguments':
         {**row['execution'], 'condition_id': row['id']} if grouped else
         row['execution'] if args.model else {**row['execution'], 'delivery': {'summary': request, 'artifacts': []}}}
         for row in conditions]
-    native.model, native.source, native.allow_execution = args.model, mounts, True
-    native.max_turns, native.max_tokens = (limits['llm_requests'], limits['total_tokens']) if args.model else (0, 0)
-    native._task_output_limit = getattr(args, 'max_output_tokens', None)
-    native._task_attempt_limit = max(20, len(conditions) + int(grouped) + native.max_turns * 10)
-    native._execution_contract = contract
-    if research_work:
-        _configure_research(native, args, sources=sources, research_config=research_config,
-            outputs=outputs, require_design=True,
-            review_model=research_config.get('feasibility_review_model'))
-        native._research_policy.update(execution_boundary=execution,
-            execution_schema=execution.get('result_schema', {}))
-    if 'report' in outputs:
-        from simple_ar.tools.writing import freeze_report_requirement
-        native._report_requirement = freeze_report_requirement(report_config or {}, method=writing_method)
-        if sources:
-            request += '\n\nSupplied read-only material roles (not verified evidence):\n' + json.dumps(
-                [{'path': row['locator'], 'role': row['role']} for row in sources], ensure_ascii=False)
-    native._process_limits = {name: limits[name] for name in ('process_invocations', 'process_wall_seconds')}
-    if research_work and native.allow_network:
-        source_count = max(1, len(args.queries or ())) * len(native._research_policy['providers'])
-        for name, extra in (('process_invocations', source_count * 4), ('process_wall_seconds', source_count * 120)):
-            if getattr(args, name, None) is None:
-                native._process_limits[name] += extra
-    if grouped and execution.get('environment') is not None:
-        from simple_ar.research.project_environment import project_environment_plan
-        first = conditions[0]['execution']
-        plan = project_environment_plan(first['environment'], Path(first['cwd']),
-            Path('__attempt__') / 'environment', first['command'])
-        required = {'process_invocations': len(conditions) + len(plan['steps']),
-            'process_wall_seconds': sum(row['execution']['timeout_sec'] for row in conditions)
-                + len(plan['steps']) * plan['profile']['timeout_sec']}
-        for name, minimum in required.items():
-            if getattr(args, name, None) is None:
-                native._process_limits[name] = max(native._process_limits[name], minimum)
-    confirm_protocol = (not research_work and 'interaction' in explicit
-        and getattr(args, 'interaction', None) in {'assisted', 'checkpoints'})
     if confirm_protocol:
-        from simple_ar.tools.sources import SourcePolicy
-        # Persist the confirmation obligation before creating its input record:
-        # a crash between creation and declaration cannot bypass this gate.
-        native._research_policy = SourcePolicy(max_results=20, require_design=True,
-            interaction=args.interaction).model_dump(mode='json')
-    app = ToolApplication.create(root, request, **native_creation_options(native))
-    if confirm_protocol:
-        decision = app.request_execution_confirmation()
-        print_line('Pending protocol decision: ' + json.dumps(decision, ensure_ascii=False))
-        print_line(f'Confirm protocol: simple-ar start --resume-task "{root}" '
-            f'--decision-id {decision["decision_id"]} --decision-response accept')
+        _print_execution_confirmation(app, root)
     print_line('Fixed measurement uses the common task owner, original cwd/argv and '
                + ('declared environment preparation. ' if execution.get('environment') is not None else 'inherited environment. ')
                + ('Research requires an accepted design matching the declared execution; execution proposals require approval. '

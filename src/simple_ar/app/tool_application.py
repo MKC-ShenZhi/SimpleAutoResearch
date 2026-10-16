@@ -697,7 +697,8 @@ class ToolApplication:
         if report_requirement is not None:
             config['report_requirement'] = report_requirement
             config['report_evidence_contract'] = (
-                'execution.v1' if code_task is not None or execution_contract is not None else 'materials.v1')
+                'execution.v1' if code_task is not None or execution_contract is not None
+                    or allow_execution and (research_policy or {}).get('require_design') else 'materials.v1')
         if snapshots:
             config['source_snapshots'] = {}
             for name, original, content in snapshots:
@@ -1661,13 +1662,14 @@ class ToolApplication:
             paths.update((Path(ref).parent / row['path']).as_posix()
                          for row in payload.get('artifact_refs', {}).values())
         current_report = self.state['config'].get('report_evidence_contract') == 'execution.v1'
+        contract = self.scientific.execution_contract if self.scientific is not None else None
         scientific = (self.scientific.report_evidence(measurements, refs,
             analysis_records=analyses if current_report else None)
-            if self.scientific is not None and self.state['config'].get('execution_contract') is not None else {})
+            if contract is not None else {})
         return {**scientific,
             **({'evidence_contract': 'execution.v1'} if current_report else {}),
             **({'analysis_records': analyses} if not current_report
-                and 'conditions' in (self.state['config'].get('execution_contract') or {}) else {}),
+                and 'conditions' in (contract or {}) else {}),
             'request_count': len(self.state['requests']),
             'requests_sha256': hashlib.sha256(json.dumps(self.state['requests'], ensure_ascii=False).encode()).hexdigest(),
             'implementation_refs': refs,
@@ -1799,7 +1801,7 @@ class ToolApplication:
             if not candidate.is_dir() or not candidate.is_relative_to(self.workspace.workspace.resolve()):
                 return None
             manifest = load_code_task_manifest(run)
-            if self.state['config'].get('execution_contract') is not None:
+            if self.scientific is not None and self.scientific.execution_contract is not None:
                 from simple_ar.code_task.execution.environment import native_validation_command
                 from simple_ar.code_task.execution.runner import _argv_command
                 manifest = {**manifest, 'benchmark': {**manifest['benchmark'],
@@ -1909,7 +1911,7 @@ class ToolApplication:
                         self._validated_code_delivery(request.artifacts)
                     if self.state['config'].get('report_requirement'):
                         self._validated_report_delivery(request.artifacts)
-                    if self.implementation.exact and self.state['config'].get('execution_contract') is not None:
+                    if self.implementation.exact and self.scientific is not None and self.scientific.execution_contract is not None:
                         gaps = self.scientific.delivery_requirement(self._execution_evidence())
                         if gaps:
                             return '; '.join(gaps) + '; disclose unresolved work for partial delivery.'

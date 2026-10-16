@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 import hashlib
 import json
+import stat
 from pathlib import Path
 import tomllib
 from typing import Any
@@ -41,7 +42,7 @@ def create_research_task(brief: ResearchBrief, *, root: str | Path, services: An
         'research_selected_idea_id': 'selected_idea_id', 'feasibility_review_model': 'feasibility_connection'}
     policy_values, unhandled = {}, []
     auxiliary = {'research_task_kind', 'research_materials_only', 'report', 'report_writing_method',
-        'data_analysis', 'max_output_tokens'}
+        'data_analysis', 'max_output_tokens', 'execution', 'execution_confirmation'}
     for name, value in config.items():
         target = aliases.get(name, name.removeprefix('research_'))
         if name not in auxiliary and target in SourcePolicy.model_fields:
@@ -73,17 +74,41 @@ def create_research_task(brief: ResearchBrief, *, root: str | Path, services: An
             and policy_values.get('allow_network') is not True)
     outputs = brief.requested_outputs or ('research_summary',)
     supported = {'summary', 'research_summary', 'report', 'paper', 'full_paper', 'assessment',
-        'idea_assessment', 'idea_comparison', 'design', 'research_design', 'data_analysis', 'experiments'}
+        'idea_assessment', 'idea_comparison', 'design', 'research_design', 'data_analysis', 'experiments',
+        'bug_fix', 'code_task'}
     if set(outputs) - supported:
         raise ValueError('Use explicit native execution contracts for these outputs: '
             + ', '.join(sorted(set(outputs) - supported)))
+    execution = config.get('execution')
+    if execution is None and {'bug_fix', 'code_task'} & set(outputs):
+        raise ValueError('Code deliverables require an explicit execution.code_task contract')
+    research_work = bool({'summary', 'research_summary'} & set(outputs) or policy_values.get('require_summary')
+        or policy_values.get('materials') or policy_values.get('source_workspace')) or (
+        bool(policy_values.get('require_design')) if 'require_design' in policy_values else
+        bool({'summary', 'research_summary'} & set(outputs) or materials
+            or set(policy_values) - {'interaction'})) if execution is not None else True
+    confirm_execution = config.get('execution_confirmation', False)
+    if type(confirm_execution) is not bool or confirm_execution and (execution is None or research_work):
+        raise ValueError('execution_confirmation requires a caller-directed fixed execution')
+    projection = (project_execution_creation(execution, request=brief.request_text, outputs=tuple(outputs),
+        sources=tuple(asset.to_dict() for asset in assets), input_base_dir=base, require_design=research_work)
+        if execution is not None else None)
+    if projection is not None:
+        policy_values = _remap_policy_mounts(policy_values, mounts, projection['sources'])
+        mounts = projection['sources']
+        materials = [name for name, path in mounts.items() if any(
+            not _is_remote_locator(asset.locator) and Path(asset.locator) == path
+            and asset.role not in {'dataset', 'code'} and path.is_file() for asset in assets)]
+    if confirm_execution and (projection is None or projection['execution_contract'] is None):
+        raise ValueError('execution_confirmation requires a fixed scientific measurement contract')
     policy = SourcePolicy.model_validate({'max_results': settings.max_results,
         'max_documents': settings.max_results, 'max_chunks': settings.max_chunks,
         'idea_limit': settings.idea_limit, 'max_fulltext_documents': min(settings.max_results, 1),
         'cache_dir': str(settings.cache_dir.resolve()) if settings.cache_dir else None,
         'providers': providers, **policy_values,
         'materials': policy_values.get('materials', materials), 'allow_network': not local_only,
-        'require_design': bool(policy_values.get('require_design') or 'experiments' in outputs),
+        'require_design': bool(confirm_execution or research_work and 'experiments' in outputs
+            or policy_values.get('require_design')),
         'require_summary': bool(policy_values.get('require_summary') or {'summary', 'research_summary'} & set(outputs))})
     report = (freeze_report_requirement(dict(config.get('report') or {}),
         method=config.get('report_writing_method')) if {'report', 'paper', 'full_paper'} & set(outputs) else None)
@@ -92,37 +117,65 @@ def create_research_task(brief: ResearchBrief, *, root: str | Path, services: An
         path = (Path(base) / table['file']).resolve()
         alias = next((name for name, item in mounts.items() if item.resolve() == path), None)
         if alias is None:
-            alias = f'source{len(assets)}'
+            index = 0
+            while f'source{index}' in mounts:
+                index += 1
+            alias = f'source{index}'
             mounts[alias] = path
         table = {'path': alias, 'spec': {name: value for name, value in table.items() if name != 'file'}}
     client = settings.llm_client
     if model is not None and client is not None:
         raise ValueError('Choose a named model or an injected client, not both')
     selected_model = model if model else 'runtime' if client is not None else None
-    if 'experiments' in outputs and selected_model is None:
+    if 'experiments' in outputs and selected_model is None and (projection is None or research_work):
         raise ValueError('Open-ended experiments require a model or an explicitly prepared execution command')
+    if projection is not None and (projection['code_task'] is not None or report is not None) and selected_model is None:
+        raise ValueError('Code preparation or a requested authored report requires a model')
+    if confirm_execution:
+        policy = SourcePolicy(require_design=True, allow_network=False, interaction=policy.interaction)
+    if projection is not None and research_work:
+        boundary = projection['execution_boundary']
+        project_alias = (projection['code_task'] or {}).get('project_path')
+        if project_alias and policy.source_workspace:
+            from simple_ar.tools.workspace import resolve_mounted_path
+            if resolve_mounted_path(mounts, policy.source_workspace).resolve() != mounts[project_alias].resolve():
+                raise ValueError('Explicit research source_workspace conflicts with the declared code project')
+        policy = policy.model_copy(update={'execution_boundary': boundary,
+            'execution_schema': execution.get('result_schema', {}),
+            'source_workspace': project_alias or policy.source_workspace})
     limits = settings.budget_limits
+    if selected_model is not None and any(type(limits[name]) is not int or limits[name] < 1
+            for name in ('llm_requests', 'total_tokens') if limits.get(name) is not None):
+        raise ValueError('Model-assisted creation requires finite positive llm_requests/total_tokens')
     unsupported_limits = {name for name, value in limits.items() if value is not None and name not in {
         'llm_requests', 'total_tokens', 'process_invocations', 'process_wall_seconds', 'source_operations'}}
     if unsupported_limits:
         raise ValueError('Unsupported creation resource controls: ' + ', '.join(sorted(unsupported_limits)))
     source_count = max(1, len(policy.queries)) * len(policy.providers)
     execution_runs = settings.max_attempts if 'experiments' in outputs else 0
+    network_runs = source_count if policy.allow_network and (projection is None or research_work) else 0
+    process_defaults = (projection['process_limits'] if projection is not None else {
+        'process_invocations': execution_runs,
+        'process_wall_seconds': execution_runs * policy.execution_boundary.get('timeout_sec', 300)})
+    process_limits = {name: limits[name] if limits.get(name) is not None else default + extra
+        for name, default, extra in (
+            ('process_invocations', process_defaults['process_invocations'], network_runs * 4),
+            ('process_wall_seconds', process_defaults['process_wall_seconds'], network_runs * 120))}
     root = Path(root).expanduser().resolve()
     app = ToolApplication.create(root, (brief.objective or brief.request_text)
         + '\nOriginal user request and declared constraints:\n' + json.dumps(brief.to_dict(), ensure_ascii=False),
         model=selected_model, sources=mounts,
-        allow_execution='experiments' in outputs, allow_network=policy.allow_network, max_turns=(limits.get('llm_requests')
+        allow_execution='experiments' in outputs or projection is not None,
+        allow_network=policy.allow_network if projection is None or research_work else False, max_turns=(limits.get('llm_requests')
             if limits.get('llm_requests') is not None else 30 if selected_model is not None else 0),
         max_tokens=(limits.get('total_tokens') if limits.get('total_tokens') is not None
             else 600000 if selected_model is not None else 0),
         max_attempts=settings.max_attempts, report_requirement=report,
         max_output_tokens=config.get('max_output_tokens'), table_analysis=table,
-        research_policy=policy.model_dump(mode='json'),
-        process_limits={name: limits[name] if limits.get(name) is not None else default
-            for name, default in (('process_invocations', execution_runs + (source_count * 4 if policy.allow_network else 0)),
-                ('process_wall_seconds', execution_runs * policy.execution_boundary.get('timeout_sec', 300)
-                    + (source_count * 120 if policy.allow_network else 0)))},
+        research_policy=policy.model_dump(mode='json') if projection is None or research_work or confirm_execution else None,
+        code_task=projection['code_task'] if projection else None,
+        execution_contract=projection['execution_contract'] if projection else None,
+        process_limits=process_limits,
         source_operations=limits.get('source_operations') if limits.get('source_operations') is not None
             else source_count * (1 + policy.max_iterations) + policy.max_documents * 3,
         services=settings, snapshot_sources=snapshot_sources, max_snapshot_bytes=max_snapshot_bytes)
@@ -133,7 +186,274 @@ def create_research_task(brief: ResearchBrief, *, root: str | Path, services: An
         app.session.manifest.state_refs['assets'] = app.session.store.write_json('inputs/research_assets.json',
             {'assets': [asset.to_dict() for asset in assets]}, kind='research_assets', producer='research_intake')
         app.session.save()
+    if confirm_execution:
+        app.request_execution_confirmation()
     return app
+
+
+class UnsupportedExecutionCreation(ValueError):
+    """The declaration needs its historical or unsupported creation owner."""
+
+
+def _remap_policy_mounts(values: dict, original: dict[str, Path], projected: dict[str, Path]) -> dict:
+    """Preserve the original asset alias identity when execution adds mounts."""
+    def remap(locator: str) -> str:
+        if not locator or Path(locator).is_absolute():
+            return locator
+        alias, separator, suffix = locator.partition('/')
+        if alias not in original:
+            raise ValueError(f'Explicit source policy locator has no original asset mount: {locator}')
+        path = original[alias].resolve()
+        target = next((name for name, mounted in projected.items() if mounted.resolve() == path), None)
+        if target is None:
+            raise ValueError(f'Execution projection cannot preserve source policy locator: {locator}')
+        return target + (separator + suffix if separator else '')
+    updated = dict(values)
+    if 'materials' in values:
+        updated['materials'] = [remap(value) for value in values['materials']]
+    if 'source_workspace' in values:
+        updated['source_workspace'] = remap(values['source_workspace'])
+    return updated
+
+
+def _execution_path(value: str | Path, base: Path) -> Path:
+    path = Path(value).expanduser()
+    return (path if path.is_absolute() else base / path).resolve()
+
+
+def _bind_baseline_references(execution: dict, mounts: list[Path], base: Path) -> dict:
+    values = execution.get('baseline_ref')
+    if execution.get('baseline_policy') != 'reuse':
+        return execution
+    if values is None:
+        raise UnsupportedExecutionCreation('Historical baseline reuse requires its saved owner')
+    from simple_ar.tools.scientific import _reject_links
+    refs = []
+    for value in values if isinstance(values, (list, tuple)) else [values]:
+        named = Path(value).expanduser()
+        named = named if named.is_absolute() else base / named
+        _reject_links(named)
+        path = named.resolve()
+        if path not in mounts:
+            mounts.append(path)
+        refs.append(f'source{mounts.index(path)}')
+    return {**execution, 'baseline_ref': refs if isinstance(values, (list, tuple)) else refs[0]}
+
+
+def _code_measurement_contract(execution: dict, task: dict, declaration: dict) -> tuple[dict, dict]:
+    from simple_ar.app.research_execution import normalize_execution_config
+    from simple_ar.tools.scientific import freeze_measurement_set, measurement_contract
+    from simple_ar.code_task.execution.environment import resolve_code_task_command
+    from simple_ar.code_task.workspace.modes import _source_venv_python
+    declaration = {**{name: value for name, value in declaration.items() if name != 'environment'},
+        'baseline_policy': normalize_execution_config(declaration)['baseline_policy']}
+    reused = (_source_venv_python(Path(task['code_root'])) if task.get('code_root')
+        and task.get('workspace_reuse_source_venv') and not task.get('python_executable') else None)
+    commands = [(declaration, 'command')]
+    reuse = declaration['baseline_policy'] == 'reuse'
+    if reuse and not declaration.get('pairs'):
+        declaration['baseline'] = {'command': list(declaration['command']), **declaration.get('baseline', {})}
+    if 'baseline' in declaration:
+        declaration['baseline'] = dict(declaration['baseline'])
+        if not reuse:
+            declaration['baseline'].setdefault('command', list(declaration['command']))
+            commands.append((declaration['baseline'], 'command'))
+    if 'pairs' in declaration:
+        declaration['pairs'] = [dict(pair) for pair in declaration['pairs']]
+    commands.extend((pair, key) for pair in declaration.get('pairs', [])
+        for key in (('candidate_command',) if reuse else ('baseline_command', 'candidate_command')))
+    for row, key in commands:
+        row[key] = (list(row[key]) if (execution.get('environment') or {}).get('mode') == 'venv' else
+            resolve_code_task_command(row[key], env_mode='external' if reused else task.get('env_mode', 'current'),
+                python_executable=str(reused) if reused else task.get('python_executable')))
+    formal = freeze_measurement_set(declaration)
+    if task.get('kind') == 'greenfield' and any(row['role'] == 'baseline' and not row.get('reuse_ref')
+            for row in formal['conditions']):
+        if task.get('workspace_mode') not in {'copy', 'sparse_copy'} or not task.get('code_root'):
+            raise UnsupportedExecutionCreation('A source baseline requires a real copied source project')
+    for row in formal['conditions']:
+        row['source'] = ('declared' if row.get('reuse_ref') else
+            'preparation' if row['role'] == 'baseline' else 'implementation')
+        if row['source'] == 'preparation':
+            row['before_implementation'] = True
+    return measurement_contract(formal), declaration
+
+
+def _exact_code_contract(execution: dict, task: dict, project: Path | None,
+                         mounts: list[Path], sources: tuple, request: str,
+                         formal: dict | None) -> dict:
+    from simple_ar.tools.implementation import ExactCodeTask
+    from simple_ar.tools.scientific import measurement_conditions
+    preparation_names = ('kind', 'workspace_mode', 'max_file_bytes', 'workspace_include', 'workspace_exclude',
+        'workspace_reuse_source_venv', 'env_mode', 'python_executable', 'max_repairs')
+    scientific = formal is not None
+    conditions = [row for row in measurement_conditions(formal) if not row.get('reuse_ref')] if scientific else []
+    if scientific:
+        if project is not None and (not project.is_dir() or any(
+                Path(row['execution']['cwd']).resolve() != project for row in conditions)):
+            raise ValueError('Reproduction measurement cwd must match the original code_root')
+        if project is None and (task['kind'] != 'greenfield' or task['workspace_mode'] != 'empty'):
+            raise ValueError('Source-less reproduction requires empty greenfield preparation')
+    # Exact argv explicitly names these file inputs. Mount only those files,
+    # never their parent directories or arbitrary directory-valued arguments.
+    # The implementation owner binds their bytes as protected external inputs.
+    commands = [task.get('validation_command') or execution['command']]
+    if (execution.get('environment') or {}).get('check_command'):
+        commands.append(execution['environment']['check_command'])
+    if formal is not None:
+        commands.extend(row['execution']['command'] for row in conditions)
+    for command in commands:
+        for argument in command[1:]:
+            value = argument.split('=', 1)[1] if argument.startswith('-') and '=' in argument else argument
+            try:
+                named = (Path(value) if Path(value).is_absolute() else Path(execution['cwd']) / value).absolute()
+                path = named.resolve()
+                if path.is_file() and (project is None or not path.is_relative_to(project)) and path not in mounts:
+                    from simple_ar.tools.scientific import _reject_links
+                    _reject_links(named)
+                    mounts.append(path)
+            except (OSError, ValueError):
+                pass  # Literal argv need not represent filesystem paths.
+    data = [Path(row['locator']).resolve().relative_to(project).as_posix() for row in sources
+            if project is not None and row['role'] == 'dataset' and Path(row['locator']).resolve().is_relative_to(project)]
+    if sources:
+        request += '\n\nSupplied material roles (read-only user declarations, not verified evidence):\n' + json.dumps(
+            [{'path': row['locator'], 'role': row['role']} for row in sources], ensure_ascii=False)
+    if scientific:
+        request += ('\n\nRun validation and formal measurements as separate physical calls, even when '
+            'their argv match; validator results are not measurements.')
+        if any(row.get('before_implementation') for row in conditions):
+            request += (' First prepare the unchanged source, then complete all declared baseline measurements '
+                'before implement(prepared_result). Pass the actual successful baseline facts to implementation; '
+                'failed or missing baselines do not authorize generation.')
+    preparation = {name: task[name] for name in preparation_names if name in task}
+    new_files = task.get('initial_files', [])
+    protected = task.get('protected_patterns', [])
+    if 'initial_files' in task:
+        if (task['kind'] != 'existing_project' or project is None
+                or task['workspace_mode'] not in {'auto', 'copy', 'git_worktree'}):
+            raise ValueError('initial_files requires an isolated existing project with auto/copy/git_worktree preparation')
+        if (not isinstance(new_files, (list, tuple)) or not new_files
+                or any(not isinstance(name, str) or Path(name).suffix != '.py'
+                       or name not in task.get('allowed_patterns', []) for name in new_files)):
+            raise ValueError('initial_files requires explicit exact allowed new Python paths')
+        from simple_ar.code_task.editing.scope import default_edit_scope
+        protected = default_edit_scope(protected_patterns=protected)['protected_patterns']
+    exact = ExactCodeTask(project_path=f'source{mounts.index(project)}' if project is not None else '', goal=request,
+        allowed_patterns=task['allowed_patterns'] or ['**'], protected_patterns=protected, new_files=list(new_files),
+        validation_command=list(task.get('validation_command') or execution['command']),
+        timeout_sec=task.get('validation_timeout_sec') or execution['timeout_sec'],
+        preparation={**preparation, 'data_inputs': list(dict.fromkeys(data))},
+        environment=execution.get('environment'),
+        edit_policy={name: task[name] for name in ('budget_profile', 'edit_budget_overrides', 'allow_large_edits') if name in task})
+    for name in exact.new_files:
+        target = project / name
+        if target.exists():
+            raise ValueError('initial_files must not replace an original project path')
+        for part in (target, *target.parents):
+            if part == project:
+                break
+            reparse = part.exists() and (getattr(part.lstat(), 'st_file_attributes', 0)
+                & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0))
+            if part.is_symlink() or reparse:
+                raise ValueError('initial_files cannot traverse links')
+
+    return exact.model_dump()
+
+
+def _normalize_creation_code_task(task: dict, base: Path) -> dict:
+    """Use the standalone CodeTask configuration owners for public partial inputs."""
+    from simple_ar.app.research_execution import code_task_execution_options
+    from simple_ar.code_task.runtime.config import load_code_task_init_options, load_code_task_execute_options
+    values = dict(task)
+    if values.get('code_root'):
+        values['code_root'] = str(_execution_path(values['code_root'], base))
+    if values.get('python_executable'):
+        python = Path(values['python_executable']).expanduser()
+        values['python_executable'] = str((python if python.is_absolute() else base / python).absolute())
+    names = ('kind', 'code_root', 'workspace_mode', 'max_file_bytes', 'workspace_include',
+        'workspace_exclude', 'workspace_reuse_source_venv', 'env_mode', 'python_executable')
+    init = load_code_task_init_options(require_task_file=False,
+        **{name: values[name] for name in names if name in values})
+    return {**code_task_execution_options(init, load_code_task_execute_options()), **values}
+
+
+def project_execution_creation(execution: Mapping[str, Any], *, request: str, outputs: tuple,
+                               sources: tuple, input_base_dir: str | Path,
+                               require_design: bool = False) -> dict[str, Any]:
+    """Compile declared domain data for both Python and CLI creation; never run or approve."""
+    from copy import deepcopy
+    from simple_ar.tools.scientific import freeze_measurement_set, measurement_contract, measurement_conditions
+    base = Path(input_base_dir).resolve()
+    execution = deepcopy(dict(execution))
+    flat = {'command', 'cwd', 'timeout_sec', 'label', 'result_schema', 'protocol', 'environment'}
+    controls = {'baseline', 'baseline_policy', 'baseline_ref', 'pairs', 'seeds', 'seed_count', 'seed_flag'}
+    if set(execution) - (flat | controls | {'code_task'}):
+        raise UnsupportedExecutionCreation('Unsupported explicit execution controls: '
+            + ', '.join(sorted(set(execution) - (flat | controls | {'code_task'}))))
+    task = execution.get('code_task')
+    if task is not None and (not isinstance(task, dict) or 'run_dir' in task):
+        raise UnsupportedExecutionCreation('Initialized CodeTask adoption requires its saved owner')
+    scientific = 'experiments' in outputs
+    if set(outputs) - ({'experiments', 'report', 'summary', 'research_summary'} if scientific
+                      else {'bug_fix', 'code_task', 'report'}):
+        raise UnsupportedExecutionCreation('Unsupported execution outputs')
+    if not scientific and task is None:
+        raise UnsupportedExecutionCreation('Execution needs a measurement or explicit code deliverable')
+    if scientific and require_design and not {'baseline_policy', 'baseline', 'pairs'}.intersection(execution):
+        raise UnsupportedExecutionCreation('Open comparison design requires its design owner; no skip policy was declared')
+    execution['cwd'] = str(_execution_path(execution.get('cwd', '.'), base))
+    if 'baseline' in execution and isinstance(execution['baseline'], dict) and 'cwd' in execution['baseline']:
+        execution['baseline']['cwd'] = str(_execution_path(execution['baseline']['cwd'], base))
+    project = None
+    if task is not None:
+        from simple_ar.tools.implementation import ExactCodePreparation
+        preparation_names = {'kind', 'workspace_mode', 'max_file_bytes', 'workspace_include', 'workspace_exclude',
+            'workspace_reuse_source_venv', 'env_mode', 'python_executable', 'max_repairs'}
+        if set(task) - (preparation_names | {'code_root', 'allowed_patterns', 'protected_patterns', 'approval_note',
+                'budget_profile', 'edit_budget_overrides', 'allow_large_edits', 'validation_command',
+                'validation_timeout_sec', 'initial_files'}):
+            raise UnsupportedExecutionCreation('Unsupported explicit CodeTask controls')
+        task = _normalize_creation_code_task(task, base)
+        execution['code_task'] = task
+        project = Path(task['code_root']) if task.get('code_root') else None
+        task.update(ExactCodePreparation.model_validate({name: task[name]
+            for name in preparation_names if name in task}).model_dump(exclude={'data_inputs'}))
+        if not scientific and (set(execution) - (flat | {'code_task', 'baseline_policy'})
+                or execution.get('baseline_policy', 'skip') != 'skip' or 'protocol' in execution):
+            raise UnsupportedExecutionCreation('Implementation-only creation cannot discard scientific controls')
+    sources = tuple({**row, 'locator': str(_execution_path(row['locator'], base))}
+        for row in sources if not _is_remote_locator(str(row['locator'])))
+    mounts = list(dict.fromkeys([*([project] if project else []), *(Path(row['locator']) for row in sources)]))
+    declaration = {key: value for key, value in execution.items() if key != 'code_task'}
+    declaration = _bind_baseline_references(declaration, mounts, base)
+    contract = None
+    if scientific:
+        extended = set(declaration) - flat
+        if not require_design and extended == {'baseline_policy'} and declaration['baseline_policy'] == 'skip':
+            declaration = {key: value for key, value in declaration.items() if key in flat}
+            extended = set()
+        if task is not None:
+            contract, declaration = _code_measurement_contract(execution, task, declaration)
+        else:
+            contract = freeze_measurement_set(declaration) if extended else measurement_contract(declaration)
+    exact = _exact_code_contract(execution, task, project, mounts, sources, request, contract) if task is not None else None
+    conditions = [row for row in measurement_conditions(contract) if not row.get('reuse_ref')] if contract else []
+    validators = 1 + (exact.get('preparation') or {}).get('max_repairs', 0) if exact else 0
+    required = {'process_invocations': len(conditions) + validators,
+        'process_wall_seconds': sum(row['execution']['timeout_sec'] for row in conditions)
+            + validators * (exact['timeout_sec'] if exact else 0)}
+    environment = execution.get('environment')
+    if environment is not None:
+        from simple_ar.research.project_environment import project_environment_plan
+        command = conditions[0]['execution']['command'] if conditions else exact['validation_command']
+        plan = project_environment_plan(environment, project or Path(execution['cwd']),
+            Path('__attempt__') / 'environment', command)
+        required['process_invocations'] += len(plan['steps'])
+        required['process_wall_seconds'] += len(plan['steps']) * plan['profile']['timeout_sec']
+    return {'sources': {f'source{i}': path for i, path in enumerate(mounts)},
+        'code_task': exact, 'execution_contract': contract, 'execution_boundary': {**declaration,
+            **({'code_task': task} if task is not None else {})}, 'process_limits': required}
 
 
 def parse_research_input(
@@ -622,6 +942,8 @@ _KNOWN_SUFFIXES = {
 __all__ = [
     "ResearchInputError",
     "create_research_task",
+    "project_execution_creation",
+    "UnsupportedExecutionCreation",
     "normalize_assets",
     "parse_research_input",
     "validate_brief",

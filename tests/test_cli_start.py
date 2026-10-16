@@ -115,6 +115,19 @@ class StartTests(unittest.TestCase):
         catalog.start()
         self.addCleanup(catalog.stop)
 
+    def _capture_creation(self, create):
+        # Keep the real intake compiler; fake only the persistent task factory.
+        app = create.return_value
+        app.state = {'turns': [], 'pending': None}
+        app.sources.pending_decision.return_value = {'decision_id': 'caller-protocol',
+            'proposal_kind': 'caller_execution_protocol'}
+        def capture(*args, **kwargs):
+            app.state.setdefault('config', kwargs)
+            app.state['config'] = kwargs
+            return app
+        create.side_effect = capture
+        return app
+
     def test_document_urls_preserve_literal_input_and_require_confirmed_chat_acquisition(self):
         url = 'https://example.test/paper'
         args = build_parser().parse_args(['start', '--kind', 'reproduction', '--goal', 'Inspect paper',
@@ -1313,7 +1326,7 @@ class StartTests(unittest.TestCase):
             grouped = {**execution, 'baseline_policy': 'run', 'seeds': [4, 9], 'seed_flag': '--seed',
                 'environment': {'mode': 'current', 'timeout_sec': 5,
                     'check_command': [sys.executable, '-c', 'pass']}}
-            app = create.return_value
+            app = self._capture_creation(create)
             app.state = {'turns': [{'origin': 'caller'}], 'pending': {'attempt': 'first'}}
             app.measurement_completion_actions.return_value = []
             def run_batch(*, actions, approve, progress):
@@ -1448,7 +1461,7 @@ class StartTests(unittest.TestCase):
                         self.assertEqual(candidate['role'], 'candidate')
                     self.assertEqual((options['max_turns'], options['max_tokens']), (3, 24000))
                     self.assertEqual(options['max_output_tokens'], 1700)
-                    self.assertEqual(options['source_operations'], 4 + 7 * 3)
+                    self.assertEqual(options['source_operations'], 4 * (1 + 3) + 7 * 3)
                     # Two exact queries x two providers reserve search work only by default.
                     self.assertEqual(options['process_limits'], {
                         'process_invocations': 2 if explicit_budget or materials_only else 2 + 4 * 4,
@@ -1494,7 +1507,7 @@ class StartTests(unittest.TestCase):
                         patch('simple_ar.app.tool_application.ToolApplication.create') as create, \
                         patch('simple_ar.cli.main._render_native_result'), \
                         patch('simple_ar.cli.start.print_line') as progress, patch('subprocess.run') as process:
-                    app = create.return_value
+                    app = self._capture_creation(create)
                     app.run.return_value = {'status': 'completed'}
                     self.assertTrue(migrate_measurement_creation(args, execution=execution,
                         request='Honor the declared research obligation', outputs=outputs, root=root,
@@ -1562,7 +1575,7 @@ class StartTests(unittest.TestCase):
                             patch('simple_ar.cli.main._render_native_result'), \
                             patch('simple_ar.cli.start.print_line'), \
                             patch('subprocess.run') as process:
-                        app = create.return_value
+                        app = self._capture_creation(create)
                         app.state = {'turns': [{'origin': 'caller'}], 'pending': None}
                         app.run.return_value = {'status': 'completed'}
                         app.measurement_completion_actions.return_value = []
@@ -1605,125 +1618,142 @@ class StartTests(unittest.TestCase):
 
     def test_research_code_creation_retains_domain_contracts_in_one_task(self):
         from copy import deepcopy
-        from simple_ar.app.research_execution import code_task_execution_options
+        from simple_ar.app.research_intake import create_research_task
+        from simple_ar.app.research_application import ResearchApplicationServices
+        from simple_ar.cli.start import migrate_exact_code_creation
+        from simple_ar.research.workflow_contracts import ResearchBrief
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            project = root / 'project'
+            project.mkdir()
+            checker = project / 'check.py'
+            checker.write_text('pass\n', encoding='utf-8')
+            paper = root / 'paper.md'
+            paper.write_text('Source method and conditions', encoding='utf-8')
+            task = {'code_root': 'project', 'workspace_mode': 'copy',
+                'allowed_patterns': ['adapter.py'], 'validation_command': ['python', 'check.py'],
+                'validation_timeout_sec': 5}
+            execution = {'command': ['python', 'measure.py'], 'cwd': 'project', 'timeout_sec': 5,
+                'result_schema': {'required_metrics': ['score']}, 'baseline_policy': 'skip', 'code_task': task,
+                'protocol': {'hypothesis': 'Published claim', 'dataset': 'Fixed data', 'expected_outcome': 'Compare score'}}
+            sources = ({'locator': 'paper.md', 'role': 'paper'},)
+            research = {'interaction': 'assisted', 'research_materials_only': True, 'require_design': True}
+            limits = {'llm_requests': 4, 'total_tokens': 50000, 'process_invocations': 0, 'process_wall_seconds': 0}
+            args = build_parser().parse_args(['research-session', '--topic', 'Investigate and implement',
+                '--model', 'fixture', '--interaction', 'assisted', '--query', 'method conditions',
+                '--provider', 'arxiv'])
+            args.config = root / 'research.toml'
+            args._explicit_resume_destinations = {'model', 'interaction', 'queries', 'providers'}
+            original = deepcopy((vars(args), execution, sources, research, limits))
+            originals = {path: path.read_bytes() for path in (checker, paper)}
+            for kind in ('auto', 'measurement', 'reproduction'):
+                args.task_kind = kind
+                with self.subTest(kind=kind), patch('simple_ar.app.tool_application.ToolApplication.create') as create, \
+                        patch('simple_ar.cli.main._render_native_result'), patch('simple_ar.cli.start.print_line'), \
+                        patch('simple_ar.cli.main._run_native_start') as old_runner:
+                    app = self._capture_creation(create)
+                    app.run.return_value = {'status': 'completed'}
+                    self.assertTrue(migrate_exact_code_creation(args, execution=execution, request=args.topic,
+                        outputs=('experiments', 'summary', 'report'), sources=sources, limits=limits, root=root / kind,
+                        research_config=research))
+                    cli = create.call_args.kwargs
+                    self.assertEqual(cli['sources'], {'source0': project, 'source1': paper})
+                    self.assertEqual(cli['code_task']['project_path'], 'source0')
+                    self.assertEqual(cli['code_task']['allowed_patterns'], ['adapter.py'])
+                    self.assertEqual(cli['code_task']['preparation']['kind'], 'existing_project')
+                    self.assertEqual(cli['code_task']['validation_command'], ['python', 'check.py'])
+                    self.assertEqual(cli['execution_contract']['conditions'][0]['source'], 'implementation')
+                    self.assertEqual(cli['process_limits'], {'process_invocations': 0, 'process_wall_seconds': 0})
+                    self.assertFalse(cli['allow_network'])
+                    self.assertTrue(cli['allow_execution'])
+                    self.assertTrue(cli['research_policy']['require_design'])
+                    from simple_ar.tools.scientific import fixed_measurement_issues, freeze_measurement_set
+                    boundary = dict(cli['research_policy']['execution_boundary'])
+                    boundary.pop('code_task', None)
+                    boundary.pop('environment', None)
+                    self.assertEqual(fixed_measurement_issues(cli['execution_contract'],
+                        freeze_measurement_set(boundary)), [])
+                    self.assertTrue(cli['research_policy']['require_summary'])
+                    self.assertIsNotNone(cli['report_requirement'])
+                    self.assertEqual(cli['research_policy']['source_workspace'], 'source0')
+                    self.assertEqual(cli['research_policy']['materials'], ['source1'])
+                    app.run.assert_called_once()
+                    self.assertNotIn('approve', app.run.call_args.kwargs)
+                    old_runner.assert_not_called()
+                    services = ResearchApplicationServices(input_base_dir=root,
+                        config={**research, 'execution': execution, 'queries': ['method conditions'], 'providers': ['arxiv']},
+                        budget_limits=limits, max_results=args.max_results, max_chunks=args.max_chunks,
+                        idea_limit=args.idea_limit)
+                    create_research_task(ResearchBrief(request_text=args.topic,
+                        requested_outputs=('experiments', 'summary', 'report'), asset_requests=sources),
+                        root=root / 'python', model='fixture', services=services)
+                    python = create.call_args.kwargs
+                    for field in ('sources', 'code_task', 'execution_contract', 'research_policy',
+                                  'process_limits', 'allow_execution', 'allow_network', 'report_requirement'):
+                        self.assertEqual(python[field], cli[field], field)
+                    self.assertIs(python['services'], services)
+            args.task_kind = original[0]['task_kind']
+            with patch('simple_ar.app.tool_application.ToolApplication.create') as create:
+                for declaration in (
+                        {**execution, 'code_task': {'run_dir': str(root / 'saved-run')}},
+                        {key: value for key, value in execution.items() if key != 'baseline_policy'},
+                        {**execution, 'baseline_policy': 'reuse'},
+                        {**execution, 'unmapped_execution_control': True}):
+                    self.assertFalse(migrate_exact_code_creation(args, execution=declaration, request=args.topic,
+                        outputs=('experiments',), sources=sources, limits=limits, root=root / 'fallback',
+                        research_config=research))
+                args._explicit_resume_destinations.add('unmapped_control')
+                self.assertFalse(migrate_exact_code_creation(args, execution=execution, request=args.topic,
+                    outputs=('experiments',), sources=sources, limits=limits, root=root / 'fallback',
+                    research_config=research))
+                create.assert_not_called()
+            args._explicit_resume_destinations.remove('unmapped_control')
+            self.assertEqual((vars(args), execution, sources, research, limits), original)
+            self.assertEqual({path: path.read_bytes() for path in originals}, originals)
+
+    def test_fixed_code_protocol_confirmation_is_owned_by_public_creation(self):
         from simple_ar.cli.start import migrate_exact_code_creation
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             project = root / 'project'
             project.mkdir()
-            (project / 'check.py').write_text('pass\n', encoding='utf-8')
-            paper = root / 'paper.md'
-            paper.write_text('Source method and conditions', encoding='utf-8')
-            task = code_task_execution_options(load_code_task_init_options(kind='existing_project',
-                code_root=str(project), workspace_mode='copy', require_task_file=False),
-                load_code_task_execute_options())
-            task['validation_command'] = [sys.executable, 'check.py']
-            task['validation_timeout_sec'] = 5
-            execution = {'command': [sys.executable, 'measure.py'], 'cwd': str(project),
-                'timeout_sec': 5, 'result_schema': {'required_metrics': ['score']},
-                'baseline_policy': 'skip', 'code_task': task}
-            args = build_parser().parse_args(['research-session', '--task-kind', 'auto', '--topic', 'Investigate and implement',
-                '--model', 'fixture', '--interaction', 'autonomous', '--query', 'method conditions', '--provider', 'arxiv'])
-            args._explicit_resume_destinations = {'task_kind', 'model', 'interaction', 'queries', 'providers'}
-            limits = {'llm_requests': 4, 'total_tokens': 50000, 'process_invocations': 3, 'process_wall_seconds': 15}
-            research = {'interaction': 'autonomous', 'research_materials_only': True,
-                'research_max_documents': 2, 'research_max_iterations': 1}
-            sources = ({'locator': str(paper), 'role': 'paper'},)
-            before = deepcopy((vars(args), execution, research, limits))
-            with patch('simple_ar.cli.main._run_native_start') as run, patch('simple_ar.cli.start.print_line'):
-                self.assertTrue(migrate_exact_code_creation(args, execution=execution,
-                    request=args.topic, outputs=('experiments',), sources=sources, limits=limits,
-                    root=root / 'task', research_config=research))
-            native = run.call_args.args[0]
-            self.assertEqual(native.source, [project, paper])
-            self.assertEqual(native._code_task['project_path'], 'source0')
-            self.assertTrue(native._research_policy['require_design'])
-            self.assertFalse(native.allow_network)
-            self.assertEqual(native._research_policy['source_workspace'], 'source0')
-            self.assertEqual(native._research_policy['materials'], ['source1'])
-            self.assertEqual(native._research_policy['execution_boundary']['code_task'], task)
-            self.assertEqual(native._research_policy['queries'], ['method conditions'])
-            self.assertEqual(native._execution_contract['conditions'][0]['source'], 'implementation')
-            self.assertEqual(native._process_limits, {'process_invocations': 3, 'process_wall_seconds': 15})
-            self.assertEqual((vars(args), execution, research, limits), before)
-            for interaction in ('assisted', 'checkpoints'):
+            args = build_parser().parse_args(['research-session', '--topic', 'Implement an adapter', '--model', 'fixture'])
+            args._explicit_resume_destinations = {'model', 'interaction'}
+            execution = {'command': ['python', 'measure.py'], 'cwd': str(project), 'timeout_sec': 5,
+                'result_schema': {'primary_metric': 'score'}, 'baseline_policy': 'skip',
+                'code_task': {'code_root': str(project), 'validation_command': ['python', 'check.py'],
+                    'validation_timeout_sec': 5}}
+            for interaction in ('checkpoints', 'assisted'):
                 args.interaction = interaction
-                args.task_kind = 'measurement'
-                args.selected_idea_id = 'idea-2'
-                args._explicit_resume_destinations.add('selected_idea_id')
-                with patch('simple_ar.cli.main._run_native_start') as run, patch('subprocess.run') as process:
-                    self.assertTrue(migrate_exact_code_creation(args, execution=execution,
-                        request=args.topic, outputs=('experiments', 'summary'), sources=sources, limits=limits,
-                        root=root / interaction, research_config={**research, 'interaction': interaction,
-                            'research_selected_idea_id': 'idea-2'}))
-                    native = run.call_args.args[0]
-                    self.assertEqual(native._research_policy['interaction'], interaction)
-                    self.assertTrue(native._research_policy['require_design'])
-                    self.assertTrue(native._research_policy['require_summary'])
-                    self.assertEqual(native._research_policy['selected_idea_id'], 'idea-2')
-                    self.assertEqual(native._research_policy['execution_boundary']['code_task'], task)
-                    self.assertFalse(native.approve_execution)
-                    process.assert_not_called()
-            # Explicit old baselines use the same mounted evidence projection
-            # in CodeTask, not a second legacy creation or a prepared-source run.
-            args.interaction = 'checkpoints'
-            args.config = str(root / 'task.toml')
-            baseline_file = root / 'baseline.json'
-            baseline_file.write_text('{}', encoding='utf-8')  # Domain tests own canonical validation.
-            for code_kind in ('existing_project', 'greenfield'):
-                declared = {**execution, 'baseline_policy': 'reuse', 'baseline_ref': 'baseline.json',
-                    'command': ['python', 'measure.py'],
-                    'baseline': {'command': ['python', 'old_measure.py']},
-                    'code_task': {**task, 'kind': code_kind,
-                        **({'code_root': None, 'workspace_mode': 'empty'} if code_kind == 'greenfield' else {})}}
-                if code_kind == 'greenfield':
-                    declared['cwd'] = str(root)
-                    declared.pop('baseline')
-                snapshot = deepcopy(declared)
-                with self.subTest(reuse_code_kind=code_kind), \
-                        patch('simple_ar.cli.main._run_native_start') as run, \
-                        patch('simple_ar.cli.start.print_line'):
-                    self.assertTrue(migrate_exact_code_creation(args, execution=declared,
-                        request='Implement using a retained baseline', outputs=('experiments', 'summary'),
-                        sources=sources, limits=limits, root=root / code_kind,
-                        research_config={**research, 'interaction': 'checkpoints',
-                                         'research_selected_idea_id': 'idea-2'}))
-                native = run.call_args.args[0]
-                baseline, candidate = native._execution_contract['conditions']
-                self.assertEqual(native.source[-1], baseline_file)
-                self.assertEqual(baseline['reuse_ref'], f'source{len(native.source)-1}')
-                self.assertEqual(baseline['source'], 'declared')
-                self.assertNotIn('before_implementation', baseline)
-                self.assertEqual(baseline['execution']['command'],
-                    ['python', 'measure.py' if code_kind == 'greenfield' else 'old_measure.py'])
-                self.assertEqual(candidate['execution']['command'], [sys.executable, 'measure.py'])
-                self.assertEqual(candidate['source'], 'implementation')
-                self.assertEqual(native._process_limits, {'process_invocations': 3, 'process_wall_seconds': 15})
-                self.assertFalse(native.approve_execution)
-                self.assertEqual(native._research_policy['interaction'], 'checkpoints')
-                self.assertTrue(native._research_policy['require_summary'])
-                self.assertEqual(native._research_policy['execution_boundary']['baseline_ref'], baseline['reuse_ref'])
-                self.assertEqual(declared, snapshot)
-            self.assertEqual((project / 'check.py').read_text(), 'pass\n')
-            self.assertEqual(paper.read_text(), 'Source method and conditions')
-            with patch('simple_ar.cli.main._run_native_start') as run:
-                # An existing run is adoption, not a fresh source preparation.
-                self.assertFalse(migrate_exact_code_creation(args,
-                    execution={**execution, 'code_task': {'run_dir': str(root / 'existing-run')}},
-                    request='Adopt an existing run', outputs=('experiments',), sources=sources,
-                    limits=limits, root=root, research_config=research))
-                for declaration in (
-                        {key: value for key, value in execution.items() if key != 'baseline_policy'},
-                        {**execution, 'baseline_policy': 'reuse'},
-                        {**execution, 'unmapped_execution_control': True}):
-                    self.assertFalse(migrate_exact_code_creation(args, execution=declaration,
-                        request='Retain open or historical execution', outputs=('experiments',), sources=sources,
-                        limits=limits, root=root, research_config=research))
-                args._explicit_resume_destinations.add('unmapped_control')
-                self.assertFalse(migrate_exact_code_creation(args, execution=execution,
-                    request='Retain unmapped explicit controls', outputs=('experiments',), sources=sources,
-                    limits=limits, root=root, research_config=research))
-                run.assert_not_called()
+                with self.subTest(interaction=interaction), \
+                        patch('simple_ar.app.tool_application.ToolApplication.create') as create, \
+                        patch('simple_ar.cli.main._render_native_result'), patch('simple_ar.cli.start.print_line'):
+                    app = self._capture_creation(create)
+                    app.run.return_value = {'status': 'completed'}
+                    self.assertTrue(migrate_exact_code_creation(args, execution=execution, request=args.topic,
+                        outputs=('experiments',), sources=(), limits={}, root=root / interaction))
+                    options = create.call_args.kwargs
+                    self.assertTrue(options['research_policy']['require_design'])
+                    self.assertFalse(options['research_policy']['require_summary'])
+                    self.assertFalse(options['allow_network'])
+                    self.assertEqual(options['research_policy']['interaction'], interaction)
+                    app.request_execution_confirmation.assert_called_once_with()
+                    app.run.assert_called_once()
+                    self.assertNotIn('approve', app.run.call_args.kwargs)
+                    create.reset_mock()
+                    self.assertFalse(migrate_exact_code_creation(args, execution=execution, request=args.topic,
+                        outputs=('code_task',), sources=(), limits={}, root=root / 'code-only'))
+                    create.assert_not_called()
+            args.task_kind = 'reproduction'
+            args._explicit_resume_destinations = {'model'}
+            with patch('simple_ar.app.tool_application.ToolApplication.create') as create:
+                for declared in ({**execution, 'baseline_policy': 'run'}, {**execution, 'pairs': []}):
+                    self.assertFalse(migrate_exact_code_creation(args, execution=declared, request=args.topic,
+                        outputs=('experiments',), sources=(), limits={}, root=root / 'unsupported'))
+                with self.assertRaisesRegex(ValueError, 'user-confirmed fixed protocol'):
+                    migrate_exact_code_creation(args, execution=execution, request=args.topic,
+                        outputs=('experiments',), sources=(), limits={}, root=root / 'unconfirmed')
+                create.assert_not_called()
 
     def test_prepared_reproduction_uses_existing_config_and_preserves_argv(self):
         with tempfile.TemporaryDirectory() as directory:

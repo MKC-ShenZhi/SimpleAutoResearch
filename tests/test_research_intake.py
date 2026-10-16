@@ -220,6 +220,178 @@ class ResearchIntakeTests(unittest.TestCase):
                 self.assertTrue(writing.state['config']['allow_network'])
                 calls.assert_not_called()
 
+
+    def test_public_minimal_code_creation_uses_code_task_defaults_and_runtime_services(self):
+        from simple_ar.app.research_execution import code_task_execution_options
+        from simple_ar.code_task.runtime.config import load_code_task_init_options, load_code_task_execute_options
+        with TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            project = base / 'project'
+            project.mkdir()
+            (project / 'check.py').write_text('pass\n', encoding='utf-8')
+            client, reviewer = _JSONClient(), _JSONClient()
+            registry = SearchProviderRegistry()
+            task = {'code_root': 'project', 'validation_command': ['python', 'check.py'],
+                'validation_timeout_sec': 7}
+            execution = {'command': ['python', 'measure.py'], 'cwd': 'project', 'timeout_sec': 9,
+                'result_schema': {'primary_metric': 'score'}, 'baseline_policy': 'skip', 'code_task': task}
+            original = copy.deepcopy(execution)
+            services = ResearchApplicationServices(llm_client=client, feasibility_llm_client=reviewer,
+                search_registry=registry, input_base_dir=base,
+                config={'execution': execution, 'require_design': False},
+                budget_limits={'llm_requests': 2, 'total_tokens': 100000,
+                    'process_invocations': 0, 'process_wall_seconds': 0, 'source_operations': 0})
+            with patch.object(LLMClient, 'from_env', side_effect=AssertionError('Use supplied services')):
+                app = create_research_task(ResearchBrief(request_text='Implement an adapter.',
+                    requested_outputs=('experiments',)), root=base / 'task', services=services)
+            saved = app.state['config']
+            defaults = code_task_execution_options(load_code_task_init_options(code_root=str(project),
+                require_task_file=False), load_code_task_execute_options())
+            exact = saved['code_task']
+            self.assertEqual(exact['preparation']['kind'], defaults['kind'])
+            self.assertEqual(exact['preparation']['workspace_mode'], defaults['workspace_mode'])
+            self.assertEqual(exact['preparation']['max_repairs'], defaults['max_repairs'])
+            self.assertEqual(exact['allowed_patterns'], defaults['allowed_patterns'] or ['**'])
+            from simple_ar.code_task.editing.scope import is_edit_allowed_path
+            for path in ('adapter.py', 'src/model.py', 'README.md', 'tests/test_adapter.py', '.env'):
+                self.assertEqual(is_edit_allowed_path(path, allowed_patterns=exact['allowed_patterns'],
+                    protected_patterns=exact['protected_patterns']),
+                    is_edit_allowed_path(path, allowed_patterns=defaults['allowed_patterns'],
+                        protected_patterns=defaults['protected_patterns']), path)
+            self.assertEqual(exact['project_path'], 'source0')
+            self.assertEqual(exact['validation_command'], ['python', 'check.py'])
+            self.assertEqual(saved['execution_contract']['conditions'][0]['source'], 'implementation')
+            self.assertEqual(saved['execution_contract']['conditions'][0]['execution']['command'][1], 'measure.py')
+            self.assertIs(app.services, services)
+            self.assertIs(app.sources.registry, registry)
+            self.assertFalse(saved['allow_network'])
+            self.assertEqual(app.ledger.remaining('process_invocations'), 0)
+            self.assertEqual(app.ledger.remaining('process_wall_seconds'), 0)
+            self.assertEqual(app.ledger.remaining('source_operations'), 0)
+            self.assertEqual(app.session.list_attempts(), ())
+            self.assertEqual(client.calls, [])
+            self.assertEqual(reviewer.calls, [])
+            self.assertEqual(execution, original)
+            self.assertEqual((project / 'check.py').read_text(), 'pass\n')
+
+    def test_public_fixed_conditions_environment_and_confirmation_only_create(self):
+        import sys
+        with TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            execution = {'command': [sys.executable, 'measure.py'], 'cwd': '.', 'timeout_sec': 5,
+                'result_schema': {'primary_metric': 'score'}, 'baseline_policy': 'run',
+                'seeds': [4, 9], 'seed_flag': '--seed',
+                'environment': {'mode': 'current', 'timeout_sec': 5,
+                    'check_command': [sys.executable, '-c', 'pass']}}
+            original = copy.deepcopy(execution)
+            for confirm in (False, True):
+                services = ResearchApplicationServices(input_base_dir=base,
+                    config={'execution': execution, 'execution_confirmation': confirm, 'require_design': False})
+                app = create_research_task(ResearchBrief(request_text='Measure these exact conditions.',
+                    requested_outputs=('experiments',)), root=base / str(confirm), services=services)
+                saved = app.state['config']
+                conditions = saved['execution_contract']['conditions']
+                self.assertEqual([(row['role'], row['seed']) for row in conditions],
+                    [('baseline', 4), ('candidate', 4), ('baseline', 9), ('candidate', 9)])
+                self.assertTrue(all(row['execution']['cwd'] == str(base) for row in conditions))
+                self.assertIsNone(saved.get('code_task'))
+                self.assertEqual(app.ledger.remaining('process_invocations'), 5)
+                self.assertEqual(app.ledger.remaining('process_wall_seconds'), 25)
+                self.assertFalse(saved['allow_network'])
+                if confirm:
+                    self.assertTrue(saved['research_policy']['require_design'])
+                    self.assertFalse(saved['research_policy']['allow_network'])
+                    self.assertEqual(app.sources.pending_decision()['proposal_kind'], 'caller_execution_protocol')
+                self.assertEqual(app.session.list_attempts(), ())
+                self.assertFalse(app.ledger.entries)
+            self.assertEqual(execution, original)
+
+    def test_execution_mount_projection_preserves_explicit_source_aliases_and_suffixes(self):
+        import sys
+        with TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            docs, project = base / 'docs', base / 'project'
+            docs.mkdir()
+            project.mkdir()
+            (docs / 'paper.md').write_text('Declared method', encoding='utf-8')
+            execution = {'command': [sys.executable, 'measure.py'], 'cwd': 'project', 'timeout_sec': 5,
+                'result_schema': {'primary_metric': 'score'}, 'baseline_policy': 'skip'}
+            for with_code in (False, True):
+                declared = {**execution, **({'code_task': {'code_root': 'project',
+                    'validation_command': ['python', 'check.py'], 'validation_timeout_sec': 5}} if with_code else {})}
+                config = {'execution': declared, 'require_design': True, 'research_materials_only': True,
+                    'materials': ['source0/paper.md'], 'source_workspace': 'source1' if with_code else 'source0'}
+                original = copy.deepcopy(config)
+                services = ResearchApplicationServices(llm_client=_JSONClient(), input_base_dir=base, config=config)
+                brief = ResearchBrief(request_text='Honor declared materials.', requested_outputs=('experiments',),
+                    asset_requests=({'locator': 'docs', 'role': 'material'},
+                        *(({'locator': 'project', 'role': 'code'},) if with_code else ())))
+                app = create_research_task(brief, root=base / str(with_code), services=services)
+                policy = app.state['config']['research_policy']
+                self.assertEqual(policy['materials'], ['source1/paper.md'] if with_code else ['source0/paper.md'])
+                self.assertEqual(policy['source_workspace'], 'source0')
+                if with_code:
+                    self.assertEqual(app.state['config']['sources']['source1'], str(docs))
+                    self.assertEqual(app.state['config']['sources']['source0'], str(project))
+                else:
+                    self.assertEqual(app.state['config']['sources']['source0'], str(docs))
+                self.assertEqual(config, original)
+                absolute = create_research_task(brief, root=base / f'absolute-{with_code}',
+                    services=replace(services, config={**config, 'materials': [str(docs / 'paper.md')],
+                        'source_workspace': str(project if with_code else docs)}))
+                self.assertEqual(absolute.sources.policy.materials, (str(docs / 'paper.md'),))
+                with patch.object(ToolApplication, 'create') as create, self.assertRaisesRegex(ValueError, 'original asset mount'):
+                    create_research_task(brief, root=base / 'invalid', services=replace(services,
+                        config={**config, 'materials': ['source9/paper.md']}))
+                create.assert_not_called()
+                if with_code:
+                    with patch.object(ToolApplication, 'create') as create, self.assertRaisesRegex(ValueError, 'conflicts'):
+                        create_research_task(brief, root=base / 'conflict', services=replace(services,
+                            config={**config, 'source_workspace': 'source0'}))
+                    create.assert_not_called()
+
+    def test_public_execution_rejects_adoption_open_design_and_unknown_controls_before_creation(self):
+        from simple_ar.app.research_intake import UnsupportedExecutionCreation
+        import sys
+        with TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            execution = {'command': [sys.executable, 'measure.py'], 'cwd': str(base),
+                'timeout_sec': 5, 'result_schema': {'primary_metric': 'score'}}
+            cases = [
+                ({**execution, 'code_task': {'run_dir': str(base / 'historical')}}, False),
+                ({**execution, 'baseline_policy': 'reuse'}, False),
+                ({**execution, 'unmapped_control': True}, False),
+                (execution, True),
+            ]
+            with patch.object(ToolApplication, 'create') as create:
+                for declared, design in cases:
+                    with self.subTest(declared=declared), self.assertRaises(UnsupportedExecutionCreation):
+                        create_research_task(ResearchBrief(request_text='Keep explicit ownership.',
+                            requested_outputs=('experiments',)), root=base / 'task',
+                            services=ResearchApplicationServices(input_base_dir=base,
+                                config={'execution': declared, 'require_design': design}))
+                create.assert_not_called()
+            self.assertFalse((base / 'task').exists())
+
+    def test_public_reuse_keeps_producing_lineage_with_original_owner(self):
+        import sys
+        with TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            baseline = base / 'baseline.json'
+            baseline.write_text(json.dumps({'implementation_ref': 'records/old/implementation.json',
+                'preparation': {'attempt_id': 'old'}}), encoding='utf-8')
+            original = baseline.read_bytes()
+            with self.assertRaisesRegex(ValueError, 'baseline'):
+                create_research_task(ResearchBrief(request_text='Reuse a measured baseline.',
+                    requested_outputs=('experiments',)), root=base / 'task',
+                    services=ResearchApplicationServices(input_base_dir=base,
+                        config={'execution': {'command': [sys.executable, 'measure.py'], 'cwd': '.',
+                            'timeout_sec': 5, 'result_schema': {'primary_metric': 'score'},
+                            'baseline_policy': 'reuse', 'baseline_ref': 'baseline.json'},
+                            'require_design': False}))
+            self.assertEqual(baseline.read_bytes(), original)
+            self.assertFalse((base / 'task').exists())
+
     def test_plain_text_is_preserved_without_inferred_intent(self) -> None:
         brief = parse_research_input("  Compare two small classifiers.\n")
 

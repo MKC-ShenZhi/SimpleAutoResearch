@@ -22,7 +22,7 @@ Structured precedence is defaults → TOML → explicit CLI. CLI lists replace f
 
 ### Python task creation
 
-Structured research, writing and table inputs can use the same creation owner as the CLI:
+Structured research, writing, tables and declared execution use the same creation owner as the CLI:
 
 ```python
 from pathlib import Path
@@ -40,7 +40,22 @@ app.run(progress=print)
 restored = ToolApplication.load(Path("runs/evidence-note"))
 ```
 
-Creation validates inputs but makes no model or process calls. Omit `model` for caller-directed actions and later explicit supply; a declared report remains an obligation, not permission to invoke a model. `ResearchApplicationServices` supplies research settings and finite budgets. Unsupported legacy execution/revision controls are rejected before creation, not silently dropped; the old application APIs remain available for their existing contracts and historical continuation.
+Creation validates inputs but makes no model or process calls. Omit `model` for caller-directed actions and later explicit supply; a declared report remains an obligation, not permission to invoke a model. `ResearchApplicationServices` supplies research settings and finite budgets. Put a declared command/condition set in `services.config["execution"]`; optional `code_task` uses the existing CodeTask configuration defaults, edit boundaries and independent validator. Paths resolve from `input_base_dir`, not the output task directory. Explicit zero allowances remain zero. Source aliases, environments and verified external baseline snapshots share the same compilation as CLI creation, rather than separate Python execution semantics.
+
+For example, this creates a caller-directed measurement task without running it:
+
+```python
+from simple_ar.app.research_application import ResearchApplicationServices
+
+services = ResearchApplicationServices(input_base_dir=Path.cwd(), config={
+    "execution": {"command": ["python", "experiment.py"], "cwd": ".", "timeout_sec": 120,
+        "result_schema": {"primary_metric": "score", "required_metrics": ["score"]}}},
+    budget_limits={"process_invocations": 1, "process_wall_seconds": 120})
+app = create_research_task(ResearchBrief(request_text="Measure the supplied program.",
+    requested_outputs=("experiments",)), root=Path("runs/measurement"), services=services)
+```
+
+Execution still requires a separately approved proposal. `execution_confirmation=True` additionally requires acceptance of the caller's frozen protocol; it is not process permission. CodeTask's omitted/empty `allowed_patterns` keeps its existing default source scope with mandatory protections, not “no edits”; supply explicit globs to narrow it. Open comparison design, initialized `run_dir` adoption and baselines with producing-source lineage must retain their actual owners; unsupported controls are rejected before creation, not silently reduced to candidate-only work. Old application APIs remain available for their existing contracts and historical continuation.
 
 For trusted Python integrations, services may inject a text client, independent reviewer and `SearchProviderRegistry`. Clients must implement `with_budget` and `ask_json` or `chat_turn`, binding the task's actual ledger, session and attempt. Reload with `ToolApplication.load(path, services=services)` before further service work. Only type/model identities and provider names are retained—not credentials or executable objects. Missing dependencies do not fall back to environment clients or built-in providers. Custom implementations remain caller-trusted, not sandboxed or independently identity-verified. Named connections are preferable for CLI/restart portability; `model="env"` selects the configured default, not a literal provider model called `env`.
 

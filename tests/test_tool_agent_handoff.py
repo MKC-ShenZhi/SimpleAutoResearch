@@ -1924,6 +1924,74 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual({path: (app.session.store.root / path).read_bytes() for path in receipts}, receipts)
         fake.chat_turn.assert_not_called()
 
+    def test_accepted_design_measurements_reach_bound_report_without_static_execution(self):
+        from simple_ar.research.contracts import IdeaCandidate, ResearchExperimentContract
+        from simple_ar.research.synthesis import SynthesisResult
+        from simple_ar.tools.writing import freeze_report_requirement
+        inputs, fake, app = self._supply_fixture()
+        self.enterContext(patch('simple_ar.app.tool_application.LLMClient.for_task', return_value=fake))
+        requirement = freeze_report_requirement({'outline_strategy': 'template'})
+        fake.ask_json.side_effect = None
+        fake.ask_json.return_value = {'draft_markdown': '\n\n'.join(
+            '## ' + row['heading'] + '\n\nThe observed score is 3.5 in one local run; stability is untested.'
+            for row in requirement['outline'])}
+        synthesis = SynthesisResult(status='ready', gap_summary='Bounded experiment', ideas=(IdeaCandidate(
+            idea_id='chosen', title='Chosen observation', hypothesis='Record a testable score',
+            proposed_change='Measure the declared local program', motivation_refs=['original-span']),),
+            novelty_checks=(), experiment_contract=ResearchExperimentContract(contract_id='designed',
+                hypothesis='Record a testable score', proposed_change='Measure the declared local program'))
+        write_json(inputs / 'synthesis.json', synthesis.to_handoff_dict())
+        app.supply(supply_id='design-experiment', reason='Design, measure and explain an authorized local run',
+            changes={'allow_execution': True, 'report_requirement': requirement,
+                'research_policy': {'allow_network': False, 'require_design': True,
+                    'selected_idea_id': 'chosen', 'execution_boundary': self._supply_measurement(inputs)}},
+            resource_allowances={'source_operations': 1})
+        self.assertIsNone(app.state['config']['execution_contract'])
+        self.assertEqual(app.state['config']['report_evidence_contract'], 'execution.v1')
+        with self.assertRaisesRegex(ValueError, 'execution evidence'):
+            app._report_inputs()
+        def action(name, **arguments):
+            return {'tool_name': name, 'arguments': arguments}
+        stop = action('ask_user', question='Await explicit caller continuation')
+        app.run(actions=[action('research', operation='design', question='Record a local observation',
+            synthesis_record='source0/synthesis.json'), stop], progress=lambda _: None)
+        designed = app.session.store.read_json(app.state['turns'][-1]['tools'][0]['result'])
+        self.assertEqual(designed['status'], 'ok', designed.get('error'))
+        decision = app.sources.pending_decision()
+        self.assertIsNotNone(decision)
+        app = ToolApplication.load(app.session.store.root)
+        app.run(decision={'decision_id': decision['decision_id'], 'decision_response': 'accept'},
+            progress=lambda _: None)
+        contract = app.scientific.execution_contract
+        self.assertIsNotNone(contract)
+        condition, = contract['conditions']
+        app.run(actions=[action('measure_experiment', **condition['execution'], condition_id=condition['id']), stop],
+            progress=lambda _: None)
+        token = app.approval_token(app.state['pending']['call'])
+        app.run(approved_execution=token, progress=lambda _: None)
+        observed = app.session.store.read_json(app.state['turns'][-1]['tools'][0]['result'])
+        self.assertEqual(observed['status'], 'ok', observed.get('error'))
+        app.run(actions=[action('analyze_measurements', result_refs=[observed['data']['result_ref']]), stop],
+            progress=lambda _: None)
+        app.supply(supply_id='bind-writer', reason='Write about the completed approved measurement',
+            changes={'model': 'fixture'}, resource_allowances={'llm_requests': 2, 'total_tokens': 120000})
+        binding = app._report_inputs()
+        self.assertEqual(binding['evidence_contract'], 'execution.v1')
+        self.assertEqual(len(binding['measurement_refs']), 1)
+        self.assertEqual(len(binding['analysis_records']), 1)
+        app.run(actions=[action('compose_document', goal='Explain the actual local observation', title='Observed run'), stop],
+            progress=lambda _: None)
+        composed = app.session.store.read_json(app.state['turns'][-1]['tools'][0]['result'])
+        self.assertEqual(composed['status'], 'ok', composed.get('error'))
+        self.assertEqual(composed['data']['report_binding']['measurement_refs'], binding['measurement_refs'])
+        ledger = app.ledger.to_dict()
+        app.run(actions=[action('deliver_result', summary='Measured observation with explicit scope',
+            artifacts=[composed['data']['editable_markdown']])], progress=lambda _: None)
+        self.assertEqual(app.session.manifest.status, 'completed')
+        self.assertEqual(app.ledger.to_dict(), ledger)
+        self.assertEqual(sum(row.actual.get('process_invocations', 0) for row in app.ledger.entries), 1)
+        fake.chat_turn.assert_not_called()
+
     def test_caller_science_uses_common_approval_attempts_feedback_and_no_model(self):
         with _temporary_run() as root, patch('simple_ar.app.tool_application.LLMClient.from_env',
                 side_effect=AssertionError('Caller actions must not resolve model credentials')) as client:

@@ -1390,7 +1390,15 @@ code = "daily"
 
     def test_research_session_cli_builds_code_task_request_from_config(self) -> None:
         from simple_ar.app.tool_application import ToolApplication
-        from simple_ar.cli.main import _run_native_start
+        from simple_ar.tools.scientific import measurement_conditions
+        app = MagicMock()
+        app.run.return_value = {'status': 'completed'}
+        def capture_creation(root, goal, **options):
+            app.state = {'config': options, 'turns': [], 'pending': None}
+            return app
+        renderer = patch('simple_ar.cli.main._render_native_result')
+        renderer.start()
+        self.addCleanup(renderer.stop)
         # Current creation consumes canonical options; the old public Python
         # bridge remains compatible, but must not be a production middle layer.
         bridge = patch('simple_ar.experiment.code_task_bridge.spec.code_task_project_spec',
@@ -1449,24 +1457,26 @@ code = "daily"
                     f'baseline_policy="{policy}"\n' + declaration, encoding='utf-8')
                 with self.subTest(policy=policy, conditions=expected), \
                         patch('simple_ar.cli.main._optional_research_llm_client', return_value=object()), \
-                        patch('simple_ar.cli.main._run_native_start', wraps=_run_native_start) as native, \
                         patch('simple_ar.app.tool_application.ToolApplication.create', wraps=ToolApplication.create) as create, \
                         patch('simple_ar.app.tool_application.LLMClient.from_env', return_value=fake), \
+                        patch('subprocess.run') as process, \
                         patch('sys.stdin.isatty', return_value=False), \
                         patch('simple_ar.app.research_application.create_session') as old, \
                         contextlib.redirect_stdout(io.StringIO()):
-                    main(['research-session', '--config', str(public), '--topic', 'fixture research',
-                          '--model', 'fixture-model', '--no-report', '--output-root', str(root / 'sessions')])
+                    with self.assertRaisesRegex(SystemExit, 'Code task ended with status'):
+                        main(['research-session', '--config', str(public), '--topic', 'fixture research',
+                              '--model', 'fixture-model', '--no-report', '--output-root', str(root / 'sessions')])
                 old.assert_not_called()
-                native.assert_called_once()
                 create.assert_called_once()
                 fake.chat_turn.assert_called_once()
-                routed = native.call_args.args[0]
-                state = read_json(routed._native_root / 'actions.json')
-                self.assertEqual(state['config']['execution_contract'], routed._execution_contract)
+                process.assert_not_called()
+                routed = create.call_args.kwargs
+                state = read_json(create.call_args.args[0] / 'actions.json')
+                self.assertEqual(state['config']['execution_contract'], routed['execution_contract'])
                 self.assertEqual(len(state['turns']), 1)
+                self.assertIsNone(state['pending'])
                 fake.chat_turn.reset_mock()
-                rows = routed._execution_contract['conditions']
+                rows = routed['execution_contract']['conditions']
                 self.assertEqual([(row['role'], row['seed']) for row in rows], expected)
                 self.assertEqual([row['source'] for row in rows],
                     ['preparation' if role == 'baseline' else 'implementation' for role, _ in expected])
@@ -1475,15 +1485,14 @@ code = "daily"
                 self.assertTrue(all(row['execution']['cwd'] == str(project.resolve()) for row in rows))
                 self.assertTrue(all(row['execution']['timeout_sec'] == 7 for row in rows))
                 self.assertEqual(rows[0]['execution']['command'][0], str(Path(sys.executable).absolute()))
-                self.assertIn('Improve the fixture.', routed.request)
-                self.assertEqual(routed._code_task['validation_command'], ['python', 'benchmark.py'])
-                self.assertFalse(routed.approve_execution)
-                self.assertGreaterEqual(routed._task_attempt_limit, 20)
-                self.assertEqual(routed.source, [project.resolve()])
-                self.assertTrue(routed.allow_execution)
-                self.assertTrue(routed.yes)
-                self.assertEqual(routed._code_task['allowed_patterns'], ['**'])
-                self.assertEqual({key: routed._code_task['preparation'][key] for key in (
+                self.assertIn('Improve the fixture.', create.call_args.args[1])
+                self.assertEqual(routed['code_task']['validation_command'], ['python', 'benchmark.py'])
+                self.assertEqual(state['turns'][0]['tools'][0]['id'], 'clarify')
+                self.assertGreaterEqual(routed['max_attempts'], 20)
+                self.assertEqual(list(routed['sources'].values()), [project.resolve()])
+                self.assertTrue(routed['allow_execution'])
+                self.assertEqual(routed['code_task']['allowed_patterns'], ['**'])
+                self.assertEqual({key: routed['code_task']['preparation'][key] for key in (
                     'workspace_mode', 'max_file_bytes', 'workspace_include', 'workspace_exclude',
                     'workspace_reuse_source_venv', 'python_executable', 'max_repairs')},
                     {'workspace_mode': 'sparse_copy', 'max_file_bytes': 64,
@@ -1500,10 +1509,10 @@ code = "daily"
             self.assertEqual(execution['result_schema']['required_metrics'], ['accuracy'])
             self.assertEqual(execution['result_schema']['metric_directions'], {'accuracy': 'higher_is_better'})
             original_config = config.read_text()
-            for repairs, explicit, count, seconds in ((0, False, 1, 30), (1, False, 2, 60), (1, True, 0, 0)):
+            for repairs, explicit, count, seconds in ((0, False, 1, 7), (1, False, 2, 14), (1, True, 0, 0)):
                 with self.subTest(repairs=repairs, explicit=explicit), \
                         patch("simple_ar.cli.main._optional_research_llm_client", return_value=object()), \
-                        patch('simple_ar.cli.main._run_native_start') as native, \
+                        patch.object(ToolApplication, 'create', side_effect=capture_creation) as create, \
                         patch("simple_ar.app.research_application.create_session") as created, \
                         contextlib.redirect_stdout(io.StringIO()):
                     config.write_text(original_config + f"repair_rounds = {repairs}\n")
@@ -1511,12 +1520,12 @@ code = "daily"
                           "--model", "gpt-5.4", "--code-task-config", str(config), "--with-report",
                           *(["--process-invocations", "0", "--process-wall-seconds", "0"] if explicit else [])])
                     created.assert_not_called()
-                    routed = native.call_args.args[0]
-                    self.assertEqual(routed._process_limits, {'process_invocations': count, 'process_wall_seconds': seconds})
-                    self.assertEqual(routed._code_task['preparation']['max_repairs'], repairs)
-                    self.assertEqual(routed._report_requirement['method'], 'article')
-                    self.assertEqual(routed._report_requirement['config']['template'], 'auto')
-                    self.assertEqual(routed._report_requirement['config']['mode'], 'supplied_materials')
+                    routed = create.call_args.kwargs
+                    self.assertEqual(routed['process_limits'], {'process_invocations': count, 'process_wall_seconds': seconds})
+                    self.assertEqual(routed['code_task']['preparation']['max_repairs'], repairs)
+                    self.assertEqual(routed['report_requirement']['method'], 'article')
+                    self.assertEqual(routed['report_requirement']['config']['template'], 'auto')
+                    self.assertEqual(routed['report_requirement']['config']['mode'], 'supplied_materials')
             config.write_text(original_config)
             greenfield = root / "greenfield.toml"
             # Keep the source-less CLI branch here. Scaffold mode combinations
@@ -1535,25 +1544,25 @@ code = "daily"
                             ['--config', str(public), '--outputs', 'experiments']):
                 with self.subTest(greenfield_options=options), \
                         patch('simple_ar.cli.main._optional_research_llm_client', return_value=object()), \
-                        patch('simple_ar.cli.main._run_native_start') as native, \
+                        patch.object(ToolApplication, 'create', side_effect=capture_creation) as create, \
                         patch('simple_ar.app.research_application.create_session') as legacy, \
                         contextlib.redirect_stdout(io.StringIO()):
                     main(['research-session', '--topic', 'Create a project', '--model', 'fixture', *options])
                 legacy.assert_not_called()
-                native.assert_called_once()
-                routed = native.call_args.args[0]
-                exact = routed._code_task
+                create.assert_called_once()
+                routed = create.call_args.kwargs
+                exact = routed['code_task']
                 self.assertEqual(exact['project_path'], '')
-                self.assertEqual(routed.source, [])
+                self.assertEqual(list(routed['sources'].values()), [])
                 self.assertEqual(exact['preparation']['kind'], 'greenfield')
                 self.assertEqual(exact['preparation']['workspace_mode'], 'empty')
                 self.assertEqual(exact['allowed_patterns'], ['generated_project/**'])
                 self.assertEqual(exact['protected_patterns'], ['check.py'])
                 self.assertEqual(exact['validation_command'], ['python', 'generated_project/main.py'])
-                self.assertFalse(routed.approve_execution)
-                self.assertIsNone(routed._report_requirement)
+                self.assertNotIn('approve', app.run.call_args.kwargs)
+                self.assertIsNone(routed['report_requirement'])
                 if 'experiments' in options:
-                    self.assertEqual([row['source'] for row in routed._execution_contract['conditions']],
+                    self.assertEqual([row['source'] for row in routed['execution_contract']['conditions']],
                         ['implementation'])  # Generated candidate, without a suffix-based source heuristic.
             from simple_ar.cli.start import migrate_exact_code_creation
             config.write_text(original_config.replace('mode = "sparse_copy"', 'mode = "copy"')
@@ -1584,7 +1593,7 @@ code = "daily"
                         'check_command=["python","-c","import math"]\n' if environment else ''), encoding="utf-8")
                 with self.subTest(kind=kind, environment=environment), \
                         patch('simple_ar.cli.main._optional_research_llm_client', return_value=object()), \
-                        patch('simple_ar.cli.main._run_native_start') as native, \
+                        patch.object(ToolApplication, 'create', side_effect=capture_creation) as create, \
                         patch('simple_ar.app.research_application.create_session') as legacy, \
                         patch('subprocess.run') as process, contextlib.redirect_stdout(io.StringIO()):
                     main(['research-session', '--config', str(reproduction), '--outputs', 'experiments',
@@ -1592,67 +1601,69 @@ code = "daily"
                           *(['--process-invocations', '0', '--process-wall-seconds', '0'] if environment == 'venv' else [])])
                 legacy.assert_not_called()
                 process.assert_not_called()
-                native.assert_called_once()
-                routed = native.call_args.args[0]
-                formal = routed._execution_contract
-                selected = formal if kind == 'reproduction' else formal['conditions'][0]['execution']
+                create.assert_called_once()
+                routed = create.call_args.kwargs
+                formal = routed['execution_contract']
+                selected = measurement_conditions(formal)[0]['execution']
                 self.assertEqual(selected['cwd'], str(project.resolve()))
                 self.assertEqual(selected['result_schema'], execution['result_schema'])
                 self.assertEqual(selected['protocol']['dataset'], 'Fixed data')
                 if kind == 'reproduction':
-                    self.assertEqual(set(formal), {'command', 'cwd', 'timeout_sec', 'label', 'result_schema', 'protocol'})
-                    self.assertEqual(formal['command'], ['python', 'adapter.py'])
-                    self.assertEqual(formal['timeout_sec'], 11)
+                    self.assertEqual([row['source'] for row in formal['conditions']], ['implementation'])
+                    self.assertEqual(selected['command'], [str(Path(sys.executable).absolute()), 'adapter.py'])
+                    self.assertEqual(selected['timeout_sec'], 11)
                 else:
                     self.assertEqual([row['source'] for row in formal['conditions']], ['implementation'])
-                    self.assertEqual(routed._code_task['environment']['mode'], environment)
-                    self.assertEqual(routed._code_task['environment']['check_command'], ['python', '-c', 'import math'])
+                    self.assertEqual(routed['code_task']['environment']['mode'], environment)
+                    self.assertEqual(routed['code_task']['environment']['check_command'], ['python', '-c', 'import math'])
                     self.assertNotIn('environment', formal)
                     if environment == 'venv':
                         self.assertEqual(selected['command'], ['python', 'benchmark.py'])
-                self.assertEqual(routed._code_task['validation_command'], ['python', 'benchmark.py'])
-                self.assertEqual(routed._code_task['timeout_sec'], 7 if kind == 'reproduction' else 11)
-                self.assertEqual(routed._code_task['new_files'], ['adapter.py'])
-                self.assertNotIn('initial_files', routed._code_task)
-                self.assertNotIn('initial_files', routed._code_task['preparation'])
-                self.assertNotIn('new_files', routed._code_task['preparation'])
+                self.assertEqual(routed['code_task']['validation_command'], ['python', 'benchmark.py'])
+                self.assertTrue(routed['allow_execution'])
+                self.assertFalse(routed['allow_network'])
+                self.assertEqual(routed['code_task']['timeout_sec'], 7 if kind == 'reproduction' else 11)
+                self.assertEqual(routed['code_task']['new_files'], ['adapter.py'])
+                self.assertNotIn('initial_files', routed['code_task'])
+                self.assertNotIn('initial_files', routed['code_task']['preparation'])
+                self.assertNotIn('new_files', routed['code_task']['preparation'])
                 self.assertFalse((project / 'adapter.py').exists())
-                self.assertEqual(routed.source, [project.resolve(), task_file.resolve()])
-                self.assertEqual(routed._code_task['preparation']['workspace_mode'], 'copy')
-                self.assertEqual((routed.model, routed.max_turns, routed.max_tokens), ('fixture-model', 4, 10000))
+                self.assertEqual(list(routed['sources'].values()), [project.resolve(), task_file.resolve()])
+                self.assertEqual(routed['code_task']['preparation']['workspace_mode'], 'copy')
+                self.assertEqual((routed['model'], routed['max_turns'], routed['max_tokens']), ('fixture-model', 4, 10000))
                 if environment == 'current':
                     # Default allowance includes the check and a separate validator.
-                    self.assertGreaterEqual(routed._process_limits['process_invocations'], 3)
-                    self.assertGreaterEqual(routed._process_limits['process_wall_seconds'], 422)
+                    self.assertGreaterEqual(routed['process_limits']['process_invocations'], 3)
+                    self.assertGreaterEqual(routed['process_limits']['process_wall_seconds'], 422)
                 else:
-                    self.assertEqual(routed._process_limits, {'process_invocations': 0, 'process_wall_seconds': 0}
+                    self.assertEqual(routed['process_limits'], {'process_invocations': 0, 'process_wall_seconds': 0}
                         if environment == 'venv' else {'process_invocations': 3, 'process_wall_seconds': 30})
-                self.assertFalse(routed.approve_execution)
-                self.assertEqual(routed._report_requirement['config']['template'] if report else routed._report_requirement,
+                self.assertNotIn('approve', app.run.call_args.kwargs)
+                self.assertEqual(routed['report_requirement']['config']['template'] if report else routed['report_requirement'],
                                  'auto' if report else None)
                 if kind == 'reproduction':
-                    strict_formal = formal
+                    strict_formal = selected
             # The same public declarations also apply to code-only work.
             reproduction.write_text(reproduction.read_text().split('[execution.protocol]')[0]
                 .replace('outputs=["experiments"]', 'outputs=["code_task"]')
                 + '[execution.environment]\nmode="current"\ntimeout_sec=400\n'
                 'check_command=["python","-c","import math"]\n', encoding='utf-8')
             with patch('simple_ar.cli.main._optional_research_llm_client', return_value=object()), \
-                    patch('simple_ar.cli.main._run_native_start') as native, \
+                    patch.object(ToolApplication, 'create', side_effect=capture_creation) as create, \
                     patch('simple_ar.app.research_application.create_session') as legacy, \
                     patch('subprocess.run') as process, contextlib.redirect_stdout(io.StringIO()):
                 main(['research-session', '--config', str(reproduction)])
-            native.assert_called_once()
+            create.assert_called_once()
             legacy.assert_not_called()
             process.assert_not_called()
-            code_only = native.call_args.args[0]
-            self.assertIsNone(getattr(code_only, '_execution_contract', None))
-            self.assertEqual(code_only._code_task['environment']['mode'], 'current')
-            self.assertEqual(code_only._code_task['new_files'], ['adapter.py'])
-            self.assertEqual(code_only._code_task['validation_command'], ['python', 'benchmark.py'])
-            self.assertGreaterEqual(code_only._process_limits['process_invocations'], 2)
-            self.assertGreaterEqual(code_only._process_limits['process_wall_seconds'], 400 + code_only._code_task['timeout_sec'])
-            self.assertFalse(code_only.approve_execution)
+            code_only = create.call_args.kwargs
+            self.assertIsNone(code_only['execution_contract'])
+            self.assertEqual(code_only['code_task']['environment']['mode'], 'current')
+            self.assertEqual(code_only['code_task']['new_files'], ['adapter.py'])
+            self.assertEqual(code_only['code_task']['validation_command'], ['python', 'benchmark.py'])
+            self.assertGreaterEqual(code_only['process_limits']['process_invocations'], 2)
+            self.assertGreaterEqual(code_only['process_limits']['process_wall_seconds'], 400 + code_only['code_task']['timeout_sec'])
+            self.assertNotIn('approve', app.run.call_args.kwargs)
             formal = strict_formal
             # Reuse this normalized contract for boundaries, not a second runtime/fixture.
             prepared = {**formal, 'code_task': {**execution['code_task'],
@@ -1660,9 +1671,11 @@ code = "daily"
             arguments = dict(request='Check published conditions', outputs=('experiments',), sources=(),
                 root=root, limits={'llm_requests': 4, 'total_tokens': 10000,
                                   'process_invocations': 3, 'process_wall_seconds': 30})
-            declared = SimpleNamespace(task_kind='reproduction', model='fixture-model',
-                _explicit_resume_destinations={'cwd'})
-            with patch('simple_ar.cli.main._run_native_start') as native:
+            declared = build_parser().parse_args(['research-session', '--task-kind', 'reproduction',
+                '--topic', 'Check published conditions', '--model', 'fixture-model'])
+            declared._explicit_resume_destinations = {'cwd'}
+
+            with patch.object(ToolApplication, 'create', side_effect=capture_creation) as create:
                 # Verify this consumer invokes the shared validation gate; its
                 # type/timeout/independence matrix lives in TaskPlanTests.
                 with self.assertRaisesRegex(ValueError, 'validation_command'):
@@ -1675,8 +1688,10 @@ code = "daily"
                     migrate_exact_code_creation(declared, execution={**prepared, 'cwd': str(root.resolve())}, **arguments)
                 with self.assertRaisesRegex(ValueError, 'existing absolute directory'):
                     migrate_exact_code_creation(declared, execution={**prepared, 'cwd': str(root / 'missing')}, **arguments)
-                for extra in ({'pairs': []}, {'baseline_policy': 'paired'}):
+                for extra in ({'pairs': []}, {'baseline_policy': 'run'}):
                     self.assertFalse(migrate_exact_code_creation(declared, execution={**prepared, **extra}, **arguments))
+                with self.assertRaisesRegex(ValueError, 'baseline_policy'):
+                    migrate_exact_code_creation(declared, execution={**prepared, 'baseline_policy': 'paired'}, **arguments)
                 with self.assertRaises(ValueError):
                     migrate_exact_code_creation(declared, execution={**prepared,
                         'environment': {'mode': 'current'}}, **arguments)
@@ -1689,55 +1704,70 @@ code = "daily"
                     with self.subTest(initial_files=changes), self.assertRaises(ValueError):
                         migrate_exact_code_creation(declared, execution={**prepared,
                             'code_task': {**initial, **changes}}, **arguments)
-                self.assertFalse(migrate_exact_code_creation(SimpleNamespace(task_kind='auto'),
-                    execution=prepared, **arguments))  # Topic/paper names never grant this contract.
-                self.assertFalse(migrate_exact_code_creation(SimpleNamespace(task_kind='auto'),
+                ordinary = build_parser().parse_args(['research-session', '--task-kind', 'auto',
+                    '--topic', 'Check published conditions', '--model', 'fixture-model'])
+                no_model = build_parser().parse_args(['research-session', '--task-kind', 'auto',
+                    '--topic', 'Topic/paper names do not grant model execution'])
+                no_model.model = None
+                with self.assertRaisesRegex(ValueError, 'requires a model'):
+                    migrate_exact_code_creation(no_model, execution=prepared, **arguments)
+                self.assertFalse(migrate_exact_code_creation(ordinary,
                     execution={**prepared, 'baseline_policy': 'reuse'}, **arguments))
                 for mode, source in (('empty', None), ('empty', str(project)),
                         ('copy', None), ('sparse_copy', str(root / 'missing'))):
                     with self.subTest(baseline_without_source=(mode, source)):
-                        self.assertFalse(migrate_exact_code_creation(SimpleNamespace(task_kind='auto'), execution={**prepared,
-                            'baseline_policy': 'run', 'baseline': {'command': prepared['command']},
+                        declaration = {**prepared, 'baseline_policy': 'run',
+                            'baseline': {'command': prepared['command']},
                             'code_task': {**prepared['code_task'], 'kind': 'greenfield',
-                                'workspace_mode': mode, 'code_root': source}}, **arguments))
-                native.assert_not_called()
-                ordinary = SimpleNamespace(task_kind='auto', model='fixture-model')
+                                'workspace_mode': mode, 'code_root': source}}
+                        if mode == 'empty':
+                            self.assertFalse(migrate_exact_code_creation(ordinary, execution=declaration, **arguments))
+                        else:
+                            with self.assertRaises((ValueError, RuntimeError)):
+                                migrate_exact_code_creation(ordinary, execution=declaration, **arguments)
+                create.assert_not_called()
                 with contextlib.redirect_stdout(io.StringIO()):
                     self.assertTrue(migrate_exact_code_creation(ordinary, execution={**prepared,
                         'command': ['python', 'benchmark.py'], 'baseline_policy': 'skip'}, **arguments))
-                self.assertEqual([row['source'] for row in native.call_args.args[0]._execution_contract['conditions']],
+                self.assertEqual([row['source'] for row in create.call_args.kwargs['execution_contract']['conditions']],
                     ['implementation'])
-                native.reset_mock()
+                create.reset_mock()
                 with contextlib.redirect_stdout(io.StringIO()):
                     self.assertTrue(migrate_exact_code_creation(ordinary, execution={**prepared,
                         'command': ['python', 'benchmark.py'], 'baseline_policy': 'run',
                         'baseline': {'command': ['python', 'benchmark.py']},
                         'code_task': {**prepared['code_task'], 'kind': 'greenfield', 'workspace_mode': 'copy'}}, **arguments))
-                baseline, candidate = native.call_args.args[0]._execution_contract['conditions']
+                baseline, candidate = create.call_args.kwargs['execution_contract']['conditions']
                 self.assertEqual((baseline['source'], baseline['before_implementation']), ('preparation', True))
                 self.assertEqual(candidate['source'], 'implementation')
                 self.assertNotIn('before_implementation', candidate)
                 self.assertEqual(baseline['execution']['command'], candidate['execution']['command'])
-                self.assertFalse(native.call_args.args[0].approve_execution)
-                native.reset_mock()
+                self.assertNotIn('approve', app.run.call_args.kwargs)
+                create.reset_mock()
                 data = project / 'observations.tsv'
                 data.write_text('value\n1\n')
                 with contextlib.redirect_stdout(io.StringIO()):
                     self.assertTrue(migrate_exact_code_creation(declared, execution={**prepared,
                         'code_task': {**prepared['code_task'], 'workspace_mode': 'copy'}},
                         **{**arguments, 'sources': ({'role': 'dataset', 'locator': str(data)},)}))
-                self.assertEqual(native.call_args.args[0]._code_task['preparation']['data_inputs'], ['observations.tsv'])
-                native.reset_mock()
+                self.assertEqual(create.call_args.kwargs['code_task']['preparation']['data_inputs'], ['observations.tsv'])
+                create.reset_mock()
                 empty = {**prepared, 'cwd': str(root.resolve()), 'code_task': {**prepared['code_task'],
                     'kind': 'greenfield', 'workspace_mode': 'empty', 'code_root': None}}
                 with contextlib.redirect_stdout(io.StringIO()):
                     self.assertTrue(migrate_exact_code_creation(declared, execution=empty, **arguments))
-                native.assert_called_once()
-                self.assertEqual(native.call_args.args[0].source, [])
-                self.assertEqual(native.call_args.args[0]._code_task['project_path'], '')
-                self.assertEqual(native.call_args.args[0]._execution_contract['cwd'], str(root.resolve()))
+                create.assert_called_once()
+                self.assertEqual(list(create.call_args.kwargs['sources'].values()), [])
+                self.assertEqual(create.call_args.kwargs['code_task']['project_path'], '')
+                self.assertEqual(measurement_conditions(create.call_args.kwargs['execution_contract'])[0]['execution']['cwd'], str(root.resolve()))
 
     def test_research_case_uses_checked_in_configs_and_case_local_paths(self) -> None:
+        from simple_ar.app.tool_application import ToolApplication
+        app = MagicMock()
+        app.run.return_value = {'status': 'completed'}
+        def capture_creation(root, goal, **options):
+            app.state = {'config': options, 'turns': [], 'pending': None}
+            return app
         TEST_ROOT.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(dir=TEST_ROOT) as tmp:
             root = Path(tmp)
@@ -1774,35 +1804,80 @@ code = "daily"
             with (
                 patch("simple_ar.cli.main._optional_research_llm_client", return_value=object()),
                 patch("simple_ar.app.research_application.create_session") as old,
-                patch("simple_ar.cli.main._run_native_start") as native,
+                patch.object(ToolApplication, "create", side_effect=capture_creation) as create,
+                patch("simple_ar.cli.main._render_native_result"),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
                 main(["research-session", "--config", str(case / "research.toml")])
 
             old.assert_not_called()
-            routed = native.call_args.args[0]
-            execution = routed._execution_contract['conditions'][0]['execution']
+            create.assert_called_once()
+            app.run.assert_called_once()
+            self.assertNotIn('approve', app.run.call_args.kwargs)
+            self.assertEqual(app.state['config'], create.call_args.kwargs)
+            routed = create.call_args.kwargs
+            execution = routed['execution_contract']['conditions'][0]['execution']
             self.assertEqual(Path(execution["cwd"]), project)
             self.assertEqual(Path(execution["command"][0]), Path(sys.executable).absolute())
             self.assertEqual(Path(execution["command"][1]), case / "run.py")
             self.assertEqual(Path(execution["command"][3]), data)
-            self.assertIn(case / 'run.py', routed.source)
-            self.assertIn(checker, routed.source)
-            self.assertNotIn(case, routed.source)  # Explicit file, not its parent or all data directories.
+            self.assertIn(case / 'run.py', list(routed['sources'].values()))
+            self.assertIn(checker, list(routed['sources'].values()))
+            self.assertNotIn(case, list(routed['sources'].values()))  # Explicit file, not its parent or all data directories.
             from simple_ar.tools.workspace import WorkspaceToolGateway
             from simple_ar.tools.implementation import ImplementationToolGateway
             from simple_ar.core.budget import BudgetLedger
             (root / 'native').mkdir()
-            workspace = WorkspaceToolGateway(root / 'native', {f'source{i}': path
-                for i, path in enumerate(routed.source)}, BudgetLedger({}))
+            workspace = WorkspaceToolGateway(root / 'native', routed['sources'], BudgetLedger({}))
             owner = ImplementationToolGateway(root / 'native', workspace, workspace.ledger,
-                'fixture', 'path-binding', exact=routed._code_task, measurement=routed._execution_contract)
+                'fixture', 'path-binding', exact=routed['code_task'], measurement=routed['execution_contract'])
             bound = owner.approval_binding({}, identity='inspect-paths')
             self.assertIn(str(case / 'run.py'), bound['external_inputs'])
             import hashlib
             self.assertEqual(bound['external_inputs'][str(checker)], hashlib.sha256(checker.read_bytes()).hexdigest())
             with self.assertRaises(ValueError):
                 workspace.resolve(str(data))  # Directory access still needs an explicit material/data declaration.
+
+            # CLI paths are relative to the actual cwd; TOML paths already bind
+            # to the separate config directory. Same names must not hide a rebase.
+            caller = root / 'caller cwd'
+            caller.mkdir()
+            for name, content in (('paper.md', 'Caller paper bytes'), ('notes.md', 'Caller material bytes')):
+                (caller / name).write_text(content, encoding='utf-8')
+                (case / name).write_text('Different config-directory bytes: ' + content, encoding='utf-8')
+            public = (case / 'research.toml').resolve()
+            public.write_text(
+                '[task]\ngoal="Check declared conditions"\nkind="auto"\noutputs=["experiments"]\n'
+                '[model]\nname="fixture-model"\n[research]\nmaterials_only=true\n'
+                '[execution]\ncode_task_config="code_task.toml"\n'
+                f'cwd="{project.as_posix()}"\n'
+                'timeout_sec=5\nbaseline_policy="skip"\n'
+                '[execution.protocol]\nhypothesis="Declared claim"\ndataset="Fixed data"\n'
+                'expected_outcome="Compare measured accuracy"\n', encoding='utf-8')
+            app.reset_mock()
+            with (
+                contextlib.chdir(caller),
+                patch('simple_ar.cli.main._optional_research_llm_client', return_value=object()),
+                patch('simple_ar.app.research_application.create_session') as old,
+                patch.object(ToolApplication, 'create', side_effect=capture_creation) as create,
+                patch('simple_ar.cli.main._render_native_result'),
+                patch('subprocess.run') as process,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                main(['research-session', '--config', str(public),
+                      '--local-document', 'paper.md', '--material', 'notes.md'])
+            old.assert_not_called()
+            process.assert_not_called()
+            create.assert_called_once()
+            app.run.assert_called_once()
+            mounted = create.call_args.kwargs['sources']
+            for name in ('paper.md', 'notes.md'):
+                self.assertIn(caller / name, mounted.values())
+                self.assertNotIn(case / name, mounted.values())
+                alias = next(alias for alias, path in mounted.items() if path == caller / name)
+                self.assertEqual(Path(mounted[alias]).read_bytes(), (caller / name).read_bytes())
+                self.assertNotEqual(Path(mounted[alias]).read_bytes(), (case / name).read_bytes())
+                self.assertIn(alias, create.call_args.kwargs['research_policy']['materials'])
 
 
 
