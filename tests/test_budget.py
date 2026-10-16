@@ -14,6 +14,84 @@ from simple_ar.core.budget import (
 
 
 class BudgetLedgerTests(unittest.TestCase):
+    def test_temporary_floors_preserve_accounting_and_guard_each_reservation(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "budget.json"
+            ledger = BudgetLedger(
+                {"tokens": 30, "requests": 4, "uncertain": 10,
+                 "bounded": 10, "unlimited": None},
+                storage_path=path,
+            )
+            seed = ledger.reserve("seed", {"tokens": 4, "requests": 1})
+            ledger.settle("seed", {"tokens": 4, "requests": 1})
+            ledger.reserve("lost", {"uncertain": 2, "unlimited": 1})
+            ledger.mark_unknown("lost", reason="response lost")
+            ledger.reserve("bounded-lost", {"bounded": 4})
+            ledger.mark_unknown("bounded-lost", reason="timeout", retain_reservation=True)
+            baseline = ledger.to_dict()
+
+            with ledger.protect_remaining(
+                {"tokens": 10, "requests": 1, "uncertain": 2,
+                 "bounded": 3, "unlimited": 100, "unconfigured": 100},
+            ):
+                self.assertEqual(ledger.to_dict(), baseline)
+                self.assertEqual(ledger.remaining("tokens"), 16)
+                self.assertEqual(ledger.remaining("requests"), 2)
+                self.assertEqual(ledger.remaining("bounded"), 3)
+                self.assertIsNone(ledger.remaining("uncertain"))
+                self.assertIsNone(ledger.remaining("unlimited"))
+                self.assertIsNone(ledger.remaining("unconfigured"))
+                self.assertIs(ledger.reserve("seed", {"tokens": 4, "requests": 1}), seed)
+                with self.assertRaises(BudgetUnknownError):
+                    ledger.reserve("unknown-retry", {"uncertain": 1})
+                with self.assertRaises(BudgetExceededError):
+                    ledger.reserve("bounded-retry", {"bounded": 4})
+
+                with self.assertRaisesRegex(RuntimeError, "scope failure"):
+                    with ledger.protect_remaining({"tokens": 6, "requests": 2}):
+                        self.assertEqual(ledger.remaining("tokens"), 16)
+                        self.assertEqual(ledger.remaining("requests"), 1)
+                        work = ledger.reserve("work", {"tokens": 16, "requests": 1})
+                        self.assertEqual(ledger.remaining("tokens"), 0)
+                        self.assertEqual(ledger.remaining("requests"), 0)
+                        for retry in ("retry-1", "retry-2"):
+                            with self.assertRaises(BudgetExceededError):
+                                ledger.reserve(retry, {"tokens": 1, "requests": 1})
+                        self.assertIs(
+                            ledger.reserve("work", {"tokens": 16, "requests": 1}), work,
+                        )
+                        ledger.settle("work", {"tokens": 14, "requests": 1})
+                        raise RuntimeError("scope failure")
+
+                self.assertEqual(ledger.remaining("tokens"), 2)
+                self.assertEqual(ledger.remaining("requests"), 1)
+                with ledger.protect_remaining({"tokens": 12}):
+                    self.assertEqual(ledger.remaining("tokens"), 0)
+                self.assertEqual(ledger.remaining("tokens"), 2)
+                loaded = BudgetLedger.load(path)
+                self.assertEqual(loaded.to_dict(), ledger.to_dict())
+                self.assertEqual(loaded.remaining("tokens"), 12)
+                self.assertEqual(loaded.remaining("bounded"), 6)
+                self.assertEqual(loaded.unknown_dimensions(), ledger.unknown_dimensions())
+                self.assertEqual(ledger.entries[0].to_dict(), baseline["entries"][0])
+                ledger.reserve("unlimited-use", {"unlimited": 1000, "unconfigured": 1000})
+                ledger.authorize_remaining(
+                    "tokens", 8, authorization_id="allowance", reason="Explicit allowance",
+                )
+                self.assertEqual(ledger.limits["tokens"], 8)
+                self.assertEqual(ledger.remaining("tokens"), 0)
+                with self.assertRaises(BudgetExceededError):
+                    ledger.reserve("after-allowance", {"tokens": 1})
+
+            self.assertEqual(ledger.remaining("tokens"), 8)
+            self.assertEqual(ledger.remaining("requests"), 2)
+            self.assertEqual(ledger.remaining("bounded"), 6)
+            with self.assertRaisesRegex(RuntimeError, "outer failure"):
+                with ledger.protect_remaining({"tokens": 20}):
+                    self.assertEqual(ledger.remaining("tokens"), 0)
+                    raise RuntimeError("outer failure")
+            self.assertEqual(ledger.remaining("tokens"), 8)
+
     def test_unlimited_api_usage_survives_reload_with_unknown_calls(self):
         with TemporaryDirectory() as directory:
             path = Path(directory) / "budget.json"

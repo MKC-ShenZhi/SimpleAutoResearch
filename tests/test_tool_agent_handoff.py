@@ -4184,6 +4184,114 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         fake.chat_turn.assert_not_called()
         fake.ask_json.assert_not_called()
 
+    def test_native_shared_work_preserves_a_real_followup_decision(self) -> None:
+        from simple_ar.integrations.llm import LLMClient, LLMSettings
+        import httpx
+
+        for mode in ('review', 'retry', 'final_review', 'terminal_batch'):
+            with self.subTest(mode=mode):
+                _, _, app, _, arguments = self._writing_fixture()
+                app.state['config']['max_turns'] = 4
+                app.ledger.limits['llm_requests'] = 4
+                if mode in ('final_review', 'terminal_batch'):
+                    app.session.manifest.budget.max_attempts = 5 if mode == 'terminal_batch' else 4
+                app._save()
+                client = LLMClient(LLMSettings(api_key='fixture', model='fixture', api_mode='chat',
+                    retry_attempts=3, max_output_tokens=512))
+                def bound(attempt_id='', **_):
+                    return client.with_budget(app.ledger,
+                        session_id=app.session.manifest.session_id, attempt_id=attempt_id)
+                dispatched = []
+                draft_path = 'workspace/manuscripts/native-tool-0002/manuscript.md'
+                def provider(*args, **kwargs):
+                    number = len(dispatched)
+                    dispatched.append(number)
+                    if number == 0:
+                        message = self._native_message('compose_document', arguments, 'compose')
+                    elif mode == 'retry' and number in (1, 2):
+                        raise httpx.ReadError('Fixture peer closed connection')
+                    elif number == 1:
+                        return {'choices': [{'message': {'content': json.dumps({
+                            'draft_markdown': 'Cancellation propagates to owned sibling tasks [@P1].'})}}],
+                            'usage': {'prompt_tokens': 100, 'completion_tokens': 10, 'total_tokens': 110}}
+                    elif mode != 'retry' and number == 2:
+                        message = self._native_message('review_document', {**arguments,
+                            'prior_draft': draft_path, **({'delivery': {
+                                'summary': 'Explicit final inspection', 'artifacts': [draft_path]}}
+                                if mode == 'final_review' else {})}, 'inspect')
+                        if mode == 'terminal_batch':
+                            message['tool_calls'] += self._native_message('deliver_result', {
+                                'summary': 'Inspect and deliver this explicit batch', 'artifacts': [draft_path]}, 'deliver')['tool_calls']
+                    elif mode in ('final_review', 'terminal_batch'):
+                        return {'choices': [{'message': {'content': json.dumps({
+                            'section_reviews': [{'section_id': 'document', 'verdict': 'pass'}]})}}],
+                            'usage': {'prompt_tokens': 100, 'completion_tokens': 10, 'total_tokens': 110}}
+                    else:
+                        # The final decision must observe the real professional
+                        # stop; the ledger does not manufacture a delivery.
+                        observed = app.session.store.read_json(app.state['turns'][-1]['tools'][-1]['result'])
+                        self.assertEqual(observed['status'], 'error')
+                        self.assertIn('budget', observed['error'])
+                        message = self._native_message('deliver_result', {
+                            'summary': 'Available work; professional follow-up could not fit.',
+                            'artifacts': [draft_path] if mode == 'review' else [],
+                            'unresolved': ['Review incomplete' if mode == 'review' else 'Composition interrupted']}, 'deliver')
+                    return {'choices': [{'message': message}], 'usage': {
+                        'prompt_tokens': 100, 'completion_tokens': 10, 'total_tokens': 110}}
+                with patch.object(app, '_client', side_effect=bound), patch(
+                        'simple_ar.integrations.llm._call_openai_sdk', side_effect=provider) as request, patch(
+                        'simple_ar.integrations.llm.time.sleep'):
+                    status = app.run(progress=lambda _: None)
+                    self.assertEqual(status['status'], 'completed' if mode in ('final_review', 'terminal_batch') else 'partial', status['status_reason'])
+                self.assertEqual(request.call_count, 4)
+                self.assertEqual(len(app.ledger.entries), 4)
+                self.assertEqual(app.ledger.remaining('llm_requests'), 0)
+                self.assertEqual(sum(e.status == 'unknown' for e in app.ledger.entries), 2 if mode == 'retry' else 0)
+                self.assertEqual(app.session.store.read_json('delivery.json')['unresolved'],
+                    [] if mode in ('final_review', 'terminal_batch') else ['Review incomplete' if mode == 'review' else 'Composition interrupted'])
+                if mode != 'retry':
+                    self.assertIn('Cancellation propagates', app.workspace.resolve(draft_path).read_text())
+                before = app.ledger.to_dict()
+                restored = ToolApplication.load(app.session.store.root)
+                with patch.object(restored.gateway, 'call', side_effect=AssertionError('No tool replay')), \
+                        patch.object(restored, '_client', side_effect=AssertionError('No model replay')):
+                    self.assertEqual(restored.run(progress=lambda _: None)['status'],
+                        'completed' if mode in ('final_review', 'terminal_batch') else 'partial')
+                self.assertEqual(restored.ledger.to_dict(), before)
+
+    def test_native_attempt_space_is_reserved_without_faking_a_terminal_result(self) -> None:
+        for attempts in (1, 2, 3):
+            with self.subTest(attempts=attempts):
+                _, _, fake, _, app, _ = self._native_fixture()
+                app.session.manifest.budget.max_attempts = attempts
+                app.session.save()
+                fake.chat_turn.side_effect = [self._native_message('list_directory', {'path': 'workspace'}, 'inspect'),
+                    self._native_message('ask_user', {'question': 'More attempt space is needed to inspect inputs.'}, 'ask')]
+                original = app.workspace.call
+                def workspace(name, *args, **kwargs):
+                    self.assertNotEqual(name, 'list_directory', 'No ordinary work may consume terminal space')
+                    return original(name, *args, **kwargs)
+                with patch.object(app.workspace, 'call', side_effect=workspace) as work:
+                    status = app.run(progress=lambda _: None)
+                self.assertEqual(status['status'], 'paused')
+                self.assertFalse(app.session.store.exists('delivery.json'))
+                self.assertLessEqual(app.session.manifest.budget.attempts, attempts)
+                self.assertEqual(fake.chat_turn.call_count, max(0, attempts - 1))
+                self.assertEqual(work.call_count, int(attempts == 3))
+
+        # A pre-policy task keeps its declared admission behavior on reload;
+        # installing newer code does not silently rewrite its old contract.
+        _, _, fake, _, app, _ = self._native_fixture()
+        app.state['config'].pop('completion_policy')
+        app.session.manifest.budget.max_attempts = 2
+        app._save()
+        app = ToolApplication.load(app.session.store.root)
+        fake.chat_turn.side_effect = [self._native_message('list_directory', {'path': 'workspace'}, 'legacy-inspect')]
+        self.assertEqual(app.run(progress=lambda _: None)['status'], 'blocked')
+        self.assertNotIn('completion_policy', app.state['config'])
+        self.assertEqual(len(app.state['turns'][-1]['tools']), 1)
+        self.assertEqual(app.session.manifest.budget.attempts, 2)
+
     def test_native_unknown_and_unlimited_budget_context_preserves_accounting(self) -> None:
         _, _, fake, _, app, _ = self._native_fixture()
         # An unknown balance has the same context fallback, but still blocks

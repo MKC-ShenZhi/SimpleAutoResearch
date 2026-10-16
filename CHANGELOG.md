@@ -4,6 +4,10 @@
 
 User-visible changes, newest first. Entries describe behavior on their date; later entries may change or retire it. See [usage](docs/USAGE.md), [CLI](docs/CLI_REFERENCE.md), and [configuration](docs/CONFIG_REFERENCE.md) for current instructions.
 
+## 2026-10-17
+
+- New native tasks reserve a follow-up decision within the existing shared budget, including professional requests and retries. Explicit final-work delivery and historical contracts retain their original gates; exhausted work is not automatically marked complete.
+
 ## 2026-10-16
 
 - Native task contracts can be explicitly revised without resetting history or usage. Old approvals/results do not qualify changed conditions; report-only changes retain valid measurements. Fixed research/execution combinations use their declared obligations rather than the task label or autonomous mode, including summary and verified external-baseline inputs; historical run adoption remains with its original owner.

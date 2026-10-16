@@ -100,6 +100,8 @@ Summaries are views, not replacements for original records.
 Reports express results; they do not create them.
 Do not persist competing state solely for temporary context.
 
+New native tasks protect a follow-up decision within the same shared budget. The ledger's temporary spending floor applies to every nested provider reservation, including retries; it is not a charge, allowance or second ledger. The action owner records its serialized input/output estimate once per decision and reuses it for tool dispatch. Explicit final-work tools can spend their own remaining allowance because their result already passes the normal delivery gate. Attempt space is also reserved for a decision and terminal action. Historical tasks without this policy keep their saved contract. Protection preserves an opportunity, not guaranteed completion: future context or output may cost more than estimated, and absent explicit delivery the task remains incomplete.
+
 Structured scientific actions select their protocol and lineage, while the shared dispatch boundary binds the local backend, finite measurement budgets and attempt-scoped implementation services. Do not rebuild these in each baseline, supplement, revision or retry branch. Work-plan consumers use `task`, `steps`, `accepted_refs` and the session's attempts/budget; the unused nested `research_task_context.v1` duplicate is no longer emitted. Existing saved records are not rewritten. Experiment reports extend the literature projection's source identities rather than numbering citations or reinterpreting source metadata independently.
 
 ### Add or change a capability

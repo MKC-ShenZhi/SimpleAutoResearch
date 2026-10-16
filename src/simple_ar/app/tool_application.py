@@ -693,6 +693,7 @@ class ToolApplication:
             **({'runtime_dependencies': dependencies} if dependencies else {}),
             "feasibility_connection": feasibility_connection,
             "max_images": max_images,
+            "completion_policy": "protected_decision.v1",
             "max_turns": max_turns}
         if code_task is not None:
             config['code_task'] = code_task
@@ -862,6 +863,10 @@ class ToolApplication:
             # max_turns remains the initial allowance: the budget authorization
             # below accounts for newly authorized decisions exactly once.
             config['max_turns'] = old['max_turns']
+            # Supply changes the declared work, not a historical controller's
+            # spending policy. New tasks already carry the current policy.
+            if 'completion_policy' not in old:
+                config.pop('completion_policy', None)
             if old.get('source_snapshots'):
                 config['source_snapshots'] = {name: value for name, value in old['source_snapshots'].items()
                     if old['sources'][name] == config['sources'].get(name)}
@@ -1043,6 +1048,37 @@ class ToolApplication:
         capacity = max(0, allowance - sum(turn.get('origin') != 'caller' for turn in self.state['turns']))
         remaining = self.ledger.remaining('llm_requests')
         return capacity if remaining is None else min(capacity, remaining)
+
+    def _decision_tokens(self, client: Any, messages: list | None = None) -> int:
+        """Same serialized input/output reservation used by explicit retry."""
+        return (estimate_tokens(json.dumps(messages if messages is not None else
+                    self._messages(client=client), ensure_ascii=False))
+                + estimate_tokens(json.dumps(self.schemas, ensure_ascii=False))
+                + (client.effective_output_limit() or 0))
+
+    def _completion_floor(self, client: Any, messages: list | None = None) -> dict[str, int]:
+        if client is None or self.state['config'].get('completion_policy') != 'protected_decision.v1':
+            return {}
+        if messages is None and self.state['turns']:
+            # Reuse this decision's recorded reservation estimate instead of
+            # rebuilding history or resolving a second professional client for
+            # every read/coordination tool. This is an attempt fact, not memory.
+            path = str(Path(self.state['turns'][-1]['reply']).with_name('decision_budget.json'))
+            if self.session.store.exists(path):
+                estimate = self.session.store.read_json(path)['estimated_followup_tokens']
+                if type(estimate) is not int or estimate < 0:
+                    raise ValueError('Invalid retained decision reservation estimate')
+                return {'llm_requests': 1, 'total_tokens': estimate}
+        # A temporary spending policy, not a fake provider reservation or new
+        # allowance. Every nested physical call still uses this same ledger.
+        return {'llm_requests': 1, 'total_tokens': self._decision_tokens(client, messages)}
+
+    def _terminal_batch(self) -> bool:
+        """A fitting explicit terminal queue needs no later model decision."""
+        queued = self.state['turns'][-1].get('remaining', []) if self.state['turns'] else []
+        space = self.session.manifest.budget.max_attempts - self.session.manifest.budget.attempts
+        return bool(queued and len(queued) <= space and self._terminal_intent(queued[-1])
+            and sum(self._terminal_intent(call) for call in queued) == 1)
 
     @staticmethod
     def _history_observation(call: dict, result: dict, record: str) -> dict:
@@ -1238,8 +1274,14 @@ class ToolApplication:
                 "remaining": {name: self.ledger.remaining(name) for name in self.ledger.limits},
                 "unknown_usage": list(self.ledger.unknown_dimensions()),
                 "model_turns_remaining": remaining_requests,
+                "decision_budget": {
+                    "includes_current_decision": True,
+                    "provider_slots_after_one_attempt": max(0, remaining_requests - 1),
+                    "nested_provider_slots_after_decision_and_followup": max(0, remaining_requests - 2),
+                    "protected_followup_requests": int(config.get('completion_policy') == 'protected_decision.v1'),
+                    "scope": "Shared physical attempts, not completed actions. Professional selection, writing, review and retries also spend them. Protection is a follow-up opportunity, not guaranteed task completion."},
                 "semantics": {
-                    "llm_requests": "Shared provider attempts, including inspect_images and retries.",
+                    "llm_requests": "Shared physical provider attempts: decisions, professional selection/writing/review, inspect_images and retries.",
                     "total_tokens": "Model input/output, including image inputs to inspect_images.",
                     "image_requests": "Image generation/edit requests only; zero does not prohibit authorized inspection."},
                 "accounting": "Raw ledger limits are not permissions. Null means unlimited or unknown; consult unknown_usage. "
@@ -1496,14 +1538,28 @@ class ToolApplication:
 
     def _model(self, *, context: Any) -> CapabilityResult:
         client = self._client(context.attempt.attempt_id)
-        message = client.chat_turn(self._messages(client=client), tools=self.schemas,
-            label="native-turn", budget_call_id=context.attempt.attempt_id)
+        messages = self._messages(client=client)
+        floor = self._completion_floor(client, messages)
+        if floor:
+            context.store.write_json('decision_budget.json', {
+                'estimated_followup_tokens': floor['total_tokens'],
+                'scope': 'Current serialized decision input plus its output cap; estimate, not provider usage or guaranteed future context capacity.'})
+        remaining = self.ledger.remaining('total_tokens')
+        # A last affordable decision can deliver/question, but its retry must
+        # not steal a future decision while ordinary work is still affordable.
+        protect = bool(floor and self._request_capacity() > 1
+            and self.session.manifest.budget.max_attempts - self.session.manifest.budget.attempts > 2
+            and (remaining is None or remaining >= 2 * floor['total_tokens']))
+        with self.ledger.protect_remaining(floor if protect else {}):
+            message = client.chat_turn(messages, tools=self.schemas,
+                label="native-turn", budget_call_id=context.attempt.attempt_id)
         ref = context.store.write_json("native_result.json", message, kind="native_reply")
         return CapabilityResult(status="completed", artifacts=(ref,))
 
     def _tool(self, *, context: Any, call: dict[str, Any]) -> CapabilityResult:
+        client = None
         if self.state['config']['model'] is not None and not self._caller_takeover():
-            self._client(context.attempt.attempt_id)
+            client = self._client(context.attempt.attempt_id)
         try:
             arguments = json.loads(call["function"]["arguments"])
             if not isinstance(arguments, dict):
@@ -1512,6 +1568,10 @@ class ToolApplication:
             payload = {"status": "blocked", "error": f"Invalid tool arguments: {type(exc).__name__}"}
         else:
             terminal_error = self._terminal_error(call)
+            # A domain's explicit terminal operation already owns its actual
+            # result and delivery gate (e.g. final review/export). It needs no
+            # subsequent model decision, unlike an ordinary professional call.
+            floor = {} if self._terminal_batch() else self._completion_floor(client)
             if terminal_error:
                 result = ToolResult(tool_name=call['function']['name'], status='blocked',
                     error=terminal_error, data={'executed': False})
@@ -1536,11 +1596,13 @@ class ToolApplication:
                         and approval['token'] != self.approval_token(call)):
                     raise ValueError('Approved execution source or contract changed before execution')
                 else:
-                    result = self.gateway.call(ToolCall(tool_name=call['function']['name'],
-                        arguments=arguments, trace_id=context.attempt.attempt_id), context=context, approval=approval)
+                    with self.ledger.protect_remaining(floor):
+                        result = self.gateway.call(ToolCall(tool_name=call['function']['name'],
+                            arguments=arguments, trace_id=context.attempt.attempt_id), context=context, approval=approval)
             else:
-                result = self.gateway.call(ToolCall(tool_name=call["function"]["name"],
-                    arguments=arguments, trace_id=context.attempt.attempt_id))
+                with self.ledger.protect_remaining(floor):
+                    result = self.gateway.call(ToolCall(tool_name=call["function"]["name"],
+                        arguments=arguments, trace_id=context.attempt.attempt_id))
             payload = result.model_dump(mode="json")
             self._bind_delivery(call, payload, context.store)
         context.store.write_json("native_result.json", payload, kind="native_observation")
@@ -2299,8 +2361,7 @@ class ToolApplication:
         # effective cap as chat_turn. LLMClient still owns actual reservations
         # and each physical provider attempt, including its existing retries.
         tokens = self.ledger.remaining('total_tokens')
-        required = (cap + estimate_tokens(json.dumps(self._messages(client=client), ensure_ascii=False))
-                    + estimate_tokens(json.dumps(self.schemas, ensure_ascii=False)))
+        required = self._decision_tokens(client)
         if tokens is None or tokens < required:
             raise ValueError('Remaining token budget cannot cover the saved output cap and decision input')
         if self.session.manifest.status != 'running':
@@ -2435,14 +2496,27 @@ class ToolApplication:
 
     def _run(self, approved_execution: str, approve: Any, progress: Callable[[str], None]) -> None:
         caller_takeover = self._caller_takeover()
+        reserve_completion = (self.state['config'].get('completion_policy') == 'protected_decision.v1'
+            and self.state['config']['model'] is not None and not caller_takeover)
         while True:
             if self._commit_terminal(progress):
                 return
             pending = self.state["pending"]
             if pending is None:
                 turns = self.state["turns"]
+                attempt_space = self.session.manifest.budget.max_attempts - self.session.manifest.budget.attempts
                 if turns and turns[-1].get("remaining"):
                     call = turns[-1]["remaining"][0]
+                    if (reserve_completion
+                            and not self._terminal_intent(call)
+                            and not self._terminal_batch()
+                            and attempt_space <= 2):
+                        if attempt_space == 2:
+                            self._cancel_unstarted('Attempt space reserved for a final decision and explicit delivery/question; no operation executed')
+                            self._save()
+                            continue
+                        self.session.pause('Insufficient attempt space for ordinary work and a follow-up decision; unstarted work retained, not delivered')
+                        return
                     pending = {"kind": "tool", "call": call,
                         "attempt": self.session.allocate_attempt_id("native-tool")}
                 else:
@@ -2457,6 +2531,9 @@ class ToolApplication:
                     if self._request_capacity() <= 0:
                         self.session.pause("Shared model request allowance exhausted, including professional calls; "
                                            "existing artifacts are retained, not marked complete")
+                        return
+                    if reserve_completion and attempt_space < 2:
+                        self.session.pause('Need attempt space for a decision and its explicit terminal action; no model request sent')
                         return
                     pending = {"kind": "model", "attempt": self.session.allocate_attempt_id("native-turn")}
                 self.state["pending"] = pending

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import math
@@ -121,6 +122,33 @@ class BudgetLedger:
         self.storage_path = Path(storage_path) if storage_path is not None else None
         self._entries: dict[str, BudgetEntry] = {}
         self._lock = threading.RLock()
+        self._remaining_protections: dict[object, dict[str, BudgetNumber]] = {}
+
+    @contextmanager
+    def protect_remaining(self, amounts: Mapping[str, BudgetNumber]) -> Iterator[None]:
+        """Temporarily withhold capacity from new reservations on this ledger.
+
+        Active scopes protect the maximum requested floor per dimension.
+        Floors are in-memory only: they neither grant capacity nor change
+        accounting, unknown consumption, or unlimited dimensions. The lock
+        guards scope changes, not the caller's entire context body.
+        """
+
+        normalized = _normalize_amounts(amounts, field="protection")
+        token = object()
+        with self._lock:
+            self._remaining_protections[token] = normalized
+        try:
+            yield
+        finally:
+            with self._lock:
+                del self._remaining_protections[token]
+
+    def _remaining_floor(self, dimension: str) -> BudgetNumber:
+        return max(
+            (amounts.get(dimension, 0) for amounts in self._remaining_protections.values()),
+            default=0,
+        )
 
     @property
     def entries(self) -> tuple[BudgetEntry, ...]:
@@ -364,7 +392,7 @@ class BudgetLedger:
         return entries[start:]
 
     def remaining(self, dimension: str) -> BudgetNumber | None:
-        """Return finite remaining capacity, or ``None`` when unlimited/unknown."""
+        """Return spendable capacity after floors, or ``None`` if unlimited/unknown."""
 
         dimension = _required_text(dimension, "dimension")
         with self._lock:
@@ -373,7 +401,10 @@ class BudgetLedger:
                 return None
             if self._has_unknown(dimension):
                 return None
-            remaining = limit - self._committed(dimension) - self._reserved(dimension)
+            remaining = (
+                limit - self._committed(dimension) - self._reserved(dimension)
+                - self._remaining_floor(dimension)
+            )
             return max(0, remaining)
 
     def unknown_dimensions(self) -> tuple[str, ...]:
@@ -451,7 +482,10 @@ class BudgetLedger:
             )
         if amount == 0:
             return
-        available = limit - self._committed(dimension) - self._reserved(dimension)
+        available = (
+            limit - self._committed(dimension) - self._reserved(dimension)
+            - self._remaining_floor(dimension)
+        )
         if amount > available:
             raise BudgetExceededError(
                 f"Budget exceeded for {dimension!r}: requested {amount}, remaining {max(0, available)}"
