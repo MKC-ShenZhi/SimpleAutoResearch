@@ -200,7 +200,11 @@ class SourceToolGateway:
                  registry: SearchProviderRegistry | None = None,
                  client_factory: Callable[[str], Any] | None = None,
                  feasibility_client_factory: Callable[[str], Any] | None = None,
-                 execution_contract: dict[str, Any] | None = None) -> None:
+                 execution_contract: dict[str, Any] | None = None,
+                 authority_revision: int = 0) -> None:
+        if type(authority_revision) is not int or authority_revision < 0:
+            raise ValueError('Source authority revision must be a nonnegative integer')
+        self.authority_revision = authority_revision
         self.root, self.workspace, self.ledger = root, workspace, ledger
         self.policy = (SourcePolicy(max_results=20) if policy is None
             else SourcePolicy.model_validate(policy)).model_copy(deep=True)
@@ -430,6 +434,7 @@ class SourceToolGateway:
             inventory = (self.workspace.bind_inventory(self.workspace.resolve(source_locator), identity=identity)
                 if request.operation == 'design' and source_locator else None)
             binding = {'tool': name, 'request': request.model_dump(mode='json'),
+                **self._revision_fields(),
                 'policy': self.policy.model_dump(mode='json'),
                 'inputs': {**{str(path): self._digest(path) for path in inputs}, **{
                     str(self.workspace.resolve(path)): digest for path, digest in (inventory or {}).get('file_hashes', {}).items()}}}
@@ -517,8 +522,9 @@ class SourceToolGateway:
                     if not policy.providers:
                         raise ValueError('Collection needs configured providers or materials')
                     queries = policy.queries or (tuple(plan.source_plan.queries) if plan else (request.question,))
-                    collections = sum(json.loads(path.read_text(encoding='utf-8')).get('tool') == 'research_collect'
-                        for path in (self.root / 'attempts').glob('*/source_request.json'))
+                    collections = sum(binding.get('tool') == 'research_collect'
+                        for _, binding in self._source_requests()
+                        if self._record_revision(binding) == self.authority_revision)
                     if collections > 1 + policy.max_iterations:
                         raise ValueError('Research collection iteration limit reached; initial collection plus configured followups only')
                     count = len(queries) * len(policy.providers)
@@ -687,6 +693,7 @@ class SourceToolGateway:
                 protocol_record=f'records/{identity}/frozen_protocol.json',
                 protocol_sha256=self._digest(context.store.resolve('frozen_protocol.json')))
             decision = {'decision_id': identity + ':' + data['protocol_sha256'],
+                **self._revision_fields(),
                 'design_record': data['design_record'], 'protocol_record': data['protocol_record'],
                 'protocol_sha256': data['protocol_sha256'],
                 'design_sha256': self._digest(context.store.resolve('research_design.json'))}
@@ -711,20 +718,51 @@ class SourceToolGateway:
         return json.dumps(value, ensure_ascii=False, sort_keys=True,
             separators=(',', ':'), allow_nan=False).encode('utf-8')
 
-    def _design_requests(self) -> list[Path]:
-        return [path for path in (self.root / 'attempts').glob('*/source_request.json')
-            if json.loads(path.read_text(encoding='utf-8'))['request']['operation'] == 'design']
+    def _revision_fields(self) -> dict[str, int]:
+        # Missing is the original v0 wire format, including its hashed identities.
+        return {'authority_revision': self.authority_revision} if self.authority_revision else {}
 
-    def _caller_protocol_files(self) -> tuple[Path, dict[str, bytes], dict[str, Any]]:
-        if self._caller_contract_snapshot is None or self._declared_execution_contract is None:
-            raise ValueError('Caller protocol requires the scientific owner fixed execution contract')
-        if (self._protocol_bytes(self._declared_execution_contract) != self._caller_contract_snapshot
-                or self._protocol_bytes(self.policy.model_dump(mode='json')) != self._caller_policy_snapshot):
-            raise ValueError('Caller execution contract or original policy changed')
-        binding = {'proposal_kind': 'caller_execution_protocol',
-            'provenance': 'caller-provided-not-research-design',
-            'execution_contract': json.loads(self._caller_contract_snapshot),
-            'policy': json.loads(self._caller_policy_snapshot)}
+    def _record_revision(self, record: dict[str, Any]) -> int:
+        if not isinstance(record, dict):
+            raise ValueError('Source authority record must be an object')
+        revision = record.get('authority_revision', 0)
+        if type(revision) is not int or revision < 0 or revision > self.authority_revision:
+            raise ValueError('Malformed or future source authority revision')
+        return revision
+
+    def _source_requests(self) -> list[tuple[Path, dict[str, Any]]]:
+        rows = []
+        for path in (self.root / 'attempts').glob('*/source_request.json'):
+            binding = json.loads(path.read_text(encoding='utf-8'))
+            self._record_revision(binding)
+            rows.append((path, binding))
+        return rows
+
+    def _design_requests(self) -> list[Path]:
+        return [path for path, binding in self._source_requests()
+            if self._record_revision(binding) == self.authority_revision
+            and binding['request']['operation'] == 'design']
+
+    def _caller_protocol_files(self, binding: dict[str, Any] | None = None
+                               ) -> tuple[Path, dict[str, bytes], dict[str, Any]]:
+        if binding is None:
+            if self._caller_contract_snapshot is None or self._declared_execution_contract is None:
+                raise ValueError('Caller protocol requires the scientific owner fixed execution contract')
+            if (self._protocol_bytes(self._declared_execution_contract) != self._caller_contract_snapshot
+                    or self._protocol_bytes(self.policy.model_dump(mode='json')) != self._caller_policy_snapshot):
+                raise ValueError('Caller execution contract or original policy changed')
+            binding = {'proposal_kind': 'caller_execution_protocol',
+                'provenance': 'caller-provided-not-research-design',
+                'execution_contract': json.loads(self._caller_contract_snapshot),
+                'policy': json.loads(self._caller_policy_snapshot), **self._revision_fields()}
+        revision = self._record_revision(binding)
+        if (set(binding) - {'proposal_kind', 'provenance', 'execution_contract', 'policy', 'authority_revision'}
+                or binding.get('proposal_kind') != 'caller_execution_protocol'
+                or binding.get('provenance') != 'caller-provided-not-research-design'
+                or not isinstance(binding.get('execution_contract'), dict)
+                or not isinstance(binding.get('policy'), dict)):
+            raise ValueError('Invalid retained caller protocol binding')
+        protocol_bytes = self._protocol_bytes(binding['execution_contract'])
         request_bytes = self._protocol_bytes(binding)
         identity = hashlib.sha256(request_bytes).hexdigest()
         directory = self.root / 'inputs' / 'caller-protocols' / identity
@@ -732,13 +770,14 @@ class SourceToolGateway:
                 for path in (directory, directory.parent, directory.parent.parent)):
             raise ValueError('Caller protocol must remain in the actual session inputs directory')
         decision = {'proposal_kind': binding['proposal_kind'], 'provenance': binding['provenance'],
-            'decision_id': identity + ':' + hashlib.sha256(self._caller_contract_snapshot).hexdigest(),
+            **({'authority_revision': revision} if revision else {}),
+            'decision_id': identity + ':' + hashlib.sha256(protocol_bytes).hexdigest(),
             'protocol_record': str((directory / 'frozen_protocol.json').resolve()),
-            'protocol_sha256': hashlib.sha256(self._caller_contract_snapshot).hexdigest(),
+            'protocol_sha256': hashlib.sha256(protocol_bytes).hexdigest(),
             'request_record': str((directory / 'caller_request.json').resolve()),
             'request_sha256': identity}
         return directory, {'caller_request.json': request_bytes,
-            'frozen_protocol.json': self._caller_contract_snapshot,
+            'frozen_protocol.json': protocol_bytes,
             'protocol_decision.json': self._protocol_bytes(decision)}, decision
 
     def declare_execution_protocol(self) -> dict[str, Any]:
@@ -792,9 +831,14 @@ class SourceToolGateway:
                 paths.append(directory / 'protocol_decision.json')
         for path in sorted(paths, key=lambda item: item.stat().st_mtime_ns):
             decision = json.loads(path.read_text(encoding='utf-8'))
+            revision = self._record_revision(decision)
             protocol = self._decision_protocol(path, decision)
             if path.parent.parent == caller_root:
-                directory, files, expected = self._caller_protocol_files()
+                binding = json.loads((path.parent / 'caller_request.json').read_text(encoding='utf-8'))
+                if self._record_revision(binding) != revision:
+                    raise ValueError('Caller request and decision authority revisions differ')
+                directory, files, expected = self._caller_protocol_files(
+                    binding if revision != self.authority_revision else None)
                 if directory != path.parent or decision != expected:
                     raise ValueError('Caller protocol differs from the fixed scientific contract or policy')
                 if any(item.is_symlink() or not item.is_file() for item in directory.iterdir()):
@@ -809,9 +853,15 @@ class SourceToolGateway:
                     raise ValueError('Design decision origin changed')
                 receipt = json.loads((path.parent / 'source_result.json').read_text(encoding='utf-8'))
                 binding = json.loads((path.parent / 'source_request.json').read_text(encoding='utf-8'))
+                if self._record_revision(binding) != revision:
+                    raise ValueError('Design request and decision authority revisions differ')
                 if binding['request']['operation'] != 'design':
                     raise ValueError('Protocol decision has no actual design request')
-                if any(self._digest(Path(item)) != digest for item, digest in binding['inputs'].items()):
+                # Archived external sources may be replaced. Retained attempt
+                # artifacts still belong to their original immutable evidence.
+                if any(self._digest(Path(item)) != digest for item, digest in binding['inputs'].items()
+                        if revision == self.authority_revision
+                        or Path(item).absolute().is_relative_to((self.root / 'attempts').absolute())):
                     raise ValueError('Design source inputs changed; protocol decision is stale')
                 design = self.workspace.resolve(decision['design_record'])
                 if design.resolve() != (path.parent / 'research_design.json').resolve():
@@ -825,10 +875,12 @@ class SourceToolGateway:
             response_path = path.parent / 'protocol_response.json'
             if response_path.exists():
                 response = json.loads(response_path.read_text(encoding='utf-8'))
-                if (any(response.get(key) != value for key, value in decision.items())
+                if (self._record_revision(response) != revision
+                        or any(response.get(key) != value for key, value in decision.items())
                         or response.get('decision_response') not in {'accept', 'reject', 'revise'}):
                     raise ValueError('Protocol response identity changed; decision is stale')
-            rows.append((path, decision))
+            if revision == self.authority_revision:
+                rows.append((path, decision))
         return rows
 
     def pending_decision(self) -> dict[str, Any] | None:
@@ -874,7 +926,8 @@ class SourceToolGateway:
             directory = self.root / 'attempts' / identity
             saved = json.loads((directory / 'source_result.json').read_text(encoding='utf-8'))
             binding = json.loads((directory / 'source_request.json').read_text(encoding='utf-8'))
-            return (binding['tool'] == name and binding['policy'] == self.policy.model_dump(mode='json')
+            return (self._record_revision(binding) == self.authority_revision
+                and binding['tool'] == name and binding['policy'] == self.policy.model_dump(mode='json')
                 and all(self._digest(Path(path)) == digest for path, digest in {**binding['inputs'], **saved['hashes']}.items())
                 and not any(row.attempt_id == identity and row.status in {'reserved', 'unknown'} for row in self.ledger.entries))
         except (OSError, ValueError, KeyError, TypeError):
@@ -938,8 +991,7 @@ class SourceToolGateway:
             and {'command', 'cwd', 'timeout_sec', 'result_schema'}.issubset(boundary)
             and any(key in boundary for key in ('baseline_policy', 'baseline', 'pairs'))) else None
 
-    @staticmethod
-    def _execution_contract(execution: dict[str, Any]) -> dict[str, Any]:
+    def _execution_contract(self, execution: dict[str, Any]) -> dict[str, Any]:
         """Use the scientific owner's existing declaration normalization."""
         from simple_ar.tools.scientific import freeze_measurement_set, measurement_contract, measurement_conditions
         execution = dict(execution)
@@ -952,6 +1004,18 @@ class SourceToolGateway:
             contract = freeze_measurement_set(execution)
         else:
             contract = measurement_contract(execution)
+        if self._declared_execution_contract is not None:
+            # Creation snapshots external baseline bytes. A design may retain
+            # the caller's original locator; bind it to that SAME saved result,
+            # never ignore reuse identity when comparing physical conditions.
+            declared = {row['id']: row for row in measurement_conditions(self._declared_execution_contract)}
+            for row in measurement_conditions(contract):
+                expected = declared.get(row['id'], {})
+                if 'reuse_ref' in row and expected.get('reuse_sha256'):
+                    if (row.get('reuse_sha256', expected['reuse_sha256']) != expected['reuse_sha256']
+                            or self._digest(self.workspace.resolve(row['reuse_ref'])) != expected['reuse_sha256']):
+                        raise ValueError('Design baseline differs from the retained measurement evidence')
+                    row.update(reuse_ref=expected['reuse_ref'], reuse_sha256=expected['reuse_sha256'])
         if comparison and {row['role'] for row in measurement_conditions(contract)} != {'baseline', 'candidate'}:
             raise ValueError('Requested comparison has no explicit executable baseline/condition set')
         return contract
@@ -993,7 +1057,10 @@ class SourceToolGateway:
         issues = self.execution_issues()
         try:
             if self.policy.require_summary:
-                summaries = list((self.root / 'attempts').glob('*/research_summary.json'))
+                summaries = [path.parent / 'research_summary.json' for path, binding in self._source_requests()
+                    if self._record_revision(binding) == self.authority_revision
+                    and binding['request']['operation'] == 'summary'
+                    and (path.parent / 'research_summary.json').exists()]
                 valid = False
                 for path in summaries:
                     receipt = json.loads((path.parent / 'source_result.json').read_text(encoding='utf-8'))

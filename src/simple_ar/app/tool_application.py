@@ -300,7 +300,7 @@ class ToolApplication:
             research_inputs=lambda: self.sources.implementation_evidence(),
             candidate_outputs=lambda record: scientific['scientific'].candidate_outputs(record) if scientific else {},
             measurement_inputs=lambda origin, required: scientific['scientific'].implementation_inputs([
-                observed['data']['result_ref'] for turn in self.state['turns'] for item in turn['tools']
+                observed['data']['result_ref'] for turn in self._evidence_turns('scientific') for item in turn['tools']
                 if (observed := self.session.store.read_json(item['result'])).get('tool_name') == 'measure_experiment'
                 and observed.get('status') == 'ok'], origin, required=required),
             measurement=config.get('execution_contract') if config.get('code_task') is not None else None)
@@ -310,11 +310,16 @@ class ToolApplication:
                 self.ledger, controller.manifest.session_id,
                 implementation=self.implementation if config.get('scientific_lineage', False) else None,
                 execution_contract=config.get('execution_contract'),
+                current_attempts=lambda: {Path(item['result']).parent.name
+                    for turn in self._evidence_turns('scientific') for item in turn['tools']
+                    if item['result'].startswith('attempts/')} | (
+                        {self.state['pending']['attempt']} if self.state['pending'] else set()),
                 research_contract=lambda: self.sources.accepted_execution_contract(),
                 research_requirements=lambda: self.sources.execution_issues())
         self.scientific = scientific.get('scientific')
         self.sources = SourceToolGateway(controller.store.root, self.workspace, self.ledger,
             policy=config.get('research_policy'),
+            authority_revision=config.get('authority_revision', 0),
             execution_contract=config.get('execution_contract'),
             client_factory=(lambda identity: self._client(identity, purpose='task', native=False))
                 if config['model'] is not None else None,
@@ -402,7 +407,7 @@ class ToolApplication:
         locator. This is a projection, not persisted diagnosis or retry state.
         """
         latest = failure = None
-        for turn in reversed(self.state['turns']):
+        for turn in reversed(self._evidence_turns('implementation')):
             reply = self.session.store.read_json(turn['reply'])
             calls = {call['id']: call for call in reply.get('tool_calls', [])}
             for item in reversed(turn['tools']):
@@ -758,19 +763,20 @@ class ToolApplication:
         self.session.save()
 
     def supply(self, *, supply_id: str, reason: str, changes: dict[str, Any],
-               resource_allowances: dict[str, int | float] | None = None) -> dict[str, Any]:
-        """Caller-only completion of missing contracts; not a retry or model tool.
+               resource_allowances: dict[str, int | float] | None = None,
+               replace_existing: bool = False) -> dict[str, Any]:
+        """Record caller contracts, optionally replacing them with explicit intent.
 
-        Existing contracts and source aliases are immutable here. Their feedback
-        or historical revision protocols still own changes to executed work.
+        Ordinary supply only fills missing contracts. Explicit replacement keeps
+        old facts and approvals as history, not authority for the new conditions.
         The single actions journal owns this supply and its previous config;
         resources use the original idempotent ledger authorization, not a reset.
         """
         with self.session.mutation_scope():
             if (not isinstance(supply_id, str) or not supply_id.strip()
                     or not isinstance(reason, str) or not reason.strip()
-                    or not isinstance(changes, dict) or not changes):
-                raise ValueError('Supply requires a stable id, reason and explicit missing contracts')
+                    or not isinstance(changes, dict) or not changes or type(replace_existing) is not bool):
+                raise ValueError('Supply requires a stable id, reason, explicit contracts and a boolean replacement choice')
             supply_id, reason = supply_id.strip(), reason.strip()
             fields = {'model', 'sources', 'allow_execution', 'allow_network', 'code_task',
                 'execution_contract', 'research_policy', 'table_analysis', 'report_requirement', 'max_output_tokens'}
@@ -788,12 +794,16 @@ class ToolApplication:
             supplied = json.loads(json.dumps(supplied, ensure_ascii=False, allow_nan=False))
             terms = {'supply_id': supply_id, 'reason': reason, 'changes': supplied,
                 'resource_allowances': dict(resource_allowances or {})}
+            if replace_existing:
+                terms['replace_existing'] = True
             interrupted = self.state.get('pending_supply')
-            if interrupted is not None and any(interrupted[key] != value for key, value in terms.items()):
+            if interrupted is not None and (interrupted.get('replace_existing', False) != replace_existing
+                    or any(interrupted.get(key) != value for key, value in terms.items())):
                 raise ValueError('Finish the retained supply with its original id and terms before supplying different contracts')
             previous = next((row for row in self.state.get('supplies', []) if row['supply_id'] == supply_id), None)
             if previous is not None:
-                if any(previous[key] != value for key, value in terms.items()):
+                if (previous.get('replace_existing', False) != replace_existing
+                        or any(previous.get(key) != value for key, value in terms.items())):
                     raise ValueError('Supply id already exists with different terms')
                 return previous
             if any(row.status == 'running' for row in self.session.list_attempts()) or any(
@@ -808,15 +818,16 @@ class ToolApplication:
                 raise ValueError('Restore unchanged runtime dependencies before supplying new contracts')
             for name, value in supplied.items():
                 if name == 'sources':
-                    if any(alias in old['sources'] and old['sources'][alias] != path for alias, path in value.items()):
+                    if not replace_existing and any(alias in old['sources'] and old['sources'][alias] != path for alias, path in value.items()):
                         raise ValueError('Supply cannot replace an existing source alias')
                 elif name in {'allow_execution', 'allow_network'}:
-                    if type(value) is not bool or old.get(name, False) and not value:
+                    if type(value) is not bool or not replace_existing and old.get(name, False) and not value:
                         raise ValueError('Supply access is an explicit additional grant, not revocation')
                 elif name == 'model' and old.get(name) is not None and old[name] != value:
                     raise ValueError(f'{name} is already frozen; use its existing feedback/revision contract')
             candidate = {**old, **supplied,
-                'sources': {**old['sources'], **supplied.get('sources', {})}}
+                'sources': supplied['sources'] if replace_existing and 'sources' in supplied else
+                    {**old['sources'], **supplied.get('sources', {})}}
             allowances = terms['resource_allowances']
             first_model = old['model'] is None and candidate['model'] is not None
             if first_model and (type(allowances.get('llm_requests')) is not int or allowances['llm_requests'] < 1
@@ -834,8 +845,12 @@ class ToolApplication:
                 report_requirement=candidate.get('report_requirement'), max_output_tokens=candidate.get('max_output_tokens'),
                 max_attempts=self.session.manifest.budget.max_attempts, retained=True, services=self.services)
             for name in fields - {'model', 'sources', 'allow_execution', 'allow_network'}:
-                if old.get(name) is not None and old[name] != config.get(name):
+                if not replace_existing and old.get(name) is not None and old[name] != config.get(name):
                     raise ValueError(f'{name} is already frozen; use its existing feedback/revision contract')
+                if name in supplied and supplied[name] is None:
+                    config[name] = None  # Explicit removal must not resurrect the old optional contract on merge.
+            if 'report_requirement' in supplied and supplied['report_requirement'] is None:
+                config['report_evidence_contract'] = None
             for name in ('model_connection', 'vision_connection', 'feasibility_connection'):
                 if old.get(name) is not None:
                     if not model_connections_compatible(old[name], config.get(name) or {}):
@@ -845,8 +860,14 @@ class ToolApplication:
             # below accounts for newly authorized decisions exactly once.
             config['max_turns'] = old['max_turns']
             if old.get('source_snapshots'):
-                config['source_snapshots'] = old['source_snapshots']
+                config['source_snapshots'] = {name: value for name, value in old['source_snapshots'].items()
+                    if old['sources'][name] == config['sources'].get(name)}
+            scope_fields = {'sources', 'research_policy', 'execution_contract', 'code_task', 'table_analysis'}
+            if (any(old.get(name) != config.get(name) for name in scope_fields)
+                    or replace_existing and 'sources' in supplied):
+                config['authority_revision'] = old.get('authority_revision', 0) + 1
             terms['previous_config'] = old
+            terms['request_count'] = len(self.state['requests']) + 1
             if allowances:
                 self.ledger.validate_remaining(allowances, authorization_id=supply_id, reason=reason)
                 check = BudgetState.from_dict(self.session.manifest.budget.to_dict())
@@ -872,12 +893,27 @@ class ToolApplication:
             self.state['config'] = {**old, **config}
             self.state.pop('pending_supply', None)
             self.state.setdefault('supplies', []).append(terms)
-            self.state['requests'].append('Caller supplied missing task contracts: ' + reason)
+            self.state['requests'].append(('Caller explicitly replaced task contracts: ' if replace_existing else
+                'Caller supplied missing task contracts: ') + reason)
             if self.session.manifest.status not in {'created', 'running'}:
                 self.session.continue_with_revision(reason)
             self._save()
             self._configure_tools()
             return terms
+
+    def _evidence_turns(self, domain: str) -> list[dict[str, Any]]:
+        """Current contract applicability, derived from the one supply journal.
+
+        Old records remain readable history. Report-only feedback does not retire
+        measurements; changing their actual execution contract does.
+        """
+        fields = {'scientific': {'execution_contract', 'code_task'}, 'implementation': {'code_task'},
+            'analysis': {'table_analysis'}, 'sources': {'sources', 'research_policy', 'execution_contract', 'code_task'}}
+        table_alias = ((self.state['config'].get('table_analysis') or {}).get('path') or '').split('/')[0]
+        start = max((row.get('request_count', 0) for row in self.state.get('supplies', [])
+            if fields.get(domain, set()).intersection(row['changes']) or domain == 'analysis'
+                and table_alias in row['changes'].get('sources', {})), default=0)
+        return [turn for turn in self.state['turns'] if turn.get('request_count', 1) >= start]
 
     def _cancel_unstarted(self, reason: str) -> None:
         """Close only unstarted tool messages; keep completed observations intact."""
@@ -1566,7 +1602,7 @@ class ToolApplication:
 
     def _validated_code_delivery(self, artifacts: list[str], *, require_current_origin: bool = True) -> dict[str, Any]:
         observations = (self.session.store.read_json(item['result'])
-            for prior in reversed(self.state['turns']) for item in reversed(prior['tools']))
+            for prior in reversed(self._evidence_turns('implementation')) for item in reversed(prior['tools']))
         accepted = next((row for row in observations if row.get('tool_name') == 'implement_code_task'), None)
         if accepted is None or accepted.get('status') != 'ok':
             raise ValueError('Exact code work has no validated implementation; inspect or disclose unresolved work before delivery.')
@@ -1579,13 +1615,16 @@ class ToolApplication:
         refs = []
         measurements, analyses = [], []
         accepted = None
-        for turn in self.state['turns']:
+        for turn in self._evidence_turns('scientific'):
             for item in turn['tools']:
                 observed = self.session.store.read_json(item['result'])
                 if observed.get('tool_name') == 'measure_experiment' and observed.get('status') == 'ok':
                     measurements.append(observed['data']['result_ref'])
                 if observed.get('tool_name') == 'analyze_measurements' and observed.get('status') == 'ok':
                     analyses.append(item['result'])
+        for turn in self._evidence_turns('implementation'):
+            for item in turn['tools']:
+                observed = self.session.store.read_json(item['result'])
                 if observed.get('tool_name') == 'implement_code_task':
                     if observed.get('status') != 'ok':
                         accepted = None
@@ -1639,11 +1678,14 @@ class ToolApplication:
         if self.state['config'].get('report_evidence_contract') == 'materials.v1':
             from simple_ar.tools.writing import material_report_binding
             observations = []
+            active = {domain: {id(turn) for turn in self._evidence_turns(domain)}
+                for domain in ('sources', 'analysis', 'scientific')}
             for turn in self.state['turns']:
                 for item in turn['tools']:
                     row = self.session.store.read_json(item['result'])
                     spec = self.gateway.registry.get(row.get('tool_name', ''))
-                    if row.get('status') == 'ok' and spec is not None and spec.domain in {'sources', 'analysis', 'scientific'}:
+                    if (row.get('status') == 'ok' and spec is not None and spec.domain in active
+                            and id(turn) in active[spec.domain]):
                         observations.append(row)
             mounts = self.state['config']['sources']
             table = self.state['config'].get('table_analysis')
@@ -1805,7 +1847,7 @@ class ToolApplication:
                 or not self.state['turns'] or self.state['turns'][-1]['remaining']):
             return []
         locators = []
-        for turn in self.state['turns']:
+        for turn in self._evidence_turns('scientific'):
             for item in turn['tools']:
                 observed = self.session.store.read_json(item['result'])
                 if observed.get('tool_name') == 'measure_experiment' and observed.get('status') == 'ok':
@@ -1837,7 +1879,7 @@ class ToolApplication:
                     else arguments['delivery']))
                 if not request.unresolved:
                     measurements, analyses = [], []
-                    for accepted in self.state['turns']:
+                    for accepted in self._evidence_turns('scientific'):
                         for item in accepted['tools']:
                             observed = self.session.store.read_json(item['result'])
                             if observed.get('status') == 'ok':
@@ -1874,11 +1916,16 @@ class ToolApplication:
                 except (ValueError, OSError, KeyError, RuntimeError) as exc:
                     return str(exc)
         observations = []
+        active = {domain: {id(row) for row in self._evidence_turns(domain)}
+            for domain in ('sources', 'analysis', 'scientific', 'implementation')}
         for accepted in self.state['turns']:
             current_request = accepted.get('request_count', 1) == len(self.state['requests'])
             calls_by_id = {row['id']: row for row in self.session.store.read_json(accepted['reply']).get('tool_calls', [])}
             for item in accepted['tools']:
                 original = calls_by_id[item['id']]
+                spec = self.gateway.registry.get(original['function']['name'])
+                if spec is not None and spec.domain in active and id(accepted) not in active[spec.domain]:
+                    continue
                 try:
                     arguments = json.loads(original['function']['arguments'])
                 except (ValueError, TypeError):

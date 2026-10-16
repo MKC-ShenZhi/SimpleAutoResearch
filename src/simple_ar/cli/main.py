@@ -2578,7 +2578,7 @@ def _run_native_start(args: argparse.Namespace) -> None:
                 path = args.supply_task.resolve()
                 with path.open('rb') as stream:
                     supply = tomllib.load(stream)
-                if (set(supply) - {'supply_id', 'reason', 'changes', 'resource_allowances'}
+                if (set(supply) - {'supply_id', 'reason', 'changes', 'resource_allowances', 'replace_existing'}
                         or not {'supply_id', 'reason', 'changes'}.issubset(supply)
                         or not isinstance(supply['changes'], dict)):
                     raise ValueError('Supply TOML requires supply_id, reason and [changes]; optional [resource_allowances]')
@@ -2592,8 +2592,9 @@ def _run_native_start(args: argparse.Namespace) -> None:
                 make_console().print(Panel(Text(
                     f"Supply ID: {supply['supply_id']}\nReason: {supply['reason']}\n"
                     f"Contract fields: {', '.join(sorted(supply['changes']))}\n"
+                    f"Replace existing contracts: {supply.get('replace_existing', False)}\n"
                     f"New remaining allowances: {supply.get('resource_allowances', {})}\n"
-                    "Original records and usage remain. This records missing contracts only; "
+                    "Original records and usage remain. Replacement retires old authority, not old evidence; "
                     "no model call or process runs, and commands still require separate approval."),
                     title='Confirm task supply / 确认补齐任务条件'))
                 if args.prepare_only or (not args.yes and (not interactive or input(

@@ -101,7 +101,9 @@ simple-ar start --resume-task SESSION --supply-task supply.toml --yes
 simple-ar start --resume-task SESSION
 ```
 
-补齐与原生创建共用校验。`changes` 还可补 `sources`、`execution_contract`、`code_task`、`research_policy`、`table_analysis`、`report_requirement` 和 `max_output_tokens`，不能替换已有非空合同或来源别名。来源路径相对补齐文件解析；执行 cwd 必须是已存在的绝对目录，argv 不做 shell 展开。执行提案仍需精确批准。首次绑定模型必须显式给出正数请求/token 额度；仅续额不会取得模型权限。
+补齐与原生创建共用校验。`changes` 可补 `sources`、`execution_contract`、`code_task`、`research_policy`、`table_analysis`、`report_requirement` 和 `max_output_tokens`；默认只填缺项。修改已有原生合同须在顶层显式写 `replace_existing = true`，使用新 ID 并说明原因。仅替换 `changes` 中列出的字段；替换模式下若包含 `sources`，它是完整的新别名表，而非合并。原记录和费用保留为历史，不冒充新条件下的确认或已完成证据。只改报告时保留有效测量；模型连接变更仍走独立重试合同。
+
+来源路径相对补齐文件解析；执行 cwd 必须是已存在的绝对目录，argv 不做 shell 展开。需要协议确认的任务在条件变化后须重新确认，实际执行仍需独立精确批准。首次绑定模型必须显式给出正数请求/token 额度；仅续额不会取得模型权限。
 
 相同 ID 与参数重放幂等，也覆盖“已记额度、未完成配置提交”的中断恢复。补齐中断后须完成原补齐操作才能继续；在途/未知操作须先核对。补齐与反馈、重试、独立续额参数及命令审批分开，不是修改旧结构化研究协议的兼容适配器。
 

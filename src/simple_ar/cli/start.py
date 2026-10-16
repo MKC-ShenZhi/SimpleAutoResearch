@@ -112,7 +112,7 @@ def add_start_parser(subparsers: argparse._SubParsersAction) -> None:
     native = parser.add_argument_group("Native task")
     native.add_argument("request", nargs="?", help="Natural-language task using the native action loop; no function selection.")
     native.add_argument("--resume-task", type=Path, help="Resume a native-tool session; never replays unknown operations.")
-    native.add_argument("--supply-task", type=Path, help="With --resume-task, confirm a TOML caller supply of missing contracts or the first model binding. Records without executing; retains old evidence and ledger. Not model retry or replacement of an existing frozen contract.")
+    native.add_argument("--supply-task", type=Path, help="With --resume-task, confirm caller TOML contracts or first model binding. replace_existing=true explicitly revises saved contracts without resetting evidence or ledger. Records without execution; not a model retry or model replacement.")
     native.add_argument("--retry-model", action="store_true", help="With --resume-task, explicitly continue a terminated failed native model decision using a new attempt and remaining budget. Optionally select --model profile:NAME/route:NAME to record a compatible Chat connection change without clearing history or charges. Cached replies keep their saved connection; tools, in-flight requests and whole tasks are not resubmitted. Use separately from feedback or authorization changes.")
     native.add_argument("--authorize-remaining", action="append", default=None, metavar="DIMENSION=AMOUNT", help="Native resume: explicitly authorize a new remaining resource allowance after confirmation; repeat for multiple dimensions.")
     native.add_argument("--authorization-id", default=None, help="Native resume: stable idempotency key required for explicit continuation allowances.")
@@ -555,6 +555,19 @@ def resume_structured_task(args: argparse.Namespace) -> None:
     _run_native_start(native)
 
 
+def _fixed_execution_research(args: argparse.Namespace, sources: tuple, outputs: tuple,
+                              research_config: dict | None, research_fields: set[str]) -> bool:
+    """Detect source/design obligations from inputs, independently of CLI labels."""
+    # Bare fixed-run mounts can carry notes without requesting source work.
+    # A supplied research configuration makes those material roles actionable.
+    return ('summary' in outputs
+        or (research_config is not None
+            and any(row['role'] in {'paper', 'material'} for row in sources))
+        or bool(set(getattr(args, '_explicit_resume_destinations', ()))
+                & ((research_fields - {'interaction'}) | {'selected_idea_id', 'feasibility_review_model'}))
+        or bool((research_config or {}).get('research_selected_idea_id')))
+
+
 def migrate_exact_code_creation(args: argparse.Namespace, *, execution: dict,
                                 request: str, outputs: tuple, sources: tuple,
                                 limits: dict, root: Path, report_config: dict | None = None,
@@ -575,16 +588,15 @@ def migrate_exact_code_creation(args: argparse.Namespace, *, execution: dict,
         'llm_requests': native.max_turns if limits.get('llm_requests') is None else limits['llm_requests'],
         'total_tokens': native.max_tokens if limits.get('total_tokens') is None else limits['total_tokens']}
     task = execution['code_task']
+    if 'run_dir' in task:
+        return False  # Adoption of an initialized CodeTask retains its existing owner.
     project = Path(task['code_root']).resolve() if task['code_root'] else None
     mounts = list(dict.fromkeys([*([project] if project is not None else []),
                                 *(Path(row['locator']).resolve() for row in sources)]))
-    scientific = 'experiments' in outputs and not set(outputs) - {'experiments', 'report'}
+    scientific = 'experiments' in outputs and not set(outputs) - {'experiments', 'report', 'summary'}
     from simple_ar.cli.research_config import FIELDS
     research_fields = {destination for destination, _ in FIELDS['research'].values()}
-    research_work = (scientific and args.task_kind == 'auto'
-        and getattr(args, 'interaction', None) == 'autonomous'
-        and (any(row['role'] in {'paper', 'material'} for row in sources)
-             or bool(set(getattr(args, '_explicit_resume_destinations', ())) & (research_fields - {'interaction'}))))
+    research_work = scientific and _fixed_execution_research(args, sources, outputs, research_config, research_fields)
     if research_work and (not args.model or research_config is None):
         return False
     preparation_names = ('kind', 'workspace_mode', 'max_file_bytes', 'workspace_include', 'workspace_exclude',
@@ -592,7 +604,7 @@ def migrate_exact_code_creation(args: argparse.Namespace, *, execution: dict,
     formal = None
     conditions = []
     if scientific:
-        if (not reproduction and not controls.intersection(execution)
+        if (not reproduction and not {'baseline_policy', 'baseline', 'pairs'}.intersection(execution)
                 or set(execution) - (flat_fields | controls | {'code_task', 'environment'})
                 or set(task) - (set(preparation_names) | {'code_root', 'allowed_patterns', 'protected_patterns',
                     'approval_note', 'budget_profile', 'edit_budget_overrides', 'allow_large_edits',
@@ -617,8 +629,10 @@ def migrate_exact_code_creation(args: argparse.Namespace, *, execution: dict,
                 return False  # The structured reproduction entry retains its single-command policy.
             code_task_validation(execution, required=True)
         if reproduction and not (controls - {'baseline_policy'}).intersection(execution):
-            formal = measurement_contract({**{key: value for key, value in execution.items() if key in flat_fields},
-                'command': list(execution['command']) if isinstance(execution['command'], tuple) else execution['command']})
+            declaration = {**{key: value for key, value in execution.items() if key in flat_fields},
+                'command': list(execution['command']) if isinstance(execution['command'], tuple) else execution['command']}
+            formal = measurement_contract(declaration)
+            declaration = {**declaration, 'baseline_policy': 'skip'}
         else:
             declaration = {key: value for key, value in execution.items() if key in flat_fields | controls}
             declaration['baseline_policy'] = normalize_execution_config(execution)['baseline_policy']
@@ -794,17 +808,14 @@ def migrate_measurement_creation(args: argparse.Namespace, *, execution: dict,
     from simple_ar.cli.research_config import FIELDS
     research_fields = {destination for destination, _ in FIELDS['research'].values()}
     explicit = set(getattr(args, '_explicit_resume_destinations', ()))
-    autonomous = args.task_kind == 'auto' and getattr(args, 'interaction', None) == 'autonomous'
-    research_work = autonomous and (any(row['role'] != 'dataset' for row in sources)
-        or bool(explicit & (research_fields - {'interaction'})))
+    research_work = _fixed_execution_research(args, sources, outputs, research_config, research_fields)
     if research_work and (not args.model or research_config is None
-            or execution.get('baseline_policy') == 'reuse'
             or not {'baseline_policy', 'baseline', 'pairs'}.intersection(execution)):
         # An omitted comparison policy permits design to propose new conditions.
         # Such a request is not a fixed measurement contract.
         return False
-    if (args.task_kind != 'measurement' and not autonomous or 'experiments' not in outputs
-            or set(outputs) - {'experiments', 'report'}
+    if ('experiments' not in outputs
+            or set(outputs) - {'experiments', 'report', 'summary'}
             or set(execution) - (flat_fields | {'baseline', 'pairs', 'seeds', 'seed_count', 'seed_flag', 'baseline_policy', 'baseline_ref'})):
         return False
     extended = set(execution) - flat_fields
@@ -830,7 +841,7 @@ def migrate_measurement_creation(args: argparse.Namespace, *, execution: dict,
         supported.update(research_fields | {'local_document', 'material', 'selected_idea_id', 'feasibility_review_model'})
     unsupported = set(getattr(args, '_explicit_resume_destinations', ())) - supported
     if unsupported:
-        if autonomous:
+        if research_work or args.task_kind != 'measurement':
             return False  # Preserve other explicitly requested research/interaction work.
         raise ValueError('Fixed measurement creation cannot reinterpret these explicit controls: '
                          + ', '.join(sorted(unsupported)))
@@ -851,12 +862,12 @@ def migrate_measurement_creation(args: argparse.Namespace, *, execution: dict,
             return False  # Historical same-session reuse remains with its saved owner.
         execution = _mount_baseline_references(execution, mounts, getattr(args, 'config', None))
     contract = freeze_measurement_set(execution) if extended else measurement_contract(execution)
-    conditions = measurement_conditions(contract)
+    conditions = [row for row in measurement_conditions(contract) if 'reuse_ref' not in row]
     grouped = 'conditions' in contract
     actions = [{'tool_name': 'measure_experiment', 'arguments':
         {**row['execution'], 'condition_id': row['id']} if grouped else
         row['execution'] if args.model else {**row['execution'], 'delivery': {'summary': request, 'artifacts': []}}}
-        for row in conditions if 'reuse_ref' not in row]
+        for row in conditions]
     native.model, native.source, native.allow_execution = args.model, mounts, True
     native.max_turns, native.max_tokens = (limits['llm_requests'], limits['total_tokens']) if args.model else (0, 0)
     native._task_output_limit = getattr(args, 'max_output_tokens', None)

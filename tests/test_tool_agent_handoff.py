@@ -1492,7 +1492,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 self.assertEqual(app.ledger.limits, ledger['limits'])
                 self.assertEqual((owner.root / 'capability_result.json').read_bytes(), envelope)
 
-    def _supply_fixture(self):
+    def _supply_fixture(self, *, process_invocations=2):
         root, inputs = self._tool_materials()
         fake = Mock()
         fake._settings = SimpleNamespace(api_mode='chat', context_input_tokens=24000)
@@ -1505,7 +1505,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.enterContext(patch('simple_ar.app.tool_application.LLMClient.from_env', return_value=fake))
         app = ToolApplication.create(root / 'task', 'Collect materials, then measure when authorized',
             model=None, sources={'source0': inputs}, max_turns=0, max_tokens=0, max_attempts=30,
-            process_limits={'process_invocations': 2, 'process_wall_seconds': 30})
+            process_limits={'process_invocations': process_invocations, 'process_wall_seconds': 30})
         return inputs, fake, app
 
     @staticmethod
@@ -1744,6 +1744,124 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(self._supply_files(app), files)
         fake.chat_turn.assert_not_called()
         fake.ask_json.assert_not_called()
+
+    def test_explicit_contract_replacement_preserves_history_but_retires_old_authority(self):
+        from simple_ar.tools.scientific import freeze_measurement_set
+        inputs, fake, app = self._supply_fixture(process_invocations=4)
+        def action(name, **arguments):
+            return {'tool_name': name, 'arguments': arguments}
+        stop = action('ask_user', question='Await caller instructions')
+        original = freeze_measurement_set({**self._supply_measurement(app.workspace.workspace),
+            'baseline_policy': 'skip', 'environment': {'mode': 'current', 'timeout_sec': 3,
+                'check_command': [sys.executable, '-c', 'pass']}})
+        def measurement_args(contract):
+            row, = contract['conditions']
+            return {**row['execution'], 'condition_id': row['id']}
+        app.supply(supply_id='fixed', reason='Measure once under a confirmed protocol', changes={
+            'allow_execution': True, 'execution_contract': original,
+            'research_policy': {'allow_network': False, 'require_design': True}})
+        frozen = json.loads(json.dumps(app.state['config']['execution_contract']))
+        proposal = app.request_execution_confirmation()
+        accepted = {'decision_id': proposal['decision_id'], 'decision_response': 'accept'}
+        app.run(decision=accepted, progress=lambda _: None)
+        app.run(actions=[action('measure_experiment', **measurement_args(original)), stop], progress=lambda _: None)
+        token = app.approval_token(app.state['pending']['call'])
+        app.run(approved_execution=token, progress=lambda _: None)
+        measured = app.session.store.read_json(app.state['turns'][-1]['tools'][0]['result'])
+        self.assertEqual(measured['status'], 'ok', measured.get('error'))
+        app.run(actions=[action('analyze_measurements', result_refs=[measured['data']['result_ref']]), stop],
+            progress=lambda _: None)
+        measurement_ref = app.workspace.resolve(measured['data']['result_ref']).relative_to(app.session.store.root).as_posix()
+        self.assertEqual(app._execution_evidence()['measurement_refs'], [measurement_ref])
+        original_receipts = self._native_receipts(app, app.state['turns'])
+        original_protocol = {path: path.read_bytes() for path in Path(proposal['protocol_record']).parent.iterdir()}
+        ledger = app.ledger.to_dict()
+        root = app.session.store.root
+        changed = json.loads(json.dumps(original))
+        changed['conditions'][0]['execution']['command'] = [sys.executable, '-c',
+            "from pathlib import Path; Path('revised.txt').write_text('new'); print('score: 4.5')"]
+        request = {'supply_id': 'replace-measurement', 'reason': 'Evaluate a genuinely different command',
+            'replace_existing': True, 'changes': {'execution_contract': changed}}
+        app.supply(**request)
+        self.assertEqual(app.ledger.to_dict(), ledger)
+        self.assertEqual(app.state['supplies'][-1]['previous_config']['execution_contract'], frozen)
+        self.assertEqual(app.state['config']['authority_revision'], 2)
+        with self.assertRaisesRegex(ValueError, 'actual execution evidence'):
+            app._execution_evidence()
+        self.assertIsNone(app.sources.accepted_protocol())
+        self.assertTrue(app.sources.execution_issues())
+        self.assertFalse((app.workspace.workspace / 'revised.txt').exists())
+        before = self._supply_files(app)
+        app.supply(**request)
+        self.assertEqual(self._supply_files(app), before)
+        with self.assertRaisesRegex(ValueError, 'different terms'):
+            app.supply(**{**request, 'replace_existing': False})
+        with self.assertRaisesRegex(ValueError, 'stale'):
+            app.sources.respond_decision(accepted['decision_id'], 'accept')
+        decision = app.request_execution_confirmation()
+        self.assertNotEqual(decision['decision_id'], accepted['decision_id'])
+        app = ToolApplication.load(root)
+        app.run(decision={'decision_id': decision['decision_id'], 'decision_response': 'accept'}, progress=lambda _: None)
+        app.run(actions=[action('measure_experiment', **measurement_args(changed)), stop], progress=lambda _: None)
+        self.assertIsNotNone(app.state['pending'])
+        self.assertNotEqual(app.approval_token(app.state['pending']['call']), token)
+        app.run(approved_execution=token, progress=lambda _: None)
+        self.assertFalse((app.workspace.workspace / 'revised.txt').exists())
+        app = ToolApplication.load(root)
+        app.run(approved_execution=app.approval_token(app.state['pending']['call']), progress=lambda _: None)
+        current = app.session.store.read_json(app.state['turns'][-1]['tools'][0]['result'])
+        self.assertEqual(current['status'], 'ok', current.get('error'))
+        self.assertEqual(current['data']['metrics']['score'], 4.5)
+        current_ref = app.workspace.resolve(current['data']['result_ref']).relative_to(root).as_posix()
+        self.assertEqual(app._execution_evidence()['measurement_refs'], [current_ref])
+        app.run(actions=[action('analyze_measurements', result_refs=[current['data']['result_ref']]), stop],
+            progress=lambda _: None)
+        app.run(actions=[action('deliver_result', summary='New command measured and analyzed.', artifacts=[])],
+            progress=lambda _: None)
+        self.assertEqual(app.session.manifest.status, 'completed')
+        self.assertEqual(sum(row.actual.get('process_invocations', 0) for row in app.ledger.entries), 4)
+        self.assertEqual(app.ledger.to_dict()['entries'][:len(ledger['entries'])], ledger['entries'])
+        self.assertEqual({path: path.read_bytes() for path in original_protocol}, original_protocol)
+        self.assertEqual({path: (root / path).read_bytes() for path in original_receipts}, original_receipts)
+        # Revoking/removing contracts is explicit, not a merge that silently restores them.
+        app.supply(supply_id='remove-execution', reason='Continue as a read-only materials task',
+            replace_existing=True, changes={'allow_execution': False, 'execution_contract': None,
+                'research_policy': {'allow_network': False}})
+        self.assertIsNone(ToolApplication.load(root).state['config']['execution_contract'])
+        self.assertFalse(app.state['config']['allow_execution'])
+        fake.chat_turn.assert_not_called()
+        fake.ask_json.assert_not_called()
+
+    def test_report_only_replacement_reuses_valid_measurements_and_can_remove_optional_contract(self):
+        from simple_ar.tools.writing import freeze_report_requirement
+        _, _, app = self._supply_fixture()
+        contract = self._supply_measurement(app.workspace.workspace)
+        app.supply(supply_id='measure', reason='Measure the supplied data', changes={
+            'allow_execution': True, 'execution_contract': contract})
+        app.run(actions=[{'tool_name': 'measure_experiment', 'arguments': contract},
+            {'tool_name': 'ask_user', 'arguments': {'question': 'Await feedback'}}],
+            approve=lambda *_: True, progress=lambda _: None)
+        measured = app.session.store.read_json(app.state['turns'][-1]['tools'][0]['result'])
+        self.assertEqual(measured['status'], 'ok', measured.get('error'))
+        ledger = app.ledger.to_dict()
+        revision = app.state['config']['authority_revision']
+        # No authoring call is needed to record or remove the output contract.
+        requirement = freeze_report_requirement({'outline_strategy': 'template'})
+        app.supply(supply_id='add-report', reason='Use the valid measurements in a report',
+            changes={'report_requirement': requirement})
+        app.supply(supply_id='change-report', reason='Change only the requested presentation',
+            replace_existing=True, changes={'report_requirement': {**requirement,
+                'outline': [*requirement['outline'], {'heading': 'Practical implications', 'required': False}]}})
+        measurement_ref = app.workspace.resolve(measured['data']['result_ref']).relative_to(app.session.store.root).as_posix()
+        self.assertEqual(app._execution_evidence()['measurement_refs'], [measurement_ref])
+        self.assertEqual(app.ledger.to_dict(), ledger)
+        self.assertEqual(app.state['config']['authority_revision'], revision)
+        app.supply(supply_id='remove-report', reason='Retain data only', replace_existing=True,
+            changes={'report_requirement': None})
+        restored = ToolApplication.load(app.session.store.root)
+        self.assertIsNone(restored.state['config']['report_requirement'])
+        self.assertIsNone(restored.state['config']['report_evidence_contract'])
+        self.assertEqual(restored._execution_evidence()['measurement_refs'], [measurement_ref])
 
     def test_supply_upgrades_material_report_contract_without_accepting_old_composition(self):
         from simple_ar.tools.writing import freeze_report_requirement
@@ -4807,6 +4925,173 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertFalse(owner.can_reconcile('research', context.attempt.attempt_id))
         self.assertTrue(owner.delivery_issues([]))
 
+    def test_source_authority_revision_archives_design_without_reusing_acceptance(self) -> None:
+        from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
+        from simple_ar.tools.sources import SourceToolGateway
+
+        root, workspace, owner, context = self._professional_design_fixture()
+        arguments = {'operation': 'design', 'question': 'Test the chosen method',
+            'synthesis_record': 'source0/synthesis.json'}
+        result = owner.execute_tool('research', context, arguments)
+        self.assertEqual(result.status, 'ok', result.error)
+        old = owner.pending_decision()
+        owner.respond_decision(old['decision_id'], 'accept')
+        self.assertNotIn('authority_revision', old)
+        self.assertNotIn('authority_revision', context.store.read_json('source_request.json'))
+        retained = {path: path.read_bytes() for path in context.store.root.iterdir() if path.is_file()}
+        # A replaced external source may change; its archived approval is not current.
+        synthesis = workspace.resolve('source0/synthesis.json')
+        synthesis.write_bytes(synthesis.read_bytes() + b'\n')
+        self.assertTrue(owner.execution_issues())
+        policy = owner.policy.model_copy(update={'execution_boundary': {
+            **owner.policy.execution_boundary, 'timeout_sec': 4}})
+
+        def reload():
+            return SourceToolGateway(root, workspace, workspace.ledger,
+                policy=policy, authority_revision=1)
+
+        revised = reload()
+        self.assertEqual(revised._design_requests(), [])
+        self.assertIsNone(revised.pending_decision())
+        self.assertIsNone(revised.accepted_protocol())
+        self.assertTrue(revised.execution_issues())
+        self.assertFalse(revised.can_reconcile('research', context.attempt.attempt_id))
+        with self.assertRaisesRegex(ValueError, 'stale'):
+            revised.respond_decision(old['decision_id'], 'accept')
+        current = CapabilityContext(ArtifactStore(root / 'attempts' / 'research-design-r1'),
+            AttemptManifest('research-design-r1', capability='native_tool'))
+        result = revised.execute_tool('research', current, arguments)
+        self.assertEqual(result.status, 'ok', result.error)
+        decision = revised.pending_decision()
+        self.assertEqual(decision['authority_revision'], 1)
+        self.assertEqual(current.store.read_json('source_request.json')['authority_revision'], 1)
+        revised.respond_decision(decision['decision_id'], 'accept')
+        self.assertEqual(reload().execution_issues(), [])
+        self.assertEqual(reload().accepted_execution_contract()['conditions'][0]['execution']['timeout_sec'], 4)
+        self.assertEqual({path: path.read_bytes() for path in retained}, retained)
+        for name in ('research_design.json', 'frozen_protocol.json',
+                     'protocol_decision.json', 'protocol_response.json'):
+            path = context.store.resolve(name)
+            before = path.read_bytes()
+            changed = read_json(path)
+            changed['decision_id' if name == 'protocol_response.json' else 'tampered'] = 'changed'
+            write_json(path, changed)
+            with self.subTest(archived=name):
+                self.assertTrue(reload().execution_issues())
+                self.assertIsNone(reload().accepted_protocol())
+            path.write_bytes(before)
+        # Requests, decisions and responses must agree, with strict bounded revisions.
+        for name in ('source_request.json', 'protocol_decision.json', 'protocol_response.json'):
+            path = current.store.resolve(name)
+            before = path.read_bytes()
+            for revision in (0, 2, -1, True, '1', None):
+                write_json(path, {**json.loads(before), 'authority_revision': revision})
+                with self.subTest(record=name, revision=revision):
+                    self.assertTrue(reload().execution_issues())
+                    self.assertIsNone(reload().accepted_protocol())
+            path.write_bytes(before)
+        self.assertEqual(reload().execution_issues(), [])
+
+    def test_source_authority_revision_reconstructs_archived_caller_binding(self) -> None:
+        from simple_ar.tools.scientific import measurement_contract
+        from simple_ar.tools.sources import SourcePolicy, SourceToolGateway
+
+        root, inputs, workspace = self._workspace_fixture()
+        fixed = measurement_contract({'command': ['python', 'measure.py'], 'cwd': str(inputs),
+            'timeout_sec': 3, 'result_schema': {'required_metrics': ['score']}})
+        policy = SourcePolicy(require_design=True)
+        owner = SourceToolGateway(root, workspace, workspace.ledger, policy=policy, execution_contract=fixed)
+        old = owner.declare_execution_protocol()
+        directory = Path(old['protocol_record']).parent
+        binding = read_json(directory / 'caller_request.json')
+        self.assertNotIn('authority_revision', binding)
+        self.assertEqual(directory.name, hashlib.sha256(owner._protocol_bytes(binding)).hexdigest())
+        owner.respond_decision(old['decision_id'], 'accept')
+        retained = {path: path.read_bytes() for path in directory.iterdir()}
+        changed = {**fixed, 'timeout_sec': 4}
+        policy = policy.model_copy(update={'allow_network': False})
+
+        def reload():
+            return SourceToolGateway(root, workspace, workspace.ledger, policy=policy,
+                execution_contract=changed, authority_revision=1)
+
+        revised = reload()
+        self.assertTrue(revised.execution_issues())
+        self.assertIsNone(revised.accepted_protocol())
+        with self.assertRaisesRegex(ValueError, 'stale'):
+            revised.respond_decision(old['decision_id'], 'accept')
+        decision = revised.declare_execution_protocol()
+        self.assertNotEqual(decision['decision_id'], old['decision_id'])
+        self.assertEqual(decision['authority_revision'], 1)
+        current = Path(decision['protocol_record']).parent
+        self.assertEqual(read_json(current / 'caller_request.json')['authority_revision'], 1)
+        self.assertEqual(reload().pending_decision(), decision)
+        reload().respond_decision(decision['decision_id'], 'accept')
+        self.assertEqual(reload().accepted_execution_contract(), changed)
+        self.assertEqual(reload().execution_issues(), [])
+        self.assertEqual({path: path.read_bytes() for path in retained}, retained)
+        for parent in (directory, current):
+            for name in ('caller_request.json', 'frozen_protocol.json',
+                         'protocol_decision.json', 'protocol_response.json'):
+                path = parent / name
+                before = path.read_bytes()
+                path.write_bytes(before + b'\n' if name != 'protocol_response.json' else
+                    json.dumps({**json.loads(before), 'decision_id': 'changed'}).encode())
+                with self.subTest(directory=parent.name, tampered=name):
+                    self.assertTrue(reload().execution_issues())
+                    with self.assertRaises(ValueError):
+                        reload().declare_execution_protocol()
+                path.write_bytes(before)
+        self.assertEqual(reload().execution_issues(), [])
+        # Same revision still binds exactly the current config, including reload.
+        mismatched = SourceToolGateway(root, workspace, workspace.ledger, policy=policy,
+            execution_contract=fixed, authority_revision=1)
+        self.assertTrue(mismatched.execution_issues())
+        for invalid in (-1, True, '1', None):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                SourceToolGateway(root, workspace, workspace.ledger, authority_revision=invalid)
+
+    def test_source_authority_revision_requires_summary_from_replacement_scope(self) -> None:
+        from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
+        from simple_ar.tools.sources import SourcePolicy, SourceToolGateway
+
+        root, inputs, workspace = self._workspace_fixture()
+        workspace.mounts['records'] = root / 'attempts'
+        original = inputs / 'document.json'
+        write_json(original, self._original_document().to_handoff_dict())
+        policy = SourcePolicy(materials=('source0/document.json',), allow_network=False, require_summary=True)
+        owner = SourceToolGateway(root, workspace, workspace.ledger, policy=policy)
+        context = CapabilityContext(ArtifactStore(root / 'attempts' / 'summary-v0'),
+            AttemptManifest('summary-v0', capability='native_tool'))
+        arguments = {'operation': 'summary', 'question': 'What does cancellation do?'}
+        result = owner.execute_tool('research', context, arguments)
+        self.assertEqual(result.status, 'ok', result.error)
+        self.assertEqual(owner.delivery_issues([]), [])
+        retained = {path: path.read_bytes() for path in context.store.root.iterdir() if path.is_file()}
+        replacement = inputs / 'replacement.json'
+        replacement.write_bytes(original.read_bytes())
+        original.write_bytes(b'Changed external source; archived outputs are retained.')
+        policy = policy.model_copy(update={'materials': ('source0/replacement.json',)})
+
+        def reload():
+            return SourceToolGateway(root, workspace, workspace.ledger, policy=policy, authority_revision=1)
+
+        self.assertTrue(reload().delivery_issues([]))
+        self.assertFalse(reload().can_reconcile('research', 'summary-v0'))
+        current = CapabilityContext(ArtifactStore(root / 'attempts' / 'summary-r1'),
+            AttemptManifest('summary-r1', capability='native_tool'))
+        result = reload().execute_tool('research', current, arguments)
+        self.assertEqual(result.status, 'ok', result.error)
+        self.assertEqual(current.store.read_json('source_request.json')['authority_revision'], 1)
+        self.assertEqual(reload().delivery_issues([]), [])
+        self.assertEqual({path: path.read_bytes() for path in retained}, retained)
+        request = current.store.resolve('source_request.json')
+        before = request.read_bytes()
+        for revision in (0, 2, -1, True, '1'):
+            write_json(request, {**json.loads(before), 'authority_revision': revision})
+            self.assertTrue(reload().delivery_issues([]))
+        request.write_bytes(before)
+
     def _professional_design_fixture(self, **execution):
         from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
         from simple_ar.research.contracts import IdeaCandidate, ResearchExperimentContract
@@ -4827,6 +5112,36 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         context = CapabilityContext(ArtifactStore(root / 'attempts' / 'research-design'),
             AttemptManifest('research-design', capability='native_tool'))
         return root, workspace, owner, context
+
+    def test_design_reuse_binds_original_locator_to_retained_baseline_bytes(self) -> None:
+        from simple_ar.tools.sources import SourceToolGateway
+        from simple_ar.tools.scientific import freeze_measurement_set
+        root, workspace, owner, context = self._professional_design_fixture(
+            baseline_policy='reuse', baseline_ref='source0/prior.json')
+        original = workspace.resolve('source0/prior.json')
+        original.write_text('{"retained_measurement": "same canonical bytes"}', encoding='utf-8')
+        snapshot = context.store.resolve('prior.json')
+        snapshot.parent.mkdir(parents=True, exist_ok=True)
+        snapshot.write_bytes(original.read_bytes())
+        declared = freeze_measurement_set(owner.policy.execution_boundary)
+        baseline = declared['conditions'][0]
+        baseline.update(reuse_ref=workspace.locator(str(snapshot)),
+            reuse_sha256=hashlib.sha256(snapshot.read_bytes()).hexdigest())
+        def reload():
+            return SourceToolGateway(root, workspace, workspace.ledger,
+                policy=owner.policy, execution_contract=declared)
+        current = reload()
+        result = current.execute_tool('research', context, {'operation': 'design',
+            'question': 'Compare against the retained control', 'synthesis_record': 'source0/synthesis.json'})
+        self.assertEqual(result.status, 'ok', result.error)
+        decision = current.pending_decision()
+        self.assertIsNotNone(decision)
+        current.respond_decision(decision['decision_id'], 'accept')
+        self.assertEqual(reload().execution_issues(), [])
+        self.assertEqual(reload().accepted_execution_contract(), declared)
+        original.write_text('Different baseline bytes', encoding='utf-8')
+        self.assertTrue(reload().execution_issues())
+        self.assertIsNone(reload().accepted_protocol())
 
     def test_caller_protocol_confirmation_preserves_fixed_owner_and_terminal_replay(self) -> None:
         from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext

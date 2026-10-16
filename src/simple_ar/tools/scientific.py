@@ -278,6 +278,7 @@ class ScientificToolGateway:
     def __init__(self, root: Path, workspace: Any, ledger: Any, session_id: str,
                  *, implementation: Any | None = None,
                  execution_contract: dict[str, Any] | None = None,
+                 current_attempts: Any | None = None,
                  research_contract: Any | None = None,
                  research_requirements: Any | None = None) -> None:
         self.root = Path(root).resolve()
@@ -285,6 +286,7 @@ class ScientificToolGateway:
             raise ValueError('Scientific tools require the task workspace, shared ledger and session identity')
         self.workspace, self.ledger, self.session_id = workspace, ledger, session_id
         self.implementation = implementation
+        self._current_attempts = current_attempts
         self._declared_execution_contract = measurement_contract(execution_contract) if execution_contract is not None else None
         self._research_contract = research_contract
         self._research_requirements = research_requirements
@@ -382,8 +384,9 @@ class ScientificToolGateway:
                 row['execution'].get('environment') for row in self.execution_contract['conditions']):
             return None
         owners = []
+        current = self._current_attempts() if self._current_attempts is not None else None
         for path in sorted((self.root / 'attempts').glob('*/scientific_request.json')):
-            if path.parent.name == identity:
+            if path.parent.name == identity or current is not None and path.parent.name not in current:
                 continue
             store = self._store(path.parent.name)
             saved = store.read_json('scientific_request.json')
