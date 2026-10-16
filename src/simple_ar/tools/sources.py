@@ -201,11 +201,14 @@ class SourceToolGateway:
     def __init__(self, root: Path, workspace: Any, ledger: BudgetLedger, *,
                  policy: SourcePolicy | dict[str, Any] | None = None,
                  client_factory: Callable[[str], Any] | None = None,
-                 feasibility_client_factory: Callable[[str], Any] | None = None) -> None:
+                 feasibility_client_factory: Callable[[str], Any] | None = None,
+                 execution_contract: dict[str, Any] | None = None) -> None:
         self.root, self.workspace, self.ledger = root, workspace, ledger
         self.policy = (SourcePolicy(max_results=20) if policy is None
             else SourcePolicy.model_validate(policy)).model_copy(deep=True)
         self.client_factory, self.feasibility_client_factory = client_factory, feasibility_client_factory
+        # Runtime reference to the scientific owner's fixed authority, not source policy.
+        self._declared_execution_contract = execution_contract
         self.registry = default_search_provider_registry(local_documents=[str(path)
             for path in self._material_paths(list(self.policy.materials))] if self.policy.materials else [])
 
@@ -774,7 +777,12 @@ class SourceToolGateway:
             (path.parent / 'frozen_protocol.json').read_text(encoding='utf-8'))}
 
     def _fixed_execution_boundary(self) -> dict[str, Any] | None:
-        boundary = self.policy.execution_boundary
+        if self._declared_execution_contract is not None:
+            return self._declared_execution_contract
+        boundary = dict(self.policy.execution_boundary)
+        if boundary.pop('code_task', None) is not None:
+            boundary.pop('environment', None)
+        boundary.pop('comparison_required', None)
         return boundary if (self.policy.require_design
             and {'command', 'cwd', 'timeout_sec', 'result_schema'}.issubset(boundary)
             and any(key in boundary for key in ('baseline_policy', 'baseline', 'pairs'))) else None
@@ -784,6 +792,10 @@ class SourceToolGateway:
         """Use the scientific owner's existing declaration normalization."""
         from simple_ar.tools.scientific import freeze_measurement_set, measurement_contract, measurement_conditions
         execution = dict(execution)
+        # CodeTask owns implementation scope and preparation. Neither is a
+        # measurement control or a grant derived from accepting a design.
+        if execution.pop('code_task', None) is not None:
+            execution.pop('environment', None)
         comparison = execution.pop('comparison_required', False)
         if any(key in execution for key in ('baseline', 'pairs', 'seeds', 'seed_count', 'baseline_policy')):
             contract = freeze_measurement_set(execution)
@@ -806,7 +818,25 @@ class SourceToolGateway:
         # Extra design prose remains source evidence, not a replacement for the
         # caller's frozen measurement/approval contract (including absent protocol).
         boundary = self._fixed_execution_boundary()
+        if self._declared_execution_contract is not None:
+            return self._declared_execution_contract
         return self._execution_contract(boundary if boundary is not None else accepted['execution_protocol'])
+
+    def implementation_evidence(self) -> dict[str, Any]:
+        """Bind accepted original research records for implementation approval."""
+        if issues := self.execution_issues():
+            raise ValueError('; '.join(issues))
+        accepted = self.accepted_protocol()
+        if accepted is None:
+            return {}
+        directory = self.root / 'attempts' / accepted['decision_id'].split(':', 1)[0]
+        names = ('research_design.json', 'frozen_protocol.json', 'protocol_decision.json',
+            'protocol_response.json', 'source_request.json', 'source_result.json')
+        hashes = {self.workspace.locator(str(directory / name)): self._digest(directory / name)
+            for name in names}
+        return {'decision_id': accepted['decision_id'],
+            'design_ref': self.workspace.locator(str(directory / 'research_design.json')),
+            'hashes': hashes}
 
     def delivery_issues(self, observations: list[dict[str, Any]]) -> list[str]:
         issues = self.execution_issues()

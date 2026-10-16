@@ -219,6 +219,7 @@ class ToolApplication:
             config['model'], controller.manifest.session_id,
             client_factory=lambda identity: self._client(identity, purpose='code'),
             execution_observations=self._execution_observations, exact=config.get('code_task'),
+            research_inputs=lambda: self.sources.implementation_evidence(),
             candidate_outputs=lambda record: scientific['scientific'].candidate_outputs(record) if scientific else {},
             measurement_inputs=lambda origin, required: scientific['scientific'].implementation_inputs([
                 observed['data']['result_ref'] for turn in self.state['turns'] for item in turn['tools']
@@ -236,6 +237,7 @@ class ToolApplication:
         self.scientific = scientific.get('scientific')
         self.sources = SourceToolGateway(controller.store.root, self.workspace, self.ledger,
             policy=config.get('research_policy'),
+            execution_contract=config.get('execution_contract'),
             client_factory=(lambda identity: self._client(identity, purpose='task', native=False))
                 if config['model'] is not None else None,
             feasibility_client_factory=self._feasibility_client)
@@ -1666,11 +1668,17 @@ class ToolApplication:
                 raise RuntimeError(f"Operation failed; inspect saved diagnostics: {detail}")
         return relative
 
+    def _owner_execution_binding(self, call: dict[str, Any]) -> dict[str, Any]:
+        name = call['function']['name']
+        owner = self.gateway.session_owner(name)
+        return owner.approval_binding(json.loads(call['function']['arguments']),
+            identity=self.state['pending']['attempt'],
+            **({'for_preparation': True} if name == 'prepare_code_task' else {}))
+
     def approval_token(self, call: dict[str, Any]) -> str:
         if (owner := self.gateway.session_owner(call['function']['name'])) is not None:
             return hashlib.sha256(json.dumps({'call': call,
-                'inputs': owner.approval_binding(json.loads(call['function']['arguments']),
-                    identity=self.state['pending']['attempt'])},
+                'inputs': self._owner_execution_binding(call)},
                 sort_keys=True).encode()).hexdigest()
         if call["function"]["name"] == "export_report":
             request = ExportRequest.model_validate(json.loads(call["function"]["arguments"]))
@@ -2087,7 +2095,7 @@ class ToolApplication:
                         progress('Frozen CodeTask contract: ' + json.dumps(self.implementation.exact.model_dump(), ensure_ascii=False))
                     return
                 if (owner := self.gateway.session_owner(name)) is not None and token is not None and not started:
-                    binding = owner.approval_binding(json.loads(call['function']['arguments']), identity=pending['attempt'])
+                    binding = self._owner_execution_binding(call)
                     if token != hashlib.sha256(json.dumps({'call': call, 'inputs': binding}, sort_keys=True).encode()).hexdigest():
                         raise ValueError('Execution inputs changed during approval; approve the current identity')
                     pending['execution_approval'] = {'token': token, 'binding': binding}

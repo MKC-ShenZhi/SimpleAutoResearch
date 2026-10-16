@@ -4454,6 +4454,145 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     self.assertEqual(restored.accepted_execution_contract(), declared)
                 self.assertEqual({path: path.read_bytes() for path in before}, before)
 
+    def test_accepted_design_reaches_code_task_and_binds_implementation_approval(self) -> None:
+        from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
+        from simple_ar.code_task.runtime.state import code_task_paths, implementation_file_hashes
+        from simple_ar.research.implementation import _prepare_research_task
+        from simple_ar.research.preparation import run_preparation_capability
+        from simple_ar.tools.implementation import ImplementationToolGateway
+        from simple_ar.tools.scientific import freeze_measurement_set
+        from simple_ar.tools.sources import SourceToolGateway
+
+        root, workspace, original, design_context = self._professional_design_fixture(baseline_policy='skip')
+        project = workspace.resolve('source0')
+        (project / 'main.py').write_text('VALUE = 1\n')
+        (project / 'check.py').write_text('assert True\n')
+        static = freeze_measurement_set(original.policy.execution_boundary)
+        static['conditions'][0]['source'] = 'implementation'
+        raw = {**original.policy.execution_boundary,
+            'code_task': {'allowed_patterns': ['main.py'], 'validation_command': ['python', 'check.py']},
+            'environment': {'mode': 'current', 'timeout_sec': 5}}
+        policy = original.policy.model_copy(update={'execution_boundary': raw, 'require_design': False})
+        sources = SourceToolGateway(root, workspace, workspace.ledger, policy=policy, execution_contract=static)
+        self.assertEqual(sources.implementation_evidence(), {})
+        self.assertIs(sources._declared_execution_contract, static)
+        self.assertEqual(sources._execution_contract(raw), freeze_measurement_set(original.policy.execution_boundary))
+        contract = {'project_path': 'source0', 'goal': 'Implement the selected method',
+            'allowed_patterns': ['main.py'], 'protected_patterns': ['gold/**'],
+            'validation_command': ['python', 'check.py'], 'timeout_sec': 5}
+        owner = ImplementationToolGateway(root, workspace, workspace.ledger, 'fixture', 'design-code',
+            exact=contract, research_inputs=sources.implementation_evidence)
+        old = {'token': 'before-design', 'binding': owner.approval_binding({}, identity='research-code')}
+        arguments = {'operation': 'design', 'question': 'Test the chosen method',
+            'synthesis_record': 'source0/synthesis.json'}
+        result = sources.execute_tool('research', design_context, arguments)
+        self.assertEqual(result.status, 'ok', result.error)
+        self.assertEqual(sources.policy.execution_boundary, raw)
+        with self.assertRaises(ValueError):
+            sources.implementation_evidence()
+        with self.assertRaises(ValueError):
+            owner.approval_binding({}, identity='research-code')
+        context = CapabilityContext(ArtifactStore(root / 'attempts/research-code'), AttemptManifest('research-code'))
+        with patch('simple_ar.research.preparation.run_preparation_capability') as no_prepare, patch(
+                'simple_ar.research.implementation.run_implementation_capability') as no_implement:
+            with self.assertRaises(ValueError):
+                owner.execute(context, {}, approval=old)
+            no_prepare.assert_not_called()
+            no_implement.assert_not_called()
+        prep_context = CapabilityContext(ArtifactStore(root / 'attempts/research-prepare'), AttemptManifest('research-prepare'))
+        prep_approval = {'token': 'independent-preparation', 'binding': owner.approval_binding(
+            {}, identity='research-prepare', for_preparation=True)}
+        self.assertNotIn('research_inputs', prep_approval['binding'])
+        prepared = owner.execute_tool('prepare_code_task', prep_context, {}, approval=prep_approval)
+        self.assertEqual(prepared.status, 'ok', prepared.error)
+
+        sources.respond_decision(sources.pending_decision()['decision_id'], 'accept')
+        self.assertIs(sources.accepted_execution_contract(), static)
+        evidence = sources.implementation_evidence()
+        self.assertEqual(evidence['design_ref'], 'records/research-design/research_design.json')
+        self.assertEqual(set(evidence['hashes']), {f'records/research-design/{name}' for name in (
+            'research_design.json', 'frozen_protocol.json', 'protocol_decision.json',
+            'protocol_response.json', 'source_request.json', 'source_result.json')})
+        for locator, digest in evidence['hashes'].items():
+            self.assertEqual(hashlib.sha256(workspace.resolve(locator).read_bytes()).hexdigest(), digest)
+        with self.assertRaisesRegex(ValueError, 'changed'):
+            owner.execute(context, {}, approval=old)
+        approval = {'token': 'accepted-design', 'binding': owner.approval_binding({}, identity='research-code')}
+        response = design_context.store.read_json('protocol_response.json')
+        design_context.store.write_json('protocol_response.json', {**response, 'decision_guidance': 'Retain the selected method'})
+        self.assertNotEqual(owner.approval_binding({}, identity='research-code'), approval['binding'])
+        with self.assertRaisesRegex(ValueError, 'changed'):
+            owner.execute(context, {}, approval=approval)
+        approval['binding'] = owner.approval_binding({}, identity='research-code')
+        original_design = design_context.store.read_json('research_design.json')
+
+        def consume_design(*, context, request):
+            design_ref = next(ref for ref in context.inputs if ref.kind == 'research_design')
+            self.assertEqual(context.read_input_json(design_ref), original_design)
+            paths = code_task_paths(request.run_dir)
+            _, design = _prepare_research_task(context, request, paths.task_dir)
+            self.assertEqual(design.to_handoff_dict(), original_design)
+            consumed = read_json(paths.task_dir / 'research_handoff.json')['consumed']
+            self.assertEqual(consumed['task_kind'], 'research')
+            self.assertEqual(consumed['design'], original_design)
+            context.store.write_json('implementation.json', {'schema_version': 'research_implementation.v1',
+                'status': 'validated', 'next_action': 'inspect', 'artifact_refs': {}, 'artifact_hashes': {},
+                'native_binding': approval, 'implementation_file_hashes': implementation_file_hashes(request.run_dir),
+                'workspace_dir': str(paths.workspace_dir), 'code_task_run_dir': str(request.run_dir)})
+
+        with patch.object(owner, '_client', return_value=Mock()), patch(
+                'simple_ar.research.preparation.run_preparation_capability', wraps=run_preparation_capability) as prepare, patch(
+                'simple_ar.research.implementation.run_implementation_capability', side_effect=consume_design) as implement:
+            implemented = owner.execute(context, {}, approval=approval)
+            self.assertEqual(implemented.status, 'ok', implemented.error)
+            prepare.assert_called_once()
+            implement.assert_called_once()
+        self.assertEqual(context.store.read_json('inputs/research_design.json'), original_design)
+        restored = SourceToolGateway(root, workspace, workspace.ledger, policy=policy, execution_contract=static)
+        owner.research_inputs = restored.implementation_evidence
+        with patch('simple_ar.tools.sources.run_research_design_capability') as no_design, patch(
+                'simple_ar.research.implementation.run_implementation_capability') as no_replay:
+            self.assertEqual(restored.implementation_evidence(), sources.implementation_evidence())
+            self.assertEqual(owner.execute(context, {}, approval=approval), implemented)
+            no_design.assert_not_called()
+            no_replay.assert_not_called()
+        changed_static = json.loads(json.dumps(static))
+        changed_static['conditions'][0]['execution']['command'] = ['python', 'different.py']
+        mismatched = SourceToolGateway(root, workspace, workspace.ledger, policy=policy,
+            execution_contract=changed_static)
+        with self.assertRaisesRegex(ValueError, 'fixed physical'):
+            mismatched.implementation_evidence()
+        (project / 'synthesis.json').write_text('{}')
+        with self.assertRaisesRegex(ValueError, 'stale'):
+            restored.implementation_evidence()
+
+    def test_fixed_design_comparison_preserves_conditions_and_source_authority(self) -> None:
+        from simple_ar.tools.scientific import ScientificToolGateway, fixed_measurement_issues, freeze_measurement_set
+        root, workspace, sources, _ = self._professional_design_fixture(
+            baseline_policy='run', seeds=[7], seed_flag='--seed')
+        declared = freeze_measurement_set(sources.policy.execution_boundary)
+        declared['conditions'][0].update(source='preparation', before_implementation=True)
+        declared['conditions'][1]['source'] = 'implementation'
+        accepted = json.loads(json.dumps(declared))
+        for row in accepted['conditions']:
+            row.pop('source')
+            row.pop('before_implementation', None)
+        self.assertEqual(fixed_measurement_issues(declared, accepted), [])
+        science = ScientificToolGateway(root, workspace, workspace.ledger, 'fixed-design',
+            execution_contract=declared, research_contract=lambda: accepted)
+        self.assertEqual(science.execution_issues(), [])
+        self.assertEqual(science.execution_contract['conditions'][0]['source'], 'preparation')
+        self.assertTrue(science.execution_contract['conditions'][0]['before_implementation'])
+        for key, value in (('id', 'different'), ('role', 'candidate'), ('seed', 8)):
+            changed = json.loads(json.dumps(accepted))
+            changed['conditions'][0][key] = value
+            science._research_contract = lambda: changed
+            with self.subTest(key=key):
+                self.assertIn('fixed scientific', science.execution_issues()[0])
+        science._research_contract = lambda: accepted
+        accepted['conditions'].pop()
+        self.assertIn('fixed scientific', science.execution_issues()[0])
+
     def test_source_search_and_local_passages_preserve_original_identity(self) -> None:
         run_dir, inputs, fake, binding, resumed, code = self._native_fixture(allow_network=True)
         from simple_ar.research.sources.capability import SearchResult

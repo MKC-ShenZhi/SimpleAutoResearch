@@ -223,12 +223,12 @@ def fixed_measurement_issues(declaration: dict[str, Any], accepted: dict[str, An
     """Match physical slots and caller-explicit protocol fields, not added design prose."""
     declared = (freeze_measurement_set(declaration) if any(key in declaration for key in
         ('baseline', 'pairs', 'seeds', 'seed_count', 'baseline_policy')) else measurement_contract(declaration))
-    expected, actual = measurement_conditions(declared), measurement_conditions(accepted)
+    expected, actual = measurement_conditions(declared), measurement_conditions(measurement_contract(accepted))
     if len(expected) != len(actual):
         return ['Accepted design differs from the fixed execution condition set.']
     for index, (left, right) in enumerate(zip(expected, actual)):
-        if ({key: value for key, value in left.items() if key != 'execution'}
-                != {key: value for key, value in right.items() if key != 'execution'}
+        if ({key: value for key, value in left.items() if key not in {'execution', 'source', 'before_implementation'}}
+                != {key: value for key, value in right.items() if key not in {'execution', 'source', 'before_implementation'}}
                 or {key: value for key, value in left['execution'].items() if key != 'protocol'}
                 != {key: value for key, value in right['execution'].items() if key != 'protocol'}):
             return ['Accepted design differs from the fixed physical execution contract.']
@@ -296,10 +296,13 @@ class ScientificToolGateway:
         if self._declared_execution_contract is not None and self._research_contract is not None:
             try:
                 accepted = self._research_contract()
-                if accepted is not None and accepted != self._declared_execution_contract:
-                    return ['Accepted research design differs from the fixed scientific execution contract.']
+                if accepted is not None:
+                    differences = fixed_measurement_issues(self._declared_execution_contract, accepted)
+                    if differences:
+                        return ['Accepted research design differs from the fixed scientific execution contract. '
+                            + issue for issue in differences]
             except (OSError, ValueError, KeyError, TypeError) as exc:
-                return [str(exc)]
+                return ['Accepted research design differs from the fixed scientific execution contract. ' + str(exc)]
         contract = self.execution_contract
         if contract is not None and any(row.get('reuse_ref') and not row.get('reuse_sha256')
                 for row in measurement_conditions(contract)):

@@ -212,7 +212,7 @@ papers = ["paper.md"]
 
 准备与检查共享进程预算/日志，失败不进入测量，检查输出不作为测量。任务 venv 解析裸 Python 别名；来源绑定测量中的显式执行器若与该 venv 冲突，会在启动前拒绝，不静默替换。安装可能运行构建代码/联网；工作区不是 OS 沙箱，完成恢复不重装。
 
-已迁移的精确任务可先准备未改源码、测基线，再实施独立候选，反馈时复用原准备。冻结条件的来源与 baseline/candidate 比较角色分开。明确 `skip` 只要求声明的候选运行，交付描述性结果，不虚构基线对照。历史基线复用、研究驱动的协议设计及未支持的结构化组合仍由原控制器负责，不能视为已全部迁移。
+已迁移的精确任务可先准备未改源码、测基线，再实施独立候选，反馈时复用原准备。冻结条件的来源与 baseline/candidate 比较角色分开。明确 `skip` 只要求声明的候选运行，交付描述性结果，不虚构基线对照。固定测量可按下文的 `baseline_ref` 复用已有结果；CodeTask 基线复用及未支持的结构化组合仍由原控制器负责。
 
 普通 benchmark 允许 validator 与正式测量使用相同 argv，但必须分别进行真实物理调用并独立记账，validator 结果不能充当测量。严格 reproduction 仍要求不同的校验命令。greenfield 的 `copy`/`sparse_copy` 若有真实 source 项目，可承接源码基线；这些冻结条件显式携带 `source="preparation"`、`before_implementation=true`。高层须先 prepare，完成全部声明的 baseline，再调用 `implement(prepared_result)` 并传入实际成功基线事实；失败或缺测不能授权生成。empty 或无 source 的 greenfield baseline 保留准确的原 owner 或拒绝，不虚构源码。项目测量 cwd 仍须匹配原 source root，可写范围与源码路径投射规则不变。
 
@@ -496,7 +496,7 @@ Greenfield 设置 kind="greenfield"。没有脚手架时省略 code_root，并�
 
 通过 `execution.code_task_config` 或 `--code-task-config` 引用同一文件。CodeTask 负责编辑和验证，研究应用负责测量和报告。复现 adapter 是明确允许同时声明独立正式命令的例外。
 
-新建精确 CodeTask 请求的代码、可选环境准备、声明的基线/候选条件及报告/反馈共享原生任务，包括已支持的 copy/sparse 源码脚手架及必需新 Python 文件。环境只准备一次，条件测量与反馈复用；默认进程额度包含准备步骤，显式限制不改。任务 venv 不得静默替换明确选择的外部解释器。历史基线复用、研究驱动设计/checkpoint 及历史继续保留独特合同。工作区、编辑范围、独立验证和执行批准不丢；运行命令不等于批准执行。原生任务用 `simple-ar start --resume-task SESSION` 继续。原生工具需要 Chat 连接。Worktree 批准暂不能绑定 checkout 过滤、attributes、子模块或换行转换；需要这些语义时保留专家协议，或由用户明确选 copy。
+新建精确 CodeTask 请求的代码、可选环境准备、声明的基线/候选条件及报告/反馈共享原生任务，包括已支持的 copy/sparse 源码脚手架及必需新 Python 文件。环境只准备一次，条件测量与反馈复用；默认进程额度包含准备步骤，显式限制不改。任务 venv 不得静默替换明确选择的外部解释器。已声明测量的 auto/autonomous 任务还可调查材料并形成接受后的设计：实施直接消费原设计，批准绑定设计、接受意见和来源记录；证据变化会使旧实施批准失效。独立源码/环境准备可先于设计接受，接受设计不授予执行权限。CodeTask 基线复用、分阶段/checkpoint 新建及历史继续保留独特合同。工作区、编辑范围、独立验证和执行批准不丢；运行命令不等于批准执行。原生任务用 `simple-ar start --resume-task SESSION` 继续。原生工具需要 Chat 连接。Worktree 批准暂不能绑定 checkout 过滤、attributes、子模块或换行转换；需要这些语义时保留专家协议，或由用户明确选 copy。
 
 要求 report 时，写作直接消费已接受的实施证据及真实修订关系，由原写作模块执行保存的整稿/分节、adaptive 规划、审阅及有界修订要求；必需标题顺序和引文上限仍是硬约束。完成交付同时要求已验证代码和当前规范稿，反馈后也不能拿旧稿充数。任务 max_output_tokens 在专业路由后保留，不修改命名连接；明确的逐次上限（包括 max_section_tokens）优先。缺少报告修订或仍有必需解决的意见时保持 partial，不当作完成。
 

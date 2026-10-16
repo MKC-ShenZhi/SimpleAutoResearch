@@ -323,7 +323,7 @@ def _prepare_research_task(
         task = (
             "# Implementation-only CodeTask\n\n"
             "This action only proposes and validates the selected code change in the "
-            "isolated workspace. The outer ResearchApplication owns literature review, "
+            "isolated workspace. The surrounding task owns literature review, "
             "experiment execution, result analysis, and academic report writing. Do "
             "not create a paper, report, citations, or documentation as part of this "
             "CodeTask action.\n\n"

@@ -743,7 +743,7 @@ def _print_research_session(args: argparse.Namespace) -> None:
                 if migrate_exact_code_creation(args, execution=execution, request=brief.request_text,
                         outputs=brief.requested_outputs, sources=brief.asset_requests,
                         limits=services.budget_limits, root=session_root,
-                        report_config=report_config, writing_method=writing_method):
+                        report_config=report_config, writing_method=writing_method, research_config=config):
                     return
             if report_requested:
                 _print_report_writing_plan(writing_method, report_config)

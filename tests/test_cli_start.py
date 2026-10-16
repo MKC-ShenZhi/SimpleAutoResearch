@@ -1474,6 +1474,59 @@ class StartTests(unittest.TestCase):
                     self.assertEqual((vars(args), execution, sources, limits), original)
                     self.assertEqual({path: path.read_bytes() for path in originals}, originals)
 
+    def test_research_code_creation_retains_domain_contracts_in_one_task(self):
+        from copy import deepcopy
+        from simple_ar.app.research_execution import code_task_execution_options
+        from simple_ar.cli.start import migrate_exact_code_creation
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            project = root / 'project'
+            project.mkdir()
+            (project / 'check.py').write_text('pass\n', encoding='utf-8')
+            paper = root / 'paper.md'
+            paper.write_text('Source method and conditions', encoding='utf-8')
+            task = code_task_execution_options(load_code_task_init_options(kind='existing_project',
+                code_root=str(project), workspace_mode='copy', require_task_file=False),
+                load_code_task_execute_options())
+            task['validation_command'] = [sys.executable, 'check.py']
+            task['validation_timeout_sec'] = 5
+            execution = {'command': [sys.executable, 'measure.py'], 'cwd': str(project),
+                'timeout_sec': 5, 'result_schema': {'required_metrics': ['score']},
+                'baseline_policy': 'skip', 'code_task': task}
+            args = build_parser().parse_args(['research-session', '--task-kind', 'auto', '--topic', 'Investigate and implement',
+                '--model', 'fixture', '--interaction', 'autonomous', '--query', 'method conditions', '--provider', 'arxiv'])
+            args._explicit_resume_destinations = {'task_kind', 'model', 'interaction', 'queries', 'providers'}
+            limits = {'llm_requests': 4, 'total_tokens': 50000, 'process_invocations': 3, 'process_wall_seconds': 15}
+            research = {'interaction': 'autonomous', 'research_materials_only': True,
+                'research_max_documents': 2, 'research_max_iterations': 1}
+            sources = ({'locator': str(paper), 'role': 'paper'},)
+            before = deepcopy((vars(args), execution, research, limits))
+            with patch('simple_ar.cli.main._run_native_start') as run, patch('simple_ar.cli.start.print_line'):
+                self.assertTrue(migrate_exact_code_creation(args, execution=execution,
+                    request=args.topic, outputs=('experiments',), sources=sources, limits=limits,
+                    root=root / 'task', research_config=research))
+            native = run.call_args.args[0]
+            self.assertEqual(native.source, [project, paper])
+            self.assertEqual(native._code_task['project_path'], 'source0')
+            self.assertTrue(native._research_policy['require_design'])
+            self.assertFalse(native.allow_network)
+            self.assertEqual(native._research_policy['source_workspace'], 'source0')
+            self.assertEqual(native._research_policy['materials'], ['source1'])
+            self.assertEqual(native._research_policy['execution_boundary']['code_task'], task)
+            self.assertEqual(native._research_policy['queries'], ['method conditions'])
+            self.assertEqual(native._execution_contract['conditions'][0]['source'], 'implementation')
+            self.assertEqual(native._process_limits, {'process_invocations': 3, 'process_wall_seconds': 15})
+            self.assertEqual((vars(args), execution, research, limits), before)
+            for interaction in ('assisted', 'checkpoints'):
+                args.interaction = interaction
+                with patch('simple_ar.cli.main._run_native_start') as run:
+                    self.assertFalse(migrate_exact_code_creation(args, execution=execution,
+                        request=args.topic, outputs=('experiments',), sources=sources, limits=limits,
+                        root=root / interaction, research_config=research))
+                    run.assert_not_called()
+            self.assertEqual((project / 'check.py').read_text(), 'pass\n')
+            self.assertEqual(paper.read_text(), 'Source method and conditions')
+
     def test_prepared_reproduction_uses_existing_config_and_preserves_argv(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

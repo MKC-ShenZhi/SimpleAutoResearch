@@ -213,6 +213,7 @@ class ImplementationToolGateway:
                  execution_observations: Callable[[], list[dict[str, Any]]] | None = None,
                  candidate_outputs: Callable[[Path], dict[str, str]] | None = None,
                  measurement_inputs: Callable[[dict[str, str] | None, bool], dict[str, Any]] | None = None,
+                 research_inputs: Callable[[], dict[str, Any]] | None = None,
                  measurement: dict[str, Any] | None = None,
                  exact: dict[str, Any] | None = None) -> None:
         self.root, self.workspace, self.ledger = root, workspace, ledger
@@ -221,6 +222,7 @@ class ImplementationToolGateway:
         self.execution_observations = execution_observations
         self.candidate_outputs = candidate_outputs
         self.measurement_inputs = measurement_inputs
+        self.research_inputs = research_inputs
         self.exact = ExactCodeTask.model_validate(exact) if exact is not None else None
         if measurement is not None:
             if self.exact is None:
@@ -237,7 +239,8 @@ class ImplementationToolGateway:
         return (representative_measurement_execution(self.measurement) if self.measurement is not None
             else {'command': self.exact.validation_command})
 
-    def approval_binding(self, arguments: dict[str, Any], *, identity: str) -> dict[str, Any]:
+    def approval_binding(self, arguments: dict[str, Any], *, identity: str,
+                         for_preparation: bool = False) -> dict[str, Any]:
         if self.exact is None:
             raise ValueError('Exact implementation requires the saved contract')
         work = ExactCodeWork.model_validate(arguments)
@@ -368,6 +371,10 @@ class ImplementationToolGateway:
                 raise ValueError('Required prior measurements have no scientific evidence owner')
             binding['measurement_inputs'] = self.measurement_inputs(self._preparation_origin(
                 {'binding': binding}, identity=identity), True)
+        if not for_preparation and self.research_inputs is not None:
+            research = self.research_inputs()
+            if research:
+                binding['research_inputs'] = research
         return binding
 
     def _environment_plan(self, cwd: Path, origin: Path, identity: str, python: str) -> dict[str, Any]:
@@ -531,7 +538,7 @@ class ImplementationToolGateway:
         if self.exact is None or arguments or not approval.get('token'):
             raise ValueError('Preparation requires the frozen exact contract, empty arguments and explicit approval')
         identity = context.attempt.attempt_id
-        if approval['binding'] != self.approval_binding({}, identity=identity):
+        if approval['binding'] != self.approval_binding({}, identity=identity, for_preparation=True):
             raise ValueError('Approved preparation source or environment changed; no replay')
         record = context.store.root / 'execution.json'
         run = self.workspace.workspace / 'code_tasks' / identity
@@ -543,7 +550,8 @@ class ImplementationToolGateway:
             if run.exists():
                 raise ValueError('Interrupted preparation is not replayable; inspect original records and ledger')
             project = self.workspace.resolve(self.exact.project_path) if self.exact.project_path else None
-            self._prepare_candidate(context, ExactCodeWork(), approval, run, project, self.exact.goal)
+            self._prepare_candidate(context, ExactCodeWork(), approval, run, project, self.exact.goal,
+                for_preparation=True)
             payload = context.store.read_json(record.name)
             payload.update(native_binding=approval, file_hashes=implementation_file_hashes(run),
                 artifact_hashes={path.name: hashlib.sha256(path.read_bytes()).hexdigest()
@@ -760,6 +768,14 @@ class ImplementationToolGateway:
             self._check_retained_result(context.store, payload, run, approval)
         else:
             project = self.workspace.resolve(contract.project_path) if contract.project_path else None
+            research_ref = None
+            if research := binding.get('research_inputs'):
+                design_path = self.workspace.resolve(research['design_ref'])
+                content = design_path.read_bytes()
+                if hashlib.sha256(content).hexdigest() != research['hashes'].get(research['design_ref']):
+                    raise ValueError('Accepted research design changed before implementation')
+                research_ref = context.store.write_json('inputs/research_design.json', json.loads(content),
+                    kind='research_design', schema='research_design.v1', producer='sources')
             if work.prior_result:
                 _, project = self._prior_candidate(work.prior_result, identity=identity)
             elif work.prepared_result:
@@ -786,7 +802,7 @@ class ImplementationToolGateway:
                 {'request_text': task_text, 'objective': task_text, 'hard_constraints': []},
                 kind='research_brief')
             domain_context = CapabilityContext(context.store, context.attempt,
-                inputs=(brief,), input_store=context.store)
+                inputs=(brief, research_ref) if research_ref is not None else (brief,), input_store=context.store)
             manifest = load_code_task_manifest(run)
             from simple_ar.code_task.execution.environment import native_validation_command
             run_implementation_capability(context=domain_context, request=CodeRequest(
@@ -808,7 +824,7 @@ class ImplementationToolGateway:
             error='' if payload['status'] == 'validated' else payload['next_action'])
 
     def _prepare_candidate(self, context: Any, work: ExactCodeWork, approval: dict[str, Any],
-                           run: Path, project: Path | None, task_text: str) -> None:
+                           run: Path, project: Path | None, task_text: str, *, for_preparation: bool = False) -> None:
         """Prepare a real isolated source once; code and measurement consume it."""
         from simple_ar.research.preparation import PreparationRequest, run_preparation_capability
         from simple_ar.experiment.execution.backend import RunRequest
@@ -895,7 +911,7 @@ class ImplementationToolGateway:
             from simple_ar.research.project_environment import prepare_project_environment
             from simple_ar.experiment.execution.backend import LocalExecutionBackend
             view = binding['environment_preparations'][manifest['workspace']['selected_mode']]
-            if binding != self.approval_binding(work.model_dump(), identity=identity):
+            if binding != self.approval_binding(work.model_dump(), identity=identity, for_preparation=for_preparation):
                 raise ValueError('Approved source or executable identity changed after copying; preparation was not started')
             payload = context.store.read_json('execution.json')
             configuration = {**payload['execution'], 'command': view['command'],
@@ -909,7 +925,7 @@ class ImplementationToolGateway:
                 prepared_payload=payload, backend=LocalExecutionBackend(budget_ledger=self.ledger), record_runtime=True)
             if prepared.status != 'completed':
                 raise ValueError('Candidate environment preparation failed; no implementation or measurement was started')
-            if binding != self.approval_binding(work.model_dump(), identity=identity):
+            if binding != self.approval_binding(work.model_dump(), identity=identity, for_preparation=for_preparation):
                 raise ValueError('Approved source or preparation inputs changed during setup')
             current = implementation_file_hashes(run)
             if any(current.get(name) != digest for name, digest in expected.items()):

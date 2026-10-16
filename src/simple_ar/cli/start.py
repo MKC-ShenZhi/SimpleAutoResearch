@@ -441,7 +441,8 @@ def _configure_research(native: argparse.Namespace, args: argparse.Namespace, *,
         allow_pdf_download=research_config.get('research_allow_pdf_download', False),
         keep_raw_pdf=research_config.get('research_keep_raw_pdf', False),
         allow_network=not research_config.get('research_materials_only', False),
-        max_fulltext_documents=research_config.get('research_max_fulltext_documents', args.max_results),
+        max_fulltext_documents=research_config.get('research_max_fulltext_documents',
+            min(research_config.get('research_max_documents', args.max_results), args.max_results)),
         max_pdf_mb=research_config.get('research_max_pdf_mb', 20),
         max_pdf_pages=research_config.get('research_max_pdf_pages', 100),
         read_max_shortlist=research_config.get('research_read_max_shortlist', args.max_results),
@@ -541,8 +542,9 @@ def resume_structured_task(args: argparse.Namespace) -> None:
 def migrate_exact_code_creation(args: argparse.Namespace, *, execution: dict,
                                 request: str, outputs: tuple, sources: tuple,
                                 limits: dict, root: Path, report_config: dict | None = None,
-                                writing_method: str | None = None) -> bool:
-    """Adapt exact code work and declared measurements, not research design/reuse."""
+                                writing_method: str | None = None,
+                                research_config: dict | None = None) -> bool:
+    """Bind precise code, research and measurements to their shared owners."""
     from simple_ar.research.task_plan import implementation_only
     reproduction = getattr(args, 'task_kind', None) == 'reproduction'
     flat_fields = {'command', 'cwd', 'timeout_sec', 'label', 'result_schema', 'protocol'}
@@ -557,6 +559,14 @@ def migrate_exact_code_creation(args: argparse.Namespace, *, execution: dict,
         'total_tokens': native.max_tokens if limits.get('total_tokens') is None else limits['total_tokens']}
     task = execution['code_task']
     scientific = 'experiments' in outputs and not set(outputs) - {'experiments', 'report'}
+    from simple_ar.cli.research_config import FIELDS
+    research_fields = {destination for destination, _ in FIELDS['research'].values()}
+    research_work = (scientific and args.task_kind == 'auto'
+        and getattr(args, 'interaction', None) == 'autonomous'
+        and (any(row['role'] in {'paper', 'material'} for row in sources)
+             or bool(set(getattr(args, '_explicit_resume_destinations', ())) & (research_fields - {'interaction'}))))
+    if research_work and (not args.model or research_config is None):
+        return False
     preparation_names = ('kind', 'workspace_mode', 'max_file_bytes', 'workspace_include', 'workspace_exclude',
         'workspace_reuse_source_venv', 'env_mode', 'python_executable', 'max_repairs')
     formal = None
@@ -576,6 +586,8 @@ def migrate_exact_code_creation(args: argparse.Namespace, *, execution: dict,
         supported.update(destination for destination, _ in FIELDS['report'].values())
         if getattr(args, 'research_materials_only', None) is True:
             supported.add('research_materials_only')  # Preserve the existing supplied-material-only restriction.
+        if research_work:
+            supported.update(research_fields | {'selected_idea_id', 'feasibility_review_model'})
         if set(getattr(args, '_explicit_resume_destinations', ())) - supported:
             return False
         from simple_ar.app.research_execution import code_task_validation, normalize_execution_config
@@ -710,12 +722,22 @@ def migrate_exact_code_creation(args: argparse.Namespace, *, execution: dict,
     if formal is not None:
         native._execution_contract = formal
         native._task_attempt_limit = max(20, limits['llm_requests'] * 10 + len(conditions) + 2)
+    if research_work:
+        _configure_research(native, args, sources=sources, research_config=research_config,
+            outputs=outputs, require_design=True, review_model=research_config.get('feasibility_review_model'))
+        native._research_policy.update(execution_boundary={**declaration, 'code_task': task},
+            execution_schema=selected['result_schema'], source_workspace=exact.project_path)
     native._report_requirement = None
     if 'report' in outputs:
         from simple_ar.tools.writing import freeze_report_requirement
         native._report_requirement = freeze_report_requirement(report_config or {}, method=writing_method)
     native._task_output_limit = getattr(args, 'max_output_tokens', None)
     native._process_limits = {name: limits[name] for name in ('process_invocations', 'process_wall_seconds')}
+    if research_work and native.allow_network:
+        source_count = max(1, len(args.queries or ())) * len(native._research_policy['providers'])
+        for name, extra in (('process_invocations', source_count * 4), ('process_wall_seconds', source_count * 120)):
+            if getattr(args, name, None) is None:
+                native._process_limits[name] += extra
     if scientific or exact.environment is not None:
         validators = 1 + preparation['max_repairs']
         required = {'process_invocations': len(conditions) + validators,
