@@ -31,6 +31,11 @@ def visual_tool_specs() -> list[CommonToolSpec]:
 
 
 class VisualToolGateway:
+    def can_reconcile(self, name: str, identity: str) -> bool:
+        directory = self.workspace.workspace / 'visual-reviews' / identity
+        return name == 'inspect_images' and any(
+            (directory / path).is_file() for path in ('response.json', 'review.json'))
+
     def __init__(self, root: Path, workspace: Any, ledger: Any, session_id: str,
                  *, client_factory: Callable[[str], LLMClient] | None = None) -> None:
         self.root, self.workspace, self.ledger, self.session_id = root, workspace, ledger, session_id

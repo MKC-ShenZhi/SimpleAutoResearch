@@ -26,7 +26,8 @@ are not included in a fresh checkout; it is not a quick-start case.
 ## Files and outputs
 
 - `examples/<case>/`: reusable case inputs only, never generated runs or credentials.
-- `.env`: ignored global credentials and model/transport settings. Task assets and
+- Model catalog TOML: named connections and routes; see [model setup](../docs/USAGE.md).
+- `.env`: ignored credentials and, optionally, the catalog path. Task assets and
   interpreters belong in the task TOML; `{config_dir}` keeps case paths portable.
 - `runs/`: generated state, workspaces, measurements and reports.
 - `tests/fixtures/`: internal regression material, not additional user examples.

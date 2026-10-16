@@ -6,9 +6,11 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from tests.report_review_fixtures import changed_record
 
 from simple_ar.core import CapabilityRegistry, SessionController
 from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
+from simple_ar.integrations.llm import LLMResponseError
 from simple_ar.report.audit import (
     ReportAuditCapabilityRequest,
     run_report_audit_capability,
@@ -30,10 +32,18 @@ from simple_ar.report.schema import (
     ReportTemplateBundle,
     SourceHandle,
 )
-from simple_ar.report.writing import ARTICLE_OWNER, ReportWritingRequest, resolve_report_writing_resume, run_report_writing_capability
+from simple_ar.report.writing import ARTICLE_OWNER, ReportWritingRequest, inspect_article, resolve_report_writing_config, resolve_report_writing_resume, run_report_writing_capability, validate_report_writing_config
 
 
 class ReportAuditCapabilityTests(unittest.TestCase):
+    @staticmethod
+    def report_session(root, identity, *, audit=False):
+        registry = CapabilityRegistry()
+        registry.register("report_audit" if audit else "report",
+            run_report_audit_capability if audit else run_report_capability)
+        return SessionController.create(root, session_id=identity, topic="offline report",
+            profile="paper_audit", registry=registry)
+
     def test_experiment_figures_are_enabled_by_default_and_can_be_disabled(self):
         self.assertTrue(ReportFigureConfig().enabled)
         self.assertEqual(ReportFigureConfig(mode="off").mode, "off")
@@ -148,15 +158,7 @@ class ReportAuditCapabilityTests(unittest.TestCase):
 
     def test_report_capability_persists_verified_reference_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            registry = CapabilityRegistry()
-            registry.register("report", run_report_capability)
-            controller = SessionController.create(
-                tmp,
-                session_id="report-reference-session",
-                topic="offline report",
-                profile="paper_audit",
-                registry=registry,
-            )
+            controller = self.report_session(tmp, "report-reference-session")
 
             result = controller.execute_attempt(
                 "report",
@@ -240,109 +242,40 @@ class ReportAuditCapabilityTests(unittest.TestCase):
 
     def test_report_capability_renders_only_planned_figures(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            registry = CapabilityRegistry()
-            registry.register("report", run_report_capability)
-            controller = SessionController.create(
-                tmp,
-                session_id="report-figure-session",
-                topic="offline report",
-                profile="paper_audit",
-                registry=registry,
-            )
-
-            result = controller.execute_attempt(
-                "report",
-                attempt_id="attempt-001",
-                request=ReportAssemblyRequest(
-                    title="Offline report",
-                    template_name="paper",
-                    papers=({"id": "paper-1", "title": "Supplied source"},),
-                    config=ReportRuntimeConfig(
-                        figures=ReportFigureConfig(enabled=True)
-                    ),
-                    document_plan=ReportDocumentPlan(
-                        sections=[
-                            ReportSectionPlan(
-                                section_id="introduction",
-                                heading="Introduction",
-                                goal="Orient the reader.",
-                                evidence_handles=["paper-1", "paper-2"],
-                            )
-                        ],
-                        visual_intents=[
-                            ReportVisualIntent(
-                                visual_id="taxonomy",
-                                kind="figure",
-                                title="Conceptual taxonomy",
-                                purpose="Show the organizing concepts.",
-                                section_id="introduction",
-                                evidence_handles=["paper-1", "paper-2"],
-                                view="taxonomy-map",
-                            )
-                        ],
-                    ),
-                    sections=(
-                        ReportSectionDraft(
-                            section_id="introduction",
-                            heading="Introduction",
-                            draft_markdown="Evidence-backed claim [@paper-1].\n\n- Method A\n- Method B\n- Method C",
-                        ),
-                    ),
-                ),
-            )
-
+            controller = self.report_session(tmp, "report-figure-session")
+            request = ReportAssemblyRequest(title="Offline report", template_name="paper",
+                papers=({"id": "paper-1", "title": "Supplied source"},),
+                document_plan=ReportDocumentPlan(visual_intents=[ReportVisualIntent(
+                    visual_id="taxonomy", kind="figure", title="Conceptual taxonomy",
+                    purpose="Show the organizing concepts.", section_id="stable-id",
+                    evidence_handles=["paper-1"], view="taxonomy-map")]),
+                sections=(ReportSectionDraft(section_id="stable-id", heading="概念分类",
+                    draft_markdown="Evidence-backed claim [@paper-1].\n\n- Method A\n- Method B\n- Method C"),))
+            result = controller.execute_attempt("report", attempt_id="attempt-001", request=request)
             self.assertEqual(result.status, "completed")
-            self.assertTrue(
-                controller.store.resolve(
-                    "attempts/attempt-001/figures/figures_manifest.json"
-                ).is_file()
-            )
-            figure_refs = [artifact for artifact in result.artifacts if artifact.kind == "figure"]
-            self.assertEqual(len(figure_refs), 1)
-            self.assertEqual(figure_refs[0].path, "figures/taxonomy-map.svg")
-            self.assertEqual(figure_refs[0].status, "available")
-            body = controller.store.read_text("attempts/attempt-001/report_body.md")
-            report = controller.store.read_text("attempts/attempt-001/report.md")
-            self.assertIn("figures/taxonomy-map.svg", body)
-            self.assertIn("figures/taxonomy-map.svg", report)
-            self.assertIn("[@paper-1]", body)
-            attempt = controller.store.read_attempt_manifest(
-                "attempts/attempt-001/attempt_manifest.json"
-            )
-            self.assertEqual(
-                [artifact.path for artifact in attempt.outputs if artifact.kind == "figure"],
-                ["figures/taxonomy-map.svg"],
-            )
+            refs = [ref for ref in result.artifacts if ref.kind == "figure"]
+            self.assertEqual([(ref.path, ref.status) for ref in refs], [("figures/taxonomy-map.svg", "available")])
+            manifest = controller.store.read_json("attempts/attempt-001/figures/figures_manifest.json")
+            self.assertEqual(manifest["figures"][0]["source_artifacts"], ["paper-1"])
+            for name in ("report_body.md", "report.md"):
+                self.assertIn(refs[0].path, controller.store.read_text(f"attempts/attempt-001/{name}"))
+            self.assertIn("[@paper-1]", controller.store.read_text("attempts/attempt-001/report_body.md"))
 
     def test_missing_renderer_output_is_explicitly_partial(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            registry = CapabilityRegistry()
-            registry.register("report", run_report_capability)
-            controller = SessionController.create(
-                tmp,
-                session_id="report-missing-figure",
-                topic="offline report",
-                profile="paper_audit",
-                registry=registry,
-            )
+            controller = self.report_session(tmp, "report-missing-figure")
 
+            request = ReportAssemblyRequest(
+                title="Offline report",
+                papers=({"id": "p1", "title": "Caption source"},
+                        {"id": "p2", "title": "Body source"},
+                        {"id": "unused", "title": "Unused source"}),
+                citation_key_map={"P1": "p1", "P2": "p2"},
+                sections=(ReportSectionDraft(section_id="introduction", heading="Introduction",
+                    draft_markdown="A short report [@P2]."),),
+            )
             result = controller.execute_attempt(
-                "report",
-                attempt_id="attempt-001",
-                request=ReportAssemblyRequest(
-                    title="Offline report",
-                    papers=({"id": "p1", "title": "Caption source"},
-                            {"id": "p2", "title": "Body source"},
-                            {"id": "unused", "title": "Unused source"}),
-                    citation_key_map={"P1": "p1", "P2": "p2"},
-                    sections=(
-                        ReportSectionDraft(
-                            section_id="introduction",
-                            heading="Introduction",
-                            draft_markdown="A short report [@P2].",
-                        ),
-                    ),
-                ),
+                "report", attempt_id="attempt-001", request=request,
                 figure_renderer=_MissingFigureRenderer(caption="Caption evidence [@p1]."),
             )
 
@@ -366,6 +299,13 @@ class ReportAuditCapabilityTests(unittest.TestCase):
             self.assertIn("@misc{p2", bib)
             self.assertNotIn("@misc{unused", bib)
             self.assertEqual(result.usage["cited_paper_count"], 2)
+            # Check the actual caption-bearing body, not just the Writer's
+            # earlier source count. Preview has one source; rendering adds another.
+            bounded = replace(request, config=ReportRuntimeConfig(max_cited_sources=1))
+            self.assertEqual(len(preview_report_document(bounded).cited_papers), 1)
+            with self.assertRaisesRegex(ValueError, 'Final report exceeds max_cited_sources'):
+                assemble_report_document(bounded, report_dir=Path(tmp) / 'bounded',
+                    figure_renderer=_MissingFigureRenderer(caption="Caption evidence [@p1]."))
 
     def test_assembly_uses_frozen_title_and_preserves_legacy_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -496,15 +436,7 @@ class ReportAuditCapabilityTests(unittest.TestCase):
 
     def test_report_capability_uses_document_plan_order_without_dropping_drafts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            registry = CapabilityRegistry()
-            registry.register("report", run_report_capability)
-            controller = SessionController.create(
-                tmp,
-                session_id="report-order-session",
-                topic="offline report",
-                profile="paper_audit",
-                registry=registry,
-            )
+            controller = self.report_session(tmp, "report-order-session")
 
             result = controller.execute_attempt(
                 "report",
@@ -554,15 +486,7 @@ class ReportAuditCapabilityTests(unittest.TestCase):
 
     def test_session_adapter_reads_explicit_report_inputs_and_preserves_shape(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            registry = CapabilityRegistry()
-            registry.register("report_audit", run_report_audit_capability)
-            controller = SessionController.create(
-                tmp,
-                session_id="report-audit-session",
-                topic="offline report",
-                profile="paper_audit",
-                registry=registry,
-            )
+            controller = self.report_session(tmp, "report-audit-session", audit=True)
             report_ref = controller.store.write_text(
                 "input/report.md",
                 "# Report\n\nSupported claim [@paper-1].\n",
@@ -602,15 +526,7 @@ class ReportAuditCapabilityTests(unittest.TestCase):
 
     def test_failed_audit_is_not_reported_as_completed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            registry = CapabilityRegistry()
-            registry.register("report_audit", run_report_audit_capability)
-            controller = SessionController.create(
-                Path(tmp),
-                session_id="report-audit-failure",
-                topic="offline report",
-                profile="paper_audit",
-                registry=registry,
-            )
+            controller = self.report_session(Path(tmp), "report-audit-failure", audit=True)
             report_ref = controller.store.write_text(
                 "input/report.md",
                 "# Report\n\nUnsupported citation [@missing].\n",
@@ -655,7 +571,7 @@ class ArticleClient:
 class StructuredArticleWritingTests(unittest.TestCase):
     def request(self, client=None):
         config = ReportRuntimeConfig(reviewer='disabled', max_review_iterations=0,
-            allow_source_backtracking=False, outline_strategy='template', max_section_tokens=900)
+            allow_source_backtracking=False, outline_strategy='auto', max_section_tokens=900)
         context = ReportContext(topic='Recorded observations', report_mode='supplied_materials',
             goal_markdown='Explain the observed result and its limits.',
             source_handles=[SourceHandle(handle='material:result', kind='material',
@@ -719,6 +635,12 @@ class StructuredArticleWritingTests(unittest.TestCase):
                     run_report_writing_capability(
                         context=CapabilityContext(store, AttemptManifest('invalid')), request=rejected)
                 self.assertEqual(len(rejected.llm_client.calls), 1)
+                target = ArtifactStore(Path(tmp) / 'rejected-resume')
+                ref = store.ref('report_inputs.json', kind='article_snapshot', schema=ARTICLE_OWNER)
+                with self.assertRaisesRegex(ValueError, 'no automatic correction'):
+                    run_report_writing_capability(context=CapabilityContext(target, AttemptManifest('resume'),
+                        inputs=(ref,), input_store=store), request=replace(rejected, resume_ref=ref))
+                self.assertFalse(target.root.exists())
                 self.assertEqual(store.read_json('response.json'), response)
                 self.assertFalse(store.exists('writer.json'))
                 with self.assertRaisesRegex(ValueError, 'no automatic correction'):
@@ -760,16 +682,347 @@ class StructuredArticleWritingTests(unittest.TestCase):
             for name, raw in original.items():
                 self.assertEqual(first.resolve(name).read_bytes(), raw)
 
+    def test_article_inspection_preserves_draft_and_recovers_both_responses(self):
+        case = self
+        class Client(ArticleClient):
+            def ask_json(self, system, prompt, **options):
+                self.calls.append((system, json.loads(prompt), options))
+                if options['label'] == 'article-independent-review':
+                    view = json.loads(prompt)
+                    case.assertIn('0.75', json.dumps(view['metric_sources']))
+                    case.assertEqual(view['verified_execution_results']['status'], 'partial')
+                    return {'section_reviews': [{'section_id': 'document', 'verdict': 'revise_required',
+                        'findings': [{'finding_id': 'extent', 'type': 'structure', 'severity': 'major',
+                            'required_action': 'revise', 'message': 'Clarify the conclusion.'}]}]}
+                return self.response
+        request = self.request(Client())
+        request = replace(request, config=request.config.model_copy(update={'reviewer': 'llm',
+            'document_review': True, 'review_scope': 'document', 'max_review_iterations': 0}))
+        with tempfile.TemporaryDirectory() as tmp:
+            first = ArtifactStore(Path(tmp) / 'first')
+            with patch('simple_ar.report.writing.run_report_agent', side_effect=AssertionError('No old writing runtime')):
+                result = run_report_writing_capability(context=CapabilityContext(first, AttemptManifest('reviewed')),
+                    request=request)
+            self.assertEqual(result.status, 'completed')
+            self.assertEqual(len(request.llm_client.calls), 2)
+
+            review = ArtifactStore(first.root / 'review')
+            records = {name: review.read_json(name) for name in ('request.json', 'response.json')}
+            for name, changed in (('request.json', {**records['request.json'], 'prompt': 'Changed'}),
+                    ('response.json', None), ('response.json', {'raw_response': 'Rejected JSON'})):
+                with self.subTest(review_record=name), changed_record(review.resolve(name), changed):
+                    blocked = ArtifactStore(Path(tmp) / 'blocked-review')
+                    with self.assertRaises((ValueError, LLMResponseError)):
+                        inspect_article(store=blocked, resume_store=review, identity='reviewed',
+                            client=request.llm_client, report_context=request.report_context, config=request.config,
+                            template=request.template, markdown=first.read_json('writer.json')['sections'][0]['draft_markdown'],
+                            target_words=request.config.longform.target_words)
+                    self.assertFalse(blocked.root.exists())
+            self.assertEqual(len(request.llm_client.calls), 2)
+            self.assertEqual(first.read_json('reviewed_writer.json')['sections'], first.read_json('writer.json')['sections'])
+            self.assertEqual(first.read_json('reviewed_writer.json')['independent_review']['review_status'], 'needs_revision')
+            self.assertEqual(first.read_json('reviewed_writer.json')['memory']['reviewer_findings'][0]['finding_id'], 'extent')
+            ref = result.artifacts[0]
+            target = ArtifactStore(Path(tmp) / 'recovered')
+            recovered = run_report_writing_capability(context=CapabilityContext(target, AttemptManifest('resume'),
+                inputs=(ref,), input_store=first), request=replace(request, llm_client=None, resume_ref=ref))
+            self.assertEqual(recovered.status, 'completed')
+            for name in ('writer.json', 'reviewed_writer.json', 'review/request.json', 'review/response.json'):
+                self.assertEqual(target.read_json(name), first.read_json(name))
+            self.assertEqual(len(request.llm_client.calls), 2)
+
+    def test_article_independent_format_correction_retains_failure_and_recovers_without_calls(self):
+        from simple_ar.report.editor import DOCUMENT_FORMAT_CORRECTION_CONTRACT
+        for second_bad in (False, True):
+            with self.subTest(second_bad=second_bad), tempfile.TemporaryDirectory() as tmp:
+                request = self.request()
+                calls = []
+                rejected = {'section_reviews': [{'section_id': 'document', 'verdict': 'warning',
+                    'findings': [{'finding_id': 'located', 'type': 'style', 'message': 'Inspect the registered value.',
+                        'evidence_quotes': [{'pointer': '/metric_sources'}]}]}]}
+                case = self
+                class Client:
+                    def ask_json(self, system, prompt, **options):
+                        view = json.loads(prompt)
+                        calls.append((view, options))
+                        case.assertEqual(view['sections'][0]['markdown'], 'Current original manuscript.')
+                        if len(calls) == 1 or second_bad:
+                            return rejected
+                        correction = view['response_format_correction']
+                        case.assertEqual(correction['rejected_response'], rejected)
+                        case.assertIn('scalar field', correction['validation_error'])
+                        # The reviewer must select the literal scalar itself.
+                        return {'section_reviews': [{'section_id': 'document', 'verdict': 'warning',
+                            'findings': [{'finding_id': 'located', 'type': 'style', 'message': 'Recorded value.',
+                                'evidence_quotes': [{'pointer': '/metric_sources/rows/0/2'}]}]}]}
+                first = ArtifactStore(Path(tmp) / 'first')
+                arguments = dict(identity='original', report_context=request.report_context,
+                    config=request.config, template=request.template, markdown='Current original manuscript.')
+                if second_bad:
+                    with self.assertRaisesRegex(LLMResponseError, 'scalar field'):
+                        inspect_article(store=first, client=Client(), **arguments)
+                else:
+                    result = inspect_article(store=first, client=Client(), **arguments)
+                    self.assertEqual(result['section_reviews'][0]['findings'][0]['evidence_quotes'][0]['quote'], '0.75')
+                self.assertEqual(len(calls), 2)
+                self.assertEqual([options['budget_call_id'] for _, options in calls],
+                    ['original:review', 'original:review-format-correction'])
+                self.assertEqual(calls[0][0]['format_correction_contract'], DOCUMENT_FORMAT_CORRECTION_CONTRACT)
+                for key in ('sections', 'source_evidence', 'metric_sources', 'execution_evidence'):
+                    self.assertEqual(calls[0][0][key], calls[1][0][key])
+                self.assertEqual(first.read_json('response.json')['response'], rejected)
+                self.assertIn('scalar field', first.read_json('rejection.json')['validation_error'])
+                before = {p.relative_to(first.root).as_posix(): p.read_bytes() for p in first.root.rglob('*.json')}
+                recovered = ArtifactStore(Path(tmp) / 'recovered')
+                with patch.object(Client, 'ask_json', side_effect=AssertionError('No third request')):
+                    if second_bad:
+                        with self.assertRaisesRegex(LLMResponseError, 'scalar field'):
+                            inspect_article(store=recovered, resume_store=first, client=Client(), **arguments)
+                    else:
+                        self.assertEqual(inspect_article(store=recovered, resume_store=first, client=Client(),
+                            **{**arguments, 'identity': 'different-attempt'}), result)
+                        for name in before:
+                            self.assertEqual(recovered.resolve(name).read_bytes(), first.resolve(name).read_bytes())
+                for name, raw in before.items():
+                    self.assertEqual(first.resolve(name).read_bytes(), raw)
+
+    def test_article_review_unknown_and_legacy_rejection_never_authorize_new_requests(self):
+        for phase in ('initial', 'correction', 'legacy', 'dual'):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as tmp:
+                request = self.request()
+                first = ArtifactStore(Path(tmp) / 'review')
+                calls = []
+                class Client:
+                    def ask_json(self, system, prompt, **options):
+                        calls.append(options['label'])
+                        if phase in {'legacy', 'dual'}:
+                            return {'section_reviews': [{'section_id': 'document', 'verdict': 'pass'}]}
+                        if phase == 'correction' and len(calls) == 1:
+                            return {'section_reviews': 'bad format'}
+                        error = LLMResponseError('Unknown/undecodable provider response')
+                        error.raw_response = 'incomplete raw JSON'
+                        raise error
+                arguments = dict(identity='original', report_context=request.report_context,
+                    config=request.config, template=request.template, markdown='Current original manuscript.')
+                if phase in {'legacy', 'dual'}:
+                    import hashlib
+                    inspect_article(store=first, client=Client(), **arguments)
+                    saved = first.read_json('request.json')
+                    saved.pop('response_record_contract')
+                    view = json.loads(saved['prompt'])
+                    from simple_ar.report.review_evidence import EVIDENCE_QUOTE_RULES, EVIDENCE_QUOTE_SCHEMA
+                    saved.pop('evidence_reference_contract')
+                    view.pop('evidence_reference_contract')
+                    view['focus'] = [EVIDENCE_QUOTE_RULES[0] if row.startswith('Locate an alleged factual error')
+                                     else row for row in view['focus']]
+                    view['output_schema']['section_reviews'][0]['findings'][0]['evidence_quotes'] = [EVIDENCE_QUOTE_SCHEMA]
+                    if phase == 'legacy':
+                        saved.pop('format_correction_contract')
+                        saved.pop('budget_identity')
+                        view.pop('format_correction_contract')
+                    saved['prompt'] = json.dumps(view, ensure_ascii=False, separators=(',', ':'))
+                    first.write_json('request.json', saved)
+                    response = first.read_json('response.json')['response']
+                    first.write_json('response.json', response)
+                    if phase == 'dual':
+                        first.write_json('response_complete.json', {key: hashlib.sha256(json.dumps(value,
+                            sort_keys=True, ensure_ascii=False).encode()).hexdigest() for key, value in
+                            (('request_sha256', saved), ('response_sha256', response))})
+                    # A valid historical response must remain readable with
+                    # exactly its old prompt, without today's contract marker.
+                    self.assertEqual(inspect_article(store=first, client=None, **arguments)['review_status'], 'reviewed')
+                    first.write_json('response.json', {'section_reviews': 'historical invalid format'})
+                else:
+                    with self.assertRaisesRegex(LLMResponseError, 'Unknown/undecodable'):
+                        inspect_article(store=first, client=Client(), **arguments)
+                count = len(calls)
+                with patch.object(Client, 'ask_json', side_effect=AssertionError('No replay or legacy migration')):
+                    with self.assertRaises((ValueError, LLMResponseError)):
+                        inspect_article(store=first, client=Client(), **arguments)
+                self.assertEqual(len(calls), count)
+                if phase not in {'legacy', 'dual'}:
+                    prefix = 'format_correction/' if phase == 'correction' else ''
+                    self.assertIn('Unknown/undecodable', first.read_json(prefix + 'response_error.json')['error'])
+                    self.assertEqual(first.read_json(prefix + 'response.json'), {'raw_response': 'incomplete raw JSON'})
+
+    def test_article_gap_observation_is_frozen_and_cannot_become_verification(self):
+        from simple_ar.report.review_evidence import GAP_EVIDENCE_CONTRACT
+        request = self.request()
+        context = request.report_context.model_copy(update={'metric_sources': [], 'results': {}})
+        calls = []
+        class Client:
+            def ask_json(self, system, prompt, **options):
+                view = json.loads(prompt)
+                calls.append(view)
+                return {'section_reviews': [{'section_id': 'document', 'verdict': 'warning',
+                    'findings': [{'finding_id': 'dispersion', 'type': 'evidence_gap',
+                        'required_action': 'verify', 'message': 'No measurement supplied for this inspection.',
+                        'draft_quotes': [{'section_id': 'document', 'quote': 'The dispersion was 0.3.'}],
+                        'evidence_quotes': [{'pointer': '/metric_sources/rows'}]}]}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            first = ArtifactStore(Path(tmp) / 'review')
+            arguments = dict(identity='original', report_context=context, config=request.config,
+                template=request.template, markdown='The dispersion was 0.3.')
+            result = inspect_article(store=first, client=Client(), **arguments)
+            self.assertEqual(result['review_status'], 'needs_revision')
+            self.assertEqual(first.read_json('request.json')['evidence_reference_contract'], GAP_EVIDENCE_CONTRACT)
+            self.assertEqual(calls[0]['evidence_reference_contract'], GAP_EVIDENCE_CONTRACT)
+            self.assertEqual(len(calls), 1)
+            raw = first.read_json('response.json')['response']
+            self.assertEqual(raw['section_reviews'][0]['findings'][0]['evidence_quotes'],
+                [{'pointer': '/metric_sources/rows'}])
+            snapshot = {p.relative_to(first.root).as_posix(): p.read_bytes() for p in first.root.rglob('*.json')}
+            resumed = ArtifactStore(Path(tmp) / 'resumed')
+            self.assertEqual(inspect_article(store=resumed, resume_store=first, client=None, **arguments), result)
+            for name, content in snapshot.items():
+                self.assertEqual(first.resolve(name).read_bytes(), content)
+                self.assertEqual(resumed.resolve(name).read_bytes(), content)
+            self.assertFalse(first.exists('format_correction/request.json'))
+
+    def test_review_recovers_saved_answers_but_never_replays_started_correction(self):
+        from tests.report_review_fixtures import CheckpointStop
+        for boundary in ('original_complete', 'correction_started', 'correction_complete'):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as tmp:
+                request = self.request()
+                store = ArtifactStore(Path(tmp) / 'review')
+                calls = []
+                class Client:
+                    def ask_json(self, system, prompt, **options):
+                        calls.append(options['budget_call_id'])
+                        return ({'section_reviews': 'bad format'} if len(calls) == 1 else
+                            {'section_reviews': [{'section_id': 'document', 'verdict': 'pass'}]})
+                original_write = ArtifactStore.write_json
+                def stop(retained, path, *args, **kwargs):
+                    result = original_write(retained, path, *args, **kwargs)
+                    correcting = retained.root.name == 'format_correction'
+                    if ((boundary == 'original_complete' and not correcting and path == 'response.json')
+                            or (boundary == 'correction_started' and correcting and path == 'request.json')
+                            or (boundary == 'correction_complete' and correcting and path == 'response.json')):
+                        raise CheckpointStop()
+                    return result
+                arguments = dict(identity='original', report_context=request.report_context,
+                    config=request.config, template=request.template, markdown='Current manuscript.')
+                with patch.object(ArtifactStore, 'write_json', stop), self.assertRaises(CheckpointStop):
+                    inspect_article(store=store, client=Client(), **arguments)
+                if boundary == 'correction_started':
+                    with self.assertRaisesRegex(ValueError, 'no blind replay'):
+                        inspect_article(store=store, client=Client(), **arguments)
+                    self.assertEqual(calls, ['original:review'])
+                else:
+                    result = inspect_article(store=store, client=Client(), **arguments)
+                    self.assertEqual(result['review_status'], 'reviewed')
+                    self.assertEqual(calls, ['original:review', 'original:review-format-correction'])
+
+    def test_article_corrections_use_complete_candidates_and_retained_producers(self):
+        for constrained, reject, rounds in ((False, False, 1), (True, False, 1), (False, True, 1), (False, True, 2)):
+            with self.subTest(constrained=constrained, reject=reject, rounds=rounds), tempfile.TemporaryDirectory() as tmp:
+                calls = []
+                initial = 'Initial explanation.' if not constrained else '## Wrong\n\nInitial explanation.'
+                revised = 'Corrected explanation.' if not constrained else '## Observations\n\nCorrected explanation.\n\n## Limits\n\nSupplied conditions.'
+                class Client:
+                    def ask_json(self, system, prompt, *, label='', **options):
+                        calls.append(label)
+                        view = json.JSONDecoder().raw_decode(prompt[prompt.index('{'):])[0]
+                        if label == 'composition-article':
+                            if len(calls) > 1:
+                                self_outer.assertEqual(view['prior_draft'], initial if len(calls) == 3 else revised)
+                                self_outer.assertIn('not source facts', view['revision_findings']['status'])
+                            return {'draft_markdown': initial if len(calls) == 1 else revised}
+                        body = view['sections'][0]['markdown']
+                        self_outer.assertFalse(view['historical_findings_to_check'])
+                        needs_edit = body == initial and not constrained or body == revised and reject
+                        return {'section_reviews': [{'section_id': 'document',
+                            'verdict': 'revise_required' if needs_edit else 'pass',
+                            'findings': [{'finding_id': 'prose', 'type': 'style', 'severity': 'major',
+                                'required_action': 'revise', 'message': 'Clarify the interpretation.',
+                                'draft_quotes': [{'section_id': 'document', 'quote': body}]}] if needs_edit else []}]}
+                self_outer = self
+                request = self.request(Client())
+                request = replace(request, config=request.config.model_copy(update={'reviewer': 'llm',
+                    'document_review': True, 'review_scope': 'document', 'draft_scope': 'document',
+                    'max_review_iterations': rounds, 'outline_strategy': 'template' if constrained else 'auto'}),
+                    memory=request.memory.model_copy(update={'section_plan': [
+                        ReportSectionPlan(section_id='observations', heading='Observations', goal='Explain the observations', final_order=1),
+                        ReportSectionPlan(section_id='limits', heading='Limits', goal='Explain their limits', final_order=2)]}))
+                store = ArtifactStore(Path(tmp) / 'first')
+                with patch('simple_ar.report.writing.run_report_agent', side_effect=AssertionError('No old writing runtime')):
+                    result = run_report_writing_capability(context=CapabilityContext(store, AttemptManifest('article-edit')), request=request)
+                self.assertEqual(result.status, 'failed' if reject else 'completed')
+                expected_calls = ['composition-article', 'article-independent-review'] * (rounds + 1)
+                self.assertEqual(calls, expected_calls)
+                writer = store.read_json(next(ref.path for ref in result.artifacts if ref.kind == 'report_writer_result'))
+                self.assertEqual(store.read_json('writer.json')['sections'][0]['draft_markdown'], initial)
+                self.assertEqual(writer['sections'][0]['draft_markdown'], initial if reject else revised)
+                self.assertEqual(writer['adopted_revision'] is None, reject)
+                ref = result.artifacts[0]
+                target = ArtifactStore(Path(tmp) / 'resumed')
+                recovered = run_report_writing_capability(context=CapabilityContext(target, AttemptManifest('resumed'),
+                    inputs=(ref,), input_store=store), request=replace(request, llm_client=None, resume_ref=ref))
+                self.assertEqual(recovered.status, result.status)
+                self.assertEqual(calls, expected_calls)
+                self.assertEqual(target.read_json('writer.json'), store.read_json('writer.json'))
+                protected = {path: path.read_bytes() for path in store.root.rglob('*.json')}
+                for receipt in ('response.json', 'inspection/response.json'):
+                    with self.subTest(receipt=receipt), changed_record(
+                            store.resolve('review/revision-1/' + receipt), {'raw_response': 'Changed retained response'}):
+                        with self.assertRaises((ValueError, LLMResponseError)):
+                            run_report_writing_capability(context=CapabilityContext(ArtifactStore(Path(tmp) / 'corrupt-' / receipt),
+                                AttemptManifest('changed'), inputs=(ref,), input_store=store),
+                                request=replace(request, llm_client=None, resume_ref=ref))
+                self.assertEqual(calls, expected_calls)
+                for path, raw in protected.items():
+                    self.assertEqual(path.read_bytes(), raw)
+                if not reject:
+                    current = target.read_json(next(r.path for r in recovered.artifacts if r.kind == 'report_writer_result'))
+                    self.assertEqual(current, writer)
+
+    def test_article_candidate_and_verification_checkpoints_resume_without_repeating_calls(self):
+        for stage in ('drafted', 'completed'):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as tmp:
+                calls = []
+                class Client:
+                    def ask_json(self, system, prompt, *, label='', **options):
+                        calls.append(label)
+                        if label == 'composition-article':
+                            return {'draft_markdown': 'Initial.' if len(calls) == 1 else 'Revised.'}
+                        view = json.JSONDecoder().raw_decode(prompt[prompt.index('{'):])[0]
+                        pending = view['sections'][0]['markdown'] == 'Initial.'
+                        return {'section_reviews': [{'section_id': 'document', 'verdict': 'revise_required' if pending else 'pass',
+                            'findings': [{'finding_id': 'style', 'type': 'style', 'severity': 'major', 'required_action': 'revise',
+                                'message': 'Improve the prose.', 'draft_quotes': [{'section_id': 'document', 'quote': 'Initial.'}]}] if pending else []}]}
+                request = self.request(Client())
+                request = replace(request, config=request.config.model_copy(update={'reviewer': 'llm',
+                    'document_review': True, 'review_scope': 'document', 'draft_scope': 'document', 'max_review_iterations': 1}))
+                store = ArtifactStore(Path(tmp) / 'first')
+                original_write = ArtifactStore.write_json
+                def interrupt(owner, path, value, **options):
+                    result = original_write(owner, path, value, **options)
+                    if str(path) == 'review/checkpoint.json' and any(row['status'] == stage and row['action'] ==
+                            ('document_joint_revise' if stage == 'drafted' else 'document_joint_verify') for row in value['iterations']):
+                        raise RuntimeError('Saved editing stage')
+                    return result
+                with patch.object(ArtifactStore, 'write_json', interrupt), self.assertRaisesRegex(RuntimeError, 'Saved editing stage'):
+                    run_report_writing_capability(context=CapabilityContext(store, AttemptManifest('interrupted')), request=request)
+                count = len(calls)
+                ref = store.ref('report_inputs.json', kind='article_snapshot', schema='direct_article.v1')
+                recovered = run_report_writing_capability(context=CapabilityContext(ArtifactStore(Path(tmp) / 'resumed'),
+                    AttemptManifest('resume'), inputs=(ref,), input_store=store), request=replace(request, resume_ref=ref))
+                self.assertEqual(recovered.status, 'completed')
+                self.assertEqual(calls[count:], ['article-independent-review'] if stage == 'drafted' else [])
+
     def test_interrupted_article_uses_retained_response_but_missing_response_never_replays(self):
-        for response_saved in (False, True):
-            with self.subTest(response_saved=response_saved), tempfile.TemporaryDirectory() as tmp:
+        for response_state in ('missing', 'saved', 'raw'):
+            with self.subTest(response_state=response_state), tempfile.TemporaryDirectory() as tmp:
                 session = ArtifactStore(Path(tmp))
                 store = ArtifactStore(session.root / 'attempts' / 'original')
                 request = self.request()
                 def interrupted(system, prompt, **kwargs):
-                    if response_saved:
+                    if response_state == 'saved':
                         store.write_json('response.json', request.llm_client.response)
-                    raise RuntimeError('interrupted after request')
+                    error = RuntimeError('interrupted after request')
+                    if response_state == 'raw':
+                        error.raw_response = 'Original non-JSON bytes'
+                    raise error
                 with patch.object(request.llm_client, 'ask_json', side_effect=interrupted):
                     with self.assertRaisesRegex(RuntimeError, 'interrupted'):
                         run_report_writing_capability(context=CapabilityContext(store, AttemptManifest('original')),
@@ -781,10 +1034,14 @@ class StructuredArticleWritingTests(unittest.TestCase):
                     method='sections')
                 self.assertEqual(selected.path, 'attempts/original/report_inputs.json')
                 self.assertEqual(prior, '')
-                if response_saved:
+                if response_state == 'saved':
                     recovered = run_report_writing_capability(
                         context=CapabilityContext(store, AttemptManifest('original')), request=offline)
                     self.assertEqual(recovered.status, 'completed')
+                elif response_state == 'raw':
+                    self.assertEqual(store.read_json('response.json'), {'raw_response': 'Original non-JSON bytes'})
+                    with self.assertRaisesRegex(ValueError, 'no automatic correction'):
+                        run_report_writing_capability(context=CapabilityContext(store, AttemptManifest('original')), request=offline)
                 else:
                     with self.assertRaisesRegex(ValueError, 'no blind replay'):
                         run_report_writing_capability(
@@ -830,43 +1087,234 @@ class StructuredArticleWritingTests(unittest.TestCase):
             for path, raw in original.items():
                 self.assertEqual(path.read_bytes(), raw)
 
-    def test_article_rejects_changed_binding_unknown_owner_and_changed_writer(self):
-        for change in ('goal', 'config', 'template', 'owner', 'system', 'writer', 'identity'):
-            with self.subTest(change=change), tempfile.TemporaryDirectory() as tmp:
+    def test_article_rejects_changed_request_binding(self):
+        # Retained-record corruption is owned by the recovery matrix below.
+        for field, changes in (('report_context', {'goal_markdown': 'Changed'}),
+                               ('config', {'max_section_tokens': 800}),
+                               ('template', {'template_markdown': 'Changed'})):
+            with self.subTest(binding=field), tempfile.TemporaryDirectory() as tmp:
                 store = ArtifactStore(Path(tmp))
                 request = self.request()
                 run_report_writing_capability(context=CapabilityContext(store, AttemptManifest('original')), request=request)
-                if change == 'goal':
-                    request = replace(request, report_context=request.report_context.model_copy(update={'goal_markdown': 'Changed'}))
-                elif change == 'config':
-                    request = replace(request, config=request.config.model_copy(update={'max_section_tokens': 800}))
-                elif change == 'template':
-                    request = replace(request, template=request.template.model_copy(update={'template_markdown': 'Changed'}))
-                elif change == 'writer':
-                    writer = store.read_json('writer.json')
-                    writer['sections'][0]['draft_markdown'] = 'Changed'
-                    store.write_json('writer.json', writer)
-                else:
-                    snapshot = store.read_json('report_inputs.json')
-                    snapshot[{'identity': 'source_attempt'}.get(change, change)] = 'Changed'
-                    store.write_json('report_inputs.json', snapshot)
+                request = replace(request, **{field: getattr(request, field).model_copy(update=changes)})
                 with self.assertRaises(ValueError):
                     run_report_writing_capability(context=CapabilityContext(store, AttemptManifest('original')), request=request)
                 self.assertEqual(len(request.llm_client.calls), 1)
 
+    def test_article_recovery_validates_records_before_reusing_or_rebuilding_writer(self):
+        import hashlib
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ArtifactStore(Path(tmp))
+            request = self.request()
+            context = CapabilityContext(store, AttemptManifest('original'))
+            run_report_writing_capability(context=context, request=request)
+            records = {name: store.read_json(name) for name in
+                ('writer.json', 'response.json', 'report_inputs.json')}
+            snapshot = records['report_inputs.json']
+            cases = [('writer.json', {**records['writer.json'], 'sections': []}),
+                     ('writer.json', {**records['writer.json'], 'sections': [{
+                         **records['writer.json']['sections'][0], 'draft_markdown': 'Changed'}]}),
+                     ('response.json', {'draft_markdown': 'Changed raw response'}),
+                     ('report_inputs.json', {**snapshot, 'snapshot_id': '0' * 64}),
+                     ('report_inputs.json', None), ('response.json', None)]
+            for field, value in (('owner', 'other_article.v1'), ('source_attempt', 'other-attempt'),
+                    ('inputs', {**snapshot['inputs'], 'article': {**snapshot['inputs']['article'], 'goal': 'Changed'}}),
+                    ('system', ''), ('system', None), ('system', 'Unrecognized contract prompt')):
+                changed = {**snapshot, field: value}
+                changed['snapshot_id'] = hashlib.sha256(json.dumps(
+                    {key: value for key, value in changed.items() if key != 'snapshot_id'},
+                    sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+                cases.append(('report_inputs.json', changed))
+            for name, changed in cases:
+                with self.subTest(record=name, changed=changed), changed_record(store.resolve(name), changed):
+                    with self.assertRaises(ValueError):
+                        run_report_writing_capability(context=context, request=replace(request, llm_client=None))
+            # A self-consistent but unknown prompt cannot rebuild a missing Writer.
+            with changed_record(store.resolve('report_inputs.json'), cases[-1][1]), \
+                    changed_record(store.resolve('writer.json'), None), self.assertRaises(ValueError):
+                run_report_writing_capability(context=context, request=replace(request, llm_client=None))
+            self.assertEqual(len(request.llm_client.calls), 1)
+
+    def test_new_task_method_admission_preserves_control_intent(self):
+        joint = {'document_review': True, 'review_scope': 'document'}
+        for controls, expected, reviewed, rounds, draft in (
+                ({}, 'article', False, 0, 'section'),
+                ({'outline_strategy': 'template'}, 'article', False, 0, 'section'),
+                ({'template': 'custom.md', 'outline_strategy': 'auto'}, 'article', False, 0, 'section'),
+                ({'outline_strategy': 'adaptive'}, 'sections', False, None, None),
+                ({'reviewer': 'llm'}, 'sections', False, None, None),
+                ({'document_review': True}, 'article', True, 2, 'document'),
+                ({'reviewer': 'disabled', 'max_review_iterations': 0}, 'article', False, 0, 'section'),
+                ({'max_review_iterations': 0}, 'article', False, 0, 'section'),
+                ({**joint, 'max_review_iterations': 0}, 'article', True, 0, 'section'),
+                ({**joint, 'max_review_iterations': 0, 'draft_scope': 'document'}, 'article', True, 0, 'document'),
+                ({**joint, 'max_review_iterations': 3}, 'article', True, 3, 'document'),
+                ({**joint, 'max_review_iterations': 3, 'max_document_review_prompt_chars': 12000}, 'article', True, 3, 'document'),
+                ({**joint, 'max_review_iterations': 0, 'criteria': 'custom.md'}, 'article', True, 0, 'section'),
+                ({**joint, 'draft_scope': 'document'}, 'article', True, 2, 'document'),
+                ({**joint, 'draft_scope': 'auto'}, 'article', True, 2, 'auto'),
+                ({'document_review': True, 'draft_scope': 'auto'}, 'article', True, 2, 'auto'),
+                ({**joint, 'draft_scope': 'section'}, 'sections', True, None, None),
+                ({**joint, 'outline_strategy': 'adaptive'}, 'sections', True, None, None),
+                ({'document_review': True, 'outline_strategy': 'adaptive'}, 'sections', True, None, None),
+                ({'document_review': True, 'review_scope': 'section'}, 'sections', True, None, None),
+                ({'max_review_iterations': 3}, 'sections', False, None, None)):
+            with self.subTest(controls=controls):
+                original = controls.copy()
+                method, selected = resolve_report_writing_config(controls)
+                self.assertEqual(method, expected)
+                self.assertEqual(controls, original)
+                self.assertIsNot(selected, controls)
+                for key, value in controls.items():
+                    self.assertEqual(selected[key], value)
+                ReportRuntimeConfig.model_validate(selected)
+                if expected == 'article':
+                    self.assertEqual(selected['reviewer'], 'llm' if reviewed else 'disabled')
+                    self.assertIs(selected['document_review'], reviewed)
+                    self.assertEqual(selected['max_review_iterations'], rounds)
+                    self.assertEqual(selected['draft_scope'], draft)
+                    self.assertEqual(selected['review_scope'], 'document' if reviewed else 'section')
+                    validate_report_writing_config(ReportRuntimeConfig.model_validate(selected), method=method)
+                    self.assertEqual(resolve_report_writing_config(controls, method='article'), (method, selected))
+                else:
+                    self.assertEqual(selected, controls)
+                    with self.assertRaisesRegex(ValueError, 'cannot execute'):
+                        resolve_report_writing_config(controls, method='article')
+        # Cross-field rules belong to the existing runtime model for both methods.
+        for controls in ({'review_scope': 'document'}, {'draft_scope': 'auto'},
+                         {**joint, 'draft_scope': 'document', 'source_strategy': 'batch_refine'}):
+            for method in (None, 'article', 'sections'):
+                with self.subTest(controls=controls, method=method), self.assertRaises(ValueError):
+                    resolve_report_writing_config(controls, method=method)
+
     def test_unsupported_article_controls_fail_before_any_request_or_snapshot(self):
+        # These are owner settings, not additions to the public CLI/TOML surface.
         for key, value in [('reviewer', 'llm'), ('document_review', True), ('source_strategy', 'batch_refine'),
                 ('allow_source_backtracking', True), ('outline_strategy', 'adaptive'),
-                ('max_cited_sources', 2), ('allow_llm_fallback', True), ('criteria', 'custom.md'),
-                ('max_section_sources', 2), ('max_source_batches', 2)]:
+                ('allow_llm_fallback', True), ('criteria', 'custom.md'), ('cost_profile', 'fast'),
+                ('agent', 'disabled'), ('max_document_review_prompt_chars', 1000),
+                ('max_section_sources', 2), ('source_batch_size', 2), ('max_source_batches', 2),
+                ('draft_sections', True), ('debug_artifacts', True), ('review_trace', 'full'),
+                ('longform', {'target_papers': 30})]:
             with self.subTest(control=key), tempfile.TemporaryDirectory() as tmp:
                 request = self.request()
-                request = replace(request, config=request.config.model_copy(update={key: value}))
+                settings = {**request.config.model_dump(), key: value}
+                original = json.dumps(settings, sort_keys=True)
+                self.assertEqual(resolve_report_writing_config(settings, explicit_fields={key}), ('sections', settings))
+                with self.assertRaisesRegex(ValueError, key):
+                    resolve_report_writing_config(settings, method='article', explicit_fields={key})
+                self.assertEqual(json.dumps(settings, sort_keys=True), original)
+                request = replace(request, config=ReportRuntimeConfig.model_validate(settings))
+                with self.assertRaisesRegex(ValueError, key):
+                    validate_report_writing_config(request.config, method='article')
                 store = ArtifactStore(Path(tmp))
                 with self.assertRaisesRegex(ValueError, key):
                     run_report_writing_capability(context=CapabilityContext(store, AttemptManifest('new')), request=request)
                 self.assertFalse(store.exists('report_inputs.json'))
                 self.assertEqual(request.llm_client.calls, [])
+
+    def test_template_article_enforces_final_order_and_allows_omitted_optional_section(self):
+        plans = [
+            ReportSectionPlan(section_id='limits', heading='3. Limits', goal='Bound the claim.', final_order=3),
+            ReportSectionPlan(section_id='details', heading='Details', goal='Add detail.', required=False, final_order=2),
+            ReportSectionPlan(section_id='observations', heading='1. Observations', goal='State evidence.', final_order=1),
+        ]
+        cases = [
+            ('## Observations\n\nEvidence.\n\n## Limits\n\nBoundary.', True),
+            ('## Observations\n\nEvidence.\n\n## Details\n\nDetail.\n\n## Limits\n\nBoundary.', True),
+            ('## 1. Observations\n\nEvidence.\n\n## 3. Limits\n\nBoundary.', True),
+            ('## Limits\n\nBoundary.\n\n## Observations\n\nEvidence.', False),
+            ('## Observations\n\nEvidence.\n\n## Limits\n\nBoundary.\n\n## Details\n\nDetail.', False),
+            ('## Observations\n\nEvidence.', False),
+            ('## Observations\n\nEvidence.\n\n## Extra\n\nUnplanned.\n\n## Limits\n\nBoundary.', False),
+            ('## Observations\n\nEvidence.\n\n## Observations\n\nRepeated.\n\n## Limits\n\nBoundary.', False),
+        ]
+        # Both controls produce the same fixed-structure constraints. Own the
+        # full validation matrix once; custom-template routing needs one pass
+        # and one rejection to prove it reaches that contract.
+        scenarios = [({'outline_strategy': 'template'}, markdown, accepted) for markdown, accepted in cases]
+        scenarios += [({'template': 'custom.md', 'outline_strategy': 'auto'}, markdown, accepted)
+                      for markdown, accepted in (cases[0], cases[3])]
+        for controls, markdown, accepted in scenarios:
+            with self.subTest(controls=controls, markdown=markdown), tempfile.TemporaryDirectory() as tmp:
+                request = self.request(ArticleClient({'draft_markdown': markdown}))
+                request = replace(request, memory=request.memory.model_copy(update={'section_plan': plans}),
+                    config=request.config.model_copy(update=controls))
+                store = ArtifactStore(Path(tmp))
+                context = CapabilityContext(store, AttemptManifest('fixed-outline'))
+                if accepted:
+                    self.assertEqual(run_report_writing_capability(context=context, request=request).status, 'completed')
+                    self.assertEqual(store.read_json('writer.json')['sections'][0]['draft_markdown'], markdown)
+                else:
+                    for offline in (False, True):
+                        with self.assertRaisesRegex(ValueError, 'fixed section structure'):
+                            run_report_writing_capability(context=context,
+                                request=replace(request, llm_client=None) if offline else request)
+                    self.assertEqual(store.read_json('response.json'), request.llm_client.response)
+                    self.assertFalse(store.exists('writer.json'))
+                self.assertEqual(len(request.llm_client.calls), 1)
+                self.assertEqual(request.llm_client.calls[0][1]['constraints']['outline'], [
+                    {'heading': '1. Observations', 'required': True},
+                    {'heading': 'Details', 'required': False},
+                    {'heading': '3. Limits', 'required': True}])
+
+    def test_article_citation_cap_counts_source_identity_in_body_only(self):
+        cases = [
+            ('Repeated [@P1; @p2] and [P1, P2] and [@source-a].', True),
+            ('Canonical bare identity [source-a] and alias [P1].', True),
+            ('Two sources [P1; P3].', False),
+            ('Two bare canonical identities [source-a; source-b].', False),
+            ('Two sources @source-a and @source-b.', False),
+            ('Unknown source [@missing].', False),
+        ]
+        for prose, accepted in cases:
+            with self.subTest(prose=prose), tempfile.TemporaryDirectory() as tmp:
+                markdown = ('## Evidence\n\n' + prose
+                    + '\n\n```markdown\n## Unplanned\n[@missing; @source-b]\n```'
+                    + '\n\n## References\n\n[@missing; @source-b]')
+                request = self.request(ArticleClient({'draft_markdown': markdown}))
+                request = replace(request,
+                    config=request.config.model_copy(update={'max_cited_sources': 1}),
+                    report_context=request.report_context.model_copy(update={
+                        'papers': [{'id': 'source-a', 'title': 'A'}, {'id': 'source-b', 'title': 'B'}],
+                        'citation_key_map': {'P1': 'source-a', 'P2': 'source-a', 'P3': 'source-b'}}))
+                store = ArtifactStore(Path(tmp))
+                context = CapabilityContext(store, AttemptManifest('citation-cap'))
+                if accepted:
+                    self.assertEqual(run_report_writing_capability(context=context, request=request).status, 'completed')
+                    self.assertEqual(store.read_json('writer.json')['constraints_checked'],
+                        {'headings': ['Evidence'], 'distinct_cited_sources': 1})
+                else:
+                    for offline in (False, True):
+                        with self.assertRaisesRegex(ValueError, 'original response retained'):
+                            run_report_writing_capability(context=context,
+                                request=replace(request, llm_client=None) if offline else request)
+                    self.assertFalse(store.exists('writer.json'))
+                self.assertEqual(store.read_json('response.json'), {'draft_markdown': markdown})
+                self.assertEqual(len(request.llm_client.calls), 1)
+
+    def test_auto_article_keeps_section_plan_as_soft_guidance(self):
+        request = self.request(ArticleClient({'draft_markdown': '## Reader question\n\nA different organization.'}))
+        request = replace(request, memory=request.memory.model_copy(update={'section_plan': [
+            ReportSectionPlan(section_id='expected', heading='Expected', goal='Suggested organization.')]}))
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ArtifactStore(Path(tmp))
+            result = run_report_writing_capability(context=CapabilityContext(store, AttemptManifest('auto')), request=request)
+            self.assertEqual(result.status, 'completed')
+            self.assertNotIn('constraints', request.llm_client.calls[0][1])
+            self.assertEqual(request.llm_client.calls[0][1]['sections'][0]['heading'], 'Expected')
+            self.assertNotIn('constraints_checked', store.read_json('writer.json'))
+
+    def test_fixed_article_without_section_plan_fails_before_request(self):
+        request = self.request()
+        request = replace(request, config=request.config.model_copy(update={'outline_strategy': 'template'}))
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ArtifactStore(Path(tmp))
+            with self.assertRaisesRegex(ValueError, 'requires a section plan'):
+                run_report_writing_capability(context=CapabilityContext(store, AttemptManifest('no-plan')), request=request)
+            self.assertEqual(request.llm_client.calls, [])
+            self.assertFalse(store.exists('report_inputs.json'))
 
     def test_article_supplies_front_matter_and_source_notes_without_review_or_output_cap(self):
         from types import SimpleNamespace
@@ -925,7 +1373,9 @@ class StructuredArticleWritingTests(unittest.TestCase):
                 with self.subTest(changed=changed):
                     output = ArtifactStore(Path(tmp) / str(changed))
                     revised = request.report_context.model_copy(update={'topic': 'Revised'}) if changed else request.report_context
-                    with patch('simple_ar.report.writing.run_report_agent', side_effect=legacy) as agent:
+                    with patch('simple_ar.report.writing.run_report_agent', side_effect=legacy) as agent, \
+                         patch('simple_ar.report.writing.resolve_report_writing_config',
+                               side_effect=AssertionError('Saved checkpoints never reselect the method')):
                         run_report_writing_capability(context=CapabilityContext(output, AttemptManifest('next'),
                             inputs=(checkpoint,), input_store=store), request=replace(request, method='article',
                             resume_ref=checkpoint, report_context=revised))

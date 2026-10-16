@@ -25,6 +25,7 @@ from simple_ar.research.task_plan import (
     TaskPlanStep,
     TaskPlanRequest,
     append_research_followup,
+    action_binding,
     build_task_plan,
     default_task_steps,
     insert_evidence_followup,
@@ -65,17 +66,19 @@ class TaskPlanTests(unittest.TestCase):
             code_task_validation(alias, required=True)
 
     def test_native_reproduction_prepares_checker_edits_then_gates_measurement(self):
-        from tests.test_code_task import _FakeCodeTaskClient
+        from tests.code_task_fixtures import keyword_code_responses
         from simple_ar.code_task.runtime.state import load_code_task_manifest
         from simple_ar.code_task.orchestration.workflow import INITIAL_ADAPTER_SOURCE
         adapter_source = (
             "from spam_model import predict as author_predict\n"
             "def predict(text):\n    return author_predict(text)\n"
         )
-        class AdapterClient(_FakeCodeTaskClient):
+        class AdapterClient:
             saw_placeholder = False
             def ask_json(self, system, user, *, label=""):
-                response = super().ask_json(system, user, label=label)
+                if label.startswith("code-task-review-"):
+                    return {"findings": []}
+                response = keyword_code_responses()[label]
                 response = json.loads(json.dumps(response).replace("spam_model.py", "adapter.py"))
                 if label == "code-task-propose-edits":
                     self.saw_placeholder = "Reproduction adapter requires implementation" in user
@@ -114,13 +117,13 @@ class TaskPlanTests(unittest.TestCase):
                     config={"research_task_kind": "reproduction", "research_plan_mode": "deterministic",
                             "research_materials_only": True, "research_local_documents": [str(paper)], "execution": execution},
                     budget_limits={"llm_requests": 12, "total_tokens": 50000,
-                                   "process_invocations": 2, "process_wall_seconds": 30}))
+                                   "process_invocations": 3, "process_wall_seconds": 30}))
             app.advance(max_actions=1)
             # Isolate the execution connector from the already-tested Reader/Synthesizer.
             for name in ("read", "synthesis"):
                 app.controller.manifest.state_refs[name] = app.controller.store.write_json(
                     f"inputs/{name}-fixture.json", {}, kind=name)
-            self.assertTrue(app._run_prepare_execution_action())
+            self.assertTrue(app._run_action("prepare_execution"))
             prepared = app._effective_config()["execution"]
             run_dir = Path(prepared["code_task"]["run_dir"])
             workspace = Path(prepared["cwd"])
@@ -150,42 +153,35 @@ class TaskPlanTests(unittest.TestCase):
                         **prepared["code_task"], "edit_budget_overrides": invalid}}, None)
             self.assertEqual(independent.validation_command, (sys.executable, "check.py"))
             with patch.object(app, "_pause_action", return_value=False), patch.object(app, "_execute") as execute:
-                self.assertFalse(app._run_measurement_action("experiment"))
+                self.assertFalse(app._run_action("experiment"))
                 execute.assert_not_called()
-            failed_app = create_session(app.brief, root=root / "failed-session", services=replace(
-                app.services, budget_limits={"llm_requests": 12, "total_tokens": 50000,
-                    "process_invocations": 2, "process_wall_seconds": 30}))
-            failed_app.advance(max_actions=1)
-            for name in ("read", "synthesis"):
-                failed_app.controller.manifest.state_refs[name] = failed_app.controller.store.write_json(
-                    f"inputs/{name}-fixture.json", {}, kind=name)
-            self.assertTrue(failed_app._run_prepare_execution_action())
-            self.assertEqual(failed_app.budget_ledger.remaining("process_invocations"), 2)
-            self.assertEqual(failed_app.budget_ledger.remaining("process_wall_seconds"), 30)
+            self.assertEqual(app.budget_ledger.remaining("process_invocations"), 3)
+            self.assertEqual(app.budget_ledger.remaining("process_wall_seconds"), 30)
             # Static stop_point alone cannot pass: the untouched adapter fails
             # the real independent subprocess assertion, with evidence retained.
-            previous_attempt_ids = {attempt.attempt_id for attempt in failed_app.controller.list_attempts()}
+            previous_attempt_ids = {attempt.attempt_id for attempt in app.controller.list_attempts()}
             with patch("simple_ar.research.implementation.implement_code_task",
                        return_value=SimpleNamespace(stop_reason="stop_point", next_action="Validate", steps=())):
-                self.assertFalse(failed_app._run_implement_action("implement"))
-            new_implement_attempts = [attempt for attempt in failed_app.controller.list_attempts()
+                self.assertFalse(app._run_action("implement"))
+            new_implement_attempts = [attempt for attempt in app.controller.list_attempts()
                 if attempt.capability == "implement" and attempt.attempt_id not in previous_attempt_ids]
             self.assertEqual(len(new_implement_attempts), 1,
                 f"Expected one new implement attempt; found={[attempt.attempt_id for attempt in new_implement_attempts]}, "
-                f"reason={failed_app.controller.manifest.status_reason}")
+                f"reason={app.controller.manifest.status_reason}")
             failed_attempt = new_implement_attempts[0]
-            failed_ref = failed_app.controller.attempt_output_ref(failed_attempt.attempt_id,
+            failed_ref = app.controller.attempt_output_ref(failed_attempt.attempt_id,
                 kind="implementation_result", schema="research_implementation.v1")
-            failed_result = failed_app.controller.store.read_json(failed_ref)
+            failed_result = app.controller.store.read_json(failed_ref)
             self.assertEqual(failed_result["status"], "incomplete")
             self.assertEqual(failed_result["validation"]["status"], "failed")
             self.assertNotEqual(failed_result["validation"]["returncode"], 0)
             self.assertFalse(failed_result["validation"]["timed_out"])
             self.assertEqual(failed_result["validation"]["command"], [sys.executable, "check.py"])
-            self.assertNotIn("experiment", failed_app.controller.manifest.state_refs)
+            self.assertNotIn("experiment", app.controller.manifest.state_refs)
+            app.continue_session(reason="Retry with an adapter that passes the independent checker.")
             fake = AdapterClient()
             with patch.object(LLMClient, "ask_json", side_effect=fake.ask_json), patch.object(LLMClient, "for_task", return_value=fake):
-                self.assertTrue(app._run_implement_action("implement"))
+                self.assertTrue(app._run_action("implement"))
             self.assertTrue(fake.saw_placeholder)
             self.assertEqual((workspace / "adapter.py").read_text(), adapter_source)
             self.assertFalse((project / "adapter.py").exists())
@@ -201,9 +197,9 @@ class TaskPlanTests(unittest.TestCase):
                             {"validation": {**payload["validation"], "command": [sys.executable, "formal.py"]}},
                             {"workspace_dir": str(project)}):
                 with self.subTest(changes=changes), patch.object(app, "_pause_action", return_value=False), patch.object(app, "_state_payload", return_value={**payload, **changes}), patch.object(app, "_execute") as execute:
-                    self.assertFalse(app._run_measurement_action("experiment"))
+                    self.assertFalse(app._run_action("experiment"))
                     execute.assert_not_called()
-            self.assertTrue(app._run_measurement_action("experiment"))
+            self.assertTrue(app._run_action("experiment"))
             if app._state_payload("experiment")["status"] != "passed":
                 experiment_ref = app.controller.manifest.state_refs["experiment"]
                 self.fail((root / "session" / Path(experiment_ref.path).parent /
@@ -212,6 +208,8 @@ class TaskPlanTests(unittest.TestCase):
                 app._state_payload("experiment"))
             self.assertEqual(app._state_payload("experiment")["metrics"]["accuracy"], 1.0)
             self.assertEqual(prepared["protocol"], execution["protocol"])
+            self.assertEqual(app.controller.store.read_json(failed_ref), failed_result)
+            self.assertEqual(app.budget_ledger.remaining("process_invocations"), 0)
 
     def test_default_delivery_omits_unrequested_summary_but_keeps_saved_plans(self):
         request = TaskPlanRequest(task_kind="survey", goal="Compare sources", request_text="Compare sources",
@@ -615,6 +613,8 @@ class TaskPlanTests(unittest.TestCase):
             actions = [step.action for step in result.steps]
             self.assertLess(actions.index("baseline"), actions.index("experiment"))
             self.assertEqual(execution_request(resolved, condition="baseline").run.label, "baseline")
+            for step in TaskPlanResult.from_handoff_dict(result.to_handoff_dict()).steps:
+                self.assertEqual(action_binding(step.action), (step.capability, step.state_name))
 
     def test_model_can_omit_search_when_supplied_materials_satisfy_task(self) -> None:
         request = TaskPlanRequest(
@@ -1069,7 +1069,7 @@ class TaskPlanTests(unittest.TestCase):
         self.assertNotIn("not in list", str(raised.exception))
 
     def test_bug_application_uses_code_task_without_literature_or_experiment(self) -> None:
-        from tests.test_code_task import _FakeCodeTaskClient
+        from tests.code_task_fixtures import keyword_code_responses
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1138,9 +1138,9 @@ class TaskPlanTests(unittest.TestCase):
             self.assertNotEqual(Path(resolved["cwd"]), project)
             self.assertIn("task_plan", planned.state_refs)
             self.assertNotIn("plan", planned.state_refs)
-            fake = _FakeCodeTaskClient()
+            responses_by_label = keyword_code_responses()
             payloads = [
-                fake.ask_json("", "", label=label)
+                responses_by_label[label]
                 for label in ("code-task-work-plan", "code-task-plan", "code-task-propose-edits")
             ] + [{"findings": []}] * 8
             responses = [
@@ -1150,8 +1150,15 @@ class TaskPlanTests(unittest.TestCase):
                 }
                 for payload in payloads
             ]
+            def review_response(_system, _user, *, label="", **_kwargs):
+                if label.startswith("code-task-review-"):
+                    return {"findings": []}
+                if label in responses_by_label:
+                    return keyword_code_responses()[label]
+                raise AssertionError(f"Unexpected implementation label: {label}")
+
             with patch("simple_ar.integrations.llm._call_openai_sdk", side_effect=responses), patch.object(
-                LLMClient, "for_task", return_value=fake,
+                LLMClient, "for_task", return_value=SimpleNamespace(ask_json=review_response),
             ):
                 finished = app.advance()
 
@@ -1213,32 +1220,6 @@ class TaskPlanTests(unittest.TestCase):
             )
             self.assertEqual(assessment_step["status"], "completed")
 
-    def test_revision_followup_waits_for_implementation_state_before_measurement(self) -> None:
-        plan = TaskPlanResult(
-            status="accepted",
-            mode="deterministic",
-            task_kind="research",
-            goal="Continue the bounded experiment.",
-            steps=(
-                TaskPlanStep(
-                    step_id="design", action="research_design", capability="research_design",
-                    state_name="design", problem_solved="", observation="",
-                ),
-            ),
-        )
-
-        extended = append_research_followup(plan, 1, action="revise_candidate", pair_count=1)
-        rows = {step.action: step for step in extended.steps}
-
-        self.assertEqual(
-            rows["research_candidate:1_0"].condition,
-            "after_success:implementation_r1",
-        )
-        self.assertEqual(
-            rows["reanalysis:1"].condition,
-            "after_observation:experiment_revision_1_0",
-        )
-
     def test_revision_followup_can_route_bounded_technical_repairs(self) -> None:
         plan = TaskPlanResult(
             status="accepted", mode="deterministic", task_kind="research",
@@ -1266,6 +1247,12 @@ class TaskPlanTests(unittest.TestCase):
             TaskPlanResult.from_handoff_dict(extended.to_handoff_dict()).steps,
             extended.steps,
         )
+        for step in TaskPlanResult.from_handoff_dict(extended.to_handoff_dict()).steps:
+            with self.subTest(action=step.action):
+                self.assertEqual(action_binding(step.action), (step.capability, step.state_name))
+        for action in ("unknown", "repair_candidate:1", "research_candidate:bogus", "search_evidence:2", "read_evidence:0"):
+            with self.subTest(action=action), self.assertRaisesRegex(ValueError, "Unsupported task plan action"):
+                action_binding(action)
         with self.assertRaisesRegex(ValueError, "not supported"):
             append_research_followup(
                 plan, 1, action="revise_candidate", pair_count=1, repair_count=1,
@@ -1283,6 +1270,12 @@ class TaskPlanTests(unittest.TestCase):
         revised = append_research_followup(plan, 1, action="revise_candidate", revision_base="baseline")
         self.assertEqual(revised.steps[1].action, "research_design_revision:1")
         self.assertEqual(revised.steps[2].condition, "after_success:design_revision_1")
+        paired = append_research_followup(plan, 1, action="revise_candidate", pair_count=1)
+        rows = {step.action: step for step in paired.steps}
+        self.assertEqual(rows["research_candidate:1_0"].condition,
+                         "after_success:implementation_r1")
+        self.assertEqual(rows["reanalysis:1"].condition,
+                         "after_observation:experiment_revision_1_0")
         supplemented = append_research_followup(plan, 2, supplement_count=2)
         actions = [step.action for step in supplemented.steps]
         self.assertEqual(actions[1:5], [
@@ -1294,6 +1287,10 @@ class TaskPlanTests(unittest.TestCase):
             supplemented.steps[-1].condition,
             "after_observation:baseline_supplement_2_0",
         )
+        for route in (revised, paired, supplemented):
+            for step in TaskPlanResult.from_handoff_dict(route.to_handoff_dict()).steps:
+                with self.subTest(action=step.action):
+                    self.assertEqual(action_binding(step.action), (step.capability, step.state_name))
         invalid = supplemented.to_handoff_dict()
         invalid["steps"][-1]["condition"] = "after_observation:missing_experiment"
         with self.assertRaisesRegex(ValueError, "earlier experiment step"):

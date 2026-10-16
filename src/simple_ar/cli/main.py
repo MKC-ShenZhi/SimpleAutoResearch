@@ -43,6 +43,7 @@ from simple_ar.code_task import (
 )
 from simple_ar.code_task.runtime.config import (
     CodeTaskConfigError,
+    code_task_metric_schema,
     load_code_task_init_options,
     load_code_task_execute_options,
 )
@@ -66,6 +67,12 @@ from simple_ar.tools.cli import call_tool, print_tool_schema, serve_mcp
 
 def main(argv: Sequence[str] | None = None) -> None:
     arguments = list(sys.argv[1:] if argv is None else argv)
+    brief_alias = arguments[:1] == ["research-brief"]
+    if brief_alias:
+        # Compatibility spelling only: one public parser/control/ledger owner.
+        # Keep the old default output directory and summary-only behavior.
+        arguments = ["research-session", "--output-root", "runs/research-brief",
+                     "--outputs", "summary", "--interaction", "autonomous", *arguments[1:]]
     if arguments and arguments[0] in {"run", "resume", "research-code-task", "research-experiment"}:
         raise SystemExit(
             f"The legacy command {arguments[0]} has been retired. "
@@ -90,6 +97,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     except (OSError, ValueError) as exc:
         raise SystemExit(f"Invalid research configuration: {exc}") from exc
     args = parser.parse_args(arguments)
+    if brief_alias and (args.outputs != ["summary"] or args.session_root is not None):
+        raise SystemExit("research-brief creates a summary only; use research-session for other outputs or historical continuation.")
     if args.command == "models":
         from dotenv import load_dotenv
         from simple_ar.integrations.model_profiles import load_model_catalog, ModelConfigError
@@ -204,6 +213,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             print_line(f"{name}: " + ", ".join(str(path) for path in paths))
         if not deliveries:
             print_line("No current reusable delivery. The session may be incomplete.")
+        if "code_project" in deliveries:
+            print_line("Revise code/figure: simple-ar start --from-session SESSION --reuse code_project --goal 'Your changes'")
         if session.manifest.transition_recipe == ToolApplication.RECIPE:
             print_line(f"Status: {session.manifest.status}")
             if session.manifest.status in {"completed", "partial"}:
@@ -214,8 +225,6 @@ def main(argv: Sequence[str] | None = None) -> None:
             print_line(f"Continue: simple-ar start --resume-task '{args.session}' 'Your changes'")
             return
         print_line("Continue: simple-ar start --kind writing --from-session SESSION --reuse NAME --goal 'Your changes'")
-        if "code_project" in deliveries:
-            print_line("Revise code/figure: simple-ar start --from-session SESSION --reuse code_project --goal 'Your changes'")
         return
     if args.command == "start":
         args._explicit_start_destinations = _explicit_session_option_destinations(parser, arguments, set(), command="start")
@@ -234,15 +243,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         args._explicit_resume_destinations = _explicit_session_option_destinations(
             parser, arguments, explicit_config_destinations,
         )
+        if brief_alias and 'model' not in args._explicit_resume_destinations:
+            args.model = None  # The summary alias keeps its optional-model contract.
     elif args.command == "research-report":
         args._explicit_resume_destinations = _explicit_session_option_destinations(
             parser, arguments, set(), command="research-report",
         )
 
-
-    if args.command == "research-brief":
-        _print_research_brief(args)
-        return
 
     if args.command == "research-session":
         _print_research_session(args)
@@ -358,48 +365,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.error(f"Unknown command: {args.command}")
 
 
-def _print_research_brief(args: argparse.Namespace) -> None:
-    """Run the small capability-oriented topic-to-brief application path."""
-
-    from simple_ar.app.research_brief import (
-        ResearchBriefSessionError,
-        ResearchBriefSessionRequest,
-        new_research_brief_root,
-        run_research_brief_session,
-    )
-
-    if args.max_results < 1 or args.max_chunks < 1 or args.idea_limit < 1:
-        raise SystemExit("--max-results, --max-chunks, and --idea-limit must be positive.")
-    llm_client = _optional_research_llm_client(args.model, "research brief")
-    session_root = new_research_brief_root(args.output_root, args.topic)
-    request = ResearchBriefSessionRequest(
-        topic=args.topic,
-        session_root=session_root,
-        local_documents=tuple(Path(path) for path in args.local_document),
-        queries=tuple(args.queries),
-        providers=tuple(args.providers),
-        max_results=args.max_results,
-        max_chunks=args.max_chunks,
-        idea_limit=args.idea_limit,
-        cache_dir=Path(args.cache_dir) if args.cache_dir else None,
-        use_llm=llm_client is not None,
-        llm_client=llm_client,
-    )
-    try:
-        result = run_research_brief_session(request)
-    except ResearchBriefSessionError as exc:
-        raise SystemExit(str(exc)) from exc
-    print_line(f"Research brief session: {result.session_root}")
-    print_line(f"Status: {result.status}")
-    print_line(f"Mode: {'llm' if llm_client is not None else 'deterministic'}")
-    print_line(f"Planner: {result.plan.query_plan.planner}")
-    print_line(
-        f"Synthesis: {result.brief.synthesis.generation_mode if result.brief.synthesis else 'none'}"
-    )
-    print_line(f"Papers: {len(result.search.papers)}")
-    print_line(f"Documents: {len(result.documents.records)}")
-    print_line(f"Ideas: {len(result.brief.synthesis.ideas) if result.brief.synthesis else 0}")
-    print_line(f"Synthesis handoff: {result.brief_path}")
 
 
 
@@ -438,6 +403,11 @@ def _print_research_session(args: argparse.Namespace) -> None:
 
     saved_outputs = ()
     if getattr(args, "session_root", None) is not None:
+        manifest = Path(args.session_root) / 'session_manifest.json'
+        if manifest.is_file() and read_json(manifest).get('transition_recipe') == 'native-tools-v1':
+            from simple_ar.cli.start import resume_structured_task
+            resume_structured_task(args)
+            return
         from simple_ar.app.research_application import load_session
 
         try:
@@ -474,16 +444,18 @@ def _print_research_session(args: argparse.Namespace) -> None:
         if not args.model:
             raise SystemExit("--code-task-config requires --model for Code-Task generation.")
         try:
-            code_task_spec, execute_options = _load_code_task_spec_for_cli(
+            code_task_spec, execute_options = _load_code_task_options_for_cli(
                 _resolve_cli_path(code_task_config)
             )
         except (CodeTaskConfigError, RuntimeError, TypeError, ValueError) as exc:
             raise SystemExit(f"Invalid research Code-Task configuration: {exc}") from exc
         missing_inputs = []
-        if code_task_spec.code_root is not None and not code_task_spec.code_root.is_dir():
-            missing_inputs.append(f"project directory: {code_task_spec.code_root}")
-        if code_task_spec.task_file is not None and not code_task_spec.task_file.is_file():
-            missing_inputs.append(f"task file: {code_task_spec.task_file}")
+        code_root = Path(code_task_spec.code_root).absolute() if code_task_spec.code_root is not None else None
+        task_file = Path(code_task_spec.task_file).absolute() if code_task_spec.task_file is not None else None
+        if code_root is not None and not code_root.is_dir():
+            missing_inputs.append(f"project directory: {code_root}")
+        if task_file is not None and not task_file.is_file():
+            missing_inputs.append(f"task file: {task_file}")
         if code_task_spec.env_mode == "external":
             python = code_task_spec.python_executable
             if not python:
@@ -543,31 +515,18 @@ def _print_research_session(args: argparse.Namespace) -> None:
             raise SystemExit("The configured Code-Task benchmark command is empty.")
         if task_kind != "reproduction":
             command = validation_command
-        if code_task_spec.task_file is not None:
+        if task_file is not None:
             try:
-                task_text = code_task_spec.task_file.read_text(encoding="utf-8")
+                task_text = task_file.read_text(encoding="utf-8")
             except OSError as exc:
                 raise SystemExit(f"Could not read Code-Task task file: {exc}") from exc
-        task = {
-            "kind": code_task_spec.kind,
-            "code_root": str(code_task_spec.code_root.resolve()) if code_task_spec.code_root is not None else None,
-            "workspace_mode": code_task_spec.workspace_mode,
-            "env_mode": code_task_spec.env_mode,
-            "python_executable": code_task_spec.python_executable,
-            "approval_note": code_task_spec.approval_note,
-            "max_repairs": execute_options.repair_rounds,
-            "allowed_patterns": list(code_task_spec.edit_scope_allowed_patterns),
-            "protected_patterns": list(code_task_spec.edit_scope_protected_patterns),
-            "budget_profile": execute_options.budget_profile,
-            "edit_budget_overrides": execute_options.edit_budget_overrides,
-            "allow_large_edits": bool(
-                execute_options.allow_large_edits or code_task_spec.allow_large_edits
-            ),
-        }
+        from simple_ar.app.research_execution import code_task_execution_options
+        task = code_task_execution_options(code_task_spec, execute_options)
+        if ((execution_details.get("environment") or {}).get("mode") == "venv"
+                and code_task_spec.env_mode != "current"):
+            raise SystemExit("Venv preparation requires an initially current CodeTask interpreter; explicit external Python is not silently replaced.")
         if task_kind == "reproduction":
-            if execution_details.get("environment") and code_task_spec.env_mode != "current":
-                raise SystemExit("Venv preparation requires an initially current CodeTask interpreter; explicit external Python is not silently replaced.")
-            if args.cwd is not None and Path(args.cwd).resolve() != code_task_spec.code_root.resolve():
+            if code_root is not None and args.cwd is not None and Path(args.cwd).resolve() != code_root.resolve():
                 raise SystemExit("Reproduction measurement cwd must match the isolated CodeTask project.")
             if code_task_spec.env_mode not in {"current", "external"}:
                 raise SystemExit("Reproduction code preparation requires an existing current/external interpreter.")
@@ -575,11 +534,13 @@ def _print_research_session(args: argparse.Namespace) -> None:
                         validation_timeout_sec=execute_options.timeout_sec)
         execution = {
             "command": command,
-            "cwd": str(code_task_spec.code_root.resolve()) if code_task_spec.code_root is not None else str(Path(code_task_spec.config_path).parent.resolve()),
+            "cwd": str(code_root.resolve()) if code_root is not None else str(
+                Path(args.cwd).resolve() if task_kind == 'reproduction' and args.cwd is not None
+                else Path(code_task_spec.config_path).parent.resolve()),
             "timeout_sec": timeout_sec,
             "label": args.label,
             "result_schema": _merge_result_schemas(
-                code_task_spec.result_schema(), _experiment_result_schema(args)
+                code_task_metric_schema(code_task_spec.primary_metric, code_task_spec.metric_directions), _experiment_result_schema(args)
             ),
             "code_task": task,
         }
@@ -603,12 +564,10 @@ def _print_research_session(args: argparse.Namespace) -> None:
     if execution_details:
         if execution is None:
             raise SystemExit("execution.protocol requires a command, pairs or code_task_config.")
-        if execution_details.get("pairs") and code_task_spec is not None and code_task_baseline_policy not in {"auto", "run"}:
-            raise SystemExit("Paired experiments require CodeTask baseline_policy=auto/run.")
         execution_details = dict(execution_details)
         if "initial_files" in execution_details:
-            if task_kind != "reproduction" or code_task_spec is None:
-                raise SystemExit("Adapter creation requires explicit reproduction CodeTask preparation.")
+            if code_task_spec is None:
+                raise SystemExit("Required file creation requires explicit CodeTask preparation.")
             execution["code_task"]["initial_files"] = execution_details.pop("initial_files")
         for field in ("output_files", "metric_sources"):
             if field in execution_details:
@@ -694,7 +653,7 @@ def _print_research_session(args: argparse.Namespace) -> None:
     if code_delivery and code_task_spec is not None and code_task_spec.code_root is not None:
         asset_requests.append({
             "asset_id": "code_project",
-            "locator": str(code_task_spec.code_root.resolve()),
+            "locator": str(code_root.resolve()),
             "kind": "code",
             "role": "code",
             "mutability": "isolated_edit",
@@ -703,6 +662,16 @@ def _print_research_session(args: argparse.Namespace) -> None:
     assets = tuple(asset_requests)
     display = ResearchConsole()
     validation_runs = 1 + execute_options.repair_rounds if task_kind == "bug_fix" and code_task_spec is not None else 1
+    process_count = validation_runs if task_kind == 'bug_fix' else 8 if execution is not None else 0
+    process_wall = (max(30, timeout_sec) * validation_runs if task_kind == 'bug_fix'
+        else max(60, timeout_sec * 8) if execution is not None else 0)
+    if (resume_root is None and execution is not None and execution.get('environment') is not None
+            and code_task_spec is None and not execution.get('pairs')):
+        from simple_ar.research.project_environment import project_environment_plan
+        plan = project_environment_plan(execution['environment'], Path(execution['cwd']),
+            Path('__attempt__') / 'environment', list(execution['command']))
+        process_count = max(process_count, len(plan['steps']) + 1)
+        process_wall = max(process_wall, len(plan['steps']) * plan['profile']['timeout_sec'] + timeout_sec)
     services = ResearchApplicationServices(
         llm_client=llm_client,
         feasibility_llm_client=feasibility_client,
@@ -715,8 +684,8 @@ def _print_research_session(args: argparse.Namespace) -> None:
         budget_limits={
             "llm_requests": args.llm_requests,
             "total_tokens": args.total_tokens,
-            "process_invocations": args.process_invocations if getattr(args, "process_invocations", None) is not None else (validation_runs if task_kind == "bug_fix" else 8 if execution is not None else 0),
-            "process_wall_seconds": args.process_wall_seconds if getattr(args, "process_wall_seconds", None) is not None else (max(30, timeout_sec) * validation_runs if task_kind == "bug_fix" else max(60, timeout_sec * 8) if execution is not None else 0),
+            "process_invocations": args.process_invocations if getattr(args, "process_invocations", None) is not None else process_count,
+            "process_wall_seconds": args.process_wall_seconds if getattr(args, "process_wall_seconds", None) is not None else process_wall,
         },
         max_attempts=32 if code_task_spec is not None else 20,
         message_callback=display.message,
@@ -756,21 +725,33 @@ def _print_research_session(args: argparse.Namespace) -> None:
         raise SystemExit("Continuation allowances require --session-root.")
     try:
         if resume_root is None:
+            if execution is None and (not experiment_requested or llm_client is not None):
+                from simple_ar.cli.start import migrate_structured_creation
+                migrate_structured_creation(args, request=brief.request_text,
+                    outputs=brief.requested_outputs, sources=brief.asset_requests,
+                    limits=services.budget_limits, root=session_root, research_config=config,
+                    report_config=report_config, writing_method=writing_method,
+                    data_analysis=data_analysis, review_model=review_model or None)
+                return
+            if execution is not None:
+                from simple_ar.cli.start import migrate_exact_code_creation, migrate_measurement_creation
+                if migrate_measurement_creation(args, execution=execution, request=brief.request_text,
+                        outputs=brief.requested_outputs, root=session_root, limits=services.budget_limits,
+                        sources=brief.asset_requests, report_config=report_config, writing_method=writing_method):
+                    return
+                if migrate_exact_code_creation(args, execution=execution, request=brief.request_text,
+                        outputs=brief.requested_outputs, sources=brief.asset_requests,
+                        limits=services.budget_limits, root=session_root,
+                        report_config=report_config, writing_method=writing_method):
+                    return
             if report_requested:
-                print_line(f"Report writing: {writing_method}; " + (
-                    "one complete article, deterministic assembly/audit; no automatic planning or model review."
-                    if writing_method == "article" else "explicit section/planning/review compatibility controls retained."))
+                _print_report_writing_plan(writing_method, report_config)
             app = create_session(brief, root=session_root, services=services)
         else:
             from simple_ar.app.research_application import load_session
             from dataclasses import replace
             app = load_session(session_root, services=replace(services, config={}))
-            app.require_llm_binding(include_legacy_usage=True)
             saved_review_model = str(app.services.config.get("feasibility_review_model") or "")
-            if review_model and review_model != saved_review_model:
-                raise ResearchApplicationError(
-                    "The feasibility review model differs from the saved session; start a new session to change it."
-                )
             if saved_review_model and app.services.feasibility_llm_client is None:
                 reviewer = _optional_research_llm_client(
                     saved_review_model, "feasibility review",
@@ -779,113 +760,34 @@ def _print_research_session(args: argparse.Namespace) -> None:
                 app.services = replace(app.services, feasibility_llm_client=reviewer.with_budget(
                     app.budget_ledger, session_id=app.controller.manifest.session_id,
                 ))
+            from simple_ar.cli.research_config import report_settings
             explicit = getattr(args, "_explicit_resume_destinations", set())
-            if ("report_writing_method" in explicit and args.report_writing_method
-                    != app.services.config.get("report_writing_method", "sections")):
-                raise ResearchApplicationError("Saved reports keep their writing method and checkpoint owner; start a new task to change the method.")
-            interaction_update = (
-                args.interaction
-                if "interaction" in explicit and args.interaction != app.services.config.get("interaction")
-                else None
-            )
-            decision_requested = any(decision_fields)
-            changed_research_settings = _changed_resume_research_settings(args, app)
-            if changed_research_settings:
-                names = ", ".join(changed_research_settings)
-                raise ResearchApplicationError(
-                    "These explicit research settings differ from or cannot be verified against the saved session: "
-                    f"{names}. They were not applied; start a new research-session to change search/ingestion settings."
-                )
-            report_overrides = _report_config_overrides(args, app)
-            work_interaction = app.view().work_plan.get("interaction", {})
-            pending_decision = (
-                work_interaction.get("decision")
-                if isinstance(work_interaction, dict) else None
-            )
-            has_pending_decision = (
-                isinstance(pending_decision, dict) and pending_decision.get("status") == "pending"
-            )
-            delivery_revision = bool(
-                isinstance(pending_decision, dict)
-                and pending_decision.get("status") in {"pending", "revised"}
-                and pending_decision.get("id") == args.decision_id
-                and pending_decision.get("stage") == "delivery"
-                and args.decision_response == "revise"
-            )
-            if interaction_update is not None and (
-                getattr(args, "reanalyze", False) or (report_overrides and not delivery_revision)
-            ):
-                raise ResearchApplicationError(
-                    "Apply the interaction mode change in a separate resume before reanalysis or report refresh."
-                )
-            if task_kind != "auto" and task_kind != app.task_kind:
-                raise ResearchApplicationError("Changing task kind requires a new session; revise the goal/assets/outputs within the existing task kind.")
             revised_brief = _merge_resume_brief(
                 app.brief, brief, task_text=task_text, outputs=outputs,
                 with_report=args.with_report, no_report=args.no_report,
             )
-            existing = app.services.config.get("execution")
-            revised_execution = execution if execution is not None and execution != existing else None
-            brief_changed = revised_brief != app.brief
-            report_requested_in_session = bool(
-                {"report", "paper", "full_paper"}
-                & {item.strip().lower() for item in revised_brief.requested_outputs}
+            report_overrides = report_settings(args, explicit_destinations=explicit)
+            app.continue_session(
+                reason="Resume from research-session with explicit input/budget revision.",
+                resume_if_needed=True,
+                revised_brief=revised_brief if revised_brief != app.brief else None,
+                revised_execution=execution,
+                interaction=args.interaction if "interaction" in explicit else None,
+                task_kind=task_kind,
+                report_writing_method=args.report_writing_method if "report_writing_method" in explicit else None,
+                feasibility_review_model=review_model,
+                research_settings=_resume_research_settings(args),
+                reanalyze=getattr(args, "reanalyze", False),
+                recover_interrupted=getattr(args, "recover_interrupted", False),
+                decision_id=args.decision_id,
+                decision_response=args.decision_response,
+                decision_guidance=args.decision_guidance,
+                revised_report_config=report_overrides if report_overrides else None,
+                **{**continuation, "authorize_remaining": continuation["authorize_remaining"]
+                   if "authorize_remaining" in explicit else None,
+                   "additional_attempts": continuation["additional_attempts"] if "additional_attempts" in explicit else None,
+                   "additional_no_progress": continuation["additional_no_progress"] if "additional_no_progress" in explicit else None},
             )
-            if report_overrides and not report_requested_in_session:
-                raise ResearchApplicationError(
-                    "Report settings do not request a report deliverable. Add the report output first or use research-report."
-                )
-            continuation_requested = any((
-                continuation["authorization_id"], continuation["authorization_reason"],
-                continuation["authorize_remaining"], continuation["additional_attempts"],
-                continuation["additional_no_progress"],
-            ))
-            if report_overrides and has_pending_decision and not delivery_revision:
-                raise ResearchApplicationError(
-                    "Answer the pending research decision first; only a revise reply to a delivery decision can change report settings here."
-                )
-            if report_overrides and not delivery_revision and (
-                brief_changed or revised_execution is not None or continuation_requested
-                or getattr(args, "reanalyze", False) or decision_requested
-            ):
-                raise ResearchApplicationError(
-                    "Apply report configuration in a separate research-session resume, without input revisions, reanalysis or continuation allowances."
-                )
-            if decision_requested and getattr(args, "reanalyze", False):
-                raise ResearchApplicationError("A decision reply cannot be combined with --reanalyze.")
-            if getattr(args, "reanalyze", False) and (brief_changed or revised_execution is not None or continuation_requested):
-                raise ResearchApplicationError("--reanalyze cannot be combined with input revisions or continuation allowances.")
-            if getattr(args, "recover_interrupted", False):
-                if (getattr(args, "reanalyze", False) or brief_changed
-                    or revised_execution is not None or interaction_update is not None
-                    or decision_requested or report_overrides or continuation_requested):
-                    raise ResearchApplicationError(
-                        "Recover the interrupted attempt in a separate resume without input, budget, decision or report changes."
-                    )
-                app.recover_interrupted_attempt()
-            elif getattr(args, "reanalyze", False):
-                app.request_reanalysis()
-            elif report_overrides and not delivery_revision:
-                app.request_report(
-                    refresh=True,
-                    report_config=report_overrides,
-                    reason="Apply explicit report configuration and rebuild only report deliverables from existing evidence.",
-                )
-            elif (brief_changed or revised_execution is not None or interaction_update is not None
-                  or decision_requested or continuation_requested or (app.view().status in {"paused", "blocked", "failed"} and not (
-                has_pending_decision
-            ))):
-                app.continue_session(
-                    reason="Resume from research-session with explicit input/budget revision.",
-                    revised_brief=revised_brief if brief_changed else None,
-                    revised_execution=revised_execution,
-                    interaction=interaction_update,
-                    decision_id=args.decision_id,
-                    decision_response=args.decision_response,
-                    decision_guidance=args.decision_guidance,
-                    revised_report_config=report_overrides if delivery_revision else None,
-                    **continuation,
-                )
         view = app.view()
         display.start(
             view,
@@ -1184,77 +1086,41 @@ def _explicit_session_option_destinations(
 
 
 def _report_config_overrides(args: argparse.Namespace, app: Any) -> dict[str, object]:
+    """Compatibility projection for research-report; semantics belong to the application."""
     from simple_ar.cli.research_config import report_settings
+    from simple_ar.app.research_application import ResearchApplication
 
     supplied = report_settings(args, explicit_destinations=getattr(args, "_explicit_resume_destinations", set()))
-    if (args.command == "research-session" and supplied.get("template") == "experiment"
-            and not app.services.config.get("execution")
-            and app.services.config.get("research_task_kind") != "writing"):
-        supplied["template"] = "survey"
-    saved = app.services.config.get("report", {})
-    saved = saved if isinstance(saved, dict) else {}
-    if app.services.config.get("report_writing_method", "sections") == "article":
-        # The retained owner cannot acquire section-review semantics on resume.
-        # Validate before request_report writes configuration or invalidates work.
-        from simple_ar.report.schema import ReportRuntimeConfig
-        from simple_ar.report.writing import validate_report_writing_config
-        from simple_ar.app.research_application import ResearchApplicationError
-        try:
-            validate_report_writing_config(ReportRuntimeConfig.model_validate({**saved, **supplied}), method="article")
-        except ValueError as exc:
-            raise ResearchApplicationError(str(exc)) from exc
-    return {key: value for key, value in supplied.items() if saved.get(key) != value}
+    return ResearchApplication.report_config_overrides(
+        app, supplied, session_resume=args.command == "research-session",
+    )
 
 
-def _changed_resume_research_settings(
-    args: argparse.Namespace, app: Any,
-) -> list[str]:
+def _resume_research_settings(args: argparse.Namespace) -> dict[str, object]:
+    """Translate only explicitly supplied search/ingestion settings."""
     explicit = getattr(args, "_explicit_resume_destinations", set())
-    saved = app.services.config
-    checks: dict[str, tuple[object, object]] = {
-        "providers": (list(args.providers), list(saved.get("research_sources", []))),
-        "queries": (list(args.queries), list(saved.get("research_queries", []))),
-        "max_results": (args.max_results, app.services.max_results),
-        "max_chunks": (args.max_chunks, app.services.max_chunks),
-        "read_max_shortlist": (
-            getattr(args, "read_max_shortlist", None), saved.get("research_read_max_shortlist"),
-        ),
-        "research_max_pdf_pages": (
-            getattr(args, "research_max_pdf_pages", None), saved.get("research_max_pdf_pages"),
-        ),
-        "research_max_fulltext_documents": (
-            getattr(args, "research_max_fulltext_documents", None), saved.get("research_max_fulltext_documents"),
-        ),
-        "research_max_pdf_mb": (
-            getattr(args, "research_max_pdf_mb", None), saved.get("research_max_pdf_mb"),
-        ),
-        "idea_limit": (args.idea_limit, app.services.idea_limit),
-        "max_research_iterations": (
-            args.max_research_iterations, saved.get("research_max_iterations", 1),
-        ),
-        "research_use_fulltext": (
-            getattr(args, "research_use_fulltext", None), saved.get("research_use_fulltext"),
-        ),
-        "research_materials_only": (
-            getattr(args, "research_materials_only", None), saved.get("research_materials_only"),
-        ),
-        "research_allow_pdf_download": (
-            getattr(args, "research_allow_pdf_download", None), saved.get("research_allow_pdf_download"),
-        ),
-        "research_keep_raw_pdf": (
-            getattr(args, "research_keep_raw_pdf", None), saved.get("research_keep_raw_pdf"),
-        ),
-        "research_web_extract_backend": (
-            getattr(args, "research_web_extract_backend", None), saved.get("research_web_extract_backend"),
-        ),
-    }
-    changed = [
-        name for name, (requested, previous) in checks.items()
-        if name in explicit and requested != previous
-    ]
-    if "cache_dir" in explicit:
-        changed.append("cache_dir (not persisted for safe resume comparison)")
-    return changed
+    names = (
+        "providers", "queries", "max_results", "max_chunks", "read_max_shortlist",
+        "research_max_pdf_pages", "research_max_fulltext_documents", "research_max_pdf_mb",
+        "idea_limit", "max_research_iterations", "research_use_fulltext",
+        "research_materials_only", "research_allow_pdf_download", "research_keep_raw_pdf",
+        "research_web_extract_backend", "cache_dir",
+    )
+    return {name: getattr(args, name, None) for name in names if name in explicit}
+
+
+def _print_report_writing_plan(method: str, settings: dict) -> None:
+    if method == "article":
+        rounds = settings.get("max_review_iterations", 0)
+        if settings.get("reviewer") != "llm" or not settings.get("document_review"):
+            plan = "one complete article, deterministic assembly/audit; no model review."
+        elif rounds == 0:
+            plan = "one complete article with one independent document inspection; no automatic revision."
+        else:
+            plan = f"one complete article with an initial inspection; at most {rounds} candidate proposals, independently checked before adoption."
+    else:
+        plan = "explicit section/planning/review compatibility controls retained."
+    print_line(f"Report writing: {method}; {plan}")
 
 
 def _print_research_report(args: argparse.Namespace) -> None:
@@ -1311,6 +1177,8 @@ def _print_research_report(args: argparse.Namespace) -> None:
             view = app.continue_session(
                 reason="Resume the canonical report lifecycle within the persisted session budget.",
             )
+        _print_report_writing_plan(app.services.config.get("report_writing_method", "sections"),
+                                   app.services.config.get("report", {}))
         for _ in range(app.controller.manifest.budget.max_attempts + 8):
             if view.next_action is None and view.status != "running":
                 break
@@ -1431,20 +1299,10 @@ def _ensure_research_cli_success(
         )
 
 
-def _load_code_task_spec_for_cli(config_path: Path):
-    """Load one Code-Task spec consistently across research CLI consumers."""
-
-    from simple_ar.experiment.code_task_bridge.spec import code_task_project_spec
-
+def _load_code_task_options_for_cli(config_path: Path):
+    """Consume canonical init/execute options, not a second experiment spec."""
     execute_options = load_code_task_execute_options(config_path=str(config_path))
-    spec = code_task_project_spec(
-        {
-            "code_task_config": str(config_path),
-            "safety_allow_large_edits": execute_options.allow_large_edits,
-        },
-        allow_greenfield=True,
-    )
-    return spec, execute_options
+    return load_code_task_init_options(config_path=str(config_path), require_task_file=False), execute_options
 
 
 def _print_clean(args: argparse.Namespace) -> None:
@@ -2666,13 +2524,20 @@ def _render_native_result(app: Any, status: dict[str, Any]) -> None:
 def _run_native_start(args: argparse.Namespace) -> None:
     from simple_ar.app.session_roots import new_research_session_root
     from simple_ar.app.tool_application import ToolApplication
-    from simple_ar.cli.start import select_start_model
+    from simple_ar.cli.start import native_creation_options, select_start_model
     from simple_ar.tools.workspace import resolve_source_mount
     from simple_ar.core.console import make_console, print_line
     from rich.panel import Panel
     from rich.text import Text
     interactive = sys.stdin.isatty()
     try:
+        decision = {name: getattr(args, name, None) for name in
+                    ('decision_id', 'decision_response', 'decision_guidance')}
+        if any(value is not None for value in decision.values()):
+            if not args.resume_task or not decision['decision_id'] or not decision['decision_response']:
+                raise ValueError('A design reply requires --resume-task, --decision-id and --decision-response')
+        else:
+            decision = None
         continuation = _continuation_parameters(args)
         if args.approve_execution and not args.resume_task:
             raise ValueError("--approve-execution requires --resume-task and its saved pending command")
@@ -2771,12 +2636,8 @@ def _run_native_start(args: argparse.Namespace) -> None:
             if not args.yes and not args.prepare_only:
                 if not interactive or input("Start / 开始? [y/N]: ").strip().lower() not in {"y", "yes"}:
                     return
-            root = new_research_session_root(args.output_root, args.request)
-            app = ToolApplication.create(root, args.request, model=args.model,
-                sources={f"source{index}": path for index, path in enumerate(args.source)},
-                allow_execution=args.allow_execution, allow_network=args.allow_network, allow_vision=args.allow_vision,
-                max_turns=args.max_turns, max_tokens=args.max_tokens, max_images=args.max_images,
-                project_python=args.project_python)
+            root = getattr(args, '_native_root', None) or new_research_session_root(args.output_root, args.request)
+            app = ToolApplication.create(root, args.request, **native_creation_options(args))
             feedback = ""
         print_line(f"Task session: {app.session.store.root}")
         print_line(f"Saved process allowance (including search backends): {app.ledger.limits.get('process_invocations')}; "
@@ -2787,6 +2648,13 @@ def _run_native_start(args: argparse.Namespace) -> None:
 
         def approve(call: dict[str, Any], token: str) -> bool:
             print_line(f"Execution proposal ({call['function']['name']}): {call['function']['arguments']}")
+            if call['function']['name'] in {'prepare_code_task', 'implement_code_task'}:
+                print_line(f"Frozen CodeTask contract: {app.implementation.exact.model_dump()}")
+                exact = app.implementation.exact
+                repairs = exact.preparation.max_repairs if exact.preparation is not None else 1
+                print_line('Approval binds the project inventory, protected validator files and process environment. '
+                    + ('Preparation only; implementation and each formal measurement require separate approval.'
+                       if call['function']['name'] == 'prepare_code_task' else f'Includes at most {repairs} technical repairs.'))
             print_line("Execution is not sandboxed. Inspect the generated code before approving.")
             return interactive and input("Execute this command / 执行此命令? [y/N]: ").strip().lower() in {"y", "yes"}
 
@@ -2799,7 +2667,14 @@ def _run_native_start(args: argparse.Namespace) -> None:
                          allow_vision=args.allow_vision if args.resume_task else False,
                          resource_allowances=allowances or None,
                          authorization_id=authorization_id, authorization_reason=authorization_reason,
+                         decision=decision,
                          approve=approve if interactive else None, progress=print_line)
+        if (args.resume_task and app.state['config'].get('model') is None
+                and not feedback and not args.retry_model and not allowances
+                and not (args.source or args.allow_execution or args.allow_network or args.allow_vision)):
+            completion = app.measurement_completion_actions()
+            if completion:
+                status = app.run(actions=completion, progress=print_line)
         _render_native_result(app, status)
     except (OSError, ValueError, RuntimeError, LLMError) as exc:
         raise SystemExit(f"Native task stopped; saved operations are not replayed: {exc}") from exc

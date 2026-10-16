@@ -33,6 +33,13 @@ def image_tool_specs() -> list[CommonToolSpec]:
 
 
 class ImageToolGateway:
+    def can_reconcile(self, name: str, identity: str) -> bool:
+        # resume_image already targets an original version and rejects absent
+        # reservations. create_image must never reach a new submission here.
+        return name == 'resume_image' or (name == 'create_image'
+            and (self.workspace.workspace / 'image-versions' / identity / 'result' / 'request.json').is_file()
+            and any(entry.reservation_id == f'image:{identity}' for entry in self.ledger.entries))
+
     def __init__(self, workspace: Any, ledger: Any) -> None:
         self.workspace, self.ledger = workspace, ledger
 

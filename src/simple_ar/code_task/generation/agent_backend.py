@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from simple_ar.agent_backends import (
     AgentExecutionMode,
@@ -43,6 +43,7 @@ def write_greenfield_project_from_agent_backend(
     agent_model: str = "",
     agent_binary: str = "",
     agent_args: tuple[str, ...] = (),
+    validate_candidate: Callable[[Path], None] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run a bounded external backend for greenfield code-task generation.
 
@@ -161,7 +162,7 @@ def write_greenfield_project_from_agent_backend(
             f"Status={result.status}; generated_file_count={len(generated_files)}; "
             f"message={result.message}; result={result.result_path or package.handoff_dir}."
         )
-    with generation_candidate(project_dir) as candidate:
+    with generation_candidate(project_dir, validate=validate_candidate) as candidate:
         shutil.copytree(generated_dir, candidate, ignore=_copy_ignore, dirs_exist_ok=True)
     code_artifacts = _code_artifacts_from_project(project_dir, source=f"agent:{normalized_provider}")
     agent_result = {

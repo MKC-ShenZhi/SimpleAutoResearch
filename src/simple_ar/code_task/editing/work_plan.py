@@ -4,35 +4,35 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from simple_ar.core.artifacts import read_json, read_text, write_json, write_text
 from simple_ar.code_task.editing.budget import budget_profiles_json
-from simple_ar.code_task.analysis.context import (
-    ensure_code_task_context_pack,
-    load_latest_code_task_context_pack,
-    read_source_snippets,
-)
 from simple_ar.code_task.editing.scope import (
-    allowed_patterns_from_manifest,
     is_edit_allowed_path,
-    protected_patterns_from_manifest,
     prompt_file_inventory,
 )
+from simple_ar.code_task.generation.common import safe_relative_path
 from simple_ar.code_task.editing.planning import (
-    _collect_run_context, select_relevant_files, _context_pack_snippets,
+    MessageCallback,
+    _bullet_list,
+    _first_sentence,
+    _generate_plan_data,
+    _index_files,
+    _manifest_run_context,
+    _object_dict,
+    _object_list,
+    _prepare_planning_context,
+    _string,
+    _string_list,
 )
 from simple_ar.code_task.runtime.state import (
     code_task_paths,
-    load_code_task_manifest,
     save_code_task_manifest,
     utcnow_iso,
 )
-from simple_ar.code_task.memory import task_memory_context
 from simple_ar.code_task.analysis.interfaces import render_source_snippets, snippet_api_contract
-from simple_ar.integrations.llm import LLMClient, LLMResponseError
-from simple_ar.code_task.generation.agent_step import response_accounting_known, retry_suffix
-from simple_ar.integrations.usage import record_usage
+from simple_ar.integrations.llm import LLMClient
 
 
 CODE_TASK_WORK_PLAN_SYSTEM = (
@@ -40,8 +40,6 @@ CODE_TASK_WORK_PLAN_SYSTEM = (
     "reviewable implementation batches. You must plan execution only. Do not "
     "write patches, full code, diffs, or old/new edit payloads."
 )
-
-MessageCallback = Callable[[str], None]
 
 VALID_BUDGET_PROFILES = {"normal", "large", "absolute"}
 
@@ -132,110 +130,38 @@ def generate_code_task_work_plan(
             f"Work plan already exists: {work_plan_path}. Pass --force to overwrite."
         )
 
-    manifest = load_code_task_manifest(root)
-    task_text = _read_required_text(paths.task_dir / "task.md")
-    index = _read_required_json(paths.meta_dir / "codebase_index.json")
-    allowed_patterns = allowed_patterns_from_manifest(manifest)
-    protected_patterns = protected_patterns_from_manifest(manifest)
-    run_context = _collect_run_context(root, manifest)
-    memory_context = task_memory_context(root)
-    context_pack_ref: dict[str, Any] | None = None
-
-    if use_llm:
-        loaded_context = ensure_code_task_context_pack(root, query=task_text, max_files=max_files,
-            max_source_chars_per_file=max_source_chars_per_file)
-        manifest = load_code_task_manifest(root)  # Retain pack-owner references when saving the work plan.
-    else:
-        loaded_context = load_latest_code_task_context_pack(root)
-    if loaded_context is not None and loaded_context.selected_files:
-        selected = loaded_context.selected_paths(max_files=max_files)
-        snippets = _context_pack_snippets(
-            loaded_context,
-            max_files=max_files,
-            max_chars_per_file=max_source_chars_per_file,
-        )
-        context_pack_ref = loaded_context.manifest_reference(root)
-        _emit(message_callback, f"Using code-task context pack: {context_pack_ref['path']}")
-    else:
-        selected = []
-        snippets = []
-
-    if not selected or not snippets:
-        selected = select_relevant_files(index, task_text, max_files=max_files)
-        snippets = read_source_snippets(
-            paths.workspace_dir,
-            selected,
-            max_chars_per_file=max_source_chars_per_file,
-            editable_files=[path for path in selected if is_edit_allowed_path(
-                path, allowed_patterns=allowed_patterns, protected_patterns=protected_patterns)],
-        )
-        context_pack_ref = None
-
-    mode = "offline"
-    plan_data: dict[str, Any] | None = None
-    if use_llm:
-        client = LLMClient.for_task(
-            client=llm_client, model=model,
-            usage_callback=lambda usage: record_usage(paths.meta_dir, usage,
-                stage="code_task.work_plan", message_callback=message_callback),
-        )
-        last_error: LLMResponseError | None = None
-        for attempt in range(1, llm_retry_attempts + 1):
-            try:
-                suffix = f" (attempt {attempt}/{llm_retry_attempts})" if llm_retry_attempts > 1 else ""
-                _emit(message_callback, f"Calling LLM for code-task work planning{suffix}.")
-                plan_data = _ask_llm_for_work_plan(
-                    client,
-                    task_text=task_text,
-                    index=index,
-                    snippets=snippets,
-                    benchmark_command=_benchmark_command(manifest),
-                    run_context=run_context,
-                    memory_context=memory_context,
-                    allowed_patterns=allowed_patterns,
-                    protected_patterns=protected_patterns,
-                    retry_feedback=retry_suffix(last_error, attempt),
-                )
-                mode = "llm"
-                break
-            except LLMResponseError as exc:
-                write_json(paths.meta_dir / "planning_steps" / f"work-plan-response-{attempt:03d}.json",
-                    {"error": str(exc), "raw_response": exc.raw_response})
-                if not response_accounting_known(client):
-                    raise
-                last_error = exc
-                _emit(message_callback, f"LLM work planning attempt {attempt} failed: {exc}")
-        if plan_data is None and last_error is not None:
-            if allow_llm_fallback:
-                _emit(message_callback, f"Using offline fallback after LLM work planning failed. {last_error}")
-            else:
-                raise last_error
-
-    if plan_data is None:
-        plan_data = _offline_work_plan(
-            task_text=task_text,
-            index=index,
-            selected_files=selected,
-            benchmark_command=_benchmark_command(manifest),
-            run_context=run_context,
-            allowed_patterns=allowed_patterns,
-            protected_patterns=protected_patterns,
-        )
+    manifest, inputs, selected, context_pack_ref = _prepare_planning_context(
+        root, use_llm=use_llm, max_files=max_files,
+        max_source_chars_per_file=max_source_chars_per_file,
+        message_callback=message_callback,
+    )
+    inputs["benchmark_command"] = _benchmark_command(manifest)
+    new_files = _creation_paths(manifest, run_dir=root)
+    if new_files:
+        inputs["run_context"]["new_files"] = new_files
+    plan_data, mode = _generate_plan_data(
+        paths.meta_dir, inputs=inputs, selected_files=selected,
+        ask=_ask_llm_for_work_plan, offline=_offline_work_plan,
+        plan_name="work", usage_stage="code_task.work_plan",
+        model=model, use_llm=use_llm, llm_client=llm_client,
+        llm_retry_attempts=llm_retry_attempts,
+        allow_llm_fallback=allow_llm_fallback, message_callback=message_callback,
+    )
 
     work_plan = _normalize_work_plan_data(
         plan_data,
-        index,
+        inputs["index"],
         selected_files=selected,
-        task_text=task_text,
-        benchmark_command=_benchmark_command(manifest),
+        task_text=inputs["task_text"],
+        benchmark_command=inputs["benchmark_command"],
         mode=mode,
-        run_context=run_context,
+        run_context=inputs["run_context"],
         context_pack=context_pack_ref,
-        allowed_patterns=allowed_patterns,
-        protected_patterns=protected_patterns,
+        allowed_patterns=inputs["allowed_patterns"],
+        protected_patterns=inputs["protected_patterns"],
     )
     write_json(work_plan_path, work_plan)
-    write_text(markdown_path, render_work_plan_markdown(work_plan, task_text=task_text))
+    write_text(markdown_path, render_work_plan_markdown(work_plan, task_text=inputs["task_text"]))
     _update_manifest_after_work_plan(
         root,
         manifest,
@@ -354,6 +280,7 @@ def _work_plan_user_prompt(
         '  "summary": string,\n'
         '  "goal": string,\n'
         '  "success_criteria": [string],\n'
+        '  "new_files": [{"path": workspace_relative_path, "reason": string}],\n'
         '  "items": [\n'
         "    {\n"
         '      "id": "W1",\n'
@@ -382,8 +309,10 @@ def _work_plan_user_prompt(
         "- If a useful change requires definition, caller, and configuration files to change together before it can pass the benchmark, put those tightly coupled files in the same item.\n"
         "- Do not split producer/caller/config edits into separate dependent items unless each item is independently runnable and useful after validation.\n"
         "- Use `task.md` as requirements, not as a patch. This work plan is the execution plan.\n"
-        "- Use only workspace-relative paths from the supplied index in `target_files` and "
-        "`read_only_evidence`.\n"
+        "- Use indexed paths or explicitly declared `new_files` in `target_files`. Preserve required "
+        "new files from the run context; declare any additional new paths in `new_files`.\n"
+        "- New paths are creation targets, not observed source. Use only indexed paths in "
+        "`read_only_evidence` and context-request files.\n"
         "- Inventory `read_only_files` are evidence only. Never put them in `target_files`.\n"
         "- Prefer `budget_profile` = `normal`: a small cohesive change within the supplied file and character limits; use compact old/new edits.\n"
         "- Use `large` only when a single function or closely coupled change genuinely needs it.\n"
@@ -450,7 +379,7 @@ def _offline_work_plan(
             {
                 "id": "W1",
                 "objective": "Inspect the primary editable files and implement the smallest behavior change that satisfies the task.",
-                "target_files": editable[:3],
+                "target_files": list(dict.fromkeys([*run_context.get("new_files", []), *editable[:3]])),
                 "read_only_evidence": evidence[:3],
                 "depends_on": [],
                 "validation": validation,
@@ -499,12 +428,19 @@ def _normalize_work_plan_data(
     protected_patterns: tuple[str, ...],
 ) -> dict[str, Any]:
     known_paths = {str(item.get("path", "")) for item in _index_files(index) if item.get("path")}
+    new_files = list(dict.fromkeys([
+        *_creation_paths({}, planned=run_context.get("new_files")),
+        *_creation_paths({}, planned=data.get("new_files")),
+    ]))
+    new_files = [path for path in new_files if is_edit_allowed_path(
+        path, allowed_patterns=allowed_patterns, protected_patterns=protected_patterns)]
     items = _normalize_work_items(
         data.get("items"),
         known_paths,
         selected_files=selected_files,
         allowed_patterns=allowed_patterns,
         protected_patterns=protected_patterns,
+        new_files=new_files,
     )
     if not items:
         fallback = _offline_work_plan(
@@ -512,7 +448,7 @@ def _normalize_work_plan_data(
             index=index,
             selected_files=selected_files,
             benchmark_command=benchmark_command or _benchmark_from_context(run_context),
-            run_context=run_context,
+            run_context={**run_context, "new_files": new_files},
             allowed_patterns=allowed_patterns,
             protected_patterns=protected_patterns,
         )
@@ -522,6 +458,7 @@ def _normalize_work_plan_data(
             selected_files=selected_files,
             allowed_patterns=allowed_patterns,
             protected_patterns=protected_patterns,
+            new_files=new_files,
         )
 
     approval = _object_dict(data.get("approval"))
@@ -555,7 +492,44 @@ def _normalize_work_plan_data(
         ]
     if not result["risks"]:
         result["risks"] = ["Incomplete context can lead to incomplete edits; request more context when needed."]
+    if new_files:
+        result["new_files"] = new_files
     return result
+
+
+def _creation_paths(manifest: dict[str, Any], *, planned: object = None,
+                    run_dir: Path | None = None) -> list[str]:
+    """Read frozen/explicit plan targets without inventing indexed source rows."""
+    owner = _object_dict(_object_dict(manifest.get("code_task")).get("native_binding"))
+    contract = _object_dict(_object_dict(owner.get("binding")).get("contract"))
+    frozen = contract.get("new_files")
+    rows = [*(frozen if isinstance(frozen, list) else []), *(planned if isinstance(planned, list) else [])]
+    if run_dir is not None:
+        paths = code_task_paths(run_dir)
+        plan = _object_dict(manifest.get("plan"))
+        if plan.get("status") == "approved":
+            ref = plan.get("patch_plan", "code_task/patch_plan.md")
+            if ref == "code_task/patch_plan.json" and (paths.task_dir / "patch_plan.json").is_file():
+                declared = _object_dict(read_json(paths.task_dir / "patch_plan.json")).get("new_files")
+                rows.extend(declared if isinstance(declared, list) else [])
+            elif ref == "code_task/patch_plan.md" and (paths.task_dir / "patch_plan.md").is_file():
+                sections = re.findall(r"(?ms)^## New Files[ \t]*\r?$\n(.*?)(?=^## |\Z)",
+                                      read_text(paths.task_dir / "patch_plan.md"))
+                if sections:
+                    rows.extend(re.findall(r"(?m)^- `([^`\r\n]+)`:", sections[-1]))
+        work_plan = _object_dict(manifest.get("work_plan"))
+        if (_object_dict(work_plan.get("approval")).get("status") in {"approved", "not_required"}
+                and (paths.task_dir / "work_plan.json").is_file()):
+            declared = _object_dict(read_json(paths.task_dir / "work_plan.json")).get("new_files")
+            rows.extend(declared if isinstance(declared, list) else [])
+    paths = []
+    for row in rows:
+        path = row.get("path") if isinstance(row, dict) else row
+        if (isinstance(path, str) and safe_relative_path(path) == path and path
+                and not any(char in path for char in ':*?[]\\\x00')
+                and path.casefold() not in {name.casefold() for name in paths}):
+            paths.append(path)
+    return paths
 
 
 def _normalize_work_items(
@@ -565,6 +539,7 @@ def _normalize_work_items(
     selected_files: list[str],
     allowed_patterns: tuple[str, ...],
     protected_patterns: tuple[str, ...],
+    new_files: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     raw_items = value if isinstance(value, list) else []
     items: list[dict[str, Any]] = []
@@ -573,7 +548,7 @@ def _normalize_work_items(
             continue
         target_files = _known_paths(
             raw.get("target_files"),
-            known_paths,
+            known_paths | set(new_files or ()),
             allowed_patterns=allowed_patterns,
             protected_patterns=protected_patterns,
             editable_only=True,
@@ -817,18 +792,6 @@ def _benchmark_from_context(run_context: dict[str, Any]) -> str:
     return command.strip() if isinstance(command, str) else ""
 
 
-def _manifest_run_context(run_context: dict[str, Any]) -> dict[str, Any]:
-    baseline = _object_dict(run_context.get("baseline"))
-    environment = _object_dict(run_context.get("environment"))
-    return {
-        "available_artifacts": run_context.get("available_artifacts", []),
-        "environment_status": environment.get("status"),
-        "environment_mode": environment.get("mode"),
-        "baseline_status": baseline.get("status"),
-        "baseline_metrics": baseline.get("metrics", {}),
-    }
-
-
 def _offline_risk(run_context: dict[str, Any]) -> str:
     baseline = _object_dict(run_context.get("baseline"))
     if baseline.get("status") and baseline.get("status") != "passed":
@@ -865,63 +828,5 @@ def _budget_profiles() -> dict[str, dict[str, Any]]:
     return profiles
 
 
-def _index_files(index: dict[str, Any]) -> list[dict[str, Any]]:
-    files = index.get("files")
-    if not isinstance(files, list):
-        return []
-    return [item for item in files if isinstance(item, dict)]
-
-
-def _read_required_text(path: Path) -> str:
-    if not path.exists():
-        raise FileNotFoundError(f"Missing required code-task artifact: {path}")
-    return read_text(path)
-
-
-def _read_required_json(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        raise FileNotFoundError(f"Missing required code-task artifact: {path}")
-    data = read_json(path)
-    if not isinstance(data, dict):
-        raise RuntimeError(f"Expected JSON object in {path}")
-    return data
-
-
 def _inline_paths(paths: list[str]) -> str:
     return ", ".join(f"`{path}`" for path in paths)
-
-
-def _object_list(value: object) -> list[dict[str, Any]]:
-    if not isinstance(value, list):
-        return []
-    return [item for item in value if isinstance(item, dict)]
-
-
-def _object_dict(value: object) -> dict[str, Any]:
-    return value if isinstance(value, dict) else {}
-
-
-def _string(value: object) -> str:
-    return value.strip() if isinstance(value, str) else ""
-
-
-def _string_list(value: object) -> list[str]:
-    if not isinstance(value, list):
-        return []
-    return [_string(item) for item in value if _string(item)]
-
-
-def _bullet_list(items: list[str]) -> str:
-    return "\n".join(f"- {item}" for item in items)
-
-
-def _first_sentence(text: str) -> str:
-    normalized = " ".join(text.strip().split())
-    if not normalized:
-        return ""
-    return re.split(r"(?<=[.!?])\s+", normalized, maxsplit=1)[0]
-
-
-def _emit(callback: MessageCallback | None, message: str) -> None:
-    if callback is not None:
-        callback(message)

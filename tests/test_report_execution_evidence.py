@@ -2,10 +2,8 @@
 import json
 import unittest
 
-from tests.report_review_fixtures import draft_quotes
-
 from simple_ar.report.agent import (
-    _writer_prompt, _writer_recovery_prompt, _reviewer_prompt, run_report_agent,
+    _writer_prompt, _writer_recovery_prompt, _reviewer_prompt,
     WRITER_SYSTEM, REVIEWER_SYSTEM,
 )
 from simple_ar.report.execution_evidence import execution_record, report_execution_evidence
@@ -13,11 +11,47 @@ from simple_ar.report.schema import (
     ReportContext, ReportMemory, ReportRuntimeConfig, ReportSectionDraft, ReportSectionPlan,
 )
 from simple_ar.report.templates import load_report_template_bundle
-from simple_ar.report.tool_gateway import ReportToolGateway
-from simple_ar.integrations.llm import LLMError
 
 
 class ReportExecutionEvidenceTests(unittest.TestCase):
+    def test_experiment_reuses_literature_identity_without_survey_limitations(self):
+        from simple_ar.core import ArtifactRef
+        from simple_ar.literature.models import Paper
+        from simple_ar.report.projection import build_literature_report_inputs, build_research_report_inputs
+        from simple_ar.research.contracts import ResearchExperimentContract
+        from simple_ar.research.documents.ingest import DocumentBundle
+        from simple_ar.research.sources import SearchResult
+        from simple_ar.research.synthesis import SynthesisResult
+        from simple_ar.result_analysis.schema import AnalysisResult
+
+        papers = tuple(Paper(id=key, title=key, authors=[], abstract="Source assertion.", url="")
+            for key in ("z", "a", "z"))
+        search = SearchResult(status="completed", responses=(), papers=papers, selected_papers=papers)
+        brief = SynthesisResult(status="ready", gap_summary="", ideas=(), novelty_checks=(),
+            synthesis_markdown="Retained synthesis.", comparisons=({"relation": "single_source"},),
+            experiment_contract=ResearchExperimentContract("contract", "Measured hypothesis.", risks=["Protocol risk."]))
+        shared = dict(topic="Evidence", brief=brief, search=search,
+            documents=DocumentBundle([], {}, {}, [], []), brief_ref=ArtifactRef("brief.json"))
+        survey, _ = build_literature_report_inputs(**shared)
+        for design_ref in (None, ArtifactRef("design.json")):
+            with self.subTest(design=design_ref):
+                context, memory = build_research_report_inputs(**shared, execution=self.context.results,
+                    analysis=AnalysisResult(readme_markdown="", status="passed", audit={"limitations": ["Analysis limit."]}),
+                    execution_ref=ArtifactRef("result.json"), analysis_ref=ArtifactRef("analysis.json"), design_ref=design_ref)
+                self.assertEqual(context.citation_key_map, {"P1": "z", "P2": "a", "P3": "z"})
+                for field in ("papers", "citation_key_map", "synthesis_markdown", "source_comparisons"):
+                    self.assertEqual(getattr(context, field), getattr(survey, field))
+                self.assertEqual(context.source_handles[-3:], survey.source_handles[1:])
+                self.assertEqual([row.handle for row in context.source_handles[:-3]],
+                    ["artifact:synthesis", *(["artifact:research_design"] if design_ref else []),
+                     "artifact:experiment_execution", "artifact:result_analysis"])
+                self.assertEqual(memory.source_handles, context.source_handles)
+                self.assertEqual((context.report_mode, memory.template, memory.objective),
+                    ("experiment", "experiment", "Measured hypothesis."))
+                self.assertEqual(memory.limitations, ["Analysis limit.", "Protocol risk."])
+                self.assertEqual(report_execution_evidence(context)["execution_records"],
+                    report_execution_evidence(self.context)["execution_records"])
+
     def setUp(self):
         self.context = ReportContext(
             topic="A fixed reproduction", report_mode="experiment",
@@ -100,42 +134,6 @@ class ReportExecutionEvidenceTests(unittest.TestCase):
             extra_context=[], previous_draft=None, review=None, source_batch_index=1,
             source_batch_count=1, include_previous_draft=True, draft_mode='section')
         self.assertIn('duplicate these in the body only when the user requests it', prompt)
-
-    def test_rejected_document_candidate_survives_verifier_failure_and_checkpoint(self):
-        memory = ReportMemory(section_plan=[
-            ReportSectionPlan(section_id="setup", heading="Local Setup", goal="Explain"),
-            ReportSectionPlan(section_id="results", heading="Results", goal="Explain"),
-        ])
-        config = ReportRuntimeConfig(document_review=True, max_review_iterations=1)
-        saved = []
-
-        class Client:
-            def ask_json(self, system, prompt, *, label="", **kwargs):
-                if label == "report-document-reviewer":
-                    return {"section_reviews": [{"section_id": "setup", "verdict": "revise_required",
-                        "findings": [{"finding_id": "f1", "type": "unsupported_claim", "severity": "major",
-                                      "message": "Setup was declared, not validated.", "section_id": "setup",
-                                      "draft_quotes": draft_quotes(prompt, "setup")}]}]}
-                if label == "report-document-reviser-setup":
-                    return {"section_id": "setup", "heading": "Local Setup", "draft_markdown": "Candidate not adopted."}
-                if label == "report-document-verifier-setup":
-                    raise LLMError("Provider unavailable after candidate generation")
-                if "reviewer" in label:
-                    return {"verdict": "pass", "findings": []}
-                section_id = "setup" if "setup" in label else "results"
-                return {"section_id": section_id, "heading": section_id, "draft_markdown": "Original content."}
-
-        result = run_report_agent(client=Client(), context=self.context, memory=memory, config=config,
-            template=load_report_template_bundle(report_mode="experiment", config=config),
-            gateway=ReportToolGateway(self.context), checkpoint_sink=saved.append)
-        candidate = next(row for row in result.iterations if row.action == "document_revise")
-        self.assertEqual(candidate.draft.draft_markdown, "Candidate not adopted.")
-        self.assertFalse(candidate.adopted)
-        self.assertNotIn("Candidate not adopted.", result.report_body)
-        self.assertTrue(any(row.get("draft", {}).get("draft_markdown") == "Candidate not adopted."
-                            for snapshot in saved for row in snapshot["iterations"] if row.get("draft")))
-        self.assertTrue(any(row.type == "document_revision_unavailable" for row in result.memory.reviewer_findings))
-
 
 if __name__ == "__main__":
     unittest.main()

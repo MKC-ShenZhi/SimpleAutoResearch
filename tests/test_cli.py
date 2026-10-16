@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import sqlite3
 import sys
@@ -25,6 +26,109 @@ TEST_ROOT = Path(__file__).resolve().parents[1] / ".tmp_tests"
 
 
 class CliTests(unittest.TestCase):
+    def test_fixed_measurement_creation_uses_common_approval_and_original_execution(self):
+        from simple_ar.app.tool_application import ToolApplication
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            project = root / 'original project'
+            project.mkdir()
+            data = project / 'observations input.tsv'
+            data.write_text('value\n2\n4\n6\n', encoding='utf-8')
+            script = project / 'measure.py'
+            script.write_text("import os,sys,json\nfrom pathlib import Path\n"
+                "values=[float(x) for x in Path(sys.argv[1]).read_text().splitlines()[1:]]\n"
+                "Path('observed.json').write_text(json.dumps({'cwd':os.getcwd(),"
+                "'argument':sys.argv[1], 'environment':os.environ.get('SAR_MEASUREMENT_TEST_POLICY')}))\n"
+                "print('score: ' + str(sum(values)/len(values)))\n", encoding='utf-8')
+            original = script.read_bytes()
+            command = [sys.executable, 'measure.py', 'observations input.tsv']
+            with patch('simple_ar.cli.main.sys.stdin.isatty', return_value=False), \
+                    patch('simple_ar.app.tool_application.LLMClient.from_env', side_effect=AssertionError('No model')), \
+                    patch('simple_ar.app.research_application.create_session', side_effect=AssertionError('No old new-task controller')), \
+                    patch.dict(os.environ, {'SAR_MEASUREMENT_TEST_POLICY': 'inherited-value'}), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                main(['research-session', '--topic', 'Measure the declared observations',
+                    '--task-kind', 'measurement', '--outputs', 'experiments', '--cwd', str(project),
+                    '--timeout-sec', '8', '--primary-metric', 'score', '--output-root', str(root / 'runs'),
+                    '--command', *command])
+                manifests = list((root / 'runs').rglob('session_manifest.json'))
+                self.assertEqual(len(manifests), 1)
+                app = ToolApplication.load(manifests[0].parent)
+                self.assertIsNone(app.state['config']['model'])
+                self.assertEqual(app.state['config']['execution_contract']['command'], command)
+                self.assertIsNone(app.state['pending'])
+                self.assertEqual(app.session.manifest.status, 'completed', app.session.manifest.status_reason)
+                observed = read_json(project / 'observed.json')
+                self.assertEqual(observed, {'cwd': str(project), 'argument': 'observations input.tsv',
+                    'environment': 'inherited-value'})
+                self.assertEqual(script.read_bytes(), original)
+                self.assertEqual(len(app.ledger.entries), 1)
+                self.assertEqual(len(app.session.list_attempts()), 1)
+                payload = app.session.store.read_json(app.state['turns'][0]['tools'][0]['result'])
+                self.assertEqual(payload['data']['metrics']['score'], 4)
+                self.assertTrue(any(path.endswith('/analysis.md') for path in
+                    app.session.store.read_json('delivery.json')['artifacts']))
+                with patch('simple_ar.experiment.execution.backend.run_process') as process:
+                    ToolApplication.load(app.session.store.root).run(progress=lambda _: None)
+                    process.assert_not_called()
+
+    def test_condition_set_config_routes_declarations_without_running_the_matrix(self):
+        from simple_ar.cli.start import _inline_value
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            command = [sys.executable, 'measure.py']
+            protocol = {'contract_id': 'cli-fixed-observations',
+                'dataset_refs': [{'asset_id': 'observations'}], 'split_spec': {'name': 'all_rows'},
+                'metric_specs': [{'name': 'score', 'unit': 'value'}]}
+            declarations = (
+                ('auto', {'command': command, 'seeds': [3, 9], 'seed_flag': '--seed'}, 4),
+                ('measurement', {'command': command,
+                    'protocol': {**protocol, 'comparison_conditions': {'seeds': [3, 9]}}}, 2),
+                ('measurement', {'pairs': [{'seed': 3, 'baseline_command': command,
+                    'candidate_command': command}]}, 2),
+            )
+            for index, (kind, declaration, count) in enumerate(declarations):
+                model = 'fixture' if index == 1 else ''
+                execution = {'cwd': str(root), 'timeout_sec': 8, 'primary_metric': 'score',
+                    'baseline_policy': 'run', 'protocol': protocol, **declaration}
+                config = root / f'conditions-{index}.toml'
+                config.write_text('[task]\nkind=' + json.dumps(kind)
+                    + '\ngoal="Compare literal conditions"\noutputs=' + ('["experiments","report"]' if model else '["experiments"]')
+                    + ('\n[research]\ninteraction="autonomous"' if kind == 'auto' else '')
+                    + '\n[model]\nname=' + json.dumps(model) + '\n'
+                    + ('max_output_tokens=1000\n' if model else '')
+                    + '[budget]\nllm_requests=4\ntotal_tokens=48000\n'
+                    + 'process_invocations=4\nprocess_wall_seconds=32\n'
+                    + '[execution]\n' + ''.join(f'{key}={_inline_value(value)}\n'
+                        for key, value in execution.items()), encoding='utf-8')
+                app = MagicMock()
+                app.run.return_value = {'status': 'completed'}
+                app.measurement_completion_actions.return_value = []
+                with self.subTest(declaration=declaration), \
+                        patch('simple_ar.cli.main._optional_research_llm_client', return_value=object()), \
+                        patch('simple_ar.app.tool_application.ToolApplication.create', return_value=app) as create, \
+                        patch('simple_ar.cli.main._render_native_result'), \
+                        patch('simple_ar.app.research_application.create_session') as legacy, \
+                        patch('subprocess.run') as process, contextlib.redirect_stdout(io.StringIO()):
+                    main(['research-session', '--config', str(config)])
+                create.assert_called_once()
+                legacy.assert_not_called()
+                process.assert_not_called()
+                routed = create.call_args.kwargs
+                rows = routed['execution_contract']['conditions']
+                self.assertEqual(len(rows), count)
+                self.assertEqual([row['role'] for row in rows], ['baseline', 'candidate'] * (count // 2))
+                self.assertEqual(rows[0]['execution']['command'], command + (['--seed', '3'] if index == 0 else []))
+                self.assertEqual(routed['process_limits'], {'process_invocations': 4, 'process_wall_seconds': 32})
+                self.assertEqual(routed['model'], model or None)
+                self.assertEqual((routed['max_turns'], routed['max_tokens'], routed['max_output_tokens']),
+                    (4, 48000, 1000) if model else (0, 0, None))
+                self.assertEqual(routed['report_requirement']['method'] if model else routed['report_requirement'],
+                    'article' if model else None)
+                app.run.assert_called_once()
+                self.assertNotIn('approved_execution', app.run.call_args.kwargs)
+
     def test_models_discovers_local_env_and_preserves_process_credentials(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -186,64 +290,142 @@ code = "daily"
         app.services.config["research_task_kind"] = "survey"
         self.assertEqual(_report_config_overrides(args, app), {"template": "survey"})
 
-    def test_writing_cli_preserves_explicit_paper_template_and_material_role(self):
+    @contextlib.contextmanager
+    def _structured_creation(self):
+        # Observe the public intake boundary, never simulate legacy creation.
+        with patch("simple_ar.cli.start.migrate_structured_creation") as migrate, \
+                patch("simple_ar.cli.main._optional_research_llm_client",
+                      side_effect=lambda model, *a, **k: object() if model else None), \
+                patch("simple_ar.app.research_application.create_session",
+                      side_effect=AssertionError("New tasks must use ToolApplication")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            yield migrate
+
+    def test_structured_new_routes_outputs_roles_and_table_contract(self):
         with tempfile.TemporaryDirectory() as tmp:
-            material = Path(tmp) / "external notes.md"
-            material.write_text("User notes", encoding="utf-8")
-            app = MagicMock()
-            view = SimpleNamespace(session_root=Path(tmp) / "session", status="completed", status_reason="",
-                                   next_action=None, state_refs={}, attempts=())
-            app.view.return_value = view
-            app.advance.return_value = view
-            app.services = SimpleNamespace(max_attempts=1)
-            stream = io.StringIO()
-            with patch("simple_ar.cli.main._optional_research_llm_client", return_value=object()), \
-                 patch("simple_ar.app.research_application.create_session", return_value=app) as creator, \
-                 contextlib.redirect_stdout(stream):
-                main(["research-session", "--topic", "Write honestly", "--task-kind", "writing",
-                      "--material", str(material), "--report-template", "experiment", "--output-root", str(Path(tmp) / "sessions")])
-            brief = creator.call_args.args[0]
-            services = creator.call_args.kwargs["services"]
-            self.assertEqual(brief.requested_outputs, ("report",))
-            self.assertEqual(brief.asset_requests[0]["role"], "material")
-            self.assertEqual(services.config["report"]["template"], "experiment")
-            self.assertEqual(services.config["report_writing_method"], "article")
-            self.assertEqual(services.config["report"]["reviewer"], "disabled")
-            self.assertFalse(services.config["report"]["document_review"])
-            self.assertNotIn("execution", services.config)
-            self.assertIn("Implementation: not requested (supplied-material writing)", stream.getvalue())
-            from simple_ar.cli.research_config import report_writing_method
-            selected = SimpleNamespace(_explicit_resume_destinations={"report_reviewer"},
-                                       report_reviewer="llm", report_writing_method=None)
-            self.assertEqual(report_writing_method(selected, {"reviewer": "llm"})[0], "sections")
-            selected.report_writing_method = "article"
-            with self.assertRaisesRegex(ValueError, "does not execute"):
-                report_writing_method(selected, {"reviewer": "llm"})
-            selected.command = "research-report"
-            selected._explicit_resume_destinations = {"reviewer"}
-            with self.assertRaisesRegex(ValueError, "does not execute"):
-                report_writing_method(selected, {"reviewer": "llm"})
-            article_app = SimpleNamespace(services=SimpleNamespace(config={
-                "report_writing_method": "article", "report": {"reviewer": "disabled"}}))
-            selected.reviewer = "llm"
-            from simple_ar.cli.main import _report_config_overrides
-            from simple_ar.app.research_application import ResearchApplicationError
-            with self.assertRaises(ResearchApplicationError):
-                _report_config_overrides(selected, article_app)
-            bundle = Path(tmp) / "sources.json"
+            root = Path(tmp)
+            paper, notes, table = [root / name for name in ("paper.md", "notes.md", "values.csv")]
+            paper.write_text("# Evidence\nReported observations.", encoding="utf-8")
+            notes.write_text("User interpretation.", encoding="utf-8")
+            table.write_text("group,value\na,2\na,4\n", encoding="utf-8")
+            cases = (
+                (["--no-report"], ("summary",), "paper", None),
+                (["--model", "fixture"], ("report",), "paper", None),
+                (["--task-kind", "survey", "--outputs", "summary", "--model", "fixture"],
+                 ("summary",), "paper", None),
+                (["--task-kind", "writing", "--material", str(notes), "--model", "fixture",
+                  "--report-template", "experiment"], ("report",), "material", None),
+                (["--task-kind", "data_analysis", "--data-file", str(table),
+                  "--value-column", "value", "--group-column", "group", "--observation-unit", "record"],
+                 ("data_analysis",), "dataset", "value"),
+                (["--task-kind", "data_analysis", "--data-file", str(table),
+                  "--value-column", "value", "--observation-unit", "record", "--outputs", "data_analysis", "report",
+                  "--model", "fixture"], ("data_analysis", "report"), "dataset", "value"),
+            )
+            for flags, outputs, role, column in cases:
+                documents = [] if role == "dataset" and "report" not in outputs else [
+                    "--local-document", str(paper)]
+                with self.subTest(flags=flags), self._structured_creation() as migrate:
+                    main(["research-session", "--topic", "Use declared evidence",
+                          "--output-root", str(root / "runs"), *documents, *flags])
+                migrate.assert_called_once()
+                args = migrate.call_args.args[0]
+                routed = migrate.call_args.kwargs
+                self.assertIsNone(args.command_argv)
+                self.assertEqual(routed["request"], "Use declared evidence")
+                self.assertEqual(tuple(routed["outputs"]), outputs)
+                self.assertEqual(routed["root"].parent, root / "runs")
+                self.assertNotIn("execution", routed["research_config"])
+                self.assertEqual({k: routed["limits"][k] for k in (
+                    "process_invocations", "process_wall_seconds")},
+                    {"process_invocations": 0, "process_wall_seconds": 0})
+                source = next(row for row in routed["sources"] if row["role"] == role)
+                self.assertEqual(source["mutability"], "read_only")
+                self.assertEqual(source["allowed_uses"], ["read"] if role == "dataset" else ["read", "reference"])
+                if column:
+                    self.assertEqual(routed["data_analysis"]["file"], str(table.resolve()))
+                    self.assertEqual(list(routed["data_analysis"]["value_columns"]), [column])
+                else:
+                    self.assertIsNone(routed["data_analysis"])
+                if role == "material":
+                    self.assertEqual(source["locator"], str(notes))
+                    self.assertEqual(routed["report_config"]["template"], "experiment")
+                if "report" in outputs:
+                    self.assertEqual(routed["writing_method"], "article")
+                    self.assertEqual(routed["report_config"]["reviewer"], "disabled")
+                    self.assertFalse(routed["report_config"]["document_review"])
+                    self.assertEqual(routed["report_config"]["mode"], "research_only")
+                    if role != "material":
+                        self.assertEqual(routed["report_config"]["template"], "auto")
+
+    def test_structured_deterministic_delivery_is_native_and_resume_does_not_replay(self):
+        from simple_ar.app.tool_application import ToolApplication
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paper, table = root / "paper.md", root / "values.csv"
+            paper.write_text("# Method\nValidation supports reliability.\n", encoding="utf-8")
+            table.write_text("value\n2\n4\n6\n", encoding="utf-8")
+            config = root / "local.toml"
+            config.write_text("[research]\nmaterials_only=true\n", encoding="utf-8")
+            for flags, contract in (
+                (["research-brief", "--config", str(config), "--provider", "local_files",
+                  "--local-document", str(paper)], "research_policy"),
+                (["research-session", "--task-kind", "data_analysis", "--data-file", str(table),
+                  "--value-column", "value", "--observation-unit", "record"], "table_analysis"),
+            ):
+                output = root / contract
+                with self.subTest(contract=contract), \
+                        patch("simple_ar.app.tool_application.LLMClient.from_env",
+                              side_effect=AssertionError("Deterministic work needs no model")), \
+                        patch("simple_ar.app.research_application.create_session",
+                              side_effect=AssertionError("No legacy creation")), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    main([*flags, "--topic", "Describe supplied evidence", "--output-root", str(output)])
+                    manifest, = output.rglob("session_manifest.json")
+                    app = ToolApplication.load(manifest.parent)
+                    self.assertEqual(app.session.manifest.transition_recipe, ToolApplication.RECIPE)
+                    self.assertEqual(app.session.manifest.status, "completed")
+                    self.assertIsNotNone(app.state["config"][contract])
+                    self.assertIsNone(app.state["config"]["model"])
+                    self.assertFalse(app.state["config"]["allow_execution"])
+                    delivery = app.session.store.read_json("delivery.json")
+                    self.assertTrue(delivery["artifacts"])
+                    before = (app.ledger.to_dict(), app.state["turns"])
+                    with patch("simple_ar.tools.sources.SourceToolGateway.call") as sources, \
+                            patch("simple_ar.tools.analysis.AnalysisToolGateway.call") as analysis:
+                        main(["start", "--resume-task", str(manifest.parent)])
+                    sources.assert_not_called()
+                    analysis.assert_not_called()
+                    restored = ToolApplication.load(manifest.parent)
+                    self.assertEqual((restored.ledger.to_dict(), restored.state["turns"]), before)
+                    if contract == 'table_analysis':
+                        with patch('simple_ar.tools.analysis.AnalysisToolGateway.call',
+                                   side_effect=AssertionError('Text feedback must not recalculate')):
+                            restored.run(feedback='Retain the calculation; deliver the existing package', progress=lambda _: None)
+                            status = restored.run(actions=[{'tool_name': 'deliver_result', 'arguments': {
+                                'summary': 'Existing calculation retained', 'artifacts': delivery['artifacts']}}], progress=lambda _: None)
+                        self.assertEqual(status['status'], 'completed')
+                        self.assertEqual(restored.ledger.to_dict(), before[0])
+
+    def test_survey_retained_sources_keep_material_role_and_reject_plain_notes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundle, notes = root / "sources.json", root / "notes.md"
+            notes.write_text("User notes", encoding="utf-8")
             write_json(bundle, {"schema_version": "document_bundle.v1", "documents": [{
                 "document_id": "source", "source": "arxiv", "source_id": "1234.5678",
                 "title": "Original source", "kind": "paper", "evidence_role": "original_source"}],
                 "sections": [], "chunks": []})
-            with patch("simple_ar.cli.main._optional_research_llm_client", return_value=object()), \
-                 patch("simple_ar.app.research_application.create_session", return_value=app) as creator, \
-                 contextlib.redirect_stdout(io.StringIO()):
-                main(["research-session", "--topic", "Investigate a new question", "--task-kind", "survey",
-                      "--material", str(bundle), "--output-root", str(Path(tmp) / "survey")])
-            self.assertEqual(creator.call_args.args[0].asset_requests[0]["role"], "material")
-            with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(SystemExit, "original-source"):
-                main(["research-session", "--topic", "Do not treat notes as sources", "--task-kind", "survey",
-                      "--material", str(material)])
+            with self._structured_creation() as migrate:
+                main(["research-session", "--topic", "Investigate evidence", "--task-kind", "survey",
+                      "--material", str(bundle), "--model", "fixture", "--output-root", str(root / "runs")])
+                self.assertEqual(migrate.call_args.kwargs["sources"][0]["role"], "material")
+                migrate.reset_mock()
+                with self.assertRaisesRegex(SystemExit, "original-source"):
+                    main(["research-session", "--topic", "Investigate evidence", "--task-kind", "survey",
+                          "--material", str(notes)])
+                migrate.assert_not_called()
 
     def test_code_task_init_same_second_reuses_unique_directory_owner(self):
         from datetime import datetime
@@ -292,19 +474,49 @@ code = "daily"
             self.assertEqual(_artifact_rows(view), [])
             self.assertIsNone(method_validation_line(view))
 
-    def test_feasibility_review_model_is_session_config_not_global_env(self):
+    def test_structured_design_and_source_controls_preserve_merged_configuration(self):
+        from simple_ar.cli.start import _inline_value
         from simple_ar.cli.research_config import research_defaults
 
-        TEST_ROOT.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as directory:
-            path = Path(directory) / "research.toml"
-            path.write_text('[task]\ngoal = "Review a method"\n[model]\nname = "author"\n'
-                            'feasibility_review_model = "reviewer"\n', encoding="utf-8")
-            defaults = research_defaults(["research-session", "--config", str(path)])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "research.toml"
+            research = {"interaction": "assisted", "queries": ["declared query"],
+                "providers": ["local_files"], "materials_only": True, "use_fulltext": False,
+                "allow_pdf_download": False, "keep_raw_pdf": False, "web_extract_backend": "direct",
+                "max_results": 2, "max_chunks": 20, "idea_limit": 1, "max_iterations": 3,
+                "read_max_shortlist": 4, "max_pdf_pages": 5, "max_fulltext_documents": 6,
+                "max_pdf_mb": 7, "cache_dir": str(root / "cache")}
+            config.write_text('[task]\ngoal="Review a method"\noutputs=["experiments"]\n'
+                'selected_idea_id="candidate-2"\n[model]\nname="author"\n'
+                'feasibility_review_model="reviewer"\nmax_output_tokens=321\n'
+                '[budget]\nllm_requests=4\ntotal_tokens=12345\n'
+                'process_invocations=0\nprocess_wall_seconds=0\n[research]\n'
+                + "".join(f"{key}={_inline_value(value)}\n" for key, value in research.items()),
+                encoding="utf-8")
+            defaults = research_defaults(["research-session", "--config", str(config)])
             self.assertEqual(defaults["feasibility_review_model"], "reviewer")
-            args = build_parser(research_defaults=defaults).parse_args(
-                ["research-session", "--config", str(path)])
-            self.assertEqual(args.feasibility_review_model, "reviewer")
+            with self._structured_creation() as migrate:
+                main(["research-session", "--config", str(config), "--output-root", str(root / "runs"),
+                      "--max-results", "9"])
+            args, = migrate.call_args.args
+            routed = migrate.call_args.kwargs
+            self.assertEqual((args.model, args.max_output_tokens, args.max_results, args.max_chunks,
+                              args.idea_limit), ("author", 321, 9, 20, 1))
+            self.assertEqual(routed["review_model"], "reviewer")
+            self.assertEqual(tuple(routed["outputs"]), ("experiments",))
+            saved = routed["research_config"]
+            for key, value in {"interaction": "assisted", "research_selected_idea_id": "candidate-2",
+                    "research_queries": ["declared query"], "research_sources": ["local_files"],
+                    "research_max_documents": 9, "research_max_iterations": 3,
+                    "research_read_max_shortlist": 4, "research_max_pdf_pages": 5,
+                    "research_max_fulltext_documents": 6, "research_max_pdf_mb": 7,
+                    "research_materials_only": True, "research_use_fulltext": False,
+                    "research_allow_pdf_download": False, "research_keep_raw_pdf": False,
+                    "research_web_extract_backend": "direct"}.items():
+                self.assertEqual(saved[key], value, key)
+            self.assertEqual(routed["limits"], {"llm_requests": 4, "total_tokens": 12345,
+                "process_invocations": 0, "process_wall_seconds": 0})
 
     def test_rich_completion_uses_measured_implementation_not_stale_initial_patch(self):
         from simple_ar.cli.research_view import ResearchConsole, method_validation_line
@@ -450,7 +662,7 @@ code = "daily"
     def test_delivery_revision_uses_the_pending_reply_not_request_report(self):
         from dataclasses import replace
         from simple_ar.app.research_application import (
-            ResearchApplicationError, ResearchApplicationServices, create_session, load_session,
+            ResearchApplicationServices, create_session, load_session,
         )
         from simple_ar.research.workflow_contracts import ResearchBrief
 
@@ -517,29 +729,6 @@ code = "daily"
                            "--decision-id", decision_id, "--decision-response", "revise",
                            "--report-template", "analysis_report"]
 
-            with (
-                patch("simple_ar.cli.main._optional_research_llm_client", return_value=None),
-                patch("simple_ar.app.research_application.load_session", return_value=app),
-                patch.object(app.controller, "continue_with_revision", side_effect=RuntimeError("interrupted after reply")),
-                contextlib.redirect_stdout(io.StringIO()),
-            ):
-                with self.assertRaisesRegex(SystemExit, "interrupted after reply"):
-                    main(argv)
-
-            response = app.controller.store.read_json(
-                f"outputs/research-decision-{decision_id}-response.json",
-            )
-            self.assertEqual(response["interaction"]["response"]["revision"], {
-                "report": {"template": "analysis_report"},
-            })
-            self.assertEqual(app.services.config["report"]["template"], "auto")
-            app = load_session(session)
-            with self.assertRaisesRegex(ResearchApplicationError, "different revision inputs"):
-                app.continue_session(
-                    decision_id=decision_id, decision_response="revise",
-                    revised_report_config={"template": "survey"},
-                )
-
             def stop_before_writer(**_kwargs):
                 return replace(app.view(), status="paused", next_action=None,
                                status_reason="Test stops before report writing.")
@@ -554,6 +743,12 @@ code = "daily"
                 with self.assertRaisesRegex(SystemExit, "status 'paused'"):
                     main(argv)
             request_report.assert_not_called()
+            response = app.controller.store.read_json(
+                f"outputs/research-decision-{decision_id}-response.json",
+            )
+            self.assertEqual(response["interaction"]["response"]["revision"], {
+                "report": {"template": "analysis_report"},
+            })
             self.assertEqual(response["prior_decision_ref"], proposal_ref.to_dict())
             self.assertEqual(app.services.config["report"]["template"], "analysis_report")
             self.assertEqual(app.services.config["interaction"], "autonomous")
@@ -612,13 +807,6 @@ code = "daily"
                           "--output-root", str(root / "runs")])
             self.assertEqual(list(root.iterdir()), [])
 
-    def test_research_session_parser_allows_literature_only_mode(self) -> None:
-        args = build_parser().parse_args(
-            ["research-session", "--topic", "reliable agents", "--no-report"]
-        )
-
-        self.assertIsNone(args.command_argv)
-        self.assertIsNone(args.code_task_config)
 
     def test_research_session_interrupted_recovery_requires_saved_session(self) -> None:
         args = build_parser(allow_resume_without_topic=True).parse_args([
@@ -628,42 +816,9 @@ code = "daily"
         with self.assertRaisesRegex(SystemExit, "requires --session-root"):
             main(["research-session", "--topic", "test", "--recover-interrupted"])
 
-    def test_research_session_cli_recovers_stopped_worker_and_resumes_saved_plan(self) -> None:
-        from simple_ar.app.research_application import (
-            ResearchApplicationServices, create_session, load_session,
-        )
-        from simple_ar.research.workflow_contracts import ResearchBrief
-
-        TEST_ROOT.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as tmp:
+    def test_historical_code_task_cli_routes_saved_execution_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            paper = root / "paper.md"
-            paper.write_text("# Evidence\nThis source contains a bounded claim.\n", encoding="utf-8")
-            session = root / "session"
-            app = create_session(ResearchBrief(
-                request_text="Summarize the supplied paper.",
-                objective="Summarize the supplied paper.",
-                requested_outputs=("summary",),
-                asset_requests=({"locator": str(paper), "role": "paper"},),
-            ), root=session, services=ResearchApplicationServices(
-                config={"research_materials_only": True},
-            ))
-
-            def interrupt(**_):
-                raise KeyboardInterrupt()
-
-            app.controller.registry.register("plan", interrupt, replace=True)
-            with self.assertRaises(KeyboardInterrupt):
-                app.advance()
-            with contextlib.redirect_stdout(io.StringIO()):
-                main(["research-session", "--session-root", str(session),
-                      "--recover-interrupted", "--no-report"])
-            resumed = load_session(session)
-            self.assertEqual(
-                sum(row["status"] == "failed" for row in resumed.view().attempts), 1,
-            )
-            self.assertIn("task_plan", resumed.view().state_refs)
-            self.assertEqual(resumed.view().budget["attempts"], len(resumed.view().attempts))
             # Historical CodeTask continues through its saved orchestrator,
             # including greenfield strategy; it is not converted to native.
             saved = root / "saved-code-task.toml"
@@ -708,110 +863,33 @@ code = "daily"
                      for path in session.rglob("*") if path.is_file()}
             self.assertEqual(after, before)
 
-    def test_research_session_cli_without_command_stays_literature_only(self) -> None:
-        TEST_ROOT.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as tmp:
+    def test_brief_alias_uses_structured_summary_and_keeps_compatibility_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            session_root = root / "sessions" / "research-session"
-            final_view = SimpleNamespace(
-                session_root=session_root,
-                status="completed",
-                status_reason="",
-                next_action=None,
-                state_refs={"summary": SimpleNamespace(path="outputs/research_summary.md")},
-                attempts=(),
-            )
-            app = MagicMock()
-            app.services = SimpleNamespace(max_attempts=5)
-            app.view.side_effect = [
-                SimpleNamespace(
-                    session_root=session_root, status="running", status_reason="",
-                    next_action="plan", state_refs={}, attempts=(),
-                ),
-                final_view,
-            ]
-            app.advance.return_value = final_view
-            stdout = io.StringIO()
-            with (
-                patch("simple_ar.cli.main._optional_research_llm_client", return_value=None),
-                patch("simple_ar.app.research_application.create_session", return_value=app) as creator,
-                contextlib.redirect_stdout(stdout),
-            ):
-                main([
-                    "research-session",
-                    "--topic", "reliable agents",
-                    "--output-root", str(root / "sessions"),
-                    "--no-report",
-                ])
+            paper = root / "source.md"
+            paper.write_text("# Method\nReliable agents use validation.\n", encoding="utf-8")
+            with self._structured_creation() as migrate:
+                main(["research-brief", "--topic", "reliable agents", "--local-document", str(paper),
+                      "--query", "validation", "--provider", "local_files", "--max-results", "2",
+                      "--max-chunks", "20", "--idea-limit", "1", "--cache-dir", str(root / "cache")])
+            args = migrate.call_args.args[0]
+            routed = migrate.call_args.kwargs
+            self.assertEqual(tuple(routed["outputs"]), ("summary",))
+            self.assertEqual((args.model, args.interaction, args.output_root),
+                             (None, "autonomous", "runs/research-brief"))
+            self.assertEqual((args.max_results, args.max_chunks, args.idea_limit), (2, 20, 1))
+            self.assertEqual(Path(args.cache_dir), root / "cache")
+            self.assertEqual(routed["research_config"]["research_queries"], ["validation"])
+            self.assertEqual(routed["research_config"]["research_sources"], ["local_files"])
+            self.assertEqual(routed["sources"][0]["locator"], str(paper))
+        with patch("simple_ar.cli.main._print_research_session") as run:
+            main(["research-brief", "--topic", "Read evidence", "--model", "profile:reader"])
+            self.assertEqual(run.call_args.args[0].model, "profile:reader")
+            for flags in (["--outputs", "report"], ["--session-root", "saved"]):
+                with self.subTest(flags=flags), self.assertRaisesRegex(SystemExit, "summary only"):
+                    main(["research-brief", "--topic", "Read evidence", *flags])
 
-            brief = creator.call_args.args[0]
-            services = creator.call_args.kwargs["services"]
-            self.assertEqual(brief.requested_outputs, ("summary",))
-            self.assertEqual(brief.intents, ("research",))
-            self.assertNotIn("execution", services.config)
-            self.assertEqual(services.budget_limits["process_invocations"], 0)
-            self.assertIn("summary: ", stdout.getvalue())
 
-    def test_research_session_cli_without_command_with_model_requests_survey_report(self) -> None:
-        TEST_ROOT.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as tmp:
-            root = Path(tmp)
-            session_root = root / "sessions" / "research-session"
-            final_view = SimpleNamespace(
-                session_root=session_root,
-                status="completed",
-                status_reason="",
-                next_action=None,
-                state_refs={"report": SimpleNamespace(path="attempts/report/report.md")},
-                attempts=(),
-            )
-            app = MagicMock()
-            app.services = SimpleNamespace(max_attempts=5)
-            app.view.side_effect = [
-                SimpleNamespace(
-                    session_root=session_root, status="running", status_reason="",
-                    next_action="plan", state_refs={}, attempts=(),
-                ),
-                final_view,
-            ]
-            app.advance.return_value = final_view
-            with (
-                patch("simple_ar.cli.main._optional_research_llm_client", return_value=object()),
-                patch("simple_ar.app.research_application.create_session", return_value=app) as creator,
-                contextlib.redirect_stdout(io.StringIO()),
-            ):
-                main([
-                    "research-session",
-                    "--topic", "reliable agents",
-                    "--output-root", str(root / "sessions"),
-                ])
-
-            brief = creator.call_args.args[0]
-            services = creator.call_args.kwargs["services"]
-            self.assertEqual(brief.requested_outputs, ("report",))
-            self.assertEqual(services.config["report"]["mode"], "research_only")
-            self.assertEqual(services.config["report"]["template"], "auto")
-            self.assertEqual(services.budget_limits["process_wall_seconds"], 0)
-
-    def test_research_session_parser_accepts_shared_cache_dir(self) -> None:
-        args = build_parser().parse_args(
-            [
-                "research-session",
-                "--topic",
-                "reliable agents",
-                "--cache-dir",
-                "shared-cache",
-                "--no-report",
-                "--command",
-                sys.executable,
-                "-c",
-                "print('accuracy: 0.9')",
-            ]
-        )
-
-        self.assertEqual(args.cache_dir, "shared-cache")
-        self.assertTrue(args.no_report)
-        self.assertEqual(args.command, "research-session")
 
     def test_research_session_continue_parser_keeps_revised_command(self) -> None:
         args = build_parser().parse_args(
@@ -1092,79 +1170,56 @@ code = "daily"
             self.assertIn("0 running", status_text)
 
 
-    def test_research_report_cli_reads_existing_session_without_rerunning_it(self) -> None:
-        TEST_ROOT.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as tmp:
-            root = Path(tmp)
-            output_root = root / "sessions"
-            session_root = output_root / "existing-session"
-            session_root.mkdir(parents=True)
-            final_view = SimpleNamespace(
-                session_root=session_root,
-                status="completed",
-                status_reason="",
-                next_action=None,
-                state_refs={
-                    "report": SimpleNamespace(path="attempts/report-001/report.md"),
-                },
-                attempts=(),
-            )
-            app = MagicMock()
-            app.brief = SimpleNamespace(requested_outputs=("experiments",))
-            app.services = SimpleNamespace(max_attempts=4, config={})
-            app.controller = SimpleNamespace(
-                manifest=SimpleNamespace(budget=SimpleNamespace(max_attempts=4)),
-            )
-            app.view.return_value = SimpleNamespace(
-                session_root=session_root,
-                status="completed",
-                status_reason="",
-                next_action=None,
-                state_refs={},
-                attempts=(),
-            )
-            app.request_report.return_value = SimpleNamespace(
-                session_root=session_root,
-                status="running",
-                status_reason="",
-                next_action=None,
-                state_refs={},
-                attempts=(),
-            )
-            app.advance.return_value = final_view
-            stdout = io.StringIO()
-            with (
-                patch("simple_ar.cli.main._optional_research_llm_client", return_value=object()),
-                patch(
-                    "simple_ar.app.research_application.load_session",
-                    return_value=app,
-                ) as loader,
-                patch("simple_ar.app.research_application.create_session", side_effect=AssertionError("must not create a new session")),
-                contextlib.redirect_stdout(stdout),
+    def test_research_report_cli_routes_existing_evidence_and_refresh(self) -> None:
+        args = build_parser().parse_args([
+            "research-report", "--session-root", "session", "--model", "env", "--draft-scope", "document"])
+        self.assertEqual(args.draft_scope, "document")
+        with tempfile.TemporaryDirectory() as tmp:
+            session_root = Path(tmp) / "existing-session"
+            session_root.mkdir()
+            final_view = SimpleNamespace(session_root=session_root, status="completed",
+                status_reason="", next_action=None,
+                state_refs={"report": SimpleNamespace(path="attempts/report-001/report.md")},
+                attempts=())
+            for flags, expected in (
+                ([], {}),
+                (["--template", "survey"], {
+                    "report_config": {"template": "survey"},
+                    "reason": "Apply explicit report settings and rebuild only report deliverables from existing evidence."}),
+                (["--refresh"], {"refresh": True, "report_config": {},
+                    "reason": "Explicitly regenerate the report from existing research evidence."}),
             ):
-                main(
-                    [
-                        "research-report",
-                        "--session-root",
-                        str(session_root),
-                        "--model",
-                        "gpt-5.4",
-                        "--template",
-                        "survey",
-                    ]
-                )
-
-            loader.assert_called_once()
-            app.request_report.assert_called_once_with(
-                report_config={"template": "survey"},
-                reason="Apply explicit report settings and rebuild only report deliverables from existing evidence.",
-            )
-            app.advance.assert_called_once_with(max_actions=1)
-            self.assertIn("Status: completed", stdout.getvalue())
-            self.assertIn(
-                str(session_root / "attempts" / "report-001" / "report.md"),
-                stdout.getvalue(),
-            )
+                with self.subTest(flags=flags):
+                    saved = {"report_writing_method": "article", "report": {
+                        "reviewer": "llm", "document_review": True, "review_scope": "document",
+                        "draft_scope": "auto", "max_review_iterations": 3, "allow_source_backtracking": False}}
+                    app = MagicMock()
+                    app.brief = SimpleNamespace(requested_outputs=("experiments",))
+                    app.services = SimpleNamespace(max_attempts=4, config=saved.copy())
+                    app.controller.manifest.budget.max_attempts = 4
+                    app.view.return_value = SimpleNamespace(session_root=session_root,
+                        status="completed", status_reason="", next_action=None,
+                        state_refs={}, attempts=())
+                    app.request_report.return_value = SimpleNamespace(session_root=session_root,
+                        status="running", status_reason="", next_action=None,
+                        state_refs={}, attempts=())
+                    app.advance.return_value = final_view
+                    stdout = io.StringIO()
+                    with patch("simple_ar.cli.main._optional_research_llm_client", return_value=object()), \
+                            patch("simple_ar.app.research_application.load_session", return_value=app) as loader, \
+                            patch("simple_ar.app.research_application.create_session",
+                                  side_effect=AssertionError("must not create a new session")), \
+                            contextlib.redirect_stdout(stdout):
+                        main(["research-report", "--session-root", str(session_root),
+                              "--model", "gpt-5.4", *flags])
+                    loader.assert_called_once()
+                    self.assertEqual(loader.call_args.args[0], session_root)
+                    app.request_report.assert_called_once_with(**expected)
+                    self.assertEqual(app.services.config, saved)
+                    self.assertEqual(loader.call_args.kwargs["services"].config, {})
+                    app.advance.assert_called_once_with(max_actions=1)
+                    self.assertIn("Status: completed", stdout.getvalue())
+                    self.assertIn(str(session_root / "attempts/report-001/report.md"), stdout.getvalue())
 
     def test_report_resume_uses_real_interface_and_persisted_attempt_limit(self):
         from simple_ar.app.research_application import ResearchApplication
@@ -1223,7 +1278,10 @@ code = "daily"
                 ),
                 store=SimpleNamespace(root=root),
             )
-            app.budget_ledger = SimpleNamespace(limits={}, remaining=lambda _name: None)
+            app.budget_ledger = SimpleNamespace(
+                limits={"process_invocations": 0, "process_wall_seconds": 0},
+                remaining=lambda _name: None,
+            )
             app.view.return_value = SimpleNamespace(
                 session_root=root, status="paused", next_action="report_write", state_refs={},
             )
@@ -1241,246 +1299,105 @@ code = "daily"
             self.assertIn("simple-ar research-session", str(raised.exception))
             self.assertIn("--topic 'A bounded report'", str(raised.exception))
             self.assertNotIn("allow_no_progress_exhausted", str(raised.exception))
+            self.assertNotIn("process_invocations=", str(raised.exception))
+            self.assertNotIn("process_wall_seconds=", str(raised.exception))
 
-    def test_completed_report_authorization_refresh_and_recovery_without_processes(self):
-        from dataclasses import replace
-        from simple_ar.app.research_application import create_session, load_session, ResearchApplicationServices
+    def test_research_session_cli_routes_recovery_and_explicit_allowances(self):
+        from simple_ar.app.research_application import ResearchApplicationServices
         from simple_ar.research.workflow_contracts import ResearchBrief
-        from simple_ar.report.schema import AgentReportResult, ReportSectionDraft
-        from simple_ar.research.task_plan import TaskPlanRequest, default_task_steps
 
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            paper = root / "paper.md"
-            paper.write_text("# Calibration\nCalibration evidence is limited.\n", encoding="utf-8")
-            session = root / "session"
-            brief = ResearchBrief(
-                request_text="Review calibration.", objective="Review calibration.",
-                requested_outputs=("report",),
-                asset_requests=({"locator": str(paper), "role": "paper"},),
-            )
-            planned_actions = [row["action"] for row in default_task_steps(TaskPlanRequest(
-                task_kind="survey", goal=brief.objective, request_text=brief.request_text,
-                requested_outputs=brief.requested_outputs,
-                config={"research_local_documents": [str(paper)]}))]
-            initial_attempt_limit = 1 + len(planned_actions)  # One plan attempt plus its actual route.
-            refreshed_attempt_limit = initial_attempt_limit + 4
-            app = create_session(brief, root=session, services=ResearchApplicationServices(
-                max_results=1, max_attempts=initial_attempt_limit,
-                budget_limits={"llm_requests": 10, "total_tokens": 100,
-                               "process_invocations": 0, "process_wall_seconds": 0},
-            ))
-            for _ in range(initial_attempt_limit):
-                if app.view().next_action == "report_write":
-                    break
-                prepared = app.advance(max_actions=1)
-                self.assertNotIn(prepared.status, {"paused", "blocked", "completed"}, prepared.status_reason)
-            self.assertEqual(app.view().next_action, "report_write", app.view().status_reason)
-            self.assertFalse(any(attempt.capability == "report_write" for attempt in app.controller.list_attempts()))
-            accepted_actions = [step.action for step in app._load_task_plan().steps]
-            self.assertEqual(accepted_actions, planned_actions)
-            remaining_actions = accepted_actions[accepted_actions.index("report_write"):]
-            self.assertEqual(remaining_actions, ["report_write", "report", "report_audit"])
-            app.services = replace(app.services, llm_client=object())
-
-            def writer(**kwargs):
-                paper_id = kwargs["context"].papers[0]["id"]
-                return AgentReportResult(report_body="", memory=kwargs["memory"], used_agent=True,
-                    sections=[ReportSectionDraft(section_id="review", heading="Evidence",
-                        draft_markdown=f"Calibration evidence is limited [@{paper_id}].",
-                        used_sources=[paper_id])])
-
-            with patch("simple_ar.report.writing.run_report_agent", side_effect=writer):
-                initial = app.advance(max_actions=len(remaining_actions))
-            self.assertEqual(initial.status, "completed", app.controller.manifest.status_reason)
-            self.assertEqual(initial.budget["attempts"], initial_attempt_limit)
-            self.assertTrue(app.controller.manifest.budget.exhausted())
-            old_report = session / initial.state_refs["report"].path
-            old_body = old_report.read_bytes()
-            resume = ["research-session", "--session-root", str(session), "--topic", "Review calibration."]
-            authorize = resume + ["--authorization-id", "report-refresh-1",
-                "--authorization-reason", "One report refresh and one failed attempt.", "--additional-attempts", "4"]
-            report = ["research-report", "--session-root", str(session), "--model", "scripted"]
-            with patch("simple_ar.cli.main._optional_research_llm_client", return_value=object()), contextlib.redirect_stdout(io.StringIO()):
-                with self.assertRaises(SystemExit) as raised:
-                    main(report + ["--refresh"])
-                self.assertIn("--additional-attempts 3", str(raised.exception))
-                self.assertNotIn("process_invocations=", str(raised.exception))
-                self.assertNotIn("process_wall_seconds=", str(raised.exception))
-                self.assertIn("then repeat", str(raised.exception))
-                self.assertEqual(load_session(session).view().state_refs, initial.state_refs)
-
-                resources = resume + ["--authorization-id", "report-resources-1",
-                    "--authorization-reason", "Replenish tokens before authorizing attempts.",
-                    "--authorize-remaining", "total_tokens=200"]
-                main(resources)  # Authorization need not enable execution immediately.
-                main(resources)
-                still_completed = load_session(session)
-                self.assertEqual(still_completed.view().attempts, initial.attempts)
-                self.assertTrue(still_completed.controller.manifest.budget.exhausted())
-                self.assertEqual(still_completed.budget_ledger.limits["total_tokens"], 200)
-
-                for _ in range(2):
-                    main(authorize)
-                    view = load_session(session).view()
-                    self.assertEqual((view.status, view.revision, view.attempts, view.state_refs),
-                                     (initial.status, initial.revision, initial.attempts, initial.state_refs))
-                    self.assertEqual(view.budget["max_attempts"], refreshed_attempt_limit)
-                with self.assertRaisesRegex(SystemExit, "different terms"):
-                    main(authorize[:-1] + ["5"])
-
-                with patch("simple_ar.report.writing.run_report_agent", side_effect=RuntimeError("fixture interruption")):
-                    with self.assertRaises(SystemExit):
-                        main(report + ["--refresh"])
-                self.assertEqual(load_session(session).view().status, "paused")
-                with patch("simple_ar.report.writing.run_report_agent", side_effect=writer):
-                    main(report)
-                completed = load_session(session).view()
-                self.assertEqual(completed.status, "completed")
-                self.assertEqual(completed.budget["attempts"], refreshed_attempt_limit)
-                self.assertNotEqual(completed.state_refs["report"], initial.state_refs["report"])
-                main(authorize)  # Replay remains safe even after all four attempts were spent.
-                main(report)
-            restored = load_session(session)
-            self.assertEqual(restored.view().attempts, completed.attempts)
-            self.assertEqual(restored.view().state_refs["read"], initial.state_refs["read"])
-            self.assertEqual(old_report.read_bytes(), old_body)
-            self.assertEqual(restored.budget_ledger.limits["process_invocations"], 0)
-            self.assertEqual(restored.budget_ledger.limits["process_wall_seconds"], 0)
-            self.assertFalse(any(row["capability"] == "experiment" for row in completed.attempts))
-
-    def test_research_session_cli_can_append_report_in_one_explicit_flow(self) -> None:
-        TEST_ROOT.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as tmp:
-            root = Path(tmp)
-            paper = root / "reliable_agents.md"
-            paper.write_text(
-                "# Results\n\nThe fixture reports accuracy: 0.75.\n",
-                encoding="utf-8",
-            )
-            output_root = root / "sessions"
-            session_root = output_root / "research-session"
-            final_view = SimpleNamespace(
-                session_root=session_root,
-                status="completed",
-                status_reason="",
-                next_action=None,
-                state_refs={
-                    "report": SimpleNamespace(path="attempts/report-001/report.md"),
-                },
-                attempts=(),
-            )
+            session = Path(tmp) / "session"
+            session.mkdir()
             app = MagicMock()
-            app.services = SimpleNamespace(max_attempts=5)
-            app.view.side_effect = [
-                SimpleNamespace(
-                    session_root=session_root, status="running", status_reason="",
-                    next_action="plan", state_refs={}, attempts=(),
-                ),
-                final_view,
-            ]
-            app.advance.return_value = final_view
-            with (
-                patch("simple_ar.cli.main._optional_research_llm_client", return_value=object()),
-                patch(
-                    "simple_ar.app.research_application.create_session",
-                    return_value=app,
-                ) as creator,
-                contextlib.redirect_stdout(io.StringIO()),
-            ):
-                main(
-                    [
-                        "research-session",
-                        "--topic",
-                        "reliable agents",
-                        "--local-document",
-                        str(paper),
-                        "--output-root",
-                        str(output_root),
-                        "--cwd",
-                        str(root),
-                        "--model",
-                        "gpt-5.4",
-                        "--with-report",
-                        "--report-reviewer",
-                        "disabled",
-                        "--max-review-iterations",
-                        "0",
-                        "--command",
-                        sys.executable,
-                        "-c",
-                        "print('accuracy: 0.75')",
-                    ]
-                )
-
-            creator.assert_called_once()
-            self.assertEqual(creator.call_args.args[0].requested_outputs, ("experiments", "report"))
-            app.advance.assert_called_once_with(max_actions=1)
-
-    def test_research_session_cli_defaults_to_report_with_model(self) -> None:
-        TEST_ROOT.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as tmp:
-            root = Path(tmp)
-            paper = root / "reliable_agents.md"
-            paper.write_text(
-                "# Results\n\nThe fixture reports accuracy: 0.75.\n",
-                encoding="utf-8",
+            app.brief = ResearchBrief(request_text="Review calibration.",
+                objective="Review calibration.", requested_outputs=("report",))
+            app.services = ResearchApplicationServices(config={})
+            app.controller.manifest.budget.max_attempts = 5
+            completed = SimpleNamespace(session_root=session, status="completed",
+                status_reason="", next_action=None, state_refs={}, attempts=())
+            app.view.return_value = app.advance.return_value = completed
+            base = ["research-session", "--session-root", str(session),
+                    "--topic", app.brief.objective]
+            cases = (
+                ([], False, None, None, None),
+                (["--recover-interrupted"], True, None, None, None),
+                (["--authorization-id", "report-refresh-1",
+                  "--authorization-reason", "One bounded refresh.",
+                  "--additional-attempts", "4", "--additional-no-progress", "1",
+                  "--authorize-remaining", "total_tokens=200"], False, 4, 1,
+                 {"total_tokens": 200}),
+                (["--additional-attempts", "0", "--additional-no-progress", "0"],
+                 False, 0, 0, None),
             )
-            output_root = root / "sessions"
-            session_root = output_root / "research-session"
-            final_view = SimpleNamespace(
-                session_root=session_root,
-                status="completed",
-                status_reason="",
-                next_action=None,
-                state_refs={
-                    "report": SimpleNamespace(path="attempts/report-001/report.md"),
-                },
-                attempts=(),
-            )
-            app = MagicMock()
-            app.services = SimpleNamespace(max_attempts=5)
-            app.view.side_effect = [
-                SimpleNamespace(
-                    session_root=session_root, status="running", status_reason="",
-                    next_action="plan", state_refs={}, attempts=(),
-                ),
-                final_view,
-            ]
-            app.advance.return_value = final_view
-            with (
-                patch("simple_ar.cli.main._optional_research_llm_client", return_value=object()),
-                patch(
-                    "simple_ar.app.research_application.create_session",
-                    return_value=app,
-                ) as creator,
-                contextlib.redirect_stdout(io.StringIO()),
-            ):
-                main(
-                    [
-                        "research-session",
-                        "--topic",
-                        "reliable agents",
-                        "--local-document",
-                        str(paper),
-                        "--output-root",
-                        str(output_root),
-                        "--cwd",
-                        str(root),
-                        "--model",
-                        "gpt-5.4",
-                        "--command",
-                        sys.executable,
-                        "-c",
-                        "print('accuracy: 0.75')",
-                    ]
-                )
+            with patch("simple_ar.cli.main._optional_research_llm_client", return_value=None), \
+                    patch("simple_ar.app.research_application.load_session", return_value=app), \
+                    patch("simple_ar.cli.start.migrate_structured_creation",
+                          side_effect=AssertionError("Historical continuation must retain its owner")), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                for flags, recover, attempts, no_progress, resources in cases:
+                    with self.subTest(flags=flags):
+                        app.continue_session.reset_mock()
+                        main(base + flags)
+                        app.continue_session.assert_called_once()
+                        routed = app.continue_session.call_args.kwargs
+                        self.assertEqual(routed["recover_interrupted"], recover)
+                        self.assertEqual(routed["additional_attempts"], attempts)
+                        self.assertEqual(routed["additional_no_progress"], no_progress)
+                        self.assertEqual(routed["authorize_remaining"], resources)
+                        self.assertIsNone(routed["report_writing_method"])
+                        if resources:
+                            self.assertEqual(routed["authorization_id"], "report-refresh-1")
+                            self.assertEqual(routed["authorization_reason"], "One bounded refresh.")
 
-            creator.assert_called_once()
-            self.assertEqual(creator.call_args.args[0].requested_outputs, ("experiments", "report"))
-            app.advance.assert_called_once_with(max_actions=1)
+    def test_structured_report_saves_common_writer_contract_before_generation(self):
+        from simple_ar.app.tool_application import ToolApplication
+
+        client = MagicMock()
+        client._settings = SimpleNamespace(api_mode="chat")
+        client.connection_binding.return_value = {"profile": "fixture", "settings": {"model": "fixture", "api_mode": "chat"}}
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch("simple_ar.cli.main._optional_research_llm_client", return_value=client), \
+                patch("simple_ar.app.tool_application.LLMClient.from_env", return_value=client), \
+                patch.object(ToolApplication, "run", return_value={"status": "completed"}) as run, \
+                patch("simple_ar.cli.main._render_native_result"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            main(["research-session", "--topic", "Review evidence", "--model", "fixture", "--output-root", tmp,
+                  "--max-output-tokens", "321", "--report-writing-method", "sections",
+                  "--report-outline-strategy", "adaptive", "--report-document-review",
+                  "--max-section-tokens", "123", "--max-review-iterations", "3",
+                  "--max-document-review-prompt-chars", "4567"])
+            manifest, = Path(tmp).rglob("session_manifest.json")
+            app = ToolApplication.load(manifest.parent)
+            requirement = app.state["config"]["report_requirement"]
+            self.assertEqual(requirement["method"], "sections")
+            self.assertEqual({key: requirement["config"][key] for key in (
+                "outline_strategy", "document_review", "max_section_tokens",
+                "max_review_iterations", "max_document_review_prompt_chars")},
+                {"outline_strategy": "adaptive", "document_review": True, "max_section_tokens": 123,
+                 "max_review_iterations": 3, "max_document_review_prompt_chars": 4567})
+            self.assertEqual(app.state["config"]["max_output_tokens"], 321)
+            run.assert_called_once()
+            client.chat_turn.assert_not_called()
+
+    def test_structured_report_preflight_precedes_model_and_creation(self):
+        with patch("simple_ar.cli.main._optional_research_llm_client") as client, \
+                patch("simple_ar.cli.start.migrate_structured_creation") as migrate:
+            with self.assertRaisesRegex(SystemExit, "requires review_scope"):
+                main(["research-session", "--topic", "topic", "--report-draft-scope", "document"])
+            client.assert_not_called()
+            migrate.assert_not_called()
+
 
     def test_research_session_cli_builds_code_task_request_from_config(self) -> None:
+        from simple_ar.app.tool_application import ToolApplication
+        from simple_ar.cli.main import _run_native_start
+        # Current creation consumes canonical options; the old public Python
+        # bridge remains compatible, but must not be a production middle layer.
+        bridge = patch('simple_ar.experiment.code_task_bridge.spec.code_task_project_spec',
+                       side_effect=AssertionError('Do not reconstruct a second experiment spec'))
+        bridge.start()
+        self.addCleanup(bridge.stop)
         TEST_ROOT.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(dir=TEST_ROOT) as tmp:
             root = Path(tmp)
@@ -1493,6 +1410,12 @@ code = "daily"
                 "[code_task]\n"
                 f'code_root = "{project.as_posix()}"\n'
                 f'task_file = "{task_file.as_posix()}"\n'
+                "max_file_bytes = 64\n"
+                "[workspace]\n"
+                'mode = "sparse_copy"\n'
+                'include = ["src/**", "benchmark.py"]\n'
+                'exclude = ["src/private/**"]\n'
+                "reuse_source_venv = true\n"
                 "[environment]\n"
                 'mode = "external"\n'
                 f'python_executable = "{Path(sys.executable).as_posix()}"\n'
@@ -1507,100 +1430,313 @@ code = "daily"
                 'baseline_policy = "skip"\n',
                 encoding="utf-8",
             )
-            app = MagicMock()
-            app.services = SimpleNamespace(max_attempts=5)
-            app.view.return_value = SimpleNamespace(
-                session_root=root / "session", status="completed", status_reason="",
-                next_action=None, state_refs={}, attempts=(),
-            )
-            app.advance.return_value = app.view.return_value
-            with (
-                patch("simple_ar.cli.main._optional_research_llm_client", return_value=object()),
-                patch(
-                    "simple_ar.app.research_application.create_session",
-                    return_value=app,
-                ) as creator,
-                contextlib.redirect_stdout(io.StringIO()),
-            ):
-                main(
-                    [
-                        "research-session",
-                        "--topic",
-                        "fixture research",
-                        "--output-root",
-                        str(root / "sessions"),
-                        "--cwd",
-                        str(root),
-                        "--model",
-                        "gpt-5.4",
-                        "--no-report",
-                        "--code-task-config",
-                        str(config),
-                    ]
-                )
-
-            brief = creator.call_args.args[0]
-            services = creator.call_args.kwargs["services"]
-            execution = services.config["execution"]
-            self.assertEqual(brief.requested_outputs, ("experiments",))
-            self.assertIn("Improve the fixture.", brief.request_text)
-            self.assertEqual(execution["cwd"], str(project.resolve()))
-            self.assertEqual(execution["timeout_sec"], 7)
-            self.assertEqual(execution["code_task"]["code_root"], str(project.resolve()))
-            self.assertEqual(execution["code_task"]["max_repairs"], 0)
-            self.assertEqual(execution["code_task"]["env_mode"], "external")
-            self.assertEqual(Path(execution["code_task"]["python_executable"]), Path(sys.executable))
+            fake = MagicMock()
+            fake._settings = SimpleNamespace(api_mode='chat', context_input_tokens=24000)
+            fake.connection_binding.return_value = {'profile': 'fixture',
+                'settings': {'model': 'fixture', 'api_mode': 'chat'}}
+            fake.effective_output_limit.return_value = None
+            fake.with_output_limit.return_value = fake
+            fake.chat_turn.return_value = {'role': 'assistant', 'content': '', 'tool_calls': [{
+                'id': 'clarify', 'type': 'function', 'function': {'name': 'ask_user',
+                'arguments': json.dumps({'question': 'Confirm the declared preparation before execution.'})}}]}
+            for policy, declaration, expected in (
+                    ('skip', 'seeds=[7]\nseed_flag="--seed"\n', [('candidate', 7)]),
+                    ('run', 'seeds=[7,9]\nseed_flag="--seed"\n',
+                     [('baseline', 7), ('candidate', 7), ('baseline', 9), ('candidate', 9)]),
+                    ('skip', '[[execution.pairs]]\nseed=7\nbaseline_command=["python","benchmark.py","--baseline"]\n'
+                     'candidate_command=["python","benchmark.py","--candidate"]\n', [('candidate', 7)])):
+                public = root / 'research.toml'
+                public.write_text(f'[execution]\ncode_task_config="{config.as_posix()}"\n'
+                    f'baseline_policy="{policy}"\n' + declaration, encoding='utf-8')
+                with self.subTest(policy=policy, conditions=expected), \
+                        patch('simple_ar.cli.main._optional_research_llm_client', return_value=object()), \
+                        patch('simple_ar.cli.main._run_native_start', wraps=_run_native_start) as native, \
+                        patch('simple_ar.app.tool_application.ToolApplication.create', wraps=ToolApplication.create) as create, \
+                        patch('simple_ar.app.tool_application.LLMClient.from_env', return_value=fake), \
+                        patch('sys.stdin.isatty', return_value=False), \
+                        patch('simple_ar.app.research_application.create_session') as old, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    main(['research-session', '--config', str(public), '--topic', 'fixture research',
+                          '--model', 'fixture-model', '--no-report', '--output-root', str(root / 'sessions')])
+                old.assert_not_called()
+                native.assert_called_once()
+                create.assert_called_once()
+                fake.chat_turn.assert_called_once()
+                routed = native.call_args.args[0]
+                state = read_json(routed._native_root / 'actions.json')
+                self.assertEqual(state['config']['execution_contract'], routed._execution_contract)
+                self.assertEqual(len(state['turns']), 1)
+                fake.chat_turn.reset_mock()
+                rows = routed._execution_contract['conditions']
+                self.assertEqual([(row['role'], row['seed']) for row in rows], expected)
+                self.assertEqual([row['source'] for row in rows],
+                    ['preparation' if role == 'baseline' else 'implementation' for role, _ in expected])
+                self.assertEqual([row.get('before_implementation', False) for row in rows],
+                    [role == 'baseline' for role, _ in expected])
+                self.assertTrue(all(row['execution']['cwd'] == str(project.resolve()) for row in rows))
+                self.assertTrue(all(row['execution']['timeout_sec'] == 7 for row in rows))
+                self.assertEqual(rows[0]['execution']['command'][0], str(Path(sys.executable).absolute()))
+                self.assertIn('Improve the fixture.', routed.request)
+                self.assertEqual(routed._code_task['validation_command'], ['python', 'benchmark.py'])
+                self.assertFalse(routed.approve_execution)
+                self.assertGreaterEqual(routed._task_attempt_limit, 20)
+                self.assertEqual(routed.source, [project.resolve()])
+                self.assertTrue(routed.allow_execution)
+                self.assertTrue(routed.yes)
+                self.assertEqual(routed._code_task['allowed_patterns'], ['**'])
+                self.assertEqual({key: routed._code_task['preparation'][key] for key in (
+                    'workspace_mode', 'max_file_bytes', 'workspace_include', 'workspace_exclude',
+                    'workspace_reuse_source_venv', 'python_executable', 'max_repairs')},
+                    {'workspace_mode': 'sparse_copy', 'max_file_bytes': 64,
+                     'workspace_include': ['src/**', 'benchmark.py'], 'workspace_exclude': ['src/private/**'],
+                     'workspace_reuse_source_venv': True, 'python_executable': str(Path(sys.executable)),
+                     'max_repairs': 0})
+            # Raw normalized inputs are reused only by the adapter-boundary
+            # assertions below; the public new-creation consumer above is native.
+            from simple_ar.app.research_execution import code_task_execution_options
+            from simple_ar.cli.main import _load_code_task_options_for_cli
+            execution = {'code_task': code_task_execution_options(*_load_code_task_options_for_cli(config)),
+                'result_schema': rows[0]['execution']['result_schema']}
+            self.assertEqual(execution['result_schema']['primary_metric'], 'accuracy')
+            self.assertEqual(execution['result_schema']['required_metrics'], ['accuracy'])
+            self.assertEqual(execution['result_schema']['metric_directions'], {'accuracy': 'higher_is_better'})
             original_config = config.read_text()
             for repairs, explicit, count, seconds in ((0, False, 1, 30), (1, False, 2, 60), (1, True, 0, 0)):
                 with self.subTest(repairs=repairs, explicit=explicit), \
                         patch("simple_ar.cli.main._optional_research_llm_client", return_value=object()), \
-                        patch("simple_ar.app.research_application.create_session", return_value=app) as created, \
+                        patch('simple_ar.cli.main._run_native_start') as native, \
+                        patch("simple_ar.app.research_application.create_session") as created, \
                         contextlib.redirect_stdout(io.StringIO()):
                     config.write_text(original_config + f"repair_rounds = {repairs}\n")
                     main(["research-session", "--task-kind", "bug_fix", "--topic", "Repair the project",
                           "--model", "gpt-5.4", "--code-task-config", str(config), "--with-report",
                           *(["--process-invocations", "0", "--process-wall-seconds", "0"] if explicit else [])])
-                    limits = created.call_args.kwargs["services"].budget_limits
-                    self.assertEqual(limits["process_invocations"], count)
-                    self.assertEqual(limits["process_wall_seconds"], seconds)
-                    self.assertEqual(created.call_args.args[0].requested_outputs, ("bug_fix", "report"))
-                    self.assertEqual(created.call_args.kwargs["services"].config["report"]["template"], "auto")
-                    self.assertEqual(created.call_args.kwargs["services"].config["report"]["mode"], "supplied_materials")
+                    created.assert_not_called()
+                    routed = native.call_args.args[0]
+                    self.assertEqual(routed._process_limits, {'process_invocations': count, 'process_wall_seconds': seconds})
+                    self.assertEqual(routed._code_task['preparation']['max_repairs'], repairs)
+                    self.assertEqual(routed._report_requirement['method'], 'article')
+                    self.assertEqual(routed._report_requirement['config']['template'], 'auto')
+                    self.assertEqual(routed._report_requirement['config']['mode'], 'supplied_materials')
             config.write_text(original_config)
             greenfield = root / "greenfield.toml"
+            # Keep the source-less CLI branch here. Scaffold mode combinations
+            # and physical preparation belong to the implementation owner.
             greenfield.write_text('[code_task]\nkind="greenfield"\n' +
-                f'task_file="{task_file.as_posix()}"\n[workspace]\nmode="empty"\n' +
-                '[edit_scope]\nallowed_patterns=["generated_project/**"]\n' +
+                f'task_file="{task_file.as_posix()}"\n' +
+                '[workspace]\nmode="empty"\n' +
+                '[edit_scope]\nallowed_patterns=["generated_project/**"]\nprotected_patterns=["check.py"]\n' +
                 '[benchmark]\ncommand="python generated_project/main.py"\n' +
                 '[execute]\nuse_llm=true\nbaseline_policy="skip"\n', encoding="utf-8")
-            with patch("simple_ar.cli.main._optional_research_llm_client", return_value=object()), \
-                    patch("simple_ar.app.research_application.create_session", return_value=app) as creator, \
-                    contextlib.redirect_stdout(io.StringIO()):
-                main(["research-session", "--topic", "Create a project", "--model", "fixture-model",
-                      "--code-task-config", str(greenfield), "--outputs", "code_task", "report"])
-            new_execution = creator.call_args.kwargs["services"].config["execution"]
-            self.assertEqual(new_execution["code_task"]["kind"], "greenfield")
-            self.assertIsNone(new_execution["code_task"]["code_root"])
-            self.assertEqual(new_execution["code_task"]["workspace_mode"], "empty")
-            self.assertEqual(creator.call_args.args[0].requested_outputs, ("code_task", "report"))
+            public.write_text(f'[execution]\ncode_task_config="{greenfield.as_posix()}"\n'
+                'baseline_policy="skip"\n[[execution.pairs]]\nseed=7\n'
+                'baseline_command=["python","-m","baseline_package"]\n'
+                'candidate_command=["python","-m","generated_project"]\n', encoding='utf-8')
+            for options in (['--code-task-config', str(greenfield), '--outputs', 'code_task'],
+                            ['--config', str(public), '--outputs', 'experiments']):
+                with self.subTest(greenfield_options=options), \
+                        patch('simple_ar.cli.main._optional_research_llm_client', return_value=object()), \
+                        patch('simple_ar.cli.main._run_native_start') as native, \
+                        patch('simple_ar.app.research_application.create_session') as legacy, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    main(['research-session', '--topic', 'Create a project', '--model', 'fixture', *options])
+                legacy.assert_not_called()
+                native.assert_called_once()
+                routed = native.call_args.args[0]
+                exact = routed._code_task
+                self.assertEqual(exact['project_path'], '')
+                self.assertEqual(routed.source, [])
+                self.assertEqual(exact['preparation']['kind'], 'greenfield')
+                self.assertEqual(exact['preparation']['workspace_mode'], 'empty')
+                self.assertEqual(exact['allowed_patterns'], ['generated_project/**'])
+                self.assertEqual(exact['protected_patterns'], ['check.py'])
+                self.assertEqual(exact['validation_command'], ['python', 'generated_project/main.py'])
+                self.assertFalse(routed.approve_execution)
+                self.assertIsNone(routed._report_requirement)
+                if 'experiments' in options:
+                    self.assertEqual([row['source'] for row in routed._execution_contract['conditions']],
+                        ['implementation'])  # Generated candidate, without a suffix-based source heuristic.
+            from simple_ar.cli.start import migrate_exact_code_creation
+            config.write_text(original_config.replace('mode = "sparse_copy"', 'mode = "copy"')
+                + '\n[edit_scope]\nallowed_patterns=["adapter.py"]\n', encoding='utf-8')
             reproduction = root / "reproduction.toml"
-            reproduction.write_text(
-                '[task]\ngoal="Check published conditions"\nkind="reproduction"\noutputs=["experiments"]\n'
-                '[model]\nname="fixture-model"\n[research]\nmaterials_only=true\n'
-                f'[assets]\npapers=["{task_file.as_posix()}"]\n'
-                f'[execution]\ncode_task_config="{config.as_posix()}"\ncwd="{project.as_posix()}"\n'
-                'command=["python","adapter.py"]\ntimeout_sec=11\n'
-                '[execution.protocol]\nhypothesis="Published claim"\ndataset="Fixed data"\n'
-                'expected_outcome="Compare measured accuracy"\nmetrics=["accuracy"]\n', encoding="utf-8")
-            with patch("simple_ar.cli.main._optional_research_llm_client", return_value=object()), \
-                 patch("simple_ar.app.research_application.create_session", return_value=app) as creator, \
-                 contextlib.redirect_stdout(io.StringIO()):
-                main(["research-session", "--config", str(reproduction)])
-            prepared = creator.call_args.kwargs["services"].config["execution"]
-            self.assertEqual(prepared["command"], ("python", "adapter.py"))
-            self.assertEqual(prepared["code_task"]["validation_command"], ["python", "benchmark.py"])
-            self.assertEqual(prepared["timeout_sec"], 11)
-            self.assertEqual(prepared["code_task"]["validation_timeout_sec"], 7)
+            for kind, environment, report in (('reproduction', None, False),
+                    ('auto', 'current', False), ('auto', 'venv', True)):
+                # Public config/main owns intake; preparation and required-file
+                # execution are exercised by the implementation domain tests.
+                config.write_text((original_config.replace('mode = "sparse_copy"', 'mode = "copy"')
+                    if environment is None else original_config.replace('mode = "sparse_copy"', 'mode = "copy"')
+                        .replace('mode = "external"', 'mode = "current"')
+                        .replace(f'python_executable = "{Path(sys.executable).as_posix()}"\n', '')
+                        .replace('reuse_source_venv = true', 'reuse_source_venv = false'))
+                    + '\n[edit_scope]\nallowed_patterns=["adapter.py"]\n', encoding='utf-8')
+                reproduction.write_text(
+                    f'[task]\ngoal="Check declared conditions"\nkind="{kind}"\noutputs=["experiments"]\n'
+                    '[model]\nname="fixture-model"\n[research]\nmaterials_only=true\n'
+                    '[budget]\nllm_requests=4\ntotal_tokens=10000\n'
+                    + ('process_invocations=3\nprocess_wall_seconds=30\n' if environment is None else '')
+                    + f'[assets]\npapers=["{task_file.as_posix()}"]\n'
+                    + f'[execution]\ncode_task_config="{config.as_posix()}"\ncwd="{project.as_posix()}"\n'
+                    + ('command=["python","adapter.py"]\n' if kind == 'reproduction' else '')
+                    + 'timeout_sec=11\ninitial_files=["adapter.py"]\n'
+                    '[execution.protocol]\nhypothesis="Declared claim"\ndataset="Fixed data"\n'
+                    'expected_outcome="Compare measured accuracy"\nmetrics=["accuracy"]\n'
+                    + (f'[execution.environment]\nmode="{environment}"\ntimeout_sec=400\n'
+                        'check_command=["python","-c","import math"]\n' if environment else ''), encoding="utf-8")
+                with self.subTest(kind=kind, environment=environment), \
+                        patch('simple_ar.cli.main._optional_research_llm_client', return_value=object()), \
+                        patch('simple_ar.cli.main._run_native_start') as native, \
+                        patch('simple_ar.app.research_application.create_session') as legacy, \
+                        patch('subprocess.run') as process, contextlib.redirect_stdout(io.StringIO()):
+                    main(['research-session', '--config', str(reproduction), '--outputs', 'experiments',
+                          *(['report'] if report else []),
+                          *(['--process-invocations', '0', '--process-wall-seconds', '0'] if environment == 'venv' else [])])
+                legacy.assert_not_called()
+                process.assert_not_called()
+                native.assert_called_once()
+                routed = native.call_args.args[0]
+                formal = routed._execution_contract
+                selected = formal if kind == 'reproduction' else formal['conditions'][0]['execution']
+                self.assertEqual(selected['cwd'], str(project.resolve()))
+                self.assertEqual(selected['result_schema'], execution['result_schema'])
+                self.assertEqual(selected['protocol']['dataset'], 'Fixed data')
+                if kind == 'reproduction':
+                    self.assertEqual(set(formal), {'command', 'cwd', 'timeout_sec', 'label', 'result_schema', 'protocol'})
+                    self.assertEqual(formal['command'], ['python', 'adapter.py'])
+                    self.assertEqual(formal['timeout_sec'], 11)
+                else:
+                    self.assertEqual([row['source'] for row in formal['conditions']], ['implementation'])
+                    self.assertEqual(routed._code_task['environment']['mode'], environment)
+                    self.assertEqual(routed._code_task['environment']['check_command'], ['python', '-c', 'import math'])
+                    self.assertNotIn('environment', formal)
+                    if environment == 'venv':
+                        self.assertEqual(selected['command'], ['python', 'benchmark.py'])
+                self.assertEqual(routed._code_task['validation_command'], ['python', 'benchmark.py'])
+                self.assertEqual(routed._code_task['timeout_sec'], 7 if kind == 'reproduction' else 11)
+                self.assertEqual(routed._code_task['new_files'], ['adapter.py'])
+                self.assertNotIn('initial_files', routed._code_task)
+                self.assertNotIn('initial_files', routed._code_task['preparation'])
+                self.assertNotIn('new_files', routed._code_task['preparation'])
+                self.assertFalse((project / 'adapter.py').exists())
+                self.assertEqual(routed.source, [project.resolve(), task_file.resolve()])
+                self.assertEqual(routed._code_task['preparation']['workspace_mode'], 'copy')
+                self.assertEqual((routed.model, routed.max_turns, routed.max_tokens), ('fixture-model', 4, 10000))
+                if environment == 'current':
+                    # Default allowance includes the check and a separate validator.
+                    self.assertGreaterEqual(routed._process_limits['process_invocations'], 3)
+                    self.assertGreaterEqual(routed._process_limits['process_wall_seconds'], 422)
+                else:
+                    self.assertEqual(routed._process_limits, {'process_invocations': 0, 'process_wall_seconds': 0}
+                        if environment == 'venv' else {'process_invocations': 3, 'process_wall_seconds': 30})
+                self.assertFalse(routed.approve_execution)
+                self.assertEqual(routed._report_requirement['config']['template'] if report else routed._report_requirement,
+                                 'auto' if report else None)
+                if kind == 'reproduction':
+                    strict_formal = formal
+            # The same public declarations also apply to code-only work.
+            reproduction.write_text(reproduction.read_text().split('[execution.protocol]')[0]
+                .replace('outputs=["experiments"]', 'outputs=["code_task"]')
+                + '[execution.environment]\nmode="current"\ntimeout_sec=400\n'
+                'check_command=["python","-c","import math"]\n', encoding='utf-8')
+            with patch('simple_ar.cli.main._optional_research_llm_client', return_value=object()), \
+                    patch('simple_ar.cli.main._run_native_start') as native, \
+                    patch('simple_ar.app.research_application.create_session') as legacy, \
+                    patch('subprocess.run') as process, contextlib.redirect_stdout(io.StringIO()):
+                main(['research-session', '--config', str(reproduction)])
+            native.assert_called_once()
+            legacy.assert_not_called()
+            process.assert_not_called()
+            code_only = native.call_args.args[0]
+            self.assertIsNone(getattr(code_only, '_execution_contract', None))
+            self.assertEqual(code_only._code_task['environment']['mode'], 'current')
+            self.assertEqual(code_only._code_task['new_files'], ['adapter.py'])
+            self.assertEqual(code_only._code_task['validation_command'], ['python', 'benchmark.py'])
+            self.assertGreaterEqual(code_only._process_limits['process_invocations'], 2)
+            self.assertGreaterEqual(code_only._process_limits['process_wall_seconds'], 400 + code_only._code_task['timeout_sec'])
+            self.assertFalse(code_only.approve_execution)
+            formal = strict_formal
+            # Reuse this normalized contract for boundaries, not a second runtime/fixture.
+            prepared = {**formal, 'code_task': {**execution['code_task'],
+                'validation_command': ['python', 'benchmark.py'], 'validation_timeout_sec': 7}}
+            arguments = dict(request='Check published conditions', outputs=('experiments',), sources=(),
+                root=root, limits={'llm_requests': 4, 'total_tokens': 10000,
+                                  'process_invocations': 3, 'process_wall_seconds': 30})
+            declared = SimpleNamespace(task_kind='reproduction', model='fixture-model',
+                _explicit_resume_destinations={'cwd'})
+            with patch('simple_ar.cli.main._run_native_start') as native:
+                # Verify this consumer invokes the shared validation gate; its
+                # type/timeout/independence matrix lives in TaskPlanTests.
+                with self.assertRaisesRegex(ValueError, 'validation_command'):
+                    migrate_exact_code_creation(declared, execution={**prepared,
+                        'code_task': {**prepared['code_task'], 'validation_command': None}}, **arguments)
+                with self.assertRaises(ValueError):
+                    migrate_exact_code_creation(declared, execution={**prepared,
+                        'code_task': {**prepared['code_task'], 'validation_command': prepared['command']}}, **arguments)
+                with self.assertRaisesRegex(ValueError, 'cwd must match'):
+                    migrate_exact_code_creation(declared, execution={**prepared, 'cwd': str(root.resolve())}, **arguments)
+                with self.assertRaisesRegex(ValueError, 'existing absolute directory'):
+                    migrate_exact_code_creation(declared, execution={**prepared, 'cwd': str(root / 'missing')}, **arguments)
+                for extra in ({'pairs': []}, {'baseline_policy': 'paired'}):
+                    self.assertFalse(migrate_exact_code_creation(declared, execution={**prepared, **extra}, **arguments))
+                with self.assertRaises(ValueError):
+                    migrate_exact_code_creation(declared, execution={**prepared,
+                        'environment': {'mode': 'current'}}, **arguments)
+                initial = {**prepared['code_task'], 'workspace_mode': 'copy',
+                    'allowed_patterns': ['adapter.py'], 'initial_files': ['adapter.py']}
+                for changes in ({'workspace_mode': 'sparse_copy'}, {'kind': 'greenfield'},
+                        {'allowed_patterns': ['*.py']},
+                        {'allowed_patterns': ['adapter.txt'], 'initial_files': ['adapter.txt']},
+                        {'allowed_patterns': ['tests/test_adapter.py'], 'initial_files': ['tests/test_adapter.py']}):
+                    with self.subTest(initial_files=changes), self.assertRaises(ValueError):
+                        migrate_exact_code_creation(declared, execution={**prepared,
+                            'code_task': {**initial, **changes}}, **arguments)
+                self.assertFalse(migrate_exact_code_creation(SimpleNamespace(task_kind='auto'),
+                    execution=prepared, **arguments))  # Topic/paper names never grant this contract.
+                self.assertFalse(migrate_exact_code_creation(SimpleNamespace(task_kind='auto'),
+                    execution={**prepared, 'baseline_policy': 'reuse'}, **arguments))
+                for mode, source in (('empty', None), ('empty', str(project)),
+                        ('copy', None), ('sparse_copy', str(root / 'missing'))):
+                    with self.subTest(baseline_without_source=(mode, source)):
+                        self.assertFalse(migrate_exact_code_creation(SimpleNamespace(task_kind='auto'), execution={**prepared,
+                            'baseline_policy': 'run', 'baseline': {'command': prepared['command']},
+                            'code_task': {**prepared['code_task'], 'kind': 'greenfield',
+                                'workspace_mode': mode, 'code_root': source}}, **arguments))
+                native.assert_not_called()
+                ordinary = SimpleNamespace(task_kind='auto', model='fixture-model')
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertTrue(migrate_exact_code_creation(ordinary, execution={**prepared,
+                        'command': ['python', 'benchmark.py'], 'baseline_policy': 'skip'}, **arguments))
+                self.assertEqual([row['source'] for row in native.call_args.args[0]._execution_contract['conditions']],
+                    ['implementation'])
+                native.reset_mock()
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertTrue(migrate_exact_code_creation(ordinary, execution={**prepared,
+                        'command': ['python', 'benchmark.py'], 'baseline_policy': 'run',
+                        'baseline': {'command': ['python', 'benchmark.py']},
+                        'code_task': {**prepared['code_task'], 'kind': 'greenfield', 'workspace_mode': 'copy'}}, **arguments))
+                baseline, candidate = native.call_args.args[0]._execution_contract['conditions']
+                self.assertEqual((baseline['source'], baseline['before_implementation']), ('preparation', True))
+                self.assertEqual(candidate['source'], 'implementation')
+                self.assertNotIn('before_implementation', candidate)
+                self.assertEqual(baseline['execution']['command'], candidate['execution']['command'])
+                self.assertFalse(native.call_args.args[0].approve_execution)
+                native.reset_mock()
+                data = project / 'observations.tsv'
+                data.write_text('value\n1\n')
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertTrue(migrate_exact_code_creation(declared, execution={**prepared,
+                        'code_task': {**prepared['code_task'], 'workspace_mode': 'copy'}},
+                        **{**arguments, 'sources': ({'role': 'dataset', 'locator': str(data)},)}))
+                self.assertEqual(native.call_args.args[0]._code_task['preparation']['data_inputs'], ['observations.tsv'])
+                native.reset_mock()
+                empty = {**prepared, 'cwd': str(root.resolve()), 'code_task': {**prepared['code_task'],
+                    'kind': 'greenfield', 'workspace_mode': 'empty', 'code_root': None}}
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertTrue(migrate_exact_code_creation(declared, execution=empty, **arguments))
+                native.assert_called_once()
+                self.assertEqual(native.call_args.args[0].source, [])
+                self.assertEqual(native.call_args.args[0]._code_task['project_path'], '')
+                self.assertEqual(native.call_args.args[0]._execution_contract['cwd'], str(root.resolve()))
 
     def test_research_case_uses_checked_in_configs_and_case_local_paths(self) -> None:
         TEST_ROOT.mkdir(exist_ok=True)
@@ -1614,10 +1750,14 @@ code = "daily"
             data.mkdir()
             (case / "task.md").write_text("Improve this project.", encoding="utf-8")
             (case / "run.py").write_text("", encoding="utf-8")
+            checker = case / 'check.py'
+            checker.write_text('import math\n', encoding='utf-8')
             (case / "research.toml").write_text(
                 '[task]\ngoal = "Improve this project"\noutputs = ["experiments"]\n'
                 '[model]\nname = "fixture-model"\n'
-                '[execution]\ncode_task_config = "code_task.toml"\n',
+                '[execution]\ncode_task_config = "code_task.toml"\n'
+                '[execution.environment]\nmode="current"\ntimeout_sec=5\n'
+                f'check_command=["python",{json.dumps(str(checker))}]\n',
                 encoding="utf-8",
             )
             (case / "code_task.toml").write_text(
@@ -1632,25 +1772,38 @@ code = "daily"
                 '[execute]\nuse_llm = true\nbaseline_policy = "skip"\n',
                 encoding="utf-8",
             )
-            app = MagicMock()
-            app.services = SimpleNamespace(max_attempts=5)
-            app.view.return_value = SimpleNamespace(
-                session_root=root / "session", status="completed", status_reason="",
-                next_action=None, state_refs={}, attempts=(),
-            )
-            app.advance.return_value = app.view.return_value
             with (
                 patch("simple_ar.cli.main._optional_research_llm_client", return_value=object()),
-                patch("simple_ar.app.research_application.create_session", return_value=app) as creator,
+                patch("simple_ar.app.research_application.create_session") as old,
+                patch("simple_ar.cli.main._run_native_start") as native,
                 contextlib.redirect_stdout(io.StringIO()),
             ):
                 main(["research-session", "--config", str(case / "research.toml")])
 
-            execution = creator.call_args.kwargs["services"].config["execution"]
+            old.assert_not_called()
+            routed = native.call_args.args[0]
+            execution = routed._execution_contract['conditions'][0]['execution']
             self.assertEqual(Path(execution["cwd"]), project)
-            self.assertEqual(execution["command"][0], "python")
+            self.assertEqual(Path(execution["command"][0]), Path(sys.executable).absolute())
             self.assertEqual(Path(execution["command"][1]), case / "run.py")
             self.assertEqual(Path(execution["command"][3]), data)
+            self.assertIn(case / 'run.py', routed.source)
+            self.assertIn(checker, routed.source)
+            self.assertNotIn(case, routed.source)  # Explicit file, not its parent or all data directories.
+            from simple_ar.tools.workspace import WorkspaceToolGateway
+            from simple_ar.tools.implementation import ImplementationToolGateway
+            from simple_ar.core.budget import BudgetLedger
+            (root / 'native').mkdir()
+            workspace = WorkspaceToolGateway(root / 'native', {f'source{i}': path
+                for i, path in enumerate(routed.source)}, BudgetLedger({}))
+            owner = ImplementationToolGateway(root / 'native', workspace, workspace.ledger,
+                'fixture', 'path-binding', exact=routed._code_task, measurement=routed._execution_contract)
+            bound = owner.approval_binding({}, identity='inspect-paths')
+            self.assertIn(str(case / 'run.py'), bound['external_inputs'])
+            import hashlib
+            self.assertEqual(bound['external_inputs'][str(checker)], hashlib.sha256(checker.read_bytes()).hexdigest())
+            with self.assertRaises(ValueError):
+                workspace.resolve(str(data))  # Directory access still needs an explicit material/data declaration.
 
 
 

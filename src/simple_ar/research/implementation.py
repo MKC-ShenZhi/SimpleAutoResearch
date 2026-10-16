@@ -2,10 +2,7 @@
 
 from dataclasses import asdict, dataclass, field
 import json
-import os
 from pathlib import Path
-import shlex
-import subprocess
 from typing import Any, Callable, Mapping
 
 from simple_ar.core.capabilities import ArtifactRef, CapabilityContext, CapabilityResult
@@ -13,10 +10,8 @@ from simple_ar.core.artifacts import read_json, write_json, write_text
 from simple_ar.research.design import ResearchDesignResult
 from simple_ar.research.task_handoff import research_handoff_text
 from simple_ar.code_task.orchestration.execute import implement_code_task
-from simple_ar.code_task.orchestration.verification import validate_repair_patch
-from simple_ar.code_task.execution.runner import run_code_task_benchmark
+from simple_ar.code_task.orchestration.verification import apply_verified_repair, verify_implementation
 from simple_ar.code_task.execution.repair import RepairEvidence, propose_repair_edits
-from simple_ar.code_task.editing.patching import apply_patch_edits
 from simple_ar.code_task.analysis.context import load_latest_code_task_context_pack
 from simple_ar.code_task.runtime.state import code_task_paths, load_code_task_manifest, save_code_task_manifest, workspace_file
 from simple_ar.code_task.editing.scope import protected_patterns_from_manifest
@@ -104,9 +99,9 @@ def run_implementation_capability(*, context: CapabilityContext, request: Implem
             max_source_chars_per_file=IMPLEMENTATION_CONTEXT_MAX_SOURCE_CHARS,
             message_callback=request.message_callback,
         )
-        outcome, attempt_steps = _implement_with_patch_correction(request.run_dir, **options)
+        outcome = implement_code_task(request.run_dir, proposal_corrections=1, **options)
         stop_reason, next_action = outcome.stop_reason, outcome.next_action
-        steps = [asdict(step) for step in attempt_steps]
+        steps = [asdict(step) for step in outcome.steps]
     else:
         failed = context.read_input_json(request.failure_ref)
         failure_dir = context.resolve_input(request.failure_ref).parent
@@ -122,8 +117,8 @@ def run_implementation_capability(*, context: CapabilityContext, request: Implem
         if repair.mode != "llm" or not repair.edit_count:
             stop_reason, next_action = "empty_repair", "Inspect the failed measurement and repair proposal."
         else:
-            apply_patch_edits(request.run_dir, edits_file=repair.proposal_path)
-            validate_repair_patch(request.run_dir, llm_client=request.llm_client)
+            apply_verified_repair(request.run_dir, repair, approval_note=request.approval_note,
+                                  llm_client=request.llm_client, message_callback=request.message_callback)
             stop_reason, next_action = "stop_point", "Measure the repaired candidate separately."
     integrity = reconcile_protocol_assets(before)
     if (
@@ -131,100 +126,22 @@ def run_implementation_capability(*, context: CapabilityContext, request: Implem
         and stop_reason == "stop_point"
         and integrity["status"] != "changed"
     ):
-        command = (
-            subprocess.list2cmdline(request.validation_command)
-            if os.name == "nt"
-            else shlex.join(request.validation_command)
-        )
-        validation = run_code_task_benchmark(
-            request.run_dir,
-            command=command,
+        verified = verify_implementation(
+            request.run_dir, command=request.validation_command, approval_note=request.approval_note,
+            llm_client=request.llm_client, max_repairs=request.max_repairs,
             timeout_sec=request.validation_timeout_sec or 60,
-            skip_validation=True,
-            run_label="patched",
-            budget_ledger=request.budget_ledger,
-            session_id=request.session_id,
-            attempt_id=request.attempt_id,
+            max_files=IMPLEMENTATION_CONTEXT_MAX_FILES,
+            max_source_chars_per_file=IMPLEMENTATION_CONTEXT_MAX_SOURCE_CHARS,
+            asset_guard=lambda: reconcile_protocol_assets(before),
+            budget_ledger=request.budget_ledger, session_id=request.session_id,
+            attempt_id=request.attempt_id, message_callback=request.message_callback,
         )
-        for repair_index in range(1, request.max_repairs + 1):
-            if validation.status == "passed":
-                break
-            if validation.status not in {"failed", "timed_out"}:
-                break
-            remaining_processes = (
-                request.budget_ledger.remaining("process_invocations")
-                if request.budget_ledger is not None else None
-            )
-            if remaining_processes is not None and remaining_processes < 1:
-                break
-            if request.message_callback:
-                request.message_callback(
-                    f"Bug validation failed; proposing bounded technical repair {repair_index}/{request.max_repairs}."
-                )
-            streams = [(name, path.read_text(encoding="utf-8", errors="replace"))
-                       for name, path in (("stderr", validation.stderr_path), ("stdout", validation.stdout_path))]
-            streams = [(name, text) for name, text in streams if text.strip()]
-            per_stream = 8000 // max(1, len(streams))
-            failure_text = "\n\n".join(f"{name}:\n{text[-per_stream:]}" for name, text in streams)
-            run_report = read_json(validation.report_path)
-            history_ref = run_report.get("history_report") if isinstance(run_report, Mapping) else None
-            if not isinstance(history_ref, str) or not history_ref.startswith("code_task/run/patched/attempts/"):
-                raise ValueError("Bug validation did not record an immutable failed-run report.")
-            archived_report = request.run_dir / history_ref
-            archived_stderr = archived_report.parent / "stderr.txt"
-            if not archived_report.is_file() or not archived_stderr.is_file():
-                raise ValueError("Bug validation failed-run history is incomplete.")
-            failed_validation_artifacts.append((archived_report, archived_stderr))
-            failure = RepairEvidence(
-                source=str(archived_report),
-                execution_report={
-                    "execution_status": validation.status,
-                    "returncode": validation.returncode,
-                    "timed_out": validation.timed_out,
-                    "command": list(request.validation_command),
-                },
-                failure_analysis=failure_text or f"Validation command {validation.status} without captured output.",
-            )
-            repair = propose_repair_edits(
-                request.run_dir, llm_client=request.llm_client,
-                max_files=IMPLEMENTATION_CONTEXT_MAX_FILES,
-                max_source_chars_per_file=IMPLEMENTATION_CONTEXT_MAX_SOURCE_CHARS,
-                message_callback=request.message_callback, failure_evidence=failure,
-            )
-            repair_paths = {
-                "repair_proposal": repair.proposal_path,
-                "failure_evidence": repair.repair_dir / "failure_evidence.json",
-            }
-            record = {
-                "round": repair_index,
-                "failed_validation_report": str(archived_report),
-                "repair_proposal": str(repair.proposal_path),
-                "edit_count": repair.edit_count,
-            }
-            validation_repairs.append(record)
-            if repair.mode != "llm" or not repair.edit_count:
-                record["outcome"] = "no_repair_edits"
-                break
-            apply_patch_edits(request.run_dir, edits_file=repair.proposal_path)
-            validate_repair_patch(
-                request.run_dir, llm_client=request.llm_client,
-                message_callback=request.message_callback,
-            )
-            integrity = reconcile_protocol_assets(before)
-            if integrity["status"] == "changed":
-                record["outcome"] = "protected_asset_changed"
-                break
-            validation = run_code_task_benchmark(
-                request.run_dir,
-                command=command,
-                timeout_sec=request.validation_timeout_sec or 60,
-                skip_validation=True,
-                run_label="patched",
-                budget_ledger=request.budget_ledger,
-                session_id=request.session_id,
-                attempt_id=request.attempt_id,
-            )
-            record["outcome"] = validation.status
+        validation = verified.validation
+        validation_repairs = list(verified.repairs)
+        failed_validation_artifacts = list(verified.failed_artifacts)
+        if verified.repair is not None:
+            repair_paths = {"repair_proposal": verified.repair.proposal_path,
+                            "failure_evidence": verified.repair.repair_dir / "failure_evidence.json"}
         stop_reason = "stop_point" if validation.status == "passed" else "validation_failed"
         next_action = (
             "Review the recorded bug validation artifacts before accepting the patch."
@@ -256,6 +173,9 @@ def run_implementation_capability(*, context: CapabilityContext, request: Implem
         "research_handoff": paths.task_dir / "research_handoff.json",
         "edit_proposal": paths.meta_dir / "proposed_edits.json",
         "context_followup": paths.meta_dir / "edit_context_followup.json",
+        **({f'generation_{name}': paths.meta_dir / f'{name}.json' for name in (
+            'task_contract', 'architecture_plan', 'code_artifacts', 'dependency_advice', 'implementation_plan')}
+            if manifest.get('code_task', {}).get('kind') == 'greenfield' else {}),
         **({"dependency_api": paths.meta_dir / "dependency_api.json"}
            if isinstance(proposal_data, Mapping) and proposal_data.get("dependency_api") else {}),
         **({"source_context": source_context.prompt_context_path} if source_context is not None else {}),
@@ -304,6 +224,9 @@ def run_implementation_capability(*, context: CapabilityContext, request: Implem
         copy_code_analysis_package(paths.workspace_dir, delivery, workspace=True)
         evidence["code_analysis"] = context.store.ref("code_analysis/analysis.json", kind="code_analysis",
             schema="code_analysis.v1", producer="research.implementation")
+    if (manifest.get('code_task', {}).get('native_binding') or {}).get('binding', {}).get('environment_preparations'):
+        for name, kind in (('environment_setup', 'environment_setup'), ('environment_observation', 'environment_runtime')):
+            evidence[name] = context.store.ref(name + '.json', kind=kind, schema=kind + '.v1', producer='research.preparation')
     artifact_payload: dict[str, Any] = {
         "schema_version": "research_implementation.v1",
         "status": "validated" if finished else "incomplete",
@@ -326,6 +249,16 @@ def run_implementation_capability(*, context: CapabilityContext, request: Implem
             "reason": "No candidate-specific behavior criterion and observed result were recorded together.",
             "validation_hints": list(design.contract.validation_hints) if design.contract else [],
         }
+    native_binding = manifest.get('code_task', {}).get('native_binding')
+    if native_binding is not None:
+        import hashlib
+        from simple_ar.code_task.runtime.state import implementation_file_hashes
+        artifact_payload['native_binding'] = native_binding
+        artifact_payload['implementation_file_hashes'] = implementation_file_hashes(request.run_dir)
+        artifact_payload['artifact_hashes'] = {
+            ref.path: hashlib.sha256(context.store.resolve(ref).read_bytes()).hexdigest()
+            for ref in evidence.values()
+        }
     artifact = context.store.write_json(
         "implementation.json", artifact_payload,
         kind="implementation_result", schema="research_implementation.v1", producer="research.implementation",
@@ -338,23 +271,6 @@ def run_implementation_capability(*, context: CapabilityContext, request: Implem
             next_action, f"Asset integrity: {integrity['status']}",
         ),
     )
-
-
-def _implement_with_patch_correction(run_dir: Path, **options: Any) -> tuple[Any, tuple[Any, ...]]:
-    """Use CodeTask's one-shot proposal correction without restarting research.
-
-    A rejected proposal does not change workspace files. CodeTask already
-    records the patch/budget failure and can regenerate once from actual source;
-    research must make that existing correction reachable before pausing.
-    """
-    first = implement_code_task(run_dir, **options)
-    if first.stop_reason not in {"patch_apply_failed", "edit_budget_rejected"}:
-        return first, tuple(first.steps)
-    callback = options.get("message_callback")
-    if callback is not None:
-        callback("Edit proposal failed patch or budget validation; retrying once with recorded failure context and unchanged limits.")
-    second = implement_code_task(run_dir, **options)
-    return second, (*first.steps, *second.steps)
 
 
 def _prepare_research_task(

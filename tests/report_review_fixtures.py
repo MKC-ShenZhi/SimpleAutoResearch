@@ -1,9 +1,49 @@
 """Literal draft anchors for synthetic orchestration clients, not fact proofs."""
+import copy
 import json
+from contextlib import contextmanager
+
+from simple_ar.core.artifacts import write_json
 
 from simple_ar.report.schema import (ReportContext, ReportMemory, ReportRuntimeConfig,
     ReportSectionPlan, ReportSectionDraft, ReviewerFinding, ReportDraftQuote)
 from simple_ar.report.templates import load_report_template_bundle
+from simple_ar.report.tool_gateway import ReportToolGateway
+
+
+class CheckpointStop(BaseException):
+    """Interrupt outside the agent's handled provider/runtime failures."""
+
+
+def interrupt_checkpoint(saved, predicate):
+    def checkpoint(row):
+        saved.append(copy.deepcopy(row))
+        if predicate(row):
+            raise CheckpointStop()
+    return checkpoint
+
+
+@contextmanager
+def changed_record(path, record):
+    """Temporarily corrupt or remove a receipt, restoring its exact bytes."""
+    original = path.read_bytes()
+    try:
+        if record is None:
+            path.unlink()
+        elif isinstance(record, bytes):
+            path.write_bytes(record)
+        else:
+            write_json(path, record)
+        yield
+    finally:
+        path.write_bytes(original)
+
+
+def agent_inputs(context, memory, config):
+    """Bind a fresh template and gateway to the scenario's explicit inputs."""
+    return dict(context=context, memory=memory, config=config,
+        template=load_report_template_bundle(report_mode=context.report_mode, config=config),
+        gateway=ReportToolGateway(context))
 
 
 def finding_check_objects(*, historical=True, finding_changes=None, **settings):
@@ -62,6 +102,18 @@ def unresolved_opinion_response(view, *, verdict="revise_required",
 def prompt_payload(prompt):
     """Decode the JSON view after a protocol preamble, without altering evidence."""
     return json.JSONDecoder().raw_decode(prompt[prompt.index("{"):])[0]
+
+
+class ReviewPromptCapture:
+    """Capture reviewer inputs while leaving historical opinions unresolved."""
+    def __init__(self):
+        self.views = []
+
+    def ask_json(self, system, prompt, **unused):
+        view = prompt_payload(prompt)
+        self.views.append(view)
+        return unresolved_opinion_response(view, verdict=None,
+            explanation="Input ownership capture does not resolve the allegation.")
 
 
 def draft_quotes(prompt, section_id):

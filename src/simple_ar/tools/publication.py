@@ -93,6 +93,13 @@ def export_input_binding(source: Path, request: ExportRequest, *, output_root: P
 
 
 class PublicationToolGateway:
+    def can_reconcile(self, name: str, identity: str) -> bool:
+        return name == 'export_report' and (
+            self.workspace.workspace / 'publications' / identity / 'export.json').is_file() and self.has_started(identity)
+
+    def has_started(self, identity: str) -> bool:
+        return (self.root / 'tools' / 'publications' / identity / 'request.json').is_file()
+
     def __init__(self, root: Path, workspace: Any, ledger: Any) -> None:
         self.root, self.workspace, self.ledger = root, workspace, ledger
 

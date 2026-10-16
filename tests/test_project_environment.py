@@ -1,3 +1,6 @@
+import contextlib
+import io
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -7,15 +10,18 @@ from unittest.mock import patch
 from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
 from simple_ar.experiment.execution.backend import RunRequest, RunResult
 from simple_ar.research.preparation import PreparationRequest, run_preparation_capability
-from simple_ar.research.project_environment import environment_profile
+from simple_ar.research.project_environment import (
+    environment_profile, project_environment_plan, project_environment_process_env,
+)
 from simple_ar.cli.parser import build_parser
-from simple_ar.cli.start import prepare_start
+from simple_ar.cli.start import _inline_value, prepare_start
 from simple_ar.cli.research_config import research_defaults
 from simple_ar.research.task_plan import TaskPlanRequest, default_task_steps, build_task_plan
 
 
 class ProjectEnvironmentTests(unittest.TestCase):
     def test_session_reuses_completed_check_and_measures_only_the_formal_command(self):
+        # Historical sessions retain their separate preparation/resume contract.
         from simple_ar.app.research_application import create_session, load_session, ResearchApplicationServices
         from simple_ar.research.workflow_contracts import ResearchBrief
         with tempfile.TemporaryDirectory() as folder:
@@ -61,6 +67,16 @@ class ProjectEnvironmentTests(unittest.TestCase):
                 context = self.context(root)
                 request = self.request(root, environment={'mode': 'current',
                     'check_command': [sys.executable, '-c', program], 'timeout_sec': timeout})
+                paths = list(root.rglob('*'))
+                plan = project_environment_plan(request.execution['environment'], root,
+                    context.store.root / 'environment', request.run.command)
+                self.assertEqual(list(root.rglob('*')), paths)
+                self.assertEqual(plan, {'profile': environment_profile(request.execution['environment'], project=root),
+                    'steps': [[sys.executable, '-c', program]], 'command': request.run.command,
+                    'python_executable': None})
+                explicit = {'PYTHONPATH': '/selected/packages', 'PYTHONHOME': '/selected/python'}
+                self.assertIs(project_environment_process_env(plan['profile'], explicit), explicit)
+                self.assertIsNone(project_environment_process_env(plan['profile'], None))
                 result = run_preparation_capability(context=context, request=request, backend=LocalExecutionBackend())
                 self.assertEqual(result.status, expected)
                 self.assertFalse((context.store.root / 'environment').exists())
@@ -78,23 +94,83 @@ class ProjectEnvironmentTests(unittest.TestCase):
                     run_preparation_capability(context=context, request=request, backend=LocalExecutionBackend())
 
     def test_current_check_guided_config_and_budget_share_the_preparation_owner(self):
+        from simple_ar.app.tool_application import ToolApplication
+        from simple_ar.cli.main import main
         with tempfile.TemporaryDirectory() as folder:
-            root = Path(folder)
+            root = Path(folder).resolve()
             (root / 'paper.md').write_text('Reference')
+            (root / 'data.txt').write_text('0.5')
+            (root / 'check.py').write_text("from pathlib import Path\nassert Path('data.txt').is_file()\n"
+                "with Path('checks').open('a') as f: f.write('checked\\n')\nprint('score: 999')\n")
+            (root / 'run.py').write_text("from pathlib import Path\n"
+                "with Path('measurements.log').open('a') as f: f.write('measured\\n')\n"
+                "print('score: ' + Path('data.txt').read_text())\n")
             args = build_parser().parse_args(['start', '--kind', 'reproduction', '--goal', 'Check conclusion',
                 '--document', str(root / 'paper.md'), '--project', str(root),
                 '--hypothesis', 'Claim', '--dataset', 'Fixed data', '--expected-outcome', 'Compare score',
                 '--metric', 'score', '--timeout-sec', '7', '--prepare-only', '--output-root', str(root / 'runs'),
-                '--check-argv', '["python", "check.py"]', '--command', 'python', 'run.py'])
+                '--check-argv', json.dumps([sys.executable, 'check.py']),
+                '--command', sys.executable, 'run.py', '--fixed', '42'])
             with patch('sys.stdin.isatty', return_value=False), patch('simple_ar.cli.start.print_line'):
                 config = prepare_start(args)
             defaults = research_defaults(['research-session', '--config', str(config)])
-            self.assertEqual(defaults['execution_details']['environment']['check_command'], ['python', 'check.py'])
+            profile = defaults['execution_details']['environment']
+            self.assertEqual(profile['check_command'], [sys.executable, 'check.py'])
             self.assertEqual(defaults['process_invocations'], 2)
             self.assertEqual(defaults['process_wall_seconds'], 14)
-            request = TaskPlanRequest(goal='Observe', request_text='Observe', task_kind='measurement',
-                requested_outputs=('experiments',), execution={**defaults['execution_details'], 'command': defaults['command_argv']}, execution_protocol_accepted=True)
-            self.assertEqual([row.action for row in build_task_plan(request).steps], ['prepare_execution', 'experiment', 'analysis'])
+            plan = project_environment_plan(profile, root, root / 'future-attempt' / 'environment', defaults['command_argv'])
+            self.assertEqual(defaults['process_invocations'], len(plan['steps']) + 1)
+            self.assertFalse((root / 'future-attempt').exists())
+            # The reproduction bundle keeps its research controls. Its literal
+            # execution/budget can also be explicitly requested as measurement.
+            execution = {**defaults['execution_details'], 'command': defaults['command_argv'],
+                'cwd': defaults['cwd'], 'timeout_sec': defaults['timeout_sec'], 'primary_metric': defaults['primary_metric'],
+                'metrics': defaults['metric']}
+            measurement = root / 'measurement.toml'
+            measurement.write_text('[task]\nkind="measurement"\ngoal="Observe declared data"\noutputs=["experiments"]\n'
+                '[model]\nname=""\n[execution]\n'
+                + ''.join(f'{key}={_inline_value(value)}\n' for key, value in execution.items())
+                + '[budget]\n' + ''.join(f'{key}={defaults[key]}\n' for key in
+                    ('process_invocations', 'process_wall_seconds')), encoding='utf-8')
+            with patch('sys.stdin.isatty', return_value=False), contextlib.redirect_stdout(io.StringIO()) as output, \
+                    patch.dict('os.environ', {'SAR_ENV_DISPLAY_SECRET': 'not-for-approval-display'}), \
+                    patch('simple_ar.app.research_application.create_session', side_effect=AssertionError('No legacy new session')), \
+                    patch('simple_ar.app.tool_application.LLMClient.from_env', side_effect=AssertionError('No model')):
+                main(['research-session', '--config', str(measurement), '--output-root', str(root / 'native')])
+                display = ' '.join(output.getvalue().split())
+                self.assertIn('Environment preparation steps (literal argv):', display)
+                self.assertIn(''.join(json.dumps([sys.executable, 'check.py'], ensure_ascii=False).split()),
+                    ''.join(output.getvalue().split()))
+                self.assertIn('2 invocations; <= 14s declared wall reservation', display)
+                self.assertIn('Shared process limits:', display)
+                self.assertNotIn('SAR_ENV_DISPLAY_SECRET', output.getvalue())
+                self.assertNotIn('not-for-approval-display', output.getvalue())
+                app = ToolApplication.load(next((root / 'native').rglob('session_manifest.json')).parent)
+                self.assertEqual(app.session.manifest.status, 'completed', app.session.manifest.status_reason)
+                self.assertIsNone(app.state['config']['model'])
+                self.assertEqual(app.state['config']['execution_contract']['environment'], profile)
+                self.assertEqual(app.ledger.limits['process_invocations'], defaults['process_invocations'])
+                self.assertEqual(app.ledger.limits['process_wall_seconds'], defaults['process_wall_seconds'])
+                self.assertEqual(app.ledger.remaining('process_invocations'), 0)
+                self.assertEqual(len(app.ledger.entries), 2)
+                self.assertEqual(len(app.session.list_attempts()), 1)
+                observed = app.session.store.read_json(app.state['turns'][0]['tools'][0]['result'])
+                canonical = app.workspace.resolve(observed['data']['result_ref'])
+                self.assertEqual({entry.attempt_id for entry in app.ledger.entries}, {canonical.parent.name})
+                measured = json.loads(canonical.read_text(encoding='utf-8'))
+                self.assertEqual(measured['metrics'], {'score': 0.5})
+                self.assertEqual(measured['command'], defaults['command_argv'])
+                self.assertEqual(app.session.store.resolve(measured['preparation']['source_ref']['path']),
+                    canonical.with_name('execution.json'))
+                self.assertIn('score: 999', (canonical.parent / 'environment_logs/1.stdout.txt').read_text())
+                self.assertTrue(any(path.endswith('/analysis.md') for path in
+                    app.session.store.read_json('delivery.json')['artifacts']))
+                with patch('simple_ar.experiment.execution.backend.run_process') as process:
+                    main(['start', '--resume-task', str(app.session.store.root), '--yes'])
+                    process.assert_not_called()
+                self.assertEqual(ToolApplication.load(app.session.store.root).session.manifest.status, 'completed')
+                self.assertEqual((root / 'checks').read_text().splitlines(), ['checked'])
+                self.assertEqual((root / 'measurements.log').read_text().splitlines(), ['measured'])
 
     def test_application_preparation_requires_declared_scope_not_fake_research_design(self):
         from simple_ar.app.research_application import create_session, ResearchApplicationServices
@@ -108,7 +184,6 @@ class ProjectEnvironmentTests(unittest.TestCase):
             with patch.object(app, '_execute', return_value=True) as execute:
                 self.assertTrue(app._run_prepare_execution_action())
             self.assertNotIn('design', [ref.kind for ref in execute.call_args.args[3]])
-            self.assertIs(execute.call_args.kwargs['backend'].budget_ledger, app.budget_ledger)
             self.assertEqual(execute.call_args.args[2].execution['environment']['mode'], 'venv')
 
     def context(self, root):
@@ -131,6 +206,10 @@ class ProjectEnvironmentTests(unittest.TestCase):
             root = Path(folder)
             with self.assertRaisesRegex(ValueError, 'not found inside'):
                 environment_profile({'mode': 'venv', 'requirements': ['absent.txt']}, project=root)
+            for mode in ('current', 'venv'):
+                with self.subTest(same_command=mode), self.assertRaisesRegex(ValueError, 'must differ'):
+                    project_environment_plan({'mode': mode, 'check_command': ['python', 'formal.py']},
+                        root, root / 'environment', ['python', 'formal.py'])
         self.assertEqual(environment_profile({'mode': 'venv'})['requirements'], [])
 
     def test_each_step_uses_same_backend_and_final_command_preserves_scientific_arguments(self):
@@ -148,14 +227,30 @@ class ProjectEnvironmentTests(unittest.TestCase):
                         python.parent.mkdir(parents=True)
                         python.touch()
                     return RunResult(0, False, 'observed stdout', '', command=request.command, cwd=str(request.cwd))
-            with patch.dict('os.environ', {'PYTHONPATH': '/controller/packages', 'PYTHONHOME': '/controller/python',
-                                         'PIP_INDEX_URL': 'https://pypi.org/simple'}):
-                result = run_preparation_capability(context=context, request=self.request(root,
+            request = self.request(root,
                 baseline={'command': ['python3', 'control.py', '--seed', '42'], 'label': 'control'},
                 environment={'mode': 'venv', 'requirements': ['requirements.txt'], 'timeout_sec': 7,
-                             'check_command': ['python.exe', 'check.py']}), backend=Backend())
+                             'check_command': ['python.exe', 'check.py']})
+            paths = list(root.rglob('*'))
+            plan = project_environment_plan(request.execution['environment'], root,
+                context.store.root / 'environment', request.run.command)
+            self.assertEqual(list(root.rglob('*')), paths)
+            self.assertEqual(request.run.command, ['python', 'run.py', '--fixed', '42'])
+            self.assertEqual(request.execution['environment']['check_command'], ['python.exe', 'check.py'])
+            explicit = {'PYTHONPATH': '/selected/packages', 'PYTHONHOME': '/selected/python', 'PIP_INDEX_URL': 'selected-index'}
+            self.assertEqual(project_environment_process_env(plan['profile'], explicit), {'PIP_INDEX_URL': 'selected-index'})
+            self.assertEqual(set(explicit), {'PYTHONPATH', 'PYTHONHOME', 'PIP_INDEX_URL'})
+            with patch.dict('os.environ', {'PYTHONPATH': '/controller/packages', 'PYTHONHOME': '/controller/python',
+                                         'PIP_INDEX_URL': 'https://pypi.org/simple'}):
+                inherited = project_environment_process_env(plan['profile'], None)
+                self.assertNotIn('PYTHONPATH', inherited)
+                self.assertNotIn('PYTHONHOME', inherited)
+                self.assertEqual(inherited['PIP_INDEX_URL'], 'https://pypi.org/simple')
+                result = run_preparation_capability(context=context, request=request, backend=Backend())
             self.assertEqual(result.status, 'completed')
             self.assertEqual(len(calls), 4)
+            self.assertEqual([row.command for row in calls], plan['steps'])
+            self.assertEqual([row.label for row in calls], [f'environment:{number}' for number in range(1, 5)])
             self.assertTrue(all('PYTHONPATH' not in row.env and 'PYTHONHOME' not in row.env for row in calls))
             self.assertTrue(all(row.env['PIP_INDEX_URL'] == 'https://pypi.org/simple' for row in calls))
             self.assertTrue(all(row.timeout_sec == 7 and row.session_id == 'session' and row.attempt_id == 'prepare-1' for row in calls))
@@ -165,6 +260,8 @@ class ProjectEnvironmentTests(unittest.TestCase):
             self.assertEqual(calls[3].command, [calls[2].command[0], 'check.py'])
             payload = context.store.read_json(next(ref for ref in result.artifacts if ref.kind == 'prepared_execution'))
             self.assertNotIn('environment', payload['execution'])
+            self.assertEqual(payload['execution']['command'], plan['command'])
+            self.assertEqual(payload['environment']['python_executable'], plan['python_executable'])
             self.assertEqual(payload['execution']['command'][1:], ['run.py', '--fixed', '42'])
             self.assertTrue(payload['execution']['command'][0].startswith(str(context.store.root)))
             self.assertEqual(payload['execution']['timeout_sec'], 19)
@@ -211,11 +308,15 @@ class ProjectEnvironmentTests(unittest.TestCase):
                             python.touch()
                         return RunResult(0, False, 'observed', '', command=request.command)
                 context = self.context(root)
-                result = run_preparation_capability(context=context, request=self.request(root,
+                request = self.request(root,
                     baseline={'command': ['explicit-baseline-python', 'control.py']},
-                    environment={'mode': 'venv', 'requirements': requirements, 'install_project': True}), backend=Backend())
+                    environment={'mode': 'venv', 'requirements': requirements, 'install_project': True})
+                plan = project_environment_plan(request.execution['environment'], root,
+                    context.store.root / 'environment', request.run.command)
+                result = run_preparation_capability(context=context, request=request, backend=Backend())
                 self.assertEqual(result.status, 'completed')
                 self.assertEqual(len(calls), 3)
+                self.assertEqual([row.command for row in calls], plan['steps'])
                 self.assertEqual(calls[1].command[1:5], ['-m', 'pip', 'install', '--disable-pip-version-check'])
                 self.assertEqual(calls[1].command[5:],
                                  (['-r', str(root / 'requirements.txt')] if requirements else []) + [str(root)])
@@ -280,6 +381,15 @@ class ProjectEnvironmentTests(unittest.TestCase):
             for changes in ({'command': [sys.executable, 'run.py']}, {'code_task': {}}, {'dataset': 'x.csv'}, {'pairs': [{}]}):
                 with self.subTest(changes=changes), self.assertRaises(ValueError):
                     run_preparation_capability(context=self.context(root), request=self.request(root, **changes))
+            from simple_ar.cli.start import migrate_measurement_creation
+            args = build_parser().parse_args(['research-session', '--topic', 'Explicit environment', '--task-kind', 'measurement'])
+            execution = self.request(root).execution
+            with patch('simple_ar.app.tool_application.ToolApplication.create') as create:
+                # CodeTask still owns its own preparation. Frozen no-code
+                # comparisons are exercised through the shared scientific owner.
+                self.assertFalse(migrate_measurement_creation(args, execution={**execution, 'code_task': {}},
+                    request='Retain CodeTask preparation owner', outputs=('experiments',), root=root, limits={}))
+                create.assert_not_called()
 
     def test_guided_option_serializes_same_profile_and_counts_preparation_invocations(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -300,6 +410,10 @@ class ProjectEnvironmentTests(unittest.TestCase):
             self.assertEqual(defaults['process_invocations'], 4)
             self.assertEqual(defaults['process_wall_seconds'], 44)
             self.assertEqual(defaults['command_argv'], ['python', 'run.py'])
+            plan = project_environment_plan(profile, root, root / 'budget-preview' / 'environment', defaults['command_argv'])
+            self.assertEqual(defaults['process_invocations'], len(plan['steps']) + 1)
+            self.assertFalse((root / 'budget-preview').exists())
+            self.assertNotIn('__attempt__', config.read_text(encoding='utf-8'))
 
     def test_measurement_plan_has_only_confirmed_preparation_then_measurement_analysis(self):
         request = TaskPlanRequest(goal='Observe fixed runtime', request_text='Observe fixed runtime', task_kind='measurement', requested_outputs=('experiments',),

@@ -23,6 +23,46 @@ from simple_ar.result_analysis.schema import AnalysisResult
 
 
 class AnalysisCapabilityTests(unittest.TestCase):
+    def test_exact_table_owner_preserves_literal_grant_and_explicit_limits(self):
+        from simple_ar.tools.analysis import AnalysisToolGateway, validate_table_analysis_contract
+        from simple_ar.tools.workspace import WorkspaceToolGateway
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = WorkspaceToolGateway(root, {}, None)
+            workspace.call('write_file', {'path': 'workspace/data.csv',
+                'content': 'value\n1\n2\n'}, identity='data')
+            grant = {'path': 'workspace/data.csv', 'spec': {
+                'value_columns': ['value'], 'observation_unit': 'supplied row',
+                'max_mb': 37, 'max_figures': 101, 'max_points': 10001}}
+            frozen = validate_table_analysis_contract(workspace, grant)
+            owner = AnalysisToolGateway(root, workspace, contract=frozen)
+            grant['spec']['max_mb'] = 1  # Caller mutation cannot alter the grant.
+            with patch('simple_ar.tools.analysis.preview_table_source', return_value={'row_count': 2}) as preview:
+                self.assertEqual(owner.call('inspect_table', {'path': frozen['path']}, identity='inspect').status, 'ok')
+                self.assertEqual(preview.call_args.kwargs['max_mb'], 37)
+                denied = owner.call('inspect_table', {'path': str(workspace.resolve(frozen['path']))}, identity='alias')
+                self.assertEqual(denied.status, 'error')
+                self.assertIn('original authorized path', denied.error)
+            changed = {**frozen, 'spec': {**frozen['spec'], 'observation_unit': 'invented replicate'}}
+            with patch('simple_ar.tools.analysis.snapshot_table_capability') as snapshot:
+                self.assertIn('frozen TableSpec', owner.call('analyze_table', changed, identity='changed').error)
+                snapshot.assert_not_called()
+            ordinary = AnalysisToolGateway(root, workspace)
+            self.assertIn('bounded to 20 MB', ordinary.call('analyze_table', frozen, identity='ungranted').error)
+            # Reach the retained snapshot owner with the exact original limits,
+            # without computing figures or calling any model in this check.
+            from simple_ar.core.capabilities import CapabilityResult
+            with patch('simple_ar.tools.analysis.snapshot_table_capability',
+                       return_value=CapabilityResult(status='blocked')) as snapshot:
+                self.assertIn('snapshot did not complete', owner.call('analyze_table', frozen, identity='exact').error)
+                self.assertEqual(snapshot.call_args.kwargs['request']['max_mb'], 37)
+                self.assertEqual(snapshot.call_args.kwargs['request']['max_points'], 10001)
+            self.assertFalse((root / 'tools/analysis/changed').exists())
+            with self.assertRaises(ValueError):
+                AnalysisToolGateway(root, workspace, contract={**frozen, 'unexpected': True})
+            with self.assertRaises(ValueError):
+                validate_table_analysis_contract(workspace, {**frozen, 'path': 'workspace/missing.csv'})
+
     def test_single_execution_analysis_receives_implementation_lineage(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = ArtifactStore(Path(tmp))
@@ -144,6 +184,34 @@ class AnalysisCapabilityTests(unittest.TestCase):
             self.assertIsNone(summaries[1]["delta_sample_std"])
             self.assertTrue(any("no significance" in text for text in evidence["limitations"]))
             self.assertEqual(evidence["implementation_ref"], implementation_ref.to_dict())
+            candidate_only = store.write_json('candidate-only.json', {'pairs': [
+                {**pair, 'baseline': None} for pair in pairs], 'baseline_policy': 'skip'}, kind='experiment_set')
+            analyze_experiment_capability(context=CapabilityContext(store, AttemptManifest('candidate-only'),
+                inputs=(candidate_only, *inputs, implementation_ref)), result_ref=candidate_only, analysis_context={})
+            descriptive = store.read_json('paired_analysis.json')
+            self.assertEqual(descriptive['status'], 'passed')
+            self.assertEqual(descriptive['missing_measurements'], [])
+            self.assertEqual(descriptive['paired_summary'], [])
+            self.assertEqual(descriptive['comparisons'], [])
+            self.assertEqual([row['n'] for row in descriptive['condition_summary']], [2, 1])
+            self.assertIsNone(descriptive['condition_summary'][1]['candidate_sample_std'])
+            hidden = store.write_json('hidden-baseline.json', {'pairs': pairs, 'baseline_policy': 'skip'}, kind='experiment_set')
+            with self.assertRaisesRegex(ValueError, 'cannot hide'):
+                analyze_experiment_capability(context=CapabilityContext(store, AttemptManifest('hidden-baseline'),
+                    inputs=(hidden, *inputs, implementation_ref)), result_ref=hidden, analysis_context={})
+            for role in ('baseline', 'candidate'):
+                altered = store.read_json(f'{role}-1.json')
+                altered['result_schema'] = {'output_files': {'measurements': 'metrics.json'},
+                    'metric_sources': {'accuracy': {'output': 'measurements', 'path': ['nested', 'value']}}}
+                store.write_json(f'{role}-1.json', altered)
+            # Each seed pair still matches internally; different selectors must
+            # not silently join the same cross-seed mean.
+            analyze_experiment_capability(context=CapabilityContext(store,
+                AttemptManifest('different-schema'), inputs=(collection, *inputs, implementation_ref)),
+                result_ref=collection, analysis_context={})
+            separated = store.read_json('paired_analysis.json')['paired_summary']
+            self.assertEqual(len(separated), 3)
+            self.assertTrue(all(row['n'] == 1 for row in separated))
             other_ref = store.write_json("other-implementation.json", {}, kind="implementation_result")
             mismatched = store.write_json("mismatched-set.json", {
                 "pairs": pairs, "implementation_ref": other_ref.to_dict(),
@@ -154,6 +222,20 @@ class AnalysisCapabilityTests(unittest.TestCase):
                     inputs=(mismatched, *inputs, implementation_ref)),
                     result_ref=mismatched, analysis_context={},
                 )
+            # Exit-zero/canonical passed does not overrule independent guard
+            # rejection. The shared owner, not a native-only adapter, excludes it.
+            rejected = store.read_json('candidate-0.json')
+            rejected['guard'] = {'status': 'failed'}
+            store.write_json('candidate-0.json', rejected)
+            guarded = analyze_experiment_capability(context=CapabilityContext(store,
+                AttemptManifest('guard-analysis'), inputs=(collection, *inputs, implementation_ref)),
+                result_ref=collection, analysis_context={})
+            guarded_set = store.read_json('paired_analysis.json')
+            self.assertEqual(guarded_set['status'], 'incomplete')
+            self.assertEqual(guarded_set['failed_measurements'][0]['artifact'], 'candidate-0.json')
+            self.assertNotIn(0, [seed for row in guarded_set['paired_summary'] for seed in row['seeds']])
+            self.assertIn(guarded.status, {'partial', 'failed'})
+            self.assertEqual(store.read_json('candidate-0.json'), rejected)
 
     def test_collection_analysis_preserves_failed_and_missing_pairs_without_zero_fill(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -181,6 +263,7 @@ class AnalysisCapabilityTests(unittest.TestCase):
             self.assertEqual(evidence["seed_evidence"][0]["metrics"], {"accuracy": 0.75})
             self.assertEqual(evidence["comparisons"][0]["candidate_ref"], failed.to_dict())
             self.assertEqual(evidence["metrics"], {})
+            self.assertTrue(evidence['coverage_gaps'])
 
     def test_analysis_handoff_round_trips_without_execution(self) -> None:
         handoff = AnalysisHandoff(

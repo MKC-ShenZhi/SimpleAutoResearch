@@ -49,53 +49,11 @@ def build_parser(
     export_parser.add_argument("--compile", action="store_true", help="Also compile with installed pdflatex/bibtex; retain source and logs on failure.")
 
 
-    brief_parser = subparsers.add_parser(
-        "research-brief",
-        help="Build an evidence-backed research brief from a topic or local documents.",
-    )
-    brief_parser.add_argument("--topic", required=True)
-    brief_parser.add_argument(
-        "--model",
-        default=None,
-        help="Optional model override; enables LLM-backed planning, reading, and synthesis.",
-    )
-    brief_parser.add_argument(
-        "--output-root",
-        default="runs/research-brief",
-        help="Parent directory for the timestamped brief session.",
-    )
-    brief_parser.add_argument(
-        "--cache-dir",
-        default=None,
-        help="Optional shared full-text cache directory; omitted uses the session directory.",
-    )
-    brief_parser.add_argument(
-        "--local-document",
-        action="append",
-        default=[],
-        help="Local Markdown or text document; may be repeated.",
-    )
-    brief_parser.add_argument(
-        "--query",
-        dest="queries",
-        action="append",
-        default=[],
-        help="Search query override; may be repeated.",
-    )
-    brief_parser.add_argument(
-        "--provider",
-        dest="providers",
-        action="append",
-        default=[],
-        help="Search provider override; may be repeated.",
-    )
-    brief_parser.add_argument("--max-results", type=int, default=10)
-    brief_parser.add_argument("--max-chunks", type=int, default=300)
-    brief_parser.add_argument("--idea-limit", type=int, default=3)
 
 
     session_parser = subparsers.add_parser(
         "research-session",
+        aliases=["research-brief"],
         help="Run a bounded literature-only or literature-to-experiment research session.",
     )
     session_parser.add_argument("--config", type=Path, help="Research TOML; explicit CLI options override file values.")

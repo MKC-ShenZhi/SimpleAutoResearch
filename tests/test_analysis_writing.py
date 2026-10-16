@@ -137,29 +137,34 @@ class AnalysisWritingTests(unittest.TestCase):
             self.assertEqual(validate_session_arguments(args).outputs, ['data_analysis', 'report'])
             self.assertNotIn('command_argv', defaults)
             from simple_ar.cli.main import main
-            client = LLMClient(LLMSettings(api_key='fixture'))
-
-            def writer(**kwargs):
-                self.assertEqual(kwargs['context'].results['supplied_analyses'][0]['records'][0]['mean'], 2)
-                return AgentReportResult(report_body='', memory=kwargs['memory'], used_agent=True,
-                    sections=[ReportSectionDraft(section_id='discussion', heading='Discussion',
-                        draft_markdown='Supplied descriptive scores do not establish causal or significance claims.')])
-
-            with patch('simple_ar.cli.main._optional_research_llm_client', return_value=client) as factory, \
-                    patch('simple_ar.report.writing.run_report_agent', side_effect=writer), \
+            from simple_ar.cli.research_config import report_writing_method
+            from simple_ar.tools.writing import freeze_report_requirement
+            method, settings = report_writing_method(args, report_settings(args))
+            settings['mode'] = 'research_only'
+            analysis = validate_session_arguments(args).data_analysis
+            # The CLI owns contract projection and routing. Writer/projection,
+            # recovery and delivery behavior have their own domain tests below.
+            with patch('simple_ar.cli.main._optional_research_llm_client', return_value=object()), \
+                    patch('simple_ar.app.tool_application.ToolApplication.create') as create_native, \
+                    patch('simple_ar.app.research_application.create_session') as create_legacy, \
+                    patch('simple_ar.cli.main._render_native_result'), \
                     contextlib.redirect_stdout(io.StringIO()):
+                create_native.return_value.run.return_value = {'status': 'completed'}
                 main(['research-session', '--config', str(report), '--interaction', 'autonomous'])
-                session = next((report.parent / 'sessions').iterdir())
-                app = load_session(session)
-                self.assertEqual(app.view().status, 'completed', app.view().status_reason)
-                attempts = len(app.controller.list_attempts())
-                frozen = app.controller.store.resolve(app.view().state_refs['data_analysis']).read_bytes()
-                source.unlink()
-                main(['research-session', '--session-root', str(session), '--model', 'env'])
-                self.assertEqual(factory.call_count, 2)
-            restored = load_session(session)
-            self.assertEqual(len(restored.controller.list_attempts()), attempts)
-            self.assertEqual(restored.controller.store.resolve(restored.view().state_refs['data_analysis']).read_bytes(), frozen)
+            create_native.assert_called_once()
+            create_legacy.assert_not_called()
+            options = create_native.call_args.kwargs
+            self.assertEqual(options['report_requirement'], freeze_report_requirement(settings, method=method))
+            self.assertEqual(options['table_analysis'], {'path': 'source0',
+                'spec': {key: value for key, value in analysis.items() if key != 'file'}})
+            self.assertEqual(options['sources'], {'source0': source.resolve()})
+            self.assertEqual(options['model'], 'env')
+            self.assertFalse(options['allow_execution'])
+            self.assertFalse(options['allow_network'])
+            self.assertEqual(options['research_policy']['materials'], [])
+            self.assertEqual(options['process_limits'], {'process_invocations': 0, 'process_wall_seconds': 0})
+            create_native.return_value.run.assert_called_once()
+            self.assertNotIn('actions', create_native.return_value.run.call_args.kwargs)
 
     def test_analysis_report_uses_same_session_and_restores_frozen_analysis(self):
         with tempfile.TemporaryDirectory() as directory:

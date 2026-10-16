@@ -205,6 +205,19 @@ class CodeTaskConfig(_ConfigModel):
     budget: BudgetSection = Field(default_factory=BudgetSection)
 
 
+def code_task_metric_schema(primary_metric: str | None, metric_directions: dict[str, str]) -> dict[str, object]:
+    """Project the declared metric contract once for current and compatibility consumers."""
+    primary = str(primary_metric or '').strip()
+    directions = {str(name): str(direction) for name, direction in metric_directions.items() if str(name).strip()}
+    required = list(dict.fromkeys(([primary] if primary else []) + list(directions)))
+    schema: dict[str, object] = {'required_metrics': required}
+    if primary:
+        schema['primary_metric'] = primary
+    if directions:
+        schema['metric_directions'] = directions
+    return schema
+
+
 @dataclass(frozen=True)
 class CodeTaskInitOptions:
     """Resolved options for ``code-task init`` after config/CLI merging."""

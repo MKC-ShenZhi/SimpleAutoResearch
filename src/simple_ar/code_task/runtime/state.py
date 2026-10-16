@@ -88,6 +88,113 @@ def save_code_task_manifest(run_dir: Path, manifest: dict[str, Any]) -> None:
     write_json(code_task_paths(run_dir).manifest_path, manifest)
 
 
+def implementation_file_hashes(run_dir: Path) -> dict[str, str]:
+    """Use the CodeTask source inventory to pin a validated candidate."""
+    from simple_ar.code_task.analysis.index import build_codebase_index
+    index = build_codebase_index(code_task_paths(run_dir).workspace_dir)
+    hashes = {row['path']: row['sha256'] for row in index['files']}
+    manifest = load_code_task_manifest(run_dir)
+    names = manifest.get('code_task', {}).get('native_binding', {}).get('binding', {}).get('contract', {}).get('new_files', [])
+    # Explicit creation obligations remain bound even when the browsing index
+    # omits their directory (for example a hidden application configuration).
+    import hashlib
+    invalid = required_new_file_issues(manifest, code_task_paths(run_dir).workspace_dir)
+    for name in names:
+        path = code_task_paths(run_dir).workspace_dir / name
+        if name not in invalid:
+            with path.open('rb') as handle:
+                hashes[name] = hashlib.file_digest(handle, 'sha256').hexdigest()
+    return hashes
+
+
+def required_new_file_issues(manifest: dict[str, Any], workspace: Path) -> list[str]:
+    """Inspect frozen creation obligations, never create initializer placeholders."""
+    names = manifest.get('code_task', {}).get('native_binding', {}).get('binding', {}).get('contract', {}).get('new_files', [])
+    issues = []
+    for name in names:
+        path = workspace / name
+        components = []
+        current = path
+        while current != workspace and current.is_relative_to(workspace):
+            components.append(current)
+            current = current.parent
+        if (not path.resolve().is_relative_to(workspace.resolve())
+                or any(part.is_symlink() or part.is_junction() for part in components)
+                or not path.is_file() or path.stat().st_size == 0):
+            issues.append(name)
+    return issues
+
+
+def implementation_output_inventory(expected: dict[str, str], outputs: dict[str, str]) -> dict[str, str]:
+    """Pin the validated inventory plus explicitly observed derived files.
+
+    An output never replaces a validated input. New source/dependency files
+    need another implementation/validator, even when produced by a process.
+    No filename or extension by itself establishes output provenance.
+    """
+    from simple_ar.code_task.analysis.index import SOURCE_SUFFIXES
+    from simple_ar.code_task.execution.environment import DEPENDENCY_FILE_NAMES
+    dependencies = {name.casefold() for name in DEPENDENCY_FILE_NAMES}
+    if (set(outputs) & set(expected) or any(
+            Path(name).suffix.lower() in SOURCE_SUFFIXES or Path(name).name.casefold() in dependencies
+            for name in outputs)):
+        raise ValueError('New source or dependency files require independent validation; outputs cannot replace validated inputs')
+    return {**expected, **outputs}
+
+
+def retained_implementation_inventory(run_dir: Path, expected: dict[str, str],
+                                      outputs: dict[str, str] | None = None) -> dict[str, str]:
+    current = implementation_file_hashes(run_dir)
+    if current != implementation_output_inventory(expected, outputs or {}):
+        raise ValueError('Retained candidate inventory changed without retained execution output provenance')
+    return current
+
+
+def native_workspace_binding(manifest: dict[str, Any], workspace: Path) -> dict[str, Any]:
+    """Select approved initialization facts; old native approvals keep their shape."""
+    bound = manifest['code_task']['native_binding']['binding']
+    source = bound.get('source', {})
+    if 'workspace_input' not in source:
+        return {'file_hashes': source.get('file_hashes', {}), 'environment': bound['environment']}
+    mode = manifest['workspace']['selected_mode']
+    original = source['workspace_input']['source_snapshots']
+    prior = bound.get('prior_source', {})
+    hashes = prior['file_hashes'] if 'file_hashes' in prior else original.get(mode)
+    process = bound['process_environments'].get(mode)
+    if hashes is None or process is None or Path(process['cwd']).resolve() != workspace.resolve():
+        raise ValueError('Prepared workspace does not match any explicitly approved source/environment alternative')
+    return {'file_hashes': hashes, 'environment': process['environment']}
+
+
+def native_preparation_processes(run_dir: Path, *, ledger: Any,
+                                 session_id: str, attempt_id: str) -> set[str]:
+    """Read proof-backed preparation identities without replaying or settling work."""
+    manifest = load_code_task_manifest(run_dir)
+    bound = (manifest.get('code_task', {}).get('native_binding') or {}).get('binding', {})
+    if 'environment_preparations' not in bound or bound.get('environment_origin'):
+        return set()  # Historical approvals and inherited environments do not prepare here.
+    from simple_ar.core.capabilities import ArtifactStore
+    from simple_ar.research.project_environment import verify_environment_preparation
+    view = bound['environment_preparations'][manifest['workspace']['selected_mode']]
+    root = Path(view['store_root'])
+    store = ArtifactStore(root)
+    if (not root.is_absolute() or store.root.name != attempt_id or store.root.parent.name != 'attempts'
+            or store.root.resolve() != store.root
+            or Path(view['cwd']).resolve() != code_task_paths(run_dir).workspace_dir.resolve()):
+        raise ValueError('Preparation store or selected workspace differs from its frozen attempt owner')
+    if not session_id:
+        session_id = store.read_json('environment_setup.json')['steps'][0]['process_record']['session_id']
+    identities, _ = verify_environment_preparation(store, view, ledger=ledger,
+        session_id=session_id, attempt_id=attempt_id)
+    # Excluding by physical ID must not hide a second reservation using that ID.
+    if any(sum(row.logical_call_id == identity for row in ledger.entries) != 1 for identity in identities):
+        raise ValueError('Preparation physical identity has duplicate or missing ledger ownership')
+    if any(path.parent.name not in identities
+            for path in (store.root / 'environment_processes').glob('*/invocation.json')):
+        raise ValueError('Preparation contains a physical invocation omitted from its verified proof')
+    return identities
+
+
 def manifest_section(manifest: dict[str, Any], key: str) -> dict[str, Any]:
     """Return a mutable manifest section, creating it when necessary."""
     value = manifest.get(key)

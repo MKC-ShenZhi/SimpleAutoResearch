@@ -11,6 +11,7 @@ from unittest.mock import patch
 from simple_ar.cli.main import main
 from simple_ar.cli.parser import build_parser
 from simple_ar.cli.research_config import research_defaults
+from simple_ar.cli.start import session_materials
 from simple_ar.report.citations import append_references_section
 from simple_ar.report.data_delivery import analysis_delivery_block
 from simple_ar.report.schema import ReportRuntimeConfig
@@ -38,7 +39,10 @@ class DataAttributionTests(unittest.TestCase):
             self.assertIsNone(code)
             config = next((root / "tasks").glob("*/research.toml"))
             self.assertEqual(research_defaults(["research-session", "--config", str(config)])["data_attribution"], declaration)
-            package = next((root / "tasks").glob("**/attempts/data_analysis-*/analysis.json"))
+            session = next((config.parent / "sessions").iterdir())
+            packages = session_materials(session)['data_analysis']
+            self.assertEqual(len(packages), 1)
+            package = packages[0]
             source.unlink()  # Only the frozen package is needed thereafter.
             result, raw, _ = load_analysis_package(package)
             self.assertEqual(result["spec"]["attribution"], declaration)

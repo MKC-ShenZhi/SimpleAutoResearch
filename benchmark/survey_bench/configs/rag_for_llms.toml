@@ -49,8 +49,6 @@ read_workers = 2
 read_min_shortlist = 20
 read_max_shortlist = 25
 cache = true
-index_backend = "sqlite_fts"
-index_root = ".simple_ar_cache/research_index"
 
 [research.budget]
 max_documents = 25

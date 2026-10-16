@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 from dataclasses import dataclass, replace
@@ -13,7 +14,14 @@ from simple_ar.code_task.workspace.copy import (
     empty_copy_report,
     normalize_copy_patterns,
     sparse_copy_code_workspace,
+    _select_workspace_files,
+    _selection_snapshot,
+    _select_data_inputs,
+    _validate_root_boundary,
+    _validate_source_file,
+    _SourceIndexBoundaryError,
 )
+from simple_ar.code_task.analysis.index import IGNORED_DIR_NAMES, IGNORED_FILE_NAMES, _sha256
 from simple_ar.code_task.runtime.state import utcnow_iso as _utcnow_iso
 
 
@@ -64,6 +72,16 @@ class WorkspaceSpec:
     exclude: tuple[str, ...] = ()
     reuse_source_venv: bool = False
     data_inputs: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if type(self.max_file_bytes) is not int or self.max_file_bytes < 0:
+            raise ValueError("max_file_bytes must be a non-negative integer")
+        if type(self.reuse_source_venv) is not bool:
+            raise ValueError("reuse_source_venv must be a boolean")
+        for name in ("include", "exclude"):
+            values = getattr(self, name)
+            if not isinstance(values, (list, tuple)) or any(not isinstance(p, str) for p in values):
+                raise ValueError(f"{name} must be a list of workspace pattern strings")
 
 
 @dataclass(frozen=True)
@@ -134,6 +152,171 @@ class WorkspaceResult:
             "warnings": list(self.warnings),
             "user_next_steps": list(self.user_next_steps),
         }
+
+
+def workspace_source_binding(spec: WorkspaceSpec) -> dict:
+    """Describe acceptable initialization inventories without materializing anything.
+
+    Freeze this entire value at approval. After initialization compare the actual
+    index hashes against source_snapshots[workspace.selected_mode]; a missing key
+    is an unsupported binding, never permission to reinterpret auto as copy.
+    This describes task isolation, not an OS sandbox or a race-free filesystem.
+    """
+    mode = _normalize_mode(spec.mode)
+    if spec.data_inputs and mode in {"empty", "sparse_copy"}:
+        raise WorkspaceModeError("Declared project data requires auto, copy or git_worktree mode.")
+    binding: dict[str, Any] = {
+        "schema_version": 1,
+        "source_root": None,
+        "requested_mode": mode,
+        "input_kind": {"git_worktree": "git_head", "auto": "auto", "empty": "empty"}.get(mode, "filesystem"),
+        "policy": {
+            "owner": "workspace.copy",
+            "max_file_bytes": spec.max_file_bytes,
+            "include": list(normalize_copy_patterns(spec.include)),
+            "exclude": list(normalize_copy_patterns(spec.exclude)),
+            "data_inputs": list(spec.data_inputs),
+            "index_boundary": "simple_ar.code_task.analysis.index",
+        },
+        "source_snapshots": {},
+        "git": None,
+        "blocked_modes": {},
+        "omission_boundary": [
+            "Only indexed initialization files are bound; this is not an inventory of every repository byte.",
+            "Copy uses the shared full/sparse selection, size ceiling (0 disables it), and output-workspace exclusion.",
+            "Index exclusions, including hidden directories, .env files, links/reparse points and Python environments, apply.",
+            "Declared data bypasses incidental size ceilings and overlays filesystem bytes, including in Git mode.",
+            "Recheck after initialization; source mutation and checkout behavior can invalidate this read-only observation.",
+        ],
+    }
+    snapshots = binding["source_snapshots"]
+    if mode == "empty":
+        snapshots["empty"] = {}
+        return binding
+    if spec.code_root is None:
+        raise WorkspaceModeError(f"{mode} workspace mode requires code_root")
+    _validate_root_boundary(Path(spec.code_root))
+    source = _validated_source_root(spec.code_root)
+    binding["source_root"] = str(source)
+    _validate_root_boundary(spec.task_dir / "workspace")
+    workspace = (spec.task_dir / "workspace").resolve()
+    if mode in {"copy", "sparse_copy", "auto"}:
+        copy_mode = "sparse_copy" if mode == "sparse_copy" else "copy"
+        selection = _select_workspace_files(
+            source, workspace, max_file_bytes=spec.max_file_bytes,
+            sparse=copy_mode == "sparse_copy", include_patterns=spec.include,
+            exclude_patterns=spec.exclude,
+            check_destination=False,
+        )
+        try:
+            snapshots[copy_mode] = _selection_snapshot(selection, spec.data_inputs)
+        except _SourceIndexBoundaryError as exc:
+            binding["blocked_modes"][copy_mode] = str(exc)
+    if mode in {"git_worktree", "auto"}:
+        try:
+            repo = _git_repo_root(source)
+            commit = _git_head_commit(repo)
+            relative = _relative_path_or_dot(source, repo).as_posix()
+            dirty = bool(_git_output(repo, "status", "--short").strip())
+            binding["git"] = {
+                "repo_root": str(repo), "commit": commit,
+                "project_relative_path": relative, "origin_dirty": dirty,
+                "input_kind": "committed_head_with_declared_filesystem_data",
+            }
+            if mode == "auto" and dirty:
+                raise WorkspaceModeError("Auto uses copy for uncommitted source changes.")
+            snapshots["git_worktree"] = _git_source_snapshot(repo, commit, relative, source, workspace, spec)
+        except (WorkspaceModeError, UnicodeError) as exc:
+            binding["blocked_modes"]["git_worktree"] = str(exc)
+    return binding
+
+
+def _read_git_bytes(repo: Path, *args: str, missing_ok: bool = False) -> bytes:
+    """Only used for immutable tree/blob reads and read-only Git configuration."""
+    try:
+        result = subprocess.run(
+            ["git", "--no-optional-locks", "-c", "safe.directory=*", "-C", str(repo), *args],
+            capture_output=True, timeout=30, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise WorkspaceModeError(f"Cannot read Git snapshot: {exc}") from exc
+    if result.returncode == 1 and missing_ok:
+        return b""
+    if result.returncode:
+        raise WorkspaceModeError(f"Cannot read Git snapshot ({args[0]}): {result.stderr.decode('utf-8', errors='replace')}")
+    return result.stdout
+
+
+def _git_source_snapshot(
+    repo: Path, commit: str, project: str, source: Path, workspace: Path, spec: WorkspaceSpec,
+) -> dict[str, str]:
+    """Project-scoped HEAD inventory, with the existing index's name boundaries.
+
+    No checkout is simulated. Ambiguous checkout transformations are explicitly
+    unsupported, leaving the existing initializer untouched.
+    """
+    settings = {
+        key: _read_git_bytes(repo, "config", "--null", "--get", key, missing_ok=True)
+        .rstrip(b"\0\n").decode("utf-8", errors="strict")
+        for key in ("core.autocrlf", "core.eol")
+    }
+    if settings["core.autocrlf"].lower() not in {"", "false", "0", "off", "no"}:
+        raise WorkspaceModeError("Git checkout newline conversion prevents proving blob/index equivalence (core.autocrlf).")
+    if settings.get("core.eol", "").lower() == "crlf":
+        raise WorkspaceModeError("Git core.eol=crlf prevents proving blob/index equivalence.")
+    # Ancestor attributes can affect the requested monorepo project too.
+    repository_tree = _read_git_bytes(repo, "ls-tree", "-r", "-z", "--name-only", commit)
+    if any(Path(name.decode("utf-8")).name == ".gitattributes" for name in repository_tree.split(b"\0") if name):
+        raise WorkspaceModeError("Committed .gitattributes requires checkout/filter verification by the caller.")
+    treeish = commit if project == "." else f"{commit}:{project}"
+    raw = _read_git_bytes(repo, "ls-tree", "-r", "-z", treeish)
+    entries: dict[str, str] = {}
+    for record in raw.split(b"\0"):
+        if not record:
+            continue
+        metadata, encoded_path = record.split(b"\t", 1)
+        file_mode, kind, oid = metadata.decode("ascii").split()
+        name = encoded_path.decode("utf-8", errors="strict")
+        parts = Path(name).parts
+        if (not parts or Path(name).is_absolute() or ".." in parts
+                or "\\" in name or ":" in name):
+            raise WorkspaceModeError("Git tree contains a path not safely representable as a workspace path.")
+        if file_mode not in {"100644", "100755"} or kind != "blob":
+            raise WorkspaceModeError("Git symlinks/submodules require checkout-specific index verification.")
+        entries[name] = oid
+    overlays = _select_data_inputs(source, workspace, spec.data_inputs)
+    names = set(entries) | set(overlays)
+    if os.name == "nt":
+        spellings: dict[str, str] = {}
+        for name in names:
+            path = Path(name)
+            for prefix in (path, *path.parents):
+                spelling = prefix.as_posix()
+                folded = spelling.casefold()
+                if folded in spellings and spellings[folded] != spelling:
+                    raise WorkspaceModeError("Git tree/data contains case-colliding paths on Windows.")
+                spellings[folded] = spelling
+    environments = {str(Path(name).parent).replace("\\", "/")
+                    for name in names if Path(name).name == "pyvenv.cfg"}
+    hashes: dict[str, str] = {}
+    for name in sorted(names):
+        path = Path(name)
+        # These are precisely the name/marker rules in index._iter_files;
+        # links are refused above rather than guessed from the dirty checkout.
+        if (path.name in IGNORED_FILE_NAMES or path.name.startswith(".env")
+                or any(part in IGNORED_DIR_NAMES or part.startswith(".") for part in path.parts[:-1])
+                or any(parent.as_posix() in environments for parent in path.parents if parent != Path("."))):
+            continue
+        full_name = name if project == "." else f"{project}/{name}"
+        attributes = _read_git_bytes(repo, "check-attr", "--all", "-z", "--", full_name)
+        if attributes:
+            raise WorkspaceModeError("Active Git attributes require checkout/filter verification by the caller.")
+        if name in overlays:
+            _validate_source_file(source, overlays[name])
+            hashes[name] = _sha256(overlays[name])
+        else:
+            hashes[name] = hashlib.sha256(_read_git_bytes(repo, "cat-file", "blob", entries[name])).hexdigest()
+    return hashes
 
 
 def create_workspace(spec: WorkspaceSpec) -> WorkspaceResult:
@@ -391,6 +574,7 @@ def _create_empty_workspace(spec: WorkspaceSpec) -> WorkspaceResult:
 
 
 def _validated_source_root(code_root: Path) -> Path:
+    _validate_root_boundary(Path(code_root))
     source = Path(code_root).resolve()
     if not source.exists():
         raise FileNotFoundError(f"Code root does not exist: {source}")
@@ -540,7 +724,7 @@ def _worktree_failure_next_steps(reason: str) -> tuple[str, ...]:
 
 
 def _git_output(cwd: Path, *args: str) -> str:
-    completed = _run_git(cwd, *args)
+    completed = _run_git(cwd, "--no-optional-locks", "-c", "core.fsmonitor=false", *args)
     return completed.stdout.strip()
 
 
@@ -625,7 +809,7 @@ def _source_venv_python(source_root: Path) -> Path | None:
     )
     for path in candidates:
         if path.exists() and path.is_file():
-            return path.resolve()
+            return Path(os.path.abspath(path))
     return None
 
 

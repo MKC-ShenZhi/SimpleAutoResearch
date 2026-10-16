@@ -41,8 +41,8 @@ _TRANSPORT_PHASES = frozenset({"unobserved"} | {
     f"{operation}.{phase}" for operation in (
         "connection.connect_tcp", "connection.start_tls",
         "http11.send_request_headers", "http11.send_request_body",
-        "http11.receive_response_headers", "http2.send_request_headers",
-        "http2.send_request_body", "http2.receive_response_headers")
+        "http11.receive_response_headers", "http11.receive_response_body", "http2.send_request_headers",
+        "http2.send_request_body", "http2.receive_response_headers", "http2.receive_response_body")
     for phase in ("started", "complete", "failed")
 })
 
@@ -109,6 +109,8 @@ class LLMSettings:
             limit or request parameter; total task budget still takes precedence.
         retry_attempts: Total provider attempts for transient transport/server
             failures. Includes the first request.
+        connect_retry_attempts: Optional larger attempt ceiling only for typed
+            failures known to precede dispatch. Does not replay uncertain usage.
         retry_base_delay_sec: Initial exponential-backoff delay.
         retry_max_delay_sec: Maximum delay between provider retries.
         transport_backend: Provider client backend. ``openai`` uses the OpenAI
@@ -158,6 +160,7 @@ class LLMSettings:
     max_output_tokens: int | None = None
     context_input_tokens: int = 24000
     retry_attempts: int = 3
+    connect_retry_attempts: int = 1
     retry_base_delay_sec: float = 1.0
     retry_max_delay_sec: float = 12.0
     transport_backend: str = "openai"
@@ -249,6 +252,7 @@ class LLMClient:
         model_catalog: ModelCatalog | None = None,
         profile_name: str = "",
         purpose: str = "text",
+        task_output_limit: int | None = None,
     ) -> None:
         """Create a client from validated LLM settings.
 
@@ -280,6 +284,7 @@ class LLMClient:
         self._model_catalog = model_catalog
         self._profile_name = profile_name
         self._purpose = purpose
+        self._task_output_limit = task_output_limit
         self._usage_callback = usage_callback
         self._budget_ledger = budget_ledger
         self._budget_session_id = budget_session_id
@@ -463,6 +468,8 @@ class LLMClient:
         """Resolve the actual request limit for transport and budget planning."""
         output_cap = max_output_tokens
         if output_cap is None:
+            output_cap = self._task_output_limit
+        if output_cap is None:
             output_cap = self._settings.max_output_tokens
         if (output_cap is None and self._settings.reasoning_effort not in {"", "none"}
                 and self._settings.thinking_mode != "disabled"):
@@ -597,7 +604,17 @@ class LLMClient:
             budget_attempt_id=attempt_id or self._budget_attempt_id,
             model_catalog=self._model_catalog, profile_name=self._profile_name,
             purpose=self._purpose,
+            task_output_limit=self._task_output_limit,
         )
+
+    def with_output_limit(self, limit: int) -> "LLMClient":
+        """Clone a task operational setting without changing named connections."""
+        if type(limit) is not int or limit < 1:
+            raise LLMError('max_output_tokens must be a positive integer')
+        return type(self)(self._settings, usage_callback=self._usage_callback,
+            budget_ledger=self._budget_ledger, budget_session_id=self._budget_session_id,
+            budget_attempt_id=self._budget_attempt_id, model_catalog=self._model_catalog,
+            profile_name=self._profile_name, purpose=self._purpose, task_output_limit=limit)
 
     def connection_binding(self) -> dict[str, Any]:
         """Non-secret named configuration for the existing task snapshot.
@@ -666,7 +683,8 @@ class LLMClient:
             settings, name = routed._settings, routed._profile_name
             return cls(settings, model_catalog=routed._model_catalog, profile_name=name, purpose=purpose,
                 usage_callback=observe, budget_ledger=client._budget_ledger,
-                budget_session_id=client._budget_session_id, budget_attempt_id=client._budget_attempt_id)
+                budget_session_id=client._budget_session_id, budget_attempt_id=client._budget_attempt_id,
+                task_output_limit=client._task_output_limit)
         return cls(
             settings,
             usage_callback=observe,
@@ -675,6 +693,7 @@ class LLMClient:
             budget_attempt_id=client._budget_attempt_id,
             model_catalog=client._model_catalog, profile_name=name,
             purpose=purpose,
+            task_output_limit=client._task_output_limit,
         )
 
     def _build_request(self, system: str, user: str) -> dict[str, Any]:
@@ -727,7 +746,8 @@ class LLMClient:
                 and "chat" in _api_attempt_order(self._settings.api_mode)
                 and _finite_timeout(request.get("timeout"))):
             _require_no_running_loop()
-        attempts = max(1, int(self._settings.retry_attempts or 1))
+        normal_attempts = max(1, int(self._settings.retry_attempts or 1))
+        attempts = max(normal_attempts, int(self._settings.connect_retry_attempts or 1))
         last_error: Exception | None = None
         mode_attempts: list[tuple[str, int, Exception]] = []
         provider_attempts = 0
@@ -794,7 +814,9 @@ class LLMClient:
                         raise
                     if unbounded_chat_stream and _is_budget_consumption_unknown(exc):
                         break  # Unbounded uncertain charges cannot justify automatic replay.
-                    if attempt >= attempts or not _is_transient_llm_error(exc):
+                    retry_limit = (attempts if _transport_failure_phase(exc) == 'not_dispatched'
+                                   else normal_attempts)
+                    if attempt >= retry_limit or not _is_transient_llm_error(exc):
                         break
                     if (
                         self._settings.api_mode == "auto"
@@ -805,7 +827,7 @@ class LLMClient:
                     delay = _retry_delay(self._settings, attempt)
                     logging.getLogger(__name__).warning(
                         "LLM %s failed (%s); retry %s/%s in %.1fs",
-                        label or api_mode, type(exc).__name__, attempt + 1, attempts, delay,
+                        label or api_mode, type(exc).__name__, attempt + 1, retry_limit, delay,
                     )
                     time.sleep(delay)
             if last_error is None:
@@ -818,16 +840,16 @@ class LLMClient:
                 break
         if (proxy or visual) and last_error is not None and _is_response_format_error(last_error):
             raise LLMError("Provider response_format is unsupported; transport details omitted") from None
+        diagnostic = _provider_failure_summary(last_error) if last_error is not None else ''
+        phase_detail = f"; {diagnostic}" if diagnostic else ''
         if last_error is not None and _is_timeout_error(last_error):
             if proxy or visual:
-                raise LLMError(f"LLM request timed out ({type(last_error).__name__}); transport details omitted") from None
+                raise LLMError(f"LLM request timed out ({diagnostic}); transport details omitted") from None
             raise LLMError(
-                f"LLM request timed out after {_attempt_summary(mode_attempts)} attempt(s): {last_error}"
+                f"LLM request timed out after {_attempt_summary(mode_attempts)} attempt(s): {last_error}{phase_detail}"
             ) from last_error
-        phase = _transport_failure_phase(last_error) if last_error is not None else ''
-        phase_detail = f"; transport phase={phase}" if phase else ''
         if proxy or visual:
-            raise LLMError(f"LLM request failed ({type(last_error).__name__}){phase_detail}; transport details omitted") from None
+            raise LLMError(f"LLM request failed ({diagnostic}); transport details omitted") from None
         raise LLMError(
             f"LLM request failed after {_attempt_summary(mode_attempts)} attempt(s): {last_error}{phase_detail}"
         ) from last_error
@@ -873,9 +895,7 @@ class LLMClient:
     ) -> None:
         if self._budget_ledger is None or reservation_id is None:
             return
-        reason = f"provider attempt failed: {type(error).__name__}"
-        if not self._settings.proxy_env and not visual:
-            reason += f": {error}"
+        reason = 'provider attempt failed: ' + _provider_failure_summary(error)
         try:
             if _transport_failure_phase(error) == 'not_dispatched':
                 self._budget_ledger.settle(reservation_id,
@@ -1898,6 +1918,35 @@ def _finite_timeout(value: object) -> bool:
 _SDK_CONNECT_TIMEOUT_SEC = 20.0
 
 
+class _SDKTransportObservation:
+    """One request's safe transport facts, shared by sync and async SDK paths."""
+
+    def __init__(self) -> None:
+        self.event = 'unobserved'
+        self.request_started = False
+
+    def trace(self, event: str, _info: dict[str, Any]) -> None:
+        if event in _TRANSPORT_PHASES:
+            self.event = event
+            if event.startswith(('http11.send_request_headers.', 'http2.send_request_headers.')):
+                self.request_started = True
+
+    def attach(self, request: Any) -> None:
+        request.extensions['trace'] = self.trace
+
+    async def async_trace(self, event: str, info: dict[str, Any]) -> None:
+        self.trace(event, info)
+
+    async def async_attach(self, request: Any) -> None:
+        request.extensions['trace'] = self.async_trace
+
+    def annotate(self, error: Exception) -> None:
+        # Never retain trace info: headers, URLs, payloads and exceptions can
+        # contain credentials. The original SDK exception/cause stays intact.
+        error._simple_ar_transport_event = self.event
+        error._simple_ar_request_started = self.request_started
+
+
 def _sdk_timeout(value: object) -> object:
     # A long generation deadline must not become a long TCP/TLS deadline.
     # Leave read/write/pool and explicit non-finite values unchanged; use the
@@ -1947,17 +1996,7 @@ async def _call_openai_chat_stream(
 
     state = _ChatStreamState()
     client = stream = http_client = None
-    transport_phase = 'unobserved'
-
-    async def trace_phase(event_name: str, _info: dict[str, Any]) -> None:
-        nonlocal transport_phase
-        # Never retain trace info: it can contain credentials, bodies, URLs and
-        # exceptions. Unknown library events are ignored, not a new failure.
-        if event_name in _TRANSPORT_PHASES:
-            transport_phase = event_name
-
-    async def attach_trace(request: Any) -> None:
-        request.extensions['trace'] = trace_phase
+    observation = _SDKTransportObservation()
 
     deadline = asyncio.timeout(timeout)
     try:
@@ -1965,7 +2004,7 @@ async def _call_openai_chat_stream(
             async with deadline:
                 try:
                     http_client = DefaultAsyncHttpxClient(http2=http2,
-                        event_hooks={'request': [attach_trace]}, **({"proxy": proxy} if proxy else {}))
+                        event_hooks={'request': [observation.async_attach]}, **({"proxy": proxy} if proxy else {}))
                 except ImportError:
                     raise LLMError("HTTP/2 requires the optional dependency: install simple-autoresearch[http2]") from None
                 client = AsyncOpenAI(**client_kwargs, http_client=http_client)
@@ -1977,12 +2016,18 @@ async def _call_openai_chat_stream(
             if state.finish_reason is None:
                 raise LLMDeadlineError(
                     "SDK Chat stream wall-clock deadline exceeded; usage unknown; "
-                    f"transport_phase={transport_phase}; "
+                    f"transport_phase={observation.event}; "
                     f"stream_opened={stream is not None}; {state.progress_description()}",
-                    transport_phase=transport_phase, stream_opened=stream is not None,
+                    transport_phase=observation.event, stream_opened=stream is not None,
                 ) from None
             # Finish was observed: do not resend merely for an absent usage tail.
         return state.response()
+    except Exception as exc:
+        # Keep the SDK exception/cause intact for retry and usage classification.
+        # Ordinary network timeouts need the same safe phase as wall deadlines;
+        # never copy the trace payload, headers, URL or exception body.
+        observation.annotate(exc)
+        raise
     finally:
         # A separate bounded cleanup grace prevents pool/stream close hanging.
         # Cancellation cannot prove provider-side termination or free usage.
@@ -2064,13 +2109,13 @@ def _call_openai_sdk_request(api_mode: str, request: dict[str, Any], *, http2: b
             payload, client_kwargs, http2=http2, timeout=float(timeout),
             **({"proxy": proxy} if proxy else {}),
         ))
-    http_client = None
-    if http2 or proxy:
-        try:
-            http_client = DefaultHttpxClient(http2=http2, **({"proxy": proxy} if proxy else {}))
-        except ImportError:
-            raise LLMError("HTTP/2 requires the optional dependency: install simple-autoresearch[http2]") from None
-        client_kwargs["http_client"] = http_client
+    observation = _SDKTransportObservation()
+    try:
+        http_client = DefaultHttpxClient(http2=http2, event_hooks={'request': [observation.attach]},
+            **({"proxy": proxy} if proxy else {}))
+    except ImportError:
+        raise LLMError("HTTP/2 requires the optional dependency: install simple-autoresearch[http2]") from None
+    client_kwargs["http_client"] = http_client
     try:
         client = OpenAI(**client_kwargs)
     except BaseException:
@@ -2085,6 +2130,9 @@ def _call_openai_sdk_request(api_mode: str, request: dict[str, Any], *, http2: b
             response = client.chat.completions.create(**payload)
             return _collect_chat_stream(response) if payload.get("stream") else response
         raise ValueError(f"Unsupported LLM API mode: {api_mode}")
+    except Exception as exc:
+        observation.annotate(exc)
+        raise
     finally:
         client.close()
 
@@ -2281,6 +2329,19 @@ def _provider_failure_summary(exc: Exception) -> str:
     phase = _transport_failure_phase(exc)
     if phase:
         details.append(f"transport phase={phase}")
+    event = getattr(exc, '_simple_ar_transport_event', '')
+    if event in _TRANSPORT_PHASES and event != 'unobserved':
+        details.append(f"transport event={event}")
+    causes, seen = [], set()
+    current = exc.__cause__
+    while current is not None and id(current) not in seen and len(causes) < 8:
+        seen.add(id(current))
+        name = type(current).__name__
+        if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,79}', name):
+            causes.append(name)
+        current = current.__cause__
+    if causes:
+        details.append('causes=' + '>'.join(causes))
     if ((isinstance(exc, LLMStreamError) and "provider reported overload" in str(exc))
             or "provider reported overload" in _stream_error_description(exc)):
         details.append("provider reported overload")
@@ -2431,13 +2492,15 @@ def _transport_failure_phase(exc: Exception) -> str:
     """Use typed transport causes, never an endpoint/body/message heuristic."""
     import httpx
 
-    if isinstance(exc, LLMStreamError):
-        return 'possibly_dispatched'
     seen = set()
     current: BaseException | None = exc
     uncertain = False
     while current is not None and id(current) not in seen:
         seen.add(id(current))
+        # A later redirected connection failure cannot erase an earlier send,
+        # even when the annotated SDK exception is wrapped by another owner.
+        if isinstance(current, LLMStreamError) or getattr(current, '_simple_ar_request_started', False):
+            return 'possibly_dispatched'
         if isinstance(current, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)):
             return 'not_dispatched'
         if isinstance(current, (httpx.ReadError, httpx.ReadTimeout, httpx.WriteError,

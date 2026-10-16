@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -11,10 +12,11 @@ from simple_ar.report.export import export_acm_report, _nodes
 
 
 IDENTIFIER = 'Za71c9' * 32
+INLINE_COMMAND = 'python -m runner --input "data folder/table.csv"'
 LONG_PATH = 'artifacts/' + 'nested_measurement_directory/' * 12 + 'samples.csv'
 LITERAL_CODE = ('analyze --input ' + LONG_PATH + ' --label ' + IDENTIFIER + '\n'
     + '\t' + r'\end{Verbatim}\input{missing-file} % $ & # _ ^ ~ {}')
-TECHNICAL_BODY = ('\nInline identifier `' + IDENTIFIER + '`; plain identifier ' + IDENTIFIER
+TECHNICAL_BODY = ('\n`' + INLINE_COMMAND + '`\n\nInline identifier `' + IDENTIFIER + '`; plain identifier ' + IDENTIFIER
     + '. Inline path `' + LONG_PATH + '`.\n\n```sh\n' + LITERAL_CODE + '\n```\n')
 
 
@@ -112,6 +114,7 @@ class PortableExportIntegrationTests(unittest.TestCase):
                                          for row in manifest["compile_warnings"]), manifest)
                     initial_text = subprocess.check_output(
                         ['pdftotext', '-layout', str(exported / 'main.pdf'), '-'], text=True)
+                    self.assertIn(INLINE_COMMAND, re.sub(r'\s+', ' ', initial_text))
                     self.assertIn('Fixturecitation[1]', ''.join(initial_text.split()))
                     self.assertNotIn('[?]', ''.join(initial_text.split()))
                     self.assertIn(''.join(expected_caption.split()), ''.join(initial_text.split()))

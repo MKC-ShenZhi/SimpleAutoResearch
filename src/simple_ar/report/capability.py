@@ -124,7 +124,6 @@ def assemble_report_document(
     """Assemble explicit section drafts without changing their meaning."""
 
     report_body, papers, removed_citations, config, document_plan = _prepare_assembly_text(request)
-    renderer = figure_renderer or DeterministicFigureRenderer()
     if request.paired_comparisons and figure_renderer is None:
         from simple_ar.report.figures import add_paired_measurement_figures
         # Bind by the accepted argument's exact metric IDs, never a heading
@@ -143,6 +142,14 @@ def assemble_report_document(
             comparisons=list(request.paired_comparisons), summaries=list(request.paired_summaries),
             config=config.figures, anchors=anchors)
     else:
+        # Whole articles already own their figures. Sectional saved config and
+        # plans retain the original contract; a fresh default/template alone
+        # must never trigger a second interpretation of the Writer's body.
+        legacy_figures = ("figures" in config.model_fields_set
+                          and (request.assembly_mode == ReportAssemblyMode.SECTION_DRAFTS or document_plan is not None))
+        figure_sections = document_plan.sections if document_plan and request.assembly_mode == ReportAssemblyMode.WHOLE_ARTICLE else request.sections
+        renderer = figure_renderer or DeterministicFigureRenderer(legacy=legacy_figures,
+            section_headings=None if legacy_figures else {row.section_id: row.heading for row in figure_sections})
         rendered = renderer.render(
             report_markdown=report_body,
             report_dir=report_dir,
@@ -214,6 +221,10 @@ def _prepare_assembly_text(
 def _display_report_text(report_body: str, papers: list[Paper], config: ReportRuntimeConfig, template_name: str) -> ReportAssemblyResult:
     """Resolve final body references once, including renderer-inserted captions."""
     validate_citations(report_body, {paper.id for paper in papers})
+    if config.max_cited_sources:
+        from simple_ar.report.citations import body_citation_ids
+        if len(body_citation_ids(report_body, {paper.id for paper in papers})) > config.max_cited_sources:
+            raise ValueError('Final report exceeds max_cited_sources; no citations were silently dropped.')
     cited = cited_papers(report_body, papers)
     if papers and not cited:
         raise CitationError("Report body did not cite any paper from papers.jsonl")
@@ -290,7 +301,6 @@ def run_report_capability(
 ) -> CapabilityResult:
     """Persist one assembled report through the session capability boundary."""
 
-    renderer = figure_renderer or DeterministicFigureRenderer()
     request, attachments, imported_figures = _attach_table_analyses(context, request)
     attachments.extend(_attach_experiment_records(context, request))
     # Leave the default renderer implicit so the assembly boundary can choose
@@ -347,7 +357,7 @@ def run_report_capability(
             status = "available" if context.store.exists(path) else "missing"
             figure_refs.append(context.store.ref(
                 path, kind="figure", schema="report_figure.v1",
-                producer=f"report.{renderer.name}", status=status,  # type: ignore[arg-type]
+                producer=f"report.{figure_renderer.name if figure_renderer is not None else DeterministicFigureRenderer.name}", status=status,  # type: ignore[arg-type]
             ))
             if status == "missing":
                 diagnostics.append(f"Figure renderer reported a missing artifact: {path}.")

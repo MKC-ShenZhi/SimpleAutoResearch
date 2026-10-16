@@ -5,8 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
-import shutil
-import subprocess
+import sys
 import tempfile
 import tomllib
 import unittest
@@ -79,26 +78,33 @@ class StartTests(unittest.TestCase):
             reuse_session_materials(args)
             self.assertEqual(args.allow, ['main.py'])
             self.assertEqual(args.validate, 'python main.py')
-            with patch('sys.stdin.isatty', return_value=False), patch('simple_ar.cli.start.print_line'):
-                config = prepare_start(args)
-            settings = tomllib.loads((config.parent / 'code_task.toml').read_text())
-            self.assertIn('gold/**', settings['edit_scope']['protected_patterns'])
-            self.assertEqual(settings['execute']['budget_profile'], 'large')
-            self.assertTrue(settings['execute']['allow_large_edits'])
-            self.assertEqual(settings['budget'], {'max_new_chars': 32000, 'max_files': 6})
+            with patch('sys.stdin.isatty', return_value=False), patch('simple_ar.cli.start.print_line'), \
+                 patch('simple_ar.cli.main._run_native_start') as native:
+                self.assertIsNone(prepare_start(args))
+            native.assert_called_once_with(args)
+            self.assertIn('gold/**', args._code_task['protected_patterns'])
+            self.assertEqual(args._code_task['allowed_patterns'], ['main.py'])
+            self.assertEqual(args._code_task['validation_command'], ['python', 'main.py'])
+            self.assertEqual(args._code_task['edit_policy']['budget_profile'], 'large')
+            self.assertTrue(args._code_task['edit_policy']['allow_large_edits'])
+            self.assertEqual(args._code_task['edit_policy']['edit_budget_overrides'], {'max_new_chars': 32000, 'max_files': 6})
             self.assertEqual((initialized.workspace_dir / 'main.py').read_text(), 'VALUE = 1\n')
             self.assertEqual(session.store.resolve('session_manifest.json').read_bytes(), before)
-            self.assertNotIn('record each figure', (config.parent / 'task.md').read_text())
+            self.assertNotIn('record each figure', args._code_task['goal'])
+            self.assertFalse(list((root / 'new').rglob('*.toml')))
             delivery = session.store.write_json('analysis/analysis.json', {'schema_version': 'code_analysis.v1'})
             implementation = session.store.read_json(session.manifest.state_refs['implementation'])
             implementation['artifact_refs'] = {'code_analysis': {'path': delivery.path}}
             session.manifest.state_refs['implementation'] = session.store.write_json('implementation.json', implementation)
             session.save()
-            revised = self.prepare('--kind', 'figure', '--from-session', str(session.store.root),
+            revised = build_parser().parse_args(['start', '--kind', 'figure', '--from-session', str(session.store.root),
                 '--reuse', 'code_project', '--goal', 'Explain my existing figure',
-                '--output-root', str(root / 'figure-revision'), '--prepare-only')
-            self.assertIn('"path": "outputs/<filename>"', (revised.parent / 'task.md').read_text())
-            self.assertIn('Explain my existing figure', (revised.parent / 'task.md').read_text())
+                '--output-root', str(root / 'figure-revision'), '--prepare-only'])
+            with patch('sys.stdin.isatty', return_value=False), patch('simple_ar.cli.main._run_native_start') as native:
+                self.assertIsNone(prepare_start(revised))
+            native.assert_called_once_with(revised)
+            self.assertIn('"path": "outputs/<filename>"', revised._code_task['goal'])
+            self.assertIn('Explain my existing figure', revised._code_task['goal'])
             conflict = build_parser().parse_args(['start', '--from-session', str(session.store.root), '--reuse', 'code_project', '--allow', '**'])
             with self.assertRaisesRegex(ValueError, 'do not override'):
                 reuse_session_materials(conflict)
@@ -139,7 +145,6 @@ class StartTests(unittest.TestCase):
     def test_ordinary_preferences_enter_one_native_owner_with_declarations_and_read_only_mounts(self):
         from unittest.mock import MagicMock
         from simple_ar.cli.main import main
-        from simple_ar.tools.workspace import resolve_mounted_path
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             data = root / "measurements.csv"
@@ -199,10 +204,6 @@ class StartTests(unittest.TestCase):
                     expected_sources.append(data.resolve())
                 self.assertEqual(list(kwargs["sources"].values()), expected_sources)
                 self.assertEqual(list(kwargs["sources"].values()).count(notes.resolve()), 1)
-                mounts = {**kwargs["sources"], "workspace": root / kind / "workspace"}
-                self.assertEqual(resolve_mounted_path(mounts, str(checker.resolve())), checker.resolve())
-                with self.assertRaisesRegex(ValueError, "writable workspace"):
-                    resolve_mounted_path(mounts, str(checker.resolve()), write=True)
                 self.assertIn("document", create.call_args.args[1])
                 self.assertIn("material", create.call_args.args[1])
                 self.assertIn("outcome preference (not an access grant)", create.call_args.args[1])
@@ -311,16 +312,22 @@ class StartTests(unittest.TestCase):
                         ["--cwd", str(root)], ["--timeout-sec", "300"],
                         ["--requirements", "requirements.txt"], ["--install-project"],
                         ["--check-argv", '["python", "check.py"]'], ["--command", "python", "run.py"])
-            for kind in ("survey", "writing", "bug_fix", "reproduction", "code", "data_analysis"):
-                for flags in controls:
-                    argv = ["start", "--kind", kind, "--goal", "Keep exact controls", *flags]
-                    parser = build_parser()
-                    args = parser.parse_args(argv)
-                    args._explicit_start_destinations = _explicit_session_option_destinations(parser, argv, set(), command="start")
-                    before = vars(args).copy()
-                    with self.subTest(compatibility_kind=kind, controls=flags):
-                        self.assertFalse(migrate_new_start(args))
-                        self.assertEqual(vars(args), before)
+            # Each explicit control owns one routing check. Ordinary preferences
+            # already cover every kind; exact code controls have their own route.
+            for flags in controls:
+                argv = ["start", "--kind", "survey", "--goal", "Keep exact controls", *flags]
+                parser = build_parser()
+                args = parser.parse_args(argv)
+                args._explicit_start_destinations = _explicit_session_option_destinations(parser, argv, set(), command="start")
+                before = vars(args).copy()
+                with self.subTest(controls=flags):
+                    self.assertFalse(migrate_new_start(args))
+                    self.assertEqual(vars(args), before)
+            for flags in (["--allow", "src/**"], ["--validate", "python check.py"]):
+                args = build_parser().parse_args(["start", "--kind", "bug_fix", "--goal", "Keep exact controls", *flags])
+                with self.subTest(incomplete_code=flags), self.assertRaisesRegex(
+                        ValueError, 'requires --project, --allow and --validate'):
+                    migrate_new_start(args)
             for flags in (["--chat"], ["--resume-setup", str(root)],
                           ["--from-session", str(root), "--reuse", "report"],
                           ["--data-file", str(data), "--value-column", "x"],
@@ -402,6 +409,7 @@ class StartTests(unittest.TestCase):
             self.assertNotIn(str(files[0]), selected)
             draft = json.loads((config.parent / "reused-draft-1.json").read_text())
             self.assertEqual(draft['documents'][0]['metadata']['kind'], 'prior_draft')
+            self.assertEqual(draft['documents'][0]['metadata']['evidence_role'], 'prior_draft_not_primary_evidence')
             followup = self.prepare("--kind", "survey", "--from-session", str(session.store.root),
                 "--reuse", "report", "--goal", "Investigate a new question using relevant original sources",
                 "--output-root", str(root / "followup"), "--prepare-only")
@@ -413,23 +421,6 @@ class StartTests(unittest.TestCase):
             self.assertEqual([r['document_id'] for r in filtered['documents']], ['retained-source'])
             self.assertEqual(len(session.store.read_json(current_documents)['documents']), 2)
             self.assertFalse(list(followup.parent.glob("reused-draft-*.json")))
-            from simple_ar.research.documents.ingest import DocumentIngestRequest, DocumentBundle, run_document_ingest_capability
-            from simple_ar.research.contracts import SourcePlan
-            from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
-            from simple_ar.report.projection import build_material_report_inputs
-            from types import SimpleNamespace
-            package = config.parent / 'reused-draft-1.json'
-            ingest = CapabilityContext(ArtifactStore(config.parent / 'ingested'), AttemptManifest('ingest'))
-            result = run_document_ingest_capability(context=ingest, request=DocumentIngestRequest(
-                papers=(), source_plan=SourcePlan(queries=['local'], sources=['local_files'], local_documents=[str(package)]),
-                extraction_dir=config.parent / 'extracted', analysis_paths=(package,)))
-            documents = next(ref for ref in result.artifacts if ref.schema == 'document_bundle.v1')
-            retained = DocumentBundle.from_handoff_dict(ingest.store.read_json(documents))
-            projected, _ = build_material_report_inputs(topic='Reorganize the argument', documents=retained,
-                documents_ref=documents, assets=[SimpleNamespace(locator=str(package), role='material')])
-            self.assertEqual(projected.source_handles[0].kind, 'prior_draft')
-            self.assertEqual(projected.source_handles[0].metadata['evidence_role'], 'prior_draft_not_primary_evidence')
-            self.assertEqual(projected.papers, [])
             from simple_ar.cli.intake_dialogue import _arguments
             from argparse import Namespace
             self.assertEqual(_arguments(Namespace(_reuse_report_drafts=[str(files[0])]))['_reuse_report_drafts'], [str(files[0])])
@@ -441,14 +432,13 @@ class StartTests(unittest.TestCase):
             # saved tool task rather than manufacturing a legacy writing task.
             from simple_ar.app.tool_application import ToolApplication
             from simple_ar.cli.main import main
-            native = SessionController.create(root / "native", session_id="native",
-                topic="Reuse results", registry=CapabilityRegistry())
-            native.manifest.transition_recipe = ToolApplication.RECIPE
-            native.manifest.status = "partial"
+            app = ToolApplication.create(root / "native", "Reuse results", model=None, sources={},
+                max_turns=0, max_tokens=0, max_attempts=4)
+            native = app.session
             native.store.write_text("workspace/note.md", "Saved results, not new measurements.")
-            native.store.write_json("delivery.json", {"summary": "A short note", "artifacts": ["workspace/note.md"],
-                "unresolved": ["Raw data unavailable"]})
-            native.save()
+            app.run(actions=[{'tool_name': 'deliver_result', 'arguments': {
+                'summary': 'A short note', 'artifacts': ['workspace/note.md'],
+                'unresolved': ['Raw data unavailable']}}])
             self.assertEqual(session_materials(native.store.root), {"artifacts": [native.store.root / "workspace/note.md"]})
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
@@ -554,14 +544,14 @@ class StartTests(unittest.TestCase):
                 self.assertEqual(settings["draft_scope"], "document")
                 self.assertEqual(settings["review_scope"], "document")
             self.assertEqual(defaults["report_outline_strategy"], "adaptive")
+            # Keep alias/content checks until a domain test owns these exact
+            # builtin defaults; explicit analysis_report resolution is covered
+            # by ResearchApplicationTests.test_writing_auto_template_keeps_started_snapshot_across_default_change.
             for name in ("", "auto", "material_report"):
                 bundle = load_report_template_bundle(report_mode="supplied_materials", config=ReportRuntimeConfig(template=name))
                 self.assertEqual(bundle.name, "material_report")
                 self.assertIn("## Findings", bundle.template_markdown)
                 self.assertTrue(bundle.criteria_markdown.strip())
-            # Explicit existing choices and experimental fallback retain their meaning.
-            self.assertEqual(load_report_template_bundle(report_mode="supplied_materials",
-                config=ReportRuntimeConfig(template="analysis_report")).name, "analysis_report")
             self.assertEqual(load_report_template_bundle(report_mode="experiment",
                 config=ReportRuntimeConfig(template="auto")).name, "experiment")
 
@@ -576,9 +566,9 @@ class StartTests(unittest.TestCase):
             with patch("sys.stdin.isatty", return_value=False), patch("simple_ar.cli.start.print_line") as output:
                 config = prepare_start(args)
             self.assertEqual(research_defaults(["research-session", "--config", str(config)])["model"], "")
-            resume_hint = next(call.args[0] for call in output.call_args_list if "resume its printed path" in call.args[0])
+            resume_hint = next(call.args[0] for call in output.call_args_list if "resume command printed by the task owner" in call.args[0])
             self.assertNotIn("--model", resume_hint)
-            self.assertIn("research-session --session-root PATH", resume_hint)
+            self.assertNotIn("--session-root", resume_hint)  # Setup does not select the eventual task recipe.
 
     def test_explicit_custom_writing_template_keeps_its_topology(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -595,7 +585,7 @@ class StartTests(unittest.TestCase):
             self.assertNotIn("draft_scope", settings)
             self.assertNotIn("review_scope", settings)
 
-    def test_resume_hint_preserves_the_selected_model(self):
+    def test_setup_preserves_selected_model_and_catalog_default(self):
         from simple_ar.integrations.model_profiles import ModelCatalog
         with tempfile.TemporaryDirectory() as directory:
             for model in ("env", "custom-model"):
@@ -605,8 +595,6 @@ class StartTests(unittest.TestCase):
                     with patch("sys.stdin.isatty", return_value=False), patch("simple_ar.cli.start.print_line") as output:
                         config = prepare_start(args)
                     self.assertEqual(research_defaults(["research-session", "--config", str(config)])["model"], model)
-                    resume_hint = next(call.args[0] for call in output.call_args_list if "resume its printed path" in call.args[0])
-                    self.assertIn(f"--model {model}", resume_hint)
             catalog = ModelCatalog.model_validate({"profiles": {
                 name: {"api": "openai_chat", "base_url": "https://example.test/v1", "model": name,
                        "api_key_env": "TEST_ABSENT_KEY", "capabilities": ["text"], "stream": True,
@@ -636,10 +624,8 @@ class StartTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Available columns.*value.*group"):
                 self.prepare(*args)
             self.assertFalse(output.exists())
-            source.write_text("loss,group\n0.2,A,extra\n", encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "expected 2"):
-                self.prepare(*args)
-            self.assertFalse(output.exists())
+            # Ragged-row permutations belong to TableAnalysisTests. Keep the
+            # entrance's diagnostic and pre-save rejection for columns/bytes.
             source.write_bytes(b"loss\n\xff\n")
             with self.assertRaisesRegex(ValueError, "UTF-8"):
                 self.prepare(*args)
@@ -764,114 +750,55 @@ class StartTests(unittest.TestCase):
             self.assertNotIn("total_tokens", defaults)
             self.assertNotIn("execution_details", defaults)
 
-    def test_code_inputs_use_existing_loader_and_protect_tests(self):
+    def test_exact_code_start_uses_native_contract_without_structured_setup(self):
+        from simple_ar.cli.start import migrate_new_start
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             project = root / "project with spaces"
             project.mkdir()
-            config = self.prepare("--kind", "bug_fix", "--goal", "Fix the rounding error",
-                                  "--project", str(project), "--allow", "src/**",
-                                  "--validate", "python -m unittest discover -s tests",
-                                  "--output-root", str(root / "runs"), "--prepare-only")
-            defaults = research_defaults(["research-session", "--config", str(config)])
-            code_config = Path(defaults["code_task_config"])
-            options = load_code_task_init_options(config_path=code_config)
-            execution = load_code_task_execute_options(config_path=code_config)
-            self.assertEqual(Path(options.code_root), project.resolve())
-            self.assertEqual(options.workspace_mode, "auto")
-            self.assertEqual(options.env_mode, "current")
-            self.assertEqual(options.edit_scope_allowed_patterns, ("src/**",))
-            self.assertIn("tests/**", options.edit_scope_protected_patterns)
-            self.assertTrue(execution.use_llm)
-            self.assertEqual(execution.baseline_policy, "skip")
-            self.assertEqual(Path(options.task_file).read_text(encoding="utf-8"), "Fix the rounding error\n")
-            self.assertEqual(list(project.iterdir()), [])
-            guide = root / "guide.md"
+            data = project / "data.csv"
+            data.write_text("value\n7\n", encoding="utf-8")
+            interpreter = root / "python"
+            interpreter.touch()
+            args = build_parser().parse_args(["start", "--kind", "bug_fix", "--goal", "Fix the rounding error",
+                "--project", str(project), "--allow", "src/**", "--validate", "python tests/check.py",
+                "--project-python", str(interpreter), "--data-path", str(data), "--timeout-sec", "45", "--prepare-only"])
+            with patch("sys.stdin.isatty", return_value=False), patch("simple_ar.cli.start.print_line"):
+                self.assertTrue(migrate_new_start(args))
+            self.assertEqual(args._code_task["project_path"], "source1")
+            self.assertEqual(args.source, [data.resolve(), project.resolve()])
+            self.assertIn('"data_path": [', args.request)
+            self.assertIn(json.dumps(str(data.resolve()), ensure_ascii=False), args.request)
+            self.assertEqual(args._code_task["allowed_patterns"], ["src/**"])
+            self.assertEqual(args._code_task["validation_command"], ["python", "tests/check.py"])
+            self.assertEqual(args._code_task["timeout_sec"], 45)
+            self.assertTrue(args.allow_execution)
+            self.assertEqual(args.project_python, interpreter)
+            self.assertIn("implement_code_task", args.request)
+            self.assertEqual(list(project.iterdir()), [data])
+            self.assertEqual(data.read_text(encoding="utf-8"), "value\n7\n")
+            with patch("simple_ar.cli.main._run_native_start") as native, patch("sys.stdin.isatty", return_value=False):
+                routed = build_parser().parse_args(["start", "--kind", "bug_fix", "--goal", "Fix",
+                    "--project", str(project), "--allow", "src/**", "--validate", "python tests/check.py", "--prepare-only"])
+                self.assertIsNone(prepare_start(routed))
+            native.assert_called_once()
+            self.assertFalse(list(root.rglob("research.toml")))
+            self.assertFalse(list(root.rglob("code_task.toml")))
+
+    def test_greenfield_exact_configuration_retains_its_existing_method(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
             created = self.prepare("--kind", "code", "--goal", "Build a reusable CSV validator",
                 "--allow", "generated_project/**", "--validate", "python generated_project/main.py",
                 "--with-report", "--output-root", str(root / "new-code"), "--prepare-only")
-            created_defaults = research_defaults(["research-session", "--config", str(created)])
-            new_options = load_code_task_init_options(config_path=created_defaults["code_task_config"])
-            self.assertEqual(created_defaults["outputs"], ["code_task", "report"])
-            self.assertEqual(new_options.kind, "greenfield")
-            self.assertIsNone(new_options.code_root)
-            self.assertEqual(new_options.workspace_mode, "empty")
-            self.assertFalse((created.parent / "source").exists())
-            guide.write_text("# API contract\nMissing inputs must remain distinguishable from numeric zero.\n", encoding="utf-8")
-            combined = self.prepare("--kind", "bug_fix", "--goal", "Update the data reader and explain the change",
-                "--project", str(project), "--allow", "src/**", "--validate", "python -m unittest discover -s tests",
-                "--document", str(guide), "--sources", "materials", "--with-report",
-                "--output-root", str(root / "combined"), "--prepare-only")
-            values = research_defaults(["research-session", "--config", str(combined)])
-            self.assertEqual(values["outputs"], ["bug_fix", "report"])
-            self.assertEqual(values["local_document"], [str(guide.resolve())])
-            self.assertTrue(values["research_materials_only"])
-            interpreter = root / "environment with spaces" / "python"
-            interpreter.parent.mkdir()
-            interpreter.touch()  # Input check only; prepare-only must not execute it.
-            external = self.prepare("--kind", "bug_fix", "--goal", "Fix with the existing environment",
-                "--project", str(project), "--project-python", str(interpreter), "--allow", "src/**",
-                "--validate", "python -m unittest", "--output-root", str(root / "external-runs"), "--prepare-only")
-            external_defaults = research_defaults(["research-session", "--config", str(external)])
-            external_options = load_code_task_init_options(config_path=external_defaults["code_task_config"])
-            self.assertEqual(external_options.env_mode, "external")
-            self.assertEqual(Path(external_options.python_executable), interpreter.absolute())
-            self.assertEqual(external_options.edit_scope_allowed_patterns, options.edit_scope_allowed_patterns)
-            self.assertEqual(external_options.edit_scope_protected_patterns, options.edit_scope_protected_patterns)
-            self.assertEqual(list(project.iterdir()), [])
-            if os.name != "nt":
-                alias = interpreter.parent / "venv-python"
-                alias.symlink_to(interpreter)
-                linked = self.prepare("--kind", "bug_fix", "--goal", "Use the chosen venv",
-                    "--project", str(project), "--project-python", str(alias), "--allow", "src/**",
-                    "--validate", "python -m unittest", "--output-root", str(root / "linked-runs"), "--prepare-only")
-                linked_defaults = research_defaults(["research-session", "--config", str(linked)])
-                linked_options = load_code_task_init_options(config_path=linked_defaults["code_task_config"])
-                self.assertEqual(Path(linked_options.python_executable), alias.absolute())
-                self.assertNotEqual(Path(linked_options.python_executable), alias.resolve())
-            for flags, expected in ((["--kind", "writing", "--project-python", str(interpreter)], "requires --kind bug_fix"),
-                                    (["--kind", "bug_fix", "--project-python", str(root / "missing")], "not found")):
-                with self.subTest(flags=flags), self.assertRaisesRegex(ValueError, expected):
-                    self.prepare(*flags, "--interaction", "checkpoints", "--prepare-only", "--output-root", str(root / "refused"))
-                self.assertFalse((root / "refused").exists())
-
-    @unittest.skipUnless(shutil.which("git"), "Git is required for workspace isolation")
-    def test_guided_code_workspace_keeps_large_committed_source_and_dirty_changes(self):
-        from simple_ar.code_task.workspace.modes import WorkspaceSpec, create_workspace
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            project = root / "project"
-            project.mkdir()
-            source = project / "generated.py"
-            source.write_text("# generated source\n" + "# retained\n" * 190000, encoding="utf-8")
-            for command in (("init",), ("config", "user.name", "Workspace Test"),
-                            ("config", "user.email", "test@example.invalid"),
-                            ("add", "."), ("commit", "-m", "fixture")):
-                subprocess.run(["git", "-C", str(project), *command],
-                               check=True, capture_output=True)
-            config = self.prepare("--kind", "bug_fix", "--goal", "Keep project behavior",
-                                  "--project", str(project), "--allow", "*.py",
-                                  "--validate", "python -m unittest", "--output-root", str(root / "runs"),
-                                  "--prepare-only")
-            code_config = Path(research_defaults(["research-session", "--config", str(config)])["code_task_config"])
-            options = load_code_task_init_options(config_path=code_config)
-            clean = create_workspace(WorkspaceSpec(code_root=project, task_dir=root / "clean",
-                                                   mode=options.workspace_mode,
-                                                   max_file_bytes=options.max_file_bytes))
-            self.assertEqual(clean.mode, "git_worktree")
-            self.assertGreater(source.stat().st_size, options.max_file_bytes)
-            self.assertEqual((clean.project_root / source.name).stat().st_size, source.stat().st_size)
-            changed = project / "user_changes.py"
-            changed.write_text("VALUE = 7\n", encoding="utf-8")
-            dirty = create_workspace(WorkspaceSpec(code_root=project, task_dir=root / "dirty",
-                                                   mode=options.workspace_mode,
-                                                   max_file_bytes=options.max_file_bytes))
-            self.assertEqual(dirty.mode, "copy")
-            self.assertIn("uncommitted", dirty.fallback_reason)
-            self.assertEqual((dirty.project_root / changed.name).read_text(), changed.read_text())
-            self.assertTrue(any(item["path"] == source.name and item["reason"] == "file_too_large"
-                                for item in dirty.copy_report.skipped))
-            self.assertEqual(changed.read_text(), "VALUE = 7\n")
+            defaults = research_defaults(["research-session", "--config", str(created)])
+            options = load_code_task_init_options(config_path=defaults["code_task_config"])
+            self.assertEqual(defaults["outputs"], ["code_task", "report"])
+            self.assertEqual(options.kind, "greenfield")
+            self.assertIsNone(options.code_root)
+            self.assertEqual(options.workspace_mode, "empty")
+            self.assertEqual(defaults['report_outline_strategy'], 'adaptive')
+            self.assertTrue(defaults['report_document_review'])
 
     def test_fulltext_is_explicit_and_maps_to_existing_retrieval_permissions(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -978,7 +905,7 @@ class StartTests(unittest.TestCase):
                 prepare_start(args)
             self.assertFalse(root.exists())
 
-    def test_native_resume_and_readout_preserve_existing_authorization_and_state(self):
+    def test_native_resume_preserves_existing_authorization_and_state(self):
         from simple_ar.cli.main import main
         from simple_ar.core.budget import BudgetLedger
         from unittest.mock import MagicMock
@@ -987,7 +914,9 @@ class StartTests(unittest.TestCase):
         app.session.store.root = Path('saved-task').resolve()
         app.session.store.exists.return_value = False
         app.workspace.workspace = app.session.store.root / 'workspace'
-        app.state = {'pending': None}
+        app.state = {'config': {'model': 'profile:saved', 'execution_contract': None},
+            'pending': None, 'requests': ['Saved goal'], 'turns': []}
+        app.measurement_completion_actions.return_value = []
         app.ledger = BudgetLedger({'llm_requests': 2, 'total_tokens': 100, 'process_wall_seconds': 20})
         app.ledger.reserve('old-call', {'llm_requests': 2, 'total_tokens': 100})
         app.ledger.settle('old-call', {'llm_requests': 2, 'total_tokens': 100})
@@ -1077,13 +1006,16 @@ class StartTests(unittest.TestCase):
                 with self.subTest(retry_argv=argv), self.assertRaises(SystemExit):
                     main(argv)
                 app.run.assert_not_called()
-        # The same native CLI fixture reads retained state without taking over
-        # terminal consumption, recovery, budget authorization or acceptance.
+
+    def test_native_readout_preserves_saved_bytes_accounting_and_acceptance_boundary(self):
         from simple_ar.cli.main import _render_native_result
+        from simple_ar.core.budget import BudgetLedger
         from simple_ar.core.capabilities import ArtifactStore
         from simple_ar.tools.workspace import resolve_mounted_path
         from types import SimpleNamespace
         from rich.console import Console
+        from unittest.mock import MagicMock
+        app = MagicMock()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             app.session.store = ArtifactStore(root)
@@ -1153,14 +1085,17 @@ class StartTests(unittest.TestCase):
             with contextlib.redirect_stdout(output := io.StringIO()):
                 _render_native_result(app, {'status': 'paused', 'status_reason': ''})
             self.assertIn('No saved delivery record', output.getvalue())
+
+    def test_native_and_explicit_protocol_entry_routes_remain_distinct(self):
+        from simple_ar.cli.main import main
         with patch('simple_ar.cli.main._run_native_start') as native, \
                 patch('simple_ar.cli.start.new_research_session_root') as legacy:
-            for argv in (['start'], ['start', '--goal', 'Explain saved results'],
-                         ['start', '--source', 'results with spaces', '--prepare-only'],
+            # Bare/goal spellings share the ordinary-preferences test above.
+            for argv in (['start', '--source', 'results with spaces', '--prepare-only'],
                          ['start', '--allow-network', '--model', 'profile:research']):
                 with self.subTest(argv=argv):
                     main(argv)
-            self.assertEqual(native.call_count, 4)
+            self.assertEqual(native.call_count, 2)
             legacy.assert_not_called()
             with self.assertRaisesRegex(SystemExit, 'Do not mix'):
                 main(['start', 'Write a report', '--template', 'experiment'])
@@ -1171,6 +1106,96 @@ class StartTests(unittest.TestCase):
             run.assert_called_once()
             self.assertEqual(run.call_args.args[0].task_kind, "survey")
             self.assertEqual(run.call_args.args[0].outputs, ["report"])
+        from simple_ar.cli.start import migrate_measurement_creation
+        with tempfile.TemporaryDirectory() as directory, \
+                patch('simple_ar.app.tool_application.ToolApplication.create') as create, \
+                patch('simple_ar.cli.main._render_native_result'), patch('simple_ar.cli.start.print_line'):
+            root = Path(directory).resolve()
+            execution = {'command': [sys.executable, '-c', "print('score: 3')"], 'cwd': str(root),
+                'timeout_sec': 5, 'result_schema': {'primary_metric': 'score'}}
+            limits = {'llm_requests': 3, 'total_tokens': 24000,
+                'process_invocations': 2, 'process_wall_seconds': 10}
+            for model in (None, 'fixture'):
+                args = build_parser().parse_args(['research-session', '--topic', 'Fixed measurement', '--task-kind', 'measurement',
+                    *(['--model', model] if model else [])])
+                args._explicit_resume_destinations = {'task_kind', 'model'}
+                with self.assertRaisesRegex(ValueError, 'explicit interpreters'):
+                    migrate_measurement_creation(args, execution={**execution, 'environment': {'mode': 'venv'}},
+                        request='Do not replace the selected interpreter', outputs=('experiments',), root=root, limits=limits)
+                for extra in ({'baseline_ref': 'historical.json'}, {'baseline_policy': 'reuse'}):
+                    self.assertFalse(migrate_measurement_creation(args, execution={**execution, **extra},
+                        request='Keep the complex owner', outputs=('experiments',), root=root, limits=limits))
+                self.assertFalse(migrate_measurement_creation(args, execution=execution,
+                    request='Keep explicit outputs', outputs=('report',), root=root, limits=limits))
+                if model is None:
+                    with self.assertRaisesRegex(ValueError, 'authored report requires a model'):
+                        migrate_measurement_creation(args, execution=execution,
+                            request='Do not fabricate a report', outputs=('experiments', 'report'), root=root, limits=limits)
+                create.assert_not_called()
+                args._explicit_resume_destinations.add('interaction')
+                with self.assertRaisesRegex(ValueError, 'explicit controls'):
+                    migrate_measurement_creation(args, execution=execution, request='Preserve explicit controls',
+                        outputs=('experiments',), root=root, limits=limits)
+                args._explicit_resume_destinations.remove('interaction')
+                if model:
+                    for key, value in (('llm_requests', 0), ('total_tokens', 0), ('total_tokens', -1)):
+                        with self.assertRaisesRegex(ValueError, 'finite positive'):
+                            migrate_measurement_creation(args, execution=execution, request='Bounded creation',
+                                outputs=('experiments',), root=root, limits={**limits, key: value})
+                create.assert_not_called()
+
+            args = build_parser().parse_args(['research-session', '--topic', 'Measure declared conditions', '--task-kind', 'measurement'])
+            args.model = None
+            args._explicit_resume_destinations = {'task_kind'}
+            grouped = {**execution, 'baseline_policy': 'run', 'seeds': [4, 9], 'seed_flag': '--seed',
+                'environment': {'mode': 'current', 'timeout_sec': 5,
+                    'check_command': [sys.executable, '-c', 'pass']}}
+            app = create.return_value
+            app.state = {'turns': [{'origin': 'caller'}], 'pending': {'attempt': 'first'}}
+            app.measurement_completion_actions.return_value = []
+            def run_batch(*, actions, approve, progress):
+                self.assertEqual(len(actions), 4)
+                for index, action in enumerate(actions):
+                    call = {'id': f'caller-0-{index}', 'function': {'name': action['tool_name'],
+                        'arguments': json.dumps(action['arguments'])}}
+                    changed = {**call, 'function': {**call['function'], 'arguments': json.dumps({
+                        **action['arguments'], 'timeout_sec': 99})}}
+                    self.assertFalse(approve(changed, 'changed-argv'))
+                    app.state['turns'][0]['origin'] = 'model'
+                    self.assertFalse(approve(call, 'model-must-not-inherit-caller-approval'))
+                    app.state['turns'][0]['origin'] = 'caller'
+                    app.scientific.approval_binding.return_value = ({'environment_preparation': {
+                        'steps': [[sys.executable, '-c', 'pass']], 'profile': {'timeout_sec': 5}},
+                        'limits': limits} if index == 0 else {'shared_environment': {'attempt_id': 'first'}})
+                    self.assertTrue(approve(call, 'literal-initial-condition'))
+                    self.assertFalse(approve(call, 'never-retry'))
+                return {'status': 'completed'}
+            app.run.side_effect = run_batch
+            self.assertTrue(migrate_measurement_creation(args, execution=grouped, request='Prepare once for all roles',
+                outputs=('experiments',), root=root, limits=limits))
+            options = create.call_args.kwargs
+            self.assertIsNone(options['code_task'])
+            self.assertEqual(options['process_limits'], {'process_invocations': 5, 'process_wall_seconds': 25})
+            self.assertEqual(len(options['execution_contract']['conditions']), 4)
+            args.process_invocations, args.process_wall_seconds = 2, 10
+            migrate_measurement_creation(args, execution=grouped, request='Keep explicit limits',
+                outputs=('experiments',), root=root, limits=limits)
+            self.assertEqual(create.call_args.kwargs['process_limits'],
+                {'process_invocations': 2, 'process_wall_seconds': 10})
+            create.reset_mock()
+            # Reject an incompatible baseline cwd before creating the common task.
+            other = root / 'other'
+            other.mkdir()
+            with self.assertRaisesRegex(ValueError, 'same declared cwd'):
+                migrate_measurement_creation(args, execution={**grouped, 'baseline': {
+                    'command': execution['command'], 'cwd': str(other)}}, request='Invalid shared cwd',
+                    outputs=('experiments',), root=root, limits=limits)
+            create.assert_not_called()
+            with self.assertRaises(ValueError):
+                migrate_measurement_creation(args, execution={**grouped, 'baseline': {
+                    'command': execution['command'], 'environment': {'mode': 'venv'}}},
+                    request='No per-condition environment replacement', outputs=('experiments',), root=root, limits=limits)
+            create.assert_not_called()
 
     def test_prepared_reproduction_uses_existing_config_and_preserves_argv(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1205,11 +1230,13 @@ class StartTests(unittest.TestCase):
             self.assertNotIn("total_tokens", values)
             self.assertFalse(values["research_allow_pdf_download"])
             self.assertFalse((config.parent / "code_task.toml").exists())
-            adapter = self.prepare("--kind", "reproduction", "--goal", "Export author results without changing the method",
-                "--document", str(paper), "--hypothesis", "Published claim", "--dataset", "Fixed data",
-                "--expected-outcome", "Measure coverage", "--metric", "coverage", "--project", directory,
-                "--data-path", directory, "--allow", "adapter.py", "--validate", "python tests/check_adapter.py",
-                "--output-root", str(root / "adapted-runs"), "--prepare-only", "--command", "python", "adapter.py")
+            with patch('simple_ar.cli.start.migrate_exact_code_creation') as migrate:
+                adapter = self.prepare("--kind", "reproduction", "--goal", "Export author results without changing the method",
+                    "--document", str(paper), "--hypothesis", "Published claim", "--dataset", "Fixed data",
+                    "--expected-outcome", "Measure coverage", "--metric", "coverage", "--project", directory,
+                    "--data-path", directory, "--allow", "adapter.py", "--validate", "python tests/check_adapter.py",
+                    "--output-root", str(root / "adapted-runs"), "--prepare-only", "--command", "python", "adapter.py")
+            migrate.assert_not_called()  # Preparation still emits the existing structured TOML.
             prepared = research_defaults(["research-session", "--config", str(adapter)])
             self.assertEqual(prepared["command_argv"], ["python", "adapter.py"])
             self.assertEqual(prepared["process_invocations"], 3)

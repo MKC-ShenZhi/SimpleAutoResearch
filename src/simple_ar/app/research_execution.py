@@ -10,8 +10,26 @@ from simple_ar.research.experiment import ExperimentRequest
 from simple_ar.research.contracts import ResearchExperimentContract
 from simple_ar.research.implementation import ImplementationRequest
 from simple_ar.code_task.editing.budget import VALID_BUDGET_PROFILES
+from simple_ar.code_task.runtime.config import CodeTaskInitOptions, CodeTaskExecuteOptions
 from simple_ar.code_task.execution.environment import resolve_code_task_command
 from simple_ar.result_analysis.metrics import normalize_direction
+
+
+def code_task_execution_options(init: CodeTaskInitOptions, execute: CodeTaskExecuteOptions) -> dict[str, Any]:
+    """Translate canonical options to the shared preparation/implementation contract."""
+    return {
+        'kind': init.kind, 'code_root': str(Path(init.code_root).resolve()) if init.code_root is not None else None,
+        'workspace_mode': init.workspace_mode, 'max_file_bytes': init.max_file_bytes,
+        'workspace_include': list(init.workspace_include), 'workspace_exclude': list(init.workspace_exclude),
+        'workspace_reuse_source_venv': init.workspace_reuse_source_venv,
+        'env_mode': init.env_mode, 'python_executable': init.python_executable,
+        'approval_note': 'Auto-approved inside the isolated research-session workspace.',
+        'max_repairs': execute.repair_rounds,
+        'allowed_patterns': list(init.edit_scope_allowed_patterns),
+        'protected_patterns': list(init.edit_scope_protected_patterns),
+        'budget_profile': execute.budget_profile, 'edit_budget_overrides': execute.edit_budget_overrides,
+        'allow_large_edits': execute.allow_large_edits,
+    }
 
 
 def analysis_contract_context(
@@ -80,6 +98,38 @@ def analysis_contract_context(
     return context
 
 
+def validate_execution_declaration(config: Mapping) -> tuple[tuple[Mapping, ...], str]:
+    """Validate all supplied declarations without requiring or expanding argv.
+
+    Return explicit pairs and the baseline policy; do not mutate configuration
+    or expand seed_count. Explicit seeds retain precedence over a valid count.
+    """
+    if not isinstance(config, Mapping):
+        raise ValueError("Provide execution with command (argv), absolute cwd and timeout_sec.")
+    pairs = _validated_pairs(config.get("pairs", ()))
+    if pairs and any(key in config for key in ("seeds", "seed_count", "seed_flag")):
+        raise ValueError("Use execution.pairs or compact seed settings, not both.")
+    if "seeds" in config:
+        _seed_list(config["seeds"], "execution.seeds")
+    protocol = config.get("protocol")
+    comparison = protocol.get("comparison_conditions") if isinstance(protocol, Mapping) else None
+    if isinstance(comparison, Mapping) and "seeds" in comparison:
+        _seed_list(comparison["seeds"], "execution.protocol.comparison_conditions.seeds")
+    if "seed_count" in config and (type(config["seed_count"]) is not int or config["seed_count"] < 1):
+        raise ValueError("execution.seed_count must be a positive integer.")
+    if "seed_flag" in config and (not isinstance(config["seed_flag"], str) or not config["seed_flag"].strip()):
+        raise ValueError("execution.seed_flag must be a non-empty string.")
+    if "baseline_ref" in config and (not isinstance(config["baseline_ref"], str) or not config["baseline_ref"].strip()):
+        raise ValueError("execution.baseline_ref must be a non-empty artifact path.")
+    if "baseline_policy" in config:
+        raw = config["baseline_policy"]
+        if not isinstance(raw, str) or raw.strip().lower() not in {"run", "skip", "reuse"}:
+            raise ValueError("execution.baseline_policy must be run, skip or reuse.")
+        return pairs, raw.strip().lower()
+    # Pairs or an explicit baseline are a comparison request; otherwise skip.
+    return pairs, "run" if pairs or "baseline" in config else "skip"
+
+
 def normalize_execution_config(
     config: Mapping,
     *,
@@ -95,19 +145,14 @@ def normalize_execution_config(
     text or turns a model suggestion into an executable command.
     """
 
-    if not isinstance(config, Mapping):
-        raise ValueError("Provide execution with command (argv), absolute cwd and timeout_sec.")
+    pairs, baseline_policy = validate_execution_declaration(config)
     normalized = dict(config)
-    pairs = _validated_pairs(normalized.get("pairs", ()))
-    baseline_policy = _baseline_policy(normalized, pairs=pairs)
-    if pairs and any(key in normalized for key in ("seeds", "seed_count", "seed_flag")):
-        raise ValueError("Use execution.pairs or compact seed settings, not both.")
 
     del task_text
     seed_values, seed_reason = _declared_seed_values(normalized)
     if seed_values and not pairs:
         seed_flag = normalized.get("seed_flag", "")
-        if not isinstance(seed_flag, str) or not seed_flag.strip():
+        if not seed_flag:
             raise ValueError(
                 "Seed-aware execution requires an explicit execution.seed_flag; "
                 "the task text cannot authorize command inference."
@@ -243,8 +288,6 @@ def _declared_seed_values(config: Mapping) -> tuple[tuple[int, ...], str]:
             return (), "Protocol declares seed conditions; the fixed command is retained without per-seed expansion."
     count = config.get("seed_count")
     if count is not None:
-        if type(count) is not int or count < 1:
-            raise ValueError("execution.seed_count must be a positive integer.")
         return tuple(range(count)), f"Seeds defaulted to 0..{count - 1} from execution.seed_count."
     return (), "No repeated seed condition was declared; the single configured execution is retained."
 
@@ -258,24 +301,6 @@ def _seed_list(value: object, name: str) -> tuple[int, ...]:
             raise ValueError(f"{name} must contain unique integers.")
         result.append(item)
     return tuple(result)
-
-
-def _baseline_policy(config: Mapping, *, pairs: tuple[Mapping, ...]) -> str:
-    raw = str(config.get("baseline_policy") or "").strip().lower()
-    if raw == "run":
-        return "run"
-    if raw == "skip":
-        return "skip"
-    if raw == "reuse":
-        return "reuse"
-    if raw:
-        raise ValueError("execution.baseline_policy must be run, skip or reuse.")
-    # A pair or an explicit baseline command is already an explicit comparison
-    # request. Otherwise the honest deterministic default is no baseline;
-    # design may replace it with a structured comparison decision later.
-    if pairs or "baseline" in config:
-        return "run"
-    return "skip"
 
 
 def execution_protocol(config: Mapping, *, task_text: str = "") -> dict[str, Any]:
@@ -549,11 +574,11 @@ def code_task_validation(config: Mapping, *, required: bool = False) -> tuple[tu
         if "environment" in config:
             from simple_ar.research.project_environment import environment_profile
             profile = environment_profile(config["environment"])
-            if profile["mode"] != "venv" or policy["env_mode"] != "current" or task.get("python_executable"):
+            if profile["mode"] == "venv" and (policy["env_mode"] != "current" or task.get("python_executable")):
                 raise ValueError("Reproduction installation requires an explicit venv and an initially current CodeTask interpreter.")
-            if profile.get("check_command"):
-                raise ValueError("CodeTask's independent validation replaces environment.check_command; do not run a second check or formal command in preparation.")
-            if any(argv[0] not in {"python", "python3"} for argv in (task["validation_command"], config["command"])):
+            if profile.get("check_command") and tuple(resolve_code_task_command(profile['check_command'], **policy)) == tuple(resolve_code_task_command(config['command'], **policy)):
+                raise ValueError('Preparation checks must not run the formal scientific command.')
+            if profile["mode"] == "venv" and any(argv[0] not in {"python", "python3"} for argv in (task["validation_command"], config["command"])):
                 raise ValueError("CodeTask venv requires python/python3 aliases for both checker and formal command.")
         if command == tuple(resolve_code_task_command(config["command"], **policy)):
             raise ValueError("Reproduction validation_command must differ from the formal command.")
@@ -569,6 +594,7 @@ def repair_limit(config: Mapping) -> int:
 
 
 __all__ = [
+    "code_task_execution_options",
     "execution_pairs", "execution_protocol", "execution_request", "implementation_request", "code_task_validation",
     "merge_execution_protocol", "normalize_execution_config", "repair_limit",
 ]

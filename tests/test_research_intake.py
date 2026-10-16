@@ -7,7 +7,6 @@ import unittest
 
 from simple_ar.app.research_intake import (
     ResearchInputError,
-    brief_from_legacy_request,
     normalize_assets,
     parse_research_input,
     validate_brief,
@@ -16,9 +15,6 @@ from simple_ar.app.research_intake import (
 from simple_ar.research.workflow_contracts import ResearchBrief
 
 
-class _LegacyRequest:
-    topic = "reliable agents"
-    local_documents = ()
 
 
 class ResearchIntakeTests(unittest.TestCase):
@@ -113,15 +109,6 @@ role = "baseline"
             parse_research_input("")
 
         self.assertEqual(raised.exception.diagnostics[0].code, "request_text_required")
-
-    def test_legacy_topic_maps_to_explicit_brief_and_assets(self) -> None:
-        brief = brief_from_legacy_request(_LegacyRequest())
-
-        self.assertEqual(brief.request_text, "reliable agents")
-        self.assertEqual(brief.objective, "reliable agents")
-        self.assertEqual(brief.intents, ("research",))
-        self.assertEqual(brief.requested_outputs, ("research_summary",))
-
 
 if __name__ == "__main__":
     unittest.main()

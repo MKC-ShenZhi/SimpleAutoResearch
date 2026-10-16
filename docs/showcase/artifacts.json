@@ -1,0 +1,31 @@
+{
+  "published_at": "2026-10-13",
+  "method": "Byte-identical copies of saved development acceptance artifacts; no new run or image editing.",
+  "files": [
+    {
+      "file": "assets/bike-sharing-revised.png",
+      "source": "runs/acceptance/harness-20261009/final-user-data-20261013/revised-figure.png",
+      "sha256": "1b3828ffdde722274d7039adecc0a281611a7127fe9bd73b328f7ea2d89199a5"
+    },
+    {
+      "file": "assets/bike-sharing-report-page-1.png",
+      "source": "runs/acceptance/harness-20261009/final-user-data-20261013/final-page-1.png",
+      "sha256": "af717b51e9d1d6666c3e2a8954107f3381f28dfd0d69779a4bc05dd0b75f3f9e"
+    },
+    {
+      "file": "assets/bike-sharing-report.pdf",
+      "source": "runs/acceptance/harness-20261009/final-user-data-20261013/delivered-feedback-report.pdf",
+      "sha256": "153a7b21b4a0c139c698e39b6a85164780dbdf696b0f609826a9b7ab8e702eed"
+    },
+    {
+      "file": "assets/study-figure-before.png",
+      "source": "runs/acceptance/harness-20261009/editable-study-figure-initial-preview.png",
+      "sha256": "af7117fffb2c37ecc003106e2199da4def10595fcaaaa22dcdc29fe17e0f34ce"
+    },
+    {
+      "file": "assets/study-figure-after.png",
+      "source": "runs/acceptance/harness-20261009/editable-study-figure-revised-preview.png",
+      "sha256": "00f542619d188306ff61815016a8e839517c8b9c2b6674171808fcecb2285158"
+    }
+  ]
+}

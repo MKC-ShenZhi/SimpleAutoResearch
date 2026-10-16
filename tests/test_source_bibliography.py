@@ -431,7 +431,7 @@ class MaterialBibliographyTests(unittest.TestCase):
         gateway.call_counts["get_paper_brief"] = 2
         client, checkpoints = Mock(), []
         client.ask_json.return_value = response
-        with patch("simple_ar.report.agent._draft_section_with_recovery", side_effect=LLMError("First writer outage")):
+        with patch("simple_ar.report.agent._section_response", side_effect=LLMError("First writer outage")):
             with self.assertRaises(LLMError):
                 run_report_agent(client=client, context=context, memory=memory, template=template,
                     config=config, gateway=gateway, checkpoint_sink=checkpoints.append)

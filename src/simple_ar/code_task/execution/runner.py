@@ -7,12 +7,12 @@ import shlex
 import subprocess
 import threading
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from simple_ar.core.artifacts import write_json, write_text
-from simple_ar.core.process import ProcessSpec, run_process, with_process_outputs
+from simple_ar.core.artifacts import read_json, write_json, write_text
+from simple_ar.core.process import ProcessResult, ProcessSpec, run_process, with_process_outputs
 from simple_ar.core.budget import BudgetLedger
 from simple_ar.code_task.editing.attempts import (
     load_latest_code_task_batch,
@@ -35,6 +35,8 @@ from simple_ar.code_task.runtime.state import (
     code_task_paths,
     load_code_task_manifest,
     manifest_section,
+    native_workspace_binding,
+    native_preparation_processes,
     save_code_task_manifest,
     utcnow_iso,
 )
@@ -277,28 +279,79 @@ def run_code_task_benchmark(
         manifest = load_code_task_manifest(run_dir)
 
     started = time.monotonic()
-    try:
-        completed = _run_command(
-            command_args,
-            cwd=paths.workspace_dir,
-            timeout_sec=timeout_sec,
-            stream_output=stream_output,
-            output_callback=output_callback,
-            output_dir=paths.run_artifact_dir / label / "process",
-            budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
-        )
-        duration_sec = round(time.monotonic() - started, 3)
-        stdout, stdout_truncated = _clip_output(completed.stdout)
-        stderr, stderr_truncated = _clip_output(completed.stderr)
-        metrics = parse_metric_lines(stdout)
-        status = "passed" if completed.returncode == 0 else "failed"
-        process_record = completed.simple_ar_process
-        stdout_truncated |= process_record["streams"]["stdout"]["tail_bytes_discarded"] > 0
-        stderr_truncated |= process_record["streams"]["stderr"]["tail_bytes_discarded"] > 0
-        report_metadata: dict[str, Any] = {"process": process_record}
-        run_metadata: dict[str, Any] = {}
+    watchdog = _OutputWatchdog()
+    mode = normalize_stream_output_mode(stream_output)
+    binding = manifest.get('code_task', {}).get('native_binding')
+    recovered = recover_implementation_process(run_dir, budget_ledger=budget_ledger,
+        session_id=session_id, attempt_id=attempt_id) if binding is not None else None
+    if binding is not None:
+        from simple_ar.code_task.execution.environment import native_validation_command
+        expected = _split_command(
+            _argv_command(native_validation_command(manifest, paths.workspace_dir)), environment_policy=environment_policy)
+        if (command_args != expected or timeout_sec != binding['binding']['contract']['timeout_sec']
+                or environment_policy.get('python_executable') != binding['binding']['python_executable']):
+            raise CodeTaskRunError('Validator command, interpreter or timeout differs from the original approval')
+        from simple_ar.code_task.runtime.state import implementation_file_hashes, required_new_file_issues
+        missing = required_new_file_issues(manifest, paths.workspace_dir)
+        if missing and recovered is None:
+            return _write_blocked_result(run_dir, command_text=command_text, command_args=command_args,
+                environment_policy=environment_policy, timeout_sec=timeout_sec, run_label=label,
+                reason='Create required nonempty project files before validation: ' + ', '.join(missing),
+                report_metadata={'native_binding': binding,
+                    'preflight': {'reason': 'required_new_files', 'missing_files': missing},
+                    'implementation_file_hashes': implementation_file_hashes(run_dir)})
+    process = recovered or _run_command(
+        command_args,
+        cwd=paths.workspace_dir,
+        timeout_sec=timeout_sec,
+        stream_output=mode,
+        output_callback=output_callback,
+        output_dir=paths.run_artifact_dir / label / "process",
+        budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
+        **({'environment': native_workspace_binding(manifest, paths.workspace_dir)['environment'],
+            'input_binding': {'native_binding': binding,
+                'implementation_file_hashes': implementation_file_hashes(run_dir),
+                **({'required_new_file_issues': required_new_file_issues(manifest, paths.workspace_dir)}
+                    if binding['binding']['contract'].get('new_files') else {})}}
+            if binding is not None else {}),
+        watchdog=watchdog,
+    )
+    if recovered is not None:
+        watchdog.triggered = recovered.record['input_binding']['runtime_watchdog']
+    stderr_text = process.stderr
+    timed_out = process.stop_reason == "timeout"
+    returncode = None if timed_out else process.returncode
+    status = "timed_out" if timed_out else "passed" if returncode == 0 and not process.stop_reason else "failed"
+    report_metadata: dict[str, Any] = {"process": process.record}
+    if binding is not None:
+        from simple_ar.code_task.runtime.state import implementation_file_hashes
+        report_metadata['native_binding'] = binding
+        report_metadata['implementation_file_hashes'] = implementation_file_hashes(run_dir)
+    run_metadata: dict[str, Any] = {}
+    if timed_out:
+        if stderr_text:
+            stderr_text += "\n"
+        stderr_text += f"Timed out after {timeout_sec} seconds."
+    else:
+        if watchdog.triggered is not None:
+            returncode = 124
+            status = "failed"
+            detail = watchdog.triggered["detail"]
+            stderr_text = stderr_text.rstrip() + f"\nRuntime output watchdog aborted benchmark: {detail}\n"
+            report_metadata["runtime_watchdog"] = watchdog.triggered
+            run_metadata["runtime_watchdog"] = watchdog.triggered
+        if mode == "summary" and output_callback is not None:
+            _emit_output_summary(process.stdout, stderr_text, output_callback)
+    duration_sec = round(process.duration_sec if binding is not None else time.monotonic() - started, 3)
+    stdout, stdout_truncated = _clip_output(process.stdout)
+    stderr, stderr_truncated = _clip_output(stderr_text)
+    metrics = parse_metric_lines(stdout)
+    stdout_truncated |= process.record["streams"]["stdout"]["tail_bytes_discarded"] > 0
+    stderr_truncated |= process.record["streams"]["stderr"]["tail_bytes_discarded"] > 0
+    if not timed_out:
         artifact_scan: dict[str, Any] | None = None
-        if _is_greenfield_manifest(manifest):
+        if (_is_greenfield_manifest(manifest)
+                and not (binding and binding['binding'].get('measurement_contract') is not None)):
             artifact_scan = scan_required_artifacts(run_dir, manifest)
             artifact_scan_path = _write_runtime_artifact_scan(run_dir, label, artifact_scan)
             artifact_scan_rel = _relative_to_run(run_dir, artifact_scan_path)
@@ -315,16 +368,13 @@ def run_code_task_benchmark(
                     "artifact_scan_summary": artifact_scan_summary,
                 }
             )
-        watchdog_record = getattr(completed, "simple_ar_watchdog", None)
-        if isinstance(watchdog_record, dict):
-            report_metadata["runtime_watchdog"] = watchdog_record
-            run_metadata["runtime_watchdog"] = watchdog_record
         quality_guard = _greenfield_result_quality_guard(
             run_dir,
             manifest,
             status=status,
             metrics=metrics,
             artifact_scan=artifact_scan,
+            required_file_issues=(process.record.get('input_binding') or {}).get('required_new_file_issues'),
         )
         if quality_guard is not None:
             status = "failed"
@@ -334,57 +384,26 @@ def run_code_task_benchmark(
             stderr, stderr_truncated = _clip_output(stderr_text)
             report_metadata["quality_guard"] = quality_guard
             run_metadata["quality_guard"] = quality_guard
-        return _write_execution_result(
-            run_dir,
-            manifest=manifest,
-            command_text=command_text,
-            command_args=command_args,
-            environment_policy=environment_policy,
-            timeout_sec=timeout_sec,
-            duration_sec=duration_sec,
-            status=status,
-            returncode=completed.returncode,
-            timed_out=False,
-            stdout=stdout,
-            stderr=stderr,
-            metrics=metrics,
-            stdout_truncated=stdout_truncated,
-            stderr_truncated=stderr_truncated,
-            run_label=label,
-            report_metadata=report_metadata or None,
-            run_metadata=run_metadata or None,
-        )
-    except subprocess.TimeoutExpired as exc:
-        duration_sec = round(time.monotonic() - started, 3)
-        process_record = exc.simple_ar_process
-        stdout, stdout_truncated = _clip_output(_output_text(exc.stdout))
-        stderr_text = _output_text(exc.stderr)
-        if stderr_text:
-            stderr_text += "\n"
-        stderr_text += f"Timed out after {timeout_sec} seconds."
-        stderr, stderr_truncated = _clip_output(stderr_text)
-        metrics = parse_metric_lines(stdout)
-        stdout_truncated |= process_record["streams"]["stdout"]["tail_bytes_discarded"] > 0
-        stderr_truncated |= process_record["streams"]["stderr"]["tail_bytes_discarded"] > 0
-        return _write_execution_result(
-            run_dir,
-            manifest=manifest,
-            command_text=command_text,
-            command_args=command_args,
-            environment_policy=environment_policy,
-            timeout_sec=timeout_sec,
-            duration_sec=duration_sec,
-            status="timed_out",
-            returncode=None,
-            timed_out=True,
-            stdout=stdout,
-            stderr=stderr,
-            metrics=metrics,
-            stdout_truncated=stdout_truncated,
-            stderr_truncated=stderr_truncated,
-            run_label=label,
-            report_metadata={"process": process_record},
-        )
+    return _write_execution_result(
+        run_dir,
+        manifest=manifest,
+        command_text=command_text,
+        command_args=command_args,
+        environment_policy=environment_policy,
+        timeout_sec=timeout_sec,
+        duration_sec=duration_sec,
+        status=status,
+        returncode=returncode,
+        timed_out=timed_out,
+        stdout=stdout,
+        stderr=stderr,
+        metrics=metrics,
+        stdout_truncated=stdout_truncated,
+        stderr_truncated=stderr_truncated,
+        run_label=label,
+        report_metadata=report_metadata,
+        run_metadata=run_metadata or None,
+    )
 
 
 def run_code_task_baseline(
@@ -493,6 +512,116 @@ def record_provided_code_task_baseline(
     )
 
 
+def _argv_command(argv: list[str]) -> str:
+    return subprocess.list2cmdline(argv) if os.name == 'nt' else shlex.join(argv)
+
+
+def native_validation_process(
+    run_dir: Path, *, budget_ledger: BudgetLedger, session_id: str, attempt_id: str,
+    invocation_id: str, file_hashes: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Verify one physical validator for recovery and downstream provenance.
+
+    No process, reconciliation, ledger settlement or report mutation occurs.
+    The implementation owner may pin its validated source inventory while
+    allowing subsequently produced non-source artifacts.
+    """
+    from simple_ar.code_task.runtime.state import implementation_file_hashes
+    paths = code_task_paths(run_dir)
+    manifest = load_code_task_manifest(run_dir)
+    binding = manifest.get('code_task', {}).get('native_binding')
+    if binding is None or not re.fullmatch(r'[0-9a-f]{32}', invocation_id):
+        raise CodeTaskRunError('Native validation needs an original binding and physical invocation identity')
+    invocation = paths.run_artifact_dir / 'patched' / 'process' / invocation_id / 'invocation.json'
+    if (not invocation.resolve().is_relative_to((paths.run_artifact_dir / 'patched' / 'process').resolve())
+            or not invocation.is_file()):
+        raise CodeTaskRunError('Original validator invocation is missing or outside its owner')
+    record = read_json(invocation)
+    expected_env = {**native_workspace_binding(manifest, paths.workspace_dir)['environment'],
+        'SIMPLE_AR_OUTPUT_DIR': str(invocation.parent.absolute() / 'outputs')}
+    contract = binding['binding']['contract']
+    from simple_ar.core.process import verify_process_accounting
+    try:
+        verify_process_accounting(record, budget_ledger, session_id=session_id or record.get('session_id'),
+            attempt_id=attempt_id, timeout_sec=contract['timeout_sec'])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CodeTaskRunError('Original validator physical accounting cannot be reconciled') from exc
+    from simple_ar.code_task.execution.environment import native_validation_command
+    expected_argv = _split_command(_argv_command(native_validation_command(manifest, paths.workspace_dir)),
+        environment_policy=manifest['environment']['policy'])
+    expected_argv = [arg.replace('{output_dir}', expected_env['SIMPLE_AR_OUTPUT_DIR']) for arg in expected_argv]
+    original = record.get('input_binding', {})
+    expected_files = implementation_file_hashes(run_dir) if file_hashes is None else file_hashes
+    if (record.get('invocation_id') != invocation_id
+            or record.get('argv') != expected_argv or record.get('cwd') != str(paths.workspace_dir.resolve())
+            or record.get('environment_policy') != 'caller_supplied' or record.get('environment') != expected_env
+            or record.get('timeout_sec') != contract['timeout_sec']
+            or manifest['environment']['policy'].get('python_executable') != binding['binding']['python_executable']
+            or original.get('native_binding') != binding or 'runtime_watchdog' not in original
+            or contract.get('new_files') and original.get('required_new_file_issues') != []
+            or original.get('implementation_file_hashes') != expected_files
+            or not isinstance(record.get('output'), dict)):
+        raise CodeTaskRunError('Original validator argv/cwd/environment/source/ledger binding cannot be reconciled')
+    return record
+
+
+def recover_implementation_process(
+    run_dir: Path, *, budget_ledger: BudgetLedger | None, session_id: str, attempt_id: str,
+) -> ProcessResult | None:
+    """Read one original finalized validator; never execute or settle new work."""
+    paths = code_task_paths(run_dir)
+    manifest = load_code_task_manifest(run_dir)
+    binding = manifest.get('code_task', {}).get('native_binding')
+    if binding is None:
+        return None
+    if budget_ledger is None or not attempt_id:
+        raise CodeTaskRunError('Bound validation recovery requires its original attempt and ledger')
+    try:
+        preparation_ids = native_preparation_processes(run_dir, ledger=budget_ledger,
+            session_id=session_id, attempt_id=attempt_id)
+    except (OSError, KeyError, IndexError, TypeError, ValueError, RuntimeError) as exc:
+        raise CodeTaskRunError('Original preparation evidence cannot be reconciled; no replay') from exc
+    entries = [entry for entry in budget_ledger.entries
+        if entry.attempt_id == attempt_id and entry.purpose == 'local_process' and entry.status != 'released'
+        and entry.logical_call_id not in preparation_ids]
+    invocations = list((paths.run_artifact_dir / 'patched' / 'process').glob('*/invocation.json'))
+    owned_ids = {row.logical_call_id for row in budget_ledger.entries
+        if row.attempt_id == attempt_id and row.purpose == 'local_process'
+        and row.logical_call_id not in preparation_ids}
+    if any(path.parent.name not in owned_ids for path in invocations):
+        raise CodeTaskRunError('Validator invocation has no matching original ledger owner; no replay')
+    if not entries:
+        if invocations:
+            raise CodeTaskRunError('Validator invocation lacks settled original consumption; no replay')
+        return None
+    latest = paths.run_artifact_dir / 'patched' / 'execution_report.json'
+    entry = entries[-1]
+    if any(row.status != 'settled' or (session_id and row.session_id != session_id) for row in entries):
+        raise CodeTaskRunError('Validator invocation is pending or unknown; no replay')
+    reports = [latest, *(paths.run_artifact_dir / 'patched' / 'attempts').glob('*/execution_report.json')]
+    projected = {read_json(path).get('process', {}).get('invocation_id') for path in reports if path.is_file()}
+    if any(row.logical_call_id not in projected for row in entries[:-1]):
+        raise CodeTaskRunError('Multiple unprojected validator invocations require inspection; no replay')
+    if latest.is_file():
+        report = read_json(latest)
+        if report.get('process', {}).get('invocation_id') == entry.logical_call_id:
+            if (binding['binding']['contract'].get('new_files')
+                    and report['process'].get('input_binding', {}).get('required_new_file_issues') != []):
+                raise CodeTaskRunError('Original validator lacks a passed creation preflight; no replay')
+            return None  # Verification consumes this already projected report.
+        if (report.get('status') == 'blocked_by_validation' and report.get('native_binding') == binding
+                and report.get('preflight', {}).get('reason') == 'required_new_files'
+                and entry.logical_call_id in projected):
+            return None  # A newer source preflight is not an unprojected old process.
+    record = native_validation_process(run_dir, budget_ledger=budget_ledger,
+        session_id=session_id, attempt_id=attempt_id, invocation_id=entry.logical_call_id)
+    invocation = paths.run_artifact_dir / 'patched' / 'process' / entry.logical_call_id / 'invocation.json'
+    from simple_ar.core.process import process_observation
+    observed = process_observation(record, invocation.parent)
+    return ProcessResult(record['returncode'], record.get('stop_reason'), observed['stdout'],
+        observed['stderr'], record['duration_sec'], record)
+
+
 def _run_command(
     command_args: list[str],
     *,
@@ -504,45 +633,39 @@ def _run_command(
     budget_ledger: BudgetLedger | None = None,
     session_id: str = "",
     attempt_id: str = "",
-) -> subprocess.CompletedProcess[str]:
+    watchdog: _OutputWatchdog | None = None,
+    environment: dict[str, str] | None = None,
+    input_binding: dict[str, Any] | None = None,
+) -> ProcessResult:
     mode = normalize_stream_output_mode(stream_output)
-    watchdog = _OutputWatchdog()
+    if watchdog is None:
+        watchdog = _OutputWatchdog()
     cancel = threading.Event()
     callback = output_callback if mode not in {"off", "summary"} else None
     relays = {
         name: _OutputRelay(name, callback, mode, watchdog, cancel)
         for name in ("stdout", "stderr")
     }
-    spec = ProcessSpec(command_args, cwd, timeout_sec, env=_safe_env(cwd), output_dir=output_dir,
-                       session_id=session_id, attempt_id=attempt_id)
+    spec = ProcessSpec(command_args, cwd, timeout_sec, env=environment if environment is not None else _safe_env(cwd), output_dir=output_dir,
+                       session_id=session_id, attempt_id=attempt_id, input_binding=input_binding)
     spec = with_process_outputs(spec)
+
+    def finish_output() -> None:
+        for relay in relays.values():
+            relay.finish()
+        if input_binding is not None:
+            input_binding['runtime_watchdog'] = watchdog.triggered
+
     result = run_process(
         spec,
         output_callback=lambda name, chunk: relays[name].feed(chunk),
         cancel=cancel,
         budget_ledger=budget_ledger,
+        **({'output_complete_callback': finish_output} if input_binding is not None else {}),
     )
-    for relay in relays.values():
-        relay.finish()
-    if result.stop_reason == "timeout":
-        exc = subprocess.TimeoutExpired(command_args, timeout_sec, output=result.stdout, stderr=result.stderr)
-        exc.simple_ar_process = result.record
-        raise exc
-    stderr = result.stderr
-    if watchdog.triggered is not None:
-        detail = watchdog.triggered["detail"]
-        stderr = stderr.rstrip() + f"\nRuntime output watchdog aborted benchmark: {detail}\n"
-    completed = subprocess.CompletedProcess(
-        command_args,
-        124 if watchdog.triggered is not None else result.returncode,
-        stdout=result.stdout, stderr=stderr,
-    )
-    completed.simple_ar_process = result.record
-    if watchdog.triggered is not None:
-        completed.simple_ar_watchdog = watchdog.triggered
-    if mode == "summary" and output_callback is not None:
-        _emit_output_summary(completed.stdout, completed.stderr, output_callback)
-    return completed
+    if input_binding is None:
+        finish_output()
+    return result
 
 
 def normalize_stream_output_mode(value: bool | str) -> StreamOutputMode:
@@ -653,6 +776,7 @@ def _write_blocked_result(
     timeout_sec: int,
     reason: str,
     run_label: str,
+    report_metadata: dict[str, Any] | None = None,
 ) -> CodeTaskRunResult:
     manifest = load_code_task_manifest(run_dir)
     return _write_execution_result(
@@ -672,6 +796,7 @@ def _write_blocked_result(
         stdout_truncated=False,
         stderr_truncated=False,
         run_label=run_label,
+        report_metadata=report_metadata,
     )
 
 
@@ -930,14 +1055,6 @@ def _clip_output(text: str) -> tuple[str, bool]:
     return text[: OUTPUT_CHAR_LIMIT - len(suffix)] + suffix, True
 
 
-def _output_text(value: bytes | str | None) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    return value
-
-
 def _benchmark_command(manifest: dict[str, Any]) -> str:
     benchmark = manifest.get("benchmark", {})
     if isinstance(benchmark, dict):
@@ -967,10 +1084,22 @@ def _greenfield_result_quality_guard(
     status: str,
     metrics: dict[str, float],
     artifact_scan: dict[str, Any] | None = None,
+    required_file_issues: list[str] | None = None,
 ) -> dict[str, Any] | None:
     if status != "passed":
         return None
+    from simple_ar.code_task.runtime.state import required_new_file_issues
+    missing = list(dict.fromkeys([*(required_file_issues or []),
+        *required_new_file_issues(manifest, code_task_paths(run_dir).workspace_dir)]))
+    if missing:
+        return {'status': 'failed', 'reason': 'required_new_files',
+            'message': 'Required new files were not created as nonempty regular files: ' + ', '.join(missing)}
     if not _is_greenfield_manifest(manifest):
+        return None
+    if manifest.get('code_task', {}).get('native_binding', {}).get('binding', {}).get('measurement_contract') is not None:
+        # This physical invocation is the independently approved validator.
+        # Source/API review remains mandatory; scientific runtime artifacts
+        # are checked by the separate formal measurement owner/result schema.
         return None
     paths = code_task_paths(run_dir)
     if artifact_scan and has_artifact_path_mismatch(artifact_scan):
@@ -1164,13 +1293,15 @@ def _update_manifest_after_run(
         int(existing_record.get("attempt_count", 0) or 0) if isinstance(existing_record, dict) else 0
     )
     attempts = [row for row in previous_attempts if isinstance(row, dict)]
+    new_history = history_record and not any(row.get('id') == history_record['id'] for row in attempts)
     if history_record:
-        attempts.append(dict(history_record))
+        if new_history:
+            attempts.append(dict(history_record))
         run_record["latest_attempt"] = history_record["id"]
         run_record["latest_attempt_dir"] = str(history_record["execution_report"]).rsplit("/", 1)[0]
     if attempts:
         run_record["attempts"] = attempts[-50:]
-        run_record["attempt_count"] = max(previous_attempt_count + (1 if history_record else 0), len(attempts))
+        run_record["attempt_count"] = max(previous_attempt_count + (1 if new_history else 0), len(attempts))
     if run_metadata:
         run_record.update(run_metadata)
     runs[run_label] = run_record

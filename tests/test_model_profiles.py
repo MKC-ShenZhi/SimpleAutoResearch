@@ -478,15 +478,18 @@ class ModelProfileTests(unittest.TestCase):
         self._write_catalog("image-model", "new-image-model")
         self.assertEqual(LLMClient.from_env().connection_binding(), binding)
         self._write_catalog('retry_attempts = 1',
-            'retry_attempts = 3\nrequest_timeout_sec = 1200.0\nmax_output_tokens = 16384\ncontext_input_tokens = 64000')
+            'retry_attempts = 3\nconnect_retry_attempts = 4\nrequest_timeout_sec = 1200.0\nmax_output_tokens = 16384\ncontext_input_tokens = 64000')
         tuned = LLMClient.from_env().connection_binding()
         self.assertNotEqual(tuned, binding)
         self.assertTrue(model_connections_compatible(binding, tuned))
         self.assertEqual(LLMClient.from_env()._settings.context_input_tokens, 64000)
+        self.assertEqual(LLMClient.from_env()._settings.connect_retry_attempts, 4)
         self.assertNotIn('context_input_tokens', LLMClient.from_env()._build_request('system', 'user'))
         legacy_binding = json.loads(json.dumps(binding))
         legacy_binding['settings'].pop('context_input_tokens')
         legacy_binding['code_route']['connection'].pop('context_input_tokens')
+        legacy_binding['settings'].pop('connect_retry_attempts')
+        legacy_binding['code_route']['connection'].pop('connect_retry_attempts')
         self.assertTrue(model_connections_compatible(legacy_binding, tuned))
         self._write_catalog("coder-model", "next-model")
         self.assertNotEqual(LLMClient.from_env().connection_binding(), binding)
@@ -531,6 +534,9 @@ class ModelProfileTests(unittest.TestCase):
             ('api_key_env = "WRITER_KEY"', 'api_key = "accidental-secret"'),
             ('https://writer.example/v1', 'https://accidental-secret@writer.example/v1'),
             ('retry_attempts = 1', 'retry_attempts = 0'),
+            ('retry_attempts = 1', 'connect_retry_attempts = 0'),
+            ('retry_attempts = 1', 'connect_retry_attempts = true'),
+            ('api = "openai_images"', 'api = "openai_images"\nconnect_retry_attempts = 2'),
             ('retry_attempts = 1', 'context_input_tokens = 0'),
             ('retry_attempts = 1', 'context_input_tokens = true'),
             ('api_key_env = "WRITER_KEY"', 'api_key_env = "WRITER_KEY"\nproxy_env = "http://accidental-secret@proxy"'),

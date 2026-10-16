@@ -3,8 +3,83 @@
 import hashlib
 import json
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, TYPE_CHECKING
 from pathlib import Path
+
+if TYPE_CHECKING:
+    from simple_ar.research.experiment import ExperimentRequest
+
+
+def representative_measurement_execution(contract: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Read one candidate execution for code preparation/generation, not a copy of its contract."""
+    if 'conditions' not in contract:
+        return contract
+    candidates = [row['execution'] for row in contract['conditions'] if row['role'] == 'candidate']
+    if not candidates or any(row.get('result_schema') != candidates[0].get('result_schema') for row in candidates):
+        raise ValueError('A condition set needs candidates with one shared result_schema for code generation')
+    return candidates[0]
+
+
+def measurement_reuse_matches(
+    payload: Mapping[str, Any], expected: "ExperimentRequest", *,
+    same_session_result: bool = False,
+    actual_source: Mapping[str, Any] | None = None,
+    current_source: Mapping[str, Any] | None = None,
+) -> bool:
+    """Match canonical evidence to one declared request without owning its lifecycle.
+
+    Callers verify result/attempt and preparation-reference ownership. This
+    function checks their loaded domain facts and reads only declared protected
+    files. Same-session reuse without those snapshots retains its limitations;
+    it is not upgraded to independently verified asset integrity.
+    """
+    try:
+        if not isinstance(payload, Mapping) or str(payload.get("status") or "").lower() != "passed":
+            return False
+        if (list(payload.get("command") or ()) != list(expected.run.command)
+                or dict(payload.get("result_schema") or {}) != dict(expected.result_schema)):
+            return False
+        expected_contract = expected.normalized_experiment_contract()
+        actual_contract = payload.get("experiment_contract")
+        if (not isinstance(expected_contract, Mapping) or not isinstance(actual_contract, Mapping)
+                or comparable_protocol(actual_contract) != comparable_protocol(expected_contract)):
+            return False
+        preparation = payload.get("preparation")
+        if current_source is not None:
+            if (not isinstance(preparation, Mapping) or not isinstance(preparation.get("source_ref"), Mapping)
+                    or not isinstance(actual_source, Mapping) or not isinstance(current_source, Mapping)):
+                return False
+            actual_project, current_project = actual_source.get("source_project"), current_source.get("source_project")
+            if not isinstance(actual_project, str) or not isinstance(current_project, str):
+                return False
+            actual_project, current_project = Path(actual_project).resolve(), Path(current_project).resolve()
+            if not actual_project.is_dir() or actual_project != current_project:
+                return False
+        elif preparation is not None or actual_source is not None:
+            return False  # A claimed producing preparation cannot lose its current lineage.
+        integrity = (payload.get("measurement") or {}).get("asset_integrity")
+        if (payload.get("validity_status") == "invalid"
+                or isinstance(integrity, Mapping) and integrity.get("status") == "changed"):
+            return False
+        protected = expected_contract.get("protected_assets")
+        if same_session_result and (not isinstance(protected, list) or not protected):
+            return True
+        if (not isinstance(protected, list) or not protected or not isinstance(integrity, Mapping)
+                or integrity.get("status") != "observed_unchanged"):
+            return False
+        before = integrity.get("before")
+        if not isinstance(before, Mapping) or not before:
+            return False
+        current = snapshot_protocol_assets(expected_contract, expected.run.cwd)
+        # Copies may have different physical paths; protected identities and
+        # original observed content, not those paths, bind this narrow check.
+        return set(before) == set(current) and all(
+            isinstance(before.get(asset_id), Mapping)
+            and before[asset_id].get("sha256") == current[asset_id].get("sha256")
+            for asset_id in before
+        )
+    except (OSError, KeyError, TypeError, ValueError, AttributeError, RuntimeError):
+        return False
 
 
 def snapshot_protocol_assets(contract: Mapping[str, Any] | None, cwd: Path) -> dict[str, dict[str, str]]:
@@ -46,16 +121,25 @@ def _file_hash(path: Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def comparable_protocol(contract: Mapping[str, Any]) -> dict[str, Any]:
+def comparable_protocol(contract: Mapping[str, Any], *, observed_assets: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Project comparison conditions, excluding candidate identity and research prose."""
-    return {key: contract.get(key) for key in (
+    protocol = {key: contract.get(key) for key in (
         "protocol_revision", "dataset_refs", "split_spec", "metric_specs",
         "comparison_conditions", "protected_assets",
     )}
+    assets = protocol.get('protected_assets') or []
+    if (observed_assets and observed_assets.get('status') == 'observed_unchanged'
+            and observed_assets.get('content_fingerprint')
+            and {row.get('asset_id') for row in assets} == set(observed_assets.get('before', {}))):
+        # File locations bind physical execution; logical IDs and independently
+        # observed content bind comparability across isolated candidate copies.
+        protocol['protected_assets'] = [{key: value for key, value in row.items() if key != 'path'} for row in assets]
+    return protocol
 
 
-def _protocol_fingerprint(contract: Mapping[str, Any], result_schema: Mapping[str, Any]) -> str | None:
-    protocol = comparable_protocol(contract)
+def _protocol_fingerprint(contract: Mapping[str, Any], result_schema: Mapping[str, Any],
+                          *, observed_assets: Mapping[str, Any] | None = None) -> str | None:
+    protocol = comparable_protocol(contract, observed_assets=observed_assets)
     if not all(protocol.get(key) for key in (
         "dataset_refs", "split_spec", "metric_specs", "comparison_conditions",
     )):
@@ -101,8 +185,8 @@ def comparison_compatibility(baseline: Mapping, candidate: Mapping) -> tuple[str
     if any(isinstance(contract, Mapping) for contract in contracts):
         if not all(isinstance(contract, Mapping) for contract in contracts):
             return "unknown", "One result lacks its persisted comparison contract."
-        a = _protocol_fingerprint(contracts[0], baseline.get("result_schema") or {})
-        b = _protocol_fingerprint(contracts[1], candidate.get("result_schema") or {})
+        a = _protocol_fingerprint(contracts[0], baseline.get("result_schema") or {}, observed_assets=first.get('asset_integrity'))
+        b = _protocol_fingerprint(contracts[1], candidate.get("result_schema") or {}, observed_assets=second.get('asset_integrity'))
         if not a or not b:
             return "unknown", "Comparison protocol is incomplete."
     if a != b:

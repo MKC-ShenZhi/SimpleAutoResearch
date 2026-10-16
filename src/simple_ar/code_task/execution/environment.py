@@ -37,6 +37,41 @@ DEPENDENCY_FILE_NAMES = {
 SUPPORTED_ENV_MODES = {"current", "external"}
 
 
+def project_command(argv: Sequence[str], origin: Path, candidate: Path, *, python_executable: str | None = None) -> list[str]:
+    """Relocate whole project paths, never shell text or arbitrary substrings.
+
+    External inputs and relative argv retain their declared meaning. The
+    actual command remains visible in the approval and physical receipt.
+    """
+    origin = Path(os.path.abspath(origin))
+    result = []
+    for index, arg in enumerate(argv):
+        if index == 0 and python_executable and arg in {'python', 'python3', python_executable}:
+            result.append(python_executable)
+            continue
+        key, separator, value = arg.partition('=') if arg.startswith('-') else ('', '', arg)
+        path = Path(value)
+        if path.is_absolute():
+            path = Path(os.path.abspath(path))  # Normalize '..' without following/hiding links.
+            if path.is_relative_to(origin):
+                value = str(candidate / path.relative_to(origin))
+        result.append(key + separator + value)
+    return result
+
+
+def native_validation_command(manifest: Mapping[str, Any], workspace: Path) -> list[str]:
+    """Materialize only the relocation rule in a saved scientific approval."""
+    bound = manifest['code_task']['native_binding']['binding']
+    argv = list(bound['contract']['validation_command'])
+    measurement = bound.get('measurement_contract')
+    if measurement is not None and bound['contract'].get('project_path'):
+        from simple_ar.experiment.execution.measurement import representative_measurement_execution
+        measurement = representative_measurement_execution(measurement)
+        argv = project_command(argv, Path(measurement['cwd']), workspace,
+            python_executable=bound['python_executable'])
+    return argv
+
+
 @dataclass(frozen=True)
 class CodeTaskEnvironmentResult:
     """Result returned after probing a copied code-task workspace.

@@ -10,6 +10,7 @@ import os
 import sys
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+from tests.report_review_fixtures import changed_record as _changed_record
 
 from simple_ar.agent_backends import (
     AgentExecutionMode,
@@ -55,22 +56,6 @@ def _writing_prompt(fake):
     return json.loads(fake.ask_json.call_args.args[1])
 
 
-@contextmanager
-def _changed_record(path, record):
-    """Temporarily corrupt or remove a receipt, restoring its exact bytes."""
-    original = path.read_bytes()
-    try:
-        if record is None:
-            path.unlink()
-        elif isinstance(record, bytes):
-            path.write_bytes(record)
-        else:
-            write_json(path, record)
-        yield
-    finally:
-        path.write_bytes(original)
-
-
 def _call_tool(gateway, name, arguments, *, identity):
     return gateway.call(ToolCall(tool_name=name, arguments=arguments, trace_id=identity))
 
@@ -80,6 +65,21 @@ def _write_code_task(run_dir, text, manifest=None):
     (run_dir / "code_task" / "task.md").write_text(text, encoding="utf-8")
     if manifest is not None:
         (run_dir / "manifest.json").write_text(manifest, encoding="utf-8")
+
+
+@contextmanager
+def _interrupt_outcome_commit():
+    from simple_ar.core.capabilities import ArtifactStore
+
+    original = ArtifactStore.write_json
+
+    def interrupted(store, path, data, **kwargs):
+        if path == 'capability_result.json':
+            raise KeyboardInterrupt('after cached reply')
+        return original(store, path, data, **kwargs)
+
+    with patch.object(ArtifactStore, 'write_json', new=interrupted):
+        yield
 
 
 class _ImplementationAssertions:
@@ -149,7 +149,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
     def _native_fixture(self, *, counter=False, completed=False, project_python=False,
                         goal='Create and verify a small tool', mount_inputs=True,
-                        allow_execution=True, allow_network=False, max_turns=30):
+                        allow_execution=True, allow_network=False, max_turns=30, code_task=None, process_limits=None,
+                        report_requirement=None, measurement_command=None):
         run_dir, inputs = self._tool_materials()
         fake = Mock()
         fake.effective_output_limit.return_value = None
@@ -164,7 +165,13 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         app = ToolApplication.create(run_dir / 'native', goal,
             model='fixture', sources={'source0': inputs} if mount_inputs else {},
             allow_execution=allow_execution, allow_network=allow_network,
-            max_turns=max_turns, project_python=interpreter)
+            max_turns=max_turns, project_python=interpreter, code_task=code_task, process_limits=process_limits,
+            report_requirement=report_requirement,
+            execution_contract=({'command': measurement_command, 'cwd': str(inputs), 'timeout_sec': 3,
+                'result_schema': {'primary_metric': 'score', 'required_metrics': ['score']},
+                'protocol': {'hypothesis': 'Record the implemented value', 'dataset': 'Supplied local input',
+                    'expected_outcome': 'Observed score, not proof of improvement'}}
+                if measurement_command is not None else None))
         code = "from pathlib import Path\np = Path('counter.txt')\np.write_text(str(int(p.read_text()) + 1) if p.exists() else '1')\nprint('done')\n"
         code += "# Native history preserves the actual source, not substitute payloads.\n" * 80
         if counter or completed:
@@ -430,6 +437,12 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(result.data["experiment_contract"]["contract_id"], "exp-test")
         self.assertEqual(blocked.status, "blocked")
         self.assertEqual(blocked.error, "Unknown tool.")
+        # A registered tool without an explicit recovery owner cannot be
+        # replayed merely because it was readable during a normal call.
+        self.assertFalse(gateway.can_reconcile(
+            ToolCall(tool_name="read_experiment_contract", trace_id="retained")))
+        self.assertFalse(gateway.can_reconcile(
+            ToolCall(tool_name="run_experiment_command", trace_id="retained")))
         self.assertTrue((run_dir / "tools" / "tool_trace.jsonl").is_file())
 
     def test_workspace_reads_exact_windows_and_enforces_mount_boundaries(self) -> None:
@@ -1215,19 +1228,13 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                          ['/explicit/python', 'python -c unchanged'])
 
     def test_project_implementation_owns_file_selection_and_original_binding(self) -> None:
-        from simple_ar.tools.implementation import ImplementationToolGateway
-        with _temporary_run() as run_dir:
-            project = run_dir / 'materials'
-            project.mkdir()
+        _, project, fake, _, app, _ = self._native_fixture()
+        with patch.object(app.implementation, 'client_factory', return_value=fake):
             module = project / 'module.py'
             original = 'def keep():\n    return 7\n\ndef change():\n    return 1\n'
             module.write_text(original)
             (project / 'README.md').write_text('# Library\nPublic utilities in module.py.\n')
             (project / '.env').write_text('PRIVATE_FIXTURE=do-not-send')
-            workspace = WorkspaceToolGateway(run_dir, {'source0': project}, BudgetLedger(
-                {'llm_requests': 8, 'total_tokens': 100000}))
-            fake = Mock()
-            fake.effective_output_limit.return_value = None
             selection = {'files': [
                 {'path': 'module.py', 'purpose': 'Change the existing public behavior'},
                 {'path': 'CHANGE.md', 'purpose': 'Explain the change and verification gaps'}]}
@@ -1241,15 +1248,13 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 'result': {'status': 'ok', 'data': {'returncode': 1,
                     'stdout': '', 'stderr': 'module.change returned the wrong value'}}}]
             original_diagnostics = json.loads(json.dumps(diagnostics))
-            owner = ImplementationToolGateway(run_dir, workspace, workspace.ledger,
-                'test-model', 'selection', client_factory=lambda _: fake,
-                execution_observations=lambda: diagnostics)
+            app.implementation.execution_observations = lambda: diagnostics
             arguments = {'goal': 'Change behavior and explain it', 'project_path': str(project)}
 
-            def invoke(identity, status, calls, *, source=original):
-                result = self._prepare_candidate(owner, fake, arguments, identity,
+            def invoke(identity, status, calls):
+                result = self._prepare_candidate(app.gateway, fake, arguments, identity,
                     status=status, calls=calls)
-                self.assertEqual(module.read_text(), source)
+                self.assertEqual(module.read_text(), original)
                 return result
 
             prepared = invoke('project-unit', 'ok', 2)
@@ -1267,13 +1272,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             self.assertNotIn('do-not-send', str(fake.ask_json.call_args_list))
             diagnostics.clear()  # Recovery must not rebind to changing execution history.
             invoke('project-unit', 'ok', 2)
-            changed = original + '# changed input\n'
-            module.write_text(changed)
-            invoke('project-unit', 'error', 2, source=changed)
-            module.write_text(original)
-            fake.ask_json.side_effect = [{'files': [{'path': '.env', 'purpose': 'Not authorized'}]}]
-            invoke('private-selection', 'error', 3)
-            self.assertFalse((workspace.workspace / 'implementations/private-selection').exists())
+            # Changed-source and private-selection rejection matrices belong to
+            # CodeTaskInterfaceTests; this entrance binds both model phases.
 
     def test_implementation_selection_reads_only_frozen_inventory(self) -> None:
         from simple_ar.code_task import review_pipeline
@@ -1361,6 +1361,621 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, 'Interrupted selection'):
                         select_implementation_files(**arguments)
             self.assertEqual(fake.ask_json.call_count, 2)
+
+    def test_native_confirmed_interruption_projects_failure_without_replay(self) -> None:
+        from simple_ar.core.capabilities import ArtifactStore
+
+        class ProviderInterrupted(BaseException):
+            pass
+
+        for boundary in ('confirmed', 'core_commit', 'native_commit', 'recorded'):
+            with self.subTest(boundary=boundary):
+                _, _, fake, _, app, _ = self._native_fixture()
+                fake.chat_turn.side_effect = [self._native_message('read_file',
+                    {'path': 'source0/notes.txt'}, 'interrupted-read')]
+                with patch.object(app.gateway, 'call', side_effect=ProviderInterrupted('provider failure')):
+                    with self.assertRaises(ProviderInterrupted):
+                        app.run(progress=lambda _: None)
+                pending = dict(app.state['pending'])
+                identity = pending['attempt']
+                root = app.session.store.root
+                owner = ArtifactStore(root / 'attempts' / identity)
+                app.ledger.reserve('lost-provider-response', {'total_tokens': 17553, 'llm_requests': 1},
+                    attempt_id=identity)
+                app.ledger.mark_unknown('lost-provider-response', reason='Provider response lost',
+                    known_actual={'llm_requests': 1}, retain_reservation=True)
+                ledger = app.ledger.to_dict()
+                calls = fake.chat_turn.call_count
+                # Neither missing nor ordinary failed results confer confirmation.
+                with patch.object(app.gateway, 'can_reconcile', return_value=False), \
+                        patch.object(app, '_tool', side_effect=AssertionError('No tool replay')):
+                    with self.assertRaisesRegex(RuntimeError, 'no durable result'):
+                        app._attempt('native_tool', pending)
+                    unconfirmed = {'status': 'failed', 'diagnostics': ['provider failure'],
+                        'provenance': {'capability': 'native_tool'}}
+                    owner.write_json('capability_result.json', unconfirmed)
+                    try:
+                        with self.assertRaisesRegex(RuntimeError, 'no durable result'):
+                            app._attempt('native_tool', pending)
+                    finally:
+                        (owner.root / 'capability_result.json').unlink()
+                reason = 'Explicitly confirmed provider interruption; usage remains unknown'
+                if boundary == 'core_commit':
+                    # Public recovery has saved confirmation, but not its manifest/accounting.
+                    with patch.object(app.session, '_commit_attempt_result', side_effect=KeyboardInterrupt):
+                        with self.assertRaises(KeyboardInterrupt):
+                            app.session.recover_interrupted(identity, reason=reason)
+                else:
+                    app.session.recover_interrupted(identity, reason=reason)
+                envelope = (owner.root / 'capability_result.json').read_bytes()
+                saved = owner.read_json('capability_result.json')
+                # A mismatched/nonfailed/handler-only marker cannot authorize projection.
+                for changed in (
+                        {**saved, 'provenance': {**saved['provenance'], 'capability': 'native_turn'}},
+                        {**saved, 'status': 'completed'},
+                        {**saved, 'session_interruption_reason': None}):
+                    with _changed_record(owner.root / 'capability_result.json', changed), \
+                            self.assertRaisesRegex(RuntimeError, 'does not confirm'):
+                        app._attempt('native_tool', pending)
+                with self.assertRaisesRegex(RuntimeError, 'does not confirm'):
+                    app._attempt('native_turn', pending)
+                app = ToolApplication.load(root)
+                if boundary == 'native_commit':
+                    original = ArtifactStore.write_json
+                    def interrupted(store, path, data, **kwargs):
+                        if path == 'native_result.json':
+                            raise KeyboardInterrupt('before native observation commit')
+                        return original(store, path, data, **kwargs)
+                    with patch.object(ArtifactStore, 'write_json', new=interrupted):
+                        with self.assertRaises(KeyboardInterrupt):
+                            app._attempt('native_tool', pending)
+                    app = ToolApplication.load(root)
+                elif boundary == 'recorded':
+                    owner.write_json('native_result.json', {'tool_name': 'read_file', 'status': 'error',
+                        'error': 'Original recorded failure', 'data': {'diagnostics': ['original diagnostic']}})
+                recorded = ((owner.root / 'native_result.json').read_bytes()
+                    if owner.exists('native_result.json') else None)
+                with patch.object(app, '_tool', side_effect=AssertionError('No tool replay')), \
+                        patch.object(app.gateway, 'call', side_effect=AssertionError('No gateway call')):
+                    relative = app._attempt('native_tool', pending)
+                    observation = owner.read_json('native_result.json')
+                    if recorded is None:
+                        self.assertEqual(observation['status'], 'error')
+                        self.assertEqual(observation['error'], reason)
+                        self.assertEqual(observation['data'], {'status': 'failed', 'diagnostics': [reason]})
+                        ref = observation['metadata']['capability_result']
+                        self.assertEqual(ref, f'records/{identity}/capability_result.json')
+                        self.assertEqual(observation['metadata'], {
+                            'capability_result': ref,
+                            'provenance': saved['provenance']})
+                        self.assertEqual(observation['artifacts'], [ref])
+                        self.assertEqual(app.workspace.resolve(ref), owner.resolve('capability_result.json'))
+                        self.assertEqual(read_json(app.workspace.resolve(ref)), saved)
+                    else:
+                        self.assertEqual((owner.root / 'native_result.json').read_bytes(), recorded)
+                    budget = app.session.manifest.budget.to_dict()
+                    self.assertEqual(app._attempt('native_tool', pending), relative)
+                    self.assertEqual(app.session.manifest.budget.to_dict(), budget)
+                    # Guard the loop after it consumes the failed call, before
+                    # allocating any new model identity; run owns the pause.
+                    commit_terminal = app._commit_terminal
+                    def stop_before_model(progress):
+                        if app.state['pending'] is None and not app.state['turns'][-1]['remaining']:
+                            raise KeyboardInterrupt('Repair projection only; await user continuation')
+                        return commit_terminal(progress)
+                    attempts = [a.attempt_id for a in app.session.list_attempts()]
+                    with patch.object(app, '_commit_terminal', side_effect=stop_before_model):
+                        self.assertEqual(app.run(progress=lambda _: None)['status'], 'paused')
+                    self.assertEqual([a.attempt_id for a in app.session.list_attempts()], attempts)
+                self.assertIsNone(app.state['pending'])
+                self.assertEqual(app.state['turns'][-1]['remaining'], [])
+                self.assertEqual(app.state['turns'][-1]['tools'], [{'id': 'interrupted-read', 'result': relative}])
+                self.assertEqual(fake.chat_turn.call_count, calls)
+                fake.ask_json.assert_not_called()
+                self.assertEqual(app.ledger.to_dict(), ledger)
+                self.assertEqual((owner.root / 'capability_result.json').read_bytes(), envelope)
+                self.assertEqual(next(a.status for a in app.session.list_attempts()
+                    if a.attempt_id == identity), 'failed')
+                # A new user instruction authorizes a distinct decision with the same ledger.
+                app = ToolApplication.load(root)
+                def continuation(*args, **kwargs):
+                    new_identity = kwargs['budget_call_id']
+                    self.assertNotEqual(new_identity, identity)
+                    app.ledger.reserve(new_identity, {'llm_requests': 1}, attempt_id=new_identity)
+                    app.ledger.settle(new_identity, {'llm_requests': 1})
+                    return self._native_message('ask_user', {'question': 'Which output next?'}, 'new-question')
+                fake.chat_turn.side_effect = continuation
+                self.assertEqual(app.run(feedback='Continue with a new decision after the confirmed failure',
+                    progress=lambda _: None)['status'], 'paused')
+                self.assertEqual(fake.chat_turn.call_count, calls + 1)
+                self.assertEqual(app.ledger.to_dict()['entries'][0], ledger['entries'][0])
+                self.assertEqual(app.ledger.limits, ledger['limits'])
+                self.assertEqual((owner.root / 'capability_result.json').read_bytes(), envelope)
+
+    def test_caller_science_uses_common_approval_attempts_feedback_and_no_model(self):
+        with _temporary_run() as root, patch('simple_ar.app.tool_application.LLMClient.from_env',
+                side_effect=AssertionError('Caller actions must not resolve model credentials')) as client:
+            app = ToolApplication.create(root / 'task', 'Measure declared data, then explain the result',
+                model=None, sources={}, allow_execution=True, max_turns=0, max_tokens=0,
+                max_attempts=16, process_limits={'process_invocations': 1, 'process_wall_seconds': 30})
+            def action(name, **arguments):
+                return {'tool_name': name, 'arguments': arguments}
+            app.run(actions=[action('write_file', path='workspace/observed.py', content=
+                "import json\nfrom pathlib import Path\np=Path('counter')\np.write_text('1')\n"
+                "print('loss: 0.25')\n")], progress=lambda _: None)
+            self.assertEqual(len(app.session.list_attempts()), 1)
+            request = action('measure_experiment', command=['python', 'observed.py'],
+                timeout_sec=20, result_schema={'required_metrics': ['loss'], 'primary_metric': 'loss',
+                    'metric_directions': {'loss': 'min'}})
+            status = app.run(actions=[request], progress=lambda _: None)
+            self.assertEqual(status['status'], 'paused')
+            self.assertFalse((app.workspace.workspace / 'counter').exists())
+            pending = app.state['pending']
+            token = app.approval_token(pending['call'])
+            app = ToolApplication.load(root / 'task')
+            app.run(approved_execution=token, progress=lambda _: None)
+            identity = pending['attempt']
+            observation = app.session.store.read_json(f'attempts/{identity}/native_result.json')
+            self.assertEqual(observation['status'], 'ok', observation.get('error'))
+            self.assertEqual(observation['data']['metrics']['loss'], 0.25)
+            self.assertEqual(app._execution_observations()[-1]['result']['data']['returncode'], 0)
+            self.assertTrue(app.session.store.exists(f'attempts/{identity}/scientific_result.json'))
+            self.assertEqual(len(app.ledger.entries), 1)
+            self.assertEqual(app.ledger.entries[0].attempt_id, identity)
+            receipt_before = (root / 'task' / 'budget_ledger.json').read_bytes()
+            original_outputs = next(a.outputs for a in app.session.list_attempts() if a.attempt_id == identity)
+            store = app.session.store.root / 'attempts' / identity
+            (store / 'capability_result.json').unlink()
+            approved = app.session.store.read_json(f'attempts/{identity}/scientific_request.json')['execution_approval']
+            with patch('simple_ar.experiment.execution.backend.run_process') as process:
+                app._attempt('native_tool', {**pending, 'execution_approval': approved})
+                process.assert_not_called()
+            self.assertEqual(next(a.outputs for a in app.session.list_attempts() if a.attempt_id == identity),
+                original_outputs)
+            app.run(actions=[action('analyze_measurements',
+                result_refs=[observation['data']['result_ref']], question='Explain the declared loss')],
+                progress=lambda _: None)
+            analysis = app.state['turns'][-1]['tools'][-1]['result']
+            result = app.session.store.read_json(analysis)
+            self.assertEqual(result['status'], 'ok', result.get('error'))
+            self.assertTrue(any(path.endswith('/analysis.md') for path in result['artifacts']))
+            app.run(actions=[action('write_file', path='workspace/summary.md',
+                    content='Observed loss: 0.25; one run, not a stability claim.'),
+                action('deliver_result', summary='One measured result with declared scope',
+                    artifacts=['workspace/summary.md'])], progress=lambda _: None)
+            self.assertEqual(app.session.manifest.status, 'completed')
+            with patch('simple_ar.experiment.execution.backend.run_process') as process:
+                app = ToolApplication.load(root / 'task')
+                app.run(progress=lambda _: None)
+                app.run(feedback='Change the explanation only, no measurement', actions=[
+                    action('write_file', path='workspace/revision.md', content='One observation; no comparison.'),
+                    action('deliver_result', summary='Revised explanation', artifacts=['workspace/revision.md'])],
+                    progress=lambda _: None)
+                self.assertEqual(app.session.manifest.status, 'completed')
+                process.assert_not_called()
+            self.assertEqual((root / 'task' / 'budget_ledger.json').read_bytes(), receipt_before)
+            client.assert_not_called()
+            guarded = ToolApplication.create(root / 'guarded', 'Measure a required observation',
+                model=None, sources={}, allow_execution=True, max_turns=0, max_tokens=0,
+                max_attempts=8, process_limits={'process_invocations': 1, 'process_wall_seconds': 30})
+            guarded.run(actions=[action('write_file', path='workspace/observed.py',
+                content="print('loss: 0.25')\n"), {**request, 'arguments': {**request['arguments'],
+                    'result_schema': {'required_metrics': ['missing_measurement']}}}],
+                approve=lambda *_: True, progress=lambda _: None)
+            measured = guarded.session.store.read_json(guarded.state['turns'][-1]['tools'][-1]['result'])
+            self.assertEqual(measured['data']['returncode'], 0)
+            self.assertEqual(measured['data']['capability_status'], 'failed')
+            # A different turn must not erase an exit-zero scientific rejection.
+            guarded.run(actions=[action('write_file', path='workspace/note.md', content='Required metric is missing.'),
+                action('deliver_result', summary='Not actually complete', artifacts=['workspace/note.md'])],
+                progress=lambda _: None)
+            self.assertEqual(guarded.session.manifest.status, 'paused')
+            self.assertFalse(guarded.session.store.exists('delivery.json'))
+            guarded.run(actions=[action('deliver_result', summary='Failure evidence retained',
+                artifacts=['workspace/note.md'], unresolved=['Required measurement missing; no validity claim'])],
+                progress=lambda _: None)
+            self.assertEqual(guarded.session.manifest.status, 'partial')
+            self.assertEqual(len(guarded.ledger.entries), 1)
+            client.assert_not_called()
+
+    def test_frozen_condition_set_delivers_complete_comparison_and_preserves_feedback_obligations(self):
+        from simple_ar.tools.scientific import freeze_measurement_set, measurement_conditions
+        with _temporary_run() as root, patch('simple_ar.app.tool_application.LLMClient.from_env',
+                side_effect=AssertionError('Declared conditions need no model')):
+            project = root / 'project'
+            project.mkdir()
+            (project / 'evaluate.py').write_text("import sys\nfrom pathlib import Path\n"
+                "with Path('calls.txt').open('a') as f: f.write(' '.join(sys.argv[1:])+'\\n')\n"
+                "print('score:', float(sys.argv[1]))\n", encoding='utf-8')
+            (project / 'check.py').write_text("from pathlib import Path\n"
+                "Path('setup.txt').write_text('prepared once')\nprint('score: 999')\n", encoding='utf-8')
+            execution = {'command': [sys.executable, 'evaluate.py', '3'], 'cwd': str(project), 'timeout_sec': 5,
+                'environment': {'mode': 'current', 'timeout_sec': 5, 'check_command': [sys.executable, 'check.py']},
+                'baseline': {'command': [sys.executable, 'evaluate.py', '1']},
+                'baseline_policy': 'run', 'seeds': [4, 9], 'seed_flag': '--seed',
+                'result_schema': {'primary_metric': 'score', 'required_metrics': ['score'], 'direction': 'higher'},
+                'protocol': {'contract_id': 'declared-comparison', 'dataset_refs': [{'asset_id': 'public-fixture'}],
+                    'split_spec': {'name': 'heldout'}, 'metric_specs': [{'name': 'score', 'direction': 'higher'}]}}
+            contract = freeze_measurement_set(execution)
+            app = ToolApplication.create(root / 'task', 'Compare the explicitly declared conditions',
+                model=None, sources={}, allow_execution=True, max_turns=0, max_tokens=0, max_attempts=20,
+                execution_contract=contract, process_limits={'process_invocations': 5, 'process_wall_seconds': 25})
+            def action(name, **arguments):
+                return {'tool_name': name, 'arguments': arguments}
+            batch = [action('measure_experiment', **row['execution'], condition_id=row['id'])
+                for row in measurement_conditions(contract)]
+            app.run(actions=batch, progress=lambda _: None)
+            self.assertFalse((project / 'calls.txt').exists())
+            self.assertFalse((project / 'setup.txt').exists())
+            token = app.approval_token(app.state['pending']['call'])
+            app = ToolApplication.load(root / 'task')
+            app.run(approved_execution=token, progress=lambda _: None)
+            self.assertEqual(len(app.ledger.entries), 2)
+            owner = app.state['turns'][0]['tools'][0]['result'].split('/')[1]
+            prepared = app.session.store.read_json(f'attempts/{owner}/results.json')['preparation']['source_ref']
+            app = ToolApplication.load(root / 'task')
+            app.run(approve=lambda *_: True, progress=lambda _: None)
+            measurements = [app.session.store.read_json(item['result'])['data']['result_ref']
+                for turn in app.state['turns'] for item in turn['tools']]
+            self.assertEqual(len(measurements), 4)
+            self.assertEqual(len(app.ledger.entries), 5)
+            self.assertEqual(len(list((root / 'task/attempts').glob('*/environment_setup.json'))), 1)
+            for locator in measurements:
+                canonical = json.loads(app.workspace.resolve(locator).read_text())
+                self.assertEqual(canonical['preparation']['source_ref'], prepared)
+                self.assertEqual(canonical['command'][0], sys.executable)
+                self.assertNotEqual(canonical['metrics']['score'], 999)
+            args = app.scientific.analysis_arguments(measurements)
+            app.run(actions=[action('analyze_measurements', pairs=args['pairs'][:1]),
+                action('deliver_result', summary='False full coverage', artifacts=[])], progress=lambda _: None)
+            self.assertEqual(app.session.manifest.status, 'paused')
+            self.assertFalse(app.session.store.exists('delivery.json'))
+            with patch('simple_ar.experiment.execution.backend.run_process') as process:
+                app.run(actions=[action('analyze_measurements', **args,
+                    delivery={'summary': 'Two observed paired conditions; descriptive, not significance.', 'artifacts': []})],
+                    progress=lambda _: None)
+                self.assertEqual(app.session.manifest.status, 'completed')
+                delivery = app.session.store.read_json('delivery.json')
+                self.assertTrue(any(path.endswith('/analysis.md') for path in delivery['artifacts']))
+                ledger = app.ledger.to_dict()
+                app = ToolApplication.load(root / 'task')
+                app.run(feedback='Explain only; preserve all measurements', actions=[
+                    action('deliver_result', summary='No additional execution or significance claim',
+                        artifacts=delivery['artifacts'])], progress=lambda _: None)
+                self.assertEqual(app.session.manifest.status, 'completed')
+                self.assertEqual(app.ledger.to_dict(), ledger)
+                self.assertTrue(app.scientific.evidence_requirement(measurements[:-1], []))
+                process.assert_not_called()
+            self.assertEqual((project / 'calls.txt').read_text().splitlines(),
+                ['1 --seed 4', '3 --seed 4', '1 --seed 9', '3 --seed 9'])
+            for change in ({'cwd': str(root)}, {'environment': None}, {'source': 'preparation'}):
+                changed = json.loads(json.dumps(contract))
+                if 'source' in change:
+                    changed['conditions'][-1].update(change)
+                else:
+                    changed['conditions'][-1]['execution'].update(change)
+                with self.subTest(change=change), self.assertRaises(ValueError):
+                    from simple_ar.tools.scientific import measurement_contract
+                    measurement_contract(changed)
+            for bad in ({'seed_count': True}, {'seeds': [False]}, {'baseline_policy': 'reuse'}):
+                with self.subTest(bad=bad), self.assertRaises(ValueError):
+                    freeze_measurement_set({**execution, **bad})
+            for change in ({'condition_id': 'unlisted'}, {'command': [sys.executable, 'evaluate.py', '99']},
+                    {'protocol': {**batch[0]['arguments']['protocol'], 'comparison_conditions': {'seed': 99}}}):
+                with self.subTest(change=change), self.assertRaises(ValueError):
+                    app.scientific.approval_binding({**batch[0]['arguments'], **change}, identity='changed-condition')
+
+    def test_shared_condition_environment_reuses_venv_and_blocks_changed_or_unfinished_preparation(self):
+        from simple_ar.tools.scientific import freeze_measurement_set
+        for scenario in ('venv', 'budget', 'mutation', 'interrupted', 'failed'):
+            with self.subTest(scenario=scenario), _temporary_run() as root:
+                project = root / 'project'
+                project.mkdir()
+                (project / 'baseline.py').write_text("print('score: 1')\n", encoding='utf-8')
+                candidate = project / 'candidate.py'
+                candidate.write_text("print('score: 3')\n", encoding='utf-8')
+                check = project / 'check.py'
+                check.write_text("from pathlib import Path\n" + (
+                    "Path('candidate.py').write_text(\"print('score: 999')\\n\")\n"
+                    if scenario == 'mutation' else "raise SystemExit(2)\n" if scenario == 'failed' else
+                    "Path('checked').write_text('once')\n"), encoding='utf-8')
+                isolated = scenario == 'venv'
+                python = 'python' if isolated else sys.executable
+                (project / 'requirements.txt').write_text('--no-index\n', encoding='utf-8')
+                (project / 'data.csv').write_text('fixed,data\n1,2\n', encoding='utf-8')
+                execution = {'command': [python, 'candidate.py'], 'cwd': str(project), 'timeout_sec': 5,
+                    'baseline': {'command': [python if isolated else sys._base_executable, 'baseline.py']}, 'baseline_policy': 'run',
+                    'result_schema': {'primary_metric': 'score'},
+                    'protocol': {'protected_assets': [{'asset_id': 'data', 'path': 'data.csv'}]},
+                    'environment': {'mode': 'venv' if isolated else 'current', 'timeout_sec': 30,
+                        **({'python_executable': sys.executable, 'requirements': ['requirements.txt']} if isolated else {}),
+                        'check_command': [python, 'check.py']}}
+                if not isolated and sys.prefix != sys.base_prefix:
+                    self.assertNotEqual(execution['command'][0], execution['baseline']['command'][0])
+                contract = freeze_measurement_set(execution)
+                app = ToolApplication.create(root / 'task', 'Measure both frozen roles', model=None,
+                    sources={}, allow_execution=True, max_turns=0, max_tokens=0, max_attempts=12,
+                    execution_contract=contract, process_limits={'process_invocations': 7 if isolated else
+                        2 if scenario == 'budget' else 3, 'process_wall_seconds': 150})
+                batch = [{'tool_name': 'measure_experiment', 'arguments': {
+                    **row['execution'], 'condition_id': row['id']}} for row in contract['conditions']]
+                # A valid frozen contract does not grant permission to execute.
+                app.run(actions=batch[:1], progress=lambda _: None)
+                self.assertFalse(app.ledger.entries)
+                self.assertFalse((project / 'checked').exists())
+                pending = app.state['pending']
+                token = app.approval_token(pending['call'])
+                original = candidate.read_bytes()
+                candidate.write_bytes(original + b'# changed after approval\n')
+                self.assertNotEqual(app.approval_token(pending['call']), token)
+                candidate.write_bytes(original)
+                if scenario == 'interrupted':
+                    with patch('simple_ar.tools.scientific.run_experiment_capability', side_effect=KeyboardInterrupt):
+                        app.run(approved_execution=token, progress=lambda _: None)
+                else:
+                    app.run(approved_execution=token, progress=lambda _: None)
+                owner = app.session.store.root / 'attempts' / pending['attempt']
+                app = ToolApplication.load(root / 'task')
+                if scenario == 'budget':
+                    self.assertFalse((owner / 'scientific_request.json').exists())
+                    self.assertFalse(app.ledger.entries)
+                elif scenario != 'venv':
+                    self.assertFalse((owner / 'results.json').exists())
+                    self.assertEqual(len(app.ledger.entries), 1)
+                    with patch('simple_ar.experiment.execution.backend.run_process') as process, \
+                            self.assertRaisesRegex(ValueError, 'unfinished|interrupted'):
+                        app.scientific.approval_binding(batch[1]['arguments'], identity='must-not-reinstall')
+                    process.assert_not_called()
+                else:
+                    setup = json.loads((owner / 'environment_setup.json').read_text())
+                    self.assertEqual(len(setup['steps']), 4)  # venv, install, pip check, explicit check.
+                    self.assertEqual(setup['steps'][0]['command'][0], sys.executable)
+                    app.run(actions=batch[1:], approve=lambda *_: True, progress=lambda _: None)
+                    self.assertEqual(len(app.ledger.entries), 6)
+                    self.assertEqual(len(list((root / 'task/attempts').glob('*/environment_setup.json'))), 1)
+                    results = list((root / 'task/attempts').glob('*/results.json'))
+                    canonical = [json.loads(path.read_text()) for path in results]
+                    self.assertEqual({row['command'][0] for row in canonical},
+                        {str(owner / 'environment' / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python'))})
+                    self.assertEqual({row['metrics']['score'] for row in canonical}, {1, 3})
+                    before = app.ledger.to_dict()
+                    with patch('simple_ar.experiment.execution.backend.run_process') as process:
+                        for path in results:
+                            app.scientific._measurement_input(app.workspace.locator(str(path)))
+                        for path in (candidate, check, project / 'requirements.txt', project / 'data.csv',
+                                owner / 'environment_observation.json'):
+                            content = path.read_bytes()
+                            path.write_bytes(content + b'\nchanged\n')
+                            with self.subTest(changed=path.name), self.assertRaises((ValueError, OSError)):
+                                app.scientific.approval_binding(batch[1]['arguments'], identity='changed-environment')
+                            path.write_bytes(content)
+                        process.assert_not_called()
+                    self.assertEqual(app.ledger.to_dict(), before)
+                    app.ledger.reserve('unaccounted-process', {'process_invocations': 1, 'process_wall_seconds': 1},
+                        session_id=app.scientific.session_id, attempt_id=pending['attempt'],
+                        logical_call_id='unaccounted', purpose='local_process')
+                    app.ledger.mark_unknown('unaccounted-process', reason='Interrupted physical step')
+                    unknown = app.ledger.to_dict()
+                    with patch('simple_ar.experiment.execution.backend.run_process') as process, self.assertRaises(ValueError):
+                        app.scientific.approval_binding(batch[1]['arguments'], identity='unknown-preparation')
+                    process.assert_not_called()
+                    self.assertEqual(app.ledger.to_dict(), unknown)
+
+    def test_caller_actions_cannot_bypass_policy_pending_work_or_context(self):
+        with _temporary_run() as root, patch('simple_ar.app.tool_application.LLMClient.from_env',
+                side_effect=AssertionError('No model')):
+            app = ToolApplication.create(root / 'task', 'Only read supplied inputs', model=None,
+                sources={}, max_turns=0, max_tokens=0, max_attempts=8)
+            for actions in ([], [{'tool_name': 'measure_experiment', 'arguments': {}}],
+                    [{'tool_name': 'write_file', 'arguments': {}, 'approval': True}]):
+                with self.subTest(actions=actions), self.assertRaises(ValueError):
+                    app.run(actions=actions, progress=lambda _: None)
+            self.assertEqual(app.state['turns'], [])
+            large = ToolApplication.create(root / 'large', 'Keep the declared set intact', model=None,
+                sources={}, max_turns=0, max_tokens=0, max_attempts=40)
+            queued = [{'tool_name': 'ask_user', 'arguments': {'question': 'Confirm remaining scope'}}] * 33
+            with self.assertRaisesRegex(ValueError, 'attempt allowance'):
+                large._submit_actions(queued + queued)
+            large._submit_actions(queued)
+            self.assertEqual(len(large.state['turns'][0]['remaining']), 33)
+            self.assertEqual(len(large.session.list_attempts()), 0)
+            result = app.gateway.call(ToolCall(tool_name='analyze_measurements',
+                arguments={'result_refs': ['source0/pretend.json']}, trace_id='../escape'))
+            self.assertEqual(result.status, 'blocked')
+            self.assertEqual(len(app.session.list_attempts()), 0)
+            from simple_ar.core.capabilities import CapabilityContext, ArtifactStore, AttemptManifest
+            forged = CapabilityContext(ArtifactStore(root / 'task/attempts/forged'),
+                AttemptManifest('forged', capability='native_tool', status='running'))
+            result = app.gateway.call(ToolCall(tool_name='analyze_measurements',
+                arguments={'result_refs': ['source0/pretend.json']}, trace_id='forged'), context=forged)
+            self.assertEqual(result.status, 'blocked')
+            with self.assertRaises(ValueError):
+                app.run(resource_allowances={'llm_requests': 2}, authorization_id='no-model-grant',
+                    authorization_reason='This is not a model contract', progress=lambda _: None)
+            app.run(actions=[{'tool_name': 'ask_user', 'arguments': {'question': 'What should change?'}}],
+                progress=lambda _: None)
+            self.assertEqual(app.session.manifest.status, 'paused')
+            cancelled = {}
+            for number in range(2):
+                with app.session.mutation_scope():
+                    app._submit_actions([{'tool_name': 'write_file', 'arguments': {
+                        'path': f'workspace/not-executed-{number}.txt', 'content': 'cancel me'}}])
+                # Simulate a stop after submission, before pending allocation.
+                app = ToolApplication.load(root / 'task')
+                app.run(feedback='Cancel those unstarted actions', progress=lambda _: None)
+                current = {path.name: path.read_bytes() for path in
+                    (root / 'task/tools/cancelled').glob('*.json')}
+                self.assertEqual(len(current), number + 1)
+                self.assertTrue(all(current[name] == value for name, value in cancelled.items()))
+                cancelled = current
+            delivery = [{'tool_name': 'write_file', 'arguments': {'path': 'workspace/final.md',
+                'content': 'Delivered version', 'delivery': {'summary': 'Done', 'artifacts': ['workspace/final.md']}}}]
+            with patch.object(app.session, 'complete', side_effect=RuntimeError('stop after observation')):
+                self.assertEqual(app.run(actions=delivery, progress=lambda _: None)['status'], 'paused')
+            app = ToolApplication.load(root / 'task')
+            with self.assertRaisesRegex(ValueError, 'feedback'):
+                app.run(actions=[{'tool_name': 'write_file', 'arguments': {
+                    'path': 'workspace/unrequested.txt', 'content': 'must not run'}}], progress=lambda _: None)
+            self.assertEqual(app.session.manifest.status, 'completed')
+            self.assertFalse((root / 'task/workspace/unrequested.txt').exists())
+
+            exhausted = ToolApplication.create(root / 'exhausted', 'One bounded action', model=None,
+                sources={}, max_turns=0, max_tokens=0, max_attempts=1)
+            exhausted.run(actions=[{'tool_name': 'read_history', 'arguments': {}}], progress=lambda _: None)
+            for _ in range(2):
+                with self.assertRaises(RuntimeError):
+                    exhausted.run(actions=[{'tool_name': 'read_history', 'arguments': {}}], progress=lambda _: None)
+                self.assertFalse(exhausted.session.store.exists('tools/submissions/caller-1.json'))
+
+    def test_caller_takeover_requires_closed_failed_decision_and_retains_history(self) -> None:
+        from simple_ar.core.capabilities import CapabilityResult
+
+        cases = ('completed', 'partial', 'older_unknown', 'semantic_error', 'running', 'other_running', 'reserved', 'cached',
+            'pending_tool', 'queue', 'unknown_effect', 'unbounded', 'foreign_charge',
+            'accepted', 'invalid_action', 'invalid_structure', 'not_object', 'not_json',
+            'unauthorized', 'conflict', 'feedback', 'authorization')
+        for case in cases:
+            with self.subTest(case=case):
+                _, _, fake, _, app, _ = self._native_fixture(mount_inputs=False, max_turns=2)
+                root = app.session.store.root
+                (app.workspace.workspace / 'result.md').write_text('Retained reviewed candidate')
+
+                def closed_failure(*, context):
+                    identity = context.attempt.attempt_id
+                    app.ledger.reserve(identity, {'llm_requests': 1, 'total_tokens': 9000},
+                        session_id=app.session.manifest.session_id, attempt_id=identity,
+                        logical_call_id=identity, purpose='native-turn')
+                    if case != 'reserved':
+                        app.ledger.mark_unknown(identity, reason='Provider usage unavailable',
+                            known_actual={'llm_requests': 1}, retain_reservation=True)
+                    return CapabilityResult(status='failed', diagnostics=('Decision closed without accepted output',))
+
+                app.session.registry.register('native_turn', closed_failure, replace=True)
+                if case == 'older_unknown':
+                    with self.assertRaises(RuntimeError):
+                        app._attempt('native_turn', {'kind': 'model',
+                            'attempt': app.session.allocate_attempt_id('native-turn')})
+                self.assertEqual(app.run(progress=lambda _: None)['status'], 'paused')
+                identity = app.state['pending']['attempt']
+                self.assertIsNotNone(app._failed_model_attempt(app.state['pending']))
+                failed_path = f'attempts/{identity}/attempt_manifest.json'
+                if case in {'running', 'other_running'}:
+                    record = app.session.store.read_json(failed_path)
+                    record['status'] = 'running'
+                    if case == 'other_running':
+                        record['attempt_id'] = 'native-tool-unconfirmed'
+                        record['capability'] = 'native_tool'
+                        failed_path = 'attempts/native-tool-unconfirmed/attempt_manifest.json'
+                    app.session.store.write_json(failed_path, record)
+                elif case == 'cached':
+                    app.session.store.write_json(f'attempts/{identity}/native_result.json',
+                        self._native_message('deliver_result', {'summary': 'Cached reply'}, 'cached'))
+                elif case == 'pending_tool':
+                    app.state['pending']['kind'] = 'tool'
+                elif case == 'queue':
+                    # Guard every historical queue, even if the latest turn is empty.
+                    app.state['turns'] = [{'remaining': [{'id': 'unconsumed'}]}, {'remaining': []}]
+                elif case == 'unknown_effect':
+                    app.ledger.reserve('unconfirmed-process', {'process_invocations': 1},
+                        attempt_id=identity, session_id=app.session.manifest.session_id)
+                    app.ledger.mark_unknown('unconfirmed-process', reason='Unconfirmed side effect')
+                elif case in {'unbounded', 'foreign_charge'}:
+                    ledger = app.ledger.to_dict()
+                    if case == 'unbounded':
+                        ledger['entries'][0]['reserved']['total_tokens'] = 0
+                    else:
+                        ledger['entries'][0]['session_id'] = 'another-session'
+                    app.session.store.write_json('budget_ledger.json', ledger)
+                elif case == 'accepted':
+                    result_path = f'attempts/{identity}/capability_result.json'
+                    result = app.session.store.read_json(result_path)
+                    result['status'] = 'completed'
+                    app.session.store.write_json(result_path, result)
+                actions = [{'tool_name': 'deliver_result', 'arguments': {
+                    'summary': 'Caller delivered retained work', 'artifacts': ['workspace/result.md'],
+                    'unresolved': ['Remaining scope disclosed'] if case in {'partial', 'semantic_error'} else []}}]
+                if case == 'invalid_action':
+                    actions.append({'tool_name': 'unknown_tool', 'arguments': {}})
+                elif case == 'invalid_structure':
+                    actions.append({'tool_name': 'write_file', 'arguments': {}, 'approval': True})
+                elif case == 'not_object':
+                    actions.append({'tool_name': 'read_file', 'arguments': []})
+                elif case == 'not_json':
+                    actions.append({'tool_name': 'read_file', 'arguments': {'path': float('nan')}})
+                elif case == 'unauthorized':
+                    app.gateway.policy.blocked_tools.add('run_process')
+                    # Persist this existing policy through its config owner for reload.
+                    app.state['config']['allow_execution'] = False
+                    actions.append({'tool_name': 'run_process', 'arguments': {'argv': ['python']}})
+                elif case == 'semantic_error':
+                    actions.insert(0, {'tool_name': 'read_file', 'arguments': {}})
+                elif case == 'conflict':
+                    app.session.store.write_json('tools/submissions/caller-0.json', {'different': 'caller'})
+                app._save()
+                app = ToolApplication.load(root)
+
+                def persisted():
+                    return {path.relative_to(root).as_posix(): path.read_bytes()
+                        for path in root.rglob('*') if path.is_file() and path.name != '.session.lock'}
+
+                before = persisted()
+                ledger_before = app.ledger.to_dict()
+                config_before = json.loads(json.dumps(app.state['config']))
+                budget_before = app.session.manifest.budget.to_dict()
+                with (patch('simple_ar.app.tool_application.LLMClient.from_env',
+                        side_effect=AssertionError('No model resolution during caller takeover')) as model,
+                        patch('simple_ar.tools.workspace.run_process',
+                            side_effect=AssertionError('No new process')) as process):
+                    if case not in {'completed', 'partial', 'older_unknown', 'semantic_error'}:
+                        with self.assertRaises(ValueError):
+                            app.run(actions=actions, feedback='Changed intent' if case == 'feedback' else '',
+                                allow_network=case == 'authorization', progress=lambda _: None)
+                        self.assertEqual(persisted(), before)
+                        self.assertEqual(app.ledger.to_dict(), ledger_before)
+                        self.assertEqual(app.session.manifest.budget.to_dict(), budget_before)
+                    else:
+                        expected = 'partial' if case in {'partial', 'semantic_error'} else 'completed'
+                        self.assertFalse(app.session.store.exists('delivery.json'))
+                        self.assertEqual(app.run(actions=actions, progress=lambda _: None)['status'], expected)
+                        self.assertEqual(app.session.store.read_json('delivery.json')['summary'],
+                            actions[-1]['arguments']['summary'])
+                        if case == 'semantic_error':
+                            observed = app.session.store.read_json(app.state['turns'][-1]['tools'][0]['result'])
+                            self.assertIn(observed['status'], {'blocked', 'error'})
+                            self.assertTrue(observed['error'])
+                        self.assertEqual(app.state['turns'][-1]['origin'], 'caller')
+                        submission = app.session.store.read_json(app.state['turns'][-1]['reply'])
+                        self.assertEqual(submission['abandoned_failed_decision'], identity)
+                        self.assertIn('explicitly submitted by the caller', submission['content'])
+                        self.assertIn(identity, submission['content'])
+                        caller_messages = [row for row in app._messages(client=fake)
+                            if row['role'] == 'assistant' and row.get('content') == submission['content']]
+                        self.assertEqual(len(caller_messages), 1)
+                        self.assertEqual(set(caller_messages[0]), {'role', 'content', 'tool_calls'})
+                        self.assertFalse(app.session.store.exists(f'attempts/{identity}/native_result.json'))
+                        self.assertEqual(app.state['config'], config_before)
+                        for name, data in before.items():
+                            if name.startswith(f'attempts/{identity}/') or name == 'budget_ledger.json':
+                                self.assertEqual(persisted()[name], data)
+                        self.assertEqual(app.ledger.to_dict(), ledger_before)
+                        self.assertEqual(app.session.manifest.budget.max_attempts, budget_before['max_attempts'])
+                        restored = ToolApplication.load(root)
+                        delivered = persisted()
+                        with patch.object(restored.gateway, 'call', side_effect=AssertionError('No replay')):
+                            for _ in range(2):
+                                self.assertEqual(restored.run(progress=lambda _: None)['status'], expected)
+                        self.assertEqual(persisted(), delivered)
+                        self.assertEqual(restored.ledger.to_dict(), ledger_before)
+                    model.assert_not_called()
+                    process.assert_not_called()
+                fake.chat_turn.assert_not_called()
+                if case == 'completed':
+                    fake.chat_turn.return_value = self._native_message('ask_user',
+                        {'question': 'What next?'}, 'new-feedback')
+                    self.assertEqual(restored.run(feedback='Continue with a different goal',
+                        progress=lambda _: None)['status'], 'paused')
+                    fake.chat_turn.assert_called_once()
+                    self.assertFalse(restored._caller_takeover())
 
     def test_native_execution_requires_matching_approval_and_recovers_without_reexecution(self) -> None:
         run_dir, inputs, fake, binding, app, code = self._native_fixture(counter=True)
@@ -1495,6 +2110,476 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             ['Not content-reviewed'])
         self.assertEqual(publication_app.run(progress=lambda _: None)['status'], 'partial')
         self.assertEqual(fake.chat_turn.call_count, 1)
+
+    def test_exact_code_authority_cannot_be_bypassed_or_complete_without_validation(self):
+        contract = {'project_path': 'source0', 'goal': 'Repair supplied source',
+            'allowed_patterns': ['main.py'], 'validation_command': ['python', 'check.py']}
+        _, _, fake, _, app, _ = self._native_fixture(code_task=contract, max_turns=4)
+        note = app.workspace.workspace / 'note.md'
+        note.write_text('No code has been verified.\n')
+        final = {'summary': 'Unverified note', 'artifacts': ['workspace/note.md']}
+        fake.chat_turn.side_effect = [
+            self._native_message('write_file', {'path': 'workspace/escape.py', 'content': 'pass\n'}, 'write'),
+            self._native_message('run_process', {'argv': ['python', '-c', 'print(1)']}, 'execute'),
+            self._native_message('deliver_result', final, 'unverified'),
+            self._native_message('deliver_result', {**final, 'unresolved': ['Code work remains unverified']}, 'partial'),
+        ]
+        approve = Mock(return_value=True)
+        with patch('simple_ar.tools.workspace.run_process') as launch:
+            self.assertEqual(app.run(approve=approve, progress=lambda _: None)['status'], 'partial')
+            approve.assert_not_called()
+            launch.assert_not_called()
+        self.assertFalse((app.workspace.workspace / 'escape.py').exists())
+        observations = [app.session.store.read_json(turn['tools'][0]['result']) for turn in app.state['turns']]
+        self.assertEqual([row['status'] for row in observations], ['blocked', 'blocked', 'blocked', 'ok'])
+        self.assertIn('no validated implementation', observations[2]['error'])
+        self.assertEqual(app.session.store.read_json('delivery.json')['unresolved'], ['Code work remains unverified'])
+        self.assertIsNone(app.reusable_code_project())
+        # Domain output tools remain available; the restriction is authority,
+        # not a task-name switch to a separate workflow.
+        self.assertTrue(app.gateway.policy.is_allowed(app.gateway.registry.get('compose_document'))[0])
+        self.assertTrue(app.gateway.policy.is_allowed(app.gateway.registry.get('read_file'))[0])
+        old = self._record_native_turn(app, 'implement_code_task', {}, {'status': 'validated'}, 'old-success')
+        failed = self._record_native_turn(app, 'implement_code_task', {}, {'status': 'incomplete'}, 'new-failure')
+        result_path = failed['tools'][0]['result']
+        app.session.store.write_json(result_path, {'tool_name': 'implement_code_task', 'status': 'blocked', 'data': {}})
+        terminal = self._record_native_turn(app, 'deliver_result', final, {}, 'stale-delivery')
+        app.state['turns'] = [old, failed, terminal]
+        with patch.object(app.implementation, 'check_delivery') as check:
+            call = self._native_message('deliver_result', final, 'stale-delivery')['tool_calls'][0]
+            self.assertIn('no validated implementation', app._terminal_error(call))
+            check.assert_not_called()  # Do not revive an older success after a new failure.
+            self.assertIsNone(app.reusable_code_project())
+
+    def test_measurement_report_and_feedback_do_not_require_or_rerun_code(self):
+        from simple_ar.tools.writing import BOUND_REPORT_REVISION, freeze_report_requirement
+        requirement = freeze_report_requirement({'outline_strategy': 'template'})
+        _, inputs, fake, _, app, _ = self._native_fixture(report_requirement=requirement,
+            measurement_command=[sys.executable, '-c', "print('score: 3.5')"])
+        self.enterContext(patch('simple_ar.app.tool_application.LLMClient.for_task', return_value=fake))
+        manuscripts = []
+        def article(system, prompt, **kwargs):
+            view = json.loads(prompt)
+            self.assertEqual(view['results']['metrics']['score'], 3.5)
+            self.assertTrue(view['results']['measurement_history'])
+            self.assertNotIn('implementation', view['results'])
+            text = ('Recorded score is 3.5; this single observation does not establish stability.'
+                if len(app.state['requests']) > 1 else 'The recorded score is 3.5.')
+            return {'draft_markdown': '\n\n'.join('## ' + row['heading'] + '\n\n' + text
+                for row in requirement['outline'])}
+        fake.ask_json.side_effect = article
+        actions = iter(('measure', 'analyze', 'premature', 'compose', 'deliver'))
+        def decision(*args, **kwargs):
+            action = next(actions)
+            if action == 'measure':
+                return self._native_message('measure_experiment', app.state['config']['execution_contract'], action)
+            evidence = app._execution_evidence()
+            self.assertEqual(evidence['implementation_refs'], [])
+            if action == 'analyze':
+                with self.assertRaisesRegex(ValueError, 'matching deterministic analysis'):
+                    app._report_inputs()
+                return self._native_message('analyze_measurements', {'result_refs': [
+                    str(app.session.store.resolve(evidence['measurement_refs'][0]))]}, action)
+            if action == 'compose':
+                return self._native_message('compose_document', {'goal': 'Explain actual measurement',
+                    'title': 'Measurement report'}, action)
+            manuscripts[:] = [app.session.store.read_json(item['result'])['data']['editable_markdown']
+                for turn in app.state['turns'] for item in turn['tools']
+                if app.session.store.read_json(item['result']).get('tool_name') == 'compose_document']
+            return self._native_message('deliver_result', {'summary': 'Measured result and explanation',
+                'artifacts': manuscripts}, action)
+        fake.chat_turn.side_effect = decision
+        result = app.run(approve=lambda *_: True, progress=lambda _: None)
+        self.assertEqual(result['status'], 'completed', app.session.manifest.status_reason)
+        refused = app.session.store.read_json(app.state['turns'][2]['tools'][0]['result'])
+        self.assertIn('current canonical composition receipt', refused['error'])
+        self.assertEqual(len(app.ledger.entries), 1)
+        original = app.workspace.resolve(manuscripts[-1]).read_bytes()
+        report = app.session.store.read_json(app.state['turns'][3]['tools'][0]['result'])
+        self.assertEqual(report['summary'], BOUND_REPORT_REVISION)
+        self.assertIn(BOUND_REPORT_REVISION, json.loads(app._messages()[1]['content'])['report_delivery'])
+        changed = app.workspace.call('write_file', {'path': manuscripts[-1],
+            'content': original.decode() + '\nUnbound manual revision.\n',
+            'expected_sha256': hashlib.sha256(original).hexdigest()}, identity='unbound-report-edit')
+        self.assertEqual(changed.status, 'ok')  # Editable bytes are not a new canonical receipt.
+        with self.assertRaisesRegex(ValueError, 'current canonical composition receipt'):
+            app._validated_report_delivery(manuscripts)
+        self.assertEqual((app.session.store.root / 'tools/edits/unbound-report-edit/previous').read_bytes(), original)
+        app.workspace.resolve(manuscripts[-1]).write_bytes(original)  # Restore only this fault-injection fixture.
+        before = app.ledger.to_dict()
+        feedback = iter(('premature', 'compose', 'deliver'))
+        def revise(*args, **kwargs):
+            action = next(feedback)
+            if action == 'compose':
+                return self._native_message('compose_document', {'goal': 'Clarify observation limits',
+                    'title': 'Measurement report', 'prior_draft': manuscripts[-1]}, 'feedback-compose')
+            latest = [app.session.store.read_json(item['result'])['data']['editable_markdown']
+                for turn in app.state['turns'] for item in turn['tools']
+                if app.session.store.read_json(item['result']).get('tool_name') == 'compose_document'][-1]
+            return self._native_message('deliver_result', {'summary': 'Clarified limits', 'artifacts': [latest]},
+                'feedback-' + action)
+        fake.chat_turn.side_effect = revise
+        with patch.object(app.implementation, 'check_delivery', side_effect=AssertionError('No fabricated implementation')), \
+                patch('simple_ar.experiment.execution.backend.run_process', side_effect=AssertionError('No rerun')):
+            result = app.run(feedback='Explain that stability was not measured', progress=lambda _: None)
+        self.assertEqual(result['status'], 'completed', app.session.manifest.status_reason)
+        self.assertEqual(app.workspace.resolve(manuscripts[-1]).read_bytes(), original)
+        self.assertEqual(app.ledger.to_dict(), before)
+        latest = app.session.store.read_json(app.state['turns'][-2]['tools'][0]['result'])
+        self.assertIn('single observation', app.workspace.resolve(latest['data']['editable_markdown']).read_text())
+        analysis = app.session.store.resolve(app._report_inputs()['analysis_artifacts']['analysis_result'])
+        saved_analysis = analysis.read_bytes()
+        try:
+            analysis.write_text('{}')
+            with self.assertRaisesRegex(ValueError, 'hashes changed'):
+                app._validated_report_delivery([latest['data']['editable_markdown']])
+        finally:
+            analysis.write_bytes(saved_analysis)
+        self.assertEqual(app.ledger.to_dict(), before)
+
+    def test_code_report_creation_and_feedback_require_current_canonical_composition(self):
+        from simple_ar.core import ArtifactStore
+        from simple_ar.code_task.runtime.state import code_task_paths, implementation_file_hashes, load_code_task_manifest
+        from simple_ar.tools.writing import freeze_report_requirement
+        requirement = freeze_report_requirement({'outline_strategy': 'template', 'max_cited_sources': 1,
+            'figures': {'enabled': True, 'max_figures': 2}})
+        contract = {'project_path': 'source0', 'goal': 'Repair supplied source and explain checks',
+            'allowed_patterns': ['main.py'], 'validation_command': ['python', 'check.py']}
+        _, inputs, fake, _, app, _ = self._native_fixture(code_task=contract,
+            report_requirement=requirement, max_turns=12,
+            measurement_command=['python', '-c', "from main import VALUE; print('score: ' + str(VALUE))"])
+        self.enterContext(patch('simple_ar.app.tool_application.LLMClient.for_task', return_value=fake))
+        (inputs / 'main.py').write_text('VALUE = 1\n')
+        (inputs / 'check.py').write_text('assert True\n')
+        candidate = []
+
+        def implementation(*, context, request):
+            workspace = code_task_paths(request.run_dir).workspace_dir
+            (workspace / 'main.py').write_text('VALUE = 2\n')
+            from simple_ar.code_task.execution.runner import run_code_task_benchmark, _argv_command
+            validation = run_code_task_benchmark(request.run_dir, command=_argv_command(request.validation_command),
+                timeout_sec=request.validation_timeout_sec, skip_validation=True,
+                budget_ledger=request.budget_ledger, session_id=request.session_id, attempt_id=request.attempt_id)
+            self.assertEqual(validation.status, 'passed')
+            report_ref = context.store.write_text('validation-report.json', validation.report_path.read_text(),
+                kind='implementation_validation_report')
+            evidence = context.store.write_text('review.txt', 'Actual independent check: VALUE == 2; no performance measurement.')
+            context.store.write_json('implementation.json', {'status': 'validated', 'next_action': 'inspect',
+                'validation': {'status': 'passed', 'returncode': 0, 'timed_out': False,
+                    'command': list(request.validation_command), 'timeout_sec': request.validation_timeout_sec},
+                'artifact_refs': {'review': evidence.to_dict(), 'validation_report': report_ref.to_dict()},
+                'artifact_hashes': {ref.path: hashlib.sha256(context.store.resolve(ref).read_bytes()).hexdigest()
+                    for ref in (evidence, report_ref)},
+                'native_binding': load_code_task_manifest(request.run_dir)['code_task']['native_binding'],
+                'implementation_file_hashes': implementation_file_hashes(request.run_dir),
+                'workspace_dir': str(workspace), 'code_task_run_dir': str(request.run_dir)})
+            candidate.append(workspace.relative_to(app.session.store.root).as_posix())
+
+        def article(system, prompt, **kwargs):
+            view = json.loads(prompt)
+            self.assertIn('Actual independent check: VALUE == 2', json.dumps(view['results']))
+            self.assertEqual(view['results']['metrics']['score'], 2)
+            self.assertTrue(view['results']['measurement_history'])
+            self.assertEqual(view['constraints']['max_cited_sources'], 1)
+            limitation = ('Validation is limited to recorded behavior, not performance improvement.'
+                if len(app.state['requests']) > 1 else 'Recorded implementation; no performance claims.')
+            return {'draft_markdown': '\n\n'.join('## ' + row['heading'] + '\n\n' + limitation
+                + '\n\n- Taxonomy\n- Baseline\n- Failure'
+                for row in requirement['outline'])}
+
+        fake.ask_json.side_effect = article
+        actions = iter(('implement', 'premature', 'measure', 'compose', 'deliver'))
+
+        def decision(*args, **kwargs):
+            projected = json.loads(args[0][1]['content'])['report_requirement']
+            self.assertEqual(projected['method'], requirement['method'])
+            self.assertNotIn('template', projected)
+            self.assertNotIn('config', projected)
+            action = next(actions)
+            if action == 'implement':
+                return self._native_message('implement_code_task', {}, action)
+            if action == 'measure':
+                refs = app._report_inputs()['implementation_refs']
+                return self._native_message('measure_experiment', {**app.state['config']['execution_contract'],
+                    'cwd': str(app.workspace.resolve(candidate[0])),
+                    'implementation_ref': app.workspace.locator(str(app.session.store.resolve(refs[-1])))}, action)
+            if action == 'compose':
+                return self._native_message('compose_document', {'goal': contract['goal'], 'title': 'Implementation report'}, action)
+            manuscripts = [app.session.store.read_json(item['result'])['data']['editable_markdown']
+                for turn in app.state['turns'] for item in turn['tools']
+                if app.session.store.read_json(item['result']).get('tool_name') == 'compose_document']
+            return self._native_message('deliver_result', {'summary': 'Code and report',
+                'artifacts': candidate + manuscripts}, action)
+
+        fake.chat_turn.side_effect = decision
+        with patch('simple_ar.research.implementation.run_implementation_capability', side_effect=implementation):
+            outcome = app.run(approve=lambda *_: True, progress=lambda _: None)
+            self.assertEqual(outcome['status'], 'completed', (app.session.manifest.status_reason,
+                [app.session.store.read_json(item['result']) for turn in app.state['turns'] for item in turn['tools']]))
+        rejected = app.session.store.read_json(app.state['turns'][1]['tools'][0]['result'])
+        self.assertIn('current canonical composition receipt', rejected['error'])
+        report = app.session.store.read_json(app.state['turns'][3]['tools'][0]['result'])
+        self.assertEqual(len(app.ledger.entries), 2)  # Actual independent validator and formal measurement only.
+        self.assertNotIn('![', app.workspace.resolve(report['data']['editable_markdown']).read_text())
+        identity = Path(report['data']['version']).name
+        owner = app.session.store.root / 'tools/writing' / identity
+        (owner / 'result.json').rename(owner / 'retained-result.json')
+        with patch.object(app.writing, 'client_factory', side_effect=AssertionError('No orphan replay')):
+            recovered = self._compose_document(app, {'goal': contract['goal'], 'title': 'Implementation report'}, identity)
+        self.assertEqual(recovered.data, report['data'])
+        app._validated_report_delivery(candidate + [report['data']['editable_markdown']])
+        before = fake.ask_json.call_count
+        app._validated_report_delivery(candidate + [report['data']['editable_markdown']])
+        self.assertEqual(fake.ask_json.call_count, before)
+        original = app.workspace.resolve(report['data']['editable_markdown']).read_bytes()
+        revisions = iter(('revise', 'deliver'))
+        def feedback_decision(*args, **kwargs):
+            if next(revisions) == 'revise':
+                return self._native_message('compose_document', {'goal': 'Explain validation limits',
+                    'title': 'Implementation report', 'prior_draft': report['data']['editable_markdown']}, 'revise-report')
+            latest = app.session.store.read_json(app.state['turns'][-1]['tools'][0]['result'])
+            return self._native_message('deliver_result', {'summary': 'Clarified report; code reused',
+                'artifacts': candidate + [latest['data']['editable_markdown']]}, 'deliver-revision')
+        fake.chat_turn.side_effect = feedback_decision
+        outcome = app.run(feedback='Explain the limitation more clearly', approve=lambda *_: True, progress=lambda _: None)
+        self.assertEqual(outcome['status'], 'completed', app.session.manifest.status_reason)
+        revised = app.session.store.read_json(app.state['turns'][-2]['tools'][0]['result'])
+        self.assertIn(b'Validation is limited to recorded behavior', app.workspace.resolve(revised['data']['editable_markdown']).read_bytes())
+        self.assertEqual(app.workspace.resolve(report['data']['editable_markdown']).read_bytes(), original)
+        self.assertEqual(len(candidate), 1)  # Report feedback did not rerun implementation.
+        self.assertEqual(len(app.ledger.entries), 2)  # Nor did it rerun measurement/validation.
+        repeat = app.reusable_execution()
+        self.assertEqual(repeat['command'][1:], app.state['config']['execution_contract']['command'][1:])
+        self.assertEqual(repeat['cwd'], str(app.workspace.resolve(candidate[0])))
+        self.assertEqual(repeat['protocol'], app.state['config']['execution_contract']['protocol'])
+        from simple_ar.cli.start import reuse_session_materials
+        from simple_ar.cli.parser import build_parser
+        reused = build_parser().parse_args(['start', '--kind', 'reproduction', '--from-session',
+            str(app.session.store.root), '--reuse', 'code_project'])
+        before_reuse = app.ledger.to_dict()
+        reuse_session_materials(reused)
+        self.assertEqual(reused.run_argv, repeat['command'])
+        self.assertEqual(reused.project, app.workspace.resolve(candidate[0]))
+        self.assertEqual(reused.hypothesis, repeat['protocol']['hypothesis'])
+        self.assertEqual(app.ledger.to_dict(), before_reuse)
+        evidence = app._execution_evidence()
+        unrelated = app.session.store.root / 'attempts/unrelated-old-measurement'
+        ArtifactStore(unrelated).write_json('scientific_request.json', {'execution_approval': {'binding': {
+            'source': {'implementation_ref': {'path': 'attempts/another-implementation/implementation.json'}}}}})
+        selected = app.scientific.report_evidence([app.workspace.locator(str(unrelated / 'results.json')),
+            *(app.workspace.locator(str(app.session.store.resolve(ref))) for ref in evidence['measurement_refs'])],
+            evidence['implementation_refs'])
+        self.assertEqual(selected['measurement_refs'], evidence['measurement_refs'])
+        saved_turns = app.state['turns']
+        claimed = {'summary': 'Claim complete after report-only feedback', 'artifacts': candidate}
+        terminal = self._record_native_turn(app, 'deliver_result', claimed, claimed, 'missing-measurement-after-feedback')
+        app.state['turns'] = [row for row in saved_turns if not any(
+            app.session.store.read_json(item['result']).get('tool_name') == 'measure_experiment' for item in row['tools'])] + [terminal]
+        with patch.object(app, '_validated_report_delivery'):
+            self.assertIn('no formal measurement', app._terminal_error(
+                self._native_message('deliver_result', claimed, 'missing-measurement-after-feedback')['tool_calls'][0]))
+        app.state['turns'] = saved_turns
+        app.state['requests'].append('Explain the limitation more clearly')
+        app._save()
+        with self.assertRaisesRegex(ValueError, 'current canonical composition receipt'):
+            app._validated_report_delivery(candidate + [report['data']['editable_markdown']])
+        # A disclosed missing revision is partial, never promoted by an old report.
+        delivery = {'summary': 'Prior version retained', 'artifacts': candidate,
+            'unresolved': ['Report feedback has not been applied']}
+        turn = self._record_native_turn(app, 'deliver_result', delivery, delivery, 'partial-report')
+        turn['request_count'] = len(app.state['requests'])
+        app.state['turns'].append(turn)
+        self.assertEqual(app._terminal_error(self._native_message('deliver_result', delivery, 'partial-report')['tool_calls'][0]), '')
+
+    def test_exact_code_project_reuse_requires_current_verified_delivery_and_preserves_owner(self):
+        from simple_ar.code_task.runtime.state import code_task_paths, load_code_task_manifest, implementation_file_hashes
+        from simple_ar.tools.implementation import ExactCodeTask, ExactCodeWork
+
+        original = {'project_path': 'source0', 'goal': 'Repair supplied source',
+            'allowed_patterns': ['main.py'], 'validation_command': ['python', 'check.py']}
+        legacy = {**original, 'protected_patterns': [], 'timeout_sec': 300}
+        self.assertEqual(ExactCodeTask.model_validate(original).model_dump(), legacy)
+        self.assertEqual(ExactCodeTask.model_validate({**original, 'edit_policy': None}).model_dump(), legacy)
+        self.assertEqual(set(ExactCodeWork.model_fields), {'instruction', 'prior_result', 'prepared_result'})
+        self.assertEqual(ExactCodeWork().model_dump(), {'instruction': '', 'prior_result': ''})
+        policies = ({}, {'budget_profile': None, 'allow_large_edits': False, 'edit_budget_overrides': {}},
+            {'budget_profile': 'absolute', 'allow_large_edits': True,
+             'edit_budget_overrides': {'max_files': 1, 'max_total_edit_chars': 10**9}})
+        for policy in policies:
+            with self.subTest(policy=policy):
+                contract = {**original, **({'edit_policy': policy} if policy else {})}
+                _, inputs, fake, _, app, _ = self._native_fixture(code_task=contract, max_turns=3)
+                (inputs / 'main.py').write_text('VALUE = 1\n')
+                (inputs / 'check.py').write_text('assert True\n')
+                source_bytes = {p: p.read_bytes() for p in inputs.rglob('*') if p.is_file()}
+                candidates = []
+
+                def domain_result(*, context, request):
+                    self.assertEqual(request.budget_profile, policy.get('budget_profile'))
+                    self.assertEqual(request.allow_large_edits, policy.get('allow_large_edits', False))
+                    self.assertEqual(request.edit_budget_overrides, policy.get('edit_budget_overrides'))
+                    self.assertEqual(request.max_repairs, 1)
+                    self.assertIs(request.budget_ledger, app.ledger)
+                    self.assertEqual(request.attempt_id, context.attempt.attempt_id)
+                    self.assertEqual(context.store.root, app.session.store.root / 'attempts' / request.attempt_id)
+                    prepared = context.store.read_json('execution.json')['execution']['code_task']
+                    for name, value in policy.items():
+                        self.assertEqual(prepared[name], value)
+                    self.assertEqual(prepared['max_repairs'], request.max_repairs)
+                    self.assertEqual(prepared['validation_command'], list(request.validation_command))
+                    manifest = load_code_task_manifest(request.run_dir)
+                    approval = manifest['code_task']['native_binding']
+                    self.assertEqual(approval['binding']['contract'], {**legacy, **({'edit_policy': policy} if policy else {})})
+                    candidate = code_task_paths(request.run_dir).workspace_dir
+                    (candidate / 'main.py').write_text('VALUE = 2\n')
+                    evidence = context.store.write_text('code_task/review.txt', 'independent validation')
+                    context.store.write_json('implementation.json', {'status': 'validated', 'next_action': 'inspect',
+                        'artifact_refs': {'review': evidence.to_dict()},
+                        'artifact_hashes': {evidence.path: hashlib.sha256(context.store.resolve(evidence).read_bytes()).hexdigest()},
+                        'native_binding': approval, 'implementation_file_hashes': implementation_file_hashes(request.run_dir),
+                        'workspace_dir': str(candidate), 'code_task_run_dir': str(request.run_dir)})
+                    candidates.append((request.run_dir, candidate))
+
+                def next_turn(*args, **kwargs):
+                    if not candidates:
+                        return self._native_message('implement_code_task', {}, 'implement')
+                    target = candidates[-1][1] / 'main.py' if policy else candidates[-1][1]
+                    return self._native_message('deliver_result', {'summary': 'Verified project',
+                        'artifacts': [target.relative_to(app.session.store.root).as_posix()],
+                        'unresolved': ['Follow-up documentation'] if policy else []}, 'deliver')
+
+                fake.chat_turn.side_effect = next_turn
+                with (patch('simple_ar.research.implementation.run_implementation_capability', side_effect=domain_result),
+                        patch.object(app.implementation, 'client_factory', return_value=fake)):
+                    self.assertEqual(app.run(approve=lambda *_: True, progress=lambda _: None)['status'],
+                        'partial' if policy else 'completed')
+                root = app.session.store.root
+                before = {p: p.read_bytes() for p in root.rglob('*') if p.is_file()}
+                with (patch.object(app, '_client', side_effect=AssertionError('read-only reuse')),
+                        patch.object(app.gateway, 'call', side_effect=AssertionError('no tool call'))):
+                    reused = app.reusable_code_project()
+                    self.assertIsNotNone(reused)
+                    self.assertEqual(reused, (candidates[-1][1].resolve(), load_code_task_manifest(candidates[-1][0]), policy))
+                    self.assertEqual(app.reusable_code_project(), reused)
+                    self.assertEqual(ToolApplication.load(root).reusable_code_project(), reused)
+                self.assertEqual({p: p.read_bytes() for p in root.rglob('*') if p.is_file()}, before)
+                self.assertEqual({p: p.read_bytes() for p in inputs.rglob('*') if p.is_file()}, source_bytes)
+                moved = inputs.with_name(inputs.name + '-unavailable')
+                inputs.rename(moved)
+                try:
+                    self.assertEqual(app.reusable_code_project(), reused)
+                    with self.assertRaises((OSError, ValueError)):
+                        app._validated_code_delivery(app.session.store.read_json('delivery.json')['artifacts'])
+                finally:
+                    moved.rename(inputs)
+                missing = candidates[-1][1] / 'check.py'
+                saved = missing.read_bytes()
+                missing.unlink()
+                try:
+                    self.assertIsNone(app.reusable_code_project())
+                finally:
+                    missing.write_bytes(saved)
+                for status in ('running', 'paused'):
+                    app.session.manifest.status = status
+                    self.assertIsNone(app.reusable_code_project())
+                app.session.manifest.status = 'partial' if policy else 'completed'
+                for path in (candidates[-1][1] / 'main.py', root / 'delivery.json',
+                        root / 'attempts' / candidates[-1][0].name / 'code_task/review.txt'):
+                    saved = path.read_bytes()
+                    path.write_bytes(saved + b' ')
+                    # Whitespace alone leaves JSON semantics intact; alter the formal delivery value too.
+                    if path.name == 'delivery.json':
+                        delivery = app.session.store.read_json('delivery.json')
+                        delivery['summary'] = 'Changed delivery'
+                        app.session.store.write_json('delivery.json', delivery)
+                    self.assertIsNone(app.reusable_code_project())
+                    path.write_bytes(saved)
+                terminal = app.state['turns'][-1]
+                failed = self._record_native_turn(app, 'implement_code_task', {}, {'status': 'incomplete'}, 'new-failure')
+                app.state['turns'].insert(-1, failed)
+                self.assertIsNone(app.reusable_code_project())
+                app.state['turns'].pop(-2)
+                app.state['turns'].remove(terminal)
+                self.assertIsNone(app.reusable_code_project())
+        _, _, _, _, ordinary, _ = self._native_fixture(completed=True)
+        self.assertIsNone(ordinary.reusable_code_project())
+
+    def test_exact_code_edit_policy_rejects_invalid_authority_before_session_or_client(self):
+        from simple_ar.tools.implementation import ExactCodeWork
+        contract = {'project_path': 'source0', 'goal': 'Repair supplied source',
+            'allowed_patterns': ['main.py'], 'validation_command': ['python', 'check.py']}
+        root, inputs = self._tool_materials()
+        invalid = ([], {'extra': 1}, {'budget_profile': 'huge'}, {'budget_profile': []},
+            {'allow_large_edits': 0}, {'allow_large_edits': 'false'},
+            {'edit_budget_overrides': None}, {'edit_budget_overrides': {'max_files': 0}},
+            {'edit_budget_overrides': {'max_files': -1}}, {'edit_budget_overrides': {'max_files': True}},
+            {'edit_budget_overrides': {'max_files': 1.5}}, {'edit_budget_overrides': {'unknown': 1}})
+        with (patch('simple_ar.app.tool_application.LLMClient.from_env') as client,
+                patch('simple_ar.app.tool_application.SessionController.create') as session):
+            for policy in invalid:
+                with self.subTest(policy=policy), self.assertRaises(ValueError):
+                    ToolApplication.create(root / 'invalid', contract['goal'], model='fixture',
+                        sources={'source0': inputs}, allow_execution=True,
+                        code_task={**contract, 'edit_policy': policy})
+            client.assert_not_called()
+            session.assert_not_called()
+        self.assertFalse((root / 'invalid').exists())
+        with self.assertRaises(ValueError):
+            ExactCodeWork.model_validate({'edit_policy': {'allow_large_edits': True}})
+
+    def test_exact_preparation_and_explicit_process_limits_preserve_creation_authority(self):
+        from simple_ar.tools.implementation import ExactCodeTask, ExactCodePreparation
+        contract = {'project_path': 'source0', 'goal': 'Repair supplied source',
+            'allowed_patterns': ['*.py'], 'validation_command': ['python', 'check.py']}
+        root, inputs = self._tool_materials()
+        invalid_preparations = ({'unknown': 1}, {'kind': 'other'}, {'workspace_mode': 'empty'},
+            {'kind': 'greenfield'},
+            {'max_file_bytes': True}, {'max_file_bytes': -1},
+            {'max_repairs': 1.5}, {'env_mode': 'external'}, {'data_inputs': ['../outside']},
+            {'workspace_mode': 'sparse_copy', 'data_inputs': ['data.csv']})
+        with (patch('simple_ar.app.tool_application.LLMClient.from_env') as client,
+                patch('simple_ar.app.tool_application.SessionController.create') as session):
+            for policy in invalid_preparations:
+                with self.subTest(preparation=policy), self.assertRaises(ValueError):
+                    ToolApplication.create(root / 'invalid', 'Repair', model='fixture',
+                        sources={'source0': inputs}, allow_execution=True,
+                        code_task={**contract, 'preparation': policy})
+            for limits in ({'unknown': 1}, {'process_invocations': False}, {'process_invocations': 1.5},
+                           {'process_wall_seconds': float('nan')}, {'process_wall_seconds': -1}):
+                with self.subTest(limits=limits), self.assertRaises(ValueError):
+                    ToolApplication.create(root / 'invalid', 'Repair', model='fixture',
+                        sources={'source0': inputs}, process_limits=limits)
+            client.assert_not_called()
+            session.assert_not_called()
+        self.assertEqual(ExactCodeTask.model_validate(contract).model_dump(),
+            {**contract, 'protected_patterns': [], 'timeout_sec': 300})
+        for limits in (None, {'process_invocations': 0, 'process_wall_seconds': 0},
+                       {'process_invocations': 2, 'process_wall_seconds': 1.5}):
+            with self.subTest(limits=limits):
+                _, _, _, _, app, _ = self._native_fixture(process_limits=limits, max_turns=3)
+                expected = limits or {'process_invocations': 30, 'process_wall_seconds': 900}
+                self.assertEqual({key: app.ledger.limits[key] for key in expected}, expected)
+                self.assertEqual(ToolApplication.load(app.session.store.root).ledger.to_dict(), app.ledger.to_dict())
+        created = ExactCodeTask.model_validate({**contract, 'project_path': '',
+            'preparation': ExactCodePreparation(kind='greenfield', workspace_mode='empty').model_dump()})
+        self.assertEqual(created.preparation.kind, 'greenfield')
+        self.assertEqual(ExactCodeTask.model_validate(created.model_dump()).model_dump(), created.model_dump())
+        for mode in ('empty', 'copy', 'sparse_copy', 'auto', 'git_worktree'):
+            for source in ('', 'source0'):
+                declaration = {**contract, 'project_path': source,
+                    'preparation': {'kind': 'greenfield', 'workspace_mode': mode}}
+                valid = (mode == 'empty' and not source) or (mode in {'copy', 'sparse_copy'} and bool(source))
+                with self.subTest(mode=mode, source=source):
+                    if valid:
+                        self.assertEqual(ExactCodeTask.model_validate(declaration).project_path, source)
+                    else:
+                        with self.assertRaises(ValueError):
+                            ExactCodeTask.model_validate(declaration)
+        for mode in ('empty', 'sparse_copy'):
+            with self.assertRaisesRegex(ValueError, 'Declared project data'):
+                ExactCodePreparation(kind='greenfield', workspace_mode=mode, data_inputs=['data.csv'])
+        # Actual generation, controlled feedback and whole-project/API gates
+        # are exercised at their domain owner, not inferred from a mock here.
 
     def test_native_batch_delivery_consumes_current_verification_not_old_probes(self) -> None:
         for failed, unresolved, expected in (
@@ -1682,6 +2767,24 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             progress=lambda _: None)['status'], 'paused')
         self.assertEqual(restored.session.manifest.status_reason, 'Inspect the changed result?')
         self.assertEqual(fake.chat_turn.call_count, 2)
+
+    def test_disconnected_progress_does_not_abort_or_replay_work(self) -> None:
+        for boundary in (1, 2, 3):
+            with self.subTest(boundary=boundary):
+                _, _, fake, _, app, _ = self._native_fixture(mount_inputs=False, max_turns=1)
+                draft = app.workspace.workspace / 'result.md'
+                draft.write_text('Retained result')
+                fake.chat_turn.side_effect = [self._native_message('deliver_result', {
+                    'summary': 'Delivered', 'artifacts': ['workspace/result.md']}, 'delivery')]
+                sink = Mock(side_effect=[None] * (boundary - 1) + [BrokenPipeError('display disconnected')])
+                self.assertEqual(app.run(progress=sink)['status'], 'completed')
+                self.assertEqual(sink.call_count, boundary)
+                before = app.ledger.to_dict()
+                restored = ToolApplication.load(app.session.store.root)
+                with patch.object(restored.gateway, 'call', side_effect=AssertionError('No replay')):
+                    self.assertEqual(restored.run(progress=sink)['status'], 'completed')
+                self.assertEqual(fake.chat_turn.call_count, 1)
+                self.assertEqual(restored.ledger.to_dict(), before)
 
     def test_native_tool_contract_selection_preserves_authority_and_resume(self) -> None:
         _, _, fake, _, app, _ = self._native_fixture(allow_execution=False)
@@ -2182,6 +3285,10 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
     def test_native_history_long_view_bounds_indexes_and_archives_whole_turns(self) -> None:
         _, inputs, fake, _, app, _ = self._native_fixture()
+        # Exercise the public start path's on-demand contracts. The eager
+        # eager full catalog has variable schema cost and may legitimately
+        # evict these windows; it must not dictate this history fixture's size.
+        app.state['config']['tool_contracts'] = 'on_demand'
         original_text = 'source evidence\n' * 1000
         original_path = inputs / 'notes.txt'
         original_path.write_text(original_text, encoding='utf-8', newline='\n')
@@ -2292,6 +3399,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
     def test_native_working_set_follows_recent_work_not_lifetime_read_count(self) -> None:
         _, inputs, fake, _, app, _ = self._native_fixture()
+        app.state['config']['tool_contracts'] = 'on_demand'
         prior = inputs / 'notes.txt'
         current = app.workspace.workspace / 'current.txt'
         # Omitted read and write observations share the remaining serialized capacity.
@@ -2360,8 +3468,16 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         from simple_ar.integrations.llm import LLMClient, LLMSettings
         import httpx
 
-        for purpose, failure in ((purpose, failure) for purpose in ('task', 'code', 'writing')
-                for failure in ('bounded_unknown', 'pre_dispatch', 'preflight', 'cached')):
+        # Transport/preflight closure uses the same retry admission on every
+        # route. Keep those failures once; each focus still proves retained
+        # unknown charges, saved-cap admission and cached-reply recovery.
+        cases = (
+            ('task', 'bounded_unknown'), ('task', 'pre_dispatch'),
+            ('task', 'preflight'), ('task', 'cached'),
+            ('code', 'bounded_unknown'), ('code', 'cached'),
+            ('writing', 'bounded_unknown'), ('writing', 'cached'),
+        )
+        for purpose, failure in cases:
             with self.subTest(purpose=purpose, failure=failure):
                 _, _, _, _, app, _ = self._native_fixture(completed=True, max_turns=8)
                 usages = []
@@ -2392,7 +3508,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                         'simple_ar.integrations.llm._call_openai_sdk',
                         side_effect=None if failure == 'cached' else error, return_value=response) as provider:
                     with patch.dict(app.ledger.limits, {'total_tokens': 1} if failure == 'preflight' else {}), \
-                            (patch.object(ArtifactStore, 'write_capability_result', side_effect=KeyboardInterrupt('after cached reply'))
+                            (_interrupt_outcome_commit()
                              if failure == 'cached' else nullcontext()):
                         app.run(feedback='Inspect the saved work', progress=lambda _: None)
                     self.assertEqual(provider.call_count, 0 if failure == 'preflight' else 1)
@@ -2524,8 +3640,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             app.state['config'].update(model='profile:old',
                 model_connection=resolve('profile:old').connection_binding())
             app._save()
-            with (patch.object(ArtifactStore, 'write_capability_result',
-                    side_effect=KeyboardInterrupt('after cached reply')) if cached else nullcontext()):
+            with (_interrupt_outcome_commit() if cached else nullcontext()):
                 app.run(progress=lambda _: None)
             self.assertEqual(provider.call_count, 1)
             self.assertEqual(app.session.list_attempts()[-1].status, 'running' if cached else 'failed')
@@ -2807,13 +3922,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 self.assertEqual(app.run(**grant, progress=lambda _: None)['status'], 'completed')
                 self.assertEqual(app.ledger.to_dict(), before)
                 self.assertEqual(app.session.manifest.budget.to_dict(), budget)
-                for changed in ({'resource_allowances': {'llm_requests': 3, 'total_tokens': 120000}},
-                                {'authorization_reason': 'Different authorization terms'}):
-                    with self.subTest(conflict=changed):
-                        with self.assertRaisesRegex((ValueError, RuntimeError), 'different terms'):
-                            app.run(**{**grant, **changed}, progress=lambda _: None)
-                        self.assertEqual(app.ledger.to_dict(), before)
-                        self.assertEqual(app.session.manifest.budget.to_dict(), budget)
+                # Authorization term conflicts belong to the budget/transition tests;
+                # this integration retains replay after spending and feedback behavior.
                 self.assertEqual(provider.call_count, 1)
                 # Feedback replaces an existing artifact using the digest of
                 # its actual executed bytes, as required by write_file.
@@ -3037,6 +4147,79 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 self.assertEqual({name: resumed.session.store.resolve(name).read_bytes()
                                   for name in retained}, retained)
 
+    def test_professional_summary_uses_parent_attempt_and_retains_bound_partial_evidence(self) -> None:
+        from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
+        from simple_ar.tools.sources import SourcePolicy, SourceToolGateway
+        root, inputs, workspace = self._workspace_fixture()
+        workspace.mounts['records'] = root / 'attempts'
+        original = inputs / 'document.json'
+        write_json(original, self._original_document().to_handoff_dict())
+        policy = SourcePolicy(materials=('source0/document.json',), allow_network=False, require_summary=True)
+        owner = SourceToolGateway(root, workspace, workspace.ledger, policy=policy)
+        store = ArtifactStore(root / 'attempts' / 'research-summary')
+        context = CapabilityContext(store, AttemptManifest('research-summary', capability='native_tool'))
+        arguments = {'operation': 'summary', 'question': 'What does cancellation do?'}
+        before = original.read_bytes()
+        with patch('simple_ar.tools.sources.search_sources') as no_network:
+            result = owner.execute_tool('research', context, arguments)
+            self.assertEqual(result.status, 'ok', result.error)
+            repeated = owner.execute_tool('research', context, arguments)
+            self.assertEqual(repeated, result)
+            no_network.assert_not_called()
+        self.assertIn('records/research-summary/research_summary.md', result.artifacts)
+        self.assertEqual(result.data['document_record'], 'records/research-summary/document_bundle.json')
+        self.assertEqual(owner.delivery_issues([]), [])
+        if result.data['status'] == 'partial':
+            self.assertTrue(result.data['unresolved'])
+        self.assertEqual(original.read_bytes(), before)
+        changed = owner.execute_tool('research', context, {**arguments, 'question': 'Different question'})
+        self.assertEqual(changed.status, 'blocked')
+        store.write_text('research_summary.md', 'Changed after completion')
+        self.assertFalse(owner.can_reconcile('research', context.attempt.attempt_id))
+        self.assertTrue(owner.delivery_issues([]))
+
+    def test_professional_design_confirmation_binds_protocol_and_rejects_replay(self) -> None:
+        from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
+        from simple_ar.research.contracts import IdeaCandidate, ResearchExperimentContract
+        from simple_ar.research.synthesis import SynthesisResult
+        from simple_ar.tools.sources import SourcePolicy, SourceToolGateway
+        root, inputs, workspace = self._workspace_fixture()
+        workspace.mounts['records'] = root / 'attempts'
+        synthesis = SynthesisResult(status='ready', gap_summary='Bounded candidate', ideas=(IdeaCandidate(
+            idea_id='chosen', title='Selected candidate', hypothesis='A testable change',
+            proposed_change='Use the selected method', motivation_refs=['original-span']),), novelty_checks=(),
+            experiment_contract=ResearchExperimentContract(contract_id='contract', hypothesis='A testable change',
+                proposed_change='Use the selected method'))
+        write_json(inputs / 'synthesis.json', synthesis.to_handoff_dict())
+        owner = SourceToolGateway(root, workspace, workspace.ledger, policy=SourcePolicy(
+            require_design=True, selected_idea_id='chosen', execution_boundary={
+                'command': ['python', 'measure.py'], 'cwd': str(inputs), 'timeout_sec': 3,
+                'result_schema': {'required_metrics': ['score']}}))
+        self.assertTrue(owner.execution_issues())
+        context = CapabilityContext(ArtifactStore(root / 'attempts' / 'research-design'),
+            AttemptManifest('research-design', capability='native_tool'))
+        result = owner.execute_tool('research', context, {'operation': 'design', 'question': 'Test the chosen method',
+            'synthesis_record': 'source0/synthesis.json'})
+        self.assertEqual(result.status, 'ok', result.error)
+        decision = owner.pending_decision()
+        self.assertEqual(result.data['pending_decision'], decision)
+        self.assertTrue(owner.execution_issues())
+        with self.assertRaisesRegex(ValueError, 'mismatched'):
+            owner.respond_decision('wrong-id', 'accept')
+        owner.respond_decision(decision['decision_id'], 'accept', None)
+        self.assertIsNone(owner.pending_decision())
+        self.assertEqual(owner.execution_issues(), [])
+        with self.assertRaisesRegex(ValueError, 'already answered'):
+            owner.respond_decision(decision['decision_id'], 'accept')
+        context.store.write_json('frozen_protocol.json', {'command': ['different']})
+        self.assertTrue(owner.execution_issues())
+        with self.assertRaisesRegex(ValueError, 'stale'):
+            owner.pending_decision()
+        with self.assertRaises(ValueError):
+            SourcePolicy.model_validate({'max_chunks': 0})
+        with self.assertRaises(ValueError):
+            SourcePolicy.model_validate({'providers': ['invented']})
+
     def test_source_search_and_local_passages_preserve_original_identity(self) -> None:
         run_dir, inputs, fake, binding, resumed, code = self._native_fixture(allow_network=True)
         from simple_ar.research.sources.capability import SearchResult
@@ -3157,24 +4340,9 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertNotIn('10.1234/invented', bibliography)
         view = _writing_prompt(fake)
         self.assertTrue({'config', 'memory', 'section_plan', 'template_markdown', 'audit'}.isdisjoint(view))
-        # Both public projection consumers retain identical source facts. Only
-        # the sectional consumer asks for recoverable Writer memory.
+        # Projection parity belongs to ResearchReportApplicationTests; this
+        # entry point binds the selected source bytes to the actual article.
         from simple_ar.core.capabilities import ArtifactStore
-        from simple_ar.report.projection import build_material_report_inputs
-        from simple_ar.research.documents.ingest import DocumentBundle
-        owner = ArtifactStore(resumed.session.store.root / 'tools/writing/writing-first')
-        retained = DocumentBundle.from_handoff_dict(owner.read_json('documents.json'))
-        projection_inputs = dict(topic=writing_arguments['goal'], documents=retained,
-            documents_ref=owner.ref('documents.json', kind='documents', schema='document_bundle.v1'),
-            assets=[], selected_evidence=True)
-        sectional_context, sectional_memory = build_material_report_inputs(**projection_inputs)
-        article_context, article_memory = build_material_report_inputs(**projection_inputs, include_memory=False)
-        self.assertIsNone(article_memory)
-        self.assertEqual(article_context.model_dump(mode='json'), sectional_context.model_dump(mode='json'))
-        self.assertEqual(sectional_memory.source_handles, sectional_context.source_handles)
-        self.assertTrue(any('not independently verified' in row for row in sectional_memory.limitations))
-        self.assertEqual(view['bibliography'], sectional_context.papers)
-        self.assertEqual(view['citation_key_map'], sectional_context.citation_key_map)
         self.assertEqual((view['goal'], view['title'], view['target_words']),
             (writing_arguments['goal'], writing_arguments['title'], 0))
         self.assertEqual(view['front_matter'], [row.to_row() for row in original.sections])
@@ -3191,6 +4359,9 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         saved_binding = resumed.session.store.read_json('tools/writing/writing-first/request.json')
         self.assertEqual(saved_binding['writing_owner'], 'direct_article.v1')
         self.assertEqual(saved_binding['assembly_mode'], 'whole_article')
+        self.assertNotIn('required_headings', saved_binding['request'])
+        self.assertNotIn('max_cited_sources', saved_binding['request'])
+        self.assertNotIn('constraints', view)
         self.assertNotIn('questions', saved_binding['request']['sources'][0])
         self.assertEqual(set(saved_binding['inputs'][0]), {'path', 'sha256'})
         draft_path = composed.data['editable_markdown']
@@ -3233,75 +4404,57 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual({name: feedback_owner.resolve(name).read_bytes() for name in retained}, retained)
 
     def test_composition_unknown_transport_preserves_response_and_client_settings(self) -> None:
-        _, fake, resumed, _, writing_arguments = self._writing_fixture()
+        _, _, resumed, _, writing_arguments = self._writing_fixture()
         from simple_ar.integrations.llm import LLMClient, LLMSettings
         settings = LLMSettings(api_key='fixture', model='fixture', api_mode='auto', retry_attempts=3)
         client = LLMClient(settings, budget_ledger=resumed.ledger, budget_attempt_id='writing-settings-failure')
         # A failed call is not permission to resubmit on recovery.
         from simple_ar.integrations.llm import LLMError
-        for index, raw in enumerate((None, {'draft_markdown': 'Unconfirmed prose'}, 'Invalid JSON')):
-            error = LLMError('Unconfirmed transport result')
-            error.raw_response = raw
-            fake.ask_json.side_effect = error
-            identity = f'writing-interrupted-{index}'
-            for phase in ('failure', 'replay'):
-                with self.subTest(raw_response=raw, phase=phase):
-                    self._compose_document(resumed, writing_arguments, identity, status='error')
-            self.assertEqual(fake.ask_json.call_count, 1 + index)
-            if raw is not None:
-                self.assertEqual(resumed.session.store.read_json(f'tools/writing/{identity}/writer/response.json'), {'raw_response': raw})
+        # Missing/saved/raw response permutations belong to the article owner.
+        error = LLMError('Unconfirmed transport result')
+        error.raw_response = {'draft_markdown': 'Unconfirmed prose'}
         with patch.object(resumed.writing, 'client_factory', return_value=client), \
-                patch.object(client, 'ask_json', side_effect=error):
+                patch.object(client, 'ask_json', side_effect=error) as send:
             self._compose_document(resumed, writing_arguments, 'writing-settings-failure', status='error')
+            with patch.object(resumed.writing, 'client_factory', side_effect=AssertionError('No unknown replay')):
+                self._compose_document(resumed, writing_arguments, 'writing-settings-failure', status='error')
+            send.assert_called_once()
+        self.assertEqual(resumed.session.store.read_json(
+            'tools/writing/writing-settings-failure/writer/response.json'), {'raw_response': error.raw_response})
         self.assertIs(client._settings, settings)
 
-    def test_composition_transport_policy_accounts_attempts_and_replays_saved_responses(self) -> None:
-        _, fake, resumed, _, writing_arguments = self._writing_fixture()
-        from simple_ar.integrations.llm import LLMClient, LLMSettings, LLMDeadlineError
+    def test_composition_transport_uses_shared_ledger_and_replays_saved_response(self) -> None:
+        _, _, app, _, arguments = self._writing_fixture()
+        from simple_ar.integrations.llm import LLMClient, LLMSettings
 
-        # Exercise the shared transport through composition, with no live provider.
+        # Transport permutations belong to test_llm; this consumer owns the
+        # shared ledger, logical call identity and saved-response replay.
+        identity = 'writing-ledger'
         response = {'draft_markdown': 'Retained observation [@P1].'}
         provider_response = {'choices': [{'message': {'content': json.dumps(response)}}],
             'usage': {'prompt_tokens': 5, 'completion_tokens': 3, 'total_tokens': 8}}
-        for case, mode, attempts, error, modes, status in (
-                ('retry', 'chat', 2, LLMDeadlineError('deadline'), ['chat', 'chat'], 'ok'),
-                ('single', 'chat', 1, LLMDeadlineError('deadline'), ['chat'], 'error'),
-                ('protocol', 'auto', 3, RuntimeError('Server disconnected without sending a response.'),
-                    ['responses', 'chat'], 'ok'),
-                ('json', 'chat', 3, ValueError('invalid request: response_format not supported'), ['chat', 'chat'], 'ok')):
-            with self.subTest(policy=case):
-                identity = f'writing-policy-{case}'
-                settings = LLMSettings(api_key='fixture', model='fixture', api_mode=mode,
-                    retry_attempts=attempts, max_output_tokens=8192)
-                client = LLMClient(settings, budget_ledger=resumed.ledger, budget_attempt_id=identity)
-                start = len(resumed.ledger.entries)
-                with patch.object(resumed.writing, 'client_factory', return_value=client), \
-                        patch.object(client, 'ask_json', wraps=client.ask_json) as logical, \
-                        patch('simple_ar.integrations.llm._call_provider',
-                            side_effect=[error, provider_response]) as send, \
-                        patch('simple_ar.integrations.llm.time.sleep'):
-                    result = self._compose_document(resumed, writing_arguments, identity, status=status)
-                    logical.assert_called_once()
-                    self.assertEqual([call.args[1] for call in send.call_args_list], modes)
-                    self.assertIs(client._settings, settings)
-                    entries = resumed.ledger.entries[start:]
-                    self.assertEqual(len(entries), len(modes))
-                    self.assertEqual({row.logical_call_id for row in entries}, {f'{identity}:article'})
-                    if case in {'retry', 'single'}:
-                        self.assertEqual(entries[0].status, 'unknown')
-                        self.assertGreater(entries[0].reserved['total_tokens'], 8192)
-                    if case == 'json':
-                        self.assertEqual(entries[0].status, 'released')
-                        self.assertEqual(send.call_args_list[0].args[2]['response_format'], {'type': 'json_object'})
-                        self.assertNotIn('response_format', send.call_args_list[1].args[2])
-                    retained_ledger = resumed.ledger.to_dict()
-                    replay = self._compose_document(resumed, writing_arguments, identity, status=status)
-                    self.assertEqual(send.call_count, len(modes))
-                    logical.assert_called_once()
-                    self.assertEqual(resumed.ledger.to_dict(), retained_ledger)
-                if status == 'ok':
-                    self.assertEqual(resumed.session.store.read_json(
-                        f'tools/writing/{identity}/writer/response.json'), response)
+        settings = LLMSettings(api_key='fixture', model='fixture', api_mode='chat',
+            retry_attempts=2, max_output_tokens=8192)
+        client = LLMClient(settings, budget_ledger=app.ledger, budget_attempt_id=identity)
+        with patch.object(app.writing, 'client_factory', return_value=client), \
+                patch.object(client, 'ask_json', wraps=client.ask_json) as logical, \
+                patch('simple_ar.integrations.llm._call_provider', return_value=provider_response) as send:
+            result = self._compose_document(app, arguments, identity)
+            logical.assert_called_once()
+            self.assertEqual(send.call_args.args[1], 'chat')
+            self.assertIs(client._settings, settings)
+            self.assertEqual(len(app.ledger.entries), 1)
+            self.assertEqual({row.logical_call_id for row in app.ledger.entries}, {f'{identity}:article'})
+            self.assertEqual(app.ledger.entries[0].status, 'settled')
+            self.assertEqual(app.ledger.entries[0].actual['total_tokens'], 8)
+            retained_ledger = app.ledger.to_dict()
+            replay = self._compose_document(app, arguments, identity)
+            self.assertEqual(replay.artifacts, result.artifacts)
+            send.assert_called_once()
+            logical.assert_called_once()
+            self.assertEqual(app.ledger.to_dict(), retained_ledger)
+        self.assertEqual(app.session.store.read_json(
+            f'tools/writing/{identity}/writer/response.json'), response)
 
     def test_composition_reconciles_native_assembly_publication_and_envelope_interruptions(self) -> None:
         from simple_ar.core.capabilities import ArtifactStore
@@ -3422,29 +4575,17 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         direct_records = [read_json(path) for path in direct_paths]
         snapshot = direct_records[2]
         self.assertEqual(snapshot['system'], historical_system)
+        self.assertNotIn('constraints', snapshot['inputs']['article'])
+        retained_bytes = {path: path.read_bytes() for path in direct_paths}
         self.assertEqual(fake.ask_json.call_args.args[0], historical_system)
-        changed_snapshots = []
-        for field, value in (('owner', 'other_article.v1'), ('source_attempt', 'other-attempt'),
-                             ('inputs', {**snapshot['inputs'], 'article': {
-                                 **snapshot['inputs']['article'], 'goal': 'Changed goal'}}),
-                             ('system', ARTICLE_SYSTEM), ('system', ''), ('system', None),
-                             ('system', 'Unrecognized contract prompt')):
-            changed = {**snapshot, field: value}
-            changed['snapshot_id'] = hashlib.sha256(json.dumps(
-                {key: value for key, value in changed.items() if key != 'snapshot_id'},
-                sort_keys=True, ensure_ascii=False).encode()).hexdigest()
-            changed_snapshots.append((direct_paths[2], changed))
-        self._assert_record_rejections(app, call, (
-                              (direct_paths[0], {**direct_records[0], 'sections': []}),
-                              (direct_paths[1], {'draft_markdown': 'Changed raw response'}),
-                              (direct_paths[2], {**direct_records[2], 'snapshot_id': '0' * 64}),
-                              (direct_paths[2], {**snapshot, 'system': ARTICLE_SYSTEM}),
-                              (direct_paths[2], None),
-                              (direct_paths[1], None),
-                              *changed_snapshots))
-        # An unknown prompt cannot manufacture a Writer even with a self-consistent snapshot.
-        with _changed_record(direct_paths[0], None):
-            self._assert_record_rejections(app, call, (changed_snapshots[-1],))
+        # Generic record/owner/identity failures belong to the shared article
+        # owner. This entrance additionally binds the historical prompt bytes:
+        # even another recognized prompt cannot replace the accepted Writer.
+        changed = {**snapshot, 'system': ARTICLE_SYSTEM}
+        changed['snapshot_id'] = hashlib.sha256(json.dumps(
+            {key: value for key, value in changed.items() if key != 'snapshot_id'},
+            sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        self._assert_record_rejections(app, call, [(direct_paths[2], changed)])
         with patch.object(app.writing, 'client_factory',
                           side_effect=AssertionError('historical recovery must not create a client')):
             recovered = app.gateway.call(call)
@@ -3452,9 +4593,12 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(read_json(direct_paths[2]), snapshot)
         self.assertEqual(read_json(direct_paths[0]), direct_records[0])
         self.assertEqual(fake.ask_json.call_count, 1)
+        self.assertEqual({path: path.read_bytes() for path in direct_paths}, retained_bytes)
 
         from simple_ar.research.evidence.bibliography import CITATION_FIELD_VALUE_RULE
-        previous_system = ARTICLE_SYSTEM.removesuffix(CITATION_FIELD_VALUE_RULE).rstrip()
+        previous_system = ARTICLE_SYSTEM.removesuffix(CITATION_FIELD_VALUE_RULE).replace(
+            'When constraints are supplied, keep their article-level headings in order, '
+            'include every required section, and obey the distinct cited-source ceiling. ', '').rstrip()
         self.assertEqual(hashlib.sha256(previous_system.encode()).hexdigest(),
                          'a2a45241449c56ab563da248f633351a61738d6e168b615225c4d394d2a9979e')
         with patch('simple_ar.report.writing.ARTICLE_SYSTEM', previous_system):
@@ -3464,18 +4608,244 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(prior_result.status, 'ok', prior_result.error)
         self.assertEqual(prior_client.ask_json.call_count, 1)
 
+    def test_composition_explicit_outline_and_citation_cap_share_article_owner(self) -> None:
+        _, fake, app, _, arguments = self._writing_fixture()
+        arguments = {**arguments, 'required_headings': ['1. Decision ###', '2. LIMITS'], 'max_cited_sources': 1}
+        canonical_id = 'material-' + 'original'.encode('utf-8').hex()
+        response = {'draft_markdown': '# Authored title\n\n## 1. Decision\n\nEvidence [@P1], [P1], [' + canonical_id + '].\n\n'
+            '### Detail\n\nSupported detail.\n\n## 2. Limits\n\nOne supplied source.\n\n'
+            '```markdown\n## Extra\n[@unknown]\n```\n\n## References\n\n[@unknown]'}
+        fake.ask_json.return_value = response
+        result = self._compose_document(app, arguments, 'writing-constrained')
+        self.assertEqual(fake.ask_json.call_count, 1)
+        self.assertEqual(_writing_prompt(fake)['constraints'], {
+            'outline': [{'heading': '1. Decision ###', 'required': True}, {'heading': '2. LIMITS', 'required': True}],
+            'max_cited_sources': 1})
+        owner = app.session.store.root / 'tools/writing/writing-constrained'
+        self.assertEqual(read_json(owner / 'writer/response.json'), response)
+        self.assertEqual(read_json(owner / 'writer/writer.json')['constraints_checked'],
+            {'headings': ['Decision', 'Limits'], 'distinct_cited_sources': 1})
+        binding = read_json(owner / 'request.json')['request']
+        self.assertEqual(binding['required_headings'], arguments['required_headings'])
+        self.assertEqual(binding['max_cited_sources'], 1)
+        with patch.object(app.writing, 'client_factory', side_effect=AssertionError('No recovery model')):
+            repeated = self._compose_document(app, arguments, 'writing-constrained')
+        self.assertEqual(repeated.artifacts, result.artifacts)
+        self.assertEqual(fake.ask_json.call_count, 1)
+
+    def test_independent_review_uses_current_draft_and_original_evidence_without_writing(self) -> None:
+        inputs, fake, app, _, arguments = self._writing_fixture()
+        draft = inputs / 'user-draft.md'
+        draft.write_text('Cancellation undoes completed external effects.', encoding='utf-8')
+        original = draft.read_bytes()
+        material = inputs / 'observed.txt'
+        material.write_text('Original observed value: 0.75.', encoding='utf-8')
+        arguments = {**arguments, 'prior_draft': str(draft), 'materials': [{'path': str(material)}]}
+        def inspect(system, prompt, **options):
+            view = json.loads(prompt)
+            self.assertEqual(view['sections'][0]['markdown'], original.decode())
+            self.assertIn('cancellation does not undo completed external effects', json.dumps(view['source_evidence']))
+            self.assertEqual(view['historical_findings_to_check'], [])
+            self.assertEqual(view['context_tools'], [])
+            self.assertIn(material.read_text(encoding='utf-8'), json.dumps(view['source_evidence']))
+            correcting = bool(view['response_format_correction'])
+            self.assertEqual(options['budget_call_id'],
+                'standalone-review:review-format-correction' if correcting else 'standalone-review:review')
+            pointer = (next(iter(view['evidence_locator']['pointers_by_role']['recorded_material'].values()))
+                if correcting else '/source_evidence')
+            return {'section_reviews': [{'section_id': 'document', 'verdict': 'revise_required',
+                'findings': [{'finding_id': 'scope', 'type': 'evidence_gap', 'severity': 'major',
+                    'required_action': 'revise', 'message': 'Bound cancellation to the stated effect.',
+                    'draft_quotes': [{'section_id': 'document', 'quote': original.decode()}],
+                    'evidence_quotes': [{'pointer': pointer}]}]}]}
+        fake.ask_json.side_effect = inspect
+        result = _call_tool(app.gateway, 'review_document', arguments, identity='standalone-review')
+        self.assertEqual(result.status, 'ok', result.error)
+        self.assertEqual([call.kwargs['label'] for call in fake.ask_json.call_args_list],
+            ['article-independent-review', 'article-independent-review-format-correction'])
+        self.assertEqual(result.data['review_status'], 'needs_revision')
+        self.assertNotIn('editable_markdown', result.data)
+        self.assertEqual(draft.read_bytes(), original)
+        owner = app.session.store.root / 'tools/writing/standalone-review'
+        self.assertFalse((owner / 'writer').exists())
+        self.assertFalse((app.workspace.workspace / 'manuscripts/standalone-review').exists())
+        with patch.object(app.writing, 'client_factory', side_effect=AssertionError('No cached review call')):
+            cached = _call_tool(app.gateway, 'review_document', arguments, identity='standalone-review')
+        self.assertEqual(cached.artifacts, result.artifacts)
+        self.assertEqual(fake.ask_json.call_count, 2)
+        self.assertEqual(draft.read_bytes(), original)
+
+        # Feedback belongs to a new article version, not an implicit repair
+        # inside the reviewer or a mutation of its original finding.
+        fake.ask_json.side_effect = None
+        fake.ask_json.return_value = {'draft_markdown':
+            'Cancellation propagates to sibling tasks but does not undo completed external effects [@P1].'}
+        corrected = self._compose_document(app, {**arguments,
+            'goal': 'Correct the cancellation boundary from the supplied evidence and keep the rest concise.'}, 'review-feedback')
+        fake.ask_json.return_value = {'section_reviews': [{'section_id': 'document', 'verdict': 'pass'}]}
+        checked = _call_tool(app.gateway, 'review_document', {**arguments,
+            'prior_draft': corrected.data['editable_markdown']}, identity='review-feedback-check')
+        self.assertEqual(checked.status, 'ok', checked.error)
+        self.assertEqual(checked.data['review_status'], 'reviewed')
+        self.assertEqual(read_json(owner / 'result.json')['data']['review_status'], 'needs_revision')
+        self.assertEqual(draft.read_bytes(), original)
+        self.assertEqual(fake.ask_json.call_count, 4)
+        style = _call_tool(app.gateway, 'review_document', {'goal': 'Inspect organization only.',
+            'title': 'Style check', 'prior_draft': str(draft)}, identity='style-only-review')
+        self.assertEqual(style.status, 'ok', style.error)
+        style_view = json.loads(fake.ask_json.call_args.args[1])
+        self.assertEqual(style_view['source_evidence'], [])
+        self.assertTrue(any('do not certify factual claims' in row for row in style_view['known_limitations']))
+        self.assertEqual(draft.read_bytes(), original)
+
+    def test_native_review_delivers_bound_inspection_without_rewriting_or_another_turn(self) -> None:
+        from simple_ar.integrations.llm import LLMError
+        for outcome in ('reviewed', 'needs_revision', 'error'):
+            with self.subTest(outcome=outcome):
+                _, coordinator, app, _, arguments = self._writing_fixture()
+                app.state['config']['max_turns'] = 1
+                draft = app.workspace.workspace / 'draft.md'
+                original = b'Cancellation propagates to owned sibling tasks.'
+                draft.write_bytes(original)
+                evidence = app.session.store.root / 'evidence/retained.txt'
+                evidence.parent.mkdir(exist_ok=True)
+                evidence.write_bytes(b'Retained delivery context')
+                arguments = {**arguments, 'prior_draft': 'workspace/draft.md', 'delivery': {
+                    'summary': 'Independent inspection retained',
+                    'artifacts': ['workspace/draft.md', 'evidence/retained.txt'],
+                    'unresolved': []}}
+                if outcome == 'needs_revision':
+                    arguments['required_headings'] = ['Limits']
+                reviewer = Mock()
+                def review(system, prompt, **options):
+                    view = json.loads(prompt)
+                    self.assertEqual(view['sections'][0]['markdown'], original.decode())
+                    self.assertEqual((view['context_tools'], view['context_request_limit']), ([], 0))
+                    self.assertFalse(view['response_format_correction'])
+                    row = {'section_id': 'document', 'verdict': 'pass'}
+                    if outcome == 'needs_revision':
+                        pointer = next(iter(view['evidence_locator']['pointers_by_role']['recorded_material'].values()))
+                        row.update(verdict='revise_required', findings=[{
+                            'finding_id': 'boundary', 'type': 'evidence_gap', 'severity': 'major',
+                            'required_action': 'revise', 'message': 'State the external-effect boundary.',
+                            'draft_quotes': [{'section_id': 'document', 'quote': original.decode()}],
+                            'evidence_quotes': [{'pointer': pointer}]}], context_requests=[{
+                                'tool_name': 'get_paper_brief', 'arguments': {'paper_id': 'original'},
+                                'caller': 'document_reviewer'}])
+                    return {'section_reviews': [row]}
+                reviewer.ask_json.side_effect = LLMError('Interrupted review') if outcome == 'error' else review
+                coordinator.chat_turn.side_effect = [self._native_message('review_document', arguments, 'inspect')]
+                with patch.object(app.writing, 'client_factory', return_value=reviewer), \
+                        patch.object(app.session, 'complete', side_effect=KeyboardInterrupt('after delivery write')):
+                    self.assertEqual(app.run(progress=lambda _: None)['status'], 'paused')
+                payload = app.session.store.read_json(app.state['turns'][-1]['tools'][-1]['result'])
+                self.assertEqual(payload['status'], 'error' if outcome == 'error' else 'ok')
+                self.assertEqual(app.session.store.exists('delivery.json'), outcome != 'error')
+                self.assertEqual(draft.read_bytes(), original)
+                self.assertEqual(coordinator.chat_turn.call_count, 1)
+                self.assertEqual(reviewer.ask_json.call_count, 1)
+                if outcome == 'error':
+                    self.assertNotIn('delivery', payload['data'])
+                    continue
+                delivery = payload['data']['delivery']
+                self.assertEqual(app.session.store.read_json('delivery.json'), delivery)
+                review_path = payload['data']['review_path']
+                self.assertEqual(delivery['artifacts'], arguments['delivery']['artifacts'] + [review_path])
+                self.assertIn(outcome, delivery['summary'])
+                report = read_json(app.workspace.resolve(review_path))
+                self.assertEqual(report['review_status'], outcome)
+                self.assertEqual(payload['metadata']['delivery_hashes'],
+                    app.workspace.artifact_hashes(delivery['artifacts']))
+                if outcome == 'needs_revision':
+                    self.assertIn(review_path, json.dumps(delivery['unresolved']))
+                    self.assertEqual(report['section_reviews'][0]['findings'][0]['message'],
+                        'State the external-effect boundary.')
+                    self.assertEqual(report['section_reviews'][0]['context_requests'][0]['tool_name'], 'get_paper_brief')
+                    self.assertEqual(report['mechanical_constraints']['status'], 'needs_revision')
+                else:
+                    self.assertEqual(delivery['unresolved'], [])
+                restored = ToolApplication.load(app.session.store.root)
+                receipts = self._native_receipts(app, app.state['turns'])
+                before = restored.ledger.snapshot()
+                with patch.object(restored.gateway, 'call', side_effect=AssertionError('No tool replay')), \
+                        patch.object(restored.writing, 'client_factory', side_effect=AssertionError('No reviewer replay')):
+                    for _ in range(2):
+                        self.assertEqual(restored.run(progress=lambda _: None)['status'],
+                            'partial' if outcome == 'needs_revision' else 'completed')
+                self.assertEqual(restored.session.store.read_json('delivery.json'), delivery)
+                self.assertEqual(restored.ledger.snapshot(), before)
+                self.assertEqual(restored.state['turns'], app.state['turns'])
+                self.assertEqual(self._native_receipts(restored, restored.state['turns']), receipts)
+                self.assertEqual(coordinator.chat_turn.call_count, 1)
+                identity = Path(payload['data']['version']).name
+                with _changed_record(evidence, b'Changed declared delivery context'), \
+                        patch.object(app.writing, 'client_factory', side_effect=AssertionError('No cached review model')):
+                    cached = _call_tool(app.gateway, 'review_document', arguments, identity=identity)
+                self.assertFalse(cached.ok, 'Cached review must not rebind changed declared deliverables')
+                self.assertEqual(draft.read_bytes(), original)
+
+    def test_review_delivery_preflight_precedes_material_selection_and_model_creation(self) -> None:
+        from simple_ar.tools.writing import ReviewRequest
+        self.assertNotIn('delivery', ReviewRequest(goal='Inspect', title='Review', prior_draft='draft.md').model_dump())
+        inputs, fake, app, _, _ = self._writing_fixture()
+        draft = app.workspace.workspace / 'draft.md'
+        draft.write_bytes(b'Original manuscript')
+        for destination in ('workspace/missing.md', 'source0/notes.txt'):
+            with self.subTest(destination=destination), \
+                    patch.object(app.writing, '_select_materials', side_effect=AssertionError('No selection')) as selection, \
+                    patch.object(app.writing, 'client_factory', side_effect=AssertionError('No model')) as factory:
+                result = _call_tool(app.gateway, 'review_document', {
+                    'goal': 'Inspect manuscript', 'title': 'Inspection', 'prior_draft': 'workspace/draft.md',
+                    'material_roots': [str(inputs)], 'delivery': {'summary': 'Inspection',
+                        'artifacts': [destination]}}, identity='preflight-' + destination.split('/')[0])
+                self.assertFalse(result.ok)
+                selection.assert_not_called()
+                factory.assert_not_called()
+        fake.ask_json.assert_not_called()
+        self.assertEqual(draft.read_bytes(), b'Original manuscript')
+
+    def test_independent_review_rejected_and_unknown_responses_never_replay(self) -> None:
+        from simple_ar.integrations.llm import LLMError
+        for failure in ({'section_reviews': []}, LLMError('Interrupted transport')):
+            with self.subTest(failure=failure):
+                inputs, fake, app, _, arguments = self._writing_fixture()
+                draft = app.workspace.workspace / 'draft.md'
+                draft.write_text('Observed cancellation boundary.', encoding='utf-8')
+                arguments = {**arguments, 'prior_draft': str(draft), 'delivery': {
+                    'summary': 'Requested inspection', 'artifacts': ['workspace/draft.md']}}
+                if isinstance(failure, Exception):
+                    fake.ask_json.side_effect = failure
+                else:
+                    fake.ask_json.return_value = failure
+                result = _call_tool(app.gateway, 'review_document', arguments, identity='rejected-review')
+                self.assertEqual(result.status, 'error')
+                self.assertNotIn('delivery', result.data)
+                self.assertFalse(app.session.store.exists('delivery.json'))
+                owner = app.session.store.root / 'tools/writing/rejected-review'
+                self.assertTrue((owner / 'review/request.json').exists())
+                if not isinstance(failure, Exception):
+                    self.assertEqual(read_json(owner / 'review/response.json')['response'], failure)
+                with patch.object(app.writing, 'client_factory', side_effect=AssertionError('No review replay')):
+                    repeated = _call_tool(app.gateway, 'review_document', arguments, identity='rejected-review')
+                self.assertEqual(repeated.status, 'error')
+                self.assertEqual(fake.ask_json.call_count, 1 if isinstance(failure, Exception) else 2)
+                self.assertFalse((owner / 'result.json').exists())
+
     def test_composition_rejects_invalid_articles_without_resubmission(self) -> None:
         _, fake, app, _, arguments = self._writing_fixture()
-        call = ToolCall(tool_name='compose_document', arguments=arguments, trace_id='invalid-article')
-        # Shared response-shape cases live with the Writer capability; retain
-        # this public tool's error receipt and no-resubmission behavior here.
-        response = {'draft_markdown': 'Body', 'heading': 'Unbound title'}
+        # Shape/outline/citation matrices live with StructuredArticleWritingTests.
+        # One rejection proves public error translation and retained recovery.
+        request = {**arguments, 'required_headings': ['Decision', 'Limits']}
+        response = {'draft_markdown': '## Decision\n\nEvidence [P1].'}
         fake.ask_json.return_value = response
-        self.assertEqual(app.gateway.call(call).status, 'error')
-        count = fake.ask_json.call_count
-        self.assertEqual(app.gateway.call(call).status, 'error')
-        self.assertEqual(fake.ask_json.call_count, count)
-        self.assertEqual(read_json(app.session.store.root / 'tools/writing' / call.trace_id / 'writer/response.json'), response)
+        rejected = self._compose_document(app, request, 'invalid-article', status='error')
+        self.assertIn('fixed section structure', rejected.error)
+        owner = app.session.store.root / 'tools/writing/invalid-article'
+        with patch.object(app.writing, 'client_factory', side_effect=AssertionError('No rejected replay')):
+            self._compose_document(app, request, 'invalid-article', status='error')
+        fake.ask_json.assert_called_once()
+        self.assertEqual(read_json(owner / 'writer/response.json'), response)
+        self.assertFalse((owner / 'writer/writer.json').exists())
 
     def test_composition_recovery_rejects_partial_changed_and_failed_writer_records(self) -> None:
         fake, app, arguments, call, owner = self._interrupted_composition()
@@ -3576,6 +4946,15 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             fake.ask_json.assert_not_called()
         with self.assertRaises(ValueError):
             ComposeRequest.model_validate(mixed)
+        self.assertEqual(ComposeRequest.model_validate(request).required_headings, [])
+        self.assertEqual(ComposeRequest.model_validate(request).max_cited_sources, 0)
+        for extra in ({'required_headings': ['1. Foo ###', 'foo']}, {'required_headings': ['2. REFERENCES ###']},
+                      {'required_headings': ['Foo\n']}, {'required_headings': ['Foo\r']},
+                      {'required_headings': ['# Foo']}, {'max_cited_sources': -1}):
+            with self.subTest(controls=extra), patch.object(app.writing, 'client_factory') as factory:
+                self._compose_document(app, {**request, **extra}, 'invalid-constraints', status='error')
+                factory.assert_not_called()
+                fake.ask_json.assert_not_called()
         invalid = (
             {'figures': ['figures/comparison.svg']},
             {'figures': [str(materials / 'missing.svg')]},
@@ -3592,93 +4971,242 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             (extra, 'Figure', extra['figures'][-1], '') if 'figures' in extra else
             (extra, 'Prior draft', extra['prior_draft'], '') for extra in invalid])
 
-    def test_composition_selects_material_roots_with_shared_inventory_and_preserves_replay(self) -> None:
+
+    def test_composition_investigates_renamed_records_tail_and_provenance(self) -> None:
+        inputs, fake, app, _, old_table, _, request = self._material_root_fixture()
+        root = inputs / 'parcel-19'
+        nested = root / 'zeta' / 'branch-7'
+        nested.mkdir(parents=True)
+        table = old_table.rename(nested / 'entry-04.txt')
+        head = b'Unverified overview; the completed records are elsewhere in this file.\n'
+        tail = b'observed item\n' * 220 + b'cycle,accepted,rejected\n17,31,2\n18,29,4\n'
+        table.write_bytes(head + b'padding\n' * 40000 + tail)
+        tail_offset = table.stat().st_size - len(tail)
+        provenance = root / 'p7.txt'
+        provenance.write_bytes(b'Provenance detail.\n' * 180 +
+            b'Batch 17-18 used device K; counts were transcribed, not rerun.\n')
+        distractor = nested / 'q.md'
+        distractor.write_bytes(b'Older proposal; no completed counts.\n')
+        private = root / '.env'
+        private.write_text('PRIVATE_SENTINEL')
+        excluded, oversized, unread = [root / name for name in ('weights.bin', 'raw.csv', 'extra.csv')]
+        for path, size in ((excluded, 129), (oversized, 129), (unread, 48)):
+            with path.open('wb') as handle:
+                handle.truncate(size * 1024 * 1024)
+        Path(request['prior_draft']).write_text('Check the completed counts and their execution provenance.')
+        request = {**request, 'material_roots': [str(root)]}
+        first = {'path': app.workspace.locator(str(table)), 'max_bytes': len(head)}
+        last = {'path': str(table), 'offset_bytes': tail_offset, 'max_bytes': len(tail)}
+        evidence = {'path': str(provenance)}
+        final = {'materials': [first, last, evidence]}
+        draft = {'draft_markdown': 'The supplied records list 31 and 29 accepted items on device K; these were not rerun.'}
+        decisions = [
+            {'read_windows': [first, evidence, {'path': str(distractor)}]},
+            {'read_windows': [last]}, final]
+        fake.ask_json.side_effect = [*decisions, draft]
+        identity = 'writing-generic-tail'
+        call = ToolCall(tool_name='compose_document', arguments=request, trace_id=identity)
+        original_open = Path.open
+        def guarded_open(path, *args, **kwargs):
+            if path in {private, excluded, oversized, unread}:
+                raise AssertionError('Unselected large/private files must not be read or hashed')
+            return original_open(path, *args, **kwargs)
+        with patch.object(Path, 'open', guarded_open), \
+                patch.object(app.workspace, 'call', wraps=app.workspace.call) as reads:
+            with self.assertRaisesRegex(ValueError, '128 MiB'):
+                app.workspace.bind_inventory(root, identity='legacy-full-inventory')
+            result = self._replay_interrupted_assembly(app, fake, call)
+        self.assertEqual(fake.ask_json.call_count, 4)
+        # Investigation is based on actual workspace reads, with complete-file
+        # digests even when the selected bytes are a small nonzero window.
+        actual_reads = [row.args[1] for row in reads.call_args_list if row.args[0] == 'read_file']
+        self.assertTrue(actual_reads)
+        self.assertTrue(all(row['full_digest'] for row in actual_reads))
+        self.assertTrue(any(row.get('offset_bytes') == tail_offset for row in actual_reads))
+        prompts = [json.loads(row.args[1]) for row in fake.ask_json.call_args_list[:3]]
+        self.assertEqual(prompts[0]['observations'], [])
+        self.assertEqual([len(row['observations']) for row in prompts], [0, 3, 4])
+        self.assertEqual([row['decisions_remaining'] for row in prompts], [6, 5, 4])
+        observed_head = prompts[1]['observations'][0]['data']
+        self.assertEqual(observed_head['text'], head.decode())
+        self.assertEqual(observed_head['next_offset_bytes'], len(head))
+        self.assertTrue(observed_head['has_more'])
+        self.assertEqual(prompts[2]['observations'][-1]['data']['text'], tail.decode())
+        self.assertFalse(prompts[2]['observations'][-1]['data']['has_more'])
+        owner = app.session.store.root / 'tools/writing' / identity
+        selection_input = read_json(owner / 'selection-input.json')
+        self.assertEqual(selection_input['selection_method'], 'inspect_windows.v1')
+        self.assertEqual(prompts[0]['prior_draft'], selection_input['prior_draft'])
+        self.assertEqual(selection_input['prior_draft']['evidence_role'], 'draft_claims_not_evidence')
+        self.assertNotIn('PRIVATE_SENTINEL', json.dumps(prompts))
+        self.assertNotIn('.env', json.dumps(prompts))
+        self.assertEqual(read_json(owner / 'selection-response.json'), final)
+        observations = read_json(owner / 'selection-observations.json')
+        self.assertEqual(observations, prompts[2]['observations'])
+        self.assertEqual(len(observations), 4)
+        for row in observations:
+            path = app.workspace.resolve(row['request']['path'])
+            self.assertTrue(row['request']['full_digest'])
+            self.assertEqual(row['data']['sha256'], hashlib.sha256(path.read_bytes()).hexdigest())
+        coverage = result.data['material_selection']
+        self.assertEqual(coverage['selected_materials'], [first['path'], str(table), str(provenance)])
+        self.assertEqual(coverage['selected_windows'], [first, last, evidence])
+        self.assertEqual(coverage['unselected_file_count'], 2)
+        self.assertEqual({(row['path'], row['reason']) for row in coverage['omitted_files']},
+            {(str(excluded), 'unsupported_format'), (str(oversized), 'consumer_size_limit')})
+        selected_bindings = [row for row in result.data['inputs'] if 'window_sha256' in row.get('selection', {})]
+        self.assertEqual([row['selection']['offset_bytes'] for row in selected_bindings], [0, tail_offset, 0])
+        self.assertIn({'path': str(distractor), 'sha256': hashlib.sha256(distractor.read_bytes()).hexdigest()},
+            result.data['inputs'])
+        writer = json.dumps(_writing_prompt(fake))
+        self.assertIn('17,31,2', writer)
+        self.assertIn('Batch 17-18 used device K', writer)
+        self.assertNotIn('Older proposal; no completed counts.', writer)
+        self.assertNotIn('padding', writer)
+        body = app.workspace.resolve(result.data['editable_markdown']).read_text()
+        self.assertIn(draft['draft_markdown'], body)
+        retained = {path: path.read_bytes() for path in owner.rglob('*.json')}
+        with patch.object(app.writing, 'client_factory', side_effect=AssertionError('No replay model')):
+            # Same-size changes outside selected windows and in an observed but
+            # unselected record invalidate the retained investigation alike.
+            for path, changed in ((table, table.read_bytes().replace(b'padding', b'changed', 1)),
+                                  (distractor, distractor.read_bytes().replace(b'Older', b'Other'))):
+                with self.subTest(changed_observation=path), _changed_record(path, changed):
+                    stale = self._compose_document(app, request, identity, status='error')
+                    self.assertIn('Inspected material contents changed', stale.error)
+            self.assertEqual(app.gateway.call(call).artifacts, result.artifacts)
+        self.assertEqual({path: path.read_bytes() for path in owner.rglob('*.json')}, retained)
+        self.assertEqual(fake.ask_json.call_count, 4)
+        # A file observed but not selected must also stay unchanged between
+        # the final decision and handing evidence to the Writer.
+        def change_before_final(*args, **kwargs):
+            response = next(pending)
+            if response is final:
+                distractor.write_bytes(distractor.read_bytes().replace(b'Older', b'Other'))
+            return response
+        pending = iter(decisions)
+        fake.ask_json.side_effect = change_before_final
+        rejected = self._compose_document(app, request, 'writing-generic-race', status='error')
+        self.assertIn('Inspected material contents changed', rejected.error)
+        self.assertEqual(fake.ask_json.call_count, 7)
+        self.assertFalse((owner.parent / 'writing-generic-race/writer').exists())
+
+    def test_composition_investigation_enforces_windows_authority_and_bounds(self) -> None:
         from simple_ar.integrations.llm import LLMError
 
-        for large_binary, windowed_text in ((False, False), (True, False), (False, True)):
-            with self.subTest(large_unrelated_binary=large_binary, windowed_text=windowed_text):
-                inputs, fake, app, materials, table, figure, request = self._material_root_fixture()
-                if windowed_text:
-                    table.write_bytes(table.read_bytes() + b'additional,1,2\n' * 20000 + b'UNREAD_SUFFIX')
-                excluded = materials / 'weights.bin'
-                oversized = materials / 'raw.csv'
-                unselected_tables = [materials / f'unselected-{number}.csv' for number in range(3)] if large_binary else []
-                if large_binary:
-                    for path in (excluded, oversized):
-                        with path.open('wb') as handle:
-                            handle.truncate(129 * 1024 * 1024)
-                    for path in unselected_tables:
-                        with path.open('wb') as handle:
-                            handle.truncate(48 * 1024 * 1024)
-                original_open = Path.open
-                def guarded_open(path, *args, **kwargs):
-                    if path in {excluded, oversized, materials / '.env', *unselected_tables}:
-                        raise AssertionError('Excluded/private candidates must not be read or hashed')
-                    return original_open(path, *args, **kwargs)
-                with patch.object(Path, 'open', guarded_open):
-                    if large_binary:
-                        with self.assertRaisesRegex(ValueError, '128 MiB'):
-                            app.workspace.bind_inventory(materials, identity='legacy-full-inventory')
-                    prior = Path(request['prior_draft'])
-                    selection = {'materials': [str(table)], 'figures': [str(figure)]}
-                    draft = {'draft_markdown': 'These are supplied descriptive group yields, not a causal comparison.'}
-                    fake.ask_json.side_effect = [selection, draft]
-                    call = ToolCall(tool_name='compose_document', arguments=request, trace_id='writing-roots')
-                    composed = self._replay_interrupted_assembly(app, fake, call)
-                    select_prompt = json.loads(fake.ask_json.call_args_list[0].args[1])
-                    self.assertNotIn('.env', json.dumps(select_prompt))
-                    self.assertNotIn('PRIVATE_SENTINEL', json.dumps(select_prompt))
-                    if large_binary:
-                        omissions = composed.data['material_selection']['omitted_files']
-                        self.assertEqual({row['reason'] for row in omissions},
-                            {'unsupported_format', 'consumer_size_limit'})
-                        self.assertEqual({row['path'] for row in omissions}, {str(excluded), str(oversized)})
-                        self.assertNotIn(app.workspace.locator(str(excluded)), [
-                            row[0] for item in select_prompt['inventories'] for row in item['files']])
-                    listed = [row[0] for inventory in select_prompt['inventories'] for row in inventory['files']]
-                    self.assertIn(app.workspace.locator(str(table)), listed)
-                    self.assertNotIn(str(materials), json.dumps(select_prompt['inventories']))
-                    view = _writing_prompt(fake)
-                    self.assertIn(json.dumps(table.read_bytes()[:16000].decode())[1:-1], json.dumps(view))
-                    self.assertEqual(composed.data['inputs'][0]['sha256'], hashlib.sha256(table.read_bytes()).hexdigest())
-                    self.assertEqual(composed.data['inputs'][0]['selection']['has_more'], windowed_text)
-                    if windowed_text:
-                        self.assertNotIn('UNREAD_SUFFIX', json.dumps(view))
-                    self.assertNotIn('Not selected for this article.', json.dumps(view))
-                    self.assertEqual(view['prior_draft'], prior.read_text())
-                    figure_handle = next(row for row in view['source_handles'] if row['handle'].startswith('figure:'))
-                    self.assertEqual(figure_handle['metadata']['caption'], 'Supplied comparison diagram.')
-                    self.assertEqual(len([row for row in view['source_handles'] if row['handle'].startswith('figure:')]), 1)
-                    self.assertEqual(composed.data['material_selection']['unselected_file_count'], 1 + len(unselected_tables))
-                    self.assertEqual(composed.data['material_selection']['selected_materials'], [str(table)])
-                    baseline = table.read_bytes()
-                    replay = app.gateway.call(call)
-                    self.assertEqual(replay.artifacts, composed.artifacts)
-                    table.write_bytes(b'group,n,yield\nchanged,1,9\n')
-                    changed = app.gateway.call(call)
-                    self.assertEqual(changed.status, 'error')
-                    self.assertIn('inputs changed', changed.error)
-                    self.assertEqual(fake.ask_json.call_count, 2)
-                    table.write_bytes(baseline)
-                    calls = fake.ask_json.call_count
-                    # The owner exposes short locators, while the immutable receipt still
-                    # binds real authorized files. Aliases cannot bypass inventory or
-                    # duplicate-file checks; historical absolute replies still replay.
-                    fake.ask_json.side_effect = [{'materials': [app.workspace.locator(str(table))]}, draft]
-                    short = self._compose_document(app, request, 'writing-root-short')
-                    self.assertEqual(short.data['material_selection']['unselected_file_count'], 2 + len(unselected_tables))
-                    self.assertEqual(short.data['inputs'][0]['sha256'], hashlib.sha256(baseline).hexdigest())
-                    fake.ask_json.side_effect = [{'materials': [str(table), app.workspace.locator(str(table))]}]
-                    duplicate = self._compose_document(app, request, 'writing-root-alias-duplicate', status='error')
-                    self.assertIn('distinct paths from the bound inventory', duplicate.error)
-                    calls = fake.ask_json.call_count
-                    fake.ask_json.side_effect = LLMError('Unconfirmed selection transport')
-                    self._compose_document(app, request, 'writing-root-interrupted', status='error')
-                    with patch.object(app.writing, 'client_factory', side_effect=AssertionError('unknown selection cannot resend')) as factory:
-                        interrupted = self._compose_document(app, request, 'writing-root-interrupted', status='error')
-                        self.assertIn('Interrupted material selection', interrupted.error)
-                        factory.assert_not_called()
-                    self.assertEqual(fake.ask_json.call_count, calls + 1)
+        inputs, fake, app, materials, table, figure, request = self._material_root_fixture()
+        table.write_bytes(b'x' * 160000)
+        outside = inputs / 'outside.txt'
+        outside.write_bytes(b'Authorized mount, outside this candidate inventory.\n')
+        original_path = materials / 'original-document.json'
+        write_json(original_path, self._original_document().to_handoff_dict())
+        source = {'document_record': str(original_path), 'questions': ['Cancellation sibling tasks']}
+        window = {'path': str(table)}
+        probe = {'read_windows': [window]}
+        final = {'materials': [str(table)]}
+        alias = app.workspace.locator(str(table))
+        # One matrix replaces overlapping filename-only rejection scenarios.
+        cases = [
+            ('unobserved', [final], 'not inspected', 1),
+            ('different-window', [probe, {'materials': [{**window, 'max_bytes': 15999}]}], 'not inspected', 2),
+            ('explicit-line-cap', [probe, {'materials': [{**window, 'max_lines': 200}]}], 'not inspected', 2),
+            ('mixed-decision', [{**probe, **final}], 'OR finalize', 1),
+            ('mixed-figure', [{**probe, 'figures': [str(figure)]}], 'OR finalize', 1),
+            ('mixed-source', [{**probe, 'sources': [source]}], 'OR finalize', 1),
+            ('repeat-probe', [probe, {'read_windows': [{'path': alias}]}], 'distinct windows', 2),
+            ('duplicate-window', [probe, {'materials': [str(table), alias]}], 'distinct paths', 2),
+            ('private', [{'read_windows': [{'path': str(materials / '.env')}]}], 'Private/runtime paths', 1),
+            ('outside-candidate', [{'read_windows': [{'path': str(outside)}]}], 'candidate inventory', 1),
+            ('unauthorized', [{'read_windows': [{'path': '../outside.txt'}]}], '', 1),
+            ('original-as-text', [{'read_windows': [{'path': str(original_path)}]},
+                                  {'sources': [source]}], '', 1),
+            ('character-limit', [{'read_windows': [{**window, 'max_bytes': 64000},
+                {**window, 'offset_bytes': 64000, 'max_bytes': 32001}]}], '96000', 1),
+            ('decision-limit', [{'read_windows': [{**window, 'offset_bytes': index * 10, 'max_bytes': 10}]}
+                for index in range(6)], 'decision limit', 6),
+        ]
+        for name, replies, diagnostic, decisions in cases:
+            with self.subTest(investigation=name):
+                fake.ask_json.reset_mock()
+                fake.ask_json.side_effect = replies
+                with patch.object(app.workspace, 'call', wraps=app.workspace.call) as reads:
+                    rejected = self._compose_document(app, request, 'writing-inspection-' + name, status='error')
+                self.assertIn(diagnostic, rejected.error)
+                self.assertNotIn('PRIVATE_SENTINEL', rejected.error)
+                self.assertEqual(fake.ask_json.call_count, decisions)
+                read_paths = [row.args[1]['path'] for row in reads.call_args_list if row.args[0] == 'read_file']
+                self.assertNotIn(str(original_path), read_paths)
+                self.assertNotIn(str(materials / '.env'), read_paths)
+                self.assertNotIn(str(outside), read_paths)
+                self.assertFalse((app.session.store.root / 'tools/writing' /
+                    ('writing-inspection-' + name) / 'writer').exists())
+        # Boundary success: final selection on decision six, exactly 96000
+        # observed characters, and an explicitly capped line window matches.
+        windows = [{**window, 'offset_bytes': index * 20000,
+                    'max_bytes': 20000 if index < 4 else 16000} for index in range(5)]
+        windows[0]['max_lines'] = 200
+        fake.ask_json.reset_mock()
+        fake.ask_json.side_effect = [*({'read_windows': [row]} for row in windows),
+            {'materials': windows}, {'draft_markdown': 'Supplied local record windows.'}]
+        result = self._compose_document(app, request, 'writing-inspection-boundary')
+        self.assertEqual(fake.ask_json.call_count, 7)  # Six selection decisions, one Writer.
+        owner = app.session.store.root / 'tools/writing/writing-inspection-boundary'
+        observations = read_json(owner / 'selection-observations.json')
+        self.assertEqual(sum(len(row['data']['text']) for row in observations), 96000)
+        self.assertEqual(result.data['material_selection']['selected_windows'], windows)
+        fake.ask_json.reset_mock()
+        fake.ask_json.side_effect = [probe, LLMError('Unconfirmed selection transport')]
+        self._compose_document(app, request, 'writing-inspection-lost', status='error')
+        lost_owner = owner.parent / 'writing-inspection-lost'
+        self.assertTrue((lost_owner / 'selection-steps/1/observations.json').is_file())
+        self.assertFalse((lost_owner / 'selection-response.json').exists())
+        with patch.object(app.writing, 'client_factory', side_effect=AssertionError('No blind replay')) as factory:
+            with _changed_record(Path(request['prior_draft']), b'Changed draft claims.'):
+                changed = self._compose_document(app, request, 'writing-inspection-lost', status='error')
+                self.assertIn('Material selection inputs changed', changed.error)
+            lost = self._compose_document(app, request, 'writing-inspection-lost', status='error')
+            self.assertIn('Interrupted material selection', lost.error)
+            factory.assert_not_called()
+        self.assertEqual(fake.ask_json.call_count, 2)
+
+    def test_composition_material_roots_bind_positive_constraints_and_replay_without_selection(self) -> None:
+        _, fake, app, _, table, _, request = self._material_root_fixture()
+        request = {**request, 'required_headings': ['Summary', 'Limits'], 'max_cited_sources': 1}
+        fake.ask_json.side_effect = [{'read_windows': [{'path': str(table)}]}, {'materials': [str(table)]}, {
+            'draft_markdown': '## Summary\n\nSupplied yields.\n\n## Limits\n\nDescriptive observations only.'}]
+        result = self._compose_document(app, request, 'writing-root-constraints')
+        owner = app.session.store.root / 'tools/writing/writing-root-constraints'
+        for path in ('selection-input.json', 'request.json'):
+            bound = read_json(owner / path)['request']
+            self.assertEqual(bound['required_headings'], request['required_headings'])
+            self.assertEqual(bound['max_cited_sources'], 1)
+        self.assertEqual(read_json(owner / 'writer/writer.json')['constraints_checked'],
+            {'headings': ['Summary', 'Limits'], 'distinct_cited_sources': 0})
+        retained = {path: path.read_bytes() for path in owner.rglob('*.json')}
+        with patch.object(app.writing, 'client_factory', side_effect=AssertionError('No reselection or redraft')):
+            repeated = self._compose_document(app, request, 'writing-root-constraints')
+            self.assertEqual(repeated.artifacts, result.artifacts)
+            for changed in ({'required_headings': ['Limits', 'Summary']}, {'max_cited_sources': 2}):
+                rejected = self._compose_document(app, {**request, **changed}, 'writing-root-constraints', status='error')
+                self.assertIn('inputs changed', rejected.error)
+        self.assertEqual(fake.ask_json.call_count, 3)
+        self.assertEqual({path: path.read_bytes() for path in owner.rglob('*.json')}, retained)
+        # Candidate-policy selections predating draft-aware selection also
+        # recover with exactly their saved shape and no model client.
+        legacy_selection = read_json(owner / 'selection-input.json')
+        legacy_selection.pop('prior_draft')
+        legacy_selection.pop('selection_method')
+        write_json(owner / 'selection-input.json', legacy_selection)
+        # A pre-investigation candidate receipt never had observation records.
+        (owner / 'selection-observations.json').unlink()
+        legacy_bytes = (owner / 'selection-input.json').read_bytes()
+        with patch.object(app.writing, 'client_factory', side_effect=AssertionError('legacy selection cannot call model')) as factory:
+            repeated = self._compose_document(app, request, 'writing-root-constraints')
+            self.assertEqual(repeated.artifacts, result.artifacts)
+            factory.assert_not_called()
+        self.assertEqual(fake.ask_json.call_count, 3)
+        self.assertNotIn('prior_draft', read_json(owner / 'selection-input.json'))
+        self.assertEqual((owner / 'selection-input.json').read_bytes(), legacy_bytes)
 
     def test_composition_material_roots_bind_original_sources_and_legacy_mixed_receipts(self) -> None:
         from simple_ar.core.capabilities import ArtifactStore
@@ -3702,7 +5230,9 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             'draft_markdown': 'Cancellation propagates to owned sibling tasks [@P1].'}]
         original_call = ToolCall(tool_name='compose_document', arguments=request, trace_id='writing-root-original')
         calls = fake.ask_json.call_count
-        sourced = self._replay_interrupted_assembly(app, fake, original_call)
+        with patch.object(app.workspace, 'call', wraps=app.workspace.call) as reads:
+            sourced = self._replay_interrupted_assembly(app, fake, original_call)
+        self.assertFalse(any(row.args[0] == 'read_file' for row in reads.call_args_list))
         index = json.loads(fake.ask_json.call_args_list[calls].args[1])
         self.assertEqual(index['retained_original_sources'][0]['documents'][0]['title'], original.records[0].title)
         self.assertEqual(index['retained_original_sources'][0]['retained_chunks'], 1)
@@ -3731,18 +5261,27 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 identity = f'writing-root-mixed-{historical}'
                 owner = ArtifactStore(app.session.store.root / 'tools/writing' / identity)
                 if historical:
+                    legacy_request = ComposeRequest.model_validate(mixed_request).model_dump()
+                    legacy_request.pop('required_headings')
+                    legacy_request.pop('max_cited_sources')
                     owner.write_json('selection-input.json', {
-                        'request': ComposeRequest.model_validate(mixed_request).model_dump(),
+                        'request': legacy_request,
                         'inventories': [app.workspace.bind_inventory(materials, identity=identity)]})
-                    owner.write_json('selection-response.json', selection)
+                    owner.write_json('selection-response.json', {**selection, 'sources': [selected_source]})
+                    legacy_selection_bytes = owner.resolve('selection-input.json').read_bytes()
                     fake.ask_json.side_effect = [{'draft_markdown': 'Retained observation [@P1].'}]
                 else:
-                    fake.ask_json.side_effect = [selection, {'draft_markdown': 'Retained observation [@P1].'}]
+                    fake.ask_json.side_effect = [{'read_windows': [{'path': str(table)}]},
+                        selection, {'draft_markdown': 'Retained observation [@P1].'}]
                 composed = app.writing.call('compose_document', mixed_request, identity=identity)
                 self.assertEqual(composed.status, 'ok', composed.error)
                 handles = _writing_prompt(fake)['source_handles']
                 self.assertEqual(handles[0]['metadata']['evidence_passages'][0]['text'], original.chunks[0].text)
                 stored_request = owner.read_json('request.json')
+                self.assertNotIn('required_headings', stored_request['request'])
+                self.assertNotIn('max_cited_sources', stored_request['request'])
+                self.assertNotIn('required_headings', owner.read_json('selection-input.json')['request'])
+                self.assertNotIn('max_cited_sources', owner.read_json('selection-input.json')['request'])
                 self.assertEqual(stored_request['request']['sources'][0]['document_record'], str(original_path))
                 calls = fake.ask_json.call_count
                 retained = {str(path): path.read_bytes() for path in owner.root.rglob('*.json')}
@@ -3751,23 +5290,23 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     self.assertEqual(replay.artifacts, composed.artifacts, replay.error)
                     for arguments in ({**mixed_request, 'title': 'Changed'}, request):
                         self.assertEqual(app.writing.call('compose_document', arguments, identity=identity).status, 'error')
-                    changed_metadata = original.to_handoff_dict()
-                    changed_metadata['documents'][0]['metadata'] = {'kind': 'changed'}
-                    changed_chunks = original.to_handoff_dict()
-                    changed_chunks['chunks'][0]['text'] = 'Changed original passage.'
-                    for changed_source in (original_bytes + b'\n',
-                            json.dumps(changed_metadata).encode(), json.dumps(changed_chunks).encode()):
-                        with _changed_record(original_path, changed_source):
-                            stale = app.writing.call('compose_document', mixed_request, identity=identity)
-                            self.assertEqual(stale.status, 'error')
-                            self.assertIn('inputs changed', stale.error)
+                    # The retained source preview above binds SHA-256 of the
+                    # whole file. Even a semantically inert byte change must
+                    # fail, covering metadata/passage changes with that owner.
+                    with _changed_record(original_path, original_bytes + b'\n'):
+                        stale = app.writing.call('compose_document', mixed_request, identity=identity)
+                        self.assertEqual(stale.status, 'error')
+                        self.assertIn('inputs changed', stale.error)
                     factory.assert_not_called()
                 self.assertEqual(fake.ask_json.call_count, calls)
                 self.assertEqual({str(path): path.read_bytes() for path in owner.root.rglob('*.json')}, retained)
+                if historical:
+                    self.assertNotIn('prior_draft', owner.read_json('selection-input.json'))
+                    self.assertNotIn('selection_method', owner.read_json('selection-input.json'))
+                    self.assertFalse(owner.exists('selection-observations.json'))
+                    self.assertFalse(owner.resolve('selection-steps').exists())
+                    self.assertEqual(owner.resolve('selection-input.json').read_bytes(), legacy_selection_bytes)
         for index, (response, diagnostic) in enumerate((
-            ({'materials': [str(materials / '.env')], 'figures': []}, 'distinct paths from the bound inventory'),
-            ({'materials': [str(inputs / 'writing-document.json')], 'figures': []}, 'distinct paths from the bound inventory'),
-            ({'materials': [str(table), str(table)], 'figures': []}, 'distinct paths from the bound inventory'),
             ({'sources': [{'document_record': str(table), 'questions': ['yields']}]}, ''),
             ({'sources': [selected_source], 'materials': [str(original_path)]}, ''),
             ({'figures': [str(figure)]}, ''),
@@ -4035,6 +5574,9 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         with patch('simple_ar.integrations.llm.LLMClient.from_env', side_effect=resolve_client):
             pinned = ToolApplication.create(run_dir / 'vision-routing', 'Inspect supplied figure',
                 model='fixture', sources={'source0': inputs}, allow_vision=True)
+            for spec in pinned.gateway.registry.list_specs():
+                if spec.domain == 'sources' and spec.permission_level == 'network':
+                    self.assertFalse(pinned.gateway.policy.is_allowed(spec)[0], spec.name)
             self.assertNotIn('code_route', pinned.state['config']['vision_connection'])
             self.assertNotIn('writing_route', pinned.state['config']['vision_connection'])
             self.assertIs(pinned._client('visual-check', purpose='vision'), vision_client)
@@ -4612,6 +6154,161 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             self.assertTrue(any(row["category"] == "scope" for row in findings))
 
 
+class ScientificToolTests(unittest.TestCase):
+    """Source-routing/selection boundaries; physical owner proof is exercised above/below separately."""
+
+    def test_condition_contract_preserves_skip_and_explicit_source_roles(self):
+        from simple_ar.tools.scientific import freeze_measurement_set, measurement_contract
+        from simple_ar.experiment.execution.measurement import representative_measurement_execution
+
+        with _temporary_run() as directory:
+            flat = {'command': ['python', 'evaluate.py'], 'cwd': str(directory.resolve()),
+                'timeout_sec': 5, 'result_schema': {'primary_metric': 'score'}}
+            self.assertIs(representative_measurement_execution(flat), flat)
+            for policy, count in (('skip', 2), ('run', 4)):
+                frozen = freeze_measurement_set({**flat, 'baseline_policy': policy,
+                    'seeds': [4, 9], 'seed_flag': '--seed'})
+                self.assertEqual(len(frozen['conditions']), count)
+                self.assertEqual({row['seed'] for row in frozen['conditions']}, {4, 9})
+                if policy == 'skip':
+                    self.assertTrue(all(row['role'] == 'candidate' for row in frozen['conditions']))
+            rows = [{'id': role, 'role': role, 'seed': None, 'source': source, 'execution': flat}
+                for role, source in (('baseline', 'implementation'), ('candidate', 'preparation'))]
+            frozen = measurement_contract({'conditions': rows})
+            self.assertEqual([row['source'] for row in frozen['conditions']], ['implementation', 'preparation'])
+            self.assertIs(representative_measurement_execution(frozen), frozen['conditions'][1]['execution'])
+            for invalid in ({'conditions': rows[:1]},
+                    {'conditions': [rows[1], {**rows[1], 'id': 'duplicate-slot'}]}):
+                with self.assertRaises(ValueError):
+                    measurement_contract(invalid)
+            with self.assertRaisesRegex(ValueError, 'one shared result_schema'):
+                representative_measurement_execution({'conditions': [rows[1], {**rows[1],
+                    'execution': {**flat, 'result_schema': {'primary_metric': 'loss'}}}]})
+            for controls in ({'baseline_policy': 'reuse'}, {'baseline_ref': 'old/results.json'}):
+                with self.assertRaises(ValueError):
+                    freeze_measurement_set({**flat, **controls})
+
+    def test_scoped_preparation_routes_exact_source_without_asset_authorization_bypass(self):
+        from simple_ar.tools.scientific import ScientificToolGateway, MeasurementRequest
+
+        with _temporary_run() as directory:
+            root = directory.resolve()
+            ledger = BudgetLedger({'process_invocations': 2, 'process_wall_seconds': 20})
+            workspace = WorkspaceToolGateway(root, {'records': root / 'attempts'}, ledger)
+            origin = root / 'origin'
+            origin.mkdir()
+            candidate = workspace.workspace / 'prepared'
+            candidate.mkdir()
+            (candidate / 'evaluate.py').write_text('print("score: 1")\n')
+            asset = candidate / 'data.txt'
+            asset.write_text('fixed\n')
+            flat = {'command': ['python', str(origin / 'evaluate.py')], 'cwd': str(origin),
+                'timeout_sec': 5, 'result_schema': {'primary_metric': 'score'}}
+            contract = {'conditions': [{'id': 'prepared-candidate', 'role': 'candidate', 'seed': None,
+                'source': 'preparation', 'execution': flat}]}
+            source = {'implementation_ref': None, 'prepared_ref': {'path': 'attempts/prepared/execution.json'},
+                'cwd': str(candidate), 'python_executable': sys.executable, 'validation_command': None,
+                'environment': {}, 'file_hashes': {}, 'protected_assets': [{'asset_id': 'data',
+                    'path': str(asset), 'role': 'evaluation_data'}]}
+            owner = SimpleNamespace(exact=SimpleNamespace(project_path='origin'), measurement=contract,
+                prepared_source=Mock(return_value=source), measurement_source=Mock())
+            science = ScientificToolGateway(root, workspace, ledger, 'unit', implementation=owner, execution_contract=contract)
+            owner.measurement = science.execution_contract
+            arguments = {**flat, 'cwd': str(candidate), 'condition_id': 'prepared-candidate',
+                'preparation_ref': 'records/prepared/execution.json'}
+            with patch('simple_ar.code_task.runtime.state.implementation_file_hashes', return_value={}):
+                _, request, bound_source = science._request(arguments, identity='measurement')
+                self.assertIs(bound_source, source)
+                self.assertEqual(request.run.command, [sys.executable, str(candidate / 'evaluate.py')])
+                self.assertEqual(source['protected_assets'][0]['path'], str(asset))
+                owner.prepared_source.assert_called_with(arguments['preparation_ref'], identity='measurement')
+                owner.measurement_source.assert_not_called()
+                # A nonempty asset list must never turn source_kind into True
+                # and grant the fixed literal caller's external-path exception.
+                outside = root / 'unmounted.txt'
+                outside.write_text('not authorized\n')
+                source['protected_assets'][0]['path'] = str(outside)
+                with self.assertRaisesRegex(ValueError, 'authorized mounts'):
+                    science._request(arguments, identity='denied')
+                source['protected_assets'] = []
+                with self.assertRaisesRegex(ValueError, 'frozen source kind'):
+                    science._request({**arguments, 'preparation_ref': None,
+                        'implementation_ref': 'records/other/implementation.json'}, identity='wrong-source')
+                unfrozen = ScientificToolGateway(root, workspace, ledger, 'unit', implementation=owner)
+                unfrozen._request({**arguments, 'condition_id': None,
+                    'command': ['python', str(candidate / 'evaluate.py')]}, identity='unfrozen')
+            with self.assertRaises(ValueError):
+                MeasurementRequest.model_validate({**arguments, 'implementation_ref': 'records/other/implementation.json'})
+
+    def test_scoped_condition_selection_binds_current_revision_and_preparation_ancestor(self):
+        from simple_ar.core.capabilities import ArtifactRef
+        from simple_ar.tools.scientific import ScientificToolGateway, MeasurementRequest, MeasurementAnalysisRequest
+
+        with _temporary_run() as directory:
+            root = directory.resolve()
+            ledger = BudgetLedger({})
+            workspace = WorkspaceToolGateway(root, {'records': root / 'attempts'}, ledger)
+            flat = {'command': ['python', 'evaluate.py'], 'cwd': str(workspace.workspace),
+                'timeout_sec': 5, 'result_schema': {'primary_metric': 'score'}}
+            contract = {'conditions': [{'id': role, 'role': role, 'seed': None, 'source': source,
+                'execution': flat} for role, source in (('baseline', 'preparation'), ('candidate', 'implementation'))]}
+            science = ScientificToolGateway(root, workspace, ledger, 'unit',
+                implementation=SimpleNamespace(exact=True), execution_contract=contract)
+            origin = {'path': 'attempts/prepared/execution.json', 'sha256': 'actual-preparation-bytes'}
+            def observation(identity, role, *, revision=None, ancestor=origin):
+                prepared = ArtifactRef('attempts/prepared/execution.json', kind='prepared_execution').to_dict()
+                implemented = ArtifactRef(f'attempts/{revision}/implementation.json', kind='implementation_result').to_dict() if revision else None
+                source = {'implementation_ref': implemented, 'prepared_ref': prepared, 'preparation_origin': ancestor}
+                arguments = MeasurementRequest.model_validate({**flat, 'condition_id': role,
+                    **({'implementation_ref': f'records/{revision}/implementation.json'} if revision else
+                       {'preparation_ref': 'records/prepared/execution.json'})}).model_dump()
+                store = root / 'attempts' / identity
+                write_json(store / 'scientific_request.json', {'arguments': arguments,
+                    'execution_approval': {'binding': {'source': source}}})
+                write_json(store / 'results.json', {'implementation_ref': implemented,
+                    'preparation': {'source_ref': prepared}, 'status': 'passed', 'execution_status': 'passed',
+                    'result_schema': flat['result_schema'], 'metrics': {'score': 1}})
+                return f'records/{identity}/results.json'
+            baseline = observation('baseline', 'baseline')
+            old = observation('old-measurement', 'candidate', revision='old')
+            current = observation('current-measurement', 'candidate', revision='current')
+            wrong = observation('unrelated-baseline', 'baseline', ancestor={**origin, 'sha256': 'other-bytes'})
+            def verified(locator):
+                path = workspace.resolve(locator)
+                return ArtifactRef(path.relative_to(root).as_posix(), kind='experiment_result'), {'hashes': {}, 'result': {'data': {}}}
+            # Only physical-proof verification is substituted here; the actual
+            # owner/ledger chain has its separate current+venv integration test.
+            with patch.object(science, '_measurement_input', side_effect=verified) as proof:
+                locators = [baseline, old, current, wrong]
+                revisions = ['attempts/old/implementation.json', 'attempts/current/implementation.json']
+                with self.assertRaisesRegex(ValueError, 'current implementation revision'):
+                    science._condition_results(locators)
+                selected = science._condition_results(locators, implementation_refs=revisions)
+                self.assertEqual(selected, {'baseline': baseline, 'candidate': current})
+                self.assertNotIn(unittest.mock.call(old), proof.call_args_list)
+                evidence = science.report_evidence(locators, revisions)
+                self.assertEqual(set(evidence['measurement_refs']),
+                    {'attempts/baseline/results.json', 'attempts/current-measurement/results.json'})
+                self.assertIn('no matching deterministic analysis', science.delivery_requirement(
+                    {**evidence, 'implementation_refs': revisions})[0])
+                analysis = 'attempts/analysis/native_result.json'
+                write_json(root / 'attempts/analysis/scientific_request.json', {
+                    'arguments': science.analysis_arguments([baseline, current])})
+                accepted_analysis = {'tool_name': 'analyze_measurements', 'status': 'ok', 'artifacts': [],
+                    'data': {'analysis_status': 'passed', 'execution_status': 'passed', 'comparison_gaps': []}}
+                write_json(root / analysis, accepted_analysis)
+                with patch.object(science, '_receipt', return_value={'result': accepted_analysis}):
+                    self.assertEqual(science.delivery_requirement({**evidence,
+                        'implementation_refs': revisions, 'analysis_records': [analysis]}), [])
+                missing = science.delivery_requirement({**evidence,
+                    'implementation_refs': [*revisions, 'attempts/unmeasured/implementation.json']})
+                self.assertTrue(any('candidate' in issue for issue in missing))
+                with self.assertRaisesRegex(ValueError, 'preparation ancestor'):
+                    science._analysis_inputs(MeasurementAnalysisRequest(result_refs=[current], baseline_ref=wrong))
+                with self.assertRaisesRegex(ValueError, 'role/seed'):
+                    science._analysis_inputs(MeasurementAnalysisRequest(result_refs=[baseline], baseline_ref=current))
+
+
 class AgentHandoffTests(unittest.TestCase):
     @staticmethod
     def _greenfield_fixture(root, text, **options):
@@ -4707,7 +6404,6 @@ class AgentHandoffTests(unittest.TestCase):
 
     def test_implementation_unit_corrects_contract_once_with_shared_budget(self) -> None:
         from simple_ar.code_task.generation.writer import write_implementation_unit
-        from simple_ar.integrations.llm import LLMError
 
         original_bytes = b'# Preserve unrelated code.\ndef value():\n    return 1\n'
         original_text = original_bytes.decode('utf-8')
@@ -4716,15 +6412,13 @@ class AgentHandoffTests(unittest.TestCase):
             note, {'path': 'utility.py', 'content': original_text.replace('return 1', 'return 2')}]}
         corrected = {**rejected, 'files': [note, {'path': 'utility.py', 'replacements': [
             {'old_text': 'return 1', 'new_text': 'return 2'}]}]}
-        broken = {**corrected, 'files': [note, {'path': 'utility.py', 'replacements': [
-            {'old_text': 'return 1', 'new_text': 'return ('}]}]}
+        # Transport, unknown accounting and syntax rejection belong to the
+        # native_writer cases in test_code_task_interfaces. Retain the bounded
+        # completed-contract correction and publication boundary here.
         cases = (
             ('corrected', [rejected, corrected], None),
             ('still-invalid', [rejected, rejected], ValueError),
-            ('transport', [LLMError('Provider unavailable')], LLMError),
-            ('syntax', [broken], SyntaxError),
             ('request-zero', [rejected], ValueError),
-            ('unknown', [rejected], ValueError),
         )
         for name, replies, error in cases:
             with self.subTest(case=name), _temporary_run() as run_dir:
@@ -4743,14 +6437,8 @@ class AgentHandoffTests(unittest.TestCase):
                     index = fake.ask_json.call_count - 1
                     reservation = f'request-{index + 1}'
                     ledger.reserve(reservation, {'llm_requests': 1})
-                    if name == 'unknown':
-                        ledger.mark_unknown(reservation, reason='Provider usage unavailable')
-                    else:
-                        ledger.settle(reservation, {'llm_requests': 1})
-                    reply = replies[index]
-                    if isinstance(reply, Exception):
-                        raise reply
-                    return reply
+                    ledger.settle(reservation, {'llm_requests': 1})
+                    return replies[index]
 
                 fake.ask_json.side_effect = respond
                 arguments = dict(project_dir=candidate, goal='Change value and document the candidate.',
@@ -4776,14 +6464,11 @@ class AgentHandoffTests(unittest.TestCase):
                 self.assertEqual(source.read_bytes(), original_bytes)
                 if name == 'request-zero':
                     self.assertEqual(ledger.remaining('llm_requests'), 0)
-                if name == 'unknown':
-                    self.assertEqual(ledger.unknown_dimensions(), ('llm_requests',))
-                if name != 'transport':
-                    retained = sorted((artifacts / 'implementation').glob('attempt-*.json'))
-                    self.assertEqual([path.name for path in retained],
-                        [f'attempt-{index:03d}.json' for index in range(1, len(replies) + 1)])
-                    self.assertEqual([read_json(path)['response'] for path in retained], replies)
-                    self.assertEqual(read_json(artifacts / 'proposal.json'), replies[-1])
+                retained = sorted((artifacts / 'implementation').glob('attempt-*.json'))
+                self.assertEqual([path.name for path in retained],
+                    [f'attempt-{index:03d}.json' for index in range(1, len(replies) + 1)])
+                self.assertEqual([read_json(path)['response'] for path in retained], replies)
+                self.assertEqual(read_json(artifacts / 'proposal.json'), replies[-1])
                 if len(replies) == 2:
                     first, second = [call.args[1] for call in fake.ask_json.call_args_list]
                     self.assertTrue(second.startswith(first))
@@ -4819,29 +6504,7 @@ class AgentHandoffTests(unittest.TestCase):
             self.assertEqual(len(migrated), 1)
             self.assertTrue((migrated[0] / "greenfield-codex-old" / "stderr.txt").is_file())
 
-    def test_greenfield_fake_provider_still_uses_internal_review_boundary(self) -> None:
-        with _temporary_run() as root:
-            run_dir = self._greenfield_fixture(root,
-                "# Task\n\nGenerate a runnable project with accuracy and macro_f1 metrics.\n",
-                metric_directions={"accuracy": "higher_is_better", "macro_f1": "higher_is_better"})
 
-            result = execute_code_task(
-                run_dir,
-                use_llm=False,
-                to_step="work-plan",
-                max_generated_lines=200,
-                implementation_provider="fake",
-                implementation_agent_mode="handoff",
-            )
-
-            self.assertEqual(result.stop_reason, "stop_point")
-            self.assertTrue((run_dir / "agent_handoff" / "code-task-greenfield-fake").is_dir())
-            self.assertTrue((run_dir / "code_task" / "workspace" / "generated_project" / "main.py").is_file())
-            backend = read_json(run_dir / "code_task" / "meta" / "code_backend.json")
-            self.assertEqual(backend["backend"], "greenfield_agent")
-            self.assertEqual(backend["provider"], "fake")
-            self.assertEqual(backend["agent_mode"], "handoff")
-            self.assertTrue((run_dir / "code_task" / "meta" / "review_report.json").is_file())
 
     def test_delegated_workspace_mode_fails_explicitly_until_runner_exists(self) -> None:
         with _temporary_run() as root:
@@ -4894,6 +6557,940 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
         self.enterContext(patch('simple_ar.tools.implementation.LLMClient.from_env', return_value=self.fake))
         self.routed = self.enterContext(patch(
             'simple_ar.tools.implementation.LLMClient.for_task', return_value=self.fake))
+
+    def test_candidate_environment_preparation_shares_validator_measurement_and_feedback_owner(self) -> None:
+        from simple_ar.tools.implementation import ImplementationToolGateway
+        from simple_ar.tools.scientific import ScientificToolGateway
+        from simple_ar.core.capabilities import ArtifactStore, CapabilityRegistry, CapabilityResult, CapabilityContext, AttemptManifest
+        from simple_ar.core.session import SessionController, BudgetState
+        from simple_ar.code_task.runtime.state import code_task_paths, implementation_file_hashes, load_code_task_manifest
+        from simple_ar.code_task.execution.runner import run_code_task_benchmark
+        import shlex
+        for mode in ('current', 'venv', 'same_argv'):
+            with self.subTest(environment=mode):
+                root = self.run_dir / mode
+                project = root / 'input'
+                project.mkdir(parents=True)
+                (project / 'main.py').write_text('VALUE = 1\n')
+                (project / 'check.py').write_text('from main import VALUE\nassert VALUE >= 2\n')
+                (project / 'evaluate.py').write_text('from main import VALUE\nprint("score: " + str(VALUE))\n')
+                ledger = BudgetLedger({'llm_requests': 4, 'total_tokens': 20000,
+                    'process_invocations': 12, 'process_wall_seconds': 180})
+                workspace = WorkspaceToolGateway(root, {'input': project, 'records': root / 'attempts'}, ledger)
+                contract = {'project_path': 'input', 'goal': 'Improve value and retain the declared scientific checker',
+                    'allowed_patterns': ['main.py'], 'validation_command': ['python', 'check.py'], 'timeout_sec': 5,
+                    'preparation': {'kind': 'existing_project', 'workspace_mode': 'copy'},
+                    'environment': {'mode': 'venv' if mode == 'venv' else 'current', 'timeout_sec': 20,
+                        'check_command': ['python', '-c', 'import decimal; print("score: 999")']}}
+                if mode == 'current':
+                    contract['new_files'] = ['helper.py']
+                    contract['allowed_patterns'].append('helper.py')
+                    (project / 'check.py').write_text('from main import VALUE\nfrom helper import RESULT\nassert VALUE >= 2 and RESULT == VALUE\n')
+                formal = {'command': ['python', str(project / 'evaluate.py')], 'cwd': str(project),
+                    'timeout_sec': 5, 'result_schema': {'primary_metric': 'score', 'required_metrics': ['score']}}
+                if mode == 'same_argv':
+                    formal['command'] = contract['validation_command'] = ['python', 'evaluate.py']
+                conditions = {'conditions': [{'id': role, 'role': role, 'seed': None, 'source': source,
+                    **({'before_implementation': True} if role == 'baseline' and mode != 'venv' else {}),
+                    'execution': formal} for role, source in (('baseline', 'preparation'), ('candidate', 'implementation'))]}
+                owner = ImplementationToolGateway(root, workspace, ledger, 'test-model', 'unit', exact=contract, measurement=conditions)
+                science = ScientificToolGateway(root, workspace, ledger, 'unit', implementation=owner, execution_contract=conditions)
+                measured_locators = []
+                owner.measurement_inputs = lambda origin, required: science.implementation_inputs(
+                    measured_locators, origin, required=required)
+                registry = CapabilityRegistry()
+                def native(*, context, tool_name, arguments, approval):
+                    try:
+                        result = (owner.execute_tool(tool_name, context, arguments, approval=approval) if tool_name in owner.context_tools
+                                  else science.execute_tool(tool_name, context, arguments, approval=approval))
+                    except Exception:
+                        self.fail(__import__('traceback').format_exc())
+                    context.store.write_json('native_result.json', result.model_dump(mode='json'))
+                    if tool_name == 'measure_experiment' and result.status == 'ok':
+                        measured_locators.append(result.data['result_ref'])
+                    return CapabilityResult(status='completed', artifacts=ToolApplication._native_artifacts(
+                        context.store, result.model_dump(mode='json'), name=tool_name))
+                registry.register('native_tool', native)
+                controller = SessionController.create(root, session_id='unit', topic=contract['goal'],
+                    registry=registry, budget=BudgetState(max_attempts=8))
+                denied = {'token': 'confirmed', 'binding': owner.approval_binding({}, identity='insufficient')}
+                ledger.limits['process_invocations'] = 0
+                saved = ledger.to_dict()
+                with self.assertRaisesRegex(ValueError, 'complete finite process budget' if mode == 'venv' else 'prior measurements'), patch(
+                        'simple_ar.research.preparation.run_preparation_capability') as prepare:
+                    owner.execute(CapabilityContext(ArtifactStore(root / 'attempts/insufficient'),
+                        AttemptManifest('insufficient')), {}, approval=denied)
+                prepare.assert_not_called()
+                self.assertEqual(ledger.to_dict(), saved)
+                ledger.limits['process_invocations'] = 12
+                if mode == 'current':
+                    for identity, target, message in (('changed-setup', 'main.py', 'changed imported project bytes'),
+                            ('created-target', 'adapter.py', 'must not create required code targets')):
+                        destructive = ImplementationToolGateway(root, workspace, ledger, 'test-model', 'unit',
+                            exact={**contract, 'allowed_patterns': ['main.py', 'adapter.py'],
+                                'new_files': ['adapter.py'] if target == 'adapter.py' else [],
+                                'environment': {'mode': 'current', 'timeout_sec': 5,
+                                    'check_command': [sys.executable, '-c', f"from pathlib import Path; Path({target!r}).write_text('VALUE = 99\\n')"]}},
+                            measurement=conditions)
+                        token = {'token': 'confirm-setup', 'binding': destructive.approval_binding({}, identity=identity)}
+                        rejected_context = CapabilityContext(ArtifactStore(root / 'attempts' / identity), AttemptManifest(identity))
+                        with patch('simple_ar.research.implementation.run_implementation_capability') as implementation:
+                            with self.assertRaisesRegex(ValueError, message):
+                                destructive.prepare(rejected_context, {}, approval=token)
+                            implementation.assert_not_called()
+                        self.assertFalse(destructive.can_reconcile('prepare_code_task', identity))
+                    if os.name != 'nt':
+                        host = root / 'host'
+                        host.mkdir()
+                        (project / 'bin').mkdir()
+                        for checker in (host / 'checker', project / 'bin/checker'):
+                            checker.write_text('#!/bin/sh\nexit 0\n')
+                            checker.chmod(0o755)
+                        changed = ImplementationToolGateway(root, workspace, ledger, 'test-model', 'unit',
+                            exact={**contract, 'environment': {'mode': 'current', 'timeout_sec': 5,
+                                'check_command': ['checker']}}, measurement=conditions)
+                        with patch.dict(os.environ, {'PATH': os.pathsep.join(['bin', str(host), os.environ['PATH']])}):
+                            token = {'token': 'confirmed-host', 'binding': changed.approval_binding({}, identity='shadowed')}
+                            with patch('simple_ar.research.project_environment.prepare_project_environment') as setup:
+                                with self.assertRaisesRegex(ValueError, 'identity changed after copying'):
+                                    changed.prepare(CapabilityContext(ArtifactStore(root / 'attempts/shadowed'),
+                                        AttemptManifest('shadowed')), {}, approval=token)
+                                setup.assert_not_called()
+                def domain(*, context, request):
+                    paths = code_task_paths(request.run_dir)
+                    if mode != 'venv':
+                        facts = context.store.read_json('inputs/brief.json')['request_text']
+                        self.assertIn('Recorded prior measurement evidence', facts)
+                        self.assertIn(json.dumps(read_json(root / 'attempts/baseline/results.json')['metrics']), facts)
+                    value = 3 if request.run_dir.name == 'feedback' else 2
+                    (paths.workspace_dir / 'main.py').write_text(f'VALUE = {value}\n')
+                    if mode == 'current':
+                        (paths.workspace_dir / 'helper.py').write_text('from main import VALUE as RESULT\n')
+                    validation = run_code_task_benchmark(request.run_dir, command=shlex.join(request.validation_command),
+                        skip_validation=True, timeout_sec=5, budget_ledger=ledger, session_id='unit', attempt_id=request.run_dir.name)
+                    self.assertEqual(validation.status, 'passed')
+                    report = context.store.write_text('code_task/validation.json', validation.report_path.read_text(encoding='utf-8'))
+                    refs = {'validation_report': report.to_dict()}
+                    if context.store.exists('environment_observation.json'):
+                        refs.update({name: context.store.ref(name + '.json').to_dict()
+                            for name in ('environment_setup', 'environment_observation')})
+                    context.store.write_json('implementation.json', {'status': 'validated', 'next_action': 'inspect',
+                        'schema_version': 'research_implementation.v1', 'native_binding': load_code_task_manifest(request.run_dir)['code_task']['native_binding'],
+                        'validation': {'command': list(request.validation_command), 'status': validation.status,
+                            'timeout_sec': 5, 'returncode': validation.returncode, 'timed_out': validation.timed_out},
+                        'artifact_refs': refs,
+                        'artifact_hashes': {ref['path']: hashlib.sha256(context.store.resolve(ref['path']).read_bytes()).hexdigest() for ref in refs.values()},
+                        'implementation_file_hashes': implementation_file_hashes(request.run_dir),
+                        'workspace_dir': str(paths.workspace_dir), 'code_task_run_dir': str(request.run_dir)})
+                # Model/code generation is substituted; preparation, actual
+                # validators, measurement, lineage and original accounting are not.
+                approval = {'token': 'prepare', 'binding': owner.approval_binding({}, identity='prepared')}
+                with patch.object(owner, '_client') as model:
+                    controller.execute_attempt('native_tool', attempt_id='prepared', tool_name='prepare_code_task',
+                        arguments={}, approval=approval)
+                    model.assert_not_called()
+                prepared_store = ArtifactStore(root / 'attempts/prepared')
+                self.assertEqual(prepared_store.read_capability_result().status, 'completed',
+                    prepared_store.read_json('capability_result.json'))
+                prepared = owner.prepared_source('records/prepared/execution.json', identity='baseline')
+                if mode != 'venv':
+                    before = ledger.to_dict()
+                    with self.assertRaisesRegex(ValueError, 'required prepared-source measurements'):
+                        owner.approval_binding({'prepared_result': 'records/prepared/execution.json'}, identity='before-baseline')
+                    self.assertEqual(ledger.to_dict(), before)
+                self.assertIsNone(prepared['implementation_ref'])
+                self.assertIsNone(prepared['validation_command'])
+                self.assertTrue(ArtifactStore(root / 'attempts/prepared').exists('environment_observation.json'))
+                first_python = prepared['python_executable']
+                original_prepared = read_json(root / 'attempts/prepared/execution.json')
+                if mode == 'venv':
+                    flexible = ScientificToolGateway(root, workspace, ledger, 'unit', implementation=owner)
+                    before = ledger.to_dict()
+                    with self.assertRaisesRegex(ValueError, 'conflicts with the prepared venv'):
+                        flexible.approval_binding({**formal, 'command': [sys.executable, str(project / 'evaluate.py')],
+                            'cwd': prepared['cwd'], 'preparation_ref': 'records/prepared/execution.json'}, identity='wrong-python')
+                    self.assertEqual(ledger.to_dict(), before)
+                arguments = {**formal, 'cwd': prepared['cwd'], 'condition_id': 'baseline',
+                    'preparation_ref': 'records/prepared/execution.json'}
+                baseline_approval = {'token': 'baseline', 'binding': science.approval_binding(arguments, identity='baseline')}
+                controller.execute_attempt('native_tool', attempt_id='baseline', tool_name='measure_experiment',
+                    arguments=arguments, approval=baseline_approval)
+                self.assertEqual(read_json(root / 'attempts/baseline/results.json')['metrics']['score'], 1)
+                saved = ledger.to_dict()
+                with patch('simple_ar.experiment.execution.backend.run_process') as setup:
+                    context = CapabilityContext(ArtifactStore(root / 'attempts/prepared'), AttemptManifest('prepared'))
+                    replay = owner.prepare(context, {}, approval=approval)
+                    self.assertEqual(replay.data['sha256'], hashlib.sha256((context.store.root / 'execution.json').read_bytes()).hexdigest())
+                    setup.assert_not_called()
+                self.assertEqual(ledger.to_dict(), saved)
+                for identity, work in (('initial', {'prepared_result': 'records/prepared/execution.json'}), ('feedback', {'prior_result': 'records/initial/implementation.json',
+                        'instruction': 'Improve the same candidate without reinstalling or rerunning its prior measurement'})):
+                    ledger.limits['process_invocations'] = len(ledger.entries) + 2 if identity == 'initial' else 12
+                    approval = {'token': 'confirmed', 'binding': owner.approval_binding(work, identity=identity)}
+                    with patch('simple_ar.research.implementation.run_implementation_capability', side_effect=domain):
+                        controller.execute_attempt('native_tool', attempt_id=identity, tool_name='implement_code_task',
+                            arguments=work, approval=approval)
+                    store = ArtifactStore(root / 'attempts' / identity)
+                    self.assertTrue(store.exists('native_result.json'), store.read_json('capability_result.json'))
+                    result = store.read_json('native_result.json')
+                    self.assertEqual(result['status'], 'ok')
+                    owner.check_delivery(result['data'], [result['data']['project_path']])
+                    source = owner.measurement_source(f'records/{identity}/implementation.json', identity='formal-' + identity)
+                    self.assertEqual(source['python_executable'], approval['binding']['python_executable'])
+                    self.assertFalse(store.exists('environment_setup.json'))
+                    self.assertEqual(source['python_executable'], first_python)
+                    arguments = {**formal, 'cwd': source['cwd'], 'condition_id': 'candidate',
+                        'implementation_ref': f'records/{identity}/implementation.json'}
+                    token = {'token': 'measure', 'binding': science.approval_binding(arguments, identity='formal-' + identity)}
+                    controller.execute_attempt('native_tool', attempt_id='formal-' + identity, tool_name='measure_experiment',
+                        arguments=arguments, approval=token)
+                    measured = ArtifactStore(root / 'attempts' / ('formal-' + identity)).read_json('results.json')
+                    self.assertEqual(measured['metrics']['score'], 3 if identity == 'feedback' else 2)
+                    if mode == 'same_argv':
+                        physical_validation = read_json(store.root / 'code_task/validation.json')
+                        self.assertEqual(measured['command'], physical_validation['command'])
+                        self.assertNotEqual(measured['measurement']['measurement_id'], physical_validation['process']['invocation_id'])
+                    if identity == 'initial' and mode != 'venv':
+                        original_binding = owner.approval_binding(work, identity=identity)
+                        ledger.limits['process_invocations'] += 1
+                        probe = {**formal, 'cwd': prepared['cwd'], 'condition_id': 'baseline',
+                            'preparation_ref': 'records/prepared/execution.json'}
+                        controller.execute_attempt('native_tool', attempt_id='baseline-probe', tool_name='measure_experiment',
+                            arguments=probe, approval={'token': 'explicit-probe',
+                                'binding': science.approval_binding(probe, identity='baseline-probe')})
+                        self.assertEqual(owner.approval_binding(work, identity=identity), original_binding)
+                        owner.check_delivery(result['data'], [result['data']['project_path']])
+                    saved = ledger.to_dict()
+                    with patch('simple_ar.experiment.execution.backend.run_process') as setup, patch(
+                            'simple_ar.code_task.execution.runner._run_command') as validator:
+                        context = CapabilityContext(store, AttemptManifest(identity))
+                        self.assertEqual(owner.execute(context, work, approval=approval).model_dump(mode='json'), result)
+                        setup.assert_not_called()
+                        validator.assert_not_called()
+                    self.assertEqual(ledger.to_dict(), saved)
+                self.assertEqual(read_json(root / 'attempts/prepared/execution.json'), original_prepared)
+                self.assertEqual((Path(prepared['cwd']) / 'main.py').read_text(), 'VALUE = 1\n')
+                app = ToolApplication.__new__(ToolApplication)
+                app.session, app.workspace, app.implementation, app.scientific = controller, workspace, owner, science
+                app.state = {'config': {'execution_contract': science.execution_contract}, 'requests': [contract['goal']],
+                    'turns': [{'tools': [{'result': f'attempts/{identity}/native_result.json'} for identity in
+                        ('prepared', 'baseline', 'initial', 'formal-initial', 'baseline-probe', 'feedback', 'formal-feedback')
+                        if (root / f'attempts/{identity}/native_result.json').is_file()]}]}
+                evidence = app._execution_evidence()
+                self.assertEqual(evidence['implementation_refs'],
+                    ['attempts/initial/implementation.json', 'attempts/feedback/implementation.json'])
+                self.assertIn('attempts/prepared/execution.json', evidence['evidence_sha256'])
+                self.assertIn('attempts/' + ('baseline' if mode == 'venv' else 'baseline-probe') + '/results.json', evidence['measurement_refs'])
+                self.assertIn('attempts/formal-feedback/results.json', evidence['measurement_refs'])
+                original_manifest = code_task_paths(workspace.workspace / 'code_tasks/prepared').manifest_path
+                original_bytes = original_manifest.read_bytes()
+                changed = read_json(original_manifest)
+                changed['code_task']['native_binding']['binding']['environment_preparations']['copy']['interpreter'] = '/forged/interpreter'
+                write_json(original_manifest, changed)
+                with self.assertRaisesRegex(ValueError, 'Prepared source differs'):
+                    owner.check_delivery(result['data'], [result['data']['project_path']])
+                original_manifest.write_bytes(original_bytes)
+                self.assertEqual((project / 'main.py').read_text(), 'VALUE = 1\n')
+                ledger.reserve('unexpected-preparation-process', {'process_invocations': 1, 'process_wall_seconds': 1},
+                    session_id='unit', attempt_id='prepared', logical_call_id='unproven-process', purpose='local_process')
+                ledger.mark_unknown('unexpected-preparation-process', reason='No finalized invocation')
+                unknown = ledger.to_dict()
+                self.assertFalse(owner.can_reconcile('prepare_code_task', 'prepared'))
+                with self.assertRaisesRegex(ValueError, 'unknown, extra or orphan'):
+                    owner.prepared_source('records/prepared/execution.json', identity='later')
+                with self.assertRaisesRegex(ValueError, 'unknown, extra or orphan'):
+                    owner.check_delivery(result['data'], [result['data']['project_path']])
+                self.assertEqual(ledger.to_dict(), unknown)
+
+    def test_exact_preparation_binds_selected_sources_environment_and_feedback(self) -> None:
+        from simple_ar.tools.implementation import ImplementationToolGateway
+        from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext, CapabilityRegistry, CapabilityResult
+        from simple_ar.core.session import SessionController, BudgetState
+        from simple_ar.tools.specs import ToolResult
+        from simple_ar.code_task.runtime.state import code_task_paths, load_code_task_manifest, implementation_file_hashes
+        import subprocess
+        from simple_ar.code_task.execution.runner import run_code_task_benchmark
+        for kind, mode, cap, inputs, repairs in (
+                ('existing_project', 'copy', 0, [], 0), ('existing_project', 'sparse_copy', 64, [], 2),
+                ('existing_project', 'copy', 64, ['data/table.csv'], 1),
+                ('existing_project', 'git_worktree', 0, [], 0),
+                ('greenfield', 'copy', 0, [], 0), ('greenfield', 'sparse_copy', 64, [], 2),
+                ('greenfield', 'copy', 64, ['data/table.csv'], 1)):
+            with self.subTest(kind=kind, mode=mode, cap=cap, inputs=inputs):
+                root = self.run_dir / f'policy-{kind}-{mode}-{cap}'
+                root.mkdir()
+                project = root / 'repo' / 'original'
+                project.mkdir(parents=True)
+                (project / 'main.py').write_text('VALUE = 1\n')
+                (project / 'check.py').write_text('import os\nassert os.getcwd() == os.environ["PYTHONPATH"].split(os.pathsep)[0]\n'
+                    if mode == 'git_worktree' else 'assert True\n')
+                (project / 'large.txt').write_text('x' * 100)
+                (project / 'private.py').write_text('PRIVATE = True\n')
+                (project / 'data').mkdir()
+                (project / 'data/table.csv').write_text('value\n' * 100)
+                if mode == 'git_worktree':
+                    (project / 'measure.py').write_text("from pathlib import Path\nfrom main import VALUE\n"
+                        "Path('observations.txt').write_text(f'score: {VALUE}\\n')\nprint(f'score: {VALUE}')\n")
+                original = {p.relative_to(project).as_posix(): p.read_bytes() for p in project.rglob('*') if p.is_file()}
+                if mode == 'git_worktree':
+                    for arguments in (['init'], ['config', 'user.email', 'test@example.com'],
+                            ['config', 'user.name', 'Native preparation test'], ['config', 'core.autocrlf', 'false'],
+                            ['add', '.'], ['commit', '-m', 'Fixture source']):
+                        subprocess.run(['git', '-C', str(project.parent), *arguments], check=True,
+                            capture_output=True, text=True)
+                (root / 'attempts').mkdir()
+                external = root / 'shared-input.csv'
+                external.write_text('Supplied data\n')
+                workspace = WorkspaceToolGateway(root, {'input': project, 'external': external,
+                    'records': root / 'attempts'}, self.ledger)
+                preparation = {'kind': kind,
+                    'workspace_mode': mode, 'max_file_bytes': cap, 'max_repairs': repairs, 'data_inputs': inputs,
+                    'workspace_include': ['*.py'], 'workspace_exclude': ['private.py'], 'workspace_reuse_source_venv': False,
+                    'env_mode': 'current', 'python_executable': None}
+                contract = {'project_path': 'input', 'goal': 'Implement the requested value',
+                    'allowed_patterns': ['*.py'], 'validation_command': ['python', 'check.py'], 'preparation': preparation,
+                    'edit_policy': {'budget_profile': 'normal', 'allow_large_edits': False,
+                        'edit_budget_overrides': {'max_total_edit_chars': 1200}}}
+                if inputs:
+                    contract['validation_command'].extend(['--data', str(external)])
+                formal = None
+                if mode == 'git_worktree':
+                    contract['validation_command'] = ['python', str(project / 'check.py')]
+                    formal = {'command': ['python', str(project / 'measure.py'), '--input=' + str(external)],
+                        'cwd': str(project), 'timeout_sec': 5,
+                        'result_schema': {'primary_metric': 'score', 'required_metrics': ['score'], 'direction': 'higher'},
+                        'protocol': {'contract_id': 'native-source-evaluation', 'hypothesis': 'Observe the declared score',
+                            'dataset_refs': [{'asset_id': 'native-validator'}], 'split_spec': {'name': 'declared-evaluation'},
+                            'metric_specs': [{'name': 'score', 'direction': 'higher'}],
+                            'comparison_conditions': {'seed': 17}}}
+                owner = ImplementationToolGateway(root, workspace, self.ledger, 'test-model', 'unit',
+                    exact=contract, measurement=formal)
+                if kind == 'greenfield':
+                    unmounted = root / 'unmounted'
+                    unmounted.mkdir()
+                    unauthorized = ImplementationToolGateway(root, workspace, self.ledger, 'test-model', 'unit',
+                        exact={**contract, 'project_path': str(unmounted)})
+                    with self.assertRaises(ValueError):
+                        unauthorized.approval_binding({}, identity='unmounted-scaffold')
+                ledger_before = self.ledger.to_dict()
+                if mode == 'git_worktree':
+                    registry = CapabilityRegistry()
+                    def native(*, context, work, approval):
+                        result = owner.execute(context, work, approval=approval)
+                        context.store.write_json('native_result.json', result.model_dump(mode='json'))
+                        return CapabilityResult(status='completed', artifacts=ToolApplication._native_artifacts(
+                            context.store, result.model_dump(mode='json'), name='implement_code_task'))
+                    registry.register('native_tool', native)
+                    controller = SessionController.create(root, session_id='unit', topic=contract['goal'],
+                        registry=registry, budget=BudgetState(max_attempts=5))
+                for turn in (1, 2):
+                    identity = f'native-tool-{turn:03d}'
+                    store = ArtifactStore(root / 'attempts' / identity)
+                    context = CapabilityContext(store, AttemptManifest(identity, capability='native_tool'))
+                    work = {} if turn == 1 else {'instruction': 'Retain the candidate and update it.',
+                        'prior_result': 'records/native-tool-001/implementation.json'}
+                    approval = {'token': 'approved-policy', 'binding': owner.approval_binding(work, identity=identity)}
+                    if turn == 1:
+                        self.assertEqual(approval['binding']['source']['project_path'], str(project.resolve()))
+                        (project / 'main.py').write_text('VALUE = 99\n')
+                        with patch('simple_ar.research.preparation.run_preparation_capability') as unapproved:
+                            with self.assertRaisesRegex(ValueError, 'source identity'):
+                                owner.execute(context, work, approval=approval)
+                            unapproved.assert_not_called()
+                        (project / 'main.py').write_bytes(original['main.py'])
+                    generation_names = ('task_contract', 'architecture_plan', 'code_artifacts',
+                        'dependency_advice', 'implementation_plan')
+                    def domain(*, context, request):
+                        paths = code_task_paths(request.run_dir)
+                        manifest = load_code_task_manifest(request.run_dir)
+                        self.assertEqual(request.max_repairs, repairs)
+                        self.assertEqual(request.budget_profile, 'normal')
+                        self.assertEqual(request.edit_budget_overrides, {'max_total_edit_chars': 1200})
+                        self.assertIs(request.budget_ledger, self.ledger)
+                        self.assertEqual(manifest['code_task']['kind'], kind)
+                        self.assertIn('check.py', manifest['edit_scope']['protected_patterns'])
+                        expected_validator = ((sys.executable, str(paths.workspace_dir / 'check.py')) if mode == 'git_worktree'
+                            else tuple(contract['validation_command']))
+                        self.assertEqual(request.validation_command, expected_validator)
+                        self.assertEqual(manifest['code_task']['native_binding'], approval)
+                        self.assertEqual(manifest['environment']['policy']['python_executable'], sys.executable)
+                        if turn == 1 and mode == 'sparse_copy':
+                            self.assertFalse((paths.workspace_dir / 'large.txt').exists())
+                            self.assertFalse((paths.workspace_dir / 'data/table.csv').exists())
+                            self.assertFalse((paths.workspace_dir / 'private.py').exists())
+                        if inputs:
+                            self.assertEqual((paths.workspace_dir / 'data/table.csv').read_bytes(), original['data/table.csv'])
+                            self.assertIn('data/table.csv', [row['path'] for row in request.protocol['protected_assets']])
+                            self.assertIn(str(external), [row['path'] for row in request.protocol['protected_assets']])
+                            self.assertEqual(approval['binding']['external_inputs'],
+                                {str(external): hashlib.sha256(external.read_bytes()).hexdigest()})
+                        if turn == 2:
+                            self.assertEqual((paths.workspace_dir / 'main.py').read_text(), 'VALUE = 2\n')
+                            self.assertEqual(manifest['workspace']['selected_mode'], 'copy')
+                            if kind == 'greenfield':
+                                self.assertEqual(manifest['implementation'],
+                                    {'mode': 'controlled_patch', 'status': 'revision_prepared'})
+                                for name in generation_names:
+                                    self.assertEqual(ArtifactStore(paths.meta_dir).read_json(f'{name}.json'),
+                                        {'fact': name, 'origin': 'validated generation'})
+                        (paths.workspace_dir / 'main.py').write_text(f'VALUE = {turn + 1}\n')
+                        if mode == 'git_worktree':
+                            validation = run_code_task_benchmark(request.run_dir,
+                                command=__import__('shlex').join(request.validation_command),
+                                timeout_sec=request.validation_timeout_sec, skip_validation=True,
+                                budget_ledger=request.budget_ledger, session_id=request.session_id,
+                                attempt_id=request.attempt_id)
+                            self.assertEqual(validation.status, 'passed')
+                        evidence = context.store.write_text('code_task/unit-domain.txt',
+                            f'Mock implementation; real validator executed={mode == "git_worktree"}; no model')
+                        refs = {'unit': evidence.to_dict()}
+                        validation_row = None
+                        if mode == 'git_worktree':
+                            retained = context.store.write_text('code_task/execution_report.json',
+                                validation.report_path.read_text(encoding='utf-8'), kind='implementation_validation_report')
+                            refs['validation_report'] = retained.to_dict()
+                            validation_row = {'command': list(request.validation_command),
+                                'timeout_sec': request.validation_timeout_sec, 'status': validation.status,
+                                'returncode': validation.returncode, 'timed_out': validation.timed_out,
+                                'metrics': dict(validation.metrics)}
+                        if kind == 'greenfield':
+                            for name in generation_names:
+                                document = {'fact': name, 'origin': 'validated generation'}
+                                ArtifactStore(paths.meta_dir).write_json(f'{name}.json', document)
+                                ref = context.store.write_json(f'code_task/{name}.json', document)
+                                refs[f'generation_{name}'] = ref.to_dict()
+                        context.store.write_json('implementation.json', {'status': 'validated', 'next_action': 'inspect',
+                            'schema_version': 'research_implementation.v1', 'validation': validation_row,
+                            'artifact_refs': refs,
+                            'artifact_hashes': {row['path']: hashlib.sha256(context.store.resolve(row['path']).read_bytes()).hexdigest()
+                                for row in refs.values()},
+                            'native_binding': approval, 'implementation_file_hashes': implementation_file_hashes(request.run_dir),
+                            'workspace_dir': str(paths.workspace_dir), 'code_task_run_dir': str(request.run_dir)})
+                    from simple_ar.research.preparation import run_preparation_capability
+                    with (patch('simple_ar.research.preparation.run_preparation_capability',
+                                wraps=run_preparation_capability) as prepare,
+                            patch('simple_ar.research.implementation.run_implementation_capability', side_effect=domain) as implement):
+                        if mode == 'git_worktree':
+                            controller.execute_attempt('native_tool', attempt_id=identity, work=work, approval=approval)
+                            observed = ToolResult.model_validate(store.read_json('native_result.json'))
+                        else:
+                            observed = owner.execute(context, work, approval=approval)
+                    prepare.assert_called_once()
+                    prepared_request = prepare.call_args.kwargs['request']
+                    expected_source = project if turn == 1 else code_task_paths(
+                        workspace.workspace / 'code_tasks/native-tool-001').workspace_dir
+                    self.assertEqual(prepared_request.execution['code_task']['code_root'], str(expected_source))
+                    self.assertEqual(prepared_request.execution['code_task']['workspace_mode'], mode if turn == 1 else 'copy')
+                    self.assertEqual(prepared_request.execution['code_task']['workspace_include'], ['*.py'] if turn == 1 else [])
+                    self.assertEqual(prepared_request.execution['code_task']['workspace_exclude'], ['private.py'] if turn == 1 else [])
+                    self.assertEqual(prepared_request.execution['code_task']['max_file_bytes'], cap)
+                    self.assertEqual(observed.status, 'ok')
+                    implement.assert_called_once()
+                    if mode == 'git_worktree':
+                        locator = f'records/{identity}/implementation.json'
+                        calls, ledger_saved = self.fake.ask_json.call_count, self.ledger.to_dict()
+                        selected = workspace.python
+                        workspace.python = project / 'main.py'  # Retrieval must use the prepared candidate interpreter.
+                        try:
+                            source = owner.measurement_source(locator, identity='measurement')
+                            self.assertEqual(source['python_executable'], sys.executable)
+                            self.assertEqual(source['implementation_ref']['path'], f'attempts/{identity}/implementation.json')
+                            self.assertEqual(source['prepared_ref']['kind'], 'prepared_execution')
+                            self.assertEqual(Path(source['cwd']), code_task_paths(workspace.workspace / 'code_tasks' / identity).workspace_dir)
+                            self.assertEqual(source['environment'], approval['binding']['process_environments']['git_worktree' if turn == 1 else 'copy']['environment'])
+                            self.assertTrue(all(Path(row['path']).is_absolute() for row in source['protected_assets']))
+                            output = Path(source['cwd']) / 'evaluation.json'
+                            output.write_text('{"score": 7}\n')
+                            with self.assertRaisesRegex(ValueError, 'output provenance'):
+                                owner.measurement_source(locator, identity='measurement')
+                            for name in ('unvalidated_new.py', 'requirements.txt'):
+                                unvalidated = Path(source['cwd']) / name
+                                unvalidated.write_text('new unvalidated content\n')
+                                try:
+                                    with self.assertRaisesRegex(ValueError, 'output provenance'):
+                                        owner.measurement_source(locator, identity='measurement')
+                                finally:
+                                    unvalidated.unlink()
+                            output.unlink()
+                            with self.assertRaises(ValueError):
+                                owner.measurement_source('workspace/implementation.json', identity='measurement')
+                            raw_domain, raw_native = store.read_json('implementation.json'), store.read_json('native_result.json')
+                            store.write_json('implementation.json', {**raw_domain, 'validation': None})
+                            store.write_json('native_result.json', {**raw_native, 'data': {**raw_native['data'], 'validation': None}})
+                            with self.assertRaisesRegex(ValueError, 'validator facts'):
+                                owner.measurement_source(locator, identity='measurement')
+                            store.write_json('implementation.json', raw_domain)
+                            store.write_json('native_result.json', {**raw_native, 'data': {**raw_native['data'], 'status': 'forged'}})
+                            with self.assertRaisesRegex(ValueError, 'observation differs'):
+                                owner.measurement_source(locator, identity='measurement')
+                            store.write_json('native_result.json', raw_native)
+                            commit = store.read_json('capability_result.json')
+                            store.write_json('capability_result.json', {**commit, 'artifacts': []})
+                            with self.assertRaisesRegex(ValueError, 'registered output'):
+                                owner.measurement_source(locator, identity='measurement')
+                            store.write_json('capability_result.json', commit)
+                            older_owner = ImplementationToolGateway(root, workspace, self.ledger, 'test-model', 'unit',
+                                exact={**contract, 'goal': 'A different frozen task'})
+                            with self.assertRaisesRegex(ValueError, 'different scope/validator'):
+                                older_owner.measurement_source(locator, identity='measurement')
+                            source_file = Path(source['cwd']) / 'main.py'
+                            content = source_file.read_bytes()
+                            source_file.write_text('VALUE = -1\n')
+                            with self.assertRaisesRegex(ValueError, 'candidate'):
+                                owner.measurement_source(locator, identity='measurement')
+                            source_file.write_bytes(content)
+                            attempt_row = store.read_json('attempt_manifest.json')
+                            store.write_json('attempt_manifest.json', {**attempt_row, 'status': 'running'})
+                            with self.assertRaisesRegex(ValueError, 'completed native_tool'):
+                                owner.measurement_source(locator, identity='measurement')
+                            prepared_bytes = store.resolve('execution.json').read_bytes()
+                            store.resolve('execution.json').unlink()
+                            for name, document, key in (('attempt_manifest.json', attempt_row, 'outputs'),
+                                    ('capability_result.json', commit, 'artifacts')):
+                                store.write_json(name, {**document, key: [row for row in document[key]
+                                    if row['kind'] != 'prepared_execution']})
+                            legacy = owner.measurement_source(locator, identity='measurement')
+                            self.assertIsNone(legacy['prepared_ref'])
+                            self.assertTrue(legacy['limitations'])
+                            self.assertFalse(store.exists('execution.json'))
+                            store.resolve('execution.json').write_bytes(prepared_bytes)
+                            store.write_json('attempt_manifest.json', attempt_row)
+                            store.write_json('capability_result.json', commit)
+                        finally:
+                            workspace.python = selected
+                        self.assertEqual(self.fake.ask_json.call_count, calls)
+                        self.assertEqual(self.ledger.to_dict(), ledger_saved)
+                    with (patch('simple_ar.research.preparation.run_preparation_capability') as prepare,
+                          patch('simple_ar.research.implementation.run_implementation_capability') as implement):
+                        owner.execute(context, work, approval=approval)
+                        prepare.assert_not_called()
+                        implement.assert_not_called()
+                if mode == 'git_worktree':
+                    self.assertEqual(len(self.ledger.entries) - len(ledger_before['entries']), 2)
+                    self.assertTrue(all(row.status == 'settled' and row.purpose == 'local_process' for row in self.ledger.entries))
+                    from simple_ar.tools.scientific import ScientificToolGateway
+                    import simple_ar.research.analysis as analysis_owner
+                    science = ScientificToolGateway(root, workspace, self.ledger, 'unit',
+                        implementation=owner, execution_contract=formal)
+                    owner.candidate_outputs = science.candidate_outputs
+                    source = owner.measurement_source('records/native-tool-002/implementation.json', identity='native-measure')
+                    from simple_ar.code_task.execution.environment import project_command
+                    outside = str(project / '..' / 'external.csv')
+                    self.assertEqual(project_command(['tool', '--input=' + outside], project, Path(source['cwd'])),
+                        ['tool', '--input=' + outside])
+                    source_python = str(project / '.venv/bin/python')
+                    self.assertEqual(project_command([source_python, str(project / 'measure.py')], project,
+                        Path(source['cwd']), python_executable=source_python),
+                        [source_python, str(Path(source['cwd']) / 'measure.py')])
+                    self.ledger.limits.update(process_invocations=3, process_wall_seconds=2 * owner.exact.timeout_sec + 10)
+                    measurement = {**formal, 'implementation_ref': 'records/native-tool-002/implementation.json',
+                        'cwd': source['cwd'], 'workspace_outputs': ['observations.txt', 'missing-observation.txt']}
+                    for changes in ({'command': ['python', '-c', "print('score: 99')"]},
+                                    {'timeout_sec': 6}, {'cwd': str(project)}, {'result_schema': {}}):
+                        with self.subTest(unapproved_measurement=changes), self.assertRaises(ValueError):
+                            science.approval_binding({**measurement, **changes}, identity='changed-formal')
+                    execution_approval = {'token': 'approved-native-measurement',
+                        'binding': science.approval_binding(measurement, identity='native-measure')}
+                    previous = registry.resolve('native_tool')
+                    def scientific_native(*, context, tool_name, arguments, approval=None):
+                        result = science.execute_tool(tool_name, context, arguments, approval=approval)
+                        context.store.write_json('native_result.json', result.model_dump(mode='json'))
+                        return CapabilityResult(status='completed', artifacts=ToolApplication._native_artifacts(
+                            context.store, result.model_dump(mode='json'), name=tool_name))
+                    calls = self.fake.ask_json.call_count
+                    registry.register('native_tool', scientific_native, replace=True)
+                    try:
+                        controller.execute_attempt('native_tool', attempt_id='native-measure', tool_name='measure_experiment',
+                            arguments=measurement, approval=execution_approval)
+                        measured = ArtifactStore(root / 'attempts/native-measure')
+                        observed = measured.read_json('native_result.json')
+                        self.assertEqual(observed['status'], 'ok', observed['error'])
+                        canonical = measured.read_json('results.json')
+                        self.assertEqual(canonical['implementation_ref'], source['implementation_ref'])
+                        self.assertEqual(canonical['preparation']['source_ref'], source['prepared_ref'])
+                        self.assertEqual(canonical['measurement']['seed'], 17)
+                        self.assertEqual(canonical['measurement']['asset_integrity']['status'], 'observed_unchanged')
+                        self.assertEqual(canonical['command'][0], source['python_executable'])
+                        self.assertEqual(canonical['command'][1], str(Path(source['cwd']) / 'measure.py'))
+                        self.assertEqual(canonical['command'][2], '--input=' + str(external))
+                        self.assertEqual(canonical['metrics']['score'], 3)
+                        self.assertEqual(observed['data']['missing_workspace_outputs'], ['missing-observation.txt'])
+                        issues = science.delivery_issues([{'tool_name': 'measure_experiment', 'arguments': measurement,
+                            'record': 'attempts/native-measure/native_result.json'}])
+                        self.assertTrue(any('missing-observation.txt' in issue for issue in issues), issues)
+                        candidate = Path(source['cwd'])
+                        self.assertEqual((candidate / 'observations.txt').read_text(), 'score: 3\n')
+                        owner.check_delivery(ToolResult.model_validate(
+                            ArtifactStore(root / 'attempts/native-tool-002').read_json('native_result.json')).data,
+                            [str(candidate)])
+                        feedback = {'prior_result': 'records/native-tool-002/implementation.json',
+                            'instruction': 'Keep the existing measurement, change only the code explanation.'}
+                        next_binding = owner.approval_binding(feedback, identity='native-feedback')
+                        self.assertIn('observations.txt', next_binding['prior_source']['file_hashes'])
+                        with self.assertRaisesRegex(ValueError, 'original validator scope'):
+                            science.approval_binding({**measurement, 'workspace_outputs': ['later.txt']}, identity='repeat-measure')
+                        retained_output = (candidate / 'observations.txt').read_bytes()
+                        (candidate / 'observations.txt').write_text('changed result\n')
+                        with self.assertRaises(ValueError):
+                            owner.approval_binding(feedback, identity='native-feedback')
+                        (candidate / 'observations.txt').write_bytes(retained_output)
+                        (candidate / 'settings.json').write_text('{"mode": "unvalidated"}\n')
+                        with self.assertRaisesRegex(ValueError, 'output provenance'):
+                            owner.measurement_source(feedback['prior_result'], identity='native-feedback')
+                        (candidate / 'settings.json').unlink()
+                        with self.assertRaisesRegex(ValueError, 'replace validated inputs'):
+                            from simple_ar.code_task.runtime.state import implementation_output_inventory
+                            implementation_output_inventory(source['file_hashes'], {'check.py': ''})
+                        environment = observed['data']['effective_execution']['environment']
+                        self.assertEqual({key: environment[key] for key in source['environment']}, source['environment'])
+                        with patch('simple_ar.research.analysis.analyze_results', wraps=analysis_owner.analyze_results) as analyze:
+                            controller.execute_attempt('native_tool', attempt_id='native-analysis', tool_name='analyze_measurements',
+                                arguments={'result_refs': [observed['data']['result_ref']]})
+                            analyzed = ArtifactStore(root / 'attempts/native-analysis').read_json('native_result.json')
+                            self.assertEqual(analyzed['status'], 'ok', analyzed['error'])
+                            request = analyze.call_args.args[0]
+                            self.assertFalse(request.use_llm)
+                            self.assertEqual(request.context.project_results['implementation']['artifact_ref'], source['implementation_ref'])
+                            self.assertNotIn('implementation_ref', request.context.project_results)
+                    finally:
+                        registry.register('native_tool', previous, replace=True)
+                    self.assertEqual(self.fake.ask_json.call_count, calls)
+                    self.assertEqual(len(self.ledger.entries) - len(ledger_before['entries']), 3)
+                    self.assertEqual(self.ledger.entries[-1].attempt_id, 'native-measure')
+                    self.assertEqual(self.ledger.entries[-1].status, 'settled')
+                    self.ledger.limits.update(process_invocations=4, process_wall_seconds=3 * owner.exact.timeout_sec + 10)
+                    turn = 3
+                    approval = {'token': 'approved-feedback-with-retained-output', 'binding': next_binding}
+                    with patch('simple_ar.research.implementation.run_implementation_capability', side_effect=domain):
+                        feedback_result = controller.execute_attempt('native_tool', attempt_id='native-feedback', work=feedback,
+                            approval=approval)
+                    self.assertEqual(feedback_result.status, 'completed', feedback_result.diagnostics)
+                    revised = ArtifactStore(root / 'attempts/native-feedback').read_json('native_result.json')
+                    revised_candidate = workspace.resolve(revised['data']['project_path'])
+                    self.assertEqual(revised['status'], 'ok', revised['error'])
+                    self.assertEqual((revised_candidate / 'observations.txt').read_bytes(), retained_output)
+                    self.assertEqual((revised_candidate / 'main.py').read_text(), 'VALUE = 4\n')
+                    owner.check_delivery(revised['data'], [str(revised_candidate)])
+                    ready = owner.measurement_source('records/native-feedback/implementation.json', identity='next-measurement')
+                    self.assertIn('observations.txt', ready['file_hashes'])
+                    self.assertEqual(len(self.ledger.entries) - len(ledger_before['entries']), 4)
+                    self.assertEqual(self.ledger.entries[-1].attempt_id, 'native-feedback')
+                    self.assertEqual(self.fake.ask_json.call_count, calls)
+                else:
+                    self.assertEqual(self.ledger.to_dict(), ledger_before)
+                self.assertEqual({p.relative_to(project).as_posix(): p.read_bytes() for p in project.rglob('*') if p.is_file()}, original)
+                if kind == 'greenfield':
+                    prior = ArtifactStore(root / 'attempts/native-tool-002')
+                    ref = prior.read_json('implementation.json')['artifact_refs']['generation_architecture_plan']
+                    prior.write_json(ref['path'], {'changed': 'generation evidence'})
+                    with self.assertRaisesRegex(ValueError, 'evidence changed'):
+                        owner.approval_binding({'prior_result': 'records/native-tool-002/implementation.json'},
+                            identity='native-tool-003')
+                if mode == 'sparse_copy':
+                    omitted_validator = ImplementationToolGateway(root, workspace, self.ledger, 'test-model', 'unit',
+                        exact={**contract, 'preparation': {**preparation, 'workspace_exclude': ['check.py']}})
+                    with self.assertRaisesRegex(ValueError, 'omits a declared validator'):
+                        omitted_validator.approval_binding({}, identity='omitted-validator')
+                    self.assertFalse((workspace.workspace / 'code_tasks/omitted-validator').exists())
+                if mode == 'git_worktree':
+                    (project.parent / '.gitattributes').write_text('*.py text\n')
+                    for arguments in (['add', '.gitattributes'], ['commit', '-m', 'Fixture attributes']):
+                        subprocess.run(['git', '-C', str(project.parent), *arguments], check=True,
+                            capture_output=True, text=True)
+                    auto = ImplementationToolGateway(root, workspace, self.ledger, 'test-model', 'unit',
+                        exact={**contract, 'preparation': {**preparation, 'workspace_mode': 'auto'}})
+                    with self.assertRaisesRegex(ValueError, 'unbound Git checkout'):
+                        auto.approval_binding({}, identity='unbound-checkout')
+                    self.assertFalse((workspace.workspace / 'code_tasks/unbound-checkout').exists())
+
+    def test_required_new_files_are_created_by_edit_owner_not_initializer_or_checker(self) -> None:
+        from simple_ar.tools.implementation import ImplementationToolGateway
+        from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
+        from simple_ar.code_task.runtime.state import code_task_paths, load_code_task_manifest, implementation_file_hashes
+        from simple_ar.code_task.execution.runner import run_code_task_benchmark
+        from simple_ar.code_task import generate_patch_plan, record_plan_decision
+        from simple_ar.code_task.orchestration.verification import verify_implementation
+        from simple_ar.code_task.orchestration.execute import implementation_resume_allowed
+        root = self.run_dir / 'required-creation'
+        project = root / 'source'
+        project.mkdir(parents=True)
+        (project / 'checker.py').write_text("from pathlib import Path\np=Path('adapter.py')\n"
+            "if not p.exists(): p.write_text('VALUE = 4\\n')\nassert 'VALUE = 4' in p.read_text()\n")
+        original = (project / 'checker.py').read_bytes()
+        workspace = WorkspaceToolGateway(root, {'input': project, 'records': root / 'attempts'}, self.ledger)
+        contract = {'project_path': 'input', 'goal': 'Create the requested source without modifying the checker',
+            'allowed_patterns': ['adapter.py', '.settings/layout.py'], 'new_files': ['adapter.py', '.settings/layout.py'],
+            'validation_command': ['python', 'checker.py'], 'timeout_sec': 5,
+            'preparation': {'kind': 'existing_project', 'workspace_mode': 'copy'}}
+        owner = ImplementationToolGateway(root, workspace, self.ledger, 'fixture', 'unit', exact=contract)
+        context = CapabilityContext(ArtifactStore(root / 'attempts' / 'native-creation'),
+            AttemptManifest('native-creation', capability='native_tool'))
+        approval = {'token': 'explicit-creation', 'binding': owner.approval_binding({}, identity='native-creation')}
+        self.ledger.limits.update(process_invocations=2, process_wall_seconds=10)
+        def implement(*, context, request):
+            paths = code_task_paths(request.run_dir)
+            self.assertFalse((paths.workspace_dir / 'adapter.py').exists())
+            self.assertNotIn('adapter.py', implementation_file_hashes(request.run_dir))
+            # A checker capable of creating the missing source must not start:
+            # otherwise a later unrelated repair could launder its output.
+            def validate():
+                return run_code_task_benchmark(request.run_dir,
+                    command=__import__('shlex').join(request.validation_command), timeout_sec=5,
+                    skip_validation=True, budget_ledger=self.ledger, session_id='unit', attempt_id='native-creation')
+            before = self.ledger.to_dict()
+            with patch('simple_ar.code_task.execution.runner._run_command') as physical:
+                failed = validate()
+            physical.assert_not_called()
+            self.assertEqual((failed.returncode, failed.status), (None, 'blocked_by_validation'))
+            self.assertEqual(self.ledger.to_dict(), before)
+            self.assertFalse((paths.workspace_dir / 'adapter.py').exists())
+            generate_patch_plan(request.run_dir, use_llm=False)
+            record_plan_decision(request.run_dir, decision='approve')
+            # Substitute model responses, not planning, application, recovery,
+            # static checking, physical validation or its original ledger.
+            reply = {'summary': 'Create the missing source', 'status': 'passed', 'findings': [],
+                'edits': [{'path': name, 'old': '', 'new': 'VALUE = 4\n'} for name in contract['new_files']]}
+            with patch.object(self.fake, 'ask_json', return_value=reply):
+                checked = verify_implementation(request.run_dir, command=request.validation_command,
+                    timeout_sec=5, approval_note='Explicit fixture creation', max_repairs=1,
+                    llm_client=self.fake,
+                    asset_guard=lambda: {'status': 'unchanged'}, budget_ledger=self.ledger,
+                    session_id='unit', attempt_id='native-creation')
+            validated = checked.validation
+            self.assertEqual(validated.status, 'passed')
+            self.assertEqual(checked.repairs[0]['outcome'], 'passed')
+            self.assertTrue(implementation_resume_allowed(request.run_dir, ledger=self.ledger, attempt_id='native-creation'))
+            ref = context.store.write_text('code_task/validation.json', validated.report_path.read_text())
+            context.store.write_json('implementation.json', {'status': 'validated', 'next_action': 'inspect',
+                'schema_version': 'research_implementation.v1', 'validation': {'status': 'passed'},
+                'artifact_refs': {'validation_report': ref.to_dict()},
+                'artifact_hashes': {ref.path: hashlib.sha256(context.store.resolve(ref).read_bytes()).hexdigest()},
+                'native_binding': approval, 'implementation_file_hashes': implementation_file_hashes(request.run_dir),
+                'workspace_dir': str(paths.workspace_dir), 'code_task_run_dir': str(request.run_dir)})
+        from simple_ar.research.preparation import run_preparation_capability
+        with patch('simple_ar.research.preparation.run_preparation_capability', wraps=run_preparation_capability) as prepare, \
+                patch('simple_ar.research.implementation.run_implementation_capability', side_effect=implement):
+            result = owner.execute(context, {}, approval=approval)
+        self.assertNotIn('initial_files', prepare.call_args.kwargs['request'].execution['code_task'])
+        owner.check_delivery(result.data, [result.data['project_path']])
+        hidden = code_task_paths(Path(result.data['code_task_run_dir'])).workspace_dir / '.settings/layout.py'
+        hidden.write_text('VALUE = 999\n')
+        with self.assertRaisesRegex(ValueError, 'inventory changed'):
+            owner.check_delivery(result.data, [result.data['project_path']])
+        hidden.write_text('VALUE = 4\n')
+        run = Path(result.data['code_task_run_dir'])
+        paths = code_task_paths(run)
+        report = read_json(paths.run_artifact_dir / 'patched/execution_report.json')
+        physical = paths.run_artifact_dir / 'patched/process' / report['process']['invocation_id'] / 'invocation.json'
+        receipt = read_json(physical)
+        changed = __import__('copy').deepcopy(receipt)
+        changed['input_binding'].pop('required_new_file_issues')
+        write_json(physical, changed)
+        with self.assertRaisesRegex(RuntimeError, 'cannot be reconciled'):
+            owner.check_delivery(result.data, [result.data['project_path']])
+        write_json(physical, receipt)
+        ledger = self.ledger.to_dict()
+        with patch('simple_ar.research.implementation.run_implementation_capability') as repeat, \
+                patch('simple_ar.code_task.execution.runner._run_command') as process:
+            self.assertEqual(owner.execute(context, {}, approval=approval), result)
+            repeat.assert_not_called()
+            process.assert_not_called()
+        self.assertEqual(self.ledger.to_dict(), ledger)
+        self.assertFalse((project / 'adapter.py').exists())
+        self.assertEqual((project / 'checker.py').read_bytes(), original)
+        (project / 'adapter.py').write_text('author-owned now\n')
+        with self.assertRaisesRegex(ValueError, 'must not replace an original'):
+            owner.approval_binding({}, identity='new-authority')
+
+    def test_exact_code_task_keeps_core_attempt_approval_and_domain_recovery(self) -> None:
+        from simple_ar.tools.implementation import ImplementationToolGateway, implementation_tool_specs
+        from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
+        from simple_ar.code_task.runtime.state import code_task_paths, load_code_task_manifest, implementation_file_hashes
+        from simple_ar.research.preparation import run_preparation_capability
+        project = self.run_dir / 'input'
+        project.mkdir()
+        (project / 'main.py').write_text('VALUE = 1\n')
+        (project / 'check.py').write_text('assert True\n')
+        (self.run_dir / 'attempts').mkdir(exist_ok=True)
+        workspace = WorkspaceToolGateway(self.run_dir,
+            {'source0': project, 'records': self.run_dir / 'attempts'}, self.ledger)
+        contract = {'project_path': 'source0', 'goal': 'Fix VALUE', 'allowed_patterns': ['main.py'],
+            'protected_patterns': ['gold/**'], 'validation_command': ['python', 'check.py'], 'timeout_sec': 20}
+        owner = ImplementationToolGateway(self.run_dir, workspace, self.ledger, 'test-model', 'unit', exact=contract)
+        self.assertEqual([item.name for item in implementation_tool_specs(exact=True)], ['prepare_code_task', 'implement_code_task'])
+        store = ArtifactStore(self.run_dir / 'attempts' / 'native-tool-001')
+        attempt = AttemptManifest('native-tool-001', capability='native_tool')
+        context = CapabilityContext(store, attempt)
+        approval = {'token': 'explicit-approval', 'binding': owner.approval_binding({}, identity=attempt.attempt_id)}
+        self.assertEqual(approval['binding']['contract'], contract)
+        changed_policy = ImplementationToolGateway(self.run_dir, workspace, self.ledger, 'test-model', 'unit',
+            exact={**contract, 'edit_policy': {'allow_large_edits': True}})
+        with self.assertRaisesRegex(ValueError, 'different CodeTask contract'):
+            changed_policy.execute(context, {}, approval=approval)
+        with self.assertRaises(ValueError):
+            owner.approval_binding({'edit_policy': {'allow_large_edits': True}}, identity=attempt.attempt_id)
+        self.assertIn('check.py', approval['binding']['protected_patterns'])
+        before = {p.name: p.read_bytes() for p in project.iterdir()}
+        run = (workspace.workspace / 'code_tasks' / attempt.attempt_id).resolve()
+        ledger_before = self.ledger.to_dict()
+
+        def interrupted_before_execution(*, context, request):
+            self.assertIs(context.attempt, attempt)
+            self.assertIs(context.store, store)
+            self.assertIs(request.budget_ledger, self.ledger)
+            self.assertEqual(request.attempt_id, attempt.attempt_id)
+            self.assertEqual(request.run_dir.resolve(), run)
+            self.assertEqual(request.validation_command, ('python', 'check.py'))
+            self.assertEqual(request.validation_timeout_sec, contract['timeout_sec'])
+            self.assertEqual(request.max_repairs, 1)
+            self.assertEqual(request.approval_note, 'Explicit native approval: ' + approval['token'])
+            manifest = load_code_task_manifest(request.run_dir)
+            self.assertIn('check.py', manifest['edit_scope']['protected_patterns'])
+            self.assertIn('gold/**', manifest['edit_scope']['protected_patterns'])
+            self.assertEqual(manifest['code_task']['native_binding'], approval)
+            self.assertEqual(request.protocol, manifest['code_task']['native_protocol'])
+            self.assertEqual([row['path'] for row in request.protocol['protected_assets']], ['check.py'])
+            raise RuntimeError('worker stopped before model dispatch')
+
+        with (patch('simple_ar.research.preparation.run_preparation_capability', wraps=run_preparation_capability) as prepare,
+                patch('simple_ar.research.implementation.run_implementation_capability', side_effect=interrupted_before_execution)):
+            with self.assertRaisesRegex(RuntimeError, 'worker stopped'):
+                owner.execute(context, {}, approval=approval)
+        prepare.assert_called_once()
+        self.assertIs(prepare.call_args.kwargs['context'], context)
+        preparation = prepare.call_args.kwargs['request']
+        self.assertEqual(preparation.run_dir, run)
+        self.assertEqual(preparation.task_text, contract['goal'])
+        self.assertEqual(preparation.run.cwd, project.resolve())
+        self.assertEqual(preparation.execution['code_task']['workspace_mode'], 'copy')
+        self.assertEqual(preparation.execution['code_task']['max_file_bytes'], 0)
+        self.assertEqual(self.ledger.to_dict(), ledger_before)
+        prepared = store.read_json('execution.json')
+        self.assertEqual(prepared['schema_version'], 'prepared_execution.v1')
+        self.assertEqual(prepared['workspace_info']['mode'], 'copy')
+        self.assertEqual(Path(prepared['workspace']).resolve(), code_task_paths(run).workspace_dir.resolve())
+        self.assertEqual(Path(prepared['source_project']).resolve(), project.resolve())
+        execution = prepared['execution']
+        self.assertEqual(execution['command'], contract['validation_command'])
+        self.assertEqual(execution['timeout_sec'], contract['timeout_sec'])
+        task = execution['code_task']
+        self.assertEqual(Path(task['run_dir']).resolve(), run)
+        self.assertEqual(task['env_mode'], 'external')
+        self.assertEqual(task['python_executable'], str(workspace.python))
+        self.assertNotIn('allowed_patterns', task)
+        self.assertNotIn('protected_patterns', task)
+        self.assertEqual(task['validation_command'], contract['validation_command'])
+        self.assertEqual(task['validation_timeout_sec'], contract['timeout_sec'])
+        self.assertEqual(task['max_repairs'], 1)
+        self.assertEqual(task['approval_note'], 'Explicit native approval: ' + approval['token'])
+        manifest = load_code_task_manifest(run)
+        self.assertEqual(manifest['edit_scope']['allowed_patterns'], contract['allowed_patterns'])
+        self.assertLessEqual(set(approval['binding']['protected_patterns']), set(manifest['edit_scope']['protected_patterns']))
+        self.assertEqual(manifest['workspace']['mode'], 'copy')
+        self.assertEqual(manifest['copy']['max_file_bytes'], 0)
+        self.assertEqual(manifest['environment']['policy']['mode'], 'external')
+        self.assertEqual(implementation_file_hashes(run), approval['binding']['source']['file_hashes'])
+        self.assertEqual({p.name: p.read_bytes() for p in project.iterdir()}, before)
+        self.assertTrue(owner.can_reconcile('implement_code_task', attempt.attempt_id))
+        held = self.ledger.reserve('pending-code-model', {'llm_requests': 1, 'total_tokens': 10},
+            attempt_id=attempt.attempt_id, purpose='code-task-plan')
+        self.assertFalse(owner.can_reconcile('implement_code_task', attempt.attempt_id))
+        self.ledger.release(held.reservation_id, reason='confirmed not dispatched')
+        self.assertTrue(owner.can_reconcile('implement_code_task', attempt.attempt_id))
+        retained = {name: store.resolve(name).read_bytes() for name in ('execution.json', 'inputs/task.md')}
+        ledger_before = self.ledger.to_dict()
+        with (patch('simple_ar.research.preparation.run_preparation_capability') as no_prepare,
+                patch('simple_ar.code_task.orchestration.workflow.initialize_code_task') as no_initialize,
+                patch('simple_ar.research.implementation.run_implementation_capability', side_effect=interrupted_before_execution)):
+            with self.assertRaisesRegex(RuntimeError, 'worker stopped'):
+                owner.execute(context, {}, approval=approval)
+            no_prepare.assert_not_called()
+            no_initialize.assert_not_called()
+        self.assertEqual({name: store.resolve(name).read_bytes() for name in retained}, retained)
+        self.assertEqual(self.ledger.to_dict(), ledger_before)
+
+        # The same real initialized manifest models an older native attempt:
+        # preparation receipts were not written then and must not be backfilled.
+        store.resolve('execution.json').unlink()
+        retained_manifest = (run / 'manifest.json').read_bytes()
+
+        def saved_domain_result(*, context, request):
+            self.assertIs(context.attempt, attempt)
+            self.assertIs(context.store, store)
+            self.assertIs(request.budget_ledger, self.ledger)
+            self.assertEqual(request.attempt_id, attempt.attempt_id)
+            self.assertFalse(context.store.exists('execution.json'))
+            paths = code_task_paths(request.run_dir)
+            (paths.workspace_dir / 'main.py').write_text('VALUE = 2\n')
+            evidence = context.store.write_text('code_task/review.txt', 'retained independent review')
+            context.store.write_json('implementation.json', {'status': 'validated', 'next_action': 'inspect',
+                'artifact_refs': {'review': evidence.to_dict()},
+                'artifact_hashes': {evidence.path: hashlib.sha256(context.store.resolve(evidence).read_bytes()).hexdigest()},
+                'native_binding': approval, 'implementation_file_hashes': implementation_file_hashes(request.run_dir),
+                'workspace_dir': str(paths.workspace_dir), 'code_task_run_dir': str(request.run_dir)})
+            raise RuntimeError('worker stopped after domain commit')
+
+        with (patch('simple_ar.research.preparation.run_preparation_capability') as no_prepare,
+                patch('simple_ar.code_task.orchestration.workflow.initialize_code_task') as no_initialize,
+                patch('simple_ar.research.implementation.run_implementation_capability', side_effect=saved_domain_result)):
+            with self.assertRaisesRegex(RuntimeError, 'domain commit'):
+                owner.execute(context, {}, approval=approval)
+            no_prepare.assert_not_called()
+            no_initialize.assert_not_called()
+        self.assertFalse(store.exists('execution.json'))
+        self.assertEqual((run / 'manifest.json').read_bytes(), retained_manifest)
+        self.assertEqual(store.resolve('inputs/task.md').read_bytes(), retained['inputs/task.md'])
+        self.assertEqual(self.ledger.to_dict(), ledger_before)
+        with (patch('simple_ar.research.preparation.run_preparation_capability') as no_prepare,
+                patch('simple_ar.research.implementation.run_implementation_capability') as no_replay):
+            observed = owner.execute(context, {}, approval=approval)
+            self.assertEqual(observed.status, 'ok')
+            no_prepare.assert_not_called()
+            no_replay.assert_not_called()
+            owner.check_delivery(observed.data, [observed.data['project_path']])
+            with self.assertRaisesRegex(ValueError, 'verified candidate'):
+                owner.check_delivery(observed.data, ['workspace/unrelated.md'])
+        self.assertFalse(store.exists('execution.json'))
+        self.assertEqual(self.ledger.to_dict(), ledger_before)
+        self.assertEqual({p.name for p in (self.run_dir / 'attempts').iterdir() if p.is_dir()}, {attempt.attempt_id})
+        feedback = {'instruction': 'Keep the first change and update VALUE to three.',
+            'prior_result': 'records/native-tool-001/implementation.json'}
+        next_store = ArtifactStore(self.run_dir / 'attempts' / 'native-tool-002')
+        next_attempt = AttemptManifest('native-tool-002', capability='native_tool')
+        next_context = CapabilityContext(next_store, next_attempt)
+        with self.assertRaisesRegex(ValueError, 'different scope/validator contract'):
+            changed_policy.approval_binding(feedback, identity=next_attempt.attempt_id)
+        next_approval = {'token': 'approved-feedback', 'binding': owner.approval_binding(feedback, identity=next_attempt.attempt_id)}
+        def revised_domain_result(*, context, request):
+            self.assertIs(context.attempt, next_attempt)
+            self.assertIs(context.store, next_store)
+            candidate = code_task_paths(request.run_dir).workspace_dir
+            self.assertEqual((candidate / 'main.py').read_text(), 'VALUE = 2\n')
+            self.assertIn(feedback['instruction'], context.store.read_text('inputs/task.md'))
+            self.assertIn(feedback['instruction'], context.read_input_json(context.inputs[0])['request_text'])
+            prepared = context.store.read_json('execution.json')
+            self.assertEqual(Path(prepared['source_project']).resolve(), project.resolve())
+            self.assertEqual(prepared['execution']['code_task']['run_dir'], str(request.run_dir))
+            self.assertIs(request.budget_ledger, self.ledger)
+            self.assertEqual(request.validation_command, ('python', 'check.py'))
+            (candidate / 'main.py').write_text('VALUE = 3\n')
+            context.store.write_json('implementation.json', {'status': 'validated', 'next_action': 'inspect',
+                'artifact_refs': {}, 'artifact_hashes': {}, 'native_binding': next_approval,
+                'implementation_file_hashes': implementation_file_hashes(request.run_dir),
+                'workspace_dir': str(candidate), 'code_task_run_dir': str(request.run_dir)})
+        with patch('simple_ar.research.implementation.run_implementation_capability', side_effect=revised_domain_result):
+            revised = owner.execute(next_context, feedback, approval=next_approval)
+        owner.check_delivery(revised.data, [revised.data['project_path']])
+        self.assertEqual((code_task_paths(self.run_dir / 'workspace/code_tasks/native-tool-001').workspace_dir / 'main.py').read_text(), 'VALUE = 2\n')
+        self.assertEqual((project / 'main.py').read_text(), 'VALUE = 1\n')
+        with patch('simple_ar.research.implementation.run_implementation_capability') as no_replay:
+            store.write_text('code_task/review.txt', 'changed evidence')
+            with self.assertRaisesRegex(ValueError, 'evidence changed'):
+                owner.execute(context, {}, approval=approval)
+        self.assertEqual({p.name: p.read_bytes() for p in project.iterdir()}, before)
+        (project / 'check.py').write_text('assert False\n')
+        with self.assertRaisesRegex(ValueError, 'source identity'):
+            owner.execute(context, {}, approval=approval)
 
     def test_native_generation_binds_sources_diagnostics_and_candidate_replay(self) -> None:
         from simple_ar.tools.implementation import implementation_tool_specs

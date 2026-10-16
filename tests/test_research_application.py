@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+import shutil
 import tempfile
 import sys
 from types import SimpleNamespace
@@ -18,10 +19,21 @@ from simple_ar.app.research_application import (
 from simple_ar.core.budget import BudgetLedger
 from simple_ar.integrations.llm import LLMClient, LLMError, LLMSettings
 from simple_ar.research.planning.capability import ResearchPlanRequest
+from simple_ar.research.implementation import ImplementationRequest
 from simple_ar.research.workflow_contracts import ResearchBrief
 from simple_ar.research.task_plan import TaskPlanResult, TaskPlanStep
-from simple_ar.research.implementation import ImplementationRequest
 
+
+from simple_ar.code_task import initialize_code_task
+from simple_ar.code_task.runtime.state import code_task_paths
+from simple_ar.core.artifacts import read_json
+from tests.code_task_fixtures import (
+    TOY_PREDICT_SOURCE,
+    TOY_PREDICT_WITH_PRIZE,
+    keyword_code_responses,
+    write_toy_project as _write_toy_project,
+    write_keyword_validation_test,
+)
 
 class ResearchApplicationTests(unittest.TestCase):
     def _paper_session(self, root, text, *, filename="paper.md", services=None, **brief_fields):
@@ -50,6 +62,7 @@ class ResearchApplicationTests(unittest.TestCase):
             self.assertEqual(initial.status, "paused")
             self.assertEqual(initial.next_action, "document_ingest")
             self.assertNotIn("documents", initial.state_refs)
+            self.assertFalse(any(row["capability"] == "report_write" for row in initial.attempts))
             attempts = list(app.controller.list_attempts())
             failed = next(row for row in attempts if row.capability == "document_ingest")
             self.assertEqual(failed.status, "blocked")
@@ -211,7 +224,7 @@ class ResearchApplicationTests(unittest.TestCase):
             config = {"research_task_kind": "writing", "research_materials_only": True,
                       "research_plan_mode": "deterministic", "report_writing_method": "article",
                       "report": {"reviewer": "disabled", "max_review_iterations": 0,
-                                 "allow_source_backtracking": False, "outline_strategy": "template"}}
+                                 "allow_source_backtracking": False, "outline_strategy": "auto"}}
             app = create_session(ResearchBrief(request_text="Explain the observation without claiming verification",
                 requested_outputs=("report",), asset_requests=({"locator": str(material), "role": "material"},)),
                 root=root / "session", services=ResearchApplicationServices(config=config,
@@ -230,7 +243,7 @@ class ResearchApplicationTests(unittest.TestCase):
             with patch.object(LLMClient, "ask_json", side_effect=write) as model, patch(
                     "simple_ar.report.writing.write_whole_article", side_effect=persist_then_interrupt):
                 view = app.advance(max_actions=1)
-            self.assertEqual(model.call_count, 1)
+                self.assertEqual(model.call_count, 1, view.status_reason)
             self.assertEqual(view.status, "paused")
             app = load_session(root / "session", services=ResearchApplicationServices(llm_client=client))
             app.continue_session()
@@ -285,18 +298,6 @@ class ResearchApplicationTests(unittest.TestCase):
             self.assertFalse(context.metric_sources)
             self.assertIn("Unavailable material text: empty", " ".join(memory.limitations))
             self.assertNotIn("synthesis", view.state_refs)
-
-    def test_writing_empty_material_stops_before_writer(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            material = root / "empty.md"
-            material.write_text("", encoding="utf-8")
-            app = create_session(ResearchBrief(request_text="Write from missing evidence", requested_outputs=("report",),
-                asset_requests=({"locator": str(material), "role": "material"},)), root=root / "session",
-                services=ResearchApplicationServices(config={"research_task_kind": "writing"}))
-            view = app.advance(max_actions=3)
-            self.assertEqual(view.status, "paused")
-            self.assertFalse(any(row["capability"] == "report_write" for row in view.attempts))
 
     def test_experiment_inputs_share_provenance_without_requiring_fake_design(self):
         from simple_ar.core.capabilities import ArtifactRef
@@ -606,7 +607,8 @@ class ResearchApplicationTests(unittest.TestCase):
                 }, kind="experiment_result", producer="test",
             )
             self.assertEqual(app._experiment_diagnosis_ref(result).path, diagnosis.path)
-            compact = app._compact_failure_diagnosis(app.controller.store.read_json(diagnosis))
+            from simple_ar.report.execution_evidence import compact_failure_diagnosis
+            compact = compact_failure_diagnosis(app.controller.store.read_json(diagnosis))
             self.assertIn("TypeError", compact["stderr_tail"])
             self.assertEqual(compact["deficiencies"][0]["code"], "nonzero_returncode")
 
@@ -661,43 +663,6 @@ class ResearchApplicationTests(unittest.TestCase):
                         self.assertTrue(app._run_action("reanalysis:1"))
                     self.assertEqual(execute.call_args.kwargs["result_ref"], failed_ref)
                     self.assertEqual(execute.call_args.kwargs["baseline_ref"], baseline_ref)
-
-    def test_revision_repair_uses_same_handoff_and_failed_measurement(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            app = create_session(
-                ResearchBrief(request_text="Repair a failed candidate measurement."),
-                root=Path(tmp) / "session",
-            )
-            failed_ref = app.controller.store.write_json(
-                "outputs/failed.json", {"status": "failed", "execution_status": "failed"},
-                kind="experiment_result", schema="experiment_result.v1", producer="test",
-            )
-            baseline_ref = app.controller.store.write_json(
-                "outputs/baseline.json", {"status": "passed"},
-                kind="experiment_result", schema="experiment_result.v1", producer="test",
-            )
-            app.controller.manifest.state_refs["experiment_revision_1"] = failed_ref
-            app.controller.manifest.state_refs["baseline"] = baseline_ref
-            request = ImplementationRequest(
-                Path(tmp), Path(tmp), "Authorized isolated repair", object(),
-            )
-            with patch.object(app, "_execution_config", return_value={"execution": {}}), patch.object(
-                app, "_execution_contract", return_value={"objective": "same design"},
-            ), patch.object(app, "_revision_instruction", return_value="Keep the accepted hypothesis."), patch.object(
-                app, "_revision_baseline_refs", return_value=[baseline_ref],
-            ), patch.object(app, "_input_refs", return_value=[]), patch.object(
-                app, "_implementation_design_ref", return_value=baseline_ref,
-            ), patch("simple_ar.app.research_application.implementation_request", return_value=request) as make_request, patch.object(
-                app, "_execute", return_value=True,
-            ) as execute:
-                self.assertTrue(app._run_action("repair_candidate:1_1"))
-            self.assertEqual(make_request.call_args.kwargs["revision_instruction"],
-                             "Keep the accepted hypothesis.")
-            self.assertFalse(make_request.call_args.kwargs["validate"])
-            sent = execute.call_args.args
-            self.assertEqual(sent[:2], ("implement", "implementation_r1_repair_1"))
-            self.assertEqual(sent[2].failure_ref, failed_ref)
-            self.assertIn(baseline_ref, sent[3])
 
     def test_repaired_revision_selects_latest_measurement_in_plan_order(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1402,9 +1367,343 @@ class ResearchApplicationTests(unittest.TestCase):
             )
             self.assertIsNone(app.controller.store.read_json(unlinked_collection_ref)["implementation_ref"])
 
+    def test_application_repairs_failed_candidate_without_repeating_baseline(self):
+        self._exercise_code_measurement_boundary(repair_failure=True)
+
+    def test_application_stops_after_authorized_repair_limit(self):
+        self._exercise_code_measurement_boundary(repair_failure=True, repair_succeeds=False)
+
+    def test_application_accepts_protocol_and_recovers_preparation_with_declared_large_data(self):
+        self._exercise_code_measurement_boundary(
+            repair_failure=False, prepare_source=True, protocol_gate=True, declared_data=True,
+        )
+
+    def test_application_implements_once_after_all_paired_baselines(self):
+        self._exercise_code_measurement_boundary(repair_failure=False, prepare_source=True, paired=True)
+
+    def test_application_does_not_edit_after_a_failed_paired_baseline(self):
+        self._exercise_code_measurement_boundary(repair_failure=False, prepare_source=True, paired=True, baseline_failure=True)
+
+    def test_application_repairs_paired_candidate_without_mixing_revisions(self):
+        self._exercise_code_measurement_boundary(repair_failure=True, prepare_source=True, paired=True)
+
+    def test_application_does_not_pool_a_successful_old_seed_after_later_failure(self):
+        self._exercise_code_measurement_boundary(repair_failure=True, prepare_source=True, paired=True, late_failure=True)
+
+    def test_paired_repair_limit_keeps_failure_and_missing_seed(self):
+        self._exercise_code_measurement_boundary(repair_failure=True, repair_succeeds=False, prepare_source=True, paired=True)
+
+    def _exercise_code_measurement_boundary(self, *, repair_failure, repair_succeeds=True, prepare_source=False, paired=False, baseline_failure=False, late_failure=False, protocol_gate=False, declared_data=False):
+        """Own preparation recovery, paired seeds and initial measurement repairs.
+
+        Ordinary successful modification and scientific revision live in
+        _exercise_code_task_lifecycle; source-only cases stop after preparation
+        and the first real baseline instead of repeating that lifecycle.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project, task, code_run = root / "project", root / "task.md", root / "code-task"
+            _write_toy_project(project)
+            if declared_data:
+                (project / "input.bin").write_bytes(b"x" * 2_000_001)
+            (project / "evaluate.py").write_text(
+                "from spam_model import predict\nimport sys\n"
+                "with open('evaluation_count.txt', 'a') as log: log.write('run\\n')\n"
+                "print('accuracy:', sum(predict(x) == 'spam' for x in ('win', 'prize')) / 2)\n"
+                + ("assert len(open('input.bin', 'rb').read()) == 2000001\n" if declared_data else "")
+                + ("raise SystemExit(3 if sys.argv[-1] == '1' else 0)\n" if baseline_failure else ""),
+                encoding="utf-8",
+            )
+            task.write_text("Improve spam prediction for prize messages.", encoding="utf-8")
+            if not prepare_source:
+                initialize_code_task(run_dir=code_run, code_root=project, task_file=task,
+                                     benchmark_command="python evaluate.py")
+            workspace = project if prepare_source else code_task_paths(code_run).workspace_dir
+            paper = root / "paper.md"
+            paper.write_text("# Keyword classifier improvement\n\nCompare a keyword classifier improvement using spam features.\n", encoding="utf-8")
+            command = [sys.executable, "evaluate.py"]
+            app = create_session(ResearchBrief(
+                request_text="Compare a keyword classifier improvement.", requested_outputs=("experiments",),
+                asset_requests=({"locator": str(paper), "role": "paper"},
+                    *(({"locator": str(project / "input.bin"), "role": "dataset"},) if declared_data else ())),
+            ), root=root / "session", services=ResearchApplicationServices(max_results=1, max_attempts=24 if paired else 16, config={
+                **({"interaction": "assisted"} if protocol_gate else {}),
+                "execution": {"command": command, "baseline": {"command": command},
+                              **({"pairs": [{"seed": seed, "baseline_command": command + [str(seed)],
+                                               "candidate_command": command + [str(seed)]} for seed in (0, 1)]} if paired else {}),
+                              "cwd": str(workspace), "timeout_sec": 5,
+                              "code_task": {("code_root" if prepare_source else "run_dir"): str(project if prepare_source else code_run), "approval_note": "Authorize isolated source edits only.",
+                                            "max_repairs": int(repair_failure)},
+                              "result_schema": {"primary_metric": "accuracy", "direction": "higher"},
+                              "protocol": {"contract_id": "keyword-pair", "hypothesis": "Improve keyword coverage.",
+                                           "dataset_refs": [{"asset_id": "two-messages", "revision": "1"}],
+                                           "split_spec": {"held_out": [0, 1]},
+                                           "metric_specs": [{"name": "accuracy", "unit": "fraction"}],
+                                           "comparison_conditions": {"seed": 0},
+                                           "protected_assets": [{"asset_id": "evaluator", "path": "evaluate.py"}]}},
+            }, budget_limits={"llm_requests": 12, "total_tokens": 50000,
+                              "process_invocations": (5 + int(late_failure) if repair_failure else 4) if paired else 3 if repair_failure else 2,
+                               "process_wall_seconds": 30 if paired else 15}))
+            def advance_until(*actions):
+                for _ in range(6):
+                    view = app.view()
+                    if view.next_action in actions:
+                        return view
+                    self.assertEqual(view.status, "running", view.status_reason)
+                    app.advance(max_actions=1)
+                self.fail(f"Did not reach {actions!r}; next={app.view().next_action!r}")
+
+            if prepare_source:
+                app.advance(max_actions=20 if protocol_gate else 8)
+                if protocol_gate:
+                    pending = app.view()
+                    self.assertEqual(pending.status, "paused", pending.status_reason)
+                    gate = pending.work_plan["interaction"]["decision"]
+                    self.assertEqual(gate["stage"], "execution_protocol")
+                    self.assertFalse((project / "evaluation_count.txt").exists())
+                    app.continue_session(decision_id=gate["id"], decision_response="accept")
+                    app = load_session(root / "session")
+                advance_until("prepare_execution")
+                self.assertEqual(app.view().next_action, "prepare_execution")
+                with patch.object(app, "_persist_application_views", side_effect=RuntimeError("interrupted preparation")):
+                    with self.assertRaisesRegex(RuntimeError, "interrupted preparation"):
+                        app.advance()
+                app = load_session(root / "session")
+                with patch("simple_ar.research.preparation.initialize_code_task", side_effect=AssertionError("Do not prepare twice")):
+                    app.advance()
+                prepared = app.controller.store.read_json(app.view().state_refs["preparation"])
+                code_run = Path(prepared["execution"]["code_task"]["run_dir"])
+                workspace = Path(prepared["execution"]["cwd"])
+                self.assertNotEqual(workspace, project)
+                self.assertEqual(prepared["source_project"], str(project))
+                if declared_data:
+                    self.assertEqual((workspace / "input.bin").read_bytes(), (project / "input.bin").read_bytes())
+                    self.assertEqual(prepared["workspace_info"]["patterns"]["data_inputs"], ["input.bin"])
+            else:
+                app.advance(max_actions=9)
+            if paired:
+                app.advance()
+            advance_until("implement")
+            self.assertEqual(app.view().next_action, "implement", repr(app.view()))
+            if prepare_source and not paired:
+                # The real baseline reads declared data and proves the accepted
+                # protocol survived preparation recovery. Editing and candidate
+                # delivery are owned by the scientific lifecycle below.
+                baseline = app.controller.store.read_json(app.view().state_refs["baseline"])
+                self.assertEqual(baseline["execution_status"], "passed")
+                self.assertEqual(baseline["metrics"]["accuracy"], 0.5)
+                self.assertEqual((workspace / "evaluation_count.txt").read_text().splitlines(), ["run"])
+                self.assertFalse((project / "evaluation_count.txt").exists())
+                self.assertEqual((workspace / "spam_model.py").read_bytes(), (project / "spam_model.py").read_bytes())
+                before = app.view()
+                ledger = app.budget_ledger.to_dict()
+                app = load_session(root / "session")
+                self.assertEqual(app.view().state_refs, before.state_refs)
+                self.assertEqual(app.view().attempts, before.attempts)
+                self.assertEqual(app.budget_ledger.to_dict(), ledger)
+                self.assertEqual(app.budget_ledger.remaining("process_invocations"), 1)
+                return
+            if baseline_failure:
+                stopped = app.advance()
+                self.assertEqual(stopped.status, "paused")
+                self.assertIn("paired baseline failed", stopped.status_reason)
+                self.assertNotIn("implementation", stopped.state_refs)
+                self.assertEqual((workspace / "evaluation_count.txt").read_text().splitlines(), ["run"] * 2)
+                self.assertNotIn("lowered =", (workspace / "spam_model.py").read_text())
+                return
+            client = LLMClient(LLMSettings(api_key="test-key", api_mode="chat", max_output_tokens=2048))
+            app.services = replace(app.services, llm_client=client)
+            responses_by_label = keyword_code_responses()
+            payloads = [responses_by_label[label] for label in
+                        ("code-task-work-plan", "code-task-plan", "code-task-propose-edits")]
+            if repair_failure:
+                broken = "(text.lower() if __import__('sys').argv[-1] == '0' else text.lowerr())" if late_failure else "text.lowerr()"
+                payloads[2]["edits"][0]["new"] = payloads[2]["edits"][0]["new"].replace("text.lower()", broken)
+            payloads += [{"findings": []}] * 8
+            responses = [{"choices": [{"message": {"content": json.dumps(payload)}}],
+                          "usage": {"prompt_tokens": 30, "completion_tokens": 20, "total_tokens": 50}}
+                         for payload in payloads]
+            with patch("simple_ar.integrations.llm._call_openai_sdk", side_effect=responses) as transport, patch.object(
+                LLMClient, "from_env", side_effect=AssertionError("Use the session client"),
+            ):
+                with patch.object(app, "_persist_application_views", side_effect=RuntimeError("interrupted implementation")):
+                    with self.assertRaisesRegex(RuntimeError, "interrupted implementation"):
+                        app.advance()
+            sent = json.dumps(transport.call_args_list[0].args[1], ensure_ascii=False)
+            self.assertIn("Execution boundary and observed baseline", sent)
+            self.assertIn("keyword-pair", sent)
+            design = app.controller.store.read_json(app.controller.manifest.state_refs["design"])
+            self.assertIn(design["contract"]["hypothesis"], sent)
+            frozen = read_json(code_task_paths(code_run).task_dir / "research_handoff.json")
+            implementation_task = (code_task_paths(code_run).task_dir / "task.md").read_text(encoding="utf-8")
+            self.assertIn("Implementation-only CodeTask", implementation_task)
+            self.assertIn("outer ResearchApplication owns", implementation_task)
+            self.assertNotIn("complete academic Markdown paper", implementation_task)
+            if paired:
+                self.assertEqual(len(frozen["consumed"]["paired_baselines"]), 2)
+                self.assertEqual([row["metrics"]["accuracy"] for row in frozen["consumed"]["paired_baselines"]], [0.5, 0.5])
+            self.assertEqual(frozen["consumed"]["baseline"]["metrics"]["accuracy"], 0.5)
+            if prepare_source:
+                self.assertIn("Compare a keyword classifier improvement.", frozen["original_task"])
+                self.assertNotIn("lowered =", (project / "spam_model.py").read_text())
+                self.assertFalse((project / "evaluation_count.txt").exists())
+            else:
+                self.assertEqual(frozen["original_task"], "Improve spam prediction for prize messages.")
+            app = load_session(root / "session")
+            if repair_failure:
+                self.assertEqual(app.advance(max_actions=2 if late_failure else 1).next_action, "matrix_repair_1" if paired else "repair:1")
+                failure_key = f"matrix_candidate_{int(late_failure)}" if paired else "experiment"
+                initial_failure = app.controller.store.read_json(app.view().state_refs[failure_key])
+                self.assertEqual(initial_failure["execution_status"], "failed")
+                app.services = replace(app.services, llm_client=client)
+                repair_payload = {"summary": "Fix typo", "edits": [{"path": "spam_model.py",
+                    "old": "text.lowerr()", "new": "text.lower()" if repair_succeeds else "text.lower_again()", "reason": "AttributeError"}],
+                    "validation": ["Run evaluator separately"], "risks": []}
+                repaired_responses = [{"choices": [{"message": {"content": json.dumps(payload)}}],
+                    "usage": {"prompt_tokens": 30, "completion_tokens": 20, "total_tokens": 50}}
+                    for payload in [repair_payload] + [{"findings": []}] * 8]
+                with patch("simple_ar.integrations.llm._call_openai_sdk", side_effect=repaired_responses):
+                    with patch.object(app, "_persist_application_views", side_effect=RuntimeError("interrupted repair")):
+                        with self.assertRaisesRegex(RuntimeError, "interrupted repair"):
+                            app.advance()
+                app = load_session(root / "session")
+            view = app.advance(max_actions=3 if paired else 2)
+            if paired:
+                self.assertEqual(view.status, "completed", view.status_reason)
+                if not repair_succeeds:
+                    collection = app.controller.store.read_json(view.state_refs["matrix_results"])
+                    self.assertEqual(collection["candidate_revision"], 1)
+                    self.assertEqual(collection["pairs"][0]["candidate"], view.state_refs["matrix_candidate_r1_0"].to_dict())
+                    self.assertIsNone(collection["pairs"][1]["candidate"])
+                    self.assertNotIn("matrix_repair_2", view.state_refs)
+                    analysis = app.controller.store.read_json(view.state_refs["analysis"])
+                    self.assertEqual(analysis["execution_status"], "incomplete")
+                    self.assertEqual((workspace / "evaluation_count.txt").read_text().splitlines(), ["run"] * 4)
+                    self.assertEqual(app.budget_ledger.remaining("process_invocations"), 1)
+                    return
+                revision = 1 if repair_failure else 0
+                for i in range(2):
+                    self.assertEqual(app.controller.store.read_json(view.state_refs[f"matrix_baseline_{i}"])["metrics"]["accuracy"], 0.5)
+                    key = f"matrix_candidate_r{revision}_{i}" if revision else f"matrix_candidate_{i}"
+                    candidate_result = app.controller.store.read_json(view.state_refs[key])
+                    self.assertEqual(candidate_result["metrics"]["accuracy"], 1.0)
+                    expected_revision = "matrix_repair_1" if revision else "implementation"
+                    self.assertEqual(candidate_result["implementation_ref"], view.state_refs[expected_revision].to_dict())
+                collection = app.controller.store.read_json(view.state_refs["matrix_results"])
+                self.assertEqual(collection["candidate_revision"], revision)
+                implementation_key = "matrix_repair_1" if revision else "implementation"
+                self.assertEqual(collection["implementation_ref"], view.state_refs[implementation_key].to_dict())
+                self.assertEqual(len(collection["superseded_candidates"]), revision * (1 + int(late_failure)))
+                if late_failure:
+                    old_success = app.controller.store.read_json(view.state_refs["matrix_candidate_0"])
+                    self.assertEqual(old_success["status"], "passed")
+                    self.assertNotIn(view.state_refs["matrix_candidate_0"].to_dict(), [row["candidate"] for row in collection["pairs"]])
+                self.assertEqual(len([a for a in view.attempts if a["capability"] == "implement"]), 1 + revision)
+                for attempt in view.attempts:
+                    if attempt["trigger"].startswith("application:matrix_candidate_"):
+                        expected = "matrix_repair_1" if "_r1_" in attempt["trigger"] else "implementation"
+                        self.assertIn(view.state_refs[expected].to_dict(), attempt["inputs"])
+                self.assertEqual((workspace / "evaluation_count.txt").read_text().splitlines(), ["run"] * (4 + revision + int(late_failure)))
+                self.assertEqual(app.budget_ledger.remaining("process_invocations"), 0)
+                return
+            self.assertEqual(view.status, "completed", view.status_reason)
+            self.assertIn("implementation", view.state_refs)
+            implementation_payload = app.controller.store.read_json(view.state_refs["implementation"])
+            self.assertEqual(implementation_payload["status"], "validated")
+            self.assertEqual(implementation_payload["method_validation"]["status"], "未检查")
+            final_key = "experiment_repair_1" if repair_failure else "experiment"
+            expected_implementation = view.state_refs["repair_1"] if repair_failure else view.state_refs["implementation"]
+            final_result = app.controller.store.read_json(view.state_refs[final_key])
+            self.assertEqual(final_result["implementation_ref"], expected_implementation.to_dict())
+            self.assertEqual(app.latest_experiment_ref(), view.state_refs[final_key])
+            delivery = next(row for row in view.work_plan["requested_outputs"] if row["name"] == "experiments")
+            self.assertEqual(delivery["artifact"], view.state_refs[final_key].to_dict())
+            analysis_payload = app.controller.store.read_json(view.state_refs["analysis"])
+            self.assertEqual(analysis_payload["execution_ref"], delivery["artifact"])
+            snapshot = app.controller.store.read_text(app.export_session())
+            self.assertIn("## Latest candidate measurement", snapshot)
+            self.assertIn(view.state_refs[final_key].path, snapshot.split("## Latest candidate measurement")[1])
+            comparison = app.controller.store.read_json(view.state_refs["comparison"])
+            self.assertEqual(comparison["verdict"], "improved" if repair_succeeds else "inconclusive")
+            report_context, report_memory = app.report_inputs()
+            self.assertEqual(report_context.results["implementation"]["artifact"], expected_implementation.path)
+            unrelated = app.controller.store.write_json(
+                "outputs/unrelated_implementation.json", {"status": "validated", "artifact_refs": {}},
+                kind="implementation_result",
+            )
+            app.controller.manifest.state_refs["unrelated_implementation"] = unrelated
+            with patch.object(app, "_accepted_plan_steps", return_value=[
+                {"capability": "implement", "state_name": "unrelated_implementation"},
+            ]):
+                measured_report, _ = app.report_inputs()
+            self.assertEqual(measured_report.results["implementation"]["artifact"], expected_implementation.path)
+            self.assertEqual(report_context.results["execution_status"], "passed" if repair_succeeds else "failed")
+            for metric in report_context.metric_sources:
+                expected_ref = view.state_refs["baseline"] if metric.label == "baseline" else (
+                    view.state_refs["comparison"] if metric.label == "comparison_delta" else view.state_refs[final_key])
+                self.assertEqual(metric.artifact, expected_ref.path)
+            self.assertEqual(report_memory.metric_sources, report_context.metric_sources)
+            self.assertEqual(report_context.results["comparisons"][0]["verdict"], comparison["verdict"])
+            if repair_succeeds:
+                self.assertEqual(comparison["deltas"]["accuracy"], 0.5)
+            self.assertEqual((workspace / "evaluation_count.txt").read_text().splitlines(), ["run"] * (3 if repair_failure else 2))
+            if repair_failure:
+                self.assertEqual(app.controller.store.read_json(view.state_refs["experiment"]), initial_failure)
+                self.assertIn("repair_1", view.state_refs)
+                self.assertIn("experiment_repair_1", view.state_refs)
+                self.assertNotIn("repair_2", view.state_refs)
+                repair_artifact = app.controller.store.read_json(view.state_refs["repair_1"])
+                self.assertIn("failure_evidence", repair_artifact["artifact_refs"])
+                self.assertIn("repair_proposal", repair_artifact["artifact_refs"])
+                expected_status = "passed" if repair_succeeds else "failed"
+                self.assertEqual(app.controller.store.read_json(view.state_refs["experiment_repair_1"])["execution_status"], expected_status)
+            self.assertEqual(app.budget_ledger.remaining("process_invocations"), 0)
+            implementation_id = next(item["attempt_id"] for item in view.attempts if item["capability"] == "implement")
+            implementation_attempt = next(item for item in view.attempts if item["attempt_id"] == implementation_id)
+            self.assertIn(view.state_refs["baseline"].path, [ref["path"] for ref in implementation_attempt["inputs"]])
+            model_entries = [entry for entry in app.budget_ledger.entries if "llm_requests" in entry.actual]
+            self.assertGreater(len(model_entries), 2)
+            implementation_ids = {item["attempt_id"] for item in view.attempts if item["capability"] == "implement"}
+            self.assertTrue(all(entry.attempt_id in implementation_ids for entry in model_entries))
+            self.assertIn("evaluate.py", read_json(code_run / "manifest.json")["edit_scope"]["protected_patterns"])
+            # A later research revision must not silently reuse this accepted patch plan.
+            from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
+            from simple_ar.research.implementation import ImplementationRequest, run_implementation_capability
+            changed_store = ArtifactStore(root / "revised-inputs")
+            design["contract"]["proposed_change"] = "A different research intervention"
+            revised_design = changed_store.write_json("design.json", design, kind="research_design")
+            baseline_payload = app.controller.store.read_json(view.state_refs["baseline"])
+            baseline_ref = changed_store.write_json("baseline.json", baseline_payload, kind="experiment_result")
+            context = CapabilityContext(store=ArtifactStore(root / "revision-attempt"),
+                                        attempt=AttemptManifest("implement-revised"),
+                                        inputs=(revised_design, baseline_ref), input_store=changed_store)
+            request = ImplementationRequest(code_run, workspace, "Allow source edits", client,
+                                            frozen["consumed"]["protocol"])
+            old_task = (code_task_paths(code_run).task_dir / "task.md").read_text(encoding="utf-8")
+            with patch("simple_ar.integrations.llm._call_openai_sdk", side_effect=AssertionError("No stale-plan execution")):
+                with self.assertRaisesRegex(ValueError, "Research inputs changed"):
+                    run_implementation_capability(context=context, request=request)
+            self.assertEqual((code_task_paths(code_run).task_dir / "task.md").read_text(encoding="utf-8"), old_task)
+            # The session evidence remains readable without the external CodeTask run.
+            copied_session = root / "portable-session"
+            shutil.copytree(root / "session", copied_session)
+            code_run.rename(root / "code-task-unavailable")
+            portable = load_session(copied_session)
+            implementation_ref = portable.view().state_refs["implementation"]
+            implementation = portable.controller.store.read_json(implementation_ref)
+            self.assertEqual(implementation["artifact_base"], "attempt")
+            self.assertTrue({"patch", "validation", "patch_plan", "research_handoff"}.issubset(implementation["artifact_refs"]))
+            attempt_store = ArtifactStore(copied_session / Path(implementation_ref.path).parent)
+            from simple_ar.core.capabilities import ArtifactRef
+            for name, row in implementation["artifact_refs"].items():
+                contents = attempt_store.read_text(ArtifactRef.from_dict(row))
+                self.assertTrue(contents.strip(), name)
+            patch_ref = ArtifactRef.from_dict(implementation["artifact_refs"]["patch"])
+            self.assertIn("prize", attempt_store.read_text(patch_ref))
+            self.assertEqual(portable.advance().status, "completed")
+
     def test_code_task_lifecycle_preserves_measurement_refinement_and_repair(self):
         for scenario, options in (
-            ("modification", {}),
             ("design_gap", {"refine": True}),
             ("failed_revision", {"revised_failure": True}),
         ):
@@ -1431,7 +1730,7 @@ class ResearchApplicationTests(unittest.TestCase):
 
 
     def _exercise_code_task_lifecycle(self, *, refine=False, revised_failure=False):
-        """Keep the old real bridge check, but exercise the formal lifecycle."""
+        """Own the measured scientific revision and structured design feedback."""
         class FakeClient:
             model = "fake-research-and-code-model"
 
@@ -1492,55 +1791,8 @@ class ResearchApplicationTests(unittest.TestCase):
                         "validation": ["Remeasure under the accepted protocol."],
                         "risks": [],
                     }
-                if label == "code-task-work-plan":
-                    return {
-                        "summary": "Improve prize-message classification in one small batch.",
-                        "goal": "Classify prize messages as spam without changing tests.",
-                        "success_criteria": ["The benchmark passes after the patch."],
-                        "items": [
-                            {
-                                "id": "W1",
-                                "objective": "Add the missing prize keyword handling.",
-                                "target_files": ["spam_model.py"],
-                                "read_only_evidence": ["tests/test_spam_model.py"],
-                                "depends_on": [],
-                                "validation": ["python -m unittest discover -s tests"],
-                                "done_criteria": ["Prize messages are classified as spam."],
-                                "risk": "Low.",
-                                "parallelizable": False,
-                                "budget_profile": "normal",
-                                "requires_budget_override": False,
-                                "suggested_budget_override": "",
-                                "context_request": {
-                                    "query": "predict prize",
-                                    "files": ["spam_model.py"],
-                                    "symbols": ["predict"],
-                                },
-                            }
-                        ],
-                        "context_requests": [],
-                        "risks": [],
-                        "approval": {"required": True, "reason": "Review before editing."},
-                    }
-                if label == "code-task-plan":
-                    return {
-                        "summary": "Patch the classifier keyword logic.",
-                        "goals": ["Handle prize messages as spam."],
-                        "files_to_modify": [
-                            {
-                                "path": "spam_model.py",
-                                "reason": "Contains predict keyword logic.",
-                                "change_type": "modify",
-                            }
-                        ],
-                        "new_files": [],
-                        "proposed_steps": ["Update the predict keyword check."],
-                        "validation": ["python -m unittest discover -s tests"],
-                        "risks": ["Keep the public API stable."],
-                        "rollback": ["Discard workspace changes."],
-                        "open_questions": [],
-                        "requires_approval_before_patch": True,
-                    }
+                if label in {"code-task-work-plan", "code-task-plan"}:
+                    return keyword_code_responses()[label]
                 if label == "code-task-propose-edits":
                     if refine and not self.gap_returned:
                         self.gap_returned = True
@@ -1548,62 +1800,23 @@ class ResearchApplicationTests(unittest.TestCase):
                                 "implementation_feedback": {"kind": "design_gap", "reason": "Keyword behavior needs clarification.",
                                                             "questions": ["Should prize retain win handling?"]}}
                     self.edit_count += 1
-                    if self.edit_count == 1:
-                        old = (
-                            "def predict(text):\n"
-                            "    return 'spam' if 'win' in text.lower() else 'ham'\n"
-                        )
-                        new = (
-                            "def predict(text):\n"
-                            "    lowered = text.lower()\n"
-                            "    return 'spam' if any(keyword in lowered for keyword in ('win', 'prize')) else 'ham'\n"
-                        )
-                        summary = "Add prize keyword support."
-                    else:
-                        old = (
-                            "def predict(text):\n"
-                            "    lowered = text.lower()\n"
-                            "    return 'spam' if any(keyword in lowered for keyword in ('win', 'prize')) else 'ham'\n"
-                        )
-                        new = (
-                            "def predict(text):\n"
-                            "    lowered = text.lower()\n"
-                            "    return 'spam' if any(keyword in lowered for keyword in ('win', 'prize', 'lottery')) else 'ham'\n"
-                        )
+                    response = keyword_code_responses()[label]
+                    if self.edit_count > 1:
+                        edit = response["edits"][0]
+                        edit["old"] = TOY_PREDICT_WITH_PRIZE
+                        edit["new"] = TOY_PREDICT_WITH_PRIZE.replace("('win', 'prize')", "('win', 'prize', 'lottery')")
                         if revised_failure:
-                            new = "def predict(text):\n    lowered = text.lower()\n    return unresolved_keyword\n"
-                        summary = "Add lottery keyword support."
-                    return {
-                        "summary": summary,
-                        "edits": [
-                            {
-                                "path": "spam_model.py",
-                                "old": old,
-                                "new": new,
-                                "reason": summary,
-                            }
-                        ],
-                        "validation": ["python -m unittest discover -s tests"],
-                        "risks": [],
-                    }
+                            edit["new"] = "def predict(text):\n    lowered = text.lower()\n    return unresolved_keyword\n"
+                        response["summary"] = edit["reason"] = "Add lottery keyword support."
+                    return response
                 raise AssertionError(f"Unexpected JSON LLM label: {label}")
 
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            paper = root / "reliable_agents.md"
-            paper.write_text(
-                "# Method\n\nValidation improves reliable agent behavior.\n\n"
-                "# Results\n\nThe fixture reports accuracy: 0.75.\n",
-                encoding="utf-8",
-            )
             project = root / "project"
             project.mkdir()
-            (project / "spam_model.py").write_text(
-                "def predict(text):\n"
-                "    return 'spam' if 'win' in text.lower() else 'ham'\n",
-                encoding="utf-8",
-            )
+            (project / "spam_model.py").write_text(TOY_PREDICT_SOURCE, encoding="utf-8")
             (project / "benchmark.py").write_text(
                 "from spam_model import predict\n\n"
                 "rows = [('win now', 'spam'), ('prize only', 'spam'), ('lottery only', 'spam')]\n"
@@ -1611,15 +1824,7 @@ class ResearchApplicationTests(unittest.TestCase):
                 "print(f'accuracy: {correct / len(rows):.6f}')\n",
                 encoding="utf-8",
             )
-            (project / "tests").mkdir()
-            (project / "tests" / "test_spam_model.py").write_text(
-                "import unittest\n\n"
-                "from spam_model import predict\n\n\n"
-                "class SpamModelTests(unittest.TestCase):\n"
-                "    def test_predicts_win_as_spam(self):\n"
-                "        self.assertEqual(predict('win now'), 'spam')\n",
-                encoding="utf-8",
-            )
+            write_keyword_validation_test(project)
             execution = {
                 "command": [sys.executable, "benchmark.py"],
                 "baseline": {"command": [sys.executable, "benchmark.py"]},
@@ -1629,13 +1834,14 @@ class ResearchApplicationTests(unittest.TestCase):
                               "approval_note": "Approve only the isolated spam_model.py keyword edit.",
                               "max_repairs": 1 if revised_failure else 0},
             }
-            app = create_session(ResearchBrief(
+            app, _ = self._paper_session(
+                root, "# Method\n\nValidation improves reliable agent behavior.\n\n"
+                "# Results\n\nThe fixture reports accuracy: 0.75.\n",
+                filename="reliable_agents.md",
                 request_text="Study reliable agents; add prize keyword support without changing tests.",
-                requested_outputs=("experiments",),
-                asset_requests=({"locator": str(paper), "role": "paper"},),
-            ), root=root / "session", services=ResearchApplicationServices(
+                requested_outputs=("experiments",), services=ResearchApplicationServices(
                 max_results=1, max_attempts=32,
-                config={"research_queries": ["reliable agents"], "research_max_iterations": 2 if refine or revised_failure else 1},
+                config={"research_queries": ["reliable agents"], "research_max_iterations": 2},
                 budget_limits={"process_invocations": 4 if revised_failure else 3, "process_wall_seconds": 60},
             ))
             paused = app.advance(max_actions=10)
@@ -1780,6 +1986,20 @@ class ResearchApplicationTests(unittest.TestCase):
                 self.assertIn("experiment_revision_1_repair_1", repaired.state_refs)
                 self.assertEqual(app.controller.store.read_json(
                     repaired.state_refs["experiment_revision_1"])["execution_status"], "failed")
+                revision = app.controller.store.read_json(repaired.state_refs["implementation_r1"])
+                repair = app.controller.store.read_json(repaired.state_refs["implementation_r1_repair_1"])
+                self.assertEqual(repair["failure_ref"], repaired.state_refs["experiment_revision_1"].to_dict())
+                self.assertIsNone(repair["validation"])
+                revision_handoff = app.controller.store.read_json(
+                    Path(repaired.state_refs["implementation_r1"].path).parent / revision["artifact_refs"]["research_handoff"]["path"])
+                repair_handoff = app.controller.store.read_json(
+                    Path(repaired.state_refs["implementation_r1_repair_1"].path).parent / repair["artifact_refs"]["research_handoff"]["path"])
+                self.assertEqual(repair_handoff["consumed"], revision_handoff["consumed"])
+                self.assertIn("Add lottery keyword support.", repair_handoff["consumed"]["revision_instruction"])
+                repair_attempt = next(row for row in repaired.attempts
+                    if row["trigger"] == "application:implementation_r1_repair_1")
+                self.assertEqual(repair_attempt["capability"], "implement")
+                self.assertIn(baseline_ref.to_dict(), repair_attempt["inputs"])
             revision_ref = revised_measurement.state_refs["experiment_revision_1"]
             revision_step = next(step for step in app._load_task_plan().steps if step.state_name == "experiment_revision_1")
             self.assertTrue(app._step_completed(revision_step), app.controller.store.read_json(revision_ref))
@@ -1982,6 +2202,11 @@ class ResearchApplicationTests(unittest.TestCase):
             })
             app.controller.save()
 
+            with (patch.object(app, "_pause_action", return_value=False) as rejected,
+                    patch.object(app, "_execute") as dispatch):
+                self.assertFalse(app._run_action("supplement_baseline:1_0"))
+                rejected.assert_called_once_with("Supplement action does not match the saved measurement condition count.")
+                dispatch.assert_not_called()
             self.assertTrue(app._run_action("supplement_baseline:1"))
             self.assertTrue(app._run_action("supplement_candidate:1"))
             baseline_ref = app.controller.manifest.state_refs["baseline_supplement_1"]
@@ -2106,6 +2331,9 @@ class ResearchApplicationTests(unittest.TestCase):
             self.assertEqual(len({m.artifact for m in measured_sources}), 4)
             derived = [m for m in context.metric_sources if m.source_kind == "derived_comparison"]
             self.assertEqual([m.value for m in derived], [-0.25, -0.25])
+            self.assertEqual(memory.metric_sources, context.metric_sources)
+            self.assertEqual({m.artifact for m in derived},
+                             {(Path(final.state_refs["analysis"].path).parent / "paired_analysis.json").as_posix()})
             from simple_ar.report.schema import AgentReportResult, ReportSectionDraft
             app.services = replace(app.services, llm_client=LLMClient(LLMSettings(api_key="fixture-key", api_mode="chat")))
             def writer(**kwargs):
@@ -2334,6 +2562,9 @@ class ResearchApplicationTests(unittest.TestCase):
             )
 
     def test_baseline_reuse_preserves_condition_and_protected_asset_rules(self):
+        from simple_ar.app.research_execution import execution_request
+        from simple_ar.core.capabilities import ArtifactRef
+        from simple_ar.experiment.execution.measurement import measurement_reuse_matches
         for protected in (True, False):
             with self.subTest(protected=protected), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
@@ -2377,6 +2608,61 @@ class ResearchApplicationTests(unittest.TestCase):
                 self.advance_to(app, "baseline")
                 after_baseline = app.advance(max_actions=1)
                 baseline_ref = after_baseline.state_refs["baseline"]
+                payload = app.controller.store.read_json(baseline_ref)
+                expected = execution_request(execution, condition='baseline', contract=app._execution_contract())
+                retained = json.loads(json.dumps(payload))
+                ledger = app.budget_ledger.to_dict()
+                with patch('simple_ar.app.research_application.measurement_reuse_matches',
+                           wraps=measurement_reuse_matches) as shared:
+                    self.assertTrue(app._measurement_ref_matches(baseline_ref, execution))
+                shared.assert_called_once()
+                self.assertTrue(shared.call_args.kwargs['same_session_result'])
+                self.assertEqual(measurement_reuse_matches(payload, expected), protected)
+                for change in (
+                    {'status': 'failed'}, {'command': [sys.executable, 'different.py']},
+                    {'result_schema': {}}, {'validity_status': 'invalid'},
+                    {'experiment_contract': {**payload['experiment_contract'], 'split_spec': {'name': 'other'}}},
+                    {'measurement': {**payload.get('measurement', {}), 'asset_integrity': {'status': 'changed'}}},
+                ):
+                    with self.subTest(change=change):
+                        self.assertFalse(measurement_reuse_matches({**payload, **change}, expected,
+                                                                  same_session_result=True))
+                if protected:
+                    incomplete = {**payload, 'measurement': {**payload['measurement'],
+                        'asset_integrity': {'status': 'observed_unchanged', 'before': {}}}}
+                    self.assertFalse(measurement_reuse_matches(incomplete, expected, same_session_result=True))
+                prepared = {**payload, 'preparation': {'source_ref': {'path': 'inputs/prior.json',
+                    'kind': 'prepared_execution'}}}
+                source = {'source_project': str(root), 'workspace': str(root / 'old-copy')}
+                current = {**source, 'workspace': str(root / 'new-copy')}
+                self.assertTrue(measurement_reuse_matches(prepared, expected, same_session_result=True,
+                                                         actual_source=source, current_source=current))
+                self.assertEqual(measurement_reuse_matches(prepared, expected,
+                    actual_source=source, current_source=current), protected)
+                self.assertFalse(measurement_reuse_matches(prepared, expected, same_session_result=True))
+                other = root / 'other-source'
+                other.mkdir()
+                self.assertFalse(measurement_reuse_matches(prepared, expected, same_session_result=True,
+                    actual_source=source, current_source={'source_project': str(other)}))
+                # Reference ownership remains in the application, ahead of a permissive domain stub.
+                prior_preparation = app.controller.manifest.state_refs.get('preparation')
+                app.controller.manifest.state_refs['preparation'] = ArtifactRef(
+                    'inputs/unowned.json', kind='prepared_execution')
+                reader = app.controller.store.read_json
+                def read_result(ref):
+                    return prepared if ref == baseline_ref else reader(ref)
+                try:
+                    with patch.object(app.controller.store, 'read_json', side_effect=read_result), patch(
+                            'simple_ar.app.research_application.measurement_reuse_matches', return_value=True) as shared:
+                        self.assertFalse(app._measurement_ref_matches(baseline_ref, execution))
+                        shared.assert_not_called()
+                finally:
+                    if prior_preparation is None:
+                        app.controller.manifest.state_refs.pop('preparation', None)
+                    else:
+                        app.controller.manifest.state_refs['preparation'] = prior_preparation
+                self.assertEqual(payload, retained)
+                self.assertEqual(app.budget_ledger.to_dict(), ledger)
                 if not protected:
                     self.assertTrue(app._measurement_ref_matches(baseline_ref, execution))
                     continue
@@ -2541,7 +2827,6 @@ class ResearchApplicationTests(unittest.TestCase):
                 self.assertFalse(app.budget_ledger.entries)
                 restored = load_session(root / "session")
                 self.assertEqual("preparation" in restored.view().state_refs, change == "preference")
-                self.assertEqual(restored._needs_preparation(), True)
 
     def test_execution_revision_reuses_matching_baseline_and_remeasures_changed_inputs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2673,6 +2958,9 @@ class ResearchApplicationTests(unittest.TestCase):
                 self.assertEqual(kwargs["template"].name, "source_review")
                 self.assertIn("No experiment", context.evidence_summary)
                 citation = context.papers[0]["id"]
+                self.assertEqual(context.citation_key_map, {"P1": citation})
+                self.assertEqual(next(h for h in context.source_handles if h.kind == "paper").citation_key, "P1")
+                self.assertEqual(kwargs["memory"].source_handles, context.source_handles)
                 return AgentReportResult(report_body="", memory=kwargs["memory"], used_agent=True,
                     sections=[ReportSectionDraft(section_id="review", heading="Evidence and Limitations",
                         draft_markdown=f"Prior work discusses calibration [@{citation}]. No experiment was conducted.",
@@ -2739,7 +3027,7 @@ class ResearchApplicationTests(unittest.TestCase):
 
         self.assertEqual(view.status, "completed", view.status_reason)
 
-    def test_failed_report_scope_audit_remains_inspectable_and_pauses_delivery(self):
+    def test_overbroad_report_candidate_remains_inspectable_before_delivery(self):
         from simple_ar.report.schema import AgentReportResult, ReportSectionDraft
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -2772,24 +3060,26 @@ class ResearchApplicationTests(unittest.TestCase):
             with patch("simple_ar.report.writing.run_report_agent", side_effect=overbroad_writer):
                 view = app.advance(max_actions=3)
             self.assertEqual(view.status, "paused")
-            self.assertIn("report_audit", view.state_refs, view.status_reason)
-            audit = app.controller.store.read_json(view.state_refs["report_audit"])
-            self.assertEqual(audit["status"], "failed")
-            self.assertIn("source-scope-exceeded", [row["finding_id"] for row in audit["reviewer_findings"]])
-            # Capacity can be authorized for an audit-stopped delivery without
-            # reopening it, discarding its findings or spending another call.
+            self.assertNotIn('report', view.state_refs)
+            self.assertIn('max_cited_sources', view.status_reason)
+            self.assertIn('writer', view.state_refs)
+            saved_writer = app.controller.store.read_json(view.state_refs['writer'])
+            self.assertIn('Two prior works', saved_writer['sections'][0]['draft_markdown'])
+            # More capacity retains the rejected candidate and does not itself
+            # execute another call or override the delivery constraint.
             refs = dict(view.state_refs)
             attempt_count = len(view.attempts)
             authorized = app.continue_session(authorization_id="saved-report-check",
                 authorization_reason="Inspect the saved candidate separately.",
                 authorize_remaining={"total_tokens": 10000, "llm_requests": 1}, additional_attempts=3)
-            self.assertEqual(authorized.status, "paused")
+            self.assertEqual(authorized.status, "running")
             self.assertEqual(authorized.state_refs, refs)
             self.assertEqual(len(authorized.attempts), attempt_count)
-            replay = app.continue_session(authorization_id="saved-report-check",
-                authorization_reason="Inspect the saved candidate separately.",
-                authorize_remaining={"total_tokens": 10000, "llm_requests": 1}, additional_attempts=3)
-            self.assertEqual(replay.status, "paused")
+            with self.assertRaisesRegex(ResearchApplicationError, 'current running'):
+                app.continue_session(authorization_id="saved-report-check",
+                    authorization_reason="Inspect the saved candidate separately.",
+                    authorize_remaining={"total_tokens": 10000, "llm_requests": 1}, additional_attempts=3)
+            self.assertEqual(len(app.controller.list_attempts()), attempt_count)
 
     def test_request_report_reopens_completed_prefix_without_rerunning_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3063,24 +3353,21 @@ class ResearchApplicationTests(unittest.TestCase):
             self.assertEqual(app.budget_ledger.remaining("process_invocations"), 0)
 
     def test_experiment_budget_exhaustion_preserves_research_without_launch(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            app, paper = self._paper_session(
-                root,
-                "# Evaluation\n\nValidation measures accuracy.\n",
-                request_text="Evaluate validation.",
-                requested_outputs=("experiment", "research_summary"),
-                services=ResearchApplicationServices(max_results=1, config={
-                "execution": {"command": [sys.executable, "-c", "from pathlib import Path; Path('ran').touch()"],
-                              "cwd": str(root), "timeout_sec": 5},
-            }, budget_limits={"process_invocations": 0, "process_wall_seconds": 5}),
-            )
-            view = app.advance(max_actions=10)
-            self.assertEqual(view.status, "paused")
-            self.assertIn("summary", view.state_refs)
-            self.assertNotIn("experiment", view.state_refs)
-            self.assertFalse((root / "ran").exists())
-            self.assertEqual(len(app.budget_ledger.entries), 0)
+        for limits in ({"process_invocations": 0, "process_wall_seconds": 5},
+                       {"process_invocations": 1}, {"process_wall_seconds": 5}):
+            with self.subTest(limits=limits), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                app, _ = self._paper_session(root, "# Evaluation\n\nValidation measures accuracy.\n",
+                    request_text="Evaluate validation.", requested_outputs=("experiment", "research_summary"),
+                    services=ResearchApplicationServices(max_results=1, config={"execution": {
+                        "command": [sys.executable, "-c", "from pathlib import Path; Path('ran').touch()"],
+                        "cwd": str(root), "timeout_sec": 5}}, budget_limits=limits))
+                view = app.advance(max_actions=10)
+                self.assertEqual(view.status, "paused")
+                self.assertIn("summary", view.state_refs)
+                self.assertNotIn("experiment", view.state_refs)
+                self.assertFalse((root / "ran").exists())
+                self.assertEqual(len(app.budget_ledger.entries), 0)
 
     def test_explicit_retry_reuses_research_and_reanalyzes_corrected_command(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3109,6 +3396,8 @@ class ResearchApplicationTests(unittest.TestCase):
             self.advance_to(app, "experiment")
             failed = app.advance()
             self.assertEqual(failed.next_action, "analysis")
+            observation = app.controller.store.read_json(failed.state_refs["experiment"])
+            self.assertEqual((observation["returncode"], observation["metrics"]["accuracy"]), (1, 0.2))
             first_attempt = next(item["attempt_id"] for item in failed.attempts if item["capability"] == "experiment")
             synthesis_ref = failed.state_refs["synthesis"]
 
@@ -3134,62 +3423,9 @@ class ResearchApplicationTests(unittest.TestCase):
             result = app.controller.store.read_json(retried.state_refs["experiment"])
             self.assertEqual(result["execution_status"], "passed")
             self.assertEqual(result["metrics"]["accuracy"], 0.8)
+            self.assertEqual(result["measurement"]["protocol_status"], "declared")
+            self.assertEqual(result["experiment_contract"]["contract_id"], "retry-fixture")
             self.assertEqual(app.budget_ledger.remaining("process_invocations"), 0)
-
-    def test_explicit_experiment_is_measured_once_and_analyzed_after_reload(self):
-        for exitcode in (0, 3):
-            with self.subTest(exitcode=exitcode), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp)
-                paper = root / "paper.md"
-                paper.write_text("# Evaluation\n\nValidation measures classifier accuracy.\n", encoding="utf-8")
-                script = "from pathlib import Path; Path('ran').write_text('once'); print('accuracy: 0.5'); raise SystemExit(%d)" % exitcode
-                services = ResearchApplicationServices(max_results=1, config={
-                    "execution": {"command": [sys.executable, "-c", script], "cwd": str(root), "timeout_sec": 5,
-                                  "result_schema": {"primary_metric": "accuracy", "required_metrics": ["accuracy"]},
-                                  "protocol": {"contract_id": "fixture-1", "hypothesis": "Characterize a fixture.",
-                                               "dataset_refs": [{"asset_id": "fixture", "revision": "1"}],
-                                               "split_spec": {"evaluation": "all"},
-                                               "metric_specs": [{"name": "accuracy", "unit": "fraction"}],
-                                               "comparison_conditions": {"seed": 0}}},
-                }, budget_limits={"process_invocations": 1, "process_wall_seconds": 5})
-                # A command in configuration alone never authorizes execution.
-                summary = create_session(ResearchBrief(
-                    request_text="Summarize classifier validation.", requested_outputs=("summary",),
-                    asset_requests=({"locator": str(paper), "role": "paper"},),
-                ), root=root / "summary-session", services=services)
-                summary.advance(max_actions=10)
-                self.assertFalse((root / "ran").exists())
-                self.assertEqual(summary.budget_ledger.remaining("process_invocations"), 1)
-                app = create_session(ResearchBrief(
-                    request_text="Evaluate classifier validation.", requested_outputs=("experiment",),
-                    asset_requests=({"locator": str(paper), "role": "paper"},),
-                ), root=root / "session", services=services)
-                self.advance_to(app, "experiment")
-                if exitcode:
-                    # Simulate process termination after the physical result
-                    # is durable but before application references are saved.
-                    with patch.object(app, "_persist_application_views", side_effect=RuntimeError("interrupted")):
-                        with self.assertRaisesRegex(RuntimeError, "interrupted"):
-                            app.advance()
-                else:
-                    app.advance()
-                measured = app.view()
-                self.assertIn("experiment", measured.state_refs)
-                self.assertNotIn("analysis", measured.state_refs)
-                result = app.controller.store.read_json(measured.state_refs["experiment"])
-                self.assertEqual(result["returncode"], exitcode)
-                self.assertEqual(result["metrics"]["accuracy"], 0.5)
-                self.assertEqual(result["measurement"]["protocol_status"], "declared")
-                self.assertEqual(result["experiment_contract"]["contract_id"], "fixture-1")
-                app = load_session(root / "session")
-                view = app.advance(max_actions=2)
-                self.assertIn("analysis", view.state_refs)
-                self.assertEqual(app.budget_ledger.remaining("process_invocations"), 0)
-                self.assertEqual(sum(item["capability"] == "experiment" for item in view.attempts), 1)
-                analysis = app.controller.store.read_json(view.state_refs["analysis"])
-                self.assertEqual(analysis["execution_status"], "passed" if exitcode == 0 else "failed")
-                self.assertIn("decision", view.state_refs)
-                self.assertEqual(view.status, "completed")
 
     def test_model_assessment_drives_design_once_and_abstention_keeps_summary(self):
 
@@ -3302,15 +3538,23 @@ class ResearchApplicationTests(unittest.TestCase):
                 use_llm=True,
                 llm_client=app.services.llm_client,
             )
-            bound = app._request_for_attempt(request, "plan-0001")
             response = {"choices": [{"message": {"content": "ok"}}]}
             with patch(
                 "simple_ar.integrations.llm._call_openai_sdk", return_value=response
             ):
-                bound.llm_client.ask("system", "user", label="plan")
+                implementation = ImplementationRequest(Path(tmp), Path(tmp), "authorized", app.services.llm_client)
+                for identity, original in (("plan-0001", request), ("implement-0002", implementation)):
+                    bound = app._request_for_attempt(original, identity)
+                    if isinstance(bound, ImplementationRequest):
+                        self.assertIs(bound.budget_ledger, app.budget_ledger)
+                        self.assertIs(bound.message_callback, app.services.message_callback)
+                        self.assertEqual((bound.session_id, bound.attempt_id),
+                                         (app.controller.manifest.session_id, identity))
+                        self.assertIsNone(original.budget_ledger)
+                    bound.llm_client.ask("system", "user", label=identity)
 
             ledger = BudgetLedger.load(Path(tmp) / "budget_ledger.json")
-            self.assertEqual(ledger.entries[0].attempt_id, "plan-0001")
+            self.assertEqual([row.attempt_id for row in ledger.entries], ["plan-0001", "implement-0002"])
 
     def test_continue_retries_failed_analysis_without_repeating_measurement(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3345,35 +3589,21 @@ class ResearchApplicationTests(unittest.TestCase):
             self.assertIn("provider budget exhausted", " ".join(failed_analysis["diagnostics"]))
             self.assertEqual(context["remaining_authorized_rounds"], 1)
 
-    def test_reload_reconciles_completed_plan_at_each_persistence_boundary(self):
-        for boundary in ("state_reference", "attempt_budget"):
-            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as tmp:
-                app = create_session(ResearchBrief(request_text="Study agents"), root=tmp)
-                save = app.controller.save
-
-                def interrupted_save():
-                    if app.controller.manifest.budget.attempts:
-                        raise RuntimeError("interrupted budget save")
-                    return save()
-
-                method, failure, message = (
-                    ("attempt_output_ref", RuntimeError("interrupted"), "interrupted")
-                    if boundary == "state_reference" else
-                    ("save", interrupted_save, "interrupted budget save")
-                )
-                with patch.object(app.controller, method, side_effect=failure):
-                    with self.assertRaisesRegex(RuntimeError, message):
-                        app.advance()
-                resumed = load_session(tmp)
-                if boundary == "attempt_budget":
-                    self.assertEqual(resumed.controller.manifest.budget.attempts, 0)
-                # Recover the durable result, then stop before executing the next action.
-                with patch.object(resumed, "_run_action", return_value=False) as next_action:
-                    view = resumed.advance()
-                next_action.assert_called_once_with("search")
-                self.assertEqual(len(view.attempts), 1)
-                self.assertEqual(view.budget["attempts"], 1)
-                self.assertIn("plan", view.state_refs)
+    def test_reload_attaches_completed_plan_before_advancing_to_search(self):
+        # Core owns the result/attempt/session commit-gap matrix. This adapter
+        # owns attaching the accepted plan to application state after core commits.
+        with tempfile.TemporaryDirectory() as tmp:
+            app = create_session(ResearchBrief(request_text="Study agents"), root=tmp)
+            with patch.object(app.controller, "attempt_output_ref", side_effect=RuntimeError("interrupted")):
+                with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                    app.advance()
+            resumed = load_session(tmp)
+            with patch.object(resumed, "_run_action", return_value=False) as next_action:
+                view = resumed.advance()
+            next_action.assert_called_once_with("search")
+            self.assertEqual(len(view.attempts), 1)
+            self.assertEqual(view.budget["attempts"], 1)
+            self.assertIn("plan", view.state_refs)
 
     def test_reload_services_preserve_limits_and_missing_config_is_visible(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3402,7 +3632,11 @@ class ResearchApplicationTests(unittest.TestCase):
                 request_text="Study validation methods for reliable agents.",
                 objective="Understand how validation affects reliable agents.",
                 requested_outputs=("research_summary",),
-                services=ResearchApplicationServices(max_results=2, max_chunks=20),
+                services=ResearchApplicationServices(max_results=2, max_chunks=20,
+                    config={"execution": {
+                        "command": [sys.executable, "-c", "from pathlib import Path; Path('ran').touch()"],
+                        "cwd": str(root), "timeout_sec": 5,
+                    }}, budget_limits={"process_invocations": 1, "process_wall_seconds": 5}),
             )
 
             initial = app.view()
@@ -3414,15 +3648,25 @@ class ResearchApplicationTests(unittest.TestCase):
             self.assertTrue((root / "session" / "budget_ledger.json").is_file())
             self.assertEqual(initial.work_plan["next_action"], "plan")
             self.assertEqual(initial.work_plan["status"], "ready")
+            self.assertNotIn("context", initial.work_plan)  # No unconsumed duplicate task/plan/budget view.
             self.assertNotIn("brief", initial.work_plan["accepted_refs"])
             self.assertNotIn("assets", initial.work_plan["accepted_refs"])
             self.assertTrue((root / "session" / "planning" / "work_plan.json").is_file())
             self.assertFalse((root / "session" / "planning" / "readiness.json").exists())
             self.assertNotIn("readiness", initial.to_dict())
 
-            final = app.advance(max_actions=6)
+            partial = app.advance(max_actions=2)
+            self.assertEqual(partial.status, "running")
+            self.assertEqual(partial.next_action, "document_ingest")
+            self.assertEqual(partial.budget["attempts"], 2)
+            app = load_session(root / "session")
+            final = app.advance(max_actions=4)
 
             self.assertEqual(final.status, "completed")
+            self.assertEqual(final.budget["attempts"], 6)
+            # A configured command alone does not authorize a measurement.
+            self.assertFalse((root / "ran").exists())
+            self.assertEqual(app.budget_ledger.remaining("process_invocations"), 1)
             self.assertIsNone(final.next_action)
             self.assertEqual(
                 [item["capability"] for item in final.attempts],
@@ -3461,28 +3705,6 @@ class ResearchApplicationTests(unittest.TestCase):
             self.assertEqual(revised.next_action, "search")
             self.assertEqual(revised.budget["attempts"], 7)
             self.assertNotEqual(revised.state_refs["plan"], final.state_refs["plan"])
-
-    def test_application_can_be_advanced_in_small_steps(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            app, paper = self._paper_session(
-                root,
-                "Reliable agents use validation and report accuracy metrics.\n",
-                filename="agents.txt",
-                request_text="Study reliable agents.",
-                requested_outputs=("research_summary",),
-                services=ResearchApplicationServices(max_results=1, max_chunks=10),
-            )
-
-            partial = app.advance(max_actions=2)
-            self.assertEqual(partial.status, "running")
-            self.assertEqual(partial.next_action, "document_ingest")
-            self.assertEqual(partial.budget["attempts"], 2)
-
-            resumed = load_session(root / "session")
-            final = resumed.advance(max_actions=4)
-            self.assertEqual(final.status, "completed")
-            self.assertEqual(final.budget["attempts"], 6)
 
     def test_requested_experiment_preserves_summary_and_design_without_execution(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

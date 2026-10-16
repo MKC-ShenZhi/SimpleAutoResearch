@@ -180,6 +180,12 @@ def _article_body(markdown: str) -> str:
     return body.strip("\r\n")
 
 
+def article_section_headings(markdown: str) -> list[str]:
+    """Read article-level headings using the publication title/fence boundary."""
+    return [_strip_heading_number(_heading_title(match[2])) for _, match, _ in
+            _markdown_lines(_article_body(markdown)) if match and len(match[1]) == 2]
+
+
 def _section_body(markdown: str, *, heading: str) -> str:
     lines = markdown.splitlines()
     while lines and not lines[0].strip():

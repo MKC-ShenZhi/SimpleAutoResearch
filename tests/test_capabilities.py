@@ -210,41 +210,6 @@ class CapabilityBoundaryTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             registry.run("bad")
 
-    def test_session_controller_persists_successful_attempt(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            registry = CapabilityRegistry()
-
-            def fixture(*, context: CapabilityContext) -> CapabilityResult:
-                ref = context.store.write_json("result.json", {"ok": True}, kind="result")
-                return CapabilityResult(status="completed", artifacts=(ref,))
-
-            registry.register("fixture", fixture)
-            controller = SessionController.create(
-                tmp,
-                session_id="session-001",
-                topic="offline fixture",
-                registry=registry,
-            )
-
-            result = controller.execute_attempt("fixture", attempt_id="attempt-001")
-            loaded = SessionController.load(tmp, registry=registry)
-
-            self.assertEqual(result.status, "completed")
-            self.assertEqual(loaded.manifest.status, "running")
-            self.assertEqual(loaded.manifest.current_attempt, "attempt-001")
-            self.assertEqual(loaded.manifest.decisions, [])
-            self.assertEqual(loaded.manifest.budget.attempts, 1)
-            self.assertTrue((Path(tmp) / "attempts" / "attempt-001" / "result.json").is_file())
-            persisted = loaded.store.read_capability_result(
-                "attempts/attempt-001/capability_result.json"
-            )
-            self.assertEqual(persisted.status, "completed")
-            self.assertEqual(
-                tuple(ref.path for ref in loaded.list_attempts()[0].outputs),
-                ("result.json", "capability_result.json"),
-            )
-            self.assertEqual(loaded.store.read_attempt_manifest("attempts/attempt-001/attempt_manifest.json").outputs[0].path, "result.json")
-
     def test_session_controller_resolves_registered_inputs_from_session_store(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             registry = CapabilityRegistry()
@@ -267,13 +232,24 @@ class CapabilityBoundaryTests(unittest.TestCase):
                 "copy-input",
                 attempt_id="attempt-001",
                 inputs=(source_ref,),
+                progressed=False,
             )
 
             self.assertEqual(result.status, "completed")
+            # Input resolution is also the public persistence integration;
+            # commit permutations belong to SessionTransitionTests.
+            loaded = SessionController.load(tmp, registry=registry)
+            self.assertIs(loaded.store.read_json(
+                "attempts/attempt-001/capability_result.json")["session_progressed"], False)
+            persisted = loaded.store.read_capability_result("attempts/attempt-001/capability_result.json")
+            self.assertEqual(persisted.artifacts[0].path, "copied.json")
             self.assertEqual(
-                controller.store.read_json("attempts/attempt-001/copied.json"),
+                loaded.store.read_json("attempts/attempt-001/copied.json"),
                 {"value": 7},
             )
+            loaded.complete("Application accepted the result.")
+            self.assertEqual(loaded.reconcile_attempt(), result)
+            self.assertEqual(loaded.manifest.status, "completed")
 
     def test_capability_context_rejects_unregistered_input(self) -> None:
         context = CapabilityContext(

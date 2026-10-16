@@ -51,6 +51,16 @@ def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _persist_attempt_result(
+    store: ArtifactStore, result: CapabilityResult, commit_facts: dict[str, Any],
+) -> ArtifactRef:
+    return store.write_json(
+        "capability_result.json", {**result.to_dict(), **commit_facts},
+        kind="capability_result", schema="capability_result.v1",
+        producer="capability_runtime",
+    )
+
+
 def _locked_method(method: _ControllerMethod) -> _ControllerMethod:
     """Apply the session mutation boundary without changing method semantics."""
 
@@ -910,35 +920,15 @@ class SessionController:
                 provenance={"capability": capability},
             )
 
-        result = _reconcile_declared_outputs(result, attempt_store)
-        result_ref = attempt_store.write_capability_result(result)
-        if all(artifact.path != result_ref.path for artifact in result.artifacts):
-            result = replace(result, artifacts=(*result.artifacts, result_ref))
-
-        has_progress = (
-            progressed
-            if progressed is not None
-            else result.status in {"completed", "partial"}
-        )
-        self.manifest.budget.record(has_progress, attempt_id=attempt_id)
-        attempt_status = (
-            "failed"
-            if result.status == "failed"
-            else "blocked"
-            if result.status == "blocked"
-            else "completed"
-        )
-        attempt_store.write_attempt_manifest(
-            replace(
-                attempt,
-                status=attempt_status,  # type: ignore[arg-type]
-                outputs=result.artifacts,
-                updated_at=_utcnow_iso(),
-            )
-        )
-        self.save()
-        return result
-
+        # Save the accounting override atomically with the outcome, so recovery
+        # after either manifest write uses the caller's original progress fact.
+        commit_facts: dict[str, Any] = {}
+        if progressed is not None:
+            commit_facts["session_progressed"] = progressed
+        if result.provenance.get("recovery") == "explicit_interruption":
+            commit_facts["session_interruption_reason"] = None
+        _persist_attempt_result(attempt_store, result, commit_facts)
+        return self._commit_attempt_result(attempt_store, attempt)
 
     @_locked_method
     def reconcile_attempt(self, attempt_id: str | None = None) -> CapabilityResult:
@@ -970,42 +960,7 @@ class SessionController:
                 "use recover_interrupted() after confirming the interruption."
             )
 
-        result = _reconcile_declared_outputs(
-            attempt_store.read_capability_result("capability_result.json"),
-            attempt_store,
-        )
-        result_ref = attempt_store.ref(
-            "capability_result.json",
-            kind="capability_result",
-            schema="capability_result.v1",
-            producer="capability_runtime",
-        )
-        if all(artifact.path != result_ref.path for artifact in result.artifacts):
-            result = replace(result, artifacts=(*result.artifacts, result_ref))
-
-        has_progress = result.status in {"completed", "partial"}
-        self.manifest.budget.record(has_progress, attempt_id=selected_id)
-        attempt_status = (
-            "failed"
-            if result.status == "failed"
-            else "blocked"
-            if result.status == "blocked"
-            else "completed"
-        )
-        attempt_store.write_attempt_manifest(
-            replace(
-                attempt,
-                status=attempt_status,  # type: ignore[arg-type]
-                outputs=result.artifacts,
-                updated_at=_utcnow_iso(),
-            )
-        )
-        if attempt.status == "running":
-            self.manifest.current_attempt = selected_id
-            self.manifest.status = "running"
-            self.manifest.status_reason = "Reconciled persisted attempt result."
-        self.save()
-        return result
+        return self._commit_attempt_result(attempt_store, attempt, reconciled=True)
 
     @_locked_method
     def recover_interrupted(
@@ -1060,22 +1015,80 @@ class SessionController:
                 "recovery": "explicit_interruption",
             },
         )
-        result_ref = attempt_store.write_capability_result(result)
-        result = replace(result, artifacts=(result_ref,))
-        self.manifest.budget.record(False, attempt_id=selected_id)
-        exhausted = self.manifest.budget.exhausted()
-        self.manifest.status = "blocked" if exhausted else "running"
-        self.manifest.status_reason = (
-            "Session budget exhausted." if exhausted else reason.strip()
+        _persist_attempt_result(
+            attempt_store, result, {"session_interruption_reason": reason.strip()},
         )
+        return self._commit_attempt_result(attempt_store, attempt)
+
+    def _commit_attempt_result(
+        self,
+        attempt_store: ArtifactStore,
+        attempt: AttemptManifest,
+        *,
+        reconciled: bool = False,
+    ) -> CapabilityResult:
+        """Commit only saved outcome facts under the caller's mutation lock.
+
+        The result precedes the attempt manifest, which precedes session
+        accounting. Either save gap can be reconciled without executing work.
+        Older envelopes lack a progress override and retain status-based
+        accounting. Initial output validation is saved in the outcome;
+        later invalidation affects only the committed view.
+        """
+
+        payload = attempt_store.read_json("capability_result.json")
+        saved_result = CapabilityResult.from_dict(payload)
+        result = _reconcile_declared_outputs(saved_result, attempt_store)
+        progressed = payload.get("session_progressed")
+        if progressed is not None and type(progressed) is not bool:
+            raise ValueError("Saved session_progressed must be a boolean.")
+        if not reconciled and result != saved_result:
+            _persist_attempt_result(
+                attempt_store, result,
+                {key: payload[key] for key in ("session_progressed", "session_interruption_reason") if key in payload},
+            )
+        result_ref = attempt_store.ref(
+            "capability_result.json",
+            kind="capability_result",
+            schema="capability_result.v1",
+            producer="capability_runtime",
+        )
+        if all(artifact.path != result_ref.path for artifact in result.artifacts):
+            result = replace(result, artifacts=(*result.artifacts, result_ref))
+        recorded = self.manifest.budget.record(
+            progressed if progressed is not None else result.status in {"completed", "partial"},
+            attempt_id=attempt.attempt_id,
+        )
+        attempt_status = result.status if result.status in {"failed", "blocked"} else "completed"
         attempt_store.write_attempt_manifest(
             replace(
                 attempt,
-                status="failed",
-                outputs=(result_ref,),
+                status=attempt_status,  # type: ignore[arg-type]
+                outputs=result.artifacts,
                 updated_at=_utcnow_iso(),
             )
         )
+        interruption_reason = payload.get("session_interruption_reason")
+        # Old interrupted results used provenance alone. Only recovery consumes
+        # that legacy marker; a new handler's provenance cannot settle a session.
+        if (
+            "session_interruption_reason" not in payload and reconciled
+            and result.status == "failed"
+            and result.provenance.get("recovery") == "explicit_interruption"
+            and result.diagnostics
+        ):
+            interruption_reason = result.diagnostics[0]
+        if interruption_reason is not None:
+            if recorded or attempt.status == "running":
+                exhausted = self.manifest.budget.exhausted()
+                self.manifest.status = "blocked" if exhausted else "running"
+                self.manifest.status_reason = (
+                    "Session budget exhausted." if exhausted else interruption_reason
+                )
+        elif reconciled and attempt.status == "running":
+            self.manifest.current_attempt = attempt.attempt_id
+            self.manifest.status = "running"
+            self.manifest.status_reason = "Reconciled persisted attempt result."
         self.save()
         return result
 

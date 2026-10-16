@@ -299,9 +299,9 @@ def _prepare_and_apply_repair_unit(*, phase: str, project_dir: Path, owner: Arti
             summary['unresolved_errors'].extend(_compile_project(project_dir))
     except (LLMError, ValueError, SyntaxError) as exc:
         summary['unresolved_errors'].append(f'{phase} repair unavailable: {exc}')
-    except Exception as exc:
+    except BaseException as exc:
         # Internal errors propagate, but never leave half an associated unit.
-        restore_errors = _rollback_repair_unit(snapshot)
+        restore_errors = snapshot.restore_verified()
         owner.write_json('application-error.json', {'error_type': type(exc).__name__,
             'error': str(exc), 'restore_errors': restore_errors, 'snapshot': snapshot.artifact_record()})
         for error in restore_errors:
@@ -309,7 +309,7 @@ def _prepare_and_apply_repair_unit(*, phase: str, project_dir: Path, owner: Arti
         summary['changed_files'].clear()
         raise
     if summary['unresolved_errors']:
-        restore_errors = _rollback_repair_unit(snapshot)
+        restore_errors = snapshot.restore_verified()
         summary['unresolved_errors'].extend(restore_errors)
         summary['changed_files'].clear()
         records.clear()
@@ -325,24 +325,6 @@ def _prepare_and_apply_repair_unit(*, phase: str, project_dir: Path, owner: Arti
         write_json(owner.root.parents[2] / 'atomic_patch_set.json', atomic)
         summary['atomic_patch_set'] = str(owner.root / 'atomic_patch_set.json')
     return records
-
-
-def _rollback_repair_unit(snapshot: FileSnapshotSet) -> list[str]:
-    try:
-        events = snapshot.restore()
-        errors = [f"Snapshot restore failed for {row['path']}: {row.get('reason', row['status'])}"
-            for row in events if row['status'] not in {'restored_file', 'removed_created_file', 'already_missing'}]
-        for row in read_json(snapshot.manifest_path)['files']:
-            path = resolve_mounted_path({'project': snapshot.workspace_dir},
-                str(snapshot.workspace_dir / row['path']))
-            if row.get('existed'):
-                if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != row.get('sha256'):
-                    errors.append(f"Snapshot restore byte check failed for {row['path']}")
-            elif path.exists():
-                errors.append(f"Snapshot restore left created path {row['path']}")
-        return errors
-    except Exception as exc:
-        return [f'Snapshot restoration raised {type(exc).__name__}: {exc}; inspect {snapshot.manifest_path}']
 
 
 def _repair_destination(project_dir: Path, path: str) -> Path:

@@ -43,6 +43,7 @@ CHECK_GROUPS: dict[str, CheckGroup] = {
             "tests.test_prompts",
             "tests.test_cli",
             "tests.test_structure_cleanup",
+            "tests.test_architecture_boundaries",
         ),
     ),
     "code-task": CheckGroup(
@@ -80,7 +81,6 @@ CHECK_GROUPS: dict[str, CheckGroup] = {
             "tests.test_document_ports",
             "tests.test_synthesis_capability",
             "tests.test_research_brief",
-            "tests.test_research_brief_application",
             "tests.test_research_application",
             "tests.test_research_session_application",
             "tests.test_research_report_application",
@@ -99,7 +99,7 @@ CHECK_GROUPS: dict[str, CheckGroup] = {
     ),
     "application": CheckGroup(
         description="Research intake, application advancement, candidate assessment and recovery.",
-        targets=("tests.test_research_intake", "tests.test_research_application", "tests.test_idea_assessment", "tests.test_research_design", "tests.test_session_migration"),
+        targets=("tests.test_research_intake", "tests.test_research_application", "tests.test_idea_assessment", "tests.test_research_design", "tests.test_session_migration", "tests.test_tool_agent_handoff"),
     ),
     "llm": CheckGroup(
         description="LLM transport, retries and budget accounting; no live provider calls.",

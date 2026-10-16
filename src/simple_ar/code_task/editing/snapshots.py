@@ -14,7 +14,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
 from simple_ar.code_task.runtime.state import is_relative_to, utcnow_iso
-from simple_ar.core.artifacts import write_json
+from simple_ar.core.artifacts import write_atomically, write_json
 
 
 SNAPSHOT_SCHEMA_VERSION = "code_task_file_snapshot.v1"
@@ -119,8 +119,11 @@ class FileSnapshotSet:
             event = {"path": rel_path, "restored_at": utcnow_iso()}
             if not row.get("existed"):
                 if target.is_file() or target.is_symlink():
-                    target.unlink()
-                    event["status"] = "removed_created_file"
+                    try:
+                        target.unlink()
+                        event["status"] = "removed_created_file"
+                    except OSError as exc:
+                        event.update(status="failed", reason=str(exc))
                 elif target.exists():
                     event["status"] = "skipped"
                     event["reason"] = "created_path_is_not_file"
@@ -149,9 +152,11 @@ class FileSnapshotSet:
                 restored.append(event)
                 self._restore_events.append(event)
                 continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(snapshot_file.read_bytes())
-            event["status"] = "restored_file"
+            try:
+                write_atomically(target, snapshot_file.read_bytes())
+                event["status"] = "restored_file"
+            except OSError as exc:
+                event.update(status="failed", reason=str(exc))
             restored.append(event)
             self._restore_events.append(event)
         self.write_manifest()
@@ -168,6 +173,27 @@ class FileSnapshotSet:
             "captured_count": self.captured_count,
             "restored_count": self.restored_count,
         }
+
+    def restore_verified(self) -> list[str]:
+        """Restore the captured unit and retain failures without masking its rejection."""
+
+        try:
+            events = self.restore()
+            errors = [f"Snapshot restore failed for {row['path']}: {row.get('reason', row['status'])}"
+                for row in events if row['status'] not in
+                {'restored_file', 'removed_created_file', 'already_missing'}]
+            for row in self._rows.values():
+                path = _workspace_file(self.workspace_dir, row['path'])
+                if path is None:
+                    errors.append(f"Snapshot restore path escapes workspace: {row['path']}")
+                elif row.get('existed'):
+                    if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != row.get('sha256'):
+                        errors.append(f"Snapshot restore byte check failed for {row['path']}")
+                elif path.exists():
+                    errors.append(f"Snapshot restore left created path {row['path']}")
+            return errors
+        except Exception as exc:
+            return [f'Snapshot restoration raised {type(exc).__name__}: {exc}; inspect {self.manifest_path}']
 
     def write_manifest(self) -> None:
         self.snapshot_dir.mkdir(parents=True, exist_ok=True)

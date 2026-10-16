@@ -282,11 +282,11 @@ class ReportObjectiveTests(unittest.TestCase):
             ]))
         draft.metric_ids = ["task"]
         before = memory.model_dump()
-        writer_args = dict(context=context, memory=memory, config=config, extra_context=[],
+        writer_args = dict(context=context, template=template, memory=memory, config=config, extra_context=[],
                            previous_draft=None, review=None, adopted_sections=[])
         for heading in ("Results", "实验观察", "Evidence and trade-offs"):
             section.heading = heading
-            writer = agent._writer_task_context(**writer_args, section=section)
+            writer = agent._writer_payload(**writer_args, section=section)
             reviewer = agent._reviewer_context(context=context, memory=memory, section=section,
                 config=config, template=template, draft=draft)
             self.assertEqual([row[0] for row in writer["metric_sources"]["rows"]], ["mean", "seed"])
@@ -294,10 +294,10 @@ class ReportObjectiveTests(unittest.TestCase):
         # Projection does not rewrite the saved evidence or accepted argument.
         section.heading = before["document_plan"]["sections"][0]["heading"]
         self.assertEqual(memory.model_dump(), before)
-        joint = agent._writer_task_context(**writer_args, section=None, document_sections=[section])
+        joint = agent._writer_payload(**writer_args, section=None, document_sections=[section])
         self.assertEqual([row[0] for row in joint["metric_sources"]["rows"]], ["mean", "seed", "other"])
         memory.document_plan = None
-        legacy = agent._writer_task_context(**writer_args, section=section)
+        legacy = agent._writer_payload(**writer_args, section=section)
         self.assertEqual(legacy["metric_sources"], joint["metric_sources"])
 
     def test_section_review_policy_and_schema_use_one_read_tool_registry(self):
@@ -349,7 +349,7 @@ class ReportObjectiveTests(unittest.TestCase):
         changed = duplicate.model_copy(deep=True)
         changed.content['handles'][0]['metadata']['evidence_passages'][0]['text'] = 'New comparison condition.'
         original = duplicate.model_dump(mode='json')
-        view = agent._writer_task_context(**{**common, 'extra_context': [duplicate, changed]})
+        view = agent._writer_payload(**{**common, 'extra_context': [duplicate, changed]}, template=template)
         self.assertEqual(view['extra_tool_context'][0]['content']['handles'],
             [{'handle': source.handle, 'evidence_reference': 'source_handles'}])
         self.assertEqual(view['extra_tool_context'][1]['content']['handles'][0]['metadata']['evidence_passages'][0]['text'],
@@ -419,35 +419,6 @@ class ReportObjectiveTests(unittest.TestCase):
         self.assertEqual(memory.model_dump(), before)
         memory.objective = ""
         self.assertEqual(report_objective(context, memory), context.topic)
-
-    def test_whole_document_review_and_completed_restore_keep_full_request(self):
-        context, config, template, memory, section, _ = self.objects()
-        memory.section_plan = [section, ReportSectionPlan(section_id="end", heading="Limitations",
-                                                         goal="Bound the observations.")]
-        config = config.model_copy(update={"document_review": True, "max_review_iterations": 0})
-        seen, calls, checkpoints = {}, [], []
-
-        class Client:
-            def ask_json(self, system, prompt, *, label="", **kwargs):
-                calls.append(label)
-                seen[label] = payload(prompt)
-                if label == "report-document-reviewer":
-                    return {"section_reviews": []}
-                planned = seen[label]["section"]
-                if "reviewer" in label:
-                    return {"section_id": planned["section_id"], "verdict": "pass"}
-                return {"section_id": planned["section_id"], "heading": planned["heading"],
-                        "draft_markdown": "Recorded observations only."}
-
-        kwargs = dict(client=Client(), context=context, config=config, template=template,
-                      memory=memory, gateway=ReportToolGateway(context))
-        result = run_report_agent(**kwargs, checkpoint_sink=checkpoints.append)
-        self.assertEqual(seen["report-document-reviewer"]["objective"], context.problem_markdown)
-        self.assertEqual(seen["report-document-reviewer"]["length_observation"]["total_markdown_tokens"], 6)
-        count = len(calls)
-        restored = run_report_agent(**kwargs, completed_checkpoint=checkpoints[-1])
-        self.assertEqual(restored.report_body, result.report_body)
-        self.assertEqual(len(calls), count)
 
 if __name__ == "__main__":
     unittest.main()

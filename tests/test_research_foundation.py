@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import tempfile
 import unittest
-import sqlite3
+import os
 from unittest.mock import patch
 
 from simple_ar.literature.models import Paper
@@ -37,6 +37,7 @@ from simple_ar.research.documents.extractors import apply_fulltext_extraction
 from simple_ar.research.documents.fulltext import build_fulltext_manifest, fulltext_hints_for_paper
 from simple_ar.research.documents.sections import build_document_sections
 from simple_ar.research.store.index import write_research_index
+from simple_ar.research.planning.capability import ResearchPlanResult
 from simple_ar.research.planning.planner import build_query_plan, build_research_questions
 from simple_ar.research.evidence.retrieval import RetrievalCandidate, relevance_score, screen_retrieval_candidates
 from simple_ar.research.sources.base import SearchQuery, build_source_plan, primary_query
@@ -121,8 +122,6 @@ class ResearchFoundationTests(unittest.TestCase):
                 "research_sources": ["local_files", "openalex"],
                 "research_queries": ["agent simulation benchmarks"],
                 "research_local_documents": ["notes.md"],
-                "research_index_backend": "sqlite_fts",
-                "research_index_root": ".simple_ar_cache/research_index",
                 "research_max_documents": 7,
                 "research_max_chunks": 50,
                 "research_novelty_backend": "local",
@@ -135,10 +134,57 @@ class ResearchFoundationTests(unittest.TestCase):
         self.assertEqual(plan.sources, ["local_files", "openalex"])
         self.assertEqual(primary_query(plan), "agent simulation benchmarks")
         self.assertEqual(plan.local_documents, ["notes.md"])
-        self.assertEqual(plan.index_root, ".simple_ar_cache/research_index")
+        self.assertEqual(plan.index_backend, "keyword")
+        self.assertIsNone(plan.index_root)
         self.assertEqual(plan.budget["max_documents"], 7)
         self.assertEqual(plan.budget["max_chunks"], 50)
         self.assertEqual(plan.budget["novelty_backend"], "local")
+
+    def test_new_source_plans_ignore_legacy_index_settings_with_diagnostics(self) -> None:
+        configs = [
+            {"research_index_backend": backend}
+            for backend in ("keyword", "sqlite_fts", "hybrid", "lancedb", "hybrid_lancedb", "unknown")
+        ] + [{"research_index_root": "run"}, {"research_index_root": "outside-workspace"}]
+        for config in configs + [{}]:
+            environment = {"SIMPLE_AR_RESEARCH_INDEX_ROOT": "historical-only"} if not config else {}
+            with self.subTest(config=config), patch.dict(os.environ, environment, clear=True):
+                with self.assertWarnsRegex(FutureWarning, "Deprecated/ignored") as warning:
+                    plan = build_source_plan(
+                        topic="source", problem_markdown="", config=config,
+                        default_query="source", default_max_results=4,
+                    )
+                self.assertEqual(plan.index_backend, "keyword")
+                self.assertIsNone(plan.index_root)
+                for key in config or environment:
+                    self.assertIn(key, str(warning.warning))
+                    self.assertIn(key, plan.to_row()["rationale"])
+                self.assertIn("in-memory SQLite BM25", plan.rationale)
+
+    def test_source_plan_modes_do_not_select_persistent_indexes(self) -> None:
+        for mode in ("lite", "standard", "strong"):
+            with self.subTest(mode=mode), patch.dict(os.environ, {}, clear=True):
+                plan = build_source_plan(
+                    topic="source", problem_markdown="", config={"research_mode": mode},
+                    default_query="source", default_max_results=4,
+                )
+                self.assertEqual(plan.index_backend, "keyword")
+                self.assertIsNone(plan.index_root)
+                self.assertIn("in-memory SQLite BM25", plan.rationale)
+
+    def test_historical_source_plan_index_fields_survive_public_handoff_loading(self) -> None:
+        for backend in ("sqlite_fts", "hybrid", "lancedb", "hybrid_lancedb"):
+            plan = SourcePlan(
+                queries=["source"], index_backend=backend,
+                index_root="historical/shared", rationale="Saved historical plan.",
+            )
+            handoff = ResearchPlanResult(
+                questions=(ResearchQuestion(question_id="RQ1", question="What is retained?"),),
+                query_plan=QueryPlan(topic="source", seed_queries=["source"]), source_plan=plan,
+            ).to_handoff_dict()
+            with self.subTest(backend=backend):
+                restored = ResearchPlanResult.from_handoff_dict(handoff)
+                self.assertEqual(restored.source_plan.to_row(), plan.to_row())
+                self.assertEqual(handoff["source_plan"], plan.to_row())
 
     def test_research_questions_and_query_plan_expand_topic(self) -> None:
         questions = build_research_questions(
@@ -584,59 +630,38 @@ class ResearchFoundationTests(unittest.TestCase):
 
         self.assertEqual(url, "https://example.test/paper.pdf")
 
-    def test_text_chunks_and_sqlite_index_are_written(self) -> None:
-        TEST_ROOT.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as tmp:
+    def test_retired_index_writer_leaves_existing_and_new_locations_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            note = root / "agent_notes.md"
-            note.write_text(
-                "# Agent Notes\n\n"
-                "Multi-agent coding systems coordinate repository repair agents.\n"
-                "Benchmarks often use unit tests and patch validation.\n",
-                encoding="utf-8",
+            existing = root / "existing"
+            existing.mkdir()
+            snapshots = {
+                "chunks.jsonl": b"retained portable chunks",
+                "index_meta.json": b"historical cleanup metadata",
+                "sqlite_fts.db": b"historical database",
+                "lancedb/table.lance": b"historical LanceDB table",
+            }
+            for name, content in snapshots.items():
+                target = existing / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(content)
+            chunks = [TextChunk(chunk_id="doc#1", document_id="doc", text="retained evidence")]
+            for backend in ("keyword", "sqlite_fts", "hybrid", "lancedb", "hybrid_lancedb", "unknown"):
+                for index_dir in (existing, root / "new"):
+                    with self.subTest(backend=backend, index_dir=index_dir), self.assertRaisesRegex(
+                        RuntimeError, "write_research_index is retired"
+                    ), patch.dict(os.environ, {"SIMPLE_AR_RESEARCH_INDEX_ROOT": str(existing)}):
+                        write_research_index(
+                            index_dir=index_dir, chunks=chunks, backend=backend,
+                            run_id="old-run", shared_root=existing,
+                        )
+            self.assertFalse((root / "new").exists())
+            self.assertEqual(
+                {path.relative_to(existing).as_posix(): path.read_bytes()
+                 for path in existing.rglob("*") if path.is_file()},
+                snapshots,
             )
-            record = DocumentRecord(
-                document_id="local-agent-notes",
-                title="Agent Notes",
-                source="local_files",
-                local_path=str(note),
-                extraction_status="parsed",
-                parser="plain_text",
-            )
-
-            chunks = build_text_chunks([record], max_chunks=4, chunk_chars=80, overlap_chars=10)
-            shared_root = root / "shared_research_index"
-            meta = write_research_index(
-                index_dir=root / "research_index",
-                chunks=chunks,
-                backend="sqlite_fts",
-                run_id="test-run",
-                shared_root=shared_root,
-            )
-
-            self.assertGreaterEqual(len(chunks), 1)
-            self.assertEqual(chunks[0].document_id, "local-agent-notes")
-            self.assertEqual(meta["backend"], "sqlite_fts")
-            self.assertEqual(meta["store"]["scope"], "shared")
-            self.assertEqual(meta["store"]["root"], str(shared_root))
-            self.assertEqual(meta["sqlite_fts"]["status"], "ready")
-            self.assertTrue((root / "research_index" / "chunks.jsonl").is_file())
-            self.assertTrue((root / "research_index" / "index_meta.json").is_file())
-            self.assertFalse((root / "research_index" / "sqlite_fts.db").exists())
-            conn = sqlite3.connect(Path(str(meta["sqlite_fts"]["path"])))
-            try:
-                rows = conn.execute(
-                    "SELECT chunk_id FROM chunks WHERE run_id = ? AND chunks MATCH ?",
-                    ("test-run", "repository"),
-                ).fetchall()
-                all_rows = conn.execute(
-                    "SELECT run_id, chunk_id FROM chunks WHERE chunks MATCH ?",
-                    ("repository",),
-                ).fetchall()
-            finally:
-                conn.close()
-            self.assertGreaterEqual(len(rows), 1)
-            self.assertTrue(all(row[0] == "test-run" for row in all_rows))
+            self.assertEqual(chunks[0].text, "retained evidence")
 
     def test_section_aware_chunks_preserve_document_sections(self) -> None:
         TEST_ROOT.mkdir(exist_ok=True)
@@ -743,33 +768,6 @@ class ResearchFoundationTests(unittest.TestCase):
             self.assertTrue(claim_cards)
             self.assertTrue(method_cards)
             self.assertTrue(dataset_cards)
-
-    def test_lancedb_index_backend_is_optional(self) -> None:
-        TEST_ROOT.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=TEST_ROOT) as tmp:
-            root = Path(tmp)
-            chunks = [
-                TextChunk(
-                    chunk_id="doc-1#chunk-001",
-                    document_id="doc-1",
-                    text="agent coding evidence",
-                    metadata={"title": "Agent Coding", "source": "local_files"},
-                )
-            ]
-
-            with patch.dict("sys.modules", {"lancedb": None}):
-                meta = write_research_index(
-                    index_dir=root / "research_index",
-                    chunks=chunks,
-                    backend="lancedb",
-                    run_id="test-run",
-                    shared_root=root / "shared_research_index",
-                )
-
-            self.assertEqual(meta["backend"], "lancedb")
-            self.assertEqual(meta["lancedb"]["scope"], "shared")
-            self.assertTrue(str(meta["lancedb"]["status"]).startswith("failed:"))
-            self.assertTrue((root / "research_index" / "chunks.jsonl").is_file())
 
     def test_evidence_cards_are_grounded_in_chunks(self) -> None:
         document = DocumentRecord(

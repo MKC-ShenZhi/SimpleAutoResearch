@@ -1,8 +1,7 @@
 """Impact, required work and the bounded correction lifecycle are distinct."""
-import json
 import unittest
 
-from tests.report_review_fixtures import document_review_inputs, prompt_payload, unresolved_opinion_response
+from tests.report_review_fixtures import agent_inputs, document_review_inputs, prompt_payload, ReviewPromptCapture
 
 from simple_ar.integrations.llm import LLMError
 from simple_ar.report.agent import _needs_revision, _needs_evidence_recheck, run_report_agent
@@ -14,7 +13,6 @@ from simple_ar.report.schema import (
 )
 from simple_ar.research.contracts import DocumentRecord, TextChunk
 from simple_ar.research.documents.ingest import DocumentBundle
-from simple_ar.report.templates import load_report_template_bundle
 from simple_ar.report.tool_gateway import ReportToolGateway
 
 
@@ -30,9 +28,7 @@ class ReviewActionTests(unittest.TestCase):
         config = ReportRuntimeConfig(template='material_report', max_review_iterations=1, **settings)
         memory = ReportMemory(section_plan=[ReportSectionPlan(section_id='findings',
             heading='Findings', goal='Explain without extending the supplied setting')])
-        template = load_report_template_bundle(report_mode=context.report_mode, config=config)
-        return dict(context=context, memory=memory, config=config, template=template,
-                    gateway=ReportToolGateway(context))
+        return agent_inputs(context, memory, config)
 
     def test_explicit_action_is_independent_of_impact_and_prose_wording(self):
         for kind in ('style', 'missing_limitation', 'evidence_gap'):
@@ -131,21 +127,8 @@ class ReviewActionTests(unittest.TestCase):
                 run_report_agent(client=Client(), **objects, completed_checkpoint=saved[-1])
                 self.assertEqual(len(labels), before)
 
-    def test_optional_advice_does_not_spend_a_correction(self):
-        labels = []
-        finding = self.finding('advisory')
-        class Client:
-            def ask_json(client, system, prompt, *, label='', **kwargs):
-                labels.append(label)
-                if 'reviewer' in label:
-                    return {'verdict': 'warning', 'findings': [finding.model_dump(mode='json')]}
-                return {'draft_markdown': 'The supplied observations are limited to this setting.'}
-        result = run_report_agent(client=Client(), **self.objects())
-        self.assertFalse(any('reviser' in label for label in labels))
-        self.assertEqual(result.memory.reviewer_findings[0].required_action, 'advisory')
-
-    def test_minor_required_work_revises_and_successful_check_clears_it(self):
-        for action, kind in (('revise', 'style'), ('verify', 'missing_limitation')):
+    def test_minor_actions_spend_corrections_only_for_required_work(self):
+        for action, kind in (('advisory', 'missing_limitation'), ('revise', 'style'), ('verify', 'missing_limitation')):
             with self.subTest(action=action):
                 labels = []
                 finding = self.finding(action, type=kind)
@@ -160,11 +143,15 @@ class ReviewActionTests(unittest.TestCase):
                             row = prompt_payload(prompt)
                             assert row['review_findings'][0]['required_action'] == action
                             return {'draft_markdown': 'Only the supplied setting was observed; wider validity is unknown.'}
-                        return {'draft_markdown': 'The conclusion holds everywhere.'}
+                        return {'draft_markdown': 'The supplied observations are limited to this setting.'
+                                if action == 'advisory' else 'The conclusion holds everywhere.'}
                 result = run_report_agent(client=Client(), **self.objects())
-                self.assertEqual(sum('reviser' in label for label in labels), 1)
-                self.assertIn('wider validity is unknown', result.report_body)
-                self.assertFalse(result.memory.reviewer_findings)
+                self.assertEqual(sum('reviser' in label for label in labels), int(action != 'advisory'))
+                if action == 'advisory':
+                    self.assertEqual(result.memory.reviewer_findings[0].required_action, action)
+                else:
+                    self.assertIn('wider validity is unknown', result.report_body)
+                    self.assertFalse(result.memory.reviewer_findings)
 
     def test_exhausted_allowance_retains_required_work_and_audit_warning(self):
         objects = self.objects()
@@ -207,25 +194,19 @@ class ReviewActionTests(unittest.TestCase):
         objects = self.objects()
         objects['memory'].reviewer_findings = [self.finding('verify'), self.finding('advisory', finding_id='polish')]
         before = [row.model_dump(mode='json') for row in objects['memory'].reviewer_findings]
-        seen = []
-        class Client:
-            def ask_json(client, system, prompt, **kwargs):
-                view = json.loads(prompt)
-                seen.append(view)
-                return unresolved_opinion_response(view, verdict=None,
-                    explanation='Synthetic capture checks input projection, not factual resolution.')
+        capture = ReviewPromptCapture()
         inputs = document_review_inputs(objects['memory'], objects['config'],
             [ReportSectionDraft(section_id='findings', heading='Findings', draft_markdown='Text')],
             template=objects['template'])
-        review_document(client=Client(), **inputs,
+        review_document(client=capture, **inputs,
             historical_findings=[objects['memory'].reviewer_findings[0]])
-        self.assertEqual([row['finding_id'] for row in seen[0]['historical_findings_to_check']], ['scope'])
+        self.assertEqual([row['finding_id'] for row in capture.views[0]['historical_findings_to_check']], ['scope'])
         for field in ('required_action', 'severity', 'suggested_action'):
-            self.assertNotIn(field, seen[0]['historical_findings_to_check'][0])
+            self.assertNotIn(field, capture.views[0]['historical_findings_to_check'][0])
         self.assertEqual([row.model_dump(mode='json') for row in objects['memory'].reviewer_findings], before)
-        self.assertNotIn('findings', seen[0]['output_schema']['section_reviews'][0])
-        review_document(client=Client(), **inputs)
-        self.assertIn('required_action', seen[1]['output_schema']['section_reviews'][0]['findings'][0])
+        self.assertNotIn('findings', capture.views[0]['output_schema']['section_reviews'][0])
+        review_document(client=capture, **inputs)
+        self.assertIn('required_action', capture.views[1]['output_schema']['section_reviews'][0]['findings'][0])
 
 
 if __name__ == '__main__':

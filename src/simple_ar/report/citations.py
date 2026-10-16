@@ -111,6 +111,12 @@ def expand_short_citation_keys(markdown_body: str, citation_key_map: dict[str, s
     return re.sub(r"\[([Pp]\d+(?:\s*[;,]\s*[Pp]\d+)*)\]", replace_bare_group, expanded)
 
 
+def _citation_body(markdown: str) -> str:
+    """Exclude reference lists and fenced examples from body citation consumers."""
+    from simple_ar.report.assembler import _markdown_lines
+    return '\n'.join(line for line, _, code in _markdown_lines(strip_report_references(markdown)) if not code)
+
+
 def citation_display_map(papers: list[Paper]) -> dict[str, int]:
     """Return stable numeric citation labels for body-cited papers."""
     return {paper.id: index for index, paper in enumerate(papers, start=1)}
@@ -252,7 +258,7 @@ def cited_papers(markdown_body: str, papers: list[Paper]) -> list[Paper]:
 
 def ordered_body_citation_ids(markdown: str, allowed_ids: set[str]) -> list[str]:
     """Return allowed citation ids in first-mention order before references."""
-    body = strip_references_section(markdown)
+    body = _citation_body(markdown)
     ordered: list[str] = []
     seen: set[str] = set()
     for paper_id in re.findall(_CITATION_PATTERN, body):
@@ -262,10 +268,18 @@ def ordered_body_citation_ids(markdown: str, allowed_ids: set[str]) -> list[str]
     return ordered
 
 
-def body_citation_ids(markdown: str, allowed_ids: set[str]) -> set[str]:
-    """Return allowed citation ids that appear before the References section."""
-    body = strip_references_section(markdown)
-    found = set(re.findall(_CITATION_PATTERN, body))
-    return found & allowed_ids
+def body_citation_ids(markdown: str, allowed_ids: set[str], *,
+                      citation_key_map: dict[str, str] | None = None,
+                      include_unknown: bool = False) -> set[str]:
+    """Count body/caption identities; strict drafting may also inspect unknowns.
+
+    Existing callers still receive allowed ids only. Short-key normalization
+    uses the same source map as assembly; examples and references are excluded.
+    """
+    body = _citation_body(markdown)
+    if citation_key_map is not None:
+        body = normalize_bare_source_id_citations(expand_short_citation_keys(body, citation_key_map), allowed_ids)
+    found = find_citation_ids(body)
+    return found if include_unknown else found & allowed_ids
 
 

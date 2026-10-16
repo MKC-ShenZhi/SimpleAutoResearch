@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from simple_ar.core.budget import BudgetLedger
-from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext, CapabilityRegistry, CapabilityResult
+from simple_ar.core.capabilities import ArtifactRef, ArtifactStore, AttemptManifest, CapabilityContext, CapabilityRegistry, CapabilityResult
 from simple_ar.core.session import BudgetState, SessionController
 from simple_ar.integrations.llm import LLMClient, LLMError, LLMSettings, estimate_tokens
 from simple_ar.integrations.model_profiles import model_connections_compatible
@@ -26,17 +27,17 @@ from simple_ar.tools.specs import CommonToolSpec, ToolCall, ToolResult
 from simple_ar.tools.workspace import (WorkspaceToolGateway, workspace_tool_specs,
     DeliveryRequest, validate_workspace_arguments, workspace_observation_view, workspace_history_identity,
     resolve_source_mount)
-from simple_ar.tools.sources import SourceToolGateway, source_tool_specs
+from simple_ar.tools.sources import SourcePolicy, SourceToolGateway, source_tool_specs
 from simple_ar.tools.visual import VisualToolGateway, visual_tool_specs
 from simple_ar.tools.images import ImageToolGateway, image_tool_specs
 from simple_ar.tools.publication import PublicationToolGateway, publication_tool_specs, ExportRequest, export_input_binding
-from simple_ar.tools.writing import WritingToolGateway, writing_tool_specs
-from simple_ar.tools.implementation import ImplementationToolGateway, implementation_tool_specs
+from simple_ar.tools.writing import BOUND_REPORT_REVISION, WritingToolGateway, writing_tool_specs
+from simple_ar.tools.implementation import ExactCodeTask, ImplementationToolGateway, implementation_tool_specs
 from simple_ar.tools.analysis import AnalysisToolGateway, analysis_tool_specs
 
 
 _CORE_COORDINATION = {'focus_work', 'load_tools', 'read_history'}
-_FINAL_WORK_TOOLS = {'write_file', 'export_report', 'run_process'}
+_FINAL_WORK_TOOLS = {'write_file', 'export_report', 'run_process', 'review_document', 'measure_experiment', 'analyze_measurements'}
 
 
 SYSTEM = (
@@ -48,9 +49,9 @@ SYSTEM = (
     "Specialized tools own the work described in their catalog. Delegate a bounded outcome and "
     "authorized inputs rather than writing their answers first; do not force a particular tool "
     "or a fixed sequence when direct work is sufficient. "
-    "Keep one canonical article body: compose or edit Markdown, then let the publication tool "
-    "derive TeX/PDF and requested page previews. Do not independently author two bodies unless "
-    "the user needs custom typesetting. Direct editing remains appropriate; focus_work can use "
+    "Keep one canonical article body and follow its owner's revision contract; unmanaged Markdown "
+    "may be edited directly. Let publication derive TeX/PDF and requested page previews rather than "
+    "independently authoring a second body unless custom typesetting is requested. focus_work can use "
     "a configured code or writing connection in this same action loop to investigate evidence, "
     "correct the work, verify and deliver a bounded goal, then return to task when useful. "
     "No tool choice, candidate or work focus alone completes or verifies a task.\n\n"
@@ -164,14 +165,18 @@ class ToolApplication:
             {**{name: Path(path) for name, path in config["sources"].items()},
              "evidence": evidence,
              "records": controller.store.root / "attempts"}, self.ledger,
-            project_python=Path(config['project_python']) if config.get('project_python') else None)
+            project_python=Path(config['project_python']) if config.get('project_python') else None,
+            record_artifacts=self._record_artifacts)
         registry = ToolRegistry()
         registry.register_many(workspace_tool_specs())
         registry.register_many(source_tool_specs())
         registry.register_many(publication_tool_specs())
         registry.register_many(writing_tool_specs())
-        registry.register_many(implementation_tool_specs())
+        registry.register_many(implementation_tool_specs(exact=config.get('code_task') is not None))
         registry.register_many(analysis_tool_specs())
+        if config.get('scientific_tools', False):
+            from simple_ar.tools.scientific import scientific_tool_specs
+            registry.register_many(scientific_tool_specs())
         registry.register(CommonToolSpec(name='read_history', domain='coordination',
             permission_level='read_only', risk_level='low', input_schema=_ReadHistory.model_json_schema(),
             description='Read a bounded byte window of closed accepted turn observation indexes, including archived history and inline cancellation receipts. Turn indexes are zero-based, not attempt numbers. Continue with the returned end_turn pinned and next_offset_bytes while has_more_bytes; otherwise next_turn starts the next range. Original replies and attempt results remain readable at their record locators. Historical identities and statuses are not current file contents, authorization, verified success or resolved failures. No model call or new state.'))
@@ -194,24 +199,59 @@ class ToolApplication:
             permissions.add("execution")
         if config.get("allow_network", False) or config.get("allow_vision", False) or config.get("max_images", 0) > 0:
             permissions.add("network")
+        blocked = set() if config.get('allow_network', False) else {
+            spec.name for spec in registry.list_specs()
+            if spec.domain == 'sources' and spec.permission_level == 'network'}
+        if config.get('code_task') is not None:
+            # An exact contract owns candidate mutations and its validator.
+            # Generic workspace writes/processes cannot bypass that authority.
+            blocked.update(spec.name for spec in registry.list_specs()
+                if spec.domain == 'workspace' and spec.permission_level in {'write_patch', 'execution'})
+            if not config.get('scientific_lineage', False):
+                blocked.update(spec.name for spec in registry.list_specs()
+                    if spec.domain == 'scientific' and spec.permission_level == 'execution')
         self.writing = WritingToolGateway(controller.store.root, self.workspace, self.ledger,
             config['model'], controller.manifest.session_id,
-            client_factory=lambda identity: self._client(identity, purpose='writing', native=False))
+            client_factory=lambda identity: self._client(identity, purpose='writing', native=False),
+            report_inputs=self._report_inputs if config.get('report_requirement') else None)
+        scientific = {}
+        self.implementation = ImplementationToolGateway(controller.store.root, self.workspace, self.ledger,
+            config['model'], controller.manifest.session_id,
+            client_factory=lambda identity: self._client(identity, purpose='code'),
+            execution_observations=self._execution_observations, exact=config.get('code_task'),
+            candidate_outputs=lambda record: scientific['scientific'].candidate_outputs(record) if scientific else {},
+            measurement_inputs=lambda origin, required: scientific['scientific'].implementation_inputs([
+                observed['data']['result_ref'] for turn in self.state['turns'] for item in turn['tools']
+                if (observed := self.session.store.read_json(item['result'])).get('tool_name') == 'measure_experiment'
+                and observed.get('status') == 'ok'], origin, required=required),
+            measurement=config.get('execution_contract') if config.get('code_task') is not None else None)
+        if config.get('scientific_tools', False):
+            from simple_ar.tools.scientific import ScientificToolGateway
+            scientific['scientific'] = ScientificToolGateway(controller.store.root, self.workspace,
+                self.ledger, controller.manifest.session_id,
+                implementation=self.implementation if config.get('scientific_lineage', False) else None,
+                execution_contract=config.get('execution_contract'),
+                research_contract=lambda: self.sources.accepted_execution_contract(),
+                research_requirements=lambda: self.sources.execution_issues())
+        self.scientific = scientific.get('scientific')
+        self.sources = SourceToolGateway(controller.store.root, self.workspace, self.ledger,
+            policy=config.get('research_policy'),
+            client_factory=(lambda identity: self._client(identity, purpose='task', native=False))
+                if config['model'] is not None else None,
+            feasibility_client_factory=self._feasibility_client)
         self.gateway = CommonToolGateway(controller.store.root, registry=registry,
             policy=ToolPermissionPolicy(allowed_permissions=permissions, max_risk_level="high",
-                blocked_tools=set() if config.get("allow_network", False) else {"search_sources", "acquire_source"}),
+                blocked_tools=blocked),
             domain_gateways={"coordination": self, "workspace": self.workspace,
-                "sources": SourceToolGateway(controller.store.root, self.workspace, self.ledger),
-                "analysis": AnalysisToolGateway(controller.store.root, self.workspace),
+                "sources": self.sources,
+                "analysis": AnalysisToolGateway(controller.store.root, self.workspace,
+                    contract=config.get('table_analysis')),
                 "visual": VisualToolGateway(controller.store.root, self.workspace, self.ledger,
                     controller.manifest.session_id, client_factory=lambda identity: self._client(identity, purpose='vision')),
                 "images": ImageToolGateway(self.workspace, self.ledger),
                 "publication": PublicationToolGateway(controller.store.root, self.workspace, self.ledger),
                 "writing": self.writing,
-                "implementation": ImplementationToolGateway(controller.store.root, self.workspace, self.ledger,
-                    config['model'], controller.manifest.session_id,
-                    client_factory=lambda identity: self._client(identity, purpose='code'),
-                    execution_observations=self._execution_observations)})
+                "implementation": self.implementation, **scientific})
 
     def _tool_selection(self) -> set[str]:
         """Project the last accepted selection, not a second mutable tool state."""
@@ -221,6 +261,13 @@ class ToolApplication:
                 if result.get('tool_name') == 'load_tools' and result.get('status') == 'ok':
                     return set(_ToolSelection.model_validate(result['data']).names)
         return set()
+
+    def _record_artifacts(self) -> tuple[Path, ...]:
+        """Only actual controller-registered domain outputs can be delivered."""
+        return tuple(ArtifactStore(self.session.store.root / 'attempts' / attempt.attempt_id).resolve(ref)
+            for attempt in self.session.list_attempts() if attempt.status == 'completed'
+            for ref in attempt.outputs if ref.status == 'available'
+            and ref.kind not in {'native_reply', 'native_result', 'native_observation', 'caller_actions'})
 
     @property
     def schemas(self) -> list[dict[str, object]]:
@@ -276,7 +323,8 @@ class ToolApplication:
             calls = {call['id']: call for call in reply.get('tool_calls', [])}
             for item in reversed(turn['tools']):
                 call = calls[item['id']]
-                if call['function']['name'] != 'run_process':
+                spec = self.gateway.registry.get(call['function']['name'])
+                if spec is None or spec.permission_level != 'execution':
                     continue
                 result = self.session.store.read_json(item['result'])
                 if 'returncode' not in (result.get('data') or {}):
@@ -292,6 +340,11 @@ class ToolApplication:
                 break
         return ([failure] if failure is not None and failure is not latest else []) + (
             [latest] if latest is not None else [])
+
+    def can_reconcile(self, name: str, identity: str) -> bool:
+        # The advisory plan is deterministic and cannot grant permission,
+        # execute work or certify a delivery.
+        return name == 'update_work_plan'
 
     def call(self, name: str, arguments: dict[str, Any], *, identity: str) -> ToolResult:
         """A model-selection decision uses the same permissioned gateway."""
@@ -361,12 +414,42 @@ class ToolApplication:
             return ToolResult(tool_name=name, status='blocked', error=str(exc))
 
     @classmethod
-    def create(cls, root: Path, goal: str, *, model: str, sources: dict[str, Path],
+    def create(cls, root: Path, goal: str, *, model: str | None, sources: dict[str, Path],
                allow_execution: bool = False, allow_network: bool = False, allow_vision: bool = False, max_turns: int = 30,
                max_tokens: int = 600000, max_images: int = 0,
-               project_python: Path | None = None) -> ToolApplication:
-        if not goal.strip() or max_turns < 1 or max_tokens < 1 or max_images < 0:
-            raise ValueError("Goal and positive resource bounds are required")
+               project_python: Path | None = None, code_task: dict[str, Any] | None = None,
+               process_limits: dict[str, int | float] | None = None,
+               report_requirement: dict[str, Any] | None = None,
+               research_policy: dict[str, Any] | None = None,
+               table_analysis: dict[str, Any] | None = None,
+               max_output_tokens: int | None = None,
+               max_attempts: int | None = None,
+               source_operations: int | None = None,
+               execution_contract: dict[str, Any] | None = None) -> ToolApplication:
+        if (not goal.strip() or max_images < 0 or
+                (model is not None and (not model.strip() or max_turns < 1 or max_tokens < 1))):
+            raise ValueError('Goal and positive model resource bounds are required')
+        if source_operations is not None and (type(source_operations) is not int or source_operations < 0):
+            raise ValueError('Source operation allowance must be a finite nonnegative count')
+        if type(max_turns) is not int or type(max_tokens) is not int or max_turns < 0 or max_tokens < 0:
+            raise ValueError('Finite nonnegative model resource allowances are required')
+        if model is None and (allow_vision or max_images
+                or code_task is not None or report_requirement is not None or max_output_tokens is not None):
+            raise ValueError('A caller-directed task cannot authorize a model-owned contract')
+        attempt_limit = max_attempts if max_attempts is not None else max_turns * 10
+        if type(attempt_limit) is not int or attempt_limit < 1:
+            raise ValueError('A finite positive task attempt allowance is required')
+        if execution_contract is not None:
+            from simple_ar.tools.scientific import measurement_contract
+            if not allow_execution:
+                raise ValueError('A fixed measurement contract needs explicit execution access')
+            execution_contract = measurement_contract(execution_contract)
+        if process_limits is not None and (not isinstance(process_limits, dict)
+                or set(process_limits) - {'process_invocations', 'process_wall_seconds'}
+                or any(type(value) not in {int, float} or (type(value) is float and not math.isfinite(value)) or value < 0
+                       for value in process_limits.values())
+                or ('process_invocations' in process_limits and type(process_limits['process_invocations']) is not int)):
+            raise ValueError('Process limits require finite nonnegative counts/wall seconds; zero is not omission')
         mounts = {}
         if project_python is not None:
             project_python = project_python.expanduser().absolute()
@@ -377,10 +460,48 @@ class ToolApplication:
                 raise ValueError("Invalid or reserved source alias")
             path = resolve_source_mount(path)
             mounts[name] = str(path)
+        if research_policy is not None:
+            research_policy = SourcePolicy.model_validate(research_policy).model_dump(mode='json')
+        if table_analysis is not None:
+            from types import SimpleNamespace
+            from simple_ar.tools.analysis import validate_table_analysis_contract
+            from simple_ar.tools.workspace import resolve_mounted_path
+            table_analysis = validate_table_analysis_contract(SimpleNamespace(resolve=lambda value:
+                resolve_mounted_path({name: Path(path) for name, path in mounts.items()}, value)), table_analysis)
+        if code_task is not None:
+            from simple_ar.tools.scientific import measurement_conditions
+            conditions = measurement_conditions(execution_contract) if execution_contract is not None else []
+            if any(row['execution'].get('environment') is not None for row in conditions):
+                raise ValueError('CodeTask preparation owns its environment; do not replace it in measurement')
+            if execution_contract is not None and 'conditions' in execution_contract and any('source' not in row for row in conditions):
+                raise ValueError('Scoped conditions require explicit preparation/implementation/declared source ownership')
+            code_task = ExactCodeTask.model_validate(code_task).model_dump()
+            if not allow_execution or (code_task['project_path'] and code_task['project_path'] not in mounts):
+                raise ValueError('Exact CodeTask requires a mounted project and execution proposals')
+            if code_task['project_path'] and not Path(mounts[code_task['project_path']]).is_dir():
+                raise ValueError('Exact CodeTask project must be a directory')
+            if (code_task['project_path'] and any(row.get('source', 'implementation') != 'declared'
+                    and Path(row['execution']['cwd']).resolve() != Path(mounts[code_task['project_path']]).resolve()
+                    for row in conditions)):
+                raise ValueError('CodeTask measurement origin must match its explicitly mounted project')
+        elif execution_contract is not None:
+            from simple_ar.tools.scientific import measurement_conditions
+            if any(row.get('before_implementation') for row in measurement_conditions(execution_contract)):
+                raise ValueError('Pre-implementation conditions require a frozen code task')
+        if report_requirement is not None:
+            from simple_ar.tools.writing import validate_report_requirement
+            report_requirement = validate_report_requirement(report_requirement)
         # Preflight connection/protocol before creating a session or making a call.
-        client = LLMClient.from_env(model)
-        if client._settings.api_mode != "chat":
+        client = LLMClient.from_env(model) if model is not None else None
+        if max_output_tokens is not None:
+            client.with_output_limit(max_output_tokens)  # Validate before session mutation.
+        if client is not None and client._settings.api_mode != "chat":
             raise ValueError("Native tools currently require a named Chat connection; no protocol fallback")
+        feasibility_connection = None
+        if research_policy and research_policy.get('feasibility_connection'):
+            if client is None:
+                raise ValueError('Independent feasibility review requires model authorization')
+            feasibility_connection = LLMClient.from_env(research_policy['feasibility_connection']).connection_binding()
         vision_connection = None
         if allow_vision:
             vision_connection = cls._vision_binding(LLMClient.from_env(purpose="vision"))
@@ -393,23 +514,40 @@ class ToolApplication:
             profile.credential()
             profile.resolve_proxy()
         session = SessionController.create(root, session_id=root.name, topic=goal,
-            registry=CapabilityRegistry(), budget=BudgetState(max_attempts=max_turns * 10, max_no_progress=6))
+            registry=CapabilityRegistry(), budget=BudgetState(max_attempts=attempt_limit, max_no_progress=6))
         session.manifest.transition_recipe = cls.RECIPE
         session.store.write_json("actions.json", {"config": {"model": model,
-            "model_connection": client.connection_binding(),
+            "model_connection": client.connection_binding() if client is not None else None,
             "vision_connection": vision_connection,
             "project_python": str(project_python) if project_python else None,
             "sources": mounts, "allow_execution": allow_execution, "allow_network": allow_network,
-            "allow_vision": allow_vision,
+            "allow_vision": allow_vision, "scientific_tools": True, "scientific_lineage": True,
+            "execution_contract": execution_contract,
+            "research_policy": research_policy, "table_analysis": table_analysis,
+            "feasibility_connection": feasibility_connection,
             "max_images": max_images,
             "max_turns": max_turns},
             "requests": [goal], "turns": [], "pending": None})
+        if code_task is not None:
+            actions = session.store.read_json('actions.json')
+            actions['config']['code_task'] = code_task
+            session.store.write_json('actions.json', actions)
+        if report_requirement is not None or max_output_tokens is not None:
+            actions = session.store.read_json('actions.json')
+            if report_requirement is not None:
+                actions['config']['report_requirement'] = report_requirement
+                actions['config']['report_evidence_contract'] = (
+                    'execution.v1' if code_task is not None or execution_contract is not None else 'materials.v1')
+            if max_output_tokens is not None:
+                actions['config']['max_output_tokens'] = max_output_tokens
+            session.store.write_json('actions.json', actions)
         BudgetLedger({"llm_requests": max_turns, "total_tokens": max_tokens,
             # One model turn can contain multiple bounded tool operations.
             # Search backends share process receipts, but must not consume a
             # one-process-per-model-turn allowance before validation starts.
             "process_invocations": max_turns * 10, "process_wall_seconds": max_turns * 300,
-            "source_operations": max_turns * 3, "image_requests": max_images},
+            "source_operations": source_operations if source_operations is not None else max_turns * 3,
+            "image_requests": max_images, **(process_limits or {})},
             storage_path=root / "budget_ledger.json").save()
         session.manifest.state_refs["actions"] = session.store.ref("actions.json", kind="native_actions")
         session.manifest.budget_ledger_ref = session.store.ref("budget_ledger.json", kind="budget_ledger")
@@ -424,11 +562,87 @@ class ToolApplication:
         self.session.store.write_json("actions.json", self.state)
         self.session.save()
 
+    def _submit_actions(self, actions: list[dict[str, Any]]) -> None:
+        """Accept caller requests into the existing action journal, not a new scheduler.
+
+        Supplying an operation never approves its execution. Closed observations,
+        attempt ownership and interruption recovery are identical to model calls.
+        No references are substituted and no subsequent scientific steps inferred.
+        """
+        budget = self.session.manifest.budget
+        if not isinstance(actions, list) or not 1 <= len(actions) <= budget.max_attempts:
+            raise ValueError('Explicit tool requests must fit the task attempt allowance')
+        pending = self.state['pending']
+        abandoned = None
+        if pending:
+            abandoned = self._failed_model_attempt(pending)
+            if abandoned is None or self.session.manifest.status not in {'running', 'paused', 'blocked', 'failed'}:
+                raise ValueError('Cannot prove a closed failed decision without accepted output; recover pending work')
+            if any(row.status == 'running' for row in self.session.list_attempts()):
+                raise ValueError('Reconcile running attempts before submitting caller actions')
+            for entry in self.ledger.entries:
+                if entry.status not in {'reserved', 'unknown'}:
+                    continue
+                if (entry.status != 'unknown'
+                        or entry.session_id != self.session.manifest.session_id
+                        or entry.logical_call_id != entry.attempt_id or entry.purpose != 'native-turn'
+                        or self._failed_model_attempt({'kind': 'model', 'attempt': entry.attempt_id},
+                            current_only=False) is None
+                        or entry.actual_source != 'reservation_bound'
+                        or set(entry.reserved) != {'llm_requests', 'total_tokens'}
+                        or entry.reserved['llm_requests'] != 1
+                        or type(entry.reserved['total_tokens']) is not int or entry.reserved['total_tokens'] <= 0
+                        or entry.actual.get('llm_requests') != 1
+                        or any(key not in entry.reserved or type(value) not in {int, float}
+                            or not math.isfinite(value) or not 0 <= value <= entry.reserved[key]
+                            for key, value in entry.actual.items())):
+                    raise ValueError('Reconcile reserved or unrecognized unknown operations before caller takeover')
+        if any(turn['remaining'] for turn in self.state['turns']):
+            raise ValueError('Reconcile or explicitly cancel queued work before submitting actions')
+        if self.session.manifest.status in {'completed', 'partial'}:
+            raise ValueError('New actions after delivery require explicit feedback')
+        calls = []
+        turn_number = len(self.state['turns'])
+        for index, row in enumerate(actions):
+            if (not isinstance(row, dict) or set(row) != {'tool_name', 'arguments'}
+                    or not isinstance(row['tool_name'], str) or not isinstance(row['arguments'], dict)):
+                raise ValueError('Each caller action requires exactly tool_name and object arguments')
+            spec = self.gateway.registry.get(row['tool_name'])
+            if spec is None or not self.gateway.policy.is_allowed(spec)[0]:
+                raise ValueError('Caller action is unavailable under this task permission policy')
+            calls.append({'id': f'caller-{turn_number}-{index}', 'type': 'function',
+                'function': {'name': row['tool_name'],
+                    'arguments': json.dumps(row['arguments'], ensure_ascii=False, allow_nan=False)}})
+        relative = f'tools/submissions/caller-{turn_number}.json'
+        payload = {'role': 'assistant',
+            'content': 'These actions were explicitly submitted by the caller, not generated by a model.',
+            'tool_calls': calls}
+        if abandoned is not None:
+            payload['content'] += (' The caller explicitly abandoned failed native decision '
+                + abandoned.attempt_id + '; its failure and charges are retained. No model reply was accepted.')
+            payload['abandoned_failed_decision'] = abandoned.attempt_id
+        if self.session.store.exists(relative) and self.session.store.read_json(relative) != payload:
+            raise ValueError('A different uncommitted caller submission exists; inspect it before continuing')
+        if self.session.manifest.status in {'paused', 'blocked', 'failed'}:
+            self.session.continue_with_revision('Explicit caller actions; existing records and allowances retained')
+        if not self.session.store.exists(relative):
+            self.session.store.write_json(relative, payload, kind='caller_actions')
+        self.state['pending'] = None
+        self.state['turns'].append({'origin': 'caller', 'reply': relative, 'tools': [],
+            'remaining': calls, 'request_count': len(self.state['requests'])})
+        self._save()
+
+    def _caller_takeover(self) -> bool:
+        turns = self.state['turns']
+        return bool(turns and turns[-1].get('origin') == 'caller'
+            and turns[-1].get('request_count') == len(self.state['requests'])
+            and self.session.store.read_json(turns[-1]['reply']).get('abandoned_failed_decision'))
+
     def _request_capacity(self) -> int:
         allowance = self.state['config']['max_turns'] + sum(
             terms.get('resource_allowances', {}).get('llm_requests', 0)
             for terms in self.session.manifest.budget.continuation_authorizations.values())
-        capacity = max(0, allowance - len(self.state['turns']))
+        capacity = max(0, allowance - sum(turn.get('origin') != 'caller' for turn in self.state['turns']))
         remaining = self.ledger.remaining('llm_requests')
         return capacity if remaining is None else min(capacity, remaining)
 
@@ -493,6 +707,9 @@ class ToolApplication:
             block = [{"role": "user", "content": request}
                      for request in self.state["requests"][request_count:count]]
             reply = self.session.store.read_json(turn["reply"])
+            if turn.get('origin') == 'caller':
+                # Submission provenance belongs to the journal, not the Chat protocol.
+                reply = {key: reply[key] for key in ('role', 'content', 'tool_calls') if key in reply}
             observations = {item["id"]: self.session.store.read_json(item["result"]) for item in turn["tools"]}
             calls = {call['id']: call for call in reply.get('tool_calls', [])}
             outcomes = []
@@ -636,6 +853,34 @@ class ToolApplication:
         feedback = [{"role": "user", "content": request}
                     for request in self.state["requests"][request_count:]]
         context = json.loads(prefix[1]["content"])
+        execution_contract = self.scientific.execution_contract if self.scientific is not None else None
+        if execution_contract is not None:
+            context['execution_contract'] = execution_contract
+            context['execution_source'] = ('Use each frozen condition source: preparation requires prepare_code_task and its registered preparation_ref/cwd; '
+                'implementation requires a validated implementation_ref/cwd; declared retains its original cwd. '
+                'To preserve an unchanged baseline, implement using that prepared_result, then retain it across feedback. '
+                'Complete any before_implementation conditions on that exact preparation before code work; their verified observations are supplied to implementation. '
+                'Select the exact condition_id and analyze all required actual conditions of the current revision; do not infer source from comparison role. '
+                'Flat contracts use the validated implementation. Preparation, validator and formal measurement are distinct.'
+                if config.get('code_task') is not None else 'Caller-frozen command or complete condition set. Select exact condition_id when present; do not alter or drop declared roles, seeds or protocol. Analyze the complete actual set before claiming completion. Subsequent execution still requires approval.')
+        if config.get('report_requirement'):
+            requirement = config['report_requirement']
+            # Writer owns the full frozen template/configuration. The action
+            # loop needs delivery constraints, not another copy of its prompts.
+            context['report_requirement'] = {'method': requirement['method'], 'outline': requirement['outline'],
+                'max_cited_sources': requirement['config']['max_cited_sources'],
+                'target_words': requirement['config']['longform']['target_words']}
+            context['report_delivery'] = (('compose_document uses the frozen material/report requirements and actual supplied/source/table evidence. '
+                'Select relevant original passages and analysis artifacts, not just summaries. ' if
+                config.get('report_evidence_contract') == 'materials.v1' else
+                'After required execution and analysis, compose_document consumes actual code/measurement ')
+                + 'evidence automatically and executes the frozen writing method, including adaptive planning/review/revision. '
+                'Include its canonical manuscript.md and requested execution artifacts in delivery. '
+                + BOUND_REPORT_REVISION + ' Required findings or missing reports must be disclosed as unresolved.')
+        if config.get('research_policy'):
+            context['research_policy'] = config['research_policy']
+        if config.get('table_analysis'):
+            context['table_analysis'] = config['table_analysis']
         if config.get('tool_contracts') == 'on_demand':
             context['available_specialists'] = self._specialist_catalog()
             context['tool_contracts'] = ('Core tools stay available. Use load_tools with exact names from '
@@ -783,6 +1028,8 @@ class ToolApplication:
 
     def _client(self, attempt_id: str = "", *, purpose: str | None = None,
                 native: bool = True) -> LLMClient:
+        if self.state['config']['model'] is None:
+            raise ValueError('This caller-directed task has no model connection or model authorization')
         client = LLMClient.from_env(self.state["config"]["model"], budget_ledger=self.ledger,
             budget_session_id=self.session.manifest.session_id, budget_attempt_id=attempt_id)
         saved = self.state["config"].get("model_connection")
@@ -798,7 +1045,22 @@ class ToolApplication:
             if saved_vision and not model_connections_compatible(saved_vision, self._vision_binding(vision)):
                 raise ValueError('Named vision connection differs from this task. Restore its original route/profile; no silent model switch.')
             return vision
-        return self._text_client(client, purpose, native=native)
+        client = self._text_client(client, purpose, native=native)
+        limit = self.state['config'].get('max_output_tokens')
+        return client.with_output_limit(limit) if limit is not None else client
+
+    def _feasibility_client(self, attempt_id: str) -> LLMClient | None:
+        policy = self.state['config'].get('research_policy') or {}
+        selector = policy.get('feasibility_connection')
+        if not selector:
+            return self._client(attempt_id, purpose='task', native=False) if self.state['config']['model'] is not None else None
+        client = LLMClient.from_env(selector, budget_ledger=self.ledger,
+            budget_session_id=self.session.manifest.session_id, budget_attempt_id=attempt_id)
+        saved = self.state['config'].get('feasibility_connection')
+        if not saved or not model_connections_compatible(saved, client.connection_binding()):
+            raise ValueError('Independent feasibility connection changed; restore its saved named connection')
+        limit = self.state['config'].get('max_output_tokens')
+        return client.with_output_limit(limit) if limit is not None else client
 
     @classmethod
     def _text_client(cls, client: LLMClient, purpose: str, *, native: bool = True) -> LLMClient:
@@ -821,7 +1083,8 @@ class ToolApplication:
         return CapabilityResult(status="completed", artifacts=(ref,))
 
     def _tool(self, *, context: Any, call: dict[str, Any]) -> CapabilityResult:
-        self._client(context.attempt.attempt_id)
+        if self.state['config']['model'] is not None and not self._caller_takeover():
+            self._client(context.attempt.attempt_id)
         try:
             arguments = json.loads(call["function"]["arguments"])
             if not isinstance(arguments, dict):
@@ -833,33 +1096,73 @@ class ToolApplication:
             if terminal_error:
                 result = ToolResult(tool_name=call['function']['name'], status='blocked',
                     error=terminal_error, data={'executed': False})
+            elif ((spec := self.gateway.registry.get(call['function']['name'])) is not None
+                    and spec.domain == 'scientific' and spec.permission_level == 'execution'
+                    and (issues := self.scientific.execution_issues())):
+                result = ToolResult(tool_name=call['function']['name'], status='blocked',
+                    error='; '.join(issues), data={'executed': False})
             elif (call['function']['name'] == 'focus_work'
                     and len(self.session.store.read_json(
                         self.state['turns'][-1]['reply']).get('tool_calls', [])) != 1):
                 result = ToolResult(tool_name='focus_work', status='blocked',
                     error='Choose a work focus alone; queued actions must not silently change model ownership.')
+            elif (owner := self.gateway.session_owner(call['function']['name'])) is not None:
+                pending = self.state['pending'] or {}
+                approval = pending.get('execution_approval') or pending.get('implementation_approval')
+                requires_approval = self.gateway.registry.get(call['function']['name']).permission_level == 'execution'
+                if requires_approval and not approval:
+                    result = ToolResult(tool_name=call['function']['name'], status='blocked',
+                        error='Execution needs valid arguments and explicit saved approval; no execution occurred')
+                elif (requires_approval and not owner.has_started(context.attempt.attempt_id)
+                        and approval['token'] != self.approval_token(call)):
+                    raise ValueError('Approved execution source or contract changed before execution')
+                else:
+                    result = self.gateway.call(ToolCall(tool_name=call['function']['name'],
+                        arguments=arguments, trace_id=context.attempt.attempt_id), context=context, approval=approval)
             else:
                 result = self.gateway.call(ToolCall(tool_name=call["function"]["name"],
                     arguments=arguments, trace_id=context.attempt.attempt_id))
             payload = result.model_dump(mode="json")
-            delivery = self._delivery(call, payload)
-            if result.status == 'ok' and delivery is not None:
-                # Bind the published version in its existing durable observation,
-                # not a competing task state or a later snapshot at resume time.
-                delivery = self.workspace.resolve_delivery(DeliveryRequest.model_validate(delivery))
-                if call['function']['name'] == 'deliver_result':
-                    payload['data'] = delivery
-                else:
-                    payload['data']['delivery'] = delivery
-                hashes = self.workspace.artifact_hashes(delivery['artifacts'])
-                retained = payload['metadata'].get('delivery_hashes')
-                if retained is not None and hashes != retained:
-                    payload['status'] = 'blocked'
-                    payload['error'] = 'Final work outputs changed before delivery observation; preserve the pinned version and inspect results. No delivery or replay.'
-                else:
-                    payload['metadata']['delivery_hashes'] = hashes
-        ref = context.store.write_json("native_result.json", payload, kind="native_observation")
-        return CapabilityResult(status="completed", artifacts=(ref,))
+            self._bind_delivery(call, payload, context.store)
+        context.store.write_json("native_result.json", payload, kind="native_observation")
+        return CapabilityResult(status='completed', artifacts=self._native_artifacts(
+            context.store, payload, name=call['function']['name']))
+
+    def _bind_delivery(self, call: dict, payload: dict, store: ArtifactStore) -> dict:
+        """One delivery projection for normal execution and receipt recovery."""
+        delivery = self._delivery(call, payload)
+        if payload.get('status') == 'ok' and delivery is not None:
+            outputs = tuple(store.require(ArtifactRef.from_dict(row))
+                for row in payload.get('metadata', {}).get('capability_artifacts', []))
+            delivery = self.workspace.resolve_delivery(DeliveryRequest.model_validate(delivery), current_outputs=outputs)
+            if call['function']['name'] == 'deliver_result':
+                payload['data'] = delivery
+            else:
+                payload['data']['delivery'] = delivery
+            hashes = self.workspace.artifact_hashes(delivery['artifacts'])
+            retained = payload['metadata'].get('delivery_hashes')
+            if retained is not None and hashes != retained:
+                payload['status'] = 'blocked'
+                payload['error'] = 'Final work outputs changed before delivery observation; preserve the pinned version and inspect results. No delivery or replay.'
+            else:
+                payload['metadata']['delivery_hashes'] = hashes
+        return payload
+
+    @staticmethod
+    def _native_artifacts(store: ArtifactStore, payload: dict, *, name: str = '',
+                          kind: str = 'native_observation') -> tuple[ArtifactRef, ...]:
+        """Normal commit and crash recovery register the same domain outputs."""
+        artifacts = (store.ref('native_result.json', kind=kind),)
+        if name == 'implement_code_task' and store.exists('implementation.json'):
+            artifacts += (store.ref('implementation.json', kind='implementation_result', schema='research_implementation.v1'),)
+        if name in {'prepare_code_task', 'implement_code_task'} and store.exists('execution.json'):
+            artifacts += (store.ref('execution.json', kind='prepared_execution', schema='prepared_execution.v1'),)
+        for row in payload.get('metadata', {}).get('capability_artifacts', []):
+            declared = ArtifactRef.from_dict(row)
+            store.require(declared)
+            if declared not in artifacts:
+                artifacts += (declared,)
+        return artifacts
 
     @staticmethod
     def _terminal_intent(call: dict[str, Any]) -> bool:
@@ -881,6 +1184,259 @@ class ToolApplication:
         return data if name == 'deliver_result' else (
             data.get('delivery') if name in _FINAL_WORK_TOOLS else None)
 
+    def _validated_code_delivery(self, artifacts: list[str], *, require_current_origin: bool = True) -> dict[str, Any]:
+        observations = (self.session.store.read_json(item['result'])
+            for prior in reversed(self.state['turns']) for item in reversed(prior['tools']))
+        accepted = next((row for row in observations if row.get('tool_name') == 'implement_code_task'), None)
+        if accepted is None or accepted.get('status') != 'ok':
+            raise ValueError('Exact code work has no validated implementation; inspect or disclose unresolved work before delivery.')
+        self.implementation.check_delivery(accepted['data'], artifacts,
+            require_current_origin=require_current_origin)
+        return accepted['data']
+
+    def _execution_evidence(self, *, require_current_origin: bool = True) -> dict[str, Any]:
+        """Project actual execution evidence without requiring a code change."""
+        refs = []
+        measurements, analyses = [], []
+        accepted = None
+        for turn in self.state['turns']:
+            for item in turn['tools']:
+                observed = self.session.store.read_json(item['result'])
+                if observed.get('tool_name') == 'measure_experiment' and observed.get('status') == 'ok':
+                    measurements.append(observed['data']['result_ref'])
+                if observed.get('tool_name') == 'analyze_measurements' and observed.get('status') == 'ok':
+                    analyses.append(item['result'])
+                if observed.get('tool_name') == 'implement_code_task':
+                    if observed.get('status') != 'ok':
+                        accepted = None
+                    else:
+                        refs.append(observed['artifacts'][0])
+                        accepted = observed['data']
+        if self.implementation.exact and (not refs or accepted is None):
+            raise ValueError('Required report needs actual validated implementation evidence')
+        if accepted is not None:
+            self.implementation.check_delivery(accepted, [accepted['project_path']], require_current_origin=require_current_origin)
+        elif not measurements:
+            raise ValueError('Required report needs actual execution evidence')
+        # Only the accepted candidate's actual predecessor chain is cumulative
+        # evidence. An earlier independent candidate is not part of its patch.
+        lineage, current, paths = [], refs[-1] if accepted is not None else '', set()
+        while current:
+            if Path(current).name == 'execution.json':
+                source = self.implementation.prepared_source(
+                    self.workspace.locator(str(self.session.store.resolve(current))), identity=Path(refs[-1]).parent.name)
+                paths.update(self.workspace.resolve(name).relative_to(self.session.store.root).as_posix()
+                             for name in source['evidence_hashes'])
+                break  # A preparation is source evidence, never validated code.
+            if current in lineage or current not in refs:
+                raise ValueError('Implementation lineage is cyclic or lacks an accepted receipt')
+            lineage.append(current)
+            prior = self.session.store.read_json(current).get('native_binding', {}).get('binding', {}).get('prior_source')
+            if prior and hashlib.sha256(self.workspace.resolve(prior['record']).read_bytes()).hexdigest() != prior['sha256']:
+                raise ValueError('Implementation predecessor evidence changed')
+            current = self.workspace.resolve(prior['record']).relative_to(self.session.store.root).as_posix() if prior else ''
+        refs = list(reversed(lineage))
+        paths.update(refs)
+        for ref in refs:
+            payload = self.session.store.read_json(ref)
+            paths.update((Path(ref).parent / row['path']).as_posix()
+                         for row in payload.get('artifact_refs', {}).values())
+        current_report = self.state['config'].get('report_evidence_contract') == 'execution.v1'
+        scientific = (self.scientific.report_evidence(measurements, refs,
+            analysis_records=analyses if current_report else None)
+            if self.scientific is not None and self.state['config'].get('execution_contract') is not None else {})
+        return {**scientific,
+            **({'evidence_contract': 'execution.v1'} if current_report else {}),
+            **({'analysis_records': analyses} if not current_report
+                and 'conditions' in (self.state['config'].get('execution_contract') or {}) else {}),
+            'request_count': len(self.state['requests']),
+            'requests_sha256': hashlib.sha256(json.dumps(self.state['requests'], ensure_ascii=False).encode()).hexdigest(),
+            'implementation_refs': refs,
+            'evidence_sha256': {**scientific.get('evidence_sha256', {}), **{path: hashlib.sha256(self.session.store.resolve(path).read_bytes()).hexdigest()
+                                for path in sorted(paths)}}}
+
+    def _report_inputs(self) -> dict[str, Any]:
+        if self.state['config'].get('report_evidence_contract') == 'materials.v1':
+            from simple_ar.tools.writing import material_report_binding
+            observations = []
+            for turn in self.state['turns']:
+                for item in turn['tools']:
+                    row = self.session.store.read_json(item['result'])
+                    spec = self.gateway.registry.get(row.get('tool_name', ''))
+                    if row.get('status') == 'ok' and spec is not None and spec.domain in {'sources', 'analysis', 'scientific'}:
+                        observations.append(row)
+            mounts = self.state['config']['sources']
+            table = self.state['config'].get('table_analysis')
+            if table and any(row.get('tool_name') == 'analyze_table' for row in observations):
+                # The deterministic owner already froze the raw input into its
+                # portable package. Report feedback binds that actual snapshot,
+                # not a permanent dependency on the original external CSV.
+                mounts = [name for name in mounts if name != table['path']]
+            return material_report_binding(self.workspace, self.state['config']['report_requirement'],
+                mounts=mounts, observations=observations,
+                requests=self.state['requests'])
+        evidence = self._execution_evidence()
+        if not self.implementation.exact and not evidence.get('analysis_records'):
+            raise ValueError('A measurement report requires the matching deterministic analysis before composition')
+        return {**evidence, 'requirement': self.state['config']['report_requirement']}
+
+    def _validated_report_delivery(self, artifacts: list[str]) -> None:
+        binding = self._report_inputs()
+        delivered = {self.workspace.resolve(path) for path in artifacts}
+        for turn in reversed(self.state['turns']):
+            if turn.get('request_count', 1) != len(self.state['requests']):
+                continue
+            for item in reversed(turn['tools']):
+                observed = self.session.store.read_json(item['result'])
+                if observed.get('tool_name') != 'compose_document' or observed.get('status') != 'ok':
+                    continue
+                data = observed.get('data') or {}
+                if data.get('report_binding') != binding:
+                    continue
+                manuscript = data.get('editable_markdown')
+                if (not manuscript or self.workspace.resolve(manuscript) not in delivered or data.get('unresolved')
+                        or self.workspace.artifact_hashes(observed['artifacts']) != data.get('artifact_sha256')):
+                    continue
+                # Validate the canonical owner receipt as well as its accepted observation.
+                identity = Path(data['version']).name
+                receipt = ArtifactStore(self.session.store.root / 'tools/writing' / identity)
+                saved = receipt.read_json('result.json')
+                if (saved.get('data') == data and saved.get('artifacts') == observed['artifacts']
+                        and receipt.read_json('request.json').get('report_binding') == binding):
+                    self.writing.check_delivery(data)
+                    return
+        raise ValueError('Completed execution/report delivery needs a current canonical composition receipt, intact manuscript and execution evidence; disclose unresolved work for partial delivery.')
+
+    def reusable_materials(self) -> dict[str, list[Path]]:
+        """Read named domain outputs in the current delivery, never infer by filename.
+
+        Domains declare their reusable groups in the same accepted result and
+        pin their output bytes. No new registry, execution or mutable index.
+        Historical ungrouped deliveries remain ordinary artifacts.
+        """
+        if self.session.manifest.status not in {'completed', 'partial'}:
+            return {}
+        delivery = DeliveryRequest.model_validate(self.session.store.read_json('delivery.json'))
+        delivered = self.workspace.resolve_delivery(delivery)['artifacts']
+        paths = {self.workspace.resolve(value) for value in delivered}
+        terminal = self.session.store.read_json(self.state['turns'][-1]['tools'][-1]['result'])
+        pinned = terminal.get('metadata', {}).get('delivery_hashes')
+        if pinned is not None and pinned != self.workspace.artifact_hashes(delivered):
+            raise ValueError('Current delivered files changed; retained results cannot certify their replacements')
+        available = {'artifacts': list(dict.fromkeys(self.workspace.resolve(value) for value in delivered))} if paths else {}
+        for turn in self.state['turns']:
+            for item in turn['tools']:
+                row = self.session.store.read_json(item['result'])
+                if row.get('status') != 'ok':
+                    continue
+                groups = row.get('metadata', {}).get('reusable_materials', {})
+                if not groups:
+                    continue
+                hashes = row['data']['artifact_sha256']
+                if self.workspace.artifact_hashes(hashes) != hashes:
+                    continue
+                owned = {self.workspace.resolve(value) for value in row.get('artifacts', [])}
+                for name, locators in groups.items():
+                    selected = [self.workspace.resolve(value) for value in locators]
+                    if selected and set(selected) <= paths & owned:
+                        available[name] = selected
+        return available
+
+    def reusable_code_project(self) -> tuple[Path, dict, dict] | None:
+        """Read the latest delivered exact candidate without changing its owner."""
+        if (not self.implementation.exact or self.session.manifest.status not in {'completed', 'partial'}
+                or self.state['pending'] is not None or not self.state['turns']
+                or not self.session.store.exists('delivery.json')):
+            return None
+        try:
+            turn = self.state['turns'][-1]
+            if (turn['remaining'] or not turn['tools']
+                    or turn.get('request_count', 1) != len(self.state['requests'])):
+                return None
+            calls = self.session.store.read_json(turn['reply']).get('tool_calls') or []
+            observed = turn['tools'][-1]
+            if not calls or calls[-1]['id'] != observed['id']:
+                return None
+            payload = self.session.store.read_json(observed['result'])
+            delivery = self._delivery(calls[-1], payload)
+            if payload.get('status') != 'ok' or delivery is None:
+                return None
+            request = DeliveryRequest.model_validate(delivery)
+            saved = self.session.store.read_json('delivery.json')
+            if self.workspace.resolve_delivery(request) != saved:
+                return None
+            if self.workspace.artifact_hashes(saved['artifacts']) != (payload.get('metadata') or {}).get('delivery_hashes'):
+                return None
+            # A committed candidate is an independent snapshot. Its saved
+            # evidence/contract and current candidate bytes still bind reuse;
+            # only a new delivery needs the live origin/approval recheck.
+            result = self._validated_code_delivery(saved['artifacts'], require_current_origin=False)
+            from simple_ar.code_task.runtime.state import code_task_paths, load_code_task_manifest
+            run = Path(result['code_task_run_dir'])
+            candidate = code_task_paths(run).workspace_dir.resolve()
+            if not candidate.is_dir() or not candidate.is_relative_to(self.workspace.workspace.resolve()):
+                return None
+            manifest = load_code_task_manifest(run)
+            if self.state['config'].get('execution_contract') is not None:
+                from simple_ar.code_task.execution.environment import native_validation_command
+                from simple_ar.code_task.execution.runner import _argv_command
+                manifest = {**manifest, 'benchmark': {**manifest['benchmark'],
+                    'command': _argv_command(native_validation_command(manifest, candidate))}}
+            return (candidate, manifest,
+                dict(self.implementation.exact.edit_policy or {}))
+        except (ValueError, OSError, KeyError, TypeError, RuntimeError):
+            return None
+
+    def reusable_execution(self) -> dict[str, Any] | None:
+        """Read the delivered candidate's formal protocol, not its validator.
+
+        New tasks get no old budget or process output directory. The original
+        approved argv template retains output placeholders for a fresh run.
+        """
+        if (self.reusable_code_project() is None or self.state['config'].get('execution_contract') is None
+                or 'conditions' in self.state['config']['execution_contract']):
+            return None
+        evidence = self._execution_evidence(require_current_origin=False)
+        if self.scientific.delivery_requirement(evidence):
+            return None
+        selected = evidence['implementation_refs'][-1]
+        refs = [ref for ref in evidence['measurement_refs']
+            if (self.session.store.read_json(ref).get('implementation_ref') or {}).get('path') == selected]
+        store = ArtifactStore(self.session.store.resolve(refs[-1]).parent)
+        binding = store.read_json('scientific_request.json')['execution_approval']['binding']
+        execution = {**self.state['config']['execution_contract'], 'command': list(binding['argv']), 'cwd': binding['cwd']}
+        protocol = execution.get('protocol')
+        if protocol and protocol.get('protected_assets'):
+            from simple_ar.code_task.execution.environment import project_command
+            execution['protocol'] = {**protocol, 'protected_assets': [
+                {**row, 'path': project_command([row['path']], Path(self.state['config']['execution_contract']['cwd']),
+                    Path(binding['cwd']))[0]} for row in protocol['protected_assets']]}
+        return execution
+
+    def measurement_completion_actions(self) -> list[dict[str, Any]]:
+        """Project an explicit caller contract's remaining local comparison.
+
+        Used by initial creation and resume; no process, model, new state or
+        retry. The ordinary action journal still owns execution and delivery.
+        """
+        config = self.state['config']
+        if (config['model'] is not None or 'conditions' not in (config.get('execution_contract') or {})
+                or self.session.manifest.status != 'paused' or self.state['pending'] is not None
+                or not self.state['turns'] or self.state['turns'][-1]['remaining']):
+            return []
+        locators = []
+        for turn in self.state['turns']:
+            for item in turn['tools']:
+                observed = self.session.store.read_json(item['result'])
+                if observed.get('tool_name') == 'measure_experiment' and observed.get('status') == 'ok':
+                    locators.append(observed['data']['result_ref'])
+        selected = self.scientific._condition_results(locators)
+        if len(selected) != len(config['execution_contract']['conditions']):
+            return []
+        return [{'tool_name': 'analyze_measurements', 'arguments': {
+            **self.scientific.analysis_arguments(locators),
+            'delivery': {'summary': self.state['requests'][-1], 'artifacts': []}}}]
+
     def _terminal_error(self, call: dict[str, Any]) -> str:
         if not self._terminal_intent(call):
             return ''
@@ -891,22 +1447,88 @@ class ToolApplication:
             return 'Request exactly one delivery/question as the last action; this terminal action was not executed.'
         if call['function']['name'] == 'ask_user':
             return ''
-        failed = []
+        if (self.scientific is not None and self.scientific.execution_contract is not None
+                and not self.implementation.exact):
+            try:
+                arguments = json.loads(call['function']['arguments'])
+                retained = next((self._delivery(call, self.session.store.read_json(item['result']))
+                    for item in turn['tools'] if item['id'] == call['id']), None)
+                request = DeliveryRequest.model_validate(retained or (arguments if call['function']['name'] == 'deliver_result'
+                    else arguments['delivery']))
+                if not request.unresolved:
+                    measurements, analyses = [], []
+                    for accepted in self.state['turns']:
+                        for item in accepted['tools']:
+                            observed = self.session.store.read_json(item['result'])
+                            if observed.get('status') == 'ok':
+                                if observed.get('tool_name') == 'measure_experiment':
+                                    measurements.append(observed['data']['result_ref'])
+                                elif observed.get('tool_name') == 'analyze_measurements':
+                                    analyses.append(item['result'])
+                    # The proposed final analysis has not executed yet. Its domain
+                    # result is checked again by the same gate at terminal commit.
+                    gaps = self.scientific.evidence_requirement(measurements, analyses,
+                        proposed_analysis=arguments if retained is None and call['function']['name'] == 'analyze_measurements' else None,
+                        proposed_measurement=arguments if retained is None and call['function']['name'] == 'measure_experiment' else None)
+                    if gaps:
+                        return '; '.join(gaps) + '; disclose unresolved work for partial delivery.'
+            except (ValueError, OSError, KeyError, TypeError, RuntimeError) as exc:
+                return str(exc)
+        if self.implementation.exact or self.state['config'].get('report_requirement'):
+            try:
+                arguments = json.loads(call['function']['arguments'])
+                request = DeliveryRequest.model_validate(arguments if call['function']['name'] == 'deliver_result'
+                    else arguments['delivery'])
+            except (ValueError, TypeError, KeyError):
+                return ''  # The tool's argument validator will reject this proposal.
+            if not request.unresolved:
+                try:
+                    if self.implementation.exact:
+                        self._validated_code_delivery(request.artifacts)
+                    if self.state['config'].get('report_requirement'):
+                        self._validated_report_delivery(request.artifacts)
+                    if self.implementation.exact and self.state['config'].get('execution_contract') is not None:
+                        gaps = self.scientific.delivery_requirement(self._execution_evidence())
+                        if gaps:
+                            return '; '.join(gaps) + '; disclose unresolved work for partial delivery.'
+                except (ValueError, OSError, KeyError, RuntimeError) as exc:
+                    return str(exc)
+        observations = []
+        for accepted in self.state['turns']:
+            current_request = accepted.get('request_count', 1) == len(self.state['requests'])
+            calls_by_id = {row['id']: row for row in self.session.store.read_json(accepted['reply']).get('tool_calls', [])}
+            for item in accepted['tools']:
+                original = calls_by_id[item['id']]
+                try:
+                    arguments = json.loads(original['function']['arguments'])
+                except (ValueError, TypeError):
+                    arguments = {}
+                observations.append({**self.session.store.read_json(item['result']),
+                    'arguments': arguments, 'record': item['result'], 'current_request': current_request})
+        failed = self.gateway.delivery_issues(observations)
         for item in turn['tools']:
             observed = self.session.store.read_json(item['result'])
             data = observed.get('data') or {}
             if (observed.get('status') != 'ok' or data.get('returncode', 0) != 0
-                    or data.get('stop_reason')):
+                    or (data.get('stop_reason') and not (observed.get('tool_name') == 'implement_code_task'
+                        and data.get('status') == 'validated' and data.get('stop_reason') == 'stop_point'))):
                 failed.append(item['id'])
         if failed:
             try:
+                terminal = next((row for row in turn['tools'] if row['id'] == call['id']), None)
+                if terminal is not None:
+                    observed = self.session.store.read_json(terminal['result'])
+                    retained_delivery = self._delivery(call, observed)
+                    if (observed.get('status') == 'ok' and retained_delivery is not None
+                            and DeliveryRequest.model_validate(retained_delivery).unresolved):
+                        return ''  # A domain may force honest partial delivery.
                 arguments = json.loads(call['function']['arguments'])
                 delivery = arguments if call['function']['name'] == 'deliver_result' else arguments['delivery']
                 if DeliveryRequest.model_validate(delivery).unresolved:
                     return ''
             except (ValueError, TypeError, KeyError):
                 pass
-            return f'Earlier actions in this turn failed ({", ".join(failed)}); inspect results or disclose unresolved work before delivery.'
+            return f'Accepted actions have unresolved failures ({", ".join(failed)}); inspect results or disclose unresolved work before delivery.'
         return ''
 
     def _commit_terminal(self, progress: Callable[[str], None]) -> bool:
@@ -961,42 +1583,49 @@ class ToolApplication:
         existing = next((a for a in self.session.list_attempts() if a.attempt_id == identity), None)
         if existing is not None:
             store = ArtifactStore(self.session.store.root / "attempts" / identity)
+            recovered = None
+            confirmed = False
+            if store.exists('capability_result.json'):
+                saved = store.read_json('capability_result.json')
+                result = CapabilityResult.from_dict(saved)
+                if result.provenance.get('recovery') == 'explicit_interruption':
+                    confirmed = (capability == existing.capability == 'native_tool'
+                        and pending.get('kind') == 'tool' and result.status == 'failed'
+                        and result.provenance.get('capability') == 'native_tool'
+                        and bool(saved.get('session_interruption_reason')))
+                    if not confirmed:
+                        raise RuntimeError('Saved interruption does not confirm this native tool failure; inspect before recovery')
             if not self.session.store.exists(relative):
                 call = pending.get("call", {})
-                receipt = self.session.store.root / "tools" / "processes" / identity / "invocation.json"
-                name = call.get("function", {}).get("name")
-                visual = self.workspace.workspace / "visual-reviews" / identity
-                visual_saved = name == "inspect_images" and (
-                    (visual / "response.json").is_file() or (visual / "review.json").is_file())
-                image = self.workspace.workspace / "image-versions" / identity / "result" / "request.json"
-                image_saved = name == "create_image" and image.is_file() and any(
-                    entry.reservation_id == f"image:{identity}" for entry in self.ledger.entries)
-                # Explicit image recovery also has a durable original version;
-                # its adapter refuses any new submission after an unknown dispatch.
-                image_resume = name == "resume_image"
-                publication = self.workspace.workspace / "publications" / identity / "export.json"
-                publication_saved = name == "export_report" and publication.is_file()
-                writing_reconcile = name == "compose_document" and self.writing.can_reconcile(identity)
-                analysis_saved = name == 'analyze_table' and (
-                    self.session.store.root / 'tools' / 'analysis' / identity / 'result.json').is_file()
-                implementation_saved = name == 'prepare_implementation' and (
-                    self.session.store.root / 'attempts' / identity / 'implementation' / 'result.json').is_file()
-                project_saved = name == 'copy_project' and store.exists('project-copy.json')
-                # This advisory result is a pure function of the queued input
-                # and request version; replay makes no model/external call and
-                # cannot execute steps, grant authority or complete delivery.
-                advisory_plan = name == 'update_work_plan'
-                if capability != "native_tool" or not (advisory_plan or visual_saved or image_saved or image_resume or publication_saved or writing_reconcile or analysis_saved or implementation_saved or project_saved or (name in {"run_process", "search_files"} and receipt.exists())):
+                if confirmed:
+                    # Core owns the confirmed failure and accounting. Only fill
+                    # the missing native observation; never replay or replace it.
+                    ref = self.workspace.locator(str(store.resolve('capability_result.json')))
+                    store.write_json('native_result.json', ToolResult(
+                        tool_name=call['function']['name'], status='error',
+                        error='; '.join(result.diagnostics) or saved['session_interruption_reason'],
+                        data={'status': result.status, 'diagnostics': list(result.diagnostics)},
+                        artifacts=[ref], metadata={'capability_result': ref,
+                            'provenance': dict(result.provenance)}).model_dump(mode='json'),
+                        kind='native_observation')
+                elif capability != "native_tool" or not self.gateway.can_reconcile(
+                        ToolCall(tool_name=call["function"]["name"], trace_id=identity)):
                     raise RuntimeError("Interrupted operation has no durable result; inspect receipts before any replay")
-                # Gateway may only reconcile the existing terminal process receipt;
-                # it must reject running/unknown records, never launch again.
-                from simple_ar.core.artifacts import read_json
-                if name in {"run_process", "search_files"} and read_json(receipt).get("status") not in {"finished", "stopped"}:
-                    raise RuntimeError("Process is live or unknown; cannot replay")
-                self._tool(context=CapabilityContext(store, existing), call=call)
+                else:
+                    recovered = self._tool(context=CapabilityContext(store, existing), call=call)
+            elif not confirmed and (owner := self.gateway.session_owner(
+                    pending.get('call', {}).get('function', {}).get('name', ''))) is not None:
+                observed = owner.execute_tool(pending['call']['function']['name'], CapabilityContext(store, existing),
+                    json.loads(pending['call']['function']['arguments']),
+                    approval=pending.get('execution_approval') or pending.get('implementation_approval'))
+                if store.read_json('native_result.json') != self._bind_delivery(
+                        pending['call'], observed.model_dump(mode='json'), store):
+                    raise ValueError('Saved native observation disagrees with its retained domain result')
             if not store.exists("capability_result.json"):
-                store.write_capability_result(CapabilityResult(status="completed",
-                    artifacts=(store.ref("native_result.json", kind="native_result"),)))
+                store.write_capability_result(recovered or CapabilityResult(status="completed",
+                    artifacts=self._native_artifacts(store, store.read_json('native_result.json'),
+                        name=pending.get('call', {}).get('function', {}).get('name', ''),
+                        kind='native_result' if capability == 'native_turn' else 'native_observation')))
             self.session.reconcile_attempt(identity)
         else:
             result = self.session.execute_attempt(capability, attempt_id=identity,
@@ -1007,6 +1636,11 @@ class ToolApplication:
         return relative
 
     def approval_token(self, call: dict[str, Any]) -> str:
+        if (owner := self.gateway.session_owner(call['function']['name'])) is not None:
+            return hashlib.sha256(json.dumps({'call': call,
+                'inputs': owner.approval_binding(json.loads(call['function']['arguments']),
+                    identity=self.state['pending']['attempt'])},
+                sort_keys=True).encode()).hexdigest()
         if call["function"]["name"] == "export_report":
             request = ExportRequest.model_validate(json.loads(call["function"]["arguments"]))
             source = self.workspace.resolve(request.markdown, write=True)
@@ -1044,7 +1678,8 @@ class ToolApplication:
                 row.attempt_id == pending['attempt'] for row in self.session.list_attempts())):
             raise ValueError('Reconcile the started operation before changing authorization')
         paths = tuple(resolve_source_mount(source) for source in sources)
-        self._client()  # Authorization is not a way to switch the saved model.
+        if self.state['config']['model'] is not None:
+            self._client()  # Authorization is not a way to switch the saved model.
         config = dict(self.state['config'])
         if vision:
             vision_client = self._client(purpose='vision')
@@ -1099,7 +1734,10 @@ class ToolApplication:
                     or attempt is None or attempt.status not in {'completed', 'failed'}
                     or attempt.capability not in {'native_turn', 'native_tool'}):
                 raise ValueError('Reconcile in-flight or unknown operations before authorizing resources')
-        self._client()  # Resource authorization cannot change model identity.
+        if self.state['config']['model'] is not None:
+            self._client()  # Resource authorization cannot change model identity.
+        elif set(allowances) & {'llm_requests', 'total_tokens', 'image_requests'}:
+            raise ValueError('Caller-directed tasks cannot acquire model access through resource continuation')
         self.ledger.validate_remaining(allowances, authorization_id=authorization_id, reason=reason)
         self.session.manifest.budget.authorize_additional(authorization_id,
             attempts=requests * 10, resource_allowances=allowances, reason=reason)
@@ -1115,14 +1753,14 @@ class ToolApplication:
                 self.state['pending'] = None
         self._save()
 
-    def _failed_model_attempt(self, pending: dict[str, Any]) -> AttemptManifest | None:
-        """Only the original closed failure without an accepted output qualifies."""
+    def _failed_model_attempt(self, pending: dict[str, Any], *, current_only: bool = True) -> AttemptManifest | None:
+        """Prove a closed failure; pending/retry callers require the current identity."""
         identity = pending['attempt']
         attempt = next((row for row in self.session.list_attempts() if row.attempt_id == identity), None)
         store = ArtifactStore(self.session.store.root / 'attempts' / identity)
         if (pending['kind'] != 'model' or attempt is None
                 or attempt.capability != 'native_turn' or attempt.status != 'failed'
-                or self.session.manifest.current_attempt != identity
+                or current_only and self.session.manifest.current_attempt != identity
                 or store.exists('native_result.json') or not store.exists('capability_result.json')):
             return None
         result = store.read_capability_result('capability_result.json')
@@ -1242,18 +1880,57 @@ class ToolApplication:
         self._save()
 
     def run(self, *, feedback: str = "", approved_execution: str = "",
+            actions: list[dict[str, Any]] | None = None,
             retry_model: bool = False, retry_model_selector: str = "",
             read_only_sources: tuple[Path, ...] = (), allow_execution: bool = False,
             allow_network: bool = False, allow_vision: bool = False,
             resource_allowances: dict[str, int | float] | None = None,
             authorization_id: str = "", authorization_reason: str = "",
+            decision: dict[str, str] | None = None,
             approve: Callable[[dict[str, Any], str], bool] | None = None,
             progress: Callable[[str], None] = print) -> dict[str, Any]:
+        observer = progress
+
+        def progress(message: str) -> None:
+            nonlocal observer
+            if observer is not None:
+                try:
+                    observer(message)
+                except BrokenPipeError:
+                    # A disconnected display is not a failed model/tool action.
+                    # Stop notifying this sink; durable task records still own progress.
+                    observer = None
+
         with self.session.mutation_scope():
+            if decision is not None:
+                if (feedback or actions is not None or retry_model or approved_execution
+                        or read_only_sources or allow_execution or allow_network or allow_vision
+                        or resource_allowances or authorization_id or authorization_reason):
+                    raise ValueError('Confirm a design separately from feedback, retries or new access/resources')
+                pending = self.state['pending']
+                if pending and (pending['kind'] == 'model' or any(
+                        attempt.attempt_id == pending['attempt'] for attempt in self.session.list_attempts())):
+                    raise ValueError('Reconcile the started operation before recording a design decision')
+                if decision.get('decision_guidance') and decision.get('decision_response') != 'revise':
+                    raise ValueError('Design guidance requires a revise response, not implicit conditional acceptance')
+                response = self.sources.respond_decision(**decision)
+                feedback = 'Caller design decision (not process authorization): ' + json.dumps(response, ensure_ascii=False)
+            if (actions is not None and self.state['pending']
+                    and self.state['pending']['kind'] == 'model'
+                    and (feedback or approved_execution or read_only_sources or allow_execution
+                        or allow_network or allow_vision or resource_allowances
+                        or authorization_id or authorization_reason)):
+                raise ValueError('Submit caller takeover separately from feedback or authorization changes')
             if retry_model_selector and not retry_model:
                 raise ValueError('An explicit replacement connection requires --retry-model')
+            if actions is not None and not feedback:
+                # Crash position cannot turn an accepted delivery into an
+                # uncommitted task that accepts new work without feedback.
+                # Explicit feedback may instead correct an uncommittable
+                # changed output; its original observation remains retained.
+                self._commit_terminal(progress)
             if retry_model:
-                if (feedback or approved_execution or read_only_sources or allow_execution
+                if (feedback or actions is not None or approved_execution or read_only_sources or allow_execution
                         or allow_network or allow_vision or resource_allowances
                         or authorization_id or authorization_reason):
                     raise ValueError('Use --retry-model separately from feedback, access, resource or tool authorization')
@@ -1275,7 +1952,9 @@ class ToolApplication:
                     # facts. Close their native tool-call messages explicitly
                     # so the next model turn has a valid, truthful history.
                     turn = self.state["turns"][-1]
-                    cancellation = pending['attempt'] if pending else Path(turn['reply']).parent.name
+                    cancellation = pending['attempt'] if pending else (
+                        Path(turn['reply']).stem if turn.get('origin') == 'caller'
+                        else Path(turn['reply']).parent.name)
                     for index, call in enumerate(turn["remaining"]):
                         relative = f"tools/cancelled/{cancellation}-{index}.json"
                         self.session.store.write_json(relative, {"tool_name": call["function"]["name"],
@@ -1285,13 +1964,18 @@ class ToolApplication:
                     turn["remaining"] = []
                     self.state["pending"] = None
                 self.state["requests"].append(feedback)
-                if self.session.manifest.status != "created":
+                if self.session.manifest.status not in {'created', 'running'}:
                     self.session.continue_with_revision(feedback)
                 self._save()
+            if actions is not None:
+                self._submit_actions(actions)
             if resource_allowances and self.session.manifest.status in {'paused', 'blocked', 'failed'}:
                 self.session.continue_with_revision('Explicit resource continuation: ' + authorization_id)
             try:
-                self._client()  # Reject changed identity before starting an attempt or side effect.
+                if (self.state['config']['model'] is not None
+                        and not (self._caller_takeover()
+                            and (self.state['pending'] is None or self.state['pending']['kind'] == 'tool'))):
+                    self._client()  # Reject changed identity before starting an attempt or side effect.
                 if self._commit_terminal(progress):
                     return self.session.status_snapshot()
                 if self.session.manifest.status in {'completed', 'partial'} and not feedback:
@@ -1312,6 +1996,7 @@ class ToolApplication:
             return self.session.status_snapshot()
 
     def _run(self, approved_execution: str, approve: Any, progress: Callable[[str], None]) -> None:
+        caller_takeover = self._caller_takeover()
         while True:
             if self._commit_terminal(progress):
                 return
@@ -1323,6 +2008,10 @@ class ToolApplication:
                     pending = {"kind": "tool", "call": call,
                         "attempt": self.session.allocate_attempt_id("native-tool")}
                 else:
+                    if (self.state['config']['model'] is None
+                            or caller_takeover):
+                        self.session.pause('Caller actions consumed; submit explicit next work or delivery. No model decision was requested.')
+                        return
                     if self._request_capacity() <= 0:
                         self.session.pause("Shared model request allowance exhausted, including professional calls; "
                                            "existing artifacts are retained, not marked complete")
@@ -1348,7 +2037,9 @@ class ToolApplication:
                 continue
             call = pending["call"]
             name = call["function"]["name"]
-            if (name in {"run_process", "export_report"} and self.state["config"]["allow_execution"]
+            if (self.state["config"]["allow_execution"]
+                    and (spec := self.gateway.registry.get(name)) is not None and spec.permission_level == 'execution'
+                    and self.gateway.policy.is_allowed(spec)[0]
                     and not self._terminal_error(call)):
                 try:
                     token = self.approval_token(call)
@@ -1357,13 +2048,19 @@ class ToolApplication:
                     # as observations, not halt the task before it can correct
                     # its formatting. They cannot authorize execution.
                     token = None
-                receipt = self.session.store.root / "tools" / "processes" / pending["attempt"] / "invocation.json"
-                export_request = self.session.store.root / "tools" / "publications" / pending["attempt"] / "request.json"
-                started = receipt.exists() if name == "run_process" else export_request.exists()
+                started = self.gateway.has_started(ToolCall(tool_name=name, trace_id=pending["attempt"]))
                 if token is not None and not started and approved_execution != token and not (approve and approve(call, token)):
                     self.session.pause(f"Process requires explicit approval; token={token}")
                     progress(f"Pending command: {call['function']['arguments']}\nApproval token: {token}")
+                    if name in {'prepare_code_task', 'implement_code_task'}:
+                        progress('Frozen CodeTask contract: ' + json.dumps(self.implementation.exact.model_dump(), ensure_ascii=False))
                     return
+                if (owner := self.gateway.session_owner(name)) is not None and token is not None and not started:
+                    binding = owner.approval_binding(json.loads(call['function']['arguments']), identity=pending['attempt'])
+                    if token != hashlib.sha256(json.dumps({'call': call, 'inputs': binding}, sort_keys=True).encode()).hexdigest():
+                        raise ValueError('Execution inputs changed during approval; approve the current identity')
+                    pending['execution_approval'] = {'token': token, 'binding': binding}
+                    self._save()
             progress(f"Tool {name} — {pending['attempt']}")
             relative = self._attempt("native_tool", pending)
             turn = self.state["turns"][-1]
@@ -1371,3 +2068,9 @@ class ToolApplication:
             turn["remaining"].pop(0)
             self.state["pending"] = None
             self._save()
+            observed = self.session.store.read_json(relative)
+            decision = (observed.get('data') or {}).get('pending_decision') if observed.get('status') == 'ok' else None
+            if decision:
+                self.session.pause('Research design requires an explicit bound user decision: ' + decision['decision_id'])
+                progress('Pending design decision: ' + json.dumps(decision, ensure_ascii=False))
+                return

@@ -141,25 +141,27 @@ def maybe_add_report_figures(
     template_name: str = "",
     document_plan: ReportDocumentPlan | None = None,
     emit=None,
+    legacy: bool = True,
+    section_headings: dict[str, str] | None = None,
 ) -> ReportFigureResult:
-    """Generate deterministic SVG figures and insert Markdown image links.
+    """Render declared views; retain unplanned text inference for old contracts.
 
-    The generator is intentionally conservative: it uses only the existing
-    report text, produces small SVG files, and never calls an LLM. This keeps
-    the feature useful for generic reports while avoiding benchmark-specific
-    image hallucination.
+    Direct calls preserve the historical config/template contract. Assembly
+    disables that contract for new work: a quota is not a request for a view.
     """
 
     if not config.enabled or config.mode == "off":
         return ReportFigureResult(report_markdown=report_markdown)
     if config.format != "svg":
         return ReportFigureResult(report_markdown=report_markdown)
+    if document_plan is None and not legacy:
+        return ReportFigureResult(report_markdown=report_markdown)
     existing_images = set(re.findall(r"!\[[^\]]*\]\(([^)]+)\)", report_markdown))
     if document_plan is None and existing_images:
         return ReportFigureResult(report_markdown=report_markdown)
 
     planned_figures = visual_plan_for_renderer(document_plan)
-    automatic = len(planned_figures) if document_plan is not None else _default_figure_count(template_name)
+    automatic = len(planned_figures) if document_plan is not None else (3 if template_name.strip().lower() == "survey_long" else 0)
     max_figures = config.max_figures if config.max_figures > 0 else automatic
     if max_figures <= 0:
         return ReportFigureResult(report_markdown=report_markdown)
@@ -174,7 +176,10 @@ def maybe_add_report_figures(
     # conservative renderer behavior. A resolved plan with no visual intent is
     # an explicit decision to render no figures.
     requested = planned_figures if document_plan is not None else list(specs.values())
-    sections_by_id = {_section_id(section["heading"]): section for section in sections}
+    sections_by_heading = {section["heading"]: section for section in sections}
+    sections_by_id = ({key: sections_by_heading.get(f"## {heading}")
+                      for key, heading in section_headings.items()} if section_headings is not None
+                     else {_section_id(section["heading"]): section for section in sections})
     for item in requested:
         if len(generated) >= max_figures:
             break
@@ -193,7 +198,9 @@ def maybe_add_report_figures(
         rel_path = f"figures/{spec.figure_id}.svg"
         if rel_path in existing_images:
             continue
-        items = _figure_items(section["body"], spec)
+        # The chosen section/view already carries the professional intent.
+        # Keyword ranking is retained only for the old renderer contract.
+        items = _figure_items(section["body"], spec if legacy else None)
         if len(items) < 3:
             if emit is not None:
                 emit(f"Skipped {title}: fewer than three grounded labels in the section.")
@@ -209,18 +216,13 @@ def maybe_add_report_figures(
                 path=rel_path,
                 anchor=section["heading"],
                 caption=spec.caption,
+                source_artifacts=[] if isinstance(item, _FigureSpec) else list(item.evidence_handles),
             )
         )
 
     if generated and emit is not None:
         emit(f"Generated {len(generated)} report figure(s).")
     return ReportFigureResult(report_markdown=updated, figures=generated)
-
-
-def _default_figure_count(template_name: str) -> int:
-    if str(template_name or "").strip().lower() == "survey_long":
-        return 3
-    return 0
 
 
 def _markdown_sections(markdown: str) -> list[dict[str, str]]:
@@ -269,37 +271,27 @@ def _section_id(heading: str) -> str:
 
 def _figure_items(
     section_body: str,
-    spec: _FigureSpec,
+    spec: _FigureSpec | None,
 ) -> list[str]:
-    candidates: list[str] = []
-    candidates.extend(_table_first_column_items(section_body))
-    candidates.extend(_heading_items(section_body))
-    candidates.extend(_bullet_items(section_body))
-    seen: set[str] = set()
-    output: list[str] = []
-    for item in candidates:
-        clean = _clean_item(item)
-        if not clean:
-            continue
-        key = clean.lower()
-        if key in seen:
-            continue
-        if not _matches_spec(clean, spec):
-            continue
-        seen.add(key)
-        output.append(clean)
-        if len(output) >= 8:
-            break
-    if len(output) < 3:
-        for item in candidates:
-            clean = _clean_item(item)
-            key = clean.lower()
-            if clean and key not in seen:
-                seen.add(key)
-                output.append(clean)
-            if len(output) >= 6:
+    candidates = [*_table_first_column_items(section_body),
+        *re.findall(r"^###\s+(.+)$", section_body, re.MULTILINE),
+        *re.findall(r"^\s*[-*]\s+(?:\*\*)?([^:.;\n*]+)", section_body, re.MULTILINE)]
+    unique: dict[str, str] = {}
+    for candidate in candidates:
+        clean = _clean_item(candidate)
+        if clean:
+            unique.setdefault(clean.lower(), clean)
+    labels = list(unique.values())
+    if spec is None:
+        return labels[:8]
+    matched = [label for label in labels if any(word in label.lower() for word in spec.section_keywords)][:8]
+    if len(matched) < 3:
+        for label in labels:
+            if label not in matched:
+                matched.append(label)
+            if len(matched) >= 6:
                 break
-    return output
+    return matched
 
 
 def _table_first_column_items(text: str) -> list[str]:
@@ -317,28 +309,6 @@ def _table_first_column_items(text: str) -> list[str]:
         if in_body and cells and cells[0]:
             items.append(cells[0])
     return items
-
-
-def _heading_items(text: str) -> list[str]:
-    return [
-        re.sub(r"^#+\s*", "", line).strip()
-        for line in text.splitlines()
-        if re.match(r"^###\s+", line)
-    ]
-
-
-def _bullet_items(text: str) -> list[str]:
-    items: list[str] = []
-    for line in text.splitlines():
-        match = re.match(r"^\s*[-*]\s+(?:\*\*)?([^:.;\n*]+)", line)
-        if match:
-            items.append(match.group(1))
-    return items
-
-
-def _matches_spec(item: str, spec: _FigureSpec) -> bool:
-    text = item.lower()
-    return any(keyword in text for keyword in spec.section_keywords) or len(spec.section_keywords) == 0
 
 
 def _clean_item(item: str) -> str:

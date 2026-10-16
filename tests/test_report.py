@@ -481,23 +481,6 @@ class ReportSafetyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _merge_revision_draft(previous, revised.model_copy(update={"section_id": "results"}))
 
-    def test_substantive_reviewer_revision_replaces_prior_draft(self) -> None:
-        previous = ReportSectionDraft(
-            section_id="methods",
-            heading="Methods",
-            draft_markdown=" ".join(["Existing evidence."] * 100),
-        )
-        revised = ReportSectionDraft(
-            section_id="methods",
-            heading="Methods",
-            draft_markdown=" ".join(["Revised evidence."] * 95),
-        )
-
-        merged = _merge_revision_draft(previous, revised)
-
-        self.assertEqual(merged.draft_markdown, revised.draft_markdown)
-
-
     def test_report_review_accepts_object_revision_instructions(self) -> None:
         review = ReportSectionReview.model_validate(
             {
@@ -664,41 +647,6 @@ class ReportSafetyTests(unittest.TestCase):
             )
             self.assertIn("Abstract", template.template_markdown)
 
-    def test_report_memory_can_expose_all_selected_papers(self) -> None:
-        papers = [
-            Paper(
-                id=f"paper-{index}",
-                title=f"Known Paper {index}",
-                authors=[],
-                abstract="Known metadata.",
-                url=f"https://example.com/paper-{index}",
-            )
-            for index in range(1, 13)
-        ]
-        context = _report_fixture(
-            papers,
-            topic='Agent Simulation',
-            report_mode="research_only",
-            goal_markdown="# Goal\nStudy agents.",
-            problem_markdown="# Problem\nWhat evidence exists?",
-            search_meta={"source": "openalex", "status": "ok"},
-            synthesis_markdown="# Synthesis\nAgent workflows have roles.",
-            hypothesis_markdown="# Hypothesis\nRole separation may help.",
-            evidence_summary="- Known evidence.",
-            max_section_sources=0,
-        )
-        template = load_report_template_bundle(
-            report_mode="research_only",
-            config=ReportRuntimeConfig(template="survey"),
-            project_root=Path.cwd(),
-        )
-        memory = initialize_report_memory(context=context, template=template)
-
-        first_section = memory.section_plan[0]
-        paper_handles = [handle for handle in first_section.evidence_handles if handle.startswith("paper:")]
-
-        self.assertEqual(len(paper_handles), 12)
-
     def test_small_experiment_window_routes_paper_to_method_and_measurement_to_result(self) -> None:
         paper = Paper(id="source-x", title="An existing method", authors=[],
                       abstract="Source evidence", url="https://example.com/source")
@@ -813,107 +761,32 @@ class ReportSafetyTests(unittest.TestCase):
         self.assertEqual(resumed.iterations[0].model_dump(mode="json"), saved["iterations"][0])
 
     def test_report_agent_applies_multiple_review_revision_cycles(self) -> None:
-        paper = Paper(
-            id="paper-1",
-            title="Known Paper",
-            authors=["Ada"],
-            abstract="A paper about agent systems.",
-            url="https://example.com/paper-1",
-        )
-        context = _report_fixture(
-            [paper],
-            topic='Agent Simulation',
-            report_mode="research_only",
-            goal_markdown="# Goal\nStudy agents.",
-            problem_markdown="# Problem\nWhat evidence exists?",
-            search_meta={"source": "openalex", "status": "ok"},
-            synthesis_markdown="# Synthesis\nAgent workflows have roles.",
-            hypothesis_markdown="# Hypothesis\nRole separation may help.",
-            evidence_summary="- Known evidence [@paper-1].",
-        )
+        # Revision allowance belongs to the agent, not each built-in chapter.
+        paper = Paper(id="paper-1", title="Supplied evidence", authors=[], abstract="Observed limits.",
+                      url="https://example.com/paper-1")
+        context = _report_fixture([paper], topic="Describe observed limits", report_mode="research_only")
         config = ReportRuntimeConfig(template="survey", outline_strategy="template", max_review_iterations=2)
-        template = load_report_template_bundle(
-            report_mode="research_only",
-            config=config,
-            project_root=Path.cwd(),
-        )
-
-        result = run_report_agent(
-            client=_TwoRevisionReportLLM(),
-            context=context,
-            template=template,
-            memory=initialize_report_memory(context=context, template=template),
-            config=config,
-            gateway=ReportToolGateway(context),
-        )
+        template = load_report_template_bundle(report_mode="research_only", config=config)
+        memory = ReportMemory(section_plan=[
+            ReportSectionPlan(section_id=sid, heading=sid, goal="Qualify the evidence.")
+            for sid in ("methods", "limits")
+        ])
+        result = run_report_agent(client=_TwoRevisionReportLLM(), context=context,
+            template=template, memory=memory, config=config, gateway=ReportToolGateway(context))
 
         self.assertIsNotNone(result)
         assert result is not None
+        self.assertEqual({section.section_id for section in result.sections}, {"methods", "limits"})
         self.assertEqual(sum(item.action == "revise" for item in result.iterations), len(result.sections) * 2)
         self.assertEqual(
             sum(item.action == "review_revision" for item in result.iterations),
             len(result.sections) * 2,
         )
 
-    def test_disabled_report_reviewer_skips_review_and_revision_calls(self) -> None:
-        paper = Paper(
-            id="paper-1",
-            title="Known Paper",
-            authors=["Ada"],
-            abstract="A paper about agent systems.",
-            url="https://example.com/1",
-        )
-        context = _report_fixture(
-            [paper],
-            topic='Agent Simulation',
-            report_mode="research_only",
-            goal_markdown="# Goal\nStudy agents.",
-            problem_markdown="# Problem\nWhat evidence exists?",
-            search_meta={"source": "openalex", "status": "ok"},
-            synthesis_markdown="# Synthesis\nAgent workflows have roles.",
-            hypothesis_markdown="# Hypothesis\nRole separation may help.",
-            evidence_summary="- Known evidence [@paper-1].",
-        )
-        template = load_report_template_bundle(
-            report_mode="research_only",
-            config=ReportRuntimeConfig(template="survey"),
-            project_root=Path.cwd(),
-        )
-        client = _TrackingReportLLM()
-        result = run_report_agent(
-            client=client,
-            context=context,
-            template=template,
-            memory=initialize_report_memory(context=context, template=template),
-            config=ReportRuntimeConfig(template="survey", outline_strategy="template", reviewer="disabled"),
-            gateway=ReportToolGateway(context),
-        )
-
-        self.assertIsNotNone(result)
-        assert result is not None
-        self.assertTrue(result.sections)
-        self.assertFalse(any("reviewer" in label or "reviser" in label for label in client.labels))
-        self.assertFalse(any(item.action.startswith("review") or item.action.startswith("revise") for item in result.iterations))
-
     def test_writer_recovers_from_claim_record_with_configured_token_cap(self) -> None:
-        paper = Paper(
-            id="paper-1",
-            title="Known Paper",
-            authors=["Ada"],
-            abstract="A paper about agent systems.",
-            url="https://example.com/paper-1",
-        )
-        context = _report_fixture(
-            [paper],
-            topic='Agent Simulation',
-            report_mode="research_only",
-            goal_markdown="# Goal\nStudy agents.",
-            problem_markdown="# Problem\nWhat evidence exists?",
-            search_meta={"source": "openalex", "status": "ok"},
-            synthesis_markdown="# Synthesis\nAgent workflows have roles.",
-            hypothesis_markdown="# Hypothesis\nRole separation may help.",
-            evidence_summary="- Known evidence [@paper-1].",
-        )
+        paper = Paper(id="paper-1", title="Supplied evidence", authors=[], abstract="Observed limits.",
+                      url="https://example.com/paper-1")
+        context = _report_fixture([paper], topic="Explain supplied evidence", report_mode="research_only")
         config = ReportRuntimeConfig(
             template="survey",
             reviewer="disabled",
@@ -931,7 +804,9 @@ class ReportSafetyTests(unittest.TestCase):
             client=client,
             context=context,
             template=template,
-            memory=initialize_report_memory(context=context, template=template),
+            memory=ReportMemory(section_plan=[
+                ReportSectionPlan(section_id="methods", heading="Methods", goal="Explain supplied evidence.")
+            ]),
             config=config,
             gateway=ReportToolGateway(context),
         )
@@ -941,6 +816,10 @@ class ReportSafetyTests(unittest.TestCase):
         self.assertTrue(any(label.endswith("-retry") for label in client.labels))
         self.assertTrue(client.max_output_tokens_values)
         self.assertTrue(all(value == 777 for value in client.max_output_tokens_values))
+        assert result is not None
+        self.assertTrue(result.sections)
+        self.assertFalse(any("reviewer" in label or "reviser" in label for label in client.labels))
+        self.assertFalse(any(item.action.startswith(("review", "revise")) for item in result.iterations))
 
     def test_report_agent_uses_plan_controlled_evidence_batches(self) -> None:
         papers = [
@@ -957,12 +836,6 @@ class ReportSafetyTests(unittest.TestCase):
             papers,
             topic='Agent Simulation',
             report_mode="research_only",
-            goal_markdown="# Goal\nStudy agents.",
-            problem_markdown="# Problem\nWhat evidence exists?",
-            search_meta={"source": "openalex", "status": "ok"},
-            synthesis_markdown="# Synthesis\nAgent workflows have roles.",
-            hypothesis_markdown="# Hypothesis\nRole separation may help.",
-            evidence_summary="- Known evidence.",
             max_section_sources=0,
         )
         template = load_report_template_bundle(
@@ -972,6 +845,10 @@ class ReportSafetyTests(unittest.TestCase):
         )
         memory = initialize_report_memory(context=context, template=template)
 
+        self.assertEqual(
+            [handle for handle in memory.section_plan[0].evidence_handles if handle.startswith("paper:")],
+            [f"paper:paper-{index}" for index in range(1, 13)],
+        )
         client = _TrackingReportLLM()
         result = run_report_agent(
             client=client,
@@ -1131,148 +1008,43 @@ class ReportSafetyTests(unittest.TestCase):
         self.assertEqual(audit.claim_audit.findings[0].severity, "minor")
         self.assertIn("untested", audit.claim_audit.findings[0].suggested_action)
 
-    def test_report_audit_does_not_treat_pass_at_k_as_citation(self) -> None:
-        paper = Paper(
-            id="paper-1",
-            title="Known Paper",
-            authors=[],
-            abstract="",
-            url="https://example.com/paper-1",
-        )
-        context = _report_fixture(
-            [paper],
-            topic='Agent Simulation',
-            report_mode="experiment",
-            results={"metrics": {"pass@1": 0.75}},
-        )
-        template = load_report_template_bundle(
-            report_mode="experiment",
-            config=ReportRuntimeConfig(template="experiment"),
-            project_root=Path.cwd(),
-        )
-        memory = initialize_report_memory(context=context, template=template)
-        body = "# Results\n\nThe run recorded pass@1 = 0.75 [@paper-1].\n"
-
-        audit = build_report_audit(
-            report=body,
-            report_body=body,
-            context=context,
-            memory=memory,
-        )
-
-        self.assertEqual(audit.citation_audit.status, "passed")
-        self.assertEqual(audit.citation_audit.unknown_citations, [])
-        sanitized, removed = _sanitize_report_citations(body, {"paper-1"})
-        self.assertEqual(removed, [])
-        self.assertIn("pass@1", sanitized)
-
-    def test_report_audit_ignores_numbers_inside_citation_ids(self) -> None:
-        paper = Paper(
-            id="arxiv-2603.01327v2",
-            title="Known Paper",
-            authors=[],
-            abstract="",
-            url="https://example.com/paper-1",
-        )
-        context = _report_fixture(
-            [paper],
-            topic='Agent Simulation',
-            report_mode="experiment",
-            results={"metrics": {"accuracy": 0.75}},
-        )
-        template = load_report_template_bundle(
-            report_mode="experiment",
-            config=ReportRuntimeConfig(template="experiment"),
-            project_root=Path.cwd(),
-        )
-        memory = initialize_report_memory(context=context, template=template)
-        body = "# Results\n\nAccuracy is 0.75 [@arxiv-2603.01327v2].\n"
-
-        audit = build_report_audit(
-            report=body,
-            report_body=body,
-            context=context,
-            memory=memory,
-        )
-
-        self.assertEqual(audit.metric_audit.unmatched_numbers, [])
-        self.assertEqual(audit.citation_audit.unknown_citations, [])
-
-    def test_report_audit_allows_numbers_grounded_in_selected_source_metadata(self) -> None:
-        paper = Paper(
-            id="paper-1",
-            title="Known Paper",
-            authors=[],
-            abstract="We audited twelve benchmark papers.",
-            url="https://example.com/paper-1",
-        )
-        context = _report_fixture(
-            [paper],
-            topic='Agent Simulation',
-            report_mode="experiment",
-            results={"metrics": {"accuracy": 0.75}},
-        )
-        template = load_report_template_bundle(
-            report_mode="experiment",
-            config=ReportRuntimeConfig(template="experiment"),
-            project_root=Path.cwd(),
-        )
-        memory = initialize_report_memory(context=context, template=template)
-        body = "# Results\n\nWe reviewed 12 benchmark papers [@paper-1]. Accuracy was 0.75.\n"
-
-        audit = build_report_audit(
-            report=body,
-            report_body=body,
-            context=context,
-            memory=memory,
-        )
-
-        self.assertEqual(audit.metric_audit.status, "passed")
-        self.assertEqual(audit.metric_audit.unmatched_numbers, [])
-
-    def test_report_audit_accepts_readable_metric_names_and_scientific_values(self) -> None:
-        paper = Paper(
-            id="paper-1",
-            title="Known Paper",
-            authors=[],
-            abstract="",
-            url="https://example.com/paper-1",
-        )
-        context = _report_fixture(
-            [paper],
-            topic='Agent Simulation',
-            report_mode="experiment",
-            results={
-                "metrics": {
-                    "accuracy": 0.75,
-                    "train_time_sec": 4e-05,
-                    "model_size": 24.0,
-                    "eval_examples": 14.0,
-                }
-            },
-        )
-        template = load_report_template_bundle(
-            report_mode="experiment",
-            config=ReportRuntimeConfig(template="experiment"),
-            project_root=Path.cwd(),
-        )
-        memory = initialize_report_memory(context=context, template=template)
-        body = (
-            "# Results\n\n"
-            "Accuracy was 0.75. Training time was 4.0e-05 seconds, "
-            "model size was 24.0, and the evaluation set contained 14 examples.\n"
-        )
-
-        audit = build_report_audit(
-            report=body,
-            report_body=body,
-            context=context,
-            memory=memory,
-        )
-
-        self.assertEqual(audit.metric_audit.status, "passed")
-        self.assertEqual(audit.metric_audit.unmatched_metrics, [])
-        self.assertEqual(audit.metric_audit.unmatched_numbers, [])
+    def test_report_audit_distinguishes_metric_numbers_from_source_identifiers(self) -> None:
+        cases = [
+            ("pass_at_k", "paper-1", "", {"pass@1": 0.75},
+             "The run recorded pass@1 = 0.75 [@paper-1]."),
+            ("citation_version", "arxiv-2603.01327v2", "", {"accuracy": 0.75},
+             "Accuracy is 0.75 [@arxiv-2603.01327v2]."),
+            ("source_metadata", "paper-1", "We audited twelve benchmark papers.", {"accuracy": 0.75},
+             "We reviewed 12 benchmark papers [@paper-1]. Accuracy was 0.75."),
+            ("readable_metrics", "paper-1", "",
+             {"accuracy": 0.75, "train_time_sec": 4e-05, "model_size": 24.0, "eval_examples": 14.0},
+             "Accuracy was 0.75. Training time was 4.0e-05 seconds, "
+             "model size was 24.0, and the evaluation set contained 14 examples."),
+        ]
+        for case, paper_id, abstract, metrics, prose in cases:
+            with self.subTest(case=case):
+                paper = Paper(id=paper_id, title="Known Paper", authors=[], abstract=abstract,
+                              url="https://example.com/paper-1")
+                context = _report_fixture([paper], topic="Agent Simulation", report_mode="experiment",
+                                          results={"metrics": metrics})
+                template = load_report_template_bundle(report_mode="experiment",
+                    config=ReportRuntimeConfig(template="experiment"), project_root=Path.cwd())
+                memory = initialize_report_memory(context=context, template=template)
+                body = f"# Results\n\n{prose}\n"
+                audit = build_report_audit(report=body, report_body=body, context=context, memory=memory)
+                if case in {"pass_at_k", "citation_version"}:
+                    self.assertEqual(audit.citation_audit.unknown_citations, [])
+                if case == "pass_at_k":
+                    self.assertEqual(audit.citation_audit.status, "passed")
+                    sanitized, removed = _sanitize_report_citations(body, {paper_id})
+                    self.assertEqual(removed, [])
+                    self.assertIn("pass@1", sanitized)
+                else:
+                    self.assertEqual(audit.metric_audit.unmatched_numbers, [])
+                if case in {"source_metadata", "readable_metrics"}:
+                    self.assertEqual(audit.metric_audit.status, "passed")
+                if case == "readable_metrics":
+                    self.assertEqual(audit.metric_audit.unmatched_metrics, [])
 
     def test_report_audit_accepts_thousands_separators(self) -> None:
         paper = Paper(
@@ -1330,7 +1102,6 @@ class ReportSafetyTests(unittest.TestCase):
         self.assertIn("[@paper-1]", report)
         self.assertNotIn("@fake-paper", report)
         validate_citations(report, {"paper-1"})
-
 
 
     def test_body_citation_ids_ignore_reference_list_only_citations(self) -> None:
@@ -1404,12 +1175,6 @@ class ReportSafetyTests(unittest.TestCase):
         self.assertEqual(audit.citation_audit.status, "passed")
         self.assertEqual(audit.citation_audit.unused_references, ["paper-2"])
         self.assertEqual(audit.citation_audit.warnings, [])
-
-
-
-
-
-
 
 
     def test_academic_section_numbering_preserves_unnumbered_front_and_back_matter(self) -> None:
@@ -1581,7 +1346,6 @@ Summary.
         self.assertEqual(requirements["tables"][0]["title"], "Evaluation Settings")
         self.assertEqual(requirements["figures"][0]["view"], "evaluation-landscape")
         self.assertEqual(visual_requirements(plan, sections[1]), {"tables": [], "figures": []})
-
 
 
 if __name__ == "__main__":

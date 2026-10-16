@@ -1,433 +1,283 @@
 # Configuration Reference
 
-[中文版本](CONFIG_REFERENCE_zh.md)
+[中文版本](CONFIG_REFERENCE_zh.md) · [Usage](USAGE.md) · [CLI reference](CLI_REFERENCE.md)
 
-This is the field reference for task configuration. Start with [Usage](USAGE.md) if you do not need expert settings; commands are listed in [CLI Reference](CLI_REFERENCE.md).
+Use this reference to look up configuration fields and constraints. A model catalog defines connections; research TOML defines an exact task; CodeTask TOML defines an editable project. Credentials belong in the environment or private `.env`.
+
+| Look up | Section |
+| --- | --- |
+| Connection selection, profile fields, transport | [Named model connections](#named-model-connections) |
+| Credentials and deployment variables | [Credentials and environment](#credentials-and-environment) |
+| Goal, assets, resource limits and execution | [Research TOML](#research-toml-sections-and-defaults) |
+| Writing methods and report options | [Writing from supplied material](#writing-from-supplied-material) |
+| Table fields and statistical transformations | [Existing data](#existing-data-descriptive-analysis) |
+| Decisions and additional allowances | [Continuation](#research-continuation-and-decisions) |
+| Project, interpreter, models and edit budgets | [CodeTask fields](#codetask-field-reference) |
 
 ## Guided setup
 
-Ordinary natural-language `start`, `--guided`, and outcome preferences without exact protocol controls
-create a saved native session, rather than an editable research TOML. The model catalog TOML below
-still owns named connections. Startup arguments provide the goal, mounts, authorization and allowances;
-resume retains saved values. Only explicit structured protocols save research TOML and, when needed,
-a referenced CodeTask TOML. `--chat` uses this structured setup serializer; a setup draft is not an execution session.
-Follow the [complete ordinary workflow](USAGE.md#a-copyable-ordinary-user-workflow).
+Ordinary `start`, `--guided` and outcome preferences save a native session, not editable research TOML. Startup arguments supply its goal, read-only materials, permissions, interpreter and allowances; resume retains saved values. Explicit structured protocols and `--chat` save research TOML and, when needed, reference CodeTask TOML. A chat setup draft is not an execution session.
 
-| Setting | Location |
-| --- | --- |
-| Named provider connections and routing | Model catalog TOML (optional) |
-| Provider secrets / legacy single connection | Environment or private `.env` |
-| Native goal, read-only materials, access and resource limits | `start` arguments; resume retains the saved session |
-| Exact protocol goal, inputs, delivery and resource limits | Structured research TOML |
-| Structured editable project, protection and project interpreter | Referenced CodeTask TOML |
-
-Structured research precedence is built-in defaults → TOML → explicit CLI options. CLI lists replace file lists.
-Paths resolve from the configuration location where documented; command argv remains literal.
-Confirmed chat settings cannot silently replace explicit user choices. This is not the native resume override rule:
-resume retains the model, interpreter and allowances; adding materials/access or resources uses explicit continuation options.
+Structured precedence is defaults → TOML → explicit CLI. CLI lists replace file lists. Research paths resolve from the TOML directory; argv stays literal. Protocol protected paths use execution cwd. CodeTask retains separate [loading rules](#loading-rules). Native access/resource changes use explicit continuation controls rather than ordinary overrides.
 
 ### Named model connections
 
-Copy [the model catalog example](../examples/model-profiles/models.toml) to a private location.
-Set `SIMPLE_AR_MODELS_CONFIG` to its absolute path and put `CCTQ_API_KEY` (or your chosen variable)
-in the environment/private `.env`. Alternatively use `~/.config/simple-ar/models.toml`.
-Only one catalog is loaded; files are not merged. Secrets never belong in the TOML.
-
-Interactive `start` lists text connections before model-assisted work and lets you choose a name or number.
-It shows the model, endpoint, streaming, timeout and credential availability, then saves `profile:NAME`
-in the task configuration. An explicit `--model` is retained; descriptive analysis does not require a model.
-With a catalog, do not duplicate model or endpoint settings in `.env`: keep only the referenced secrets
-and, when not using the global path, `SIMPLE_AR_MODELS_CONFIG`. Without a catalog, legacy fallback is
-explicitly labelled. Structured `--prepare-only` can save TOML before credentials are set.
-Native `--prepare-only` preflights the connection and credentials before saving a session, without model requests or process execution.
-`start`, `models` and the model client read only the command's current-directory `.env`, preserving existing environment variables.
-After changing directories, ensure the catalog and credentials remain discoverable.
-
-```bash
-simple-ar models                       # local inspection, no API calls
-simple-ar models --config /path/models.toml
-simple-ar start "Explain these materials" --source materials/ --model profile:daily
-```
-
-`--config` on `models` inspects a file; it does not activate it for later commands.
-`--model env` uses the `text` route, then `default`; CodeTask selects `code`, then `default`.
-`--model profile:NAME` selects a complete connection; `route:NAME` selects a route.
-Existing task TOML `[model].name` accepts these selectors too. Nested code tasks use the code route
-unless their own model selector is explicit. A selected code connection survives its child calls.
-Native `compose_document` uses an optional `writing` route for material selection,
-composition and feedback, sharing the original task ledger. It requires `text`
-capability, not a new model capability. Without this route the selected task
-connection is retained, including an explicit profile. This permits inexpensive
-coordination and a separately configured scientific writer; it does not guarantee
-correct interpretation. Named task snapshots pin an explicit writing route, so
-changing its model/endpoint requires a new task rather than a silent switch.
-The same optional route is available through `focus_work` with `purpose="writing"`
-and a concrete goal, for investigation, revision and delivery in the existing action
-loop. This consumer requires `openai_chat`; a Responses writing profile can still
-serve `compose_document`, but cannot be selected for native work. No route change
-automatically increases reasoning effort, tools or the shared budget.
-
-New whole-article composition makes one logical `ask_json` call using the selected
-connection's shared bounded retries, API mode and JSON policy. Physical attempts
-use the original ledger and allowance. Invalid JSON or article content is retained
-and fails without automatic redrafting; recovery uses frozen inputs and saved
-responses, never blindly resubmits. Historical Writer checkpoints keep their contract.
-
-Each profile requires `api`, `base_url`, `model`, `api_key_env` and `capabilities`.
-Text adapters are `openai_chat` and `openai_responses`; Chat supports `stream=true`.
-Optional `http2=true` uses the SDK's HTTP/2 negotiation; install with
-`pip install 'simple-autoresearch[http2]'` (source checkout: `uv sync --extra http2`).
-It is disabled by default, never changes providers, and is not a guarantee against gateway stalls.
-Test longer input/output on the execution host before selecting it. Changing it on a saved named
-session is a connection change; old HTTP/1.1 bindings remain compatible when it is omitted/false.
-Supported optional fields: `request_timeout_sec`, `max_output_tokens`, `context_input_tokens`, `retry_attempts`,
-`retry_base_delay_sec`, `retry_max_delay_sec`, `reasoning_effort`, `thinking_mode`,
-`reasoning_output_tokens`, `json_response_format`, `chat_token_limit_param`,
-`input_price_per_million`, and `output_price_per_million`.
-Timeouts/delays and supplied token caps are positive; retry count includes the first request.
-Per-call output limits still apply. Provider support for reasoning/JSON parameters must be checked.
-`context_input_tokens` is the native action-loop input working-set target (default
-24,000), including schemas, reasoning history and observations. It is a local
-setting, not a provider request parameter or certified model context window.
-For longer work, a profile may set e.g. `context_input_tokens = 64000`, after
-checking the provider's combined input/output limit and the task's total budget.
-The active work connection owns this target; remaining tokens minus the output
-reservation can reduce it. Larger inputs increase repeated input costs and do not
-guarantee better decisions. Saved named tasks may retune it without changing
-their model identity, permissions or ledger; exhausted contracts remain exhausted.
-`reasoning_effort="low"` reduces effort; it does not disable provider thinking.
-Effort labels are not portable levels: [DeepSeek maps `medium` to `high`](https://api-docs.deepseek.com/guides/thinking_mode/).
-Its thinking-mode tool calls also carry prior `reasoning_content` into subsequent
-inputs. Higher effort can therefore increase both reasoning output and later input
-costs; do not assume it improves every inventory, edit or verification decision.
-Use separate named connections for distinct work when useful, and evaluate a whole
-delivery plus feedback before promoting a setting to the default.
-For a Chat provider supporting the switch, use `thinking_mode="disabled"` with
-empty effort or `reasoning_effort="none"`; active effort with disabled thinking is
-rejected. Explicit caller/profile output caps take precedence. The optional
-`reasoning_output_tokens` fallback applies only to active effort, not `none` or
-disabled thinking. Providers may count both reasoning and final text against the
-output cap: `finish_reason="length"` with reasoning but no final text is not a
-completed result. Check the provider's semantics rather than extending timeouts.
-For finite-timeout SDK Chat streaming, the timeout also bounds submission and
-stream consumption by elapsed time, followed by at most two seconds of local
-cleanup. A deadline without a completion marker retains unknown usage. Capped
-text requests may retry on the same API within `retry_attempts`, retaining the
-full failed-attempt reservation; uncapped and visual requests stop. This does
-not prove provider cancellation or no charge, and insufficient budget stops retries.
-`retry_attempts = 1` disables automatic retries; increasing the timeout alone
-does not change that policy. The example text profile uses a 600-second deadline
-and three total attempts. Choose an explicit provider-supported output cap when
-uncertain text retries must fit a finite task allowance; do not copy single-attempt
-image settings into text profiles without intending that restriction.
-Nonstreaming, Responses and LiteLLM retain their transport timeout semantics.
-For SDK requests with a positive finite timeout, TCP/TLS connection waiting is
-limited to the smaller of 20 seconds and that timeout; read, write and pool waits
-keep the configured value. A 600-second generation deadline therefore does not
-allow a single connection attempt to stall for ten minutes. SDK internal retries
-remain disabled; the existing `retry_attempts` budget governs new requests.
-Synchronous finite-timeout streaming inside an existing asyncio loop requires
-`await asyncio.to_thread(client.ask, ...)`, rather than nesting another loop.
-
-`json_response_format="off"` omits the provider-native JSON parameter; `ask_json`
-still parses and validates JSON. Use it for a gateway that does not support the
-parameter, not as a cure for overload. A stream can carry an upstream error even
-after HTTP connection success. Increasing the timeout does not cure an immediate
-`overloaded` response. Bounded retries consume separate physical attempts and retain
-unknown usage; they do not reset a saved task's allowance. Compare SDK and framework
-requests on the execution host, including a longer response, before changing routes.
-Stream diagnostics retain SDK exception type, available HTTP status and allowlisted
-protocol error codes/types, not arbitrary provider text, request IDs or URLs. A
-missing code is unknown, not proof of timeout; incomplete output is not adopted.
-Timeout, output cap and retry tuning can be changed when resuming a saved task;
-model, endpoint and code-route identity remain pinned. Old snapshots are not rewritten.
-
-Capabilities are declarations, not probe results. `simple-ar image` uses an `openai_images`
-profile for generation/editing; optional `image_size` and `image_quality` are passed to the
-provider. Provider support must be verified.
-An Images profile cannot be used as a text client.
-Image profiles do not accept text stream/token/JSON or token-price settings.
-Images with `http2=true` require the `simple-autoresearch[http2]` extra in the
-actual execution environment. Missing support is rejected before a reservation
-or submission record; intact completed images can still be restored offline.
-Older uncertain submissions are not reclassified or automatically resent.
-
-`simple-ar image-review` uses a separate `vision` route with an explicit
-`openai_chat` or `openai_responses` profile and `vision` capability. It sends
-actual image pixels, not filenames; automatic API-mode fallback is disabled.
-Inspection accepts up to four static PNG/JPEG/WebP images, at most 20 MiB combined
-and 4,194,304 pixels per image. Provider usage is recorded when supplied; absent
-usage remains unknown, not zero. Feedback describes visible issues, not scientific validity.
-Local image admission failures report the applicable limits; resize a review copy
-while preserving the original. Review uses the named connection's output cap,
-falling back to a bounded 3,000-token default when none is configured. Unparseable
-final responses stay in the review directory's `rejected-response.json`, not in
-published findings, and are not automatically resent.
-
-In a native task, `--allow-vision` authorizes `inspect_images`; it consumes the
-shared model-call and token allowances, not the image-generation allowance.
-`--max-images 0` therefore disables generation/editing, not authorized inspection.
-The task context distinguishes availability from budget and provider health.
-
-For cctq's documented asynchronous image-task protocol, explicitly select
-`api = "cctq_images_async"`; `openai_images` remains the generic synchronous API.
-The async path uses the configured origin, saves one task ID, polls that task and
-authenticates its same-origin `files/0` download. It does not switch hosts/providers
-or fall back to another API. `request_timeout_sec` bounds the whole async invocation,
-including submission, polling and download, with at most two seconds of local cleanup.
-A saved task ID remains recoverable by GET only; interrupted submissions without an ID
-are not replayed. Saved-task recovery and one feedback edit were
-verified through a caller-configured proxy route; direct server transport remains
-unreliable. The prior synchronous timeout remains a failed request, not a success.
-
-Optional `proxy_env = "RESEARCH_API_PROXY"` references an HTTP(S) proxy URL in
-that environment variable. It affects only this SDK/image connection, not source
-search or other profiles, and is not a provider fallback. The current option
-rejects URL userinfo, query and fragment; missing/invalid values fail before a
-paid call. Proxy values are not saved in task snapshots or provider payloads.
-Without this option, standard client environment routing remains unchanged.
-
-Linked public-document downloads can use an explicit deployment route without
-changing model connections. Set `SIMPLE_AR_DOCUMENT_ROUTE_HOSTS` to comma-separated
-exact hostnames, `SIMPLE_AR_DOCUMENT_PROXY_ENV` to the name of an environment
-variable containing an HTTP(S) proxy URL, and optionally
-`SIMPLE_AR_DOCUMENT_CA_BUNDLE` to an existing trusted CA file. For example, route
-`github.com` only; wildcards are not accepted. Unlisted hosts remain direct.
-TLS verification stays enabled. These options apply to linked supporting-material
-downloads, not literature search, model calls, paper-PDF transport or ZIP acquisition.
-Without them, this downloader ignores ambient proxies. Configure the execution
-host explicitly; a model proxy alone does not make author repositories accessible.
-
-Literature connectors use their own optional `OPENALEX_API_KEY` and
-`SEMANTIC_SCHOLAR_API_KEY` environment variables, not model-profile credentials.
-They send keys in authorization headers; absent keys retain anonymous access with
-provider quotas. Supplying a key does not certify source coverage or remove rate limits.
-Anonymous quotas may be shared by users of the same server IP. On HTTP 429,
-the current search batch stops live requests to that provider, still checks each
-query's opted-in cache and continues other configured providers. Cached results
-retain their provenance; this does not expand source coverage or obtain credentials.
-
-For project documentation, repositories and dataset webpages, explicitly add
-`"web"` to `research_sources` (or repeat `--provider web` alongside paper providers).
-This optional connector uses `TAVILY_API_KEY` from the execution host's `.env`,
-not a model profile. It uses Tavily basic search without automatic upgrades,
-generated answers or automatic retries; provider-reported credits are recorded
-in the search response. Missing credentials fail clearly without falling back.
-Existing default providers and saved source plans are unchanged.
-Web hits retain their URLs and `source="web"`; excerpts are discovery material,
-not full text, verified paper metadata or proof that a project runs. Original-page
-acquisition uses the existing document path. Explicit publication-year restrictions
-still exclude undated pages; no year is inferred from retrieval time.
-
-Original HTML/text pages can explicitly use Tavily basic extraction with
-`[research] web_extract_backend = "tavily_basic"`, or
-`start --fulltext --web-extract-backend tavily_basic`. This is independent of
-search providers and requires full-text acquisition permission. The default
-`direct` and PDF download permissions are unchanged; PDFs still use the existing
-download path. Extracted text, its original URL, provider request ID and reported
-usage are cached separately from search excerpts. Cache reuse makes no new
-extraction request. Empty or failed URL results remain failures; there is no
-automatic upgrade or fallback. Provider-extracted pages are not verified paper
-full text, and a reported zero credit count is not a promise of free extraction.
-
-With a catalog, legacy model/URL/key environment settings do not override profile values.
-Missing profiles, credentials or incompatible capabilities fail without switching providers.
-A different bare model override is rejected: define another profile instead of mixing connections.
-Without a catalog, existing environment configuration works unchanged; no `.env` is deleted or migrated.
-
-New research sessions and chat drafts save non-secret connection bindings in their existing snapshots.
-Resume pins the model, endpoint and nested code route; timeout, output cap and retry
-settings may be retuned. Rotate the value behind the same credential variable freely.
-Restore the old connection or start a new task to change providers.
-Adding an unrelated image profile does not invalidate a text session. Legacy sessions and standalone
-CodeTask operations do not gain retrospective connection pinning. Keep their catalog fixed during a run.
-
-Migration is opt-in: copy the example, register current non-secret settings, keep keys in `.env`,
-inspect with `models`, and test a small new task before removing any unused legacy variables.
-There is no interactive registration wizard or automatic migration command yet.
-
-For repair, `--project-python PATH` writes `[environment] mode="external"` and `python="..."` in CodeTask TOML. Omission keeps current. This selects an existing interpreter, without installing dependencies.
-
-By default, reproduction `--project` supplies read-only preparation and the command cwd. `--data-path` registers data; `--output-files JSON` maps producer files to `execution.output_files`. These alone do not authorize edits or infer results from arbitrary paths.
-
-Explicit `--project` + `--allow` + independent `--validate` additionally opts into
-scoped CodeTask adapter preparation. Current/external CodeTask Python applies to
-validation and formal measurement; `--project-python` selects an existing interpreter.
-Explicit task-venv preparation may precede adaptation in the same isolated workspace:
-approved requirements/project installation uses the shared process budget, then the
-prepared interpreter serves CodeTask, its independent validator and formal measurement.
-Do not combine this with an external interpreter or a second `check_command`.
-Installation failure stops implementation and measurement; completed recovery does not
-reinstall. See the reproduction contract below.
-
-Optional dependency preparation for a single Python command uses:
+Load one catalog from an explicit catalog path where offered, `SIMPLE_AR_MODELS_CONFIG`, or `~/.config/simple-ar/models.toml`. Catalogs are not merged. `models --config PATH` inspects that file without activating it for later commands. `start`, `models` and the client load current-directory `.env` without replacing existing environment variables.
 
 ```toml
-[execution.environment]
-mode = "venv"
-requirements = ["requirements.txt"] # relative to execution.cwd
-install_project = false
-timeout_sec = 300
-# python_executable = "/path/to/base/python"
+version = 1
+
+[profiles.daily]
+api = "openai_chat"
+base_url = "https://provider.example/v1"
+model = "provider-model-name"
+api_key_env = "RESEARCH_API_KEY"
+capabilities = ["text", "code"]
+max_output_tokens = 8000
+
+[routes]
+default = "daily"
+text = "daily"
+code = "daily"
+writing = "daily"
 ```
 
-The default is current execution without installation. Preparation uses the shared process budget/logs and stops measurement on failure. Build code/network access is possible; this is not an OS sandbox or general provisioning. See [workflow boundaries](WORKFLOWS.md#explicit-task-dependency-preparation).
+Replace endpoint/model with supported values and set the referenced credential privately. See [the catalog example](../examples/model-profiles/models.toml). `simple-ar models` checks settings and credential presence without API calls. Interactive `start` offers text profiles; an explicit model is retained. Structured `--prepare-only` can save TOML before credentials exist; native preparation preflights credentials without making calls.
 
-An explicitly chosen short runtime check can use the current environment:
+| Selector / consumer | Resolution |
+| --- | --- |
+| `env` | Catalog `text`, then `default`; without a catalog, legacy environment connection |
+| `profile:NAME` | Complete named connection |
+| `route:NAME` | Purpose route, then capability-compatible `default` |
+| Nested CodeTask | `code`, then `default`, unless explicitly selected |
+| Native writing | Explicit `writing` route; otherwise selected task connection, including explicit profile |
+| Vision / image | Compatible configured `vision` / `image` connection; no text-client substitution |
+
+`[model].name` accepts selectors too. A raw override cannot switch a catalog connection to another model; define another profile. Missing names, credentials or capabilities fail without provider fallback. Profile names must be nonempty and contain no `:`. Routes: `default`, `text`, `code`, `writing`, `vision`, `image`.
+
+| Profile field | Default / allowed values |
+| --- | --- |
+| `api` | Required: `openai_chat`, `openai_responses`, `openai_images`, `cctq_images_async` |
+| `base_url`, `model`, `api_key_env`, `capabilities` | Required: HTTP(S) URL without userinfo/query/fragment; nonempty model; credential variable name; nonempty list from `text`, `code`, `vision`, `image_generate`, `image_edit` |
+| `proxy_env` | Empty; variable containing HTTP(S) proxy URL without userinfo/query/fragment; resolved URL is not persisted |
+| `stream`, `http2` | `false`, `false`; streaming supported for Chat only |
+| `request_timeout_sec` | `180`; positive seconds |
+| `max_output_tokens` | Unset; positive output cap |
+| `context_input_tokens` | `24000`; positive native input working-set target, not provider context-window declaration |
+| `retry_attempts` | `3`; at least 1, includes first physical request |
+| `connect_retry_attempts` | `1`; optional higher ceiling for verified pre-dispatch connection failures only. Each attempt consumes request budget; never expands retries for interrupted/unknown responses |
+| `retry_base_delay_sec`, `retry_max_delay_sec` | `1`, `12`; positive seconds |
+| `reasoning_effort` | Optional reasoning parameter, separate from the exact `model` ID; empty means omit it. Accepted values depend on the provider/model, not the profile alias or Codex subagent settings. Configurable values: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`. A requested effort is not proof the provider applied it. |
+| `thinking_mode` | Empty, `enabled`, `disabled`, `auto`; Chat disabled thinking requires empty effort or `none` |
+| `reasoning_output_tokens` | Unset; positive fallback for active effort only; explicit call/profile caps win |
+| `json_response_format` | `auto`, `off`, `json_object`; off omits native JSON parameter, local validation remains |
+| `chat_token_limit_param` | `auto`, `max_tokens`, `max_completion_tokens` |
+| `input_price_per_million`, `output_price_per_million` | Unset; nonnegative estimates |
+| `image_size` | Unset; `auto`, `256x256`, `512x512`, `1024x1024`, `1024x1536`, `1536x1024`, `1792x1024`, `1024x1792` |
+| `image_quality` | Unset; `auto`, `standard`, `hd`, `low`, `medium`, `high` |
+
+Catalog fields/types are strict. Images profiles accept only image capabilities and reject explicitly supplied text stream/token/context/reasoning/JSON/price options. Text profiles reject image size/quality and generation capabilities. Capabilities are declarations, not API probes; provider parameter support needs checking. Native decisions and `focus_work` require Chat; `compose_document` can also use Responses on the writing route. Focus switches change neither tools nor shared allowances.
+
+New named research/native tasks and chat drafts save non-secret bindings. Model, endpoint, protocol, HTTP/2, reasoning settings and applicable code/writing routes stay pinned. Timeout, output cap, retries/delays and input working-set target may be retuned; keys may rotate behind the same variable. Vision grants save a separate binding. Unrelated image profiles do not invalidate text tasks. Legacy tasks without bindings retain legacy resolution; standalone CodeTask does not acquire retrospective pinning. Native failed-decision replacement requires the explicit CLI retry contract.
+
+HTTP/2 requires the `simple-autoresearch[http2]` extra on the execution host (`uv sync --extra http2` in a checkout). Missing image support fails before reservation/submission; intact completed images can restore offline. A profile proxy affects only that connection and fails before paid calls if invalid/missing; without it standard client routing remains.
+
+Finite-timeout SDK Chat streaming bounds submission plus consumption, then at most two seconds of cleanup. Connect waiting is at most `min(20, timeout)` seconds; read/write/pool retain configured timeout. SDK internal retries are disabled. Missing completion markers retain unknown usage; capped text may retry on the same API within the count, preserving failed-attempt reservations. Uncapped/visual requests and insufficient budgets stop. Nonstreaming, Responses and LiteLLM retain transport timeout semantics. From an existing asyncio loop, use `await asyncio.to_thread(client.ask, ...)`.
+
+Reasoning labels/caps are provider-specific; reasoning may count against output and later input. A length-stopped reply with reasoning but no final answer is incomplete. Immediate overload is not cured by timeout changes. Diagnostics retain exception type, available HTTP status and allowlisted protocol codes/types; SDK Chat failures also retain the last safe TCP/TLS/HTTP event when observed, without headers or trace payloads. A pre-dispatch connection failure is distinct from an interrupted response with unknown usage; a later successful TLS probe does not certify API stability. Uncapped output can exceed the task's input-based remaining estimate, so task allowances alone are not strict provider spending caps.
+
+<a id="global-env"></a>
+
+## Credentials and environment
+
+The model TOML can be shared globally. The `.env` file is read from the command's
+current working directory, not automatically from the global model configuration directory.
+
+Keep credentials and deployment settings here or in the environment; task paths, data and interpreters belong in task inputs/TOML. Catalog profiles override legacy model/URL/key settings.
+
+| Variable | Purpose / legacy default |
+| --- | --- |
+| `SIMPLE_AR_MODELS_CONFIG` | Catalog path; absolute path recommended for shared setup |
+| `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `SIMPLE_AR_MODEL` | Legacy connection; model `gpt-4o-mini` |
+| `SIMPLE_AR_LLM_TIMEOUT_SEC`, `SIMPLE_AR_MAX_OUTPUT_TOKENS` | `180` seconds; output cap unset |
+| `SIMPLE_AR_LLM_RETRY_ATTEMPTS`, `SIMPLE_AR_LLM_RETRY_BASE_DELAY_SEC`, `SIMPLE_AR_LLM_RETRY_MAX_DELAY_SEC` | `3` attempts; `1`/`12`-second delays |
+| `SIMPLE_AR_LLM_BACKEND`, `SIMPLE_AR_LLM_API` | Legacy transport/API |
+| `SIMPLE_AR_JSON_RESPONSE_FORMAT`, `SIMPLE_AR_CHAT_TOKEN_LIMIT_PARAM` | Legacy JSON/token parameter policy |
+| `SIMPLE_AR_LLM_REASONING_EFFORT`, `SIMPLE_AR_LLM_THINKING`, `SIMPLE_AR_LLM_REASONING_OUTPUT_TOKENS`, `SIMPLE_AR_LLM_STREAM` | Legacy reasoning/stream controls |
+| `SIMPLE_AR_INPUT_PRICE_PER_1M`, `SIMPLE_AR_OUTPUT_PRICE_PER_1M` | Optional cost estimates |
+| `SIMPLE_AR_LLM_MAX_WORKERS` | Shared model worker bound |
+| `OPENALEX_API_KEY`, `SEMANTIC_SCHOLAR_API_KEY` | Optional independent connector keys; anonymous access keeps quotas |
+| `TAVILY_API_KEY` | Required for optional `web` basic search / `tavily_basic` extraction |
+| `SIMPLE_AR_DOCUMENT_ROUTE_HOSTS`, `SIMPLE_AR_DOCUMENT_PROXY_ENV`, `SIMPLE_AR_DOCUMENT_CA_BUNDLE` | Linked-document exact comma-separated hosts, proxy-variable name, optional trusted CA file |
+| `SIMPLE_AR_RESEARCH_INDEX_ROOT` | Historical index location for explicit cleanup; default `.simple_ar_cache/research_index`. Not a source-query backend. |
+
+Document routing keeps TLS verification, rejects wildcard hosts and affects linked supporting materials only, not model/search/PDF/ZIP transport. Unlisted hosts are direct; without explicit routing this downloader ignores ambient proxies. `SIMPLE_AR_OUTPUT_DIR` is provided per process, never a global setting.
+
+Connector keys use authorization headers. On HTTP 429 a batch stops live calls to that provider, checks opted-in caches and continues other providers. Web uses Tavily basic search without upgrades, generated answers or automatic retries; missing keys fail. Undated pages do not satisfy year filters. Extraction is independent of search, requires acquisition permission and preserves original URL/text/request ID/reported usage separately. Cache reuse avoids calls; extraction failures do not fall back/upgrade. PDFs keep separate permissions. Snippets/metadata are discovery material, not verified originals.
+
+## Research TOML: sections and defaults
 
 ```toml
-[execution.environment]
-mode = "current"
-check_command = ["python", "check_inputs.py"] # your project's real check, not a built-in script
-timeout_sec = 30
+[task]
+goal = "Compare supplied evidence and limitations"
+kind = "survey"
+outputs = ["report"]
+
+[model]
+name = "env"
+
+[research]
+materials_only = true
+
+[assets]
+papers = ["paper.md"]
 ```
 
-Guided reproduction accepts `--check-argv '["python", "check_inputs.py"]'`
-before the final `--command` option. A venv profile can also include
-`check_command`; bare Python aliases then use the prepared interpreter.
-An explicit baseline command's bare Python alias uses that same task venv;
-its arguments and any explicitly selected non-alias interpreter are retained.
-Current mode retains both commands as supplied and does not install or change
-interpreters. A nonzero exit or timeout stops measurement and preserves logs;
-check outputs never become scientific metrics. Success proves only that the
-chosen check exited successfully, not that the full experiment will succeed.
-Expert configurations must budget this additional process; guided setup counts it.
-Reproduction chat may include the optional check in its displayed execution
-proposal using inspected project instructions. Confirmation saves it through the
-same serializer; setup does not execute either command or replace explicit argv.
+Run `simple-ar research-session --config research.toml`. See [the survey example](../examples/survey/README.md). Unknown research sections/fields/types fail. Omitted API caps mean no framework cap for that dimension, not free calls or unlimited retries. Saved usage/limits remain on resume.
 
-For source access, `materials_only` excludes online search; `--fulltext` permits best-effort remote retrieval for an online survey. Unavailable or truncated material stays explicit.
+### Task, model and budget
+
+| Field | Default / constraint |
+| --- | --- |
+| `task.goal` | Required for new session |
+| `task.kind` | `auto`; `survey`, `bug_fix`, `measurement`, `reproduction`, `writing`, `data_analysis` |
+| `task.outputs` | List from `summary`, `report`, `experiments`, `bug_fix`, `code_task`, `data_analysis`; kind constraints below |
+| `task.output_root`, `task.selected_idea_id` | `runs/research-session`; optional existing grounded candidate ID |
+| `model.name` | File default `env`; empty string: deterministic |
+| `model.feasibility_review_model` | Optional same-provider feasibility reviewer; shared budget, saved choice cannot change |
+| `model.max_output_tokens` | Optional positive output cap |
+| `budget.total_tokens`, `budget.llm_requests` | Optional positive API caps |
+| `budget.process_invocations`, `budget.process_wall_seconds` | Nonnegative; task-derived defaults; declare finite intended execution limits |
+
+The following kind restrictions apply to structured `research-session`, not to the tool combinations available to ordinary `start` tasks.
+
+| Kind | Constraint |
+| --- | --- |
+| `survey` | Literature only; no execution except explicit code-delivery compatibility contract |
+| `bug_fix` | Existing-project CodeTask reference; `bug_fix` output, optional report; no baseline |
+| `measurement` | Declared command(s); `experiments` and optional `report` (model required); finite process limits; fixed pairs may share one verified environment preparation; no discovery/design/CodeTask or historical baseline reuse |
+| `reproduction` | Prepared fixed protocol below; experiments, optional report |
+| `writing` | Local materials/papers; report only; no execution |
+| `data_analysis` | Supplied table; data_analysis, optional report; no research/CodeTask/process |
+| `auto` | Accepted plan selects applicable bounded steps; no automatic repository discovery/install |
+
+Explicit outputs cannot combine with `--with-report`/`--no-report`. Feasibility review is model judgment, not executable proof.
+
+### Research inputs and behavior
+
+| Field | Default / constraint |
+| --- | --- |
+| `research.providers`, `research.queries` | Optional lists. Built-in provider names: `arxiv`, `openalex`, `semantic_scholar`, `local_files`, `web`; `web` needs a Tavily key. Explicit queries remain search seeds |
+| `research.max_results`, `research.max_chunks`, `research.idea_limit` | Positive; CLI `10`, `300`, `3` |
+| `research.max_pdf_pages` | Unset: all local pages; positive ceiling records truncation; frozen extraction changes need new session |
+| `research.read_max_shortlist` | Optional; default all up to 24. Explicit papers retained within limit; excess fails |
+| `research.cache_dir` | Optional shared full-text cache; not persisted as a safe resume change |
+| `research.use_fulltext`, `research.allow_pdf_download`, `research.keep_raw_pdf`, `research.materials_only` | `false`. Materials-only disables search, not model reading; writing always local |
+| `research.max_fulltext_documents`, `research.max_pdf_mb` | Optional positive remote caps; guided full-text search: 6 documents, 20 MiB each |
+| `research.web_extract_backend` | `direct` or `tavily_basic` |
+| `research.max_iterations`, `research.interaction` | `1` follow-up round; `0` stops after first analysis. New CLI `checkpoints`; `assisted`/`autonomous` also supported |
+| `assets.papers`, `assets.materials`, `assets.data` | Bibliographic sources; writing drafts/notes/results/packages; execution inputs. Project data copied into isolated preparation, external data stays; no argv substitution or split verification |
+
+Local PDFs parse even when remote full text is disabled. Remote PDFs need download/cache-retention permissions. Provenance records total/extracted/empty pages and truncation; extraction is not OCR or full understanding. Basic parser enforces ceilings; unstructured rejects ceilings it cannot enforce. Legacy coverage is not reconstructed.
+
+Search plans use focused queries and preserve explicit seeds. arXiv joins plain keywords with `AND` and passes advanced expressions through. With model reading and automatic expansion, one gap-driven search/ingest/read cycle shares the original limits. Linked-page redirects use at most four GETs per acquisition with public-address checks. No interaction mode may bypass required material or permission checks for the affected operation.
+
+### Execution and report
+
+Fields below are under `[execution]`.
+
+| Field | Constraint |
+| --- | --- |
+| `command`, `cwd`, `timeout_sec` | Literal argv, existing cwd, optional positive timeout; research-relative cwd uses TOML directory; CLI cwd defaults `.` |
+| `code_task_config` | Referenced CodeTask TOML; normally exclusive with command except reproduction adapters |
+| `primary_metric`, `metrics`, `metric_directions` | Optional schema; direction list e.g. `["accuracy=higher"]`; higher/lower/resource/ignore |
+| `output_files`, `metric_sources` | Registered attachments / explicit finite numeric selectors |
+| `pairs`, `seeds`, `seed_flag`, `seed_count` | Explicit paired argv or compact expansion; do not mix |
+| `baseline_policy`, `baseline_ref` | run/skip/reuse; passed matching current-session artifact required for reuse |
+| `protocol` | contract_id/hypothesis, dataset_refs, split_spec, metric_specs, comparison_conditions, protected_assets; reproduction also dataset/expected_outcome |
+| `initial_files` | With explicit CodeTask preparation: exact allowed, absent, unprotected Python paths, not limited to reproduction. Supported native tasks pass these as required creations to CodeTask, not initializer stubs. Historical and unmigrated contracts retain their owner. |
+
+Omit command and CodeTask for literature-only work.
+
+| `[execution.environment]` field | Default / constraint |
+| --- | --- |
+| `mode` | venv creates task environment; current requires explicit check and performs no install/interpreter override. Omit table for ordinary current execution |
+| `requirements`, `install_project` | `[]`, `false`; requirements relative to execution cwd |
+| `python_executable` | Venv base interpreter, default runtime |
+| `timeout_sec`, `check_command` | 300 seconds per step; optional literal short-check argv |
+
+Preparation/checks share process budgets/logs; failure stops measurement. Checks emit no measurement metrics. Prepared venv resolves bare Python aliases; conflicting explicit executables in source-owned measurements are rejected, never silently replaced. Installation can run build code/network; workspace is not an OS sandbox. Completed recovery does not reinstall.
+
+Migrated exact tasks may prepare an unchanged source, measure a baseline, implement a separate candidate and reuse that preparation during feedback. Frozen conditions record their source independently of baseline/candidate roles. Explicit `skip` requires only declared candidate runs and produces descriptive results, not a fabricated baseline comparison. Historical baseline reuse, research-led protocol design and unsupported structured combinations retain their original controller; migration is not complete.
+
+Ordinary benchmarks may use identical validator and formal argv: validation and measurement require separate physical calls and ledger records, and validator results never count as measurements. Strict reproduction still requires a distinct validation command. Greenfield `copy`/`sparse_copy` with a real source project may include source baselines; those frozen conditions carry `source="preparation"` and `before_implementation=true`. Prepare first, complete every declared baseline, then call `implement(prepared_result)` with the actual successful baseline facts. Missing/failed baselines cannot authorize generation. Empty or source-less greenfield baselines retain their supported owner or are rejected; no source is invented. Every project measurement cwd must still match the original source root, and edit scope and path projection remain unchanged.
+
+```toml
+[execution.output_files]
+runtime = "runtime.json"
+observations = "tables/observations.csv"
+
+[execution.metric_sources]
+elapsed = { output = "runtime", path = ["elapsed_seconds"] }
+coverage = { output = "observations", column = "coverage", match = { method = "candidate" } }
+```
+
+Files belong under the invocation's `SIMPLE_AR_OUTPUT_DIR`. The literal `{output_dir}` argument binds that directory without shell expansion. Register files using relative POSIX paths. There is no file-count limit; each attachment must be a UTF-8 regular file no larger than 2 MiB.
+
+Registered attachments receive previews and read handles. The system does not scan the working directory, infer paths from stdout, or copy external files. Missing, unreadable, or oversized attachments are reported separately from metric success and cannot support claims.
+
+`results.json.output_evidence` records provenance and truncation. Readers can request character windows, literal matches, or JSON-array, CSV, and TSV rows selected by up to four exact scalar conditions. These reads do not aggregate records.
+
+JSON metrics select explicit keys/indices; CSV/TSV must select one row. Missing, ambiguous, nonfinite or stdout-conflicting values fail; files cannot turn failed/timed-out processes into successful measurement. Attachment-contract changes are execution revisions, not report refreshes.
+
+Reproduction requires materials_only=true, local papers, command, finite timeout, baseline_policy="skip" and hypothesis/dataset/expected_outcome. No innovation, seed expansion or implicit environment discovery. Optional CodeTask prepares scoped adapter/entry edits: its benchmark is the independent validator, execute timeout the positive validation limit. Validator argv must differ from measurement after interpreter resolution; it must pass first. Supported flat tasks create declared initial files directly through CodeTask, not initializer placeholders; historical contracts retain their original continuation. Method/split/conditions remain protected. Explicit current checks or a task venv run before implementation, with the full preparation/validator budget checked first; checks cannot run the formal measurement. A venv requires initially current CodeTask Python and cannot combine with source-venv reuse. Feedback retains the recorded environment without reinstalling. See [the example](../examples/conformal_reproduction/README.md).
+
+Each `[[execution.pairs]]` entry requires a unique integer `seed` and literal argv arrays named `baseline_command` and `candidate_command`:
+
+```toml
+[[execution.pairs]]
+seed = 0
+baseline_command = ["python", "evaluate.py", "--method", "baseline", "--seed", "0"]
+candidate_command = ["python", "evaluate.py", "--method", "candidate", "--seed", "0"]
+```
+
+Alternatively, compact expansion needs `command`, unique `seeds` or positive `seed_count`, and explicit `seed_flag`. Do not combine it with `pairs`. Existing `--seed 0` / `--seed=0` arguments are replaced, not duplicated. A flag alone records one seed without authorizing extension. Protocol-only seed lists describe evaluator conditions and keep one command.
+
+An extension needs an analysis recommendation, a matched pair, an accepted decision and remaining process capacity. Conflicting command/protocol seeds fail.
+
+Baseline identity checks command/schema/data/split/metrics/conditions/protocol revision/preparation/protected assets, not candidate ID/hypothesis/cwd alone. Missing historical evidence is not filled from newer plans; paper numbers are not local measurements. Protected files need unique asset_id/path, relative to execution cwd or absolute; checks cover listed files only. Budget every matrix invocation. Direct argv uses process PATH; CodeTask resolves leading bare Python through its environment policy.
 
 ## Writing from supplied material
 
-Put length and genre requirements in the task goal, not additional environment
-variables. New adaptive article planning distinguishes "about 1,200 words" (a
-soft target) from "1,000–1,200 words" (hard bounds). It does not invent a tolerance,
-convert pages into words, or silently alter saved plans. Targets guide composition;
-they do not make a short or incomplete report acceptable. Review still checks the
-original request, evidence and complete canonical delivery. No new TOML field is
-required for this distinction.
-Specify whether the count includes the full delivery, excludes only references,
-or also excludes title and section headings. These are separate count scopes;
-saved plans keep their recorded scope rather than reinterpreting old tasks.
+Structured writing uses kind="writing", outputs=["report"], materials/papers and a model. Ordinary `start --kind writing` saves native state. Papers are sources; drafts/notes/results are materials. Duplicate/dual-role paths fail. Text/Markdown/HTML/PDF are supported; JSON objects/arrays remain unverified text. Malformed JSON fails; declared table_analysis.* cannot degrade to ordinary text.
 
-`start --kind writing --goal "Explain my existing results" --material notes.md --prepare-only`
-saves ordinary TOML: `task.kind = "writing"`, `task.outputs = ["report"]`,
-`assets.materials = ["notes.md"]`, `model.name = "env"`.
-`--document`/`assets.papers` identifies a bibliographic source, not a draft;
-repeat `--material` for additional drafts, notes or result descriptions. Ordinary JSON
-objects/arrays are accepted as unverified supplied text, not computed analysis packages.
-Malformed JSON fails before guided setup saves the task; a declared `table_analysis.*`
-package must pass the existing loader, never silently fall back to unverified text.
-Paths resolve from the configuration directory. Supported inputs are Markdown, text, HTML/HTM and PDF;
-`assets.materials` also accepts completed `table_analysis.v1` `analysis.json` files with
-their adjacent copied data. They use the same config field, not a second task/runtime.
-Arithmetic is rechecked and SVG/PDF/PNG figures regenerated through the same renderer. The complete data package stays
-beside the report. By default, `[report].data_tables = "linked"` links its full numerical
-records rather than repeating every row table in the prose; `"full"` includes those
-tables too. Neither setting samples or drops data. Figures and data links enter the
-uniquely owning frozen-plan section when one is known; ambiguous ownership uses a
-separate descriptive-data section, not a guessed scientific interpretation.
-Opt-in adaptive planning can also assign one explicit owner to an already imported
-figure package, even when other sections cite the same source. This is saved in
-the existing document plan; it does not create new data or image paths. Invalid
-sources and conflicting owners use the existing bounded outline correction.
-CLI equivalents are `research-session --report-data-tables linked|full` and
-`research-report --data-tables linked|full`. Completed historical reports are unchanged.
-Native experiment reports use the same option: `linked` adds a compact record link;
-`full` also embeds recorded summary tables. Both preserve `experiment_evidence.json`,
-its readable `.md` companion and explicitly registered source copies beside the report.
-No measurements are sampled. Assembly preview and delivery share this text; the body
-still needs its required results. Attachment audit checks projected values, companion
-text and declared copy presence, not scientific validity or later byte-level tampering.
-ACM export carries this native package; arbitrary linked files are not discovered or copied.
-Analysis-package imports cap each JSON/input at 20 MiB; incomplete/stale packages fail before writing.
-This verifies the calculation, not data collection or scientific claims.
-Raw tables are not automatically treated as verified experiment results. Execution configuration
-is rejected. Extracted text is persisted and reused on resume; search, synthesis and experiments
-are not prerequisites. Supplied results remain unverified external assertions.
-New `research-session` reports select `[report].writing_method = "article"`
-unless explicit section/planning/review controls require `"sections"`. Article
-writing uses the shared complete-article Writer, then the existing deterministic
-assembly and audit; it does not claim independent model review or backtracking.
-`max_section_tokens` bounds that complete response when positive. A saved report
-retains its method and checkpoint owner; resume cannot silently change methods.
-Explicit incompatible controls with `writing_method = "article"` are rejected.
-Explicit refresh or goal revision supplies the last accepted article as editable
-prose, separately from evidence; earlier drafts, responses and charges remain.
+Completed table_analysis.v1 imports need adjacent copied data; JSON/input each ≤20 MiB. Arithmetic is rechecked and SVG/PDF/PNG regenerated. Stale/incomplete packages fail. Calculation checks do not verify collection/science; raw tables are not verified experiment packages. Extracted inputs persist for resume. Put genre/length/count scope in the goal: soft targets differ from hard ranges, with no invented tolerance or pages-to-words conversion; saved reference/title/heading count scope remains.
 
-The structured guided compatibility path selects `report.template = "material_report"`
-and `report.document_review = true`, retaining the controlled section Writer.
-Experts can add `review_scope = "document"` to draft the multi-section body before
-the existing whole-document inspection/revision, avoiding mandatory preliminary
-section reviews. It requires `document_review = true`; default `section` retains
-the previous sequence, and single-section documents retain section inspection.
-The same checkpoint, evidence tools and per-section revision limits apply; saved
-drafts are not certified as individually reviewed. Change saved report settings
-through the supported explicit report-refresh path, not by editing a checkpoint.
-Joint drafting is independent of review timing. Newly guided data reports
-(`start --kind data_analysis --with-report`, also via chat) explicitly select
-joint drafting and complete inspection. New guided surveys and finite reproductions
-use the same established defaults. Automatic draft granularity remains an explicit
-experimental choice, not a new entry default. Existing configs and custom writing templates
-retain their choices; expert configs can choose the same settings:
+| `[report]` field | Default / behavior |
+| --- | --- |
+| `writing_method` | New article; independent document inspection and bounded whole-article corrections use its owner; explicit sectional/adaptive controls use sections; saved methods do not silently switch |
+| `template` | auto; source_review/survey/material_report/experiment/reproduction/analysis_report or Markdown template |
+| `reviewer`, `max_review_iterations` | Article defaults to no review; explicit llm + document review/scope inspects once at 0 rounds, or proposes at most N complete candidates at N positive rounds; each candidate is independently checked before adoption |
+| `document_review`, `review_scope` | Sections: false, section; document scope requires document review |
+| `draft_scope` | section; document/auto require document review/scope and full source strategy |
+| `outline_strategy` | auto uses a suggested outline; template fixes article-level headings/order; explicit custom templates keep their planned topology; adaptive requires sections |
+| `data_tables` | linked; full also includes analysis tables / experiment summary tables |
+| `max_section_tokens` | 0/unset no per-call cap; positive bounds section, joint response or article according to method |
+| `max_cited_sources` | Unset/0 no cap; positive limits distinct body-cited sources without shrinking the evidence pool; checked in article drafting and final assembly, including captions; excess is not repaired by deleting citations or redrafting |
+| `max_document_review_prompt_chars` | 0 no extra complete-request cap; positive refuses oversized review rather than truncating; existing 60,000-character manuscript/retrieval windows remain |
+| `figures` | report.figures.enabled=false or mode="off" disables generation; max_figures=0 automatic, positive overall cap includes imports and fails on excess |
 
-```toml
-[report]
-document_review = true
-review_scope = "document"
-draft_scope = "document" # Explicit experimental alternative: "auto"
-```
+Article makes one complete-body writing request then deterministic assembly/audit. Set `reviewer="llm"`, `document_review=true`, `review_scope="document"` for independent inspection. Zero correction rounds inspect without rewriting. Positive rounds reuse the existing joint editor: retain the initial response, propose complete candidates and adopt only after independent inspection. Rejected or unavailable proposals consume rounds; saved candidates and completed inspections recover without repeating calls. Unknown or rejected responses are not blindly resent. Unfinished required corrections fail rather than publish a successful revision. These checks are not scientific certification.
 
-`auto` drafts jointly when every section has a positive planned word count and
-the full plan totals at most 2,000 words. Longer or unsized plans save sections
-individually before the same complete-document review. This is a drafting heuristic,
-not a token guarantee or a change to output limits. Choose `document` to always
-compose remaining sections together using the frozen plan and shared evidence.
-The default source
-strategy `full` is required; `batch_refine` is not compatible. Default
-`draft_scope = "section"` preserves separate draft calls and historical checkpoint
-identity. The existing `max_section_tokens` is a per-call cap, so a positive value
-bounds the whole joint answer. A validated complete section set is saved in the
-same checkpoint; resuming a saved body does not regenerate it. In this explicit
-mode and in `auto`, cross-section corrections still form one complete candidate;
-automatic initial drafting does not split a large joint revision. One complete
-candidate inspection checks outstanding issues and the current manuscript before
-adoption; unsuccessful corrections retain the original sections. The existing
-`max_review_iterations` bounds joint candidate rounds. Previously consumed
-per-section rounds and pending legacy corrections are retained on recovery;
-upgrading does not grant fresh correction or model budgets. Candidate drafts and
-  their original correction requests share the existing iteration/checkpoint trace.
-  With `allow_source_backtracking = true`, a joint Writer may request one optional
-  read-only batch before each initial composition or joint correction. The batch
-  is bounded by `max_backtracking_calls` and the existing six-result prompt window;
-  it shares the gateway's per-tool limits with review. Requests/results are saved
-  before and after reading; recovery does not replay allocated reads. Setting the
-  option to false also disables these Writer requests. No live search, arbitrary
-  path reads or new execution authority is introduced.
-This does not certify scientific quality or eliminate provider failures.
-This explains supplied material without requiring an experiment or a failed objective.
-`analysis_report` remains available for unmet/uncertain experiment goals. Explicit saved
-templates are retained; a started writing task with an automatic default reuses its
-resolved template from the existing input snapshot on resume.
-Use `template = "experiment"` for an honest paper-style draft; missing evidence remains explicit.
-Local bibliographic metadata may be incomplete; authors, dates and venues must not be invented.
+Fixed structure and citation limits do not require the sectional Writer. Without automatic corrections, missing, duplicate, unplanned or reordered article-level headings and excess citations reject the response without resending it. With bounded corrections, a complete initial candidate may be retained for editing but cannot be published until the constraints and independent inspection pass. Subsections remain free. Incompatible explicit controls fail. Refresh/revision may use prior accepted prose separately from evidence; old responses/charges remain. Historical articles resume with their saved constraints, not today's defaults.
 
-Optional `[report].outline_strategy = "adaptive"` organizes built-in non-survey templates
-around the supplied purpose, claims, measurements and limitations before drafting. `auto`
-keeps their existing template path; `template` disables adaptive planning. Custom Markdown
-templates keep their topology. New `start --kind writing` tasks using built-in templates
-explicitly save `adaptive`; this does not change `auto` in existing configuration files.
-This adds one planning call (at most one correction), not new
-research or measurements. Invalid source pointers are rejected; template fallback requires
-the existing explicit fallback setting. Started drafts retain their checkpoint plan on resume.
-After successful non-survey planning, writers retain the built-in template's intended-use
-boundary, not its old section list or draft order alongside the frozen plan.
-Section prompts reuse those frozen responsibilities rather than duplicating them;
-this reduces repeated context, not saved evidence or review requirements.
-CLI equivalents are `research-session --report-outline-strategy adaptive` and
-`research-report --outline-strategy adaptive` for a requested new report.
-An organized plan is not a factual certificate or a promise of publication-quality prose.
+`sections` preserves the accepted plan, checkpoints and bounded corrections. With `draft_scope="auto"`, joint drafting requires a positive length target for every section and a total of at most 2,000 words; otherwise drafting is sectional. New document/auto correction tasks inspect the current manuscript rather than adding a separate check of old opinions. Replacing earlier opinions requires complete current-document coverage; original opinions remain in history. Saved inspections resume without another inspection request, while historical checkpoints keep their prior checking contract. Joint revisions are complete candidates, and rejected or pending rounds still count; adoption requires independent inspection of the complete candidate. If document inspection cannot finish, drafts are saved and the task pauses.
+
+Sectional writing may reread registered originals within the existing tool allowance. This does not authorize new searches, arbitrary file reads or processes. Internal backtracking settings are not public research TOML fields.
+
+Auto template uses source_review for at most one citable source, survey for multiple, material_report for writing, and experiment/reproduction/analysis_report from goal judgment. Explicit templates cannot override facts; execution passed is not scientific success. Saved resolved templates remain. Adaptive non-survey sectional planning adds one call plus at most one correction; invalid pointers fail, fallback needs explicit runtime policy. Figure ownership can be evidence-planned; structured guided writing saves adaptive, guided data/survey/reproduction may save joint drafting/review rather than base defaults.
+
+Both data-table modes retain the whole portable package. Unique figure/link owners use their frozen section; ambiguous ownership uses descriptive-data section. Experimental packages retain experiment_evidence.json/readable companion/registered copies; audit checks projections/presence, not science or later tampering. ACM carries registered packages, not arbitrary links. Concepts are evidence-bound, never invented to fill a figure quota. Unknown bibliography stays unknown.
 
 ## Existing data: descriptive analysis
 
@@ -440,781 +290,186 @@ outputs = ["data_analysis"]
 [analysis]
 file = "observations.csv"
 value_columns = ["score"]
-group_column = "method"
 observation_unit = "one run"
-value_unit = "seconds"
+group_column = "method"
+value_unit = "score points"
 ```
 
-`file` resolves relative to this TOML; `value_columns` and nonempty `observation_unit` are required.
-`group_column` and `value_unit` default empty (ungrouped / unknown unit). Optional fields:
-`attribution = "Dataset title, release, credit or public URL"` preserves a user-declared
-source in the frozen analysis and downstream writing. It does not fetch that URL,
-verify collection or invent bibliographic metadata. Omit it when unknown; it is not required.
-`mode = "observations"` aggregates rows into group count/mean/sample std and empirical quartiles. `"values"` preserves supplied numeric values:
-bars require unique labels; line/scatter retains every complete coordinate pair, including raw individual observations.
-These mode names describe transformations, not whether the source data are observational.
-`missing = "reject"` or explicitly `"omit"`; `width = "wide"` or `"column"`;
-physical input/output limits `max_mb = 20`, `max_figures = 100` (positive, adjustable).
-Missing values are never zero-filled; nonfinite/nonnumeric values fail. No inferred error bars or
-scientific verdict. The task requires `data_analysis` output and optionally `report`,
-not execution or online research. Set `outputs = ["data_analysis", "report"]`
-and `[model].name = "env"` to analyze, plot and write in the same session.
-The completed package feeds the existing material writer and audit. With a report,
-optional `[assets].materials = ["README.md"]`
-adds local data documentation/notes and `[assets].papers = ["reference.pdf"]`
-adds reference sources. Use text/Markdown/HTML/PDF, not another raw table or JSON
-analysis package. Retained material passages and recomputed results remain
-distinct; documentation does not override `[analysis]` or authorize search.
-Analysis-only reads only the table and ignores model settings; adding a report
-requires a model and retains the same session budget.
-`plot` defaults to `"bar"` (means). `plot = "box"` requires observation rows and
-shows Q1–Q3, median and observed min–max, not uncertainty or Tukey outlier cutoffs.
-Quartiles interpolate at `(n−1)p`; all valid observations contribute. Labels include
-counts/omissions, and pages for one column share a scale. Supplied summaries cannot
-recover quartiles; box plots do not accept coordinate or Pearson options.
-`plot = "heatmap"` requires `mode = "values"` and a unique row-label `group_column`.
-Selected columns must express a user-declared compatible quantity/unit; their raw
-values share one global color scale, including across row/column pages. No normalization,
-sorting, clustering or correlation calculation is implied. Explicit `missing = "omit"`
-keeps absent cells gray/NA, including an entirely missing column; an entirely missing
-matrix cannot be colored. `max_points` limits cells per SVG page, including missing cells,
-and `max_figures` limits pages, without sampling. Full labels and values remain in the
-analysis package and downstream writing. Heatmaps do not accept coordinate, Pearson,
-paired-baseline or shared-coordinate-layout settings.
+| `[analysis]` field | Default / constraint |
+| --- | --- |
+| `file`, `value_columns`, `observation_unit` | Required UTF-8 CSV/TSV/JSON-record path, nonempty numeric-column list, nonempty row meaning |
+| `group_column`, `value_unit`, `x_column`, `x_unit`, `attribution`, `paired_baseline` | Empty; unknown units if omitted; attribution is declaration, not acquisition/bibliographic verification |
+| `mode`, `plot`, `missing`, `width` | observations, bar, reject, wide; missing omit / width column supported |
+| `association`, `series_layout` | none, separate; pearson/shared for coordinates |
+| `max_mb`, `max_points`, `max_figures` | Positive adjustable 20 MiB, 10000 positions/cells, 100 SVG pages; overflow fails without sampling |
 
-`plot = "line"` or `"scatter"` requires `mode = "values"`
-and a numeric `x_column`; `x_unit` defaults empty (unknown). Optional `group_column`
-identifies distinct series, not paired observations or replicate aggregation.
-Each selected value column gets its own axis by default. Explicit `series_layout = "shared"`
-puts selected line/scatter series on common axes with a legend, using their declared common
-`value_unit`; unit compatibility is not independently checked. It does not normalize values.
-The shared panel counts all selected series' positions towards `max_points`; no series is dropped.
-Lines require unique x within each group, sort by x and break at missing y.
-Scatter retains duplicate x; explicit `missing = "omit"` retains rows with missing
-x/y in the package but does not plot those positions. Lines still require complete x.
-Category legends paginate without dropping groups; all pages of a coordinate panel use the same axes.
-`max_points = 10000` is a positive, adjustable coordinate-output limit; overflow
-fails without sampling. Coordinates are not aggregated or fitted. See the
-[complete example](../examples/data-curves/README.md).
-Model connections are not used or required. Setup checks shape and explicit column names
-within `max_mb` before persisting a new task; numeric validation happens at ingestion.
-Settings and input bytes freeze at ingest; changing them requires a new task, while resume
-reuses completed snapshots without rereading the original file. See [workflow](WORKFLOWS.md).
+Pre-save checks shape/columns; ingest checks finite numbers and freezes bytes/settings. Missing never becomes zero; nonnumeric/nonfinite fails. Resume reuses snapshots; changed transformations need new task. Analysis-only ignores models; report additionally requires model/shared budget and may include local text/Markdown/HTML/PDF notes/references, without overriding numeric settings or authorizing search.
 
-For an explicit same-row comparison, set `paired_baseline = "baseline"` and select
-that column plus candidate columns in `value_columns`. This requires
-`mode = "observations"`, `plot = "bar"` or `"box"`, and a common quantity/unit declared by the
-user. Each row must represent a matched pair; grouping remains optional. The result
-retains candidate-minus-baseline differences, pair/missing-pair counts, mean difference,
-sample standard deviation and standard error. `missing = "omit"` omits a pair if
-either value is absent; it does not subtract independently filtered column means.
-Difference plots show ±1 standard error for at least two pairs, assuming independent
-pairs. This is not a confidence interval, significance test or automatic improvement
-verdict. Saved packages recompute paired values when imported into writing.
-With `plot = "box"`, method panels show their marginal distributions on a common
-scale; a separate panel still shows matched mean differences and SE. Marginal
-distributions retain each column's nonmissing values, while differences use complete
-pairs only. Figure metadata records what is actually drawn; computed SD is not
-an uncertainty bar unless the renderer explicitly draws it.
+| Plot | Required mode / behavior |
+| --- | --- |
+| bar | Observations: grouped count/mean/sample SD/quartiles; values: preserve values with unique labels |
+| box | Observations only; Q1–Q3, median, observed min–max; quartiles interpolate (n−1)p; no coordinate/Pearson options |
+| heatmap | Values + unique row labels/common declared quantity/unit; global raw color scale across pages; no normalization/sorting/clustering; omit keeps NA cells, entirely missing matrix fails; no coordinate/Pearson/pairing/shared layout |
+| line | Values + numeric x; unique x per group, sorted, complete x required; missing y breaks lines |
+| scatter | Values + numeric x; duplicates retained; omit keeps missing-coordinate rows in package but not plot |
 
-For a different question—linear association of two supplied measurements—set
-`association = "pearson"` on a line/scatter task with explicit numeric `x_column`
-and selected y columns. Default `"none"` does not compute correlation. Each
-declared group/column uses only its jointly present coordinate pairs; no groups
-are pooled and no coordinates or figures are changed. The analysis package and
-writing show Pearson r, complete/missing-pair counts and undefined-value reasons.
-Constant axes or fewer than two pairs have no coefficient; with two nonconstant
-pairs r is necessarily ±1. This is descriptive linear association, not a paired
-mean difference, regression, significance test, confidence interval or causal
-effect. A small r does not rule out nonlinear association. Coordinate mode
-`"values"` means supplied x/y values are retained, not that every row is an
-independent experiment. There is no extra model or dependency.
+Box whiskers are neither uncertainty nor Tukey cutoffs. Coordinates are not aggregated/fitted; groups mean series, not pairs/replicates. Shared axes require declared common unit without verification/normalization; all series positions count. Legends/pages retain groups/common panel scales; heatmap limits count missing cells too. Labels/values/counts/omissions remain.
 
-## Global `.env`
+Paired baseline requires observations/bar or box, baseline+candidates selected, same-row matching/common quantity/unit. It retains candidate-minus-baseline values, complete/missing counts, mean/sample SD/SE. Omit jointly filters pairs, never subtracts separate filtered means. ≥2 independent pairs show ±1 SE, not confidence/significance/improvement. Box marginals use each column's nonmissing rows; differences use complete pairs in separate panel.
 
-`.env` is loaded by the LLM integration for credentials, endpoint, model and
-transport settings. It is ignored by Git and must not contain task assets,
-source roots, datasets, or interpreter paths. Task-specific paths and execution
-conditions belong to the research TOML or its referenced CodeTask TOML.
-
-## Research TOML: sections and defaults
-
-`report.template` defaults to `auto`: literature tasks with at most one citable
-source use a concise single-source evidence review, while multi-source tasks
-use a survey. Supplied-material writing automatically selects `material_report`,
-with the continuation semantics described above. An explicit `source_review`,
-`survey`, `material_report`, or custom template wins;
-automatic selection never invents a comparison absent from the sources. Experimental
-tasks select a paper, reproduction report or concise analysis report using the
-analysis goal judgment. Execution `passed` is not scientific success. Unmet or
-uncertain goals default to an analysis report; explicit templates still win and
-cannot override measured facts. Saved session templates are preserved on resume.
-Use the existing report configuration revision to opt an old session into `auto`.
-Automatic structure selection does not certify the scientific judgment or prose.
-
-Run `simple-ar research-session --config examples/survey/research.toml`.
-The [survey case](../examples/survey/README.md) is a complete literature task.
-Additional configuration options are documented below, not separate user workflows.
-Precedence is built-in defaults, TOML, then explicit CLI options. CLI lists replace file lists.
-File-relative paths resolve from the TOML directory; command argv remains literal.
-
-### Task, model and budget
-
-| Section | Fields | Default / requirement / condition |
-| --- | --- | --- |
-| `[task]` | `goal`, `kind`, `outputs`, `output_root`, `selected_idea_id` | New sessions require `goal`. Kinds: `auto` (default), `survey`, `bug_fix`, `measurement`, `reproduction`, `writing`, `data_analysis`. `measurement` requires `["experiments"]`; `reproduction` includes `experiments` and optionally `report`; `writing` only accepts `report`; `data_analysis` requires its same-name output and optionally `report`. Other outputs: `summary`, `report`, `experiments`, `bug_fix`. `output_root` defaults `runs/research-session`. Optional `selected_idea_id` selects an existing grounded candidate. |
-| `[model]` | `name`, `feasibility_review_model`, `max_output_tokens` | A file config defaults `name` to `env`, which reads `SIMPLE_AR_MODEL`; `name = ""` selects deterministic processing. Optional `feasibility_review_model` routes only the source-backed implementation feasibility audit to another model on the same provider and session budget; it is saved for resume and cannot be changed within an existing session. `max_output_tokens` is optional. Credentials stay in the environment. |
-| `[budget]` | `total_tokens`, `llm_requests`, `process_invocations`, `process_wall_seconds` | Token/request caps are optional for a new session (omitted means no cap for that dimension). Process values default from the task shape; set them explicitly when execution is requested. Resume keeps the saved ledger and does not reset usage. |
-
-An independent feasibility review can challenge a candidate's mechanism before
-CodeTask or training. It is still model judgment, not an executable proof of
-the method or an improvement claim. If it is omitted, the main model performs
-the review. Use the same `feasibility_review_model` on resume (or omit it to
-reuse the saved choice).
-
-### Research inputs and behavior
-
-| Section | Fields | Default / requirement / condition |
-| --- | --- | --- |
-| `[research]` | `providers`, `queries`, `max_results`, `max_chunks`, `max_pdf_pages`, `read_max_shortlist`, `idea_limit`, `cache_dir` | Lists are optional; CLI defaults are `max_results = 10`, `max_chunks = 300`, `idea_limit = 3`. Omit `max_pdf_pages` to extract all PDF pages; a supplied positive integer explicitly limits extraction and records truncation. Changing it requires a new session because existing extracted evidence is frozen. `read_max_shortlist` is optional (default: all papers up to 24); explicitly supplied papers are retained within this reading limit, and an over-limit request fails visibly. `cache_dir` is optional and is not a safe resume-change because it is not persisted. |
-| `[research]` | `use_fulltext`, `allow_pdf_download`, `keep_raw_pdf`, `max_fulltext_documents`, `max_pdf_mb`, `materials_only` | These switches default false and optional caps are unset. `materials_only = true` consumes supplied local inputs (`assets.papers`, or writing `assets.materials`) and disables search; it does not disable model reading. Writing always uses local-only scope. Guided `start --fulltext --sources search` enables PDF cache retention with a 6-document, 20 MiB-per-resource limit; expert TOML may adjust the positive caps. Automatic evidence followup reserves initial acquisition slots within these totals, not extra downloads. Remote PDFs require both PDF permission and cache retention. Full-text retrieval remains best-effort and unavailable/abstract-only states are retained honestly. |
-| `[research]` | `max_iterations`, `interaction` | `max_iterations` defaults to `1`; `0` stops after the first analysis. `interaction` defaults to `checkpoints` for a new CLI session and accepts `assisted`, `checkpoints`, or `autonomous`. Critical facts and permissions block every mode. |
-| `[assets]` | `papers`, `materials`, `data` | Paths resolve from the TOML directory. `papers` identifies bibliographic sources; `materials` is for `writing` drafts, notes, result descriptions or completed `table_analysis.v1` packages with copied data, not independently measured experiment metrics. Writing requires at least one input and rejects duplicate/dual-role files. `data` names execution inputs; isolated CodeTask preparation copies declared project data, while direct/external inputs remain in place. No split verification or automatic argv substitution. |
-
-In model-planned searches, explicit configured queries remain seeds; otherwise
-the planner supplies focused topic queries rather than searching the full task
-description. Supporting abstract conditions guide screening and reading, not a
-mandatory conjunction of every condition. The arXiv connector joins plain
-keywords with `AND`; an explicitly supplied advanced connector expression is
-passed through. Retrieval is not semantic confirmation of relevance or coverage.
-The document limit covers different focused queries as well as required facets,
-before remaining slots are filled by lexical rank.
-
-Explicitly supplied local PDFs are parsed best-effort (all pages by default,
-or the explicitly configured `max_pdf_pages`) even when `use_fulltext = false`; that flag governs remote
-full-text retrieval. `allow_pdf_download = false` does not exclude a PDF already
-on disk. Observed total/extracted pages, truncation and empty-text pages travel
-with extraction provenance. Reading windows remain bounded independently;
-extracting all pages is not full understanding or OCR. Old bundles without
-coverage cannot be retrospectively certified. Parser failures remain diagnostics,
-not invented paper content.
-The page ceiling is implemented by the basic PDF parser. The optional
-`unstructured` backend rejects an explicit PDF ceiling it cannot enforce;
-external parsers must declare their own observed coverage.
-
-### Execution and report
-
-| Section | Fields | Default / requirement / condition |
-| --- | --- | --- |
-| `[execution]` | `command`, `cwd`, `timeout_sec`, `code_task_config` | Normally choose literal argv `command` plus an existing absolute `cwd`, or a CodeTask TOML reference. Reproduction permits both for explicitly authorized adapter preparation followed by the separate formal command. Omit both for literature-only work. `timeout_sec` is optional and defaults at the CLI/application boundary. |
-| `[execution.environment]` | `mode`, `requirements`, `install_project`, `python_executable`, `timeout_sec`, `check_command` | Optional single-command preparation: `venv` creates a task environment; `current` requires an explicit check argv and does not install or override Python. Requirements default empty, project installation false, base venv Python this runtime, per-step timeout 300. Optional check executes after setup. Omission keeps ordinary current execution. Expert TOML budgets preparation explicitly; guided start includes it. |
-| `[execution]` | `primary_metric`, `metrics`, `metric_directions` | Optional measurement schema; directions use `higher`, `lower`, `resource`, or `ignore`. |
-| `[execution]` | `output_files` | Optional mapping of attachment names to relative POSIX files under the process-owned `SIMPLE_AR_OUTPUT_DIR`. Only declared UTF-8 regular files up to 2 MiB each receive bounded previews and registered read handles; missing/unreadable attachments are recorded separately from execution success. |
-| `[execution]` | `pairs`, `seeds`, `seed_flag`, `seed_count` | Optional explicit comparison inputs. `pairs` contains unique integer `seed` plus literal `baseline_command` and `candidate_command`; compact seed expansion requires a literal command and explicit seed flag/count. Natural-language seed requests are not parsed. |
-| `[execution]` | `baseline_policy`, `baseline_ref`, `protocol` | Policy is `run`, `skip`, or `reuse`; `reuse` requires a passed current-session artifact whose command, schema, protocol conditions, protected assets and preparation lineage match. `protocol` uses the existing experiment contract and does not certify data contents. |
-| `[report]` | `writing_method` | New structured reports use `article` unless explicit section/review controls select `sections`. Article drafting shares the complete-body Writer; assembly and deterministic audit remain separate. Explicit `sections` retains planning, inspection and partial checkpoints. Historical sessions without this field remain sectional; saved owners do not switch on resume. |
-| `[report]` | `template`, `reviewer`, `max_review_iterations`, `document_review`, `max_section_tokens`, `max_cited_sources`, `figures` | `template` defaults to `auto`. The controlled `sections` method defaults to `reviewer = "llm"`, with CLI review iterations `1`; `article` disables model inspection. Optional `document_review = true` selects the controlled method and adds cross-section review: argument-led plans can correct their frozen sections; legacy plans retain two targets. Each target has at most `max_review_iterations` corrections; rejected candidates consume the allowance and recovery does not reset it. `max_section_tokens = 0` omits a per-call output cap. Positive `max_cited_sources` selects controlled writing and bounds distinct final citations without truncating the reading pool; final audit records excess. Omit it for no source-count cap. Figures are deterministic by default; set `[report.figures].enabled = false` or `mode = "off"` for text-only output. |
-| `[report]` | `max_document_review_prompt_chars` | Optional expert complete-request character cap; default `0` adds no hidden assembled-prompt cap. Existing retrieval windows, 60,000-character manuscript window, model capacity and cumulative session budget still apply. A positive cap refuses an oversized review rather than truncating evidence or claiming it was performed. |
-
-Explicit `outputs` cannot be combined with `--with-report`/`--no-report`. Report structure
-selection never overrides measured facts or certifies scientific success. Changed
-search/ingestion settings are rejected on resume when they differ from saved values;
-explicit report settings can invalidate only writer/report/audit outputs, not research
-evidence or measurements. Use `research-report` to add a report to an existing prefix.
-
-`report.figures.max_figures = 0` selects automatic generation, not text-only output.
-For an adaptive document it uses only supported, evidence-bound planned diagrams;
-it does not invent figures to fill a target. Supplied images can coexist with these
-diagrams. A positive value is an explicit overall report limit, including imported
-analysis figures; excess fails rather than silently dropping user data. Disable
-generation with `enabled = false` or `mode = "off"`. These native diagrams are
-editable concept overviews, not arbitrary mechanism illustrations or image synthesis.
-
-Choose `task.kind = "measurement"` only to run and analyze one supplied command
-as-is, without literature discovery, candidate design, CodeTask editing, or a
-baseline comparison. It requires `outputs = ["experiments"]`, an explicit
-`execution.command`, and finite process limits. Use `auto`/research for an
-evidence-driven candidate or a comparative experiment; a measurement is not
-proof of a scientific improvement.
-
-An evaluator can preserve raw observations and runtime details for writing without
-putting all rows in stdout:
-
-```toml
-[execution.output_files]
-paired_observations = "tables/observations.csv"
-runtime = "runtime.json"
-```
-
-The child command writes these files below the existing `SIMPLE_AR_OUTPUT_DIR`
-environment variable supplied **for that invocation**. Do not set it in `.env`.
-Author programs accepting an output argument can instead use literal
-`{output_dir}` in `execution.command`, e.g. `--output={output_dir}/runtime.json`;
-the existing local backend binds it to this invocation, without a shell.
-For example, Python code can create `Path(os.environ["SIMPLE_AR_OUTPUT_DIR"])`
-and write its declared files there. Existing commands need not use this option;
-no cwd scan, stdout path discovery or arbitrary external file copying occurs.
-An attachment name describes producer intent, not verified contents. The report
-receives bounded previews with omitted-range information; its existing read-only
-review tools can request another character window of a registered attachment.
-They can also locate a literal phrase within that file instead of guessing an
-offset, or select JSON record-array/CSV/TSV rows by up to four exact scalar
-field/value conditions. Selected rows retain counts, provenance and truncation;
-the tool does not aggregate or infer missing values. A lexical match is not
-semantic validation. Local producer attachments
-are named evidence, not paper references with invented bibliography keys.
-Missing files do not invalidate otherwise valid metrics, but cannot support a
-claim. Check the saved `output_evidence` in `results.json`. Changing this contract
-on resume is an execution-input revision, not a report-only refresh; completed
-historical runs are not silently enriched or rerun.
-
-To use native JSON/CSV results as measured metrics rather than only attachments:
-
-```toml
-[execution.metric_sources]
-elapsed = { output = "runtime", path = ["elapsed_seconds"] }
-coverage = { output = "paired_observations", column = "coverage", match = { method = "candidate" } }
-```
-
-JSON paths select explicit keys/indices; CSV/TSV conditions must select one row.
-Values must be finite numbers. Missing, ambiguous or conflicting stdout/file
-values fail extraction; there is no implicit aggregation or column guessing.
-Source file and selected location remain in the canonical result. A process
-failure or timeout cannot become a successful measurement through a result file.
-
-`task.kind = "reproduction"` is a **prepared, fixed-protocol** path: read supplied local
-papers, synthesize the source evidence, execute the declared command, analyze its
-measurements, and optionally write a reproduction report. Set `research.materials_only = true`,
-provide `assets.papers`, `execution.command`, and `execution.protocol` with at least
-`hypothesis`, `dataset`, and `expected_outcome`. Use `baseline_policy = "skip"`
-and a finite process timeout. By default this mode does not edit code; it does not
-propose innovations, expand seeds, or discover a missing environment. Optional
-existing-project adapter preparation requires explicit `execution.code_task_config`
-alongside the formal command. The referenced `[benchmark].command` becomes the
-independent `validation_command`, and `[execute].timeout_sec` its positive
-`validation_timeout_sec`; `execution.command` and `execution.timeout_sec` remain the
-formal measurement. Validation argv must differ from measurement argv, including
-after interpreter resolution. Preparation and scoped implementation/validation
-precede measurement in the isolated project. Only approved adapter/entry edits are
-allowed; protected paths apply, and authorization excludes changes to the declared
-scientific protocol. Validation success alone does not verify scientific equivalence.
-For a new adapter, `execution.initial_files = ["adapters/export.py"]` explicitly
-authorizes creation; each path must be an exact allowed, absent, unprotected Python
-file. Initialization creates fail-closed placeholders only in the isolated project,
-then uses the ordinary index/edit/check path. `--allow` alone never creates files.
-Preparation consumes this declaration; recovery does not overwrite implemented files.
-CodeTask uses prepared `current`/`external` Python. Explicit task-venv preparation through
-`execution.environment` can run first in the isolated workspace and bind its interpreter
-to subsequent CodeTask validation and measurement. Do not combine it with an external
-interpreter, current/check preparation or another check command. Paired comparisons still use the
-ordinary research path. This is not arbitrary-paper preparation, an OS sandbox or
-completed real-paper acceptance. Report `template = "reproduction"` preserves
-the distinction between a published result, an adapted check, and local observations.
-See [the complete CPU-only case](../examples/conformal_reproduction/README.md).
-
-Advanced experiments may either use `[[execution.pairs]]` rows with a unique integer
-`seed`, `baseline_command` and `candidate_command` (literal argv arrays), or declare
-one literal `execution.command` together with explicit `seed_count`/`seeds` and an
-explicit `seed_flag`. The canonical entrypoint expands the latter into bounded literal
-pairs; it does not parse natural-language seed requests or interpolate shell text.
-Omit a seed declaration to retain one configured execution and record that default
-reason. Do not combine explicit `pairs` with compact seed settings. In LLM mode,
-research design may propose conditions or an argv extension only after the supplied
-entrypoint has been inspected; the proposal remains inside the authorized process
-boundary and explicit configuration wins. With `code_task_config`, pairs replace its
-benchmark commands for the research matrix. CodeTask still owns edit scope and
-implementation settings.
-For a single fixed command, `seed_flag` alone records its literal integer seed
-without authorizing additional executions. A seed list only in
-`execution.protocol.comparison_conditions` describes the supplied evaluator's
-conditions; without `execution.seed_flag`, its literal command runs once and
-may handle that batch internally. Such declarations are not proof that each
-seed was measured. Top-level `execution.seeds`/`seed_count` request command
-expansion and still require an explicit flag.
-
-Supported literal bindings are `--seed 0` and `--seed=0`; neither alone permits seed extensions.
-To start with one paired seed but leave an evidence-driven extension possible,
-declare both `seeds = [0]` and `seed_flag = "--seed"`. This runs only the initial
-seed by default; another seed still requires an analysis recommendation, a
-matched baseline/candidate pair, remaining process budget and an accepted decision.
-Explicit seed expansion replaces an existing argument rather than appending a
-duplicate. A command seed conflicting with `protocol.comparison_conditions.seed`
-is rejected. Declared protocol settings flow to design, measurement and reporting;
-they do not certify data contents or retroactively modify historical measurements.
-Comparison identity includes the protocol revision, data references, split, metric
-definitions, comparison conditions, protected assets and result schema—not the
-candidate ID or hypothesis text. Complete historical contracts use the same
-read-only comparison; missing protocol evidence is not filled from a newer plan.
-`baseline_policy` is `run` when a comparison is required, `skip` when it is not, or
-`reuse` when `baseline_ref` points to a passed, same-condition canonical result in the
-current session artifact store. Reuse checks the actual command, result schema and
-declared data/split/metric/condition and preparation lineage; cwd alone or the full
-narrative contract is not a sufficient identity. It never imports paper numbers as
-measurements. The separate CodeTask TOML keeps its own `auto`/`none` compatibility
-semantics; those aliases are not research-session execution policies.
-`[execution.protocol]` uses the existing research experiment contract: dataset_refs,
-split_spec, metric_specs, comparison_conditions and protected_assets, optionally
-contract_id/hypothesis. Protected file paths are relative to the experiment cwd,
-not the TOML directory; shared data may use absolute paths. Each protected asset
-needs a unique `asset_id` and a file `path`. The existing before/after check
-detects changes during execution. Only explicitly listed files are checked;
-this does not verify an entire dataset directory or establish scientific
-validity. For example:
-
-```toml
-[[execution.protocol.protected_assets]]
-asset_id = "evaluator"
-path = "evaluate.py"
-```
-
-No seed interpolation or extra scheduler is introduced. Grant process budgets
-for every matrix run.
-Use either literal `execution.command` plus `cwd`, or `execution.code_task_config`
-for one prepared code boundary; they are mutually exclusive except for the
-explicit reproduction adapter contract above.
-Direct command argv uses the process `PATH`. A referenced CodeTask config applies
-its `current`/`external` interpreter policy to a leading bare `python`/`python3`.
-
-The sections below cover the existing CodeTask TOML for `code-task` and
-`research-session --code-task-config`. Research TOML can reference this file through
-`execution.code_task_config`; it does not duplicate CodeTask's implementation settings.
-
-CodeTask TOML preserves its legacy cwd-relative paths. Use `{config_dir}` (the
-absolute directory containing that TOML) in path fields and
-`[benchmark].command` when a case should be relocatable. Otherwise declare an
-explicit absolute path for a machine-owned project, dataset, split, or
-interpreter. Quote command arguments when a path may contain spaces.
-`[environment].required_paths` lists additional files/directories that must
-exist before running; it checks presence, not dataset correctness. See the
-[continual-learning case](../examples/continual_learning/README.md).
-
-The old eight-stage outer-pipeline parser and its alias mapping are retired.
-Historical configuration snapshots remain readable files, not executable workflows.
-
-## Loading Rules
-
-- `code-task init --config PATH` loads initialization settings.
-- `code-task execute --config PATH` loads execution/model/budget settings.
-- `research-session --code-task-config PATH` uses the same CodeTask parser.
-- Explicit CLI flags override corresponding TOML values.
-- Setup and command details: [Usage](USAGE.md), [CLI Reference](CLI_REFERENCE.md).
+Pearson requires line/scatter x/y and computes per group/y from jointly present coordinates. Constant axes or <2 pairs undefined; two nonconstant pairs give ±1. Counts/reasons retained; no point changes, regression/significance/causality/independence claim. Small r does not exclude nonlinear association. [Curves example](../examples/data-curves/README.md).
 
 ## Research continuation and decisions
 
 ### Continue a research session after preparing execution
 
-Run `simple-ar research-session --config research.toml --session-root runs/research-session/<session>`.
-Omitted goal/outputs stay unchanged; supplied goal, outputs, local papers, or execution settings
-revise the existing session. The accepted plan is rebuilt, while attempt history remains and
-measurements are reused only when their command, result schema, protocol, preparation lineage,
-and protected assets still match. Literature additions do not by themselves repeat valid
-experiments. Changing task kind still requires a new session.
+Use `research-session --config research.toml --session-root SESSION`. Omitted goal/outputs stay; explicit goal/output/local-paper/execution revisions rebuild dependent plans, retaining history. Reuse measurements only with matching command/schema/protocol/preparation/protected assets. New task kind or incompatible search/ingestion needs new session; report-only changes rebuild only report, research-report adds missing report.
 
-Resolve a pending decision through this same command, without an interactive stdin prompt:
-
-```bash
-simple-ar research-session --session-root runs/research-session/<session> --topic "Original research goal" \
-  --decision-id ID_FROM_RICH --decision-response accept
-
-simple-ar research-session --session-root runs/research-session/<session> --topic "Original research goal" \
-  --decision-id ID_FROM_RICH --decision-response revise \
-  --decision-guidance "Add facts or provide a revised direction"
-```
-
-The response may be `accept`, `reject`, or `revise`. Revising a delivery selection also
-requires an explicit report setting, such as `--report-template analysis_report`. TOML may
-place `decision_id`, `decision_response`, and `decision_guidance` under `[continuation]`.
-The proposal and reply remain separate decision artifacts; exact replay does not repeat
-completed work, and changed task/protocol inputs invalidate an old decision.
+Continuation decision_id/decision_response/decision_guidance answer pending choices; responses accept/reject/revise, delivery revisions also need report settings. Exact replay restores interrupted saved revisions without repeating work; different terms/changed inputs invalidate old decisions. Interaction changes cannot mix with reanalysis/report-only refresh, except delivery answers may include mode/report settings. See [CLI reference](CLI_REFERENCE.md).
 
 ### Explicit continuation allowances
 
-Continuation uses the existing `research-session` command. A `[continuation]` table is optional
-and only applies with `--session-root`:
-
 ```toml
 [continuation]
-authorization_id = "review-20260924-1"
-reason = "Bounded continuation after review"
+authorization_id = "continuation-1"
+reason = "Finish the saved goal"
 additional_attempts = 2
 additional_no_progress = 1
 remaining = { total_tokens = 50000, llm_requests = 8 }
 ```
 
-`remaining` starts a new allowance for subsequent calls on already configured resource
-dimensions. It does not estimate or resolve unknown historical usage; earlier ledger entries and
-attempt counters remain intact. `additional_attempts` and `additional_no_progress` increase their
-persisted caps and do not reset use. CLI equivalents are `--authorization-id`,
-`--authorization-reason`, repeatable `--authorize-remaining DIMENSION=AMOUNT`,
-`--additional-attempts`, and `--additional-no-progress`. Use the same ID only to replay exactly
-the same terms; a new allowance requires a new ID. Do not edit the ledger or manifest by hand.
-Authorization alone on a completed session keeps its status, attempts and artifacts unchanged.
-Resources and attempt capacity may be replenished separately; execution still checks all required
-limits. Replaying identical terms does not replenish spent capacity and can finish an interrupted
-resource-ledger write. For report refresh, authorize first and then run `research-report --refresh`;
-report-only work does not require expanding process permissions.
+Only with --session-root. New remaining amounts apply to subsequent calls on configured ledger dimensions; history/unknown charges persist. Attempt/no-progress additions increase caps, not reset counters. Stable ID/reason required; same ID/terms complete interrupted authorization idempotently, never replenish spent capacity. Changed terms need new ID. Do not edit ledger/manifest.
 
-Saved research/report settings remain authoritative unless explicitly revised through the
-session entrypoint. Declare intended process limits when creating a session that will later run
-experiments; continuation can only extend dimensions already present in that session's ledger.
-Automatic repository discovery/download/setup is not implemented.
+Authorization alone leaves completed sessions completed and runs nothing. Authorize then refresh report (normally writer/assembly/audit: three attempts, failed retries extra). Report-only needs no process expansion. Declare process dimensions at creation if later execution is intended.
 
-Research preparation honors CodeTask auto/copy/git_worktree and protected paths. Auto preserves
-uncommitted source by falling back to copy with a recorded reason; explicit git_worktree uses
-committed HEAD. Preparation records workspace/Git provenance, not an automatic commit per candidate.
-Sparse/empty workspace options remain limited to standalone CodeTask.
+## Loading Rules
+
+CodeTask init --config loads initialization; execute --config loads execution/model/budget; research-session --code-task-config shares parser. Explicit CLI overrides corresponding values. CodeTask relative paths use command cwd. `{config_dir}` expands code/task/output paths, Python paths, benchmark command, baseline metrics and required paths; resource `${...}` substitutions rejected. Quote spaced command paths. Required paths check existence only.
+
+Most CodeTask sections ignore unknown keys; workspace/ablation reject extras, retired stage selectors fail, budget accepts overrides. Misspellings may have no effect. Historical implementation.max_repair_attempts is not loaded by the current public parser; use supported execute.repair_rounds. Old outer-pipeline configs are read-only history.
 
 ## CodeTask Field Reference
 
 ### Code-Task Fields
 
-| Field | Meaning |
+| Field group | Default / behavior |
 | --- | --- |
-| `[code_task].kind` | `existing_project` patches an existing source project; `greenfield` starts from an empty workspace and generates a project under `code_task/workspace/generated_project`. |
-| `[code_task].code_root` | Source project path for `existing_project`; optional scaffold/source root for `greenfield`. The original project is not edited. |
-| `[code_task].task_file` | Task description for standalone CodeTask; research-session prepares its implementation handoff through the canonical application. |
-| `[benchmark].command` | Command executed inside `code_task/workspace` before and after edits. It should print parseable metrics such as `accuracy: 0.82`. |
-| `[benchmark].primary_metric` | Main metric used for the objective verdict. Unknown metrics are still recorded, but need directions to decide improvement. |
-| `[benchmark.metric_directions]` | Direction map for metrics: `higher`, `lower`, `resource`, or `ignore`. |
-| `[environment].mode` | `current` uses the active SimpleAutoResearch Python; `external` uses `[environment].python` or `[environment].python_executable`. No dependencies are installed automatically. |
-| `[environment].python_executable` | Required when `mode = "external"`; the selected executable resolves a leading bare `python`/`python3` in the benchmark argv. Absolute commands and non-Python commands are retained. |
-| `[environment].required_paths` | Optional path list checked when this CodeTask config is loaded; useful for data files and fixed splits that the command needs. |
-| `[workspace].mode` | Workspace strategy: `auto`, `copy`, `git_worktree`, `sparse_copy`, or `empty` for greenfield code-task runs. Existing projects default to `auto`, which tries git worktree first and falls back to guarded copy when needed. |
-| `[workspace].reuse_source_venv` | If a source `.venv` or `venv` is detected, record and use that Python as the execution interpreter. |
-| `[implementation].provider` | Code-task implementation backend. `local` keeps the in-process SimpleAutoResearch path; `fake` is deterministic for tests; `local_llm` uses the configured LLM; `codex`, `claude_code`, `opencode`, and `external_cli` use the external-agent handoff boundary when explicitly enabled. |
-| `[implementation].agent_mode` | Implementation mode for the backend: `model` keeps SimpleAutoResearch as the harness, `handoff` ingests candidate files from an external agent package, and `delegated_workspace` is recognized but currently fails explicitly until snapshot/diff/rollback execution is implemented. |
-| `[implementation].allow_external_agent` | Required before external CLI backends may launch. External outputs remain untrusted until SimpleAutoResearch review, validation, benchmark, or result guards accept them. |
-| `[implementation].agent_model` / `.agent_binary` / `.agent_args` / `.agent_timeout_sec` | Optional external backend launch controls. Leave `agent_model` empty unless you know the external CLI/account supports the model name. |
-| `[implementation].max_repair_attempts` | Upper bound for implementation-side repair attempts, including greenfield review repair before validation. |
-| `[resource].max_runtime_sec` | Runtime budget surfaced to greenfield planning and external-agent handoff context. |
-| `[resource].max_files` / `.max_generated_lines` | Code-task generation budgets. `[execute].max_files` and `[execute].max_generated_lines` override these during `code-task execute`; otherwise execute reads these values. |
-| `[resource].max_memory_mb` / `.allow_gpu` | Memory/GPU constraints exposed to planning. They describe the allowed resource profile; dependency installation is still not automatic. |
-| `[edit_scope].allowed_patterns` | Optional workspace-relative glob allowlist for files automated edits may touch. Empty means all normalized non-protected workspace paths are editable. |
-| `[edit_scope].protected_patterns` | Additional workspace-relative glob patterns treated as read-only evidence. Defaults for tests, benchmarks, `.env`, secrets, and credentials are always retained. |
-| `[edit_scope].mode` | Optional label stored in `manifest.json`; it does not change behavior by itself. |
-| `[safety].max_file_bytes` | Max copied file size for copy/sparse modes. This avoids accidentally copying huge model/data artifacts. |
-| `[safety].validation_max_file_bytes` | Max file size scanned by static validation. |
+| code_task.kind/code_root/task_file/output_root/name | existing_project, required source/task, runs, optional suffix; greenfield task required, optional scaffold, generated workspace/generated_project |
+| code_task.max_file_bytes, safety.max_file_bytes | First overrides second; default 2000000, copy/sparse; 0 disables |
+| benchmark.command/timeout/primary_metric/metric_directions | Workspace command string, optional timeout/metric/directions |
+| metrics.primary/primary_metric/directions/metric_directions | Compatibility aliases; benchmark primary wins; later direction maps then CLI override |
+| environment.mode/python/python_executable/required_paths | current/external; external Python required, python alias wins; bare leading Python resolved, other argv retained; presence list default empty |
+| workspace.mode/include/exclude/reuse_source_venv | Existing auto, greenfield empty; sparse globs; reuse false, detected venv supplies external Python |
+| edit_scope.allowed_patterns/protected_patterns/mode | Allowlist / additional read-only globs / label; label grants nothing |
+| safety.validation_max_file_bytes | Default 500000; execute scan overrides |
+| implementation.provider/agent_mode/allow_external_agent | local; fake/local_llm/codex/claude_code/opencode/external_cli supported; model/handoff, delegated_workspace explicitly unavailable; external launches require true |
+| implementation.agent_model/agent_binary/agent_args/agent_timeout_sec | Optional; timeout 600; empty model retains external account default |
+| resource.max_runtime_sec/max_files/max_generated_lines/max_memory_mb/allow_gpu | Planning/handoff declarations; runtime/files/lines feed execute fallbacks, not OS enforcement/install |
 
-Static checks honor Python source encoding. In a Git worktree, a syntax defect
-in a byte-identical file from the recorded frozen commit stays a visible warning
-unless strict validation is enabled. Changed/new invalid files and unverified
-baselines remain errors; this is not a test-folder exemption or runtime success.
+External candidates pass normal review/validation/benchmark/guards. Interpreter selection installs nothing. Static checks honor Python encoding: verified byte-identical frozen Git syntax defects warn unless strict; changed/new invalid files/unverified baselines error.
 
 ### Execute And Budget Fields
 
-| Field | Meaning |
+| Field | Default / behavior |
 | --- | --- |
-| `[execute].to_step` | Last step the state-aware executor may attempt. Use `propose-edits` to stop before applying patches, or `review` to stop after post-apply structured review. |
-| `[execute].use_llm` | Enables or disables LLM-backed work-plan, patch-plan, edit-proposal, and repair steps. |
-| `[execute].timeout_sec` | Benchmark timeout used by executor-managed baseline and patched runs. If omitted, execute falls back to `[benchmark].timeout`, then `[resource].max_runtime_sec`. |
-| `[execute].stream_benchmark_output` | Live benchmark log mode: `off`, `line`, `auto`, or `summary`. Use `auto` for tqdm-like progress output. |
-| `[execute].baseline_policy` | Existing-project baseline behavior: `auto`/`run` executes the unchanged benchmark; `skip`/`none` continues without baseline comparison; `provided` records metrics from `[execute].baseline_metrics_file`. |
-| `[execute].baseline_metrics_file` | JSON or metric-line file used with `baseline_policy = "provided"`. Accepted JSON shapes include `{"accuracy": 0.8}`, `{"metrics": {...}}`, and `{"metric_values": {...}}`. |
-| `[execute].apply_proposed_edits` | Lets execute apply an already reviewed proposal. Keep false for review-first workflows. |
-| `[execute].allow_large_edits` | Allows application of reviewed proposals that exceed the normal budget but fit the large budget. |
-| `[execute].allow_planning_fallback` | Permits explicit offline plans and greenfield scaffolds after known, complete response-format failures. Scaffolds emit no invented measurements; the unimplemented runner fails until replaced by an actual experiment. It does not replace provider, budget, deadline or incomplete-stream failures with an offline success. Keep false when the task requires model-generated implementation. |
-| `[execute].planning_mode` | Complete greenfield architecture work unit; default `compact`. `tool_agent` is a deprecated alias. Historical unfinished planning receives a method migration receipt; original stages and failures are retained without resetting the ledger. |
-| `[execute].planning_review_rounds` | Deprecated; default `0`. Nonzero saved values emit a migration notice and grant no review calls. Remove stage selectors and choose one existing `[models.code_task].planner` connection; named profiles are not silently replaced. |
-| `[execute].llm_retry_attempts` | Bounds completed-response corrections for work/patch planning and greenfield architecture/file generation, including the first attempt. Transport retry/backoff belongs only to the shared model connection's `retry_attempts` setting (legacy: `SIMPLE_AR_LLM_RETRY_ATTEMPTS`); stages do not multiply it. Unreconciled ledger operations prevent correction and fallback, even when their numeric dimensions are accounted. |
-| `[execute].repair_rounds` | Non-negative bound (default `0`) for technical repair after failed validation/benchmark execution. In `research-session` with a CodeTask project, this also bounds repair/retest after a failed single-condition research revision; each retest uses the accepted protocol and process budget. It does not authorize a scientific method change, seed extension, or paired-revision repair. Repairs still require review. |
-| `[execute].max_files` | Max files included in LLM context for plan/proposal/repair steps; also limits files in a new greenfield plan, including any inserted `main.py`. If a complete plan exceeds the limit, planning rejects it rather than silently discarding modules or dependencies. Saved plans are not rebuilt under a new limit. |
-| `[execute].max_source_chars_per_file` | Per-file source snippet budget for LLM context. |
-| `[execute].max_generated_lines` | Greenfield generation line budget. If omitted, execute falls back to `[resource].max_generated_lines`, then to a conservative default. |
-| `[models.code_task].planner` | Model used for work-plan, patch-plan, and greenfield architecture planning. |
-| `[models.code_task].writer` | Model used for greenfield file generation. Existing-project edit proposals use `editor`. |
-| `[models.code_task].reviewer` | Model used for code-task patch review and greenfield generated-project review. |
-| `[models.code_task].editor` | Model used for edit proposal generation. |
-| `[models.code_task].repair` | Model used for repair proposals after failures. |
-| `[budget].profile` | Active edit budget profile. `normal` permits compact changes in up to four allowed files (12,000 total edit characters); `large` permits larger reviewed changes with explicit approval. |
-| `[budget].max_batches` | Maximum number of implementation batches the executor may create for one code task. |
-| `[budget].cost_cap_usd` | Optional cost cap when provider usage includes cost estimates. |
-| `[budget.*].max_files` | Max files a single edit proposal may touch. |
-| `[budget.*].max_edits` | Max old/new replacement operations in a proposal. |
-| `[budget.*].max_old_chars` / `[budget.*].max_new_chars` | Per-edit old/new text character limits. |
-| `[budget.*].max_total_edit_chars` | Total character budget across all edits. |
-| `[budget.*].max_proposal_chars` | Total serialized proposal budget. |
+| execute.to_step/use_llm | run, true; steps in [CLI](CLI_REFERENCE.md) |
+| execute.model | General selector → models.code_task.default → models.default → llm.model |
+| llm.enabled/model | Compatibility; execute settings win |
+| models.code_task.planner/writer/reviewer/editor/repair/summarizer | Planning, greenfield files, review, proposals, repair, summaries; explicit routes or shared connection |
+| execute.timeout_sec/timeout | First → alias → benchmark.timeout → resource.max_runtime_sec → 60 |
+| execute.skip_validation/strict_validation/validation_max_file_bytes | false/false/500000 |
+| execute.stream_benchmark_output | off/false; line, auto/true carriage returns, summary tail |
+| execute.baseline_policy/baseline_metrics_file | auto; run forces, skip skips, none no comparison, provided marks supplied values not reproduced |
+| execute.apply_proposed_edits/allow_large_edits/allow_planning_fallback | false; explicit application / reviewed large edits / eligible fallback |
+| execute.planning_mode/planning_review_rounds | compact/0; tool_agent deprecated; retired rounds grant no calls |
+| execute.llm_retry_attempts/repair_rounds | 3 completed-response attempts including first / 0 technical repair rounds; transport retries separate |
+| execute.max_files/max_source_chars_per_file/max_generated_lines | 8/4000/1600; resource fallbacks for files/lines; complete oversized plans fail, saved plans not rebuilt |
+| execute.ablation.review_gate | strict; runtime blocks safety/executability but permits packaging/report gaps |
+| execute.budget_profile/max_batches/cost_cap_usd | Override corresponding budget fields |
+| budget.profile/max_batches/cost_cap_usd | Normal edit profile; optional batch/cost caps when estimates available |
+| budget.max_files/max_edits/max_old_chars/max_new_chars/max_total_edit_chars/max_proposal_chars | Numeric overrides; selected budget.normal/budget.large overrides top-level |
+
+Normal permits up to four allowed files, 12000 total edit characters. Large needs explicit approval and absolute bounds (32000 per source block). Provided JSON metrics: flat map, metrics or metric_values wrapper. Process success differs from objective improvement.
+
+#### Planning failures and repair
+
+A complete malformed planning response can receive bounded correction or explicitly allowed fallback. Provider failures, exhausted budgets, deadlines, partial streams and unreconciled operations do not become offline success. Offline greenfield generation uses a four-file development scaffold, not task-specific modules guessed from keywords. It fails until implemented and emits no invented metrics; a file cap below four rejects this scaffold. Model planning chooses its structure from the task: file and line limits are ceilings, not target sizes. Saved plans retain their original files.
+
+Technical repairs require review and remain within the accepted protocol and process limits. They do not authorize method changes, seed extensions or paired-revision repair. Reusing a repair checks bound inputs and project bytes; snapshots and rollback remain available. Interrupted candidates are not blindly replayed.
+
+#### Historical planning
+
+Method migration retains old stages, failures, hashes and usage. Retired stage model routes are rejected. Generated projects and imported immutable accepted plans skip replanning.
 
 ## Workspace Mode Variants
 
+`research-session --code-task-config` retains the configured file-size cap, sparse include/exclude rules and source-venv selection. Declared project data remains copy/worktree-only; sparse mode does not bypass that protection. Source-venv reuse cannot be combined with managed task-environment preparation. After preparation, validation, measurement and reload use its selected interpreter. Candidate revisions copy the accepted source with that interpreter; baseline revisions reapply the original import policy. A size cap that would omit accepted candidate files stops preparation instead of silently discarding them.
+
+CodeTask source inventories skip symbolic links and Windows reparse entries. Old receipts that hashed linked targets require inspection; recovery does not reread those targets to manufacture a matching source snapshot. Workspace isolation is not an OS sandbox.
+
 ### `auto`
 
-`auto` is the recommended existing-project default. It prefers a detached
-`git_worktree` when `code_root` is inside a local Git repository with at least
-one commit. If worktree preparation is not possible, it falls back to `copy`
-and records the reason plus next steps in the manifest and CLI output.
-
-```toml
-[workspace]
-mode = "auto"
-reuse_source_venv = false
-```
-
-When `code_root` points to a subdirectory inside a larger repository,
-SimpleAutoResearch creates the worktree at the repository root and uses the
-matching subdirectory as the project root for indexing, editing, and running.
+Existing default: detached worktree where possible, guarded copy with recorded reason otherwise. Research falls back for uncommitted source. Repository-subdirectory projects use matching worktree subdirectory.
 
 ### `copy`
 
-`copy` creates a guarded physical copy under `code_task/workspace`. Use it for
-non-Git projects, dirty filesystem experiments that are not committed yet, or
-cases where you deliberately want to include the current working tree state.
-
-```toml
-[workspace]
-mode = "copy"
-reuse_source_venv = false
-
-[safety]
-max_file_bytes = 2000000
-```
+Copies eligible working-tree state, including uncommitted source; exclusions/size limits may omit files.
 
 ### `git_worktree`
 
-`git_worktree` creates a detached worktree and fails instead of falling back
-when Git isolation is not possible. `code_root` may be the repository root or a
-project subdirectory inside the repository. The source project must be a local
-Git repository with at least one commit. A remote GitHub repository is not
-required.
-
-```toml
-[workspace]
-mode = "git_worktree"
-reuse_source_venv = true
-```
+Explicit committed HEAD, local repository with a commit; no remote required. Fails instead of falling back; does not include uncommitted source.
 
 ### `sparse_copy`
 
-`sparse_copy` copies only allowlisted paths and always applies built-in
-exclusions for `.git`, virtualenvs, `runs`, cache/build directories, data/model
-directories, `.env`, and secret-like paths.
-
-```toml
-[workspace]
-mode = "sparse_copy"
-include = ["src/**", "tests/**", "configs/**", "main.py", "pyproject.toml"]
-exclude = ["data/**", "models/**", "checkpoints/**"]
-reuse_source_venv = false
-```
-
-Use `sparse_copy` only when you understand the project dependency graph. It can
-omit files that runtime imports need.
+Standalone include/exclude globs plus built-in Git/venv/runs/cache/build/data/model/secret exclusions. May omit runtime dependencies. Research preparation also supports sparse_copy, but declared project data cannot bypass copy protection through sparse mode. Greenfield TOML defaults empty; copy/sparse scaffolds need code_root. CLI --workspace-mode does not accept empty.
 
 ## Standalone Code-Task Config
 
-Use this with `simple-ar code-task init --config PATH` and later
-`simple-ar code-task execute RUN_DIR --config PATH`.
-
 ```toml
 [code_task]
-kind = "existing_project"     # existing_project | greenfield
-code_root = "path/to/project"
-task_file = "tasks/improve_model.md"
-output_root = "runs"
-name = "my-code-task"
+kind = "existing_project"
+code_root = "{config_dir}/project"
+task_file = "{config_dir}/task.md"
 
 [benchmark]
-command = "python main.py --config configs/experiment.json"
+command = "python main.py"
 primary_metric = "accuracy"
 
 [benchmark.metric_directions]
 accuracy = "higher"
-macro_f1 = "higher"
-latency_ms = "resource"
-loss = "lower"
-
-[environment]
-mode = "current"
-# mode = "external"
-# python = ".venv/Scripts/python.exe"
 
 [workspace]
 mode = "copy"
-reuse_source_venv = false
 
-[safety]
-max_file_bytes = 2000000
-
-[execute]
-to_step = "run"
-use_llm = true
-timeout_sec = 120
-repair_rounds = 1
-stream_benchmark_output = "auto"
-baseline_policy = "auto"
-apply_proposed_edits = false
-allow_large_edits = false
-allow_planning_fallback = false
-planning_mode = "compact"
-planning_review_rounds = 0
-llm_retry_attempts = 3
-max_files = 8
-max_source_chars_per_file = 4000
-max_generated_lines = 1600
-
-[implementation]
-provider = "local"            # local | fake | local_llm | codex | claude_code | opencode | external_cli
-agent_mode = "model"          # model | handoff | delegated_workspace
-allow_external_agent = false
-agent_model = ""              # empty means use the external CLI/account default
-agent_binary = ""
-agent_args = []
-agent_timeout_sec = 600
-
-[resource]
-max_runtime_sec = 120
-max_files = 8
-max_generated_lines = 1600
-max_memory_mb = 4096
-allow_gpu = false
-
-[budget]
-profile = "normal"
-max_batches = 3
-
-[budget.normal]
-max_files = 2
-max_edits = 4
-max_old_chars = 3000
-max_new_chars = 4000
-max_total_edit_chars = 12000
-max_proposal_chars = 24000
-```
-
-For a standalone greenfield code task, omit `code_root` unless you deliberately
-want to start from a scaffold/template directory. The workspace defaults to
-`empty`, and `execute` generates the project under
-`code_task/workspace/generated_project`:
-
-```toml
-[code_task]
-kind = "greenfield"
-task_file = "tasks/build_new_project.md"
-name = "greenfield-project"
-
-[benchmark]
-command = "python generated_project/main.py"
-primary_metric = "accuracy"
-
-[workspace]
-mode = "empty"
+[edit_scope]
+allowed_patterns = ["src/**", "main.py"]
 
 [execute]
-to_step = "run"
-max_files = 16
-max_generated_lines = 4000
-baseline_policy = "none"
-
-[implementation]
-provider = "local"
-agent_mode = "model"
-allow_external_agent = false
-
-[resource]
-max_runtime_sec = 600
-max_files = 16
-max_generated_lines = 4000
-allow_gpu = false
+to_step = "propose-edits"
 ```
 
-To test a Codex/Claude/OpenCode handoff for the same greenfield task, keep the
-same `[code_task]`, `[benchmark]`, and `[resource]` sections, then change only
-the implementation backend:
+Use `code-task init --config PATH`, then `code-task execute RUN_DIR --config PATH`.
 
-```toml
-[implementation]
-provider = "codex"
-agent_mode = "handoff"
-allow_external_agent = true
-agent_model = ""          # use the model configured by the external CLI/account
-agent_timeout_sec = 1800
-```
+For greenfield tasks, set `kind="greenfield"`, omit `code_root` unless supplying a scaffold, and declare the actual generated-project benchmark.
 
-The external agent still writes untrusted candidate files first. SimpleAutoResearch
-ingests them, copies them into `code_task/workspace/generated_project`, and then
-runs the normal review, validation, benchmark, guard, memory, and repair path.
+For external handoff, choose a supported provider and set `agent_mode="handoff"` and `allow_external_agent=true`. Candidate files still pass normal review, validation and benchmark checks.
 
 ## CodeTask In A Research Session
 
-Use `research-session --code-task-config` with the existing-project CodeTask TOML.
-CodeTask owns editing and validation; the application owns measurement and reporting.
+execution.code_task_config / --code-task-config references the same file. CodeTask owns editing/validation; research owns measurement/report. Reproduction adapters explicitly permit separate formal command. Numeric edit overrides reach research/recovery without bypassing protection/absolute limits.
+
+New exact CodeTask requests share the native task owner for code, optional environment preparation, declared baseline/candidate conditions and report/feedback, including supported copy/sparse source scaffolds and required new Python files. A declared environment is prepared once and reused across conditions and feedback; default process allowances include its steps, while explicit limits remain unchanged. A managed venv must not silently replace an explicitly selected external interpreter. Historical baseline reuse, research-led design/checkpoints and historical continuation retain their distinct contracts. Workspace, edit scope, independent validation and execution approval remain; invoking the command does not approve execution. Resume native tasks with `simple-ar start --resume-task SESSION`. Native tools require a Chat connection. Worktree approval cannot yet bind checkout filters, attributes, submodules or newline transformations: explicitly choose copy, or retain the expert protocol when those semantics are needed.
+
+When `report` is requested, composition consumes the accepted implementation evidence and its actual revision history. The writing owner executes the saved article/section method, adaptive planning, review and bounded revision settings; ordered required headings and citation ceilings remain mandatory. Completed delivery requires both validated code and the current canonical manuscript, including after feedback. Task `max_output_tokens` survives professional routing without changing the named connection; explicit per-call limits, including `max_section_tokens`, take precedence. Missing report revisions or unresolved required findings remain partial, not completed.
+
+Explicit greenfield edit scopes and budgets apply to the complete generated candidate before publication, including deterministic entry files and received agent output. A rejected candidate does not replace the previous project. Native feedback edits the accepted project and retains its generation/API/artifact contract; it does not regenerate the architecture or bypass whole-project checks by changing task kind. A purely technical exact task does not invent a default score; scientific result contracts remain unchanged.
+
+New native professional reports render declared visual plans only; a figure quota or a heading is not a request to invent a diagram. Supplied authored figures remain available. Historical assembly retains its saved rendering policy.
 
 ## Execute And Budget
 
-`execute` is state-aware. The config below controls how far it may proceed,
-which models it uses, how much context it includes, and what edit size is
-allowed.
-
-```toml
-[execute]
-to_step = "run"
-use_llm = true
-timeout_sec = 60
-repair_rounds = 1
-max_files = 8
-max_source_chars_per_file = 4000
-stream_benchmark_output = "auto"
-baseline_policy = "auto"
-apply_proposed_edits = false
-allow_large_edits = false
-allow_planning_fallback = false
-planning_review_rounds = 0
-llm_retry_attempts = 3
-
-[models.code_task]
-planner = "gpt-4o-mini"
-writer = "gpt-4o-mini"
-reviewer = "gpt-4o-mini"
-editor = "gpt-4o-mini"
-repair = "gpt-4o-mini"
-
-[budget]
-profile = "normal"
-max_batches = 3
-cost_cap_usd = 2.0
-
-[budget.normal]
-max_files = 2
-max_edits = 4
-max_old_chars = 3000
-max_new_chars = 4000
-max_total_edit_chars = 12000
-max_proposal_chars = 24000
-```
-
-`stream_benchmark_output` values:
-
-| Value | Meaning |
-| --- | --- |
-| `off` / `false` | Do not relay benchmark logs live. |
-| `line` | Relay newline-delimited output. |
-| `auto` / `true` | Handle regular line logs and carriage-return progress such as `tqdm`. |
-| `summary` | Print only a tail summary after the benchmark finishes. |
-
-`baseline_policy` values for existing-project tasks:
-
-| Value | Meaning |
-| --- | --- |
-| `auto` | Default behavior. Run the unchanged benchmark when a baseline is needed for comparison. |
-| `run` | Force an unchanged baseline run. |
-| `skip` | Skip the unchanged baseline but still allow code understanding, review, validation, and final benchmark execution. |
-| `provided` | Record user-supplied metrics from `baseline_metrics_file`; summaries mark them as provided, not reproduced. |
-| `none` | Mark the task as having no meaningful baseline comparison. Useful for pure generation or acceptance-style tasks. |
+Use the [field table](#execute-and-budget-fields). Connection retries, research allowances, process limits, edit sizes and correction rounds are distinct; none resets another's usage.
 
 ## Edit Scope Behavior
 
-`[edit_scope]` is enforced in multiple places: repo-map role tagging, context
-selection, work-plan normalization, edit proposal normalization, repair
-proposal normalization, and final `apply-edits` validation.
-
-- The source project is edited only inside `code_task/workspace`.
-- If `allowed_patterns` is empty, any normalized workspace-relative path may be
-  edited unless protected.
-- If `allowed_patterns` is set, an edit path must match at least one allowed
-  pattern and must not match any protected pattern.
-- Default protected patterns for tests, benchmarks, `.env`, secrets, and
-  credential-like paths are always retained. User `protected_patterns` add to
-  that baseline rather than replacing it.
-- Work-plan target files still constrain the current batch, so a file can be
-  allowed by `[edit_scope]` but rejected for being outside the active batch.
-- `apply-edits` rechecks workspace-relative paths, edit scope, active batch
-  target files, and exact old-text matches before writing.
+Only workspace files are edited. Empty allowlist allows normalized non-protected paths; otherwise allowed match and no protected match required. Built-in tests/benchmarks/.env/secrets/credentials stay protected; custom patterns add protection. Batch/work-plan targets narrow scope further. Context/planning/proposal/repair enforce scope; apply rechecks paths, unique exact old text and budgets. Empty old creates an absent allowed file, never replaces existing; creations share snapshots/rollback.

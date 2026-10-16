@@ -16,7 +16,7 @@ from simple_ar.report.templates import is_builtin_template, reviewing_template_g
 from simple_ar.report.narrative import document_plan_context, report_edit_scope, report_tool_context, review_source_evidence
 from simple_ar.report.data_delivery import DELIVERY_RULES
 from simple_ar.report.review_evidence import (
-    EVIDENCE_QUOTE_RULES, EVIDENCE_QUOTE_SCHEMA, validate_evidence_quotes, validate_finding_anchors,
+    EVIDENCE_QUOTE_RULES, EVIDENCE_QUOTE_SCHEMA, GAP_EVIDENCE_CONTRACT, validate_evidence_quotes, validate_finding_anchors,
     review_draft_quote_sources, draft_quote_present, review_evidence_locator, resolve_review_evidence,
 )
 from simple_ar.report.schema import (
@@ -35,8 +35,14 @@ from simple_ar.report.schema import (
 )
 
 
+DOCUMENT_FORMAT_CORRECTION_CONTRACT = "current_review_format_once.v1"
 MAX_DOCUMENT_REVIEW_CHARS = 60_000
 MAX_DOCUMENT_REVISION_SECTIONS = 2
+
+
+def _needs_revision(review: ReportSectionReview) -> bool:
+    return (review.verdict in {"revise_required", "fail"}
+            or any(finding_requires_resolution(row) for row in review.findings))
 
 
 def document_revision_limit(memory: ReportMemory) -> int:
@@ -65,18 +71,14 @@ def edit_joint_document(
     completed checks are reused after interruption; rounds count proposal
     starts, including unavailable calls, rather than granting recovery credit.
     """
-    def needs_change(review: ReportSectionReview) -> bool:
-        return (review.verdict in {"revise_required", "fail"}
-                or any(finding_requires_resolution(row) for row in review.findings))
-
     attempts = [row for row in iterations if row.action == "document_joint_revise"]
     legacy_rounds = max(Counter(row.section_id for row in iterations
         if row.action == "document_revise").values(), default=0)
     event = attempts[-1] if attempts and attempts[-1].status == "drafted" and not attempts[-1].adopted else None
-    active = coalesce_document_reviews([row for row in reviews if needs_change(row)])
+    active = coalesce_document_reviews([row for row in reviews if _needs_revision(row)])
     def next_reviews(rows: list[ReportSectionReview]) -> list[ReportSectionReview]:
         # Only a complete inspection can supersede the previous instructions.
-        pending = [row for row in rows if needs_change(row) or row.context_requests]
+        pending = [row for row in rows if _needs_revision(row) or row.context_requests]
         complete = {row.section_id for row in rows} == {row.section_id for row in sections}
         return coalesce_document_reviews(pending if complete else [*active, *pending])
 
@@ -150,9 +152,8 @@ def edit_joint_document(
             # are bookkeeping, not an additional truth source or adoption gate.
             # Retain old checks in history, but never let a failed closure call
             # suppress inspection of the actual revised manuscript.
-            checks = [row for row in iterations if row.iteration > event.iteration
-                      and row.action == "document_joint_verify"]
-            verified = next((row for row in checks if row.action == "document_joint_verify"), None)
+            verified = next((row for row in iterations if row.iteration > event.iteration
+                             and row.action == "document_joint_verify"), None)
             if verified is None:
                 rows = inspect(candidate, prior)
                 verified = ReportIterationRecord(iteration=len(iterations) + 1, section_id="",
@@ -164,7 +165,7 @@ def edit_joint_document(
             all_findings.extend(findings)
             acceptable = ({row.section_id for row in verified.section_reviews}
                           == {row.section_id for row in candidate}
-                          and not any(needs_change(row) or row.context_requests
+                          and not any(_needs_revision(row) or row.context_requests
                                       for row in verified.section_reviews))
             if acceptable:
                 sections[:] = candidate
@@ -183,8 +184,7 @@ def edit_joint_document(
             checkpoint()
             # A rejected candidate can be corrected in the same remaining
             # round allowance. Never adopt only the apparently good sections.
-            rejected_reviews = verified.section_reviews
-            active = next_reviews(rejected_reviews)
+            active = next_reviews(verified.section_reviews)
         except (LLMError, ValidationError, ValueError) as exc:
             event.status = "drafted" if event.drafts else "unavailable"
             finding = ReviewerFinding(finding_id=f"joint-revision-{event.iteration}-unavailable",
@@ -335,12 +335,34 @@ def review_document(
     on_invalid_response: Callable[[Any, str], None] | None = None,
     on_validated_subset: Callable[[list[ReportSectionReview]], None] | None = None,
     format_correction: Mapping[str, Any] | None = None,
+    allow_format_correction: bool = False,
+    evidence_reference_contract: str | None = None,
     writing_objective: str | None = None,
     assembly_owned_content: list[dict[str, Any]] | None = None,
     delivery_text_observation: Mapping[str, Any] | None = None,
     label: str = "report-document-reviewer",
 ) -> list[ReportSectionReview]:
-    """Review the complete document; the owner separately bounds corrections."""
+    """Inspect current prose; correct one complete rejected answer under contract.
+
+    Checkpoint owners keep their existing quota unless they explicitly
+    delegate it here. Transport/decoding errors occur
+    outside validation and never authorize this correction.
+    """
+    if evidence_reference_contract not in (None, GAP_EVIDENCE_CONTRACT):
+        raise ValueError("Unknown review evidence contract; no method replacement")
+    evidence_rules = list(EVIDENCE_QUOTE_RULES)
+    evidence_schema = EVIDENCE_QUOTE_SCHEMA
+    if evidence_reference_contract:
+        evidence_rules[0] = (
+            "Locate an alleged factual error in current draft_quotes and supplied evidence_quotes. "
+            "Return exact absolute JSON Pointers into this request; the controller retains values and roles. "
+            "Normally select a scalar. Only evidence_gap with required_action=verify may select an explicitly "
+            "supplied empty array/object. This records that this supplied field is empty, not that the entire "
+            "project lacks evidence or that the draft is false. No absent paths or nonempty containers. "
+            "An empty collection cannot establish a metric mismatch, certify a claim or close an old opinion. "
+            "A gap may instead quote relevant original material, or omit evidence_quotes when no supporting "
+            "field is supplied; preserve a current draft quote and the uncertainty. Do not fabricate a pointer.")
+        evidence_schema = {"pointer": "exact path to a supplied scalar, or an explicitly empty array/object ONLY for evidence_gap/verify; omit quote and role"}
     drafts = [{"section_id": row.section_id, "heading": row.heading,
                "markdown": row.draft_markdown,
                "markdown_token_count": len(row.draft_markdown.split())} for row in sections]
@@ -414,7 +436,7 @@ def review_document(
             *DELIVERY_RULES,
             *CLAIM_SCOPE_RULES,
             *([] if prior else REVIEW_ACTION_RULES),
-            *EVIDENCE_QUOTE_RULES,
+            *evidence_rules,
             "If response_format_correction is supplied, re-evaluate the rejected answer against this schema, the validation error and the current supplied evidence. Preserve requested opinion identities, not a rejected factual conclusion. Its quotation, evidence role or judgement may be wrong. Change status only when supported by current evidence; neither unsupported closure nor preserving an unsupported judgement is a valid correction. The rejected answer is not source evidence or permission to rewrite the report.",
             "Inspect the current supplied drafts and original evidence, not remembered or superseded prose. A historical reviewer statement is an opinion to test, not independent evidence. No omitted historical finding is automatically resolved.",
             "The original request governs length. document_length_budget is a planner interpretation and known assembly forecast, not semantic verification or proof the final report fits. A constraint=target or length_check.status=target_only is a soft approximate target, not a hard interval; do not invent tolerance bounds or reject solely for deviation. Still review whether the content and extent satisfy the actual task. Section shares are approximate rather than minimums; unresolved references/visual text require checking the completed canonical delivery. Do not discard required evidence to fit a quota.",
@@ -443,7 +465,7 @@ def review_document(
                           "required_action": "advisory|revise|verify",
                           "section_id": "same target section", "suggested_action": "bounded correction",
                           "draft_quotes": [{"section_id": "current section containing the statement", "quote": "exact current draft text"}],
-                          "evidence_quotes": [EVIDENCE_QUOTE_SCHEMA]}],
+                          "evidence_quotes": [evidence_schema]}],
             "revision_instructions": ["specific change to this section without changing measured facts"],
             "finding_checks": [{"finding_id": "one supplied historical finding id; empty list during independent inspection",
                                 "status": "resolved|not_applicable|unresolved", "explanation": "reason based on current draft and supplied evidence",
@@ -500,6 +522,10 @@ def review_document(
         )
     else:
         view["output_schema"]["section_reviews"][0]["finding_checks"] = []
+    if allow_format_correction:
+        view["format_correction_contract"] = DOCUMENT_FORMAT_CORRECTION_CONTRACT
+    if evidence_reference_contract:
+        view["evidence_reference_contract"] = evidence_reference_contract
     base_prompt = json.dumps(view, ensure_ascii=False, separators=(",", ":"))
     prompt_limit = config.max_document_review_prompt_chars
     if prompt_limit and len(base_prompt) > prompt_limit:
@@ -561,6 +587,18 @@ def review_document(
                 prior_by_key=prior_by_key, evidence_view=view))
         if on_invalid_response is not None:
             on_invalid_response(response, str(exc))
+        if allow_format_correction and format_correction is None:
+            return review_document(client=client, template=template, memory=memory,
+                sections=sections, config=config, execution_summary=execution_summary,
+                execution_evidence=execution_evidence, metric_summary=metric_summary,
+                source_evidence=source_evidence, supplementary_evidence=supplementary_evidence,
+                requested_context=requested_context, historical_findings=historical_findings,
+                complete_candidate=complete_candidate, on_invalid_response=on_invalid_response,
+                on_validated_subset=on_validated_subset, allow_format_correction=True,
+                evidence_reference_contract=evidence_reference_contract,
+                format_correction={"validation_error": str(exc), "rejected_response": response},
+                writing_objective=writing_objective, assembly_owned_content=assembly_owned_content,
+                delivery_text_observation=delivery_text_observation, label=label + "-format-correction")
         raise
 
 

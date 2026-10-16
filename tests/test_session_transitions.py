@@ -3,9 +3,11 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from simple_ar.core import (
     AttemptManifest,
+    ArtifactStore,
     BudgetState,
     CapabilityContext,
     CapabilityRegistry,
@@ -86,68 +88,157 @@ class SessionTransitionTests(unittest.TestCase):
         self.assertFalse(survey.allows("code"))
 
 
-    def test_full_research_profile_default_budget_covers_named_path(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            registry = CapabilityRegistry()
-
-            def handler(**_: object) -> CapabilityResult:
-                return CapabilityResult(status="completed")
-
-            profile = resolve_lifecycle_profile("full_research")
-            assert profile is not None
-            for capability in profile.capabilities:
-                registry.register(capability, handler)
-
-            controller = SessionController.create(
-                tmp,
-                session_id="full-research-budget",
-                topic="default profile budget",
-                registry=registry,
-                profile="full_research",
-            )
-            outcomes = []
-            for index, capability in enumerate(profile.capabilities, start=1):
-                result = controller.execute_attempt(
-                    capability,
-                    attempt_id=f"attempt-{index:02d}",
-
-                )
-                outcomes.append(result)
-
-            self.assertEqual(len(outcomes), len(profile.capabilities))
-            self.assertEqual(controller.manifest.status, "running")
-            self.assertEqual(
-                controller.manifest.budget.max_attempts,
-                len(profile.capabilities) + 2,
-            )
-
     def test_missing_available_output_is_visible_at_session_boundary(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            registry = CapabilityRegistry()
+        for initially_missing in (False, True):
+            with self.subTest(initially_missing=initially_missing), tempfile.TemporaryDirectory() as tmp:
+                registry = CapabilityRegistry()
 
-            def handler(*, context: CapabilityContext) -> CapabilityResult:
-                return CapabilityResult(
-                    status="completed",
-                    artifacts=(context.store.ref("missing.json", kind="result"),),
+                def handler(*, context: CapabilityContext) -> CapabilityResult:
+                    if not initially_missing:
+                        context.store.write_text("output.txt", "saved")
+                    context.store.write_text("undeclared.txt", "not a handoff")
+                    return CapabilityResult(
+                        status="completed",
+                        artifacts=(context.store.ref("output.txt", kind="result"),),
+                    )
+
+                registry.register("probe", handler)
+                controller = SessionController.create(
+                    tmp, session_id="missing-output", topic="declared outputs", registry=registry,
                 )
+                result = controller.execute_attempt("probe", attempt_id="attempt-001")
+                self.assertEqual(result.status, "partial" if initially_missing else "completed")
+                outcome_path = Path(tmp) / "attempts/attempt-001/capability_result.json"
+                saved_outcome = outcome_path.read_bytes()
+                output_path = outcome_path.parent / "output.txt"
+                if not initially_missing:
+                    output_path.unlink()
 
-            registry.register("probe", handler)
-            controller = SessionController.create(
-                tmp,
-                session_id="missing-output",
-                topic="declared output validation",
-                registry=registry,
-            )
+                loaded = SessionController.load(tmp, registry=registry)
+                invalidated = loaded.reconcile_attempt()
+                self.assertEqual(invalidated.status, "partial")
+                self.assertEqual(invalidated.artifacts[0].status, "missing")
+                self.assertEqual(len(invalidated.diagnostics), 1)
+                self.assertIn("output.txt", invalidated.diagnostics[0])
+                self.assertEqual(loaded.list_attempts()[0].status, "completed")
+                self.assertEqual(loaded.list_attempts()[0].outputs, invalidated.artifacts)
+                self.assertEqual(loaded.attempt_output_refs()[0].status, "missing")
+                with self.assertRaisesRegex(ValueError, "marked missing"):
+                    loaded.execute_attempt("probe", attempt_id="attempt-002", inputs=loaded.attempt_output_refs())
+                self.assertEqual(loaded.manifest.budget.attempts, 1)
+                self.assertEqual(loaded.reconcile_attempt(), invalidated)
+                self.assertEqual(outcome_path.read_bytes(), saved_outcome)
 
-            result = controller.execute_attempt("probe", attempt_id="attempt-001")
+                # Initially missing outputs remain invalid even if bytes appear;
+                # later disappearance is a view over the saved available output.
+                output_path.write_text("restored", encoding="utf-8")
+                restored = loaded.reconcile_attempt()
+                self.assertEqual(restored.status, "partial" if initially_missing else "completed")
+                self.assertNotIn("undeclared.txt", [ref.path for ref in restored.artifacts])
 
-            self.assertEqual(result.status, "partial")
-            self.assertEqual(result.artifacts[0].status, "missing")
-            self.assertIn("missing.json", result.diagnostics[0])
-            attempt = controller.store.read_attempt_manifest(
-                "attempts/attempt-001/attempt_manifest.json"
-            )
-            self.assertEqual(attempt.outputs[0].status, "missing")
+    def test_saved_attempt_commit_recovers_each_manifest_gap_without_reexecution(self) -> None:
+        cases = (
+            ("completed", False, False, 1),
+            ("partial", None, False, 1),
+            ("failed", True, False, 1),
+            ("blocked", None, False, 1),
+            ("failed", None, True, 1),
+            ("failed", None, True, 3),
+        )
+        for status, progressed, interrupted, limit in cases:
+            # Confirmed interruption also owns its ordinary (no save fault)
+            # closure here, alongside every interrupted commit boundary.
+            for gap in (("none", "result", "attempt", "session") if interrupted else ("result", "attempt", "session")):
+                with self.subTest(status=status, progressed=progressed, interrupted=interrupted, limit=limit, gap=gap), tempfile.TemporaryDirectory() as tmp:
+                    registry = CapabilityRegistry()
+                    calls = []
+
+                    def handler(**_: object) -> CapabilityResult:
+                        calls.append("called")
+                        if interrupted:
+                            raise KeyboardInterrupt()
+                        return CapabilityResult(
+                            status=status,  # type: ignore[arg-type]
+                            provenance={"recovery": "explicit_interruption"} if status == "failed" else {},
+                        )
+
+                    registry.register("probe", handler)
+                    controller = SessionController.create(
+                        tmp, session_id="commit-gap", topic="saved result commit", registry=registry,
+                        budget=BudgetState(max_attempts=limit),
+                    )
+                    if interrupted:
+                        with self.assertRaises(KeyboardInterrupt):
+                            controller.execute_attempt("probe", attempt_id="attempt-001")
+
+                    write_json = ArtifactStore.write_json
+                    injected = []
+
+                    def interrupt_save(store, path, data, **kwargs):
+                        if gap == "result" and path == "capability_result.json":
+                            if interrupted:
+                                # Historical manual recovery envelopes have only
+                                # the provenance marker, with no core metadata.
+                                data = dict(data)
+                                data.pop("session_interruption_reason")
+                            write_json(store, path, data, **kwargs)
+                            injected.append(gap)
+                            raise KeyboardInterrupt()
+                        if gap == "attempt" and path == "attempt_manifest.json" and data["status"] in {"completed", "failed", "blocked"}:
+                            self.assertTrue(store.exists("capability_result.json"))
+                            injected.append(gap)
+                            raise KeyboardInterrupt()
+                        if gap == "session" and path == "session_manifest.json" and data["budget"]["attempts"]:
+                            injected.append(gap)
+                            raise KeyboardInterrupt()
+                        return write_json(store, path, data, **kwargs)
+
+                    if gap == "none":
+                        closed = SessionController.load(tmp, registry=CapabilityRegistry())
+                        result = closed.recover_interrupted(reason="Worker stopped.")
+                        self.assertEqual(result.provenance["recovery"], "explicit_interruption")
+                        self.assertEqual(result.diagnostics, ("Worker stopped.",))
+                    else:
+                        with patch.object(ArtifactStore, "write_json", new=interrupt_save):
+                            with self.assertRaises(KeyboardInterrupt):
+                                if interrupted:
+                                    controller.recover_interrupted(reason="Worker stopped.")
+                                else:
+                                    controller.execute_attempt("probe", attempt_id="attempt-001", progressed=progressed)
+
+                    self.assertEqual(injected, [] if gap == "none" else [gap])
+                    # A result cannot be replaced by manual interruption recovery.
+                    loaded = SessionController.load(tmp, registry=CapabilityRegistry())
+                    outcome_path = Path(tmp) / "attempts/attempt-001/capability_result.json"
+                    saved_outcome = outcome_path.read_bytes()
+                    with self.assertRaises((RuntimeError, ValueError)):
+                        loaded.recover_interrupted(reason="Must not replace saved facts.")
+                    self.assertEqual(outcome_path.read_bytes(), saved_outcome)
+                    result = loaded.reconcile_attempt()
+                    self.assertEqual(result.status, status)
+                    self.assertEqual(loaded.list_attempts()[0].status, status if status in {"failed", "blocked"} else "completed")
+                    self.assertEqual(loaded.list_attempts()[0].outputs, result.artifacts)
+                    self.assertEqual([ref.path for ref in result.artifacts], ["capability_result.json"])
+                    expected_progress = progressed if progressed is not None else status in {"completed", "partial"}
+                    self.assertEqual(loaded.manifest.budget.no_progress, 0 if expected_progress else 1)
+                    self.assertEqual(loaded.manifest.budget.recorded_attempts, ["attempt-001"])
+                    self.assertEqual(loaded.manifest.budget.attempts, 1)
+                    self.assertEqual(len(loaded.list_attempts()), 1)
+                    self.assertEqual(loaded.manifest.status, "blocked" if interrupted and limit == 1 else "running")
+                    if interrupted:
+                        self.assertEqual(loaded.manifest.status_reason, "Session budget exhausted." if limit == 1 else "Worker stopped.")
+                        self.assertEqual(result.diagnostics, ("Worker stopped.",))
+                        self.assertEqual(loaded.manifest.decisions, [])
+                        self.assertEqual(loaded.status_snapshot()["running_attempts"], 0)
+                        self.assertEqual(loaded.status_snapshot()["failed_attempts"], 1)
+                    self.assertEqual(calls, ["called"])
+                    before = loaded.manifest.to_dict()
+                    reloaded = SessionController.load(tmp, registry=CapabilityRegistry())
+                    self.assertEqual(reloaded.reconcile_attempt(), result)
+                    self.assertEqual(reloaded.manifest.budget.to_dict(), before["budget"])
+                    self.assertEqual(reloaded.manifest.status, before["status"])
+                    self.assertEqual(reloaded.manifest.status_reason, before["status_reason"])
+                    self.assertEqual(outcome_path.read_bytes(), saved_outcome)
 
     def test_full_research_allows_synthesis_to_experiment_adapter(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -250,6 +341,8 @@ class SessionTransitionTests(unittest.TestCase):
                 self.assertEqual(len(outcomes), len(profile.capabilities))
                 self.assertTrue(all(result.status == "completed" for result in outcomes))
                 self.assertEqual(controller.manifest.status, "running")
+                if profile_name == "full_research":
+                    self.assertEqual(controller.manifest.budget.max_attempts, len(profile.capabilities) + 2)
 
     def test_profiles_allow_only_named_legacy_capability_aliases(self) -> None:
         brief = resolve_lifecycle_profile("research_brief")
@@ -413,53 +506,6 @@ class SessionTransitionTests(unittest.TestCase):
                 resumed.store.read_attempt_manifest("attempts/attempt-001/attempt_manifest.json").status,
                 "running",
             )
-
-    def test_explicit_interrupted_recovery_closes_attempt_without_retrying(self) -> None:
-        for limit in (1, 3):
-            with self.subTest(attempt_budget=limit), tempfile.TemporaryDirectory() as tmp:
-                registry = CapabilityRegistry()
-
-                def interrupt(**_: object) -> CapabilityResult:
-                    raise KeyboardInterrupt()
-
-                registry.register("interrupt", interrupt)
-                controller = SessionController.create(
-                    tmp,
-                    session_id="explicit-interrupt-recovery",
-                    topic="interrupt recovery",
-                    registry=registry,
-                    budget=BudgetState(max_attempts=limit),
-                )
-
-                with self.assertRaises(KeyboardInterrupt):
-                    controller.execute_attempt("interrupt", attempt_id="attempt-001")
-
-                resumed = SessionController.load(tmp, registry=registry)
-                result = resumed.recover_interrupted(
-                    reason="The worker process ended before returning a capability result."
-                )
-
-                self.assertEqual(result.status, "failed")
-                self.assertEqual(resumed.manifest.decisions, [])
-                self.assertEqual(resumed.manifest.budget.attempts, 1)
-                self.assertEqual(resumed.manifest.status, "blocked" if limit == 1 else "running")
-                self.assertEqual(len(resumed.list_attempts()), 1)
-                self.assertEqual(result.provenance["recovery"], "explicit_interruption")
-                self.assertEqual(resumed.status_snapshot()["running_attempts"], 0)
-                self.assertEqual(resumed.status_snapshot()["failed_attempts"], 1)
-                self.assertEqual(
-                    resumed.store.read_attempt_manifest(
-                        "attempts/attempt-001/attempt_manifest.json"
-                    ).status,
-                    "failed",
-                )
-                self.assertEqual(
-                    resumed.store.read_capability_result(
-                        "attempts/attempt-001/capability_result.json"
-                    ).diagnostics,
-                    ("The worker process ended before returning a capability result.",),
-                )
-
 
     def test_controller_normalizes_capability_and_attempt_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

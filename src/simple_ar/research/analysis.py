@@ -346,6 +346,12 @@ def _comparison_result_summary(
 
 
 def _result_status(result: Mapping[str, Any]) -> str:
+    # A zero exit code cannot override an independently rejected measurement.
+    # Interpret the retained evidence; do not rewrite its canonical original.
+    guard = _mapping_value(result.get('guard'))
+    integrity = _mapping_value(_mapping_value(result.get('measurement')).get('asset_integrity'))
+    if guard.get('status') == 'failed' or integrity.get('status') == 'changed':
+        return 'failed'
     status = str(result.get("status") or "").strip()
     if status:
         return status
@@ -444,10 +450,25 @@ def _merge_result_schema_into_analysis_context(
     return context.model_copy(update={"expected_metrics": expected})
 
 
+def _measurement_group(result: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
+    from simple_ar.experiment.execution.measurement import comparable_protocol
+    measurement = result['measurement']
+    protocol = comparable_protocol(result['experiment_contract'], observed_assets=measurement.get('asset_integrity'))
+    conditions = dict(protocol['comparison_conditions'] or {})
+    conditions.pop('seed', None)
+    protocol['comparison_conditions'] = conditions
+    key = json.dumps([protocol, result.get('result_schema', {}),
+        measurement.get('asset_integrity', {}).get('content_fingerprint')], sort_keys=True)
+    return key, protocol
+
+
 def _experiment_set_payload(context: CapabilityContext, collection: Mapping[str, Any]) -> dict[str, Any]:
     """Resolve the declared collection; reuse the single-pair comparison rules."""
     comparisons, rows, missing, failed = [], [], [], []
-    groups = {}
+    groups, candidate_groups = {}, {}
+    policy = collection.get('baseline_policy', 'run')
+    if policy not in {'run', 'skip'} or policy == 'skip' and any(pair['baseline'] is not None for pair in collection['pairs']):
+        raise ValueError('A skipped baseline cannot hide a supplied measurement')
     statuses = []
     candidate_implementations: list[Mapping[str, Any] | None] = []
     for pair in collection["pairs"]:
@@ -455,35 +476,43 @@ def _experiment_set_payload(context: CapabilityContext, collection: Mapping[str,
         for role in ("baseline", "candidate"):
             reference = pair[role]
             if reference is None:
-                missing.append({"seed": pair["seed"], "condition": role})
+                if role != 'baseline' or policy != 'skip':
+                    missing.append({"seed": pair["seed"], "condition": role})
                 continue
             ref = ArtifactRef.from_dict(reference)
             result = context.read_input_json(ref)
             measured[role] = result
-            statuses.append(result["status"])
+            status = _result_status(result)
+            statuses.append(status)
             if role == "candidate":
                 implementation_ref = result.get("implementation_ref")
                 candidate_implementations.append(
                     dict(implementation_ref) if isinstance(implementation_ref, Mapping) else None
                 )
             # Failed runs remain in the set/comparison, never in valid metric rows.
-            if result["status"] == "passed":
+            if status == "passed":
                 rows.append({"condition": role, "seed": pair["seed"], "metrics": result["metrics"],
                              "artifact": ref.path})
+                if policy == 'skip':
+                    measurement = result.get('measurement') or {}
+                    contract = result.get('experiment_contract') or {}
+                    if (measurement.get('source_kind') == 'measured' and measurement.get('protocol_fingerprint')
+                            and all(contract.get(key) for key in ('dataset_refs', 'split_spec', 'metric_specs', 'comparison_conditions'))
+                            and contract['split_spec'].get('status') != 'not_declared_by_framework'):
+                        key, protocol = _measurement_group(result)
+                    else:
+                        key, protocol = ref.path, {}  # No inferred pooling of undeclared conditions.
+                    group = candidate_groups.setdefault(key, {'protocol': protocol, 'rows': []})
+                    group['rows'].append(rows[-1])
             else:
-                failed.append({"seed": pair["seed"], "condition": role, "status": result["status"], "artifact": ref.path})
+                failed.append({"seed": pair["seed"], "condition": role, "status": status, "artifact": ref.path})
         if len(measured) == 2:
             comparison = compare_experiment_results(measured["baseline"], measured["candidate"])
             comparisons.append({**comparison, "seed": pair["seed"],
                                 "baseline_ref": pair["baseline"], "candidate_ref": pair["candidate"]})
-            if comparison["comparability"] == "declared_match" and all(r["status"] == "passed" for r in measured.values()):
+            if comparison["comparability"] == "declared_match" and all(_result_status(r) == "passed" for r in measured.values()):
                 baseline = measured["baseline"]
-                protocol = dict(baseline["experiment_contract"])
-                conditions = dict(protocol["comparison_conditions"])
-                conditions.pop("seed", None)
-                protocol["comparison_conditions"] = conditions
-                integrity = baseline["measurement"].get("asset_integrity", {})
-                key = json.dumps([protocol, integrity.get("content_fingerprint")], sort_keys=True)
+                key, protocol = _measurement_group(baseline)
                 group = groups.setdefault(key, {"protocol": protocol, "pairs": []})
                 group["pairs"].append(comparisons[-1])
     summaries = []
@@ -500,7 +529,18 @@ def _experiment_set_payload(context: CapabilityContext, collection: Mapping[str,
                 "delta_mean": sum(values) / len(values), "delta_sample_std": sample_std(values),
                 "protocol": group["protocol"], "sources": [{"baseline_ref": pair["baseline_ref"],
                     "candidate_ref": pair["candidate_ref"]} for pair, _ in selected]})
-    metrics = _unique_candidate_summary_metrics(summaries)
+    condition_summaries = []
+    for group_id, group in enumerate(candidate_groups.values()):
+        for name in sorted({name for row in group['rows'] for name in row['metrics']}):
+            selected = [row for row in group['rows'] if type(row['metrics'].get(name)) in (int, float)
+                and math.isfinite(row['metrics'][name])]
+            values = [row['metrics'][name] for row in selected]
+            if values:
+                condition_summaries.append({'group_id': group_id, 'metric': name, 'n': len(values),
+                    'candidate_mean': sum(values) / len(values), 'candidate_sample_std': sample_std(values),
+                    'seeds': [row['seed'] for row in selected], 'sources': [row['artifact'] for row in selected],
+                    'protocol': group['protocol']})
+    metrics = _unique_candidate_summary_metrics(condition_summaries if policy == 'skip' else summaries)
     recorded_implementations = [ref for ref in candidate_implementations if ref is not None]
     if recorded_implementations and any(ref != recorded_implementations[0] for ref in recorded_implementations):
         raise ValueError("The paired candidate measurements contain different implementation revisions.")
@@ -517,15 +557,28 @@ def _experiment_set_payload(context: CapabilityContext, collection: Mapping[str,
         "Paired summaries are descriptive, grouped by declared protocol and observed protected-file identity. "
         "Only the current candidate revision is included; no significance test or population uncertainty is established."
     ]
+    if policy == 'skip':
+        limitations = ['Candidate-only descriptive summaries; no baseline comparison, significance test or population uncertainty is established. Undeclared conditions are not pooled.']
     if collection_implementation is not None and not complete_lineage:
         limitations.append("Candidate implementation lineage could not be verified for every measured pair.")
-    return {"status": "passed" if statuses and not missing and all(s == "passed" for s in statuses) else "incomplete",
+    gaps = [f"seed={row['seed']}: missing {row['condition']}" for row in missing]
+    gaps.extend(f"seed={row['seed']}: {row['condition']} status={row['status']}" for row in failed)
+    gaps.extend(f"seed={row['seed']}: comparison {row['comparability']}" for row in comparisons
+                if row['comparability'] != 'declared_match')
+    if policy == 'run' and not summaries:
+        gaps.append('No eligible paired metric summary; no compatible conditions were established.')
+    if policy == 'skip' and not condition_summaries:
+        gaps.append('No valid candidate metrics were available for descriptive analysis.')
+    limitations.extend(gaps)
+    return {"status": "passed" if statuses and not gaps and all(s == "passed" for s in statuses) else "incomplete",
             "metrics": metrics, "comparisons": comparisons, "seed_evidence": rows,
             "paired_summary": summaries,
+            **({'condition_summary': condition_summaries, 'baseline_policy': 'skip'} if policy == 'skip' else {}),
             "implementation_ref": recorded_implementations[0] if complete_lineage else None,
             "candidate_revision": collection.get("candidate_revision", 0),
             "superseded_candidates": collection.get("superseded_candidates", []),
             "missing_measurements": missing, "failed_measurements": failed, "planned_pairs": len(collection["pairs"]),
+            "coverage_gaps": gaps,
             "limitations": limitations}
 
 
@@ -596,7 +649,7 @@ def analyze_experiment_capability(
             schema="experiment_comparison.v1", producer="research.analysis",
         )
         payload = {**payload, "comparisons": [*payload.get("comparisons", []), comparison]}
-    execution_status = str(payload.get("status") or "unknown")
+    execution_status = _result_status(payload)
     result_schema = payload.get("result_schema")
     result_schema = result_schema if isinstance(result_schema, Mapping) else {}
     base_context = (
@@ -662,6 +715,8 @@ def analyze_experiment_capability(
         project_results["seed_evidence"] = payload["seed_evidence"]
         project_results["comparisons"] = payload["comparisons"]
         project_results["paired_summary"] = payload["paired_summary"]
+        if 'condition_summary' in payload:
+            project_results['condition_summary'] = payload['condition_summary']
     analysis = analyze_results(
         AnalysisRequest(
             context=base_context.model_copy(
@@ -681,9 +736,14 @@ def analyze_experiment_capability(
     preparation = payload.get("preparation")
     if is_collection:
         limitations = payload["limitations"]
+        if payload['coverage_gaps']:
+            if analysis.status == 'passed':
+                analysis.status = 'incomplete'
+            analysis.status_reasons = list(dict.fromkeys([*analysis.status_reasons, *payload['coverage_gaps']]))
         analysis.audit.limitations = list(dict.fromkeys([*analysis.audit.limitations, *limitations]))
-        analysis.readme_markdown += "\n\n## Paired measurement coverage\n\n" + (
-            f"Planned pairs: {payload['planned_pairs']}; paired comparisons: {len(payload['comparisons'])}; "
+        coverage = ('Candidate measurement coverage', 'candidate runs') if payload.get('baseline_policy') == 'skip' else ('Paired measurement coverage', 'pairs')
+        analysis.readme_markdown += f"\n\n## {coverage[0]}\n\n" + (
+            f"Planned {coverage[1]}: {payload['planned_pairs']}; paired comparisons: {len(payload['comparisons'])}; "
             f"missing measurements: {len(payload['missing_measurements'])}; failed measurements: {len(payload['failed_measurements'])}.\n\n"
             + "\n".join(f"- {item}" for item in limitations) + "\n"
         )

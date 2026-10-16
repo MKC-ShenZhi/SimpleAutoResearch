@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import os
+import stat
 import io
 import tokenize
 from collections import Counter
@@ -146,20 +147,32 @@ def project_python_files(root: Path) -> list[Path]:
 
 
 def _iter_files(root: Path) -> Iterator[Path]:
+    boundary = root.resolve()
     for current, dirnames, filenames in os.walk(root):
         current_path = Path(current)
         dirnames[:] = [
             dirname
             for dirname in dirnames
             if dirname not in IGNORED_DIR_NAMES and not dirname.startswith(".")
+            and _safe_index_path(current_path / dirname, boundary)
             and not is_python_environment(current_path / dirname)
         ]
         for filename in filenames:
             if filename in IGNORED_FILE_NAMES or filename.startswith(".env"):
                 continue
             path = current_path / filename
-            if path.is_file():
+            if _safe_index_path(path, boundary) and path.is_file():
                 yield path
+
+
+def _safe_index_path(path: Path, boundary: Path) -> bool:
+    """Index approved local bytes, never linked targets outside the inventory."""
+    try:
+        attrs = getattr(path.lstat(), "st_file_attributes", 0)
+        return (not path.is_symlink() and not attrs & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+                and path.resolve().is_relative_to(boundary))
+    except OSError:
+        return False
 
 
 def _index_file(root: Path, path: Path) -> dict[str, Any]:

@@ -7,9 +7,39 @@ from simple_ar.report.assembler import assemble_report_sections, apply_section_n
 from simple_ar.report.schema import ReportSectionDraft
 from simple_ar.report.citations import strip_references_section
 from simple_ar.report.capability import ReportAssemblyRequest, assemble_report_document
+from dataclasses import replace
+from simple_ar.report.ports import DeterministicFigureRenderer
+from simple_ar.report.schema import ReportRuntimeConfig, ReportDocumentPlan
 
 
 class AssemblyBoundaryTests(unittest.TestCase):
+    def test_template_is_not_figure_intent_and_saved_config_keeps_original_contract(self):
+        request = ReportAssemblyRequest(title='Report', template_name='survey_long',
+            sections=(ReportSectionDraft(section_id='taxonomy', heading='Taxonomy',
+                draft_markdown='- Method family A\n- Method family B\n- Method family C'),))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fresh = assemble_report_document(request, report_dir=root / 'fresh')
+            self.assertEqual(fresh.figures, ())
+            self.assertFalse((root / 'fresh' / 'figures').exists())
+            # Serialized config is a historical contract, including default
+            # auto mode; fields explicitly saved must not become fresh defaults.
+            saved = ReportRuntimeConfig().model_dump(mode='json')
+            legacy = assemble_report_document(replace(request, config=saved), report_dir=root / 'saved')
+            self.assertEqual(len(legacy.figures), 1)
+            explicit = assemble_report_document(request, report_dir=root / 'port',
+                figure_renderer=DeterministicFigureRenderer())
+            self.assertEqual(explicit.report_body_markdown, legacy.report_body_markdown)
+            whole = replace(request, config=saved, assembly_mode='whole_article', sections=(
+                request.sections[0].model_copy(update={'draft_markdown':
+                    '# Report\n\n## Taxonomy\n\n' + request.sections[0].draft_markdown}),))
+            assembled = assemble_report_document(whole, report_dir=root / 'article')
+            self.assertEqual(assembled.figures, ())
+            self.assertNotIn('![', assembled.report_body_markdown)
+            empty_plan = assemble_report_document(replace(request, config=saved,
+                document_plan=ReportDocumentPlan()), report_dir=root / 'empty-plan')
+            self.assertEqual(empty_plan.figures, ())
+
     def assemble(self, body, heading='Results'):
         return assemble_report_sections(title='Report', sections=[
             ReportSectionDraft(section_id='results', heading=heading, draft_markdown=body)])

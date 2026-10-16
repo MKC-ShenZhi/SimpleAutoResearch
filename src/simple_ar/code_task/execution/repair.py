@@ -17,6 +17,7 @@ from simple_ar.code_task.analysis.interfaces import render_source_snippets
 from simple_ar.code_task.analysis.source_context import diff_source_anchors, source_context_for_files
 from simple_ar.code_task.execution.failure import FILE_LINE_RE, analyze_code_task_failure
 from simple_ar.code_task.editing.planning import select_relevant_files, patch_plan_context
+from simple_ar.code_task.editing.work_plan import _creation_paths
 from simple_ar.code_task.editing.actions import looks_like_diff_fragment as _looks_like_diff_fragment
 from simple_ar.code_task.runtime.state import (
     code_task_paths,
@@ -59,7 +60,11 @@ class RepairEvidence:
     def __post_init__(self) -> None:
         if not self.source.strip() or not self.failure_analysis.strip():
             raise ValueError("Repair evidence requires a source and failure details.")
-        if self.execution_report["execution_status"] not in {"failed", "timed_out"}:
+        preflight = self.execution_report.get('preflight', {})
+        creation_blocked = (self.execution_report["execution_status"] == 'blocked_by_validation'
+            and preflight.get('reason') == 'required_new_files' and bool(preflight.get('missing_files'))
+            and self.execution_report.get('returncode') is None)
+        if self.execution_report["execution_status"] not in {"failed", "timed_out"} and not creation_blocked:
             raise ValueError("Repair requires a failed execution, not a valid low-scoring result.")
 
 
@@ -143,6 +148,9 @@ def propose_repair_edits(
     index = _read_required_json(paths.meta_dir / "codebase_index.json")
     allowed_patterns = allowed_patterns_from_manifest(manifest)
     protected_patterns = protected_patterns_from_manifest(manifest)
+    new_files = _missing_creation_paths(paths.workspace_dir,
+        _creation_paths(manifest, run_dir=run_dir),
+        allowed_patterns=allowed_patterns, protected_patterns=protected_patterns)[:max(1, max_files)]
     selected_context = _repair_context_files(
         manifest,
         index,
@@ -155,8 +163,8 @@ def propose_repair_edits(
         selected_context,
         allowed_patterns=allowed_patterns,
         protected_patterns=protected_patterns,
-        max_files=max_files,
-    )
+        max_files=max_files - len(new_files),
+    ) if max_files > len(new_files) else []
     read_only_context = [
         path
         for path in selected_context
@@ -168,7 +176,7 @@ def propose_repair_edits(
     ]
     snippets = source_context_for_files(
         paths.workspace_dir,
-        selected + read_only_context[:max(0, max_files - len(selected))],
+        selected + read_only_context[:max(0, max_files - len(selected) - len(new_files))],
         max_chars_per_file=max_source_chars_per_file,
         anchors=_repair_source_anchors(failure_analysis, patch_diff, validation_report),
         editable_files=selected,
@@ -210,6 +218,7 @@ def propose_repair_edits(
                 validation_report=validation_report,
                 snippets=snippets,
                 read_only_context=read_only_context,
+                new_files=new_files,
             ),
             label="code-task-repair",
         )
@@ -226,6 +235,8 @@ def propose_repair_edits(
         source_analysis=source_analysis,
         allowed_patterns=allowed_patterns,
         protected_patterns=protected_patterns,
+        new_files=new_files,
+        workspace_dir=paths.workspace_dir,
     )
     write_json(proposal_path, normalized)
     _update_manifest_after_repair(
@@ -257,6 +268,7 @@ def _repair_prompt(
     validation_report: dict[str, Any],
     snippets: list[dict[str, Any]],
     read_only_context: list[str],
+    new_files: list[str] | None = None,
 ) -> str:
     snippet_text = render_source_snippets(snippets)
     return (
@@ -267,7 +279,8 @@ def _repair_prompt(
         "- Use exact old/new text replacements only.\n"
         "- Do not include diff markers such as `+`, `-`, `@@`, `---`, or "
         "`+++` inside `old` or `new`; they must contain only file text.\n"
-        "- Edit only workspace-relative paths marked editable in the supplied snippets.\n"
+        "- Edit only workspace-relative paths marked editable in the supplied snippets, or the "
+        "declared missing creation targets below. Create an absent target with old=\"\" and nonempty new text.\n"
         "- Prefer repairing implicated or recently changed files.\n"
         "- Treat validation errors as first-class evidence even when the benchmark was not launched.\n"
         "- Do not change read-only files such as tests, benchmarks, or validation targets.\n"
@@ -282,6 +295,8 @@ def _repair_prompt(
         f"Execution report JSON:\n{json.dumps(execution_report or {'status': 'not_available'}, indent=2, ensure_ascii=False)}\n\n"
         f"Validation report JSON:\n{json.dumps(validation_report or {'status': 'not_available'}, indent=2, ensure_ascii=False)}\n\n"
         f"Failure analysis:\n{failure_analysis}\n\n"
+        "Declared missing creation targets (no source exists; these are not snippets):\n"
+        f"{json.dumps(new_files or [], indent=2, ensure_ascii=False)}\n\n"
         "Read-only context paths (never editable; source shown within the same file budget):\n"
         f"{json.dumps(read_only_context, indent=2, ensure_ascii=False)}\n\n"
         f"Selected source snippets:\n{snippet_text or 'No source snippets selected.'}"
@@ -350,9 +365,13 @@ def _normalize_repair_proposal(
     source_analysis: str,
     allowed_patterns: tuple[str, ...],
     protected_patterns: tuple[str, ...],
+    new_files: list[str] | None = None,
+    workspace_dir: Path | None = None,
 ) -> dict[str, Any]:
     known_paths = {str(item.get("path", "")) for item in _index_files(index)}
-    permitted_paths = set(selected_files) if selected_files else known_paths
+    permitted_paths = set(selected_files) if selected_files or new_files else known_paths
+    creating_paths = set(_missing_creation_paths(workspace_dir, new_files or [],
+        allowed_patterns=allowed_patterns, protected_patterns=protected_patterns)) if workspace_dir is not None else set()
     warnings: list[str] = []
     edits: list[dict[str, str]] = []
     for item in proposal.get("edits", []):
@@ -362,7 +381,8 @@ def _normalize_repair_proposal(
         path = _string(item.get("path"))
         old = item.get("old")
         new = item.get("new")
-        if path not in known_paths:
+        creating = path in creating_paths and old == "" and isinstance(new, str) and bool(new.strip())
+        if path not in known_paths and not creating:
             warnings.append(f"Dropped edit for unknown path: {path or '<empty>'}")
             continue
         rejection = edit_scope_rejection_reason(
@@ -373,7 +393,7 @@ def _normalize_repair_proposal(
         if rejection:
             warnings.append(f"Dropped edit for disallowed path `{path}`: {rejection}")
             continue
-        if path not in permitted_paths:
+        if path not in permitted_paths and not creating:
             warnings.append(f"Dropped edit outside repair context: {path}")
             continue
         if not isinstance(old, str) or not isinstance(new, str):
@@ -404,7 +424,7 @@ def _normalize_repair_proposal(
         "selected_files": selected_files,
         "read_only_context": read_only_context,
         "constraints": [
-            "Only selected context files may be edited by this repair proposal.",
+            "Only selected context files or declared absent creation targets may be edited by this repair proposal.",
             "Protected read-only files such as tests and benchmarks cannot be edited.",
             "Apply this proposal explicitly with code-task apply-edits after review.",
         ],
@@ -414,6 +434,24 @@ def _normalize_repair_proposal(
         "risks": _string_list(proposal.get("risks")),
         "warnings": warnings,
     }
+
+
+def _missing_creation_paths(workspace: Path, paths: list[str], *,
+                            allowed_patterns: tuple[str, ...], protected_patterns: tuple[str, ...]) -> list[str]:
+    result = []
+    for name in paths:
+        if not is_edit_allowed_path(name, allowed_patterns=allowed_patterns, protected_patterns=protected_patterns):
+            continue
+        target = workspace / name
+        try:
+            if (target.exists() or not target.resolve().is_relative_to(workspace.resolve())
+                    or any(path.is_symlink() or path.is_junction() or path.is_file()
+                           for path in (target, *target.parents) if path != workspace and workspace in path.parents)):
+                continue
+        except (OSError, RuntimeError):
+            continue
+        result.append(name)
+    return result
 
 
 def _next_repair_dir(repairs_dir: Path) -> Path:

@@ -297,8 +297,23 @@ def workspace_observation_view(result: dict, *, record: str, directory_path: str
 
 
 class WorkspaceToolGateway:
+    def has_started(self, identity: str) -> bool:
+        return (self.root / 'tools' / 'processes' / identity / 'invocation.json').is_file()
+
+    def can_reconcile(self, name: str, identity: str) -> bool:
+        if name == 'copy_project':
+            return (self.root / 'attempts' / identity / 'project-copy.json').is_file()
+        if name in {'run_process', 'search_files'}:
+            receipt = self.root / 'tools' / 'processes' / identity / 'invocation.json'
+            if not receipt.is_file():
+                return False
+            if read_json(receipt).get('status') not in {'finished', 'stopped'}:
+                raise RuntimeError('Process is live or unknown; cannot replay')
+            return True
+        return False
+
     def __init__(self, root: Path, sources: dict[str, Path], ledger: BudgetLedger,
-                 project_python: Path | None = None) -> None:
+                 project_python: Path | None = None, record_artifacts: Any | None = None) -> None:
         self.root = root.resolve()
         # Keep a venv's entry path, not its resolved system-Python symlink.
         self.python = (project_python or Path(sys.executable)).expanduser().absolute()
@@ -312,6 +327,7 @@ class WorkspaceToolGateway:
         if any(_private_name(path.name) for path in self.mounts.values()):
             raise ValueError("Private/runtime files cannot be mounted as task sources")
         self.ledger = ledger
+        self.record_artifacts = record_artifacts
 
     def resolve(self, value: str, *, write: bool = False) -> Path:
         return resolve_mounted_path(self.mounts, value, write=write)
@@ -618,14 +634,17 @@ class WorkspaceToolGateway:
             write_json(record, {'request': request.model_dump(), 'data': data})
         return ToolResult(tool_name='copy_project', data=data)
 
-    def resolve_delivery(self, request: DeliveryRequest, *, writing: Path | None = None) -> dict[str, Any]:
+    def resolve_delivery(self, request: DeliveryRequest, *, writing: Path | None = None,
+                         current_outputs: tuple[Path, ...] = ()) -> dict[str, Any]:
+        retained = tuple(self.record_artifacts() if self.record_artifacts is not None else ()) + current_outputs
         def resolve_artifact(value: str) -> Path:
             path = self.resolve(value)
             evidence = self.mounts.get('evidence')
-            if not path.is_relative_to(self.workspace) and not (
+            registered = any(path == output or (output.is_dir() and path.is_relative_to(output)) for output in retained)
+            if not path.is_relative_to(self.workspace) and not registered and not (
                 evidence == self.root / 'evidence' and path.is_relative_to(evidence)
             ):
-                raise ValueError('Delivery requires workspace output or retained task evidence; external sources and attempt records are not deliverables')
+                raise ValueError('Delivery requires workspace output, retained evidence or registered domain output; external sources and unregistered attempt records are not deliverables')
             return path
 
         paths, artifacts = [], []

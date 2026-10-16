@@ -7,8 +7,10 @@ from simple_ar.report.projection import (
     _metric_ledger,
     _verified_experiment_evidence,
     attach_implementation_evidence,
+    build_research_report_inputs,
+    ReportProjectionError,
 )
-from simple_ar.core import ArtifactStore
+from simple_ar.core import ArtifactRef, ArtifactStore
 from pathlib import Path
 import tempfile
 from simple_ar.report.audit import build_report_audit
@@ -16,6 +18,29 @@ from simple_ar.report.schema import MetricSource, ReportContext, ReportMemory, R
 
 
 class ReportMeasurementAuditTests(unittest.TestCase):
+    def test_saved_measurement_projection_rejects_unrelated_or_missing_owners(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ArtifactStore(Path(tmp))
+            current = ArtifactRef(path="attempts/current/results.json", kind="experiment_result")
+            foreign = ArtifactRef(path="attempts/other/results.json", kind="experiment_result")
+            analysis_ref = ArtifactRef(path="attempts/analysis/analysis.json")
+            comparison = store.write_json("comparison.json", {
+                "candidate_ref": foreign.to_dict(), "baseline_ref": current.to_dict()})
+            inputs = dict(topic="Recorded results", brief=None, search=None, documents=None,
+                execution={"status": "passed", "metrics": {}}, analysis=None,
+                brief_ref=ArtifactRef(path="brief.json"), execution_ref=current,
+                analysis_ref=analysis_ref, evidence_store=store)
+            with self.assertRaisesRegex(ReportProjectionError, "accepted candidate"):
+                build_research_report_inputs(**inputs, related_refs={"comparison": comparison})
+            with self.assertRaises(FileNotFoundError):
+                build_research_report_inputs(**inputs, related_refs={
+                    "baseline": ArtifactRef(path="missing-baseline.json")})
+            collection = ArtifactRef(path="collection.json", kind="experiment_set")
+            store.write_json("attempts/analysis/paired_analysis.json", {
+                "schema_version": "experiment_set_analysis.v1", "collection_ref": foreign.to_dict()})
+            with self.assertRaisesRegex(ReportProjectionError, "accepted measurement collection"):
+                build_research_report_inputs(**{**inputs, "execution_ref": collection})
+
     def test_unlocated_display_requires_verification_not_assumed_rewrite(self):
         from simple_ar.report.schema import finding_requires_resolution
         for name, body in (
@@ -541,7 +566,8 @@ class ReportMeasurementAuditTests(unittest.TestCase):
             context = ReportContext(topic="Replay", report_mode="experiment")
 
             attach_implementation_evidence(
-                context, store, repair_ref, lineage_refs=(initial_ref,)
+                context, store, repair_ref, lineage_refs=(initial_ref, repair_ref,
+                    ArtifactRef(path="attempts/future-unmeasured/implementation.json"))
             )
 
             implementation = context.results["implementation"]

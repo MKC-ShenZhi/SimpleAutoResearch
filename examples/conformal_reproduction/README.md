@@ -15,7 +15,7 @@ curl --fail --location https://arxiv.org/pdf/1904.06019 \
 uv run simple-ar research-session --config examples/conformal_reproduction/research.toml
 ```
 
-Set global API credentials/model in `.env` and install dependencies with `uv sync`.
+Complete [model setup](../../docs/USAGE.md) and install dependencies with `uv sync`.
 An unavailable or failed PDF parser is a source-access limitation, not proof of
 a successful review. The command's environment
 must have `python` on PATH. Advanced users can specify a different argv in TOML.

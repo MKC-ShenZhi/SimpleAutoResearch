@@ -10,14 +10,15 @@ import io
 import tempfile
 import unittest
 
-from simple_ar.app.research_application import ResearchApplication, load_session
+from simple_ar.app.research_application import ResearchApplication
+from simple_ar.app.tool_application import ToolApplication
 from simple_ar.literature.models import Paper
 from simple_ar.research.documents.fulltext import build_fulltext_manifest
 from simple_ar.research.documents.ingest import build_document_bundle
 from simple_ar.research.documents.ingest import DocumentBundle
 from simple_ar.research.documents.records import build_document_records
 from simple_ar.research.contracts import DocumentRecord, TextChunk
-from simple_ar.research.evidence.reader import ReadRequest, read_documents
+from simple_ar.research.evidence.reader import ReadRequest, ReadResult, read_documents
 from simple_ar.research.sources.base import build_source_plan
 
 
@@ -104,6 +105,7 @@ class SuppliedPdfIngestTest(unittest.TestCase):
 
     def test_configured_pdf_reaches_normal_session_reading(self) -> None:
         from simple_ar.cli.main import main
+        from simple_ar.cli.start import session_materials
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -124,15 +126,46 @@ class SuppliedPdfIngestTest(unittest.TestCase):
                     main(["research-session", "--config", str(config)])
                 except SystemExit as exc:
                     self.fail(f"Session stopped: {exc}; console: {console.getvalue()}")
+            parse_pdf.assert_called_once()
             self.assertEqual(parse_pdf.call_args.kwargs["max_pages"], 5)
             session = next((root / "out").iterdir())
-            app = load_session(session)
-            self.assertEqual(len(app._local_documents()), 1)
-            self.assertEqual(app.view().status, "completed")
+            app = ToolApplication.load(session)
+            self.assertEqual(app.session.manifest.status, "completed")
+            accepted = [app.session.store.read_json(tool['result'])
+                for turn in app.state['turns'] for tool in turn['tools']]
+            research = [row for row in accepted if row['tool_name'] in {'research', 'research_collect'}
+                        and row['status'] == 'ok' and row['data'].get('operation') == 'summary']
+            self.assertEqual(len(research), 1)
+            result = research[0]
+            self.assertEqual(result['data']['operation'], 'summary')
+            delivered = session_materials(session)['summary']
+            self.assertCountEqual(delivered, [app.workspace.resolve(path) for path in result['artifacts']])
+            bundle_path = app.workspace.resolve(result['data']['document_record'])
+            self.assertIn(bundle_path, delivered)
+            bundle = DocumentBundle.from_handoff_dict(app.session.store.read_json(
+                bundle_path.relative_to(session)))
+            self.assertEqual(len(bundle.records), 1)
+            self.assertEqual(bundle.records[0].extraction_status, 'parsed')
+            self.assertTrue(bundle.fulltext_manifest['enabled'])
+            self.assertFalse(bundle.fulltext_manifest['allow_pdf_download'])
             self.assertTrue(any(
                 "parameter-efficient ensembling" in section.text
-                for section in app._load_documents().sections
+                for section in bundle.sections
             ))
+            self.assertTrue(any('parameter-efficient ensembling' in chunk.text for chunk in bundle.chunks))
+            # Inspect only artifacts from the accepted receipt; historical
+            # attempts and the legacy state-ref layout do not own this result.
+            handoffs = [app.session.store.read_json(path.relative_to(session))
+                for path in delivered if path.suffix == '.json']
+            reads = [row for row in handoffs if row.get('schema_version') == 'read_result.v1']
+            self.assertEqual(len(reads), 1)
+            reading = ReadResult.from_handoff_dict(reads[0], bundle=bundle)
+            self.assertEqual(reading.status, 'completed')
+            self.assertEqual(len(reading.paper_cards), 1)
+            self.assertEqual({row['document_id'] for row in reads[0]['documents']},
+                             {bundle.records[0].document_id})
+            self.assertEqual({row['chunk_id'] for row in reads[0]['source_spans']},
+                             {chunk.chunk_id for chunk in bundle.chunks})
 
     def test_application_passes_local_pdf_to_source_plan(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -4,11 +4,11 @@ from contextlib import contextmanager
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import tempfile
 import uuid
-from typing import Any, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 
 @contextmanager
-def generation_candidate(destination: Path) -> Iterator[Path]:
+def generation_candidate(destination: Path, *, validate: Callable[[Path], None] | None = None) -> Iterator[Path]:
     """Publish completed files, retaining old projects and failed candidates.
 
     The caller owns the exact output directory. This is not a session transaction
@@ -23,6 +23,8 @@ def generation_candidate(destination: Path) -> Iterator[Path]:
     candidate = Path(tempfile.mkdtemp(prefix=f".{destination.name}.candidate-", dir=destination.parent))
     try:
         yield candidate
+        if validate is not None:
+            validate(candidate)
     except BaseException as exc:
         exc.add_note(f"Generated candidate retained at {candidate}; previous output was not replaced")
         raise

@@ -128,6 +128,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             spec = code_task_project_spec({"code_task_config": str(config)})
 
             self.assertTrue(spec.allow_large_edits)
+            self.assertEqual(spec.result_schema(), {'required_metrics': []})
 
 
 if __name__ == "__main__":

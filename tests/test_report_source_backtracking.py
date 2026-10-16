@@ -7,7 +7,7 @@ from unittest.mock import patch
 from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
 from simple_ar.report.schema import ReportContext, ReportMemory, ReportRuntimeConfig, ReportToolCall, SourceHandle
 from simple_ar.report.templates import load_report_template_bundle
-from simple_ar.report.agent import run_report_agent, _review_section_with_recovery, _writer_prompt, _writer_recovery_prompt
+from simple_ar.report.agent import run_report_agent, _section_response, _writer_prompt, _writer_recovery_prompt
 from simple_ar.report.schema import ReportSectionDraft, ReportToolResult
 from simple_ar.report.schema import ReportSectionPlan
 from simple_ar.report.tool_gateway import ReportToolGateway
@@ -221,7 +221,7 @@ class SourceBacktrackingTests(unittest.TestCase):
                 return {"verdict": "pass"}
         kwargs = self.report_kwargs(Client())
         section = kwargs["memory"].section_plan[0]
-        _review_section_with_recovery(client=kwargs["client"], context=self.context,
+        _section_response(client=kwargs["client"], context=self.context,
             template=kwargs["template"], memory=kwargs["memory"], section=section,
             draft=ReportSectionDraft(section_id="method", heading="Method", draft_markdown="A claim."),
             config=kwargs["config"], label="review", extra_context=extra)

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from typing import TYPE_CHECKING, Any
 
 from simple_ar.tools.permissions import ToolPermissionPolicy
 from simple_ar.tools.registry import ToolRegistry, default_tool_registry
 from simple_ar.tools.specs import CommonToolSpec, ToolCall, ToolResult
 from simple_ar.tools.trace import ToolTraceWriter, tool_timer
+from simple_ar.core.capabilities import CapabilityContext
 
 if TYPE_CHECKING:
     from simple_ar.report.schema import ReportContext
@@ -41,7 +43,62 @@ class CommonToolGateway:
     def list_specs(self) -> list[CommonToolSpec]:
         return self.registry.list_specs()
 
-    def call(self, call: ToolCall | str, arguments: dict[str, Any] | None = None) -> ToolResult:
+    def can_reconcile(self, call: ToolCall) -> bool:
+        """Ask the registered owner whether it can recover without a new operation."""
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,100}", call.trace_id):
+            return False
+        spec = self.registry.get(call.tool_name)
+        if spec is None or not self.policy.is_allowed(spec)[0]:
+            return False
+        owner = self._domain_gateways.get(spec.domain)
+        recoverable = getattr(owner, "can_reconcile", None)
+        return bool(recoverable and recoverable(call.tool_name, call.trace_id))
+
+    def has_started(self, call: ToolCall) -> bool:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,100}", call.trace_id):
+            return False
+        spec = self.registry.get(call.tool_name)
+        owner = self._domain_gateways.get(spec.domain) if spec else None
+        started = getattr(owner, "has_started", None)
+        return bool(started and started(call.trace_id))
+
+    def session_owner(self, name: str) -> Any | None:
+        """Look up a policy-authorized owner of the caller's actual attempt.
+
+        Domain declarations replace per-tool execution lists in the controller;
+        this grants neither process approval nor recovery eligibility.
+        """
+        spec = self.registry.get(name)
+        if spec is None or not self.policy.is_allowed(spec)[0]:
+            return None
+        owner = self._domain_gateways.get(spec.domain)
+        return owner if name in getattr(owner, 'context_tools', ()) else None
+
+    def _bound_context(self, call: ToolCall, context: Any) -> bool:
+        """A path-shaped context is not evidence of controller ownership."""
+        if (not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', call.trace_id)
+                or not isinstance(context, CapabilityContext)
+                or context.attempt.attempt_id != call.trace_id
+                or context.store.root.resolve() != (self.run_dir / 'attempts' / call.trace_id).resolve()):
+            return False
+        try:
+            saved = context.store.read_attempt_manifest()
+            return (saved == context.attempt and saved.capability == 'native_tool'
+                    and (saved.status == 'running' or self.can_reconcile(call)))
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
+
+    def delivery_issues(self, observations: list[dict[str, Any]]) -> list[str]:
+        """Domains judge their accepted evidence; the gateway does not reinterpret it."""
+        issues = []
+        for owner in self._domain_gateways.values():
+            check = getattr(owner, 'delivery_issues', None)
+            if check is not None:
+                issues.extend(check(observations))
+        return issues
+
+    def call(self, call: ToolCall | str, arguments: dict[str, Any] | None = None,
+             *, context: Any | None = None, approval: dict[str, Any] | None = None) -> ToolResult:
         if isinstance(call, str):
             call = ToolCall(tool_name=call, arguments=arguments or {})
         spec = self.registry.get(call.tool_name)
@@ -60,7 +117,15 @@ class CommonToolGateway:
             self._trace.append(call=call, result=result, spec=spec, duration_sec=0.0)
             return result
         with tool_timer() as timer:
-            result = self._dispatch(spec, call)
+            owner = self.session_owner(call.tool_name)
+            if owner is not None:
+                if not self._bound_context(call, context):
+                    result = ToolResult(tool_name=call.tool_name, status='blocked',
+                        error='This operation requires its actual authorized task attempt; no execution occurred.')
+                else:
+                    result = owner.execute_tool(call.tool_name, context, call.arguments, approval=approval)
+            else:
+                result = self._dispatch(spec, call)
         self._trace.append(call=call, result=result, spec=spec, duration_sec=timer.duration_sec)
         return result
 

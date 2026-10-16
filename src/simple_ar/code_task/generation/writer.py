@@ -223,6 +223,7 @@ def write_generated_project(
     allow_fallback: bool = False,
     agent_step_dir: Path | None = None,
     message_callback: Callable[[str], None] | None = None,
+    validate_candidate: Callable[[Path], None] | None = None,
 ) -> dict[str, Any]:
     """Write legacy artifacts using the shared related-file generation owner.
 
@@ -233,7 +234,7 @@ def write_generated_project(
     """
     destination = Path(project_dir)
     pending_memory = copy.deepcopy(memory)
-    with generation_candidate(destination) as project_dir:
+    with generation_candidate(destination, validate=validate_candidate) as project_dir:
         files = order_file_specs([row for row in architecture_plan.get("files", []) if isinstance(row, Mapping)])
         order = {safe_relative_path(str(row.get("path", ""))): index for index, row in enumerate(files)}
         planned_parent_dirs = _planned_parent_dirs(files)
@@ -392,6 +393,8 @@ def _dependency_advice_for_prompt(advice: Mapping[str, Any], *, package_limit: i
         "schema_version": advice.get("schema_version", "code_task_dependency_advice.v1"),
         "policy": advice.get("policy", "advice_only_no_auto_install"),
         "selection_policy": advice.get("selection_policy", ""),
+        **{key: advice.get(key) for key in ('environment_scope', 'inspecting_python_executable',
+            'target_python_executable', 'target_matches_inspecting_interpreter', 'requirements_status') if key in advice},
         "environment_package_count": advice.get("environment_package_count", 0),
         "installed_packages": advice.get("installed_packages", []),
         "missing_required": advice.get("missing_required", []),

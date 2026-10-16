@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Callable
+
+from simple_ar.code_task.analysis.index import _iter_files, _sha256, is_python_environment
 
 
 DEFAULT_IGNORED_DIR_NAMES = {
@@ -143,10 +146,42 @@ def copy_workspace_inputs(
     Other copy exclusions still apply. Validate the entire selection and disk
     capacity before overlaying inputs, including untracked data in worktrees.
     """
+    selected = _select_data_inputs(source, workspace, paths)
+    total = sum(path.stat().st_size for path in selected.values())
+    if total > shutil.disk_usage(workspace).free:
+        raise OSError(f"Declared project data needs {total} bytes; insufficient workspace disk space.")
+    for relative in selected:
+        destination = workspace / relative
+        for ancestor in (destination, *destination.parents):
+            if ancestor == workspace:
+                break
+            if _is_link_or_reparse(ancestor):
+                raise ValueError(f"Data destination is a symlink: {relative}")
+        _safe_destination(workspace, Path(relative))
+    added_files = added_bytes = 0
+    for relative, path in selected.items():
+        destination = _safe_destination(workspace, Path(relative))
+        # Ordinary copies already contain smaller inputs. Worktrees may contain
+        # a committed version; the explicitly supplied input is authoritative.
+        if not destination.exists() or report.files_copied == 0:
+            added_files += 1
+            added_bytes += path.stat().st_size
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        _validate_source_file(source, path)
+        shutil.copy2(path, destination, follow_symlinks=False)
+    remaining = tuple(row for row in report.skipped
+                      if not (row["kind"] == "file" and row["path"] in selected))
+    return CopyReport(report.files_copied + added_files, report.bytes_copied + added_bytes,
+                      max(0, report.skipped_count - added_files), remaining)
+
+
+def _select_data_inputs(source: Path, workspace: Path, paths: tuple[str, ...]) -> dict[str, Path]:
+    """Shared declaration validation; intentionally no incidental size ceiling."""
+    _validate_root_boundary(source)
     selected: dict[str, Path] = {}
     for relative in paths:
         name = Path(relative)
-        if name.is_absolute() or not name.parts or ".." in name.parts:
+        if name.anchor or not name.parts or ".." in name.parts:
             raise ValueError(f"Data input must be project-relative: {relative}")
         target = source / name
         for ancestor in (target, *target.parents):
@@ -170,31 +205,7 @@ def copy_workspace_inputs(
             if not path.is_file():
                 raise ValueError(f"Data input is not a regular file: {path}")
             selected[path.relative_to(source).as_posix()] = path
-    total = sum(path.stat().st_size for path in selected.values())
-    if total > shutil.disk_usage(workspace).free:
-        raise OSError(f"Declared project data needs {total} bytes; insufficient workspace disk space.")
-    for relative in selected:
-        destination = workspace / relative
-        for ancestor in (destination, *destination.parents):
-            if ancestor == workspace:
-                break
-            if ancestor.is_symlink():
-                raise ValueError(f"Data destination is a symlink: {relative}")
-        _safe_destination(workspace, Path(relative))
-    added_files = added_bytes = 0
-    for relative, path in selected.items():
-        destination = _safe_destination(workspace, Path(relative))
-        # Ordinary copies already contain smaller inputs. Worktrees may contain
-        # a committed version; the explicitly supplied input is authoritative.
-        if not destination.exists() or report.files_copied == 0:
-            added_files += 1
-            added_bytes += path.stat().st_size
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(path, destination)
-    remaining = tuple(row for row in report.skipped
-                      if not (row["kind"] == "file" and row["path"] in selected))
-    return CopyReport(report.files_copied + added_files, report.bytes_copied + added_bytes,
-                      max(0, report.skipped_count - added_files), remaining)
+    return selected
 
 
 def copy_code_workspace(
@@ -230,6 +241,36 @@ def copy_code_workspace(
         NotADirectoryError: If ``code_root`` is not a directory.
         FileExistsError: If ``workspace_dir`` already contains files.
     """
+    selection = _select_workspace_files(
+        code_root, workspace_dir, max_file_bytes=max_file_bytes,
+        max_files=max_files, max_total_bytes=max_total_bytes, path_allowed=path_allowed,
+    )
+    return _materialize_selection(selection)
+
+
+@dataclass(frozen=True)
+class _CopySelection:
+    source: Path
+    workspace: Path
+    files: tuple[tuple[Path, Path], ...]
+    report: CopyReport
+    max_file_bytes: int
+    max_total_bytes: int | None
+    path_allowed: Callable[[Path], bool] | None
+
+
+def _select_workspace_files(
+    code_root: Path, workspace_dir: Path, *, max_file_bytes: int = 2_000_000,
+    max_files: int | None = None, max_total_bytes: int | None = None,
+    path_allowed: Callable[[Path], bool] | None = None,
+    sparse: bool = False, include_patterns: tuple[str, ...] = (),
+    exclude_patterns: tuple[str, ...] = (),
+    check_destination: bool = True,
+) -> _CopySelection:
+    """Select once for materialization and approval; never create a destination."""
+    _validate_root_boundary(Path(code_root))
+    if check_destination:
+        _validate_root_boundary(Path(workspace_dir))
     source = Path(code_root).resolve()
     workspace = Path(workspace_dir).resolve()
     if not source.exists():
@@ -241,13 +282,13 @@ def copy_code_workspace(
     if any(value is not None and (type(value) is not int or value <= 0)
            for value in (max_files, max_total_bytes)):
         raise ValueError("Copy selection limits must be positive integers")
-    if workspace.exists() and any(workspace.iterdir()):
+    if check_destination and workspace.exists() and any(workspace.iterdir()):
         raise FileExistsError(f"Workspace already contains files: {workspace}")
 
+    includes = normalize_copy_patterns(include_patterns or DEFAULT_SPARSE_INCLUDE_PATTERNS)
+    excludes = normalize_copy_patterns(DEFAULT_SPARSE_EXCLUDE_PATTERNS + tuple(exclude_patterns))
     skipped: list[dict[str, Any]] = []
     skipped_count = 0
-    files_copied = 0
-    bytes_copied = 0
     selected: list[tuple[Path, Path]] = []
     selection_bytes = 0
     entries_seen = 0
@@ -261,7 +302,9 @@ def copy_code_workspace(
         for dirname in dirnames:
             path = current_path / dirname
             reason = (_skip_dir_reason(path, source, workspace)
-                      or ("access_excluded" if path_allowed and not path_allowed(path) else None))
+                      or ("access_excluded" if path_allowed and not path_allowed(path) else None)
+                      or (_sparse_dir_skip_reason(_relative_posix(source, path), exclude_patterns=excludes)
+                          if sparse else None))
             if reason:
                 skipped_count += 1
                 _record_skip(skipped, source, path, "dir", reason)
@@ -273,13 +316,17 @@ def copy_code_workspace(
             path = current_path / filename
             reason = ("access_excluded" if path_allowed and not path_allowed(path)
                       else _skip_file_reason(path, max_file_bytes=max_file_bytes))
+            reason = reason or (_sparse_file_skip_reason(
+                _relative_posix(source, path), include_patterns=includes, exclude_patterns=excludes,
+            ) if sparse else None)
             if reason:
                 skipped_count += 1
                 _record_skip(skipped, source, path, "file", reason)
                 continue
 
             relative_path = path.relative_to(source)
-            _safe_destination(workspace, relative_path)
+            if check_destination:
+                _safe_destination(workspace, relative_path)
             selected.append((path, relative_path))
             selection_bytes += path.stat().st_size
             if max_files is not None and len(selected) > max_files:
@@ -287,32 +334,63 @@ def copy_code_workspace(
             if max_total_bytes is not None and selection_bytes > max_total_bytes:
                 raise ValueError("Project exceeds max_total_bytes; choose a smaller source or an explicit larger bound")
 
-    # One owner supplies legacy initialization and native project preparation.
-    # Reject quota overflow before copying, not after publishing a partial tree.
+    return _CopySelection(source, workspace, tuple(selected),
+                          CopyReport(0, 0, skipped_count, tuple(skipped)),
+                          max_file_bytes, max_total_bytes, path_allowed)
+
+
+def _materialize_selection(selection: _CopySelection) -> CopyReport:
+    """The sole source-copy writer for both full and sparse policies."""
+    source, workspace = selection.source, selection.workspace
     workspace.mkdir(parents=True, exist_ok=True)
-    if max_total_bytes is not None and shutil.disk_usage(workspace).free < selection_bytes:
+    selection_bytes = sum(path.stat().st_size for path, _ in selection.files)
+    if selection.max_total_bytes is not None and shutil.disk_usage(workspace).free < selection_bytes:
         raise ValueError("Insufficient disk space for the selected project")
-    for path, relative_path in selected:
-        if (path.is_symlink() or not path.resolve().is_relative_to(source)
-                or (path_allowed and not path_allowed(path))):
-            raise ValueError("Project source changed or became inaccessible during copying")
+    files_copied = bytes_copied = 0
+    for path, relative_path in selection.files:
+        _validate_source_file(source, path)
+        if selection.path_allowed and not selection.path_allowed(path):
+            raise ValueError("Project source became inaccessible during copying")
         destination = _safe_destination(workspace, relative_path)
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(path, destination, follow_symlinks=False)
         copied_size = destination.stat().st_size
-        if destination.is_symlink() or (max_file_bytes > 0 and copied_size > max_file_bytes):
+        if (_is_link_or_reparse(destination)
+                or (selection.max_file_bytes > 0 and copied_size > selection.max_file_bytes)):
             raise ValueError("Project source changed during copying")
         files_copied += 1
         bytes_copied += copied_size
-        if max_total_bytes is not None and bytes_copied > max_total_bytes:
+        if selection.max_total_bytes is not None and bytes_copied > selection.max_total_bytes:
             raise ValueError("Project source grew beyond max_total_bytes during copying")
+    return CopyReport(files_copied, bytes_copied, selection.report.skipped_count,
+                      selection.report.skipped)
 
-    return CopyReport(
-        files_copied=files_copied,
-        bytes_copied=bytes_copied,
-        skipped_count=skipped_count,
-        skipped=tuple(skipped),
-    )
+
+class _SourceIndexBoundaryError(ValueError):
+    """The unchanged copy policy cannot be projected through the source index."""
+
+
+def _selection_snapshot(selection: _CopySelection, data_inputs: tuple[str, ...] = ()) -> dict[str, str]:
+    """Hash the selected inventory with the index's own boundary and hash owner."""
+    selected = {relative.as_posix(): path for path, relative in selection.files}
+    selected.update(_select_data_inputs(selection.source, selection.workspace, data_inputs))
+    for path in selected.values():
+        for parent in path.parents:
+            if parent == selection.source:
+                break
+            marker = parent / "pyvenv.cfg"
+            if is_python_environment(parent) and marker.relative_to(selection.source).as_posix() not in selected:
+                raise _SourceIndexBoundaryError(
+                    "Copy selection omits a pyvenv.cfg marker while retaining environment files; "
+                    "the source index cannot prove the resulting inventory without materialization."
+                )
+    hashes: dict[str, str] = {}
+    for path in _iter_files(selection.source):
+        relative = path.relative_to(selection.source).as_posix()
+        if relative in selected:
+            _validate_source_file(selection.source, path)
+            hashes[relative] = _sha256(path)
+    return dict(sorted(hashes.items()))
 
 
 def sparse_copy_code_workspace(
@@ -342,76 +420,39 @@ def sparse_copy_code_workspace(
     Returns:
         Summary of copied and skipped paths.
     """
-    source = Path(code_root).resolve()
-    workspace = Path(workspace_dir).resolve()
-    if not source.exists():
-        raise FileNotFoundError(f"Code root does not exist: {source}")
-    if not source.is_dir():
-        raise NotADirectoryError(f"Code root is not a directory: {source}")
-    if max_file_bytes < 0:
-        raise ValueError("max_file_bytes must be >= 0")
-    if workspace.exists() and any(workspace.iterdir()):
-        raise FileExistsError(f"Workspace already contains files: {workspace}")
+    return _materialize_selection(_select_workspace_files(
+        code_root, workspace_dir, max_file_bytes=max_file_bytes, sparse=True,
+        include_patterns=include_patterns, exclude_patterns=exclude_patterns,
+    ))
 
-    includes = normalize_copy_patterns(include_patterns or DEFAULT_SPARSE_INCLUDE_PATTERNS)
-    excludes = normalize_copy_patterns(DEFAULT_SPARSE_EXCLUDE_PATTERNS + tuple(exclude_patterns))
-    workspace.mkdir(parents=True, exist_ok=True)
-    skipped: list[dict[str, Any]] = []
-    skipped_count = 0
-    files_copied = 0
-    bytes_copied = 0
 
-    for current, dirnames, filenames in os.walk(source):
-        current_path = Path(current)
-        filtered_dirnames: list[str] = []
-        for dirname in dirnames:
-            path = current_path / dirname
-            rel_path = _relative_posix(source, path)
-            reason = _skip_dir_reason(path, source, workspace) or _sparse_dir_skip_reason(
-                rel_path,
-                exclude_patterns=excludes,
-            )
-            if reason:
-                skipped_count += 1
-                _record_skip(skipped, source, path, "dir", reason)
-                continue
-            filtered_dirnames.append(dirname)
-        dirnames[:] = filtered_dirnames
+def _is_link_or_reparse(path: Path) -> bool:
+    try:
+        return (path.is_symlink() or bool(getattr(path.lstat(), "st_file_attributes", 0)
+                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)))
+    except FileNotFoundError:
+        return False
 
-        for filename in filenames:
-            path = current_path / filename
-            rel_path = _relative_posix(source, path)
-            reason = (
-                _skip_file_reason(path, max_file_bytes=max_file_bytes)
-                or _sparse_file_skip_reason(
-                    rel_path,
-                    include_patterns=includes,
-                    exclude_patterns=excludes,
-                )
-            )
-            if reason:
-                skipped_count += 1
-                _record_skip(skipped, source, path, "file", reason)
-                continue
 
-            destination = _safe_destination(workspace, Path(rel_path))
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, destination)
-            copied_size = destination.stat().st_size
-            files_copied += 1
-            bytes_copied += copied_size
+def _validate_root_boundary(path: Path) -> None:
+    for ancestor in (path.absolute(), *path.absolute().parents):
+        if _is_link_or_reparse(ancestor):
+            raise ValueError(f"Linked or reparse source is not supported: {ancestor}")
 
-    return CopyReport(
-        files_copied=files_copied,
-        bytes_copied=bytes_copied,
-        skipped_count=skipped_count,
-        skipped=tuple(skipped),
-    )
+
+def _validate_source_file(source: Path, path: Path) -> None:
+    for ancestor in (path, *path.parents):
+        if _is_link_or_reparse(ancestor):
+            raise ValueError(f"Project source became linked: {path}")
+        if ancestor == source:
+            break
+    if not path.resolve().is_relative_to(source) or not path.is_file():
+        raise ValueError(f"Project source changed or is not a regular file: {path}")
 
 
 def _skip_dir_reason(path: Path, source: Path, workspace: Path) -> str | None:
     name = path.name
-    if path.is_symlink():
+    if _is_link_or_reparse(path):
         return "symlink_dir"
     if name in DEFAULT_IGNORED_DIR_NAMES or name.startswith("."):
         return "ignored_dir"
@@ -425,7 +466,7 @@ def _skip_dir_reason(path: Path, source: Path, workspace: Path) -> str | None:
 
 def _skip_file_reason(path: Path, *, max_file_bytes: int) -> str | None:
     name = path.name
-    if path.is_symlink():
+    if _is_link_or_reparse(path):
         return "symlink_file"
     if name in DEFAULT_IGNORED_FILE_NAMES:
         return "ignored_file"
@@ -434,7 +475,10 @@ def _skip_file_reason(path: Path, *, max_file_bytes: int) -> str | None:
     if path.suffix.lower() in DEFAULT_IGNORED_SUFFIXES:
         return "ignored_suffix"
     try:
-        size = path.stat().st_size
+        info = path.stat()
+        if not stat.S_ISREG(info.st_mode):
+            return "not_regular_file"
+        size = info.st_size
     except OSError:
         return "stat_failed"
     if max_file_bytes > 0 and size > max_file_bytes:
@@ -443,7 +487,13 @@ def _skip_file_reason(path: Path, *, max_file_bytes: int) -> str | None:
 
 
 def _safe_destination(workspace: Path, relative_path: Path) -> Path:
-    destination = (workspace / relative_path).resolve()
+    candidate = workspace / relative_path
+    for ancestor in (candidate, *candidate.parents):
+        if _is_link_or_reparse(ancestor):
+            raise ValueError(f"Linked or reparse destination: {relative_path}")
+        if ancestor == workspace:
+            break
+    destination = candidate.resolve()
     if not destination.is_relative_to(workspace):
         raise ValueError(f"Refusing to copy outside workspace: {relative_path}")
     return destination

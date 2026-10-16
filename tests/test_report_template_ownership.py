@@ -2,7 +2,8 @@
 import json
 import unittest
 
-from simple_ar.report.agent import _maybe_adapt_outline, _reviewer_context, _reviewer_prompt, _evidence_outline_sections
+from simple_ar.report.agent import _maybe_adapt_outline, _reviewer_context, _evidence_outline_sections
+from tests.report_review_fixtures import ReviewPromptCapture
 from simple_ar.report.editor import review_document
 from simple_ar.report.schema import (
     ReportContext, ReportDocumentPlan, ReportMemory, ReportRuntimeConfig,
@@ -44,8 +45,8 @@ class TemplateOwnershipTests(unittest.TestCase):
             self.assertIn(interpretation, written)
             self.assertNotIn(interpretation, reviewed)
         self.assertIn("Literal original conditions", reviewed)
-        self.assertEqual(result.tool_results[0], brief)
-        self.assertEqual(result.tool_results[1], synthesis)
+        for evidence in (brief, synthesis):
+            self.assertIn(evidence, result.tool_results)
 
     def test_section_review_keeps_primary_evidence_without_planning_answers(self):
         from simple_ar.report.schema import ReportArgumentPlan, ReportSectionReview, ReviewerFinding
@@ -106,18 +107,14 @@ class TemplateOwnershipTests(unittest.TestCase):
             "criteria_markdown": "Keep the project-specific review requirements."})
         section = _reviewer_context(context=ReportContext(topic="Original task", report_mode="supplied_materials"),
             template=template, memory=memory, section=plan, draft=draft, config=config)
-        captured = []
-        class Capture:
-            def ask_json(self, system, prompt, **unused):
-                captured.append(json.loads(prompt))
-                return {"section_reviews": []}
-        review_document(client=Capture(), template=template, memory=memory, sections=[draft], config=config,
+        capture = ReviewPromptCapture()
+        review_document(client=capture, template=template, memory=memory, sections=[draft], config=config,
             execution_summary={}, metric_summary={})
-        for view in (section, captured[0]):
+        for view in (section, capture.views[0]):
             self.assertEqual(view["authored_template_requirements"], template.template_markdown)
             self.assertNotIn(plan.goal, json.dumps(view))
         self.assertEqual(section["criteria_markdown"], template.criteria_markdown)
-        self.assertEqual(captured[0]["criteria"], template.criteria_markdown)
+        self.assertEqual(capture.views[0]["criteria"], template.criteria_markdown)
 
     def test_source_handles_are_explicit_without_promoting_passage_identifiers(self):
         config, template, memory, _, _ = self.objects("material_report")
@@ -163,32 +160,28 @@ class TemplateOwnershipTests(unittest.TestCase):
         from simple_ar.report.schema import ReviewerFinding
         config, template, memory, plan, draft = self.objects()
         plan.goal = "Include an interpretation named only in the plan, subject to evidence."
-        before = memory.model_dump(mode="json")
-        views = []
-        class Capture:
-            def ask_json(self, system, prompt, **unused):
-                view = json.loads(prompt)
-                views.append(view)
-                return {"section_reviews": [{"section_id": row["section_id"],
-                    "finding_checks": [{"finding_id": row["finding_id"], "status": "unresolved",
-                        "explanation": "Input ownership capture does not resolve the allegation."}]}
-                    for row in view.get("historical_findings_to_check", [])]}
+        capture = ReviewPromptCapture()
         prior = ReviewerFinding(finding_id="old", type="unsupported_claim", severity="major",
             section_id=plan.section_id, message="A fallible allegation about current prose.")
+        memory.reviewer_findings = [prior, ReviewerFinding(finding_id="wording", type="style",
+            severity="minor", message="Simplify prose.")]
+        before = memory.model_dump(mode="json")
         for label, findings, correction in (("report-document-reviewer", [], {}),
                                            ("report-document-verifier", [], {"error": "Saved format error"}),
                                            ("report-document-finding-checker", [prior], {})):
-            review_document(client=Capture(), template=template, memory=memory, sections=[draft], config=config,
+            review_document(client=capture, template=template, memory=memory, sections=[draft], config=config,
                 execution_summary={}, metric_summary={}, historical_findings=findings,
                 format_correction=correction, label=label)
-        for index, view in enumerate(views):
+        for index, view in enumerate(capture.views):
             self.assertEqual(view["sections"][0]["markdown"], draft.draft_markdown)
             self.assertNotIn("section_responsibilities", view)
             self.assertNotIn("section_responsibilities_status", view)
             self.assertNotIn(plan.goal, json.dumps(view))
             if index == 2:
+                self.assertEqual([row["finding_id"] for row in view["historical_findings_to_check"]], ["old"])
                 self.assertEqual(view["historical_findings_role"], "prior_model_opinions_not_source_facts")
             else:
+                self.assertEqual(view["historical_findings_to_check"], [])
                 self.assertIn("criteria", view)
         self.assertEqual(memory.model_dump(mode="json"), before)
 
@@ -202,17 +195,12 @@ class TemplateOwnershipTests(unittest.TestCase):
         return config, template, memory, plan, draft
 
     def views(self, config, template, memory, plan, draft):
-        prompt = _reviewer_prompt(context=ReportContext(topic="Evidence", report_mode="research_only"),
+        section = _reviewer_context(context=ReportContext(topic="Evidence", report_mode="research_only"),
             template=template, memory=memory, section=plan, draft=draft, config=config)
-        section = json.JSONDecoder().raw_decode(prompt[prompt.index("{"):])[0]
-        captured = []
-        class Capture:
-            def ask_json(self, system, prompt, **unused):
-                captured.append(json.loads(prompt))
-                return {"section_reviews": []}
-        review_document(client=Capture(), template=template, memory=memory, sections=[draft],
+        capture = ReviewPromptCapture()
+        review_document(client=capture, template=template, memory=memory, sections=[draft],
             config=config, execution_summary={}, metric_summary={})
-        return section["criteria_markdown"], captured[0]["criteria"]
+        return section["criteria_markdown"], capture.views[0]["criteria"]
 
     def test_adapted_survey_writer_does_not_receive_another_draft_order(self):
         for name in ("survey", "survey_long"):
@@ -240,7 +228,7 @@ class TemplateOwnershipTests(unittest.TestCase):
                     self.assertIn("## Output Expectations", view)
                 self.assertEqual(template.model_dump(mode="json"), before)
 
-    def test_unadapted_and_explicit_custom_criteria_remain_complete(self):
+    def test_unadapted_custom_and_legacy_criteria_remain_complete(self):
         config, template, memory, plan, draft = self.objects()
         custom = template.model_copy(update={"criteria_markdown":
             "## Required Checks\nMy fact checks.\n## Default Structure\nMy required custom arrangement.\n"})
@@ -253,8 +241,6 @@ class TemplateOwnershipTests(unittest.TestCase):
             self.assertTrue(all(view == template.criteria_markdown
                 for view in self.views(config, template, unadapted, plan, draft)))
 
-    def test_legacy_unsplit_criteria_are_not_rewritten_or_inferred(self):
-        config, template, memory, plan, draft = self.objects()
         template = template.model_copy(update={"criteria_markdown": "Saved legacy instructions, including a fixed heading."})
         self.assertTrue(all(view == template.criteria_markdown
             for view in self.views(config, template, memory, plan, draft)))

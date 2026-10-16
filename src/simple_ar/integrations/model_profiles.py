@@ -22,7 +22,7 @@ def model_connections_compatible(saved: dict, current: dict) -> bool:
     without rewriting their history. Output caps may change completion length,
     never the identity of the model used for the saved scientific task.
     """
-    operational = {"request_timeout_sec", "max_output_tokens", "retry_attempts",
+    operational = {"request_timeout_sec", "max_output_tokens", "retry_attempts", "connect_retry_attempts",
                    "retry_base_delay_sec", "retry_max_delay_sec", "context_input_tokens"}
 
     def identity(value):
@@ -48,6 +48,7 @@ class ModelProfile(BaseModel):
     max_output_tokens: int | None = Field(default=None, gt=0)
     context_input_tokens: int = Field(default=24000, gt=0)
     retry_attempts: int = Field(default=3, ge=1)
+    connect_retry_attempts: int = Field(default=1, ge=1)
     retry_base_delay_sec: float = Field(default=1.0, gt=0)
     retry_max_delay_sec: float = Field(default=12.0, gt=0)
     reasoning_effort: Literal["", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] = ""
@@ -94,7 +95,7 @@ class ModelProfile(BaseModel):
                 raise ValueError("Images profiles only declare image capabilities")
             text_options = {"stream", "max_output_tokens", "context_input_tokens", "reasoning_effort", "json_response_format",
                             "chat_token_limit_param", "thinking_mode", "reasoning_output_tokens",
-                            "input_price_per_million", "output_price_per_million"}
+                            "input_price_per_million", "output_price_per_million", "connect_retry_attempts"}
             if self.model_fields_set & text_options:
                 raise ValueError("Do not put text-generation options in an Images profile")
         elif caps & {"image_generate", "image_edit"}:

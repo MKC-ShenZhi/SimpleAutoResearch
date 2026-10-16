@@ -7,6 +7,7 @@ from simple_ar.code_task import load_code_task_init_options
 from simple_ar.code_task.runtime.config import (
     DEFAULT_MAX_FILE_BYTES,
     CodeTaskConfigError,
+    code_task_metric_schema,
     load_code_task_execute_options,
 )
 
@@ -44,20 +45,7 @@ class CodeTaskExperimentSpec:
 
     def result_schema(self) -> dict[str, object]:
         """Return the metric contract enforced by the Code-Task configuration."""
-
-        primary = str(self.primary_metric or "").strip()
-        directions = {
-            str(name): str(direction)
-            for name, direction in self.metric_directions.items()
-            if str(name).strip()
-        }
-        required = list(dict.fromkeys(([primary] if primary else []) + list(directions)))
-        schema: dict[str, object] = {"required_metrics": required}
-        if primary:
-            schema["primary_metric"] = primary
-        if directions:
-            schema["metric_directions"] = directions
-        return schema
+        return code_task_metric_schema(self.primary_metric, self.metric_directions)
 
 
 

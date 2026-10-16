@@ -648,88 +648,53 @@ class SymbolWindowTests(unittest.TestCase):
             self.assertNotIn('# observed tail', rows[0]['text'])
             self.assertEqual(rows[0]['text'], text[rows[0]['source_offset']:boundary])
 
-    def test_fresh_staged_planning_reads_named_body_and_retains_context_manifest(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            text = '# unrelated prefix\n' * 300 + 'def calibrate_observation(x):\n    return x * 2\n'
-            write_text(root / 'project/science.py', text)
-            write_text(root / 'task.md', 'Fix calibrate_observation in science.py.')
-            run = root / 'run'
-            initialize_code_task(run_dir=run, code_root=root / 'project', task_file=root / 'task.md')
-            captured = []
-            def answer(client, **kwargs):
-                captured.extend(kwargs['snippets'])
-                return {'summary': 'Use observed source.', 'items': [{'id': 'W1',
-                    'objective': 'Fix the observed definition.', 'target_files': ['science.py']}]}
-            with patch('simple_ar.code_task.editing.work_plan.LLMClient.for_task', return_value=object()), \
-                    patch('simple_ar.code_task.editing.work_plan._ask_llm_for_work_plan', side_effect=answer):
-                generate_code_task_work_plan(run, llm_client=object(), max_files=1, max_source_chars_per_file=200)
-            self.assertTrue(captured[0]['text'].startswith('def calibrate_observation'))
-            self.assertGreater(captured[0]['source_offset'], 0)
-            self.assertEqual(captured[0]['text'], text[captured[0]['source_offset']:][:200])
-            manifest = read_json(run / 'manifest.json')
-            loaded = load_latest_code_task_context_pack(run)
-            self.assertIsNotNone(loaded)
-            self.assertEqual(manifest['work_plan']['context_pack']['path'], manifest['context_pack']['latest'])
-            self.assertLessEqual(loaded.context_pack['budget']['used_chars'], 200)
-            self.assertEqual((root / 'project/science.py').read_text(), text)
-
-    def test_staged_planning_reuses_saved_coordinates_without_rebuilding(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            text = '# prefix\n' * 100 + 'def calibrate_observation(x):\n' + '    x += 1\n' * 40 + '    return x\n'
-            write_text(root / 'project/science.py', text)
-            write_text(root / 'task.md', 'Fix calibrate_observation in science.py.')
-            run = root / 'run'
-            initialize_code_task(run_dir=run, code_root=root / 'project', task_file=root / 'task.md')
-            pack = build_code_task_context_pack(run, max_files=1, max_source_chars_per_file=500, max_total_chars=500)
-            before = pack.context_pack_path.read_bytes()
-            captured = []
-            def answer(client, **kwargs):
-                captured.extend(kwargs['snippets'])
-                return {'summary': 'Use saved source.', 'items': [{'id': 'W1',
-                    'objective': 'Fix observed source.', 'target_files': ['science.py']}]}
-            with patch('simple_ar.code_task.analysis.context.build_code_task_context_pack') as build, \
-                    patch('simple_ar.code_task.editing.work_plan.LLMClient.for_task', return_value=object()), \
-                    patch('simple_ar.code_task.editing.work_plan._ask_llm_for_work_plan', side_effect=answer):
-                generate_code_task_work_plan(run, llm_client=object(), max_files=1, max_source_chars_per_file=200)
-                build.assert_not_called()
-            self.assertGreater(captured[0]['source_offset'], 0)
-            self.assertEqual(captured[0]['text'], text[captured[0]['source_offset']:][:200])
-            self.assertNotIn('[truncated]', captured[0]['text'])
-            self.assertEqual(pack.context_pack_path.read_bytes(), before)
-
-    def test_fresh_model_planning_uses_bounded_definition_and_preserves_pack(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            project = root / 'project'
-            text = '# unrelated prefix\n' * 300 + 'def calibrate_observation(x):\n    return x * 2\n'
-            write_text(project / 'science.py', text)
-            write_text(root / 'task.md', 'Fix calibrate_observation in science.py.')
-            run = root / 'run'
-            initialize_code_task(run_dir=run, code_root=project, task_file=root / 'task.md')
-            captured = []
-            def answer(client, **kwargs):
-                captured.extend(kwargs['snippets'])
-                return {'summary': 'Use the observed definition.', 'files_to_modify': []}
-            with patch('simple_ar.code_task.editing.planning.LLMClient.for_task', return_value=object()), \
-                    patch('simple_ar.code_task.editing.planning._ask_llm_for_plan', side_effect=answer):
-                generate_patch_plan(run, llm_client=object(), max_files=1, max_source_chars_per_file=180)
-            self.assertEqual(len(captured), 1)
-            self.assertTrue(captured[0]['text'].startswith('def calibrate_observation'))
-            self.assertGreater(captured[0]['source_offset'], 0)
-            manifest = read_json(run / 'manifest.json')
-            loaded = load_latest_code_task_context_pack(run)
-            self.assertIsNotNone(loaded)
-            self.assertEqual(manifest['plan']['context_pack']['path'], manifest['context_pack']['latest'])
-            self.assertLessEqual(loaded.context_pack['budget']['used_chars'], 180)
-            before = loaded.context_pack_path.read_bytes()
-            with patch('simple_ar.code_task.analysis.context.build_code_task_context_pack') as build, \
-                    patch('simple_ar.code_task.editing.planning.LLMClient.for_task', return_value=object()), \
-                    patch('simple_ar.code_task.editing.planning._ask_llm_for_plan', side_effect=answer):
-                generate_patch_plan(run, force=True, llm_client=object(), max_files=1, max_source_chars_per_file=180)
-                build.assert_not_called()
-            self.assertEqual(loaded.context_pack_path.read_bytes(), before)
+    def test_both_planners_keep_bounded_source_and_reuse_saved_coordinates(self):
+        for generate, owner, response, limit in (
+            (generate_patch_plan, 'plan', '_ask_llm_for_plan', 180),
+            (generate_code_task_work_plan, 'work_plan', '_ask_llm_for_work_plan', 200),
+        ):
+            module = 'simple_ar.code_task.editing.' + ('planning' if owner == 'plan' else owner)
+            for cached in (False, True):
+                with self.subTest(owner=owner, cached=cached), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    text = '# unrelated prefix\n' * 300 + 'def calibrate_observation(x):\n' + '    x += 1\n' * 40 + '    return x\n'
+                    write_text(root / 'project/science.py', text)
+                    write_text(root / 'task.md', 'Fix calibrate_observation in science.py.')
+                    run = root / 'run'
+                    initialize_code_task(run_dir=run, code_root=root / 'project', task_file=root / 'task.md')
+                    if cached:
+                        pack = build_code_task_context_pack(run, max_files=1,
+                            max_source_chars_per_file=500, max_total_chars=500)
+                        retained = pack.context_pack_path.read_bytes()
+                    captured = []
+                    def answer(client, **kwargs):
+                        captured.extend(kwargs['snippets'])
+                        return {'summary': 'Use observed source.', 'files_to_modify': [], 'items': [
+                            {'id': 'W1', 'objective': 'Fix the observed definition.', 'target_files': ['science.py']}]}
+                    with patch(module + '.LLMClient.for_task', return_value=object()), \
+                            patch(module + '.' + response, side_effect=answer):
+                        generate(run, llm_client=object(), max_files=1, max_source_chars_per_file=limit)
+                    self.assertEqual(len(captured), 1)
+                    row = captured[0]
+                    self.assertGreater(row['source_offset'], 0)
+                    self.assertTrue(row['text'].startswith('def calibrate_observation'))
+                    self.assertEqual(row['text'], text[row['source_offset']:][:limit])
+                    self.assertNotIn('[truncated]', row['text'])
+                    loaded = load_latest_code_task_context_pack(run)
+                    manifest = read_json(run / 'manifest.json')
+                    self.assertEqual(manifest[owner]['context_pack']['path'], manifest['context_pack']['latest'])
+                    if cached:
+                        self.assertEqual(pack.context_pack_path.read_bytes(), retained)
+                    else:
+                        self.assertLessEqual(loaded.context_pack['budget']['used_chars'], limit)
+                        retained = loaded.context_pack_path.read_bytes()
+                    with patch('simple_ar.code_task.analysis.context.build_code_task_context_pack') as build, \
+                            patch(module + '.LLMClient.for_task', return_value=object()), \
+                            patch(module + '.' + response, side_effect=answer):
+                        generate(run, force=True, llm_client=object(), max_files=1, max_source_chars_per_file=limit)
+                        build.assert_not_called()
+                    self.assertEqual(loaded.context_pack_path.read_bytes(), retained)
+                    self.assertEqual((root / 'project/science.py').read_text(), text)
 
     def test_offline_planning_keeps_existing_no_retrieval_behavior(self):
         with tempfile.TemporaryDirectory() as directory:

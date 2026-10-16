@@ -238,29 +238,6 @@ def write_intake_artifacts(
     return {"brief": brief_path, "assets": assets_path, "markdown": markdown_path}
 
 
-def brief_from_legacy_request(request: Any) -> ResearchBrief:
-    """Map the old topic/local-document request without changing that API."""
-
-    topic = str(getattr(request, "topic", "") or "").strip()
-    local_documents = getattr(request, "local_documents", ()) or ()
-    asset_requests = tuple(
-        {
-            "asset_id": _stable_asset_id(str(path)),
-            "locator": str(path),
-            "kind": _infer_kind(None, str(path)),
-            "role": "paper",
-            "mutability": "read_only",
-            "allowed_uses": ["read", "reference"],
-        }
-        for path in local_documents
-    )
-    return ResearchBrief(
-        request_text=topic,
-        objective=topic,
-        intents=("research",),
-        requested_outputs=("research_summary",),
-        asset_requests=asset_requests,
-    )
 
 
 def _read_request(value: str | Path) -> tuple[str, Path | None, Path | None]:
@@ -528,7 +505,6 @@ _KNOWN_SUFFIXES = {
 
 __all__ = [
     "ResearchInputError",
-    "brief_from_legacy_request",
     "normalize_assets",
     "parse_research_input",
     "validate_brief",

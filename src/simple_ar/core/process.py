@@ -7,7 +7,9 @@ Callers own environment policy, metrics and experiment authorization.
 from __future__ import annotations
 
 import codecs
+import math
 import os
+import re
 import signal
 import subprocess
 import threading
@@ -34,6 +36,7 @@ class ProcessSpec:
     invocation_id: str = field(default_factory=lambda: uuid4().hex)
     session_id: str = ""
     attempt_id: str = ""
+    input_binding: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -144,6 +147,7 @@ def run_process(
     output_callback: Callable[[str, str], None] | None = None,
     cancel: threading.Event | None = None,
     budget_ledger: BudgetLedger | None = None,
+    output_complete_callback: Callable[[], None] | None = None,
 ) -> ProcessResult:
     """Execute one invocation, optionally reserving and settling shared budget.
 
@@ -151,7 +155,8 @@ def run_process(
     starts another process; recovery settles its existing record explicitly.
     """
     if budget_ledger is None:
-        return _run_process(spec, output_callback=output_callback, cancel=cancel)
+        return _run_process(spec, output_callback=output_callback, cancel=cancel,
+                            output_complete_callback=output_complete_callback)
     if spec.output_dir is None:
         raise ValueError("Ledger-backed execution requires a persistent output_dir")
     reservation = f"process-{spec.invocation_id}"
@@ -163,7 +168,8 @@ def run_process(
         logical_call_id=spec.invocation_id, purpose="local_process",
     )
     try:
-        result = _run_process(spec, output_callback=output_callback, cancel=cancel)
+        result = _run_process(spec, output_callback=output_callback, cancel=cancel,
+                              output_complete_callback=output_complete_callback)
     except BaseException:
         record_path = spec.output_dir / "invocation.json"
         if record_path.is_file():
@@ -179,6 +185,29 @@ def run_process(
         raise
     settle_process_record(result.record, budget_ledger)
     return result
+
+
+def verify_process_accounting(record: dict, ledger: BudgetLedger, *, session_id: str,
+                              attempt_id: str, timeout_sec: int) -> None:
+    """Read-only verification of a finalized physical invocation and its ledger."""
+    invocation, duration = record['invocation_id'], record['duration_sec']
+    if (not isinstance(invocation, str) or not re.fullmatch(r'[0-9a-f]{32}', invocation)
+            or record['status'] not in {'finished', 'stopped'}
+            or record['session_id'] != session_id or record['attempt_id'] != attempt_id
+            or record['timeout_sec'] != timeout_sec or type(duration) not in (int, float)
+            or not math.isfinite(duration) or duration < 0):
+        raise ValueError('Invalid finalized process identity or wall-clock observation')
+    entries = [entry for entry in ledger.entries if entry.reservation_id == f'process-{invocation}']
+    if len(entries) != 1:
+        raise ValueError('Process lacks its unique physical reservation')
+    entry = entries[0]
+    if (entry.logical_call_id != invocation or entry.attempt_id != attempt_id
+            or entry.session_id != session_id or entry.status != 'settled'
+            or entry.purpose != 'local_process' or entry.actual_source != 'executor_wall_clock'
+            or entry.reserved != {'process_invocations': 1, 'process_wall_seconds': timeout_sec}
+            or entry.actual != {'process_invocations': 1, 'process_wall_seconds': duration}
+            or type(entry.actual.get('process_invocations')) is not int):
+        raise ValueError('Physical process accounting differs from its reservation and observed wall clock')
 
 
 def settle_process_record(record: dict, ledger: BudgetLedger) -> None:
@@ -197,6 +226,7 @@ def _run_process(
     *,
     output_callback: Callable[[str, str], None] | None,
     cancel: threading.Event | None,
+    output_complete_callback: Callable[[], None] | None = None,
 ) -> ProcessResult:
     """Run argv without a shell; return bounded tails and observed execution facts.
 
@@ -226,6 +256,10 @@ def _run_process(
         "environment_policy": "inherited" if spec.env is None else "caller_supplied",
         "resource_enforcement": {"cpu": "not_enforced", "gpu": "not_enforced", "memory": "not_enforced"},
     }
+    if spec.input_binding is not None:
+        # The caller owns this authority/source identity; retain it with the
+        # actual expanded argv/environment before launch, in the same record.
+        record.update(input_binding=spec.input_binding, environment=spec.env)
 
     def save() -> None:
         if spec.output_dir:
@@ -307,6 +341,8 @@ def _run_process(
                 getattr(process, name).close()
         if any(thread.is_alive() for thread in threads):
             raise RuntimeError("Process descendants retained output pipes after termination")
+    if output_complete_callback is not None:
+        output_complete_callback()
     duration = time.monotonic() - started
     if errors:
         stop_reason = "output_error"

@@ -170,6 +170,7 @@ class ReportExportTests(unittest.TestCase):
         self.assertNotIn(r"\input{", rendered)
         self.assertEqual(_breakable_code('AZ09' * 40), r'\texttt{\seqsplit{' + 'AZ09' * 40 + '}}')
         self.assertIn('{δ}', _breakable_code('δ_parameter'))
+        self.assertEqual(_breakable_code('cmd  "x y"'), r'\texttt{\seqsplit{cmd{\ }{\ }"x{\ }y"}}')
 
     def test_technical_text_wraps_without_rewriting_source_math_or_urls(self):
         with tempfile.TemporaryDirectory() as tmp:

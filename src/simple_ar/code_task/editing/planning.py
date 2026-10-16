@@ -25,8 +25,10 @@ from simple_ar.code_task.analysis.context import (
 )
 from simple_ar.code_task.memory import task_memory_context
 from simple_ar.code_task.analysis.interfaces import render_source_snippets, snippet_api_contract
-from simple_ar.integrations.llm import LLMClient, LLMResponseError
-from simple_ar.code_task.generation.agent_step import response_accounting_known, retry_suffix
+from simple_ar.integrations.llm import LLMClient, LLMError, LLMResponseError
+from simple_ar.code_task.generation.agent_step import (
+    response_accounting_known, retry_suffix, run_completed_response_corrections,
+)
 from simple_ar.integrations.usage import record_usage
 
 
@@ -106,110 +108,31 @@ def generate_patch_plan(
     paths = code_task_paths(root)
     task_dir = paths.task_dir
     meta_dir = paths.meta_dir
-    workspace_dir = paths.workspace_dir
     patch_plan_path = task_dir / "patch_plan.md"
     manifest_path = paths.manifest_path
     if patch_plan_path.exists() and not force:
         raise FileExistsError(f"Patch plan already exists: {patch_plan_path}")
 
-    manifest = _load_code_task_manifest(manifest_path)
-    task_text = _read_required_text(task_dir / "task.md")
-    index = _read_required_json(meta_dir / "codebase_index.json")
-    allowed_patterns = allowed_patterns_from_manifest(manifest)
-    protected_patterns = protected_patterns_from_manifest(manifest)
-    run_context = _collect_run_context(root, manifest)
-    memory_context = task_memory_context(root)
-    if use_llm:
-        loaded_context = ensure_code_task_context_pack(root, query=task_text, max_files=max_files,
-            max_source_chars_per_file=max_source_chars_per_file)
-        # The context builder owns its manifest references; don't overwrite
-        # them later with the pre-build planning snapshot.
-        manifest = _load_code_task_manifest(manifest_path)
-    else:
-        loaded_context = load_latest_code_task_context_pack(root)
-    context_pack_ref: dict[str, Any] | None = None
-    if loaded_context is not None and loaded_context.selected_files:
-        selected = loaded_context.selected_paths(max_files=max_files)
-        snippets = _context_pack_snippets(
-            loaded_context,
-            max_files=max_files,
-            max_chars_per_file=max_source_chars_per_file,
-            include_read_only=True,
-        )
-        context_pack_ref = loaded_context.manifest_reference(root)
-        _emit(message_callback, f"Using code-task context pack: {context_pack_ref['path']}")
-        if not snippets:
-            _emit(message_callback, "Context pack has no readable snippets; falling back to index selection.")
-            selected = []
-            context_pack_ref = None
-    else:
-        selected = []
-        snippets = []
-
-    if not selected:
-        selected = select_relevant_files(index, task_text, max_files=max_files)
-        snippets = read_source_snippets(
-            workspace_dir,
-            selected,
-            max_chars_per_file=max_source_chars_per_file,
-        )
-
-    mode = "offline"
-    plan_data: dict[str, Any] | None = None
-    if use_llm:
-        client = LLMClient.for_task(
-            client=llm_client, model=model,
-            usage_callback=lambda usage: record_usage(meta_dir, usage,
-                stage="code_task.plan", message_callback=message_callback),
-        )
-        last_error: LLMResponseError | None = None
-        for attempt in range(1, llm_retry_attempts + 1):
-            try:
-                suffix = f" (attempt {attempt}/{llm_retry_attempts})" if llm_retry_attempts > 1 else ""
-                _emit(message_callback, f"Calling LLM for code-task patch planning{suffix}.")
-                plan_data = _ask_llm_for_plan(
-                    client,
-                    task_text=task_text,
-                    index=index,
-                    snippets=snippets,
-                    benchmark_command=_benchmark_command(manifest),
-                    run_context=run_context,
-                    memory_context=memory_context,
-                    allowed_patterns=allowed_patterns,
-                    protected_patterns=protected_patterns,
-                    retry_feedback=retry_suffix(last_error, attempt),
-                )
-                mode = "llm"
-                break
-            except LLMResponseError as exc:
-                write_json(meta_dir / "planning_steps" / f"patch-plan-response-{attempt:03d}.json",
-                    {"error": str(exc), "raw_response": exc.raw_response})
-                if not response_accounting_known(client):
-                    raise
-                last_error = exc
-                _emit(message_callback, f"LLM patch planning attempt {attempt} failed: {exc}")
-        if plan_data is None and last_error is not None:
-            if allow_llm_fallback:
-                _emit(message_callback, f"Using offline fallback after LLM patch planning failed. {last_error}")
-            else:
-                raise last_error
-
-    if plan_data is None:
-        plan_data = _offline_plan(
-            task_text=task_text,
-            index=index,
-            selected_files=selected,
-            benchmark_command=_benchmark_command(manifest),
-            run_context=run_context,
-            allowed_patterns=allowed_patterns,
-            protected_patterns=protected_patterns,
-        )
+    manifest, inputs, selected, context_pack_ref = _prepare_planning_context(
+        root, use_llm=use_llm, max_files=max_files,
+        max_source_chars_per_file=max_source_chars_per_file,
+        message_callback=message_callback,
+    )
+    inputs["benchmark_command"] = _benchmark_command(manifest)
+    plan_data, mode = _generate_plan_data(
+        meta_dir, inputs=inputs, selected_files=selected,
+        ask=_ask_llm_for_plan, offline=_offline_plan,
+        plan_name="patch", usage_stage="code_task.plan",
+        model=model, use_llm=use_llm, llm_client=llm_client,
+        llm_retry_attempts=llm_retry_attempts,
+        allow_llm_fallback=allow_llm_fallback, message_callback=message_callback,
+    )
 
     markdown = _render_patch_plan(
         plan_data,
-        task_text=task_text,
+        task_text=inputs["task_text"],
         selected_files=selected,
-        run_context=run_context,
+        run_context=inputs["run_context"],
         context_pack=context_pack_ref,
         mode=mode,
     )
@@ -218,7 +141,7 @@ def generate_patch_plan(
         manifest_path,
         manifest,
         selected_files=selected,
-        run_context=run_context,
+        run_context=inputs["run_context"],
         context_pack=context_pack_ref,
         mode=mode,
     )
@@ -230,6 +153,129 @@ def generate_patch_plan(
         selected_files=tuple(selected),
         pending_approval=True,
     )
+
+
+def _prepare_planning_context(
+    run_dir: Path,
+    *,
+    use_llm: bool,
+    max_files: int,
+    max_source_chars_per_file: int,
+    message_callback: MessageCallback | None,
+) -> tuple[dict[str, Any], dict[str, Any], list[str], dict[str, Any] | None]:
+    """Prepare the shared inputs for both planning entry points.
+
+    Offline planning only reads saved context. The pack owner may update the
+    manifest online, so return its latest snapshot for the eventual plan write.
+    """
+    paths = code_task_paths(run_dir)
+    manifest = _load_code_task_manifest(paths.manifest_path)
+    task_text = _read_required_text(paths.task_dir / "task.md")
+    index = _read_required_json(paths.meta_dir / "codebase_index.json")
+    allowed_patterns = allowed_patterns_from_manifest(manifest)
+    protected_patterns = protected_patterns_from_manifest(manifest)
+    run_context = _collect_run_context(run_dir, manifest)
+    memory_context = task_memory_context(run_dir)
+    if use_llm:
+        loaded = ensure_code_task_context_pack(
+            run_dir, query=task_text, max_files=max_files,
+            max_source_chars_per_file=max_source_chars_per_file,
+        )
+        manifest = _load_code_task_manifest(paths.manifest_path)
+    else:
+        loaded = load_latest_code_task_context_pack(run_dir)
+
+    selected: list[str] = []
+    snippets: list[dict[str, Any]] = []
+    context_pack_ref = None
+    if loaded is not None and loaded.selected_files:
+        selected = loaded.selected_paths(max_files=max_files)
+        snippets = _context_pack_snippets(
+            loaded, max_files=max_files,
+            max_chars_per_file=max_source_chars_per_file,
+        )
+        context_pack_ref = loaded.manifest_reference(run_dir)
+        _emit(message_callback, f"Using code-task context pack: {context_pack_ref['path']}")
+        if not snippets:
+            _emit(message_callback, "Context pack has no readable snippets; falling back to index selection.")
+
+    if not selected or not snippets:
+        selected = select_relevant_files(index, task_text, max_files=max_files)
+        snippets = read_source_snippets(
+            paths.workspace_dir, selected,
+            max_chars_per_file=max_source_chars_per_file,
+            editable_files=[path for path in selected if is_edit_allowed_path(
+                path, allowed_patterns=allowed_patterns, protected_patterns=protected_patterns)],
+        )
+        # The legacy source reader has a 200-character floor. Planning must
+        # still honor smaller caller budgets, including patch-plan's 180.
+        snippets = [clip_source_snippet(row, max_chars=max(1, max_source_chars_per_file))
+                    for row in snippets]
+        context_pack_ref = None
+
+    return manifest, {
+        "task_text": task_text,
+        "index": index,
+        "snippets": snippets,
+        "run_context": run_context,
+        "memory_context": memory_context,
+        "allowed_patterns": allowed_patterns,
+        "protected_patterns": protected_patterns,
+    }, selected, context_pack_ref
+
+
+def _generate_plan_data(
+    meta_dir: Path,
+    *,
+    inputs: dict[str, Any],
+    selected_files: list[str],
+    ask: Callable[..., dict[str, Any]],
+    offline: Callable[..., dict[str, Any]],
+    plan_name: str,
+    usage_stage: str,
+    model: str | None,
+    use_llm: bool,
+    llm_client: LLMClient | None,
+    llm_retry_attempts: int,
+    allow_llm_fallback: bool,
+    message_callback: MessageCallback | None,
+) -> tuple[dict[str, Any], str]:
+    """Adapt planning to the existing completed-response correction owner."""
+    if use_llm:
+        client = LLMClient.for_task(
+            client=llm_client, model=model,
+            usage_callback=lambda usage: record_usage(
+                meta_dir, usage, stage=usage_stage, message_callback=message_callback),
+        )
+
+        def operation(attempt: int, last_error: LLMError | None) -> dict[str, Any]:
+            suffix = f" (attempt {attempt}/{llm_retry_attempts})" if llm_retry_attempts > 1 else ""
+            _emit(message_callback, f"Calling LLM for code-task {plan_name} planning{suffix}.")
+            return ask(client, **inputs, retry_feedback=retry_suffix(last_error, attempt))
+
+        def on_failure(exc: LLMError, attempt: int, correct: bool) -> None:
+            if isinstance(exc, LLMResponseError):
+                write_json(meta_dir / "planning_steps" / f"{plan_name}-plan-response-{attempt:03d}.json",
+                    {"error": str(exc), "raw_response": exc.raw_response})
+                if response_accounting_known(client):
+                    _emit(message_callback, f"LLM {plan_name} planning attempt {attempt} failed: {exc}")
+
+        try:
+            return run_completed_response_corrections(
+                client=client, operation=operation, retry_attempts=llm_retry_attempts,
+                on_failure=on_failure,
+            ), "llm"
+        except LLMResponseError as exc:
+            if not allow_llm_fallback or not response_accounting_known(client):
+                raise
+            _emit(message_callback, f"Using offline fallback after LLM {plan_name} planning failed. {exc}")
+
+    return offline(
+        task_text=inputs["task_text"], index=inputs["index"],
+        selected_files=selected_files, benchmark_command=inputs["benchmark_command"],
+        run_context=inputs["run_context"], allowed_patterns=inputs["allowed_patterns"],
+        protected_patterns=inputs["protected_patterns"],
+    ), "offline"
 
 
 def record_plan_decision(
@@ -283,7 +329,7 @@ def record_plan_decision(
         "reject": "rejected",
         "revise": "revision_requested",
     }
-    plan = _dict_value(manifest, "plan")
+    plan = _object_dict(manifest.get("plan"))
     plan["status"] = status_by_decision[normalized]
     plan["last_decision"] = row
     manifest["plan"] = plan
@@ -819,8 +865,13 @@ def _offline_context_step(run_context: dict[str, Any]) -> str:
 
 
 def _manifest_plan_context(run_context: dict[str, Any]) -> dict[str, Any]:
+    context = _manifest_run_context(run_context)
+    context["validation_status"] = _object_dict(run_context.get("validation")).get("status")
+    return context
+
+
+def _manifest_run_context(run_context: dict[str, Any]) -> dict[str, Any]:
     environment = _object_dict(run_context.get("environment"))
-    validation = _object_dict(run_context.get("validation"))
     baseline = _object_dict(run_context.get("baseline"))
     return {
         "available_artifacts": run_context.get("available_artifacts", []),
@@ -828,7 +879,6 @@ def _manifest_plan_context(run_context: dict[str, Any]) -> dict[str, Any]:
         "environment_mode": environment.get("mode"),
         "baseline_status": baseline.get("status"),
         "baseline_metrics": baseline.get("metrics", {}),
-        "validation_status": validation.get("status"),
     }
 
 
@@ -841,7 +891,7 @@ def _update_manifest_after_plan(
     context_pack: dict[str, Any] | None,
     mode: str,
 ) -> None:
-    plan = _dict_value(manifest, "plan")
+    plan = _object_dict(manifest.get("plan"))
     plan.update(
         {
             "status": "pending_approval",
@@ -853,7 +903,7 @@ def _update_manifest_after_plan(
             "context": _manifest_plan_context(run_context),
         }
     )
-    layout = _dict_value(manifest, "layout")
+    layout = _object_dict(manifest.get("layout"))
     layout["patch_plan"] = "code_task/patch_plan.md"
     manifest["layout"] = layout
     manifest["plan"] = plan
@@ -879,7 +929,7 @@ def _context_pack_snippets(
         text = row.get("text")
         if not path or not isinstance(text, str):
             continue
-        snippets.append(clip_source_snippet(row, max_chars=max(200, max_chars_per_file)))
+        snippets.append(clip_source_snippet(row, max_chars=max(1, max_chars_per_file)))
         if len(snippets) >= max(1, max_files):
             break
     return snippets
@@ -906,10 +956,13 @@ def _read_optional_json(path: Path) -> dict[str, Any]:
 
 
 def _index_files(index: dict[str, Any]) -> list[dict[str, Any]]:
-    files = index.get("files", [])
-    if not isinstance(files, list):
+    return _object_list(index.get("files"))
+
+
+def _object_list(value: object) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
         return []
-    return [item for item in files if isinstance(item, dict)]
+    return [item for item in value if isinstance(item, dict)]
 
 
 def _file_haystack(item: dict[str, Any]) -> str:
@@ -983,11 +1036,6 @@ def _benchmark_command(manifest: dict[str, Any]) -> str:
         command = benchmark.get("command")
         return str(command) if command else ""
     return ""
-
-
-def _dict_value(data: dict[str, Any], key: str) -> dict[str, Any]:
-    value = data.get(key)
-    return value if isinstance(value, dict) else {}
 
 
 def _object_dict(value: object) -> dict[str, Any]:

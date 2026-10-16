@@ -14,6 +14,7 @@ from typing import Any, Mapping
 
 from simple_ar.code_task.analysis.interfaces import public_api
 from simple_ar.code_task.generation.common import safe_relative_path
+from simple_ar.core.artifacts import write_atomically
 
 
 def looks_like_diff_fragment(text: str) -> bool:
@@ -227,8 +228,7 @@ def _apply_one_action(
 
     if after_text == before_text:
         return None
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(after_text, encoding="utf-8")
+    write_atomically(path, after_text)
     after_api = public_api(path) if path.suffix == ".py" else []
     return {
         "action": action,

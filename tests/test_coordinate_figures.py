@@ -11,7 +11,6 @@ from unittest.mock import patch
 import xml.etree.ElementTree as ET
 from tests import captured_data_figures
 
-from simple_ar.cli.main import main
 from simple_ar.cli.parser import build_parser
 from simple_ar.cli.research_config import research_defaults
 from simple_ar.cli.start import prepare_start
@@ -337,7 +336,10 @@ class CoordinateAssociationTests(unittest.TestCase):
         self.assertAlmostEqual(view['coordinate_summaries'][0]['association']['coefficient'], 1)
         self.assertIn('descriptive complete-pair Pearson', view['coordinate_summary_scope'])
 
-    def test_cli_config_execution_recovery_moving_and_tampering_use_same_owner(self):
+    def test_association_config_package_moving_rebuild_and_tampering_use_same_owner(self):
+        from simple_ar.core.budget import BudgetLedger
+        from simple_ar.tools.analysis import AnalysisToolGateway
+        from simple_ar.tools.workspace import WorkspaceToolGateway
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / 'points.csv'
@@ -349,13 +351,12 @@ class CoordinateAssociationTests(unittest.TestCase):
             with patch('sys.stdin.isatty', return_value=False), contextlib.redirect_stdout(io.StringIO()):
                 config = prepare_start(build_parser().parse_args(argv))
             self.assertEqual(research_defaults(['research-session', '--config', str(config)])['data_association'], 'pearson')
-            with patch('simple_ar.cli.main._optional_research_llm_client', side_effect=AssertionError('No API')), contextlib.redirect_stdout(io.StringIO()):
-                main(['research-session', '--config', str(config)])
-                package = next(config.parent.glob('sessions/*/attempts/data_analysis-*/analysis.json'))
-                before = package.read_bytes()
-                source.unlink()
-                main(['research-session', '--session-root', str(package.parents[2]), '--model', 'env'])
-                self.assertEqual(package.read_bytes(), before)
+            workspace = WorkspaceToolGateway(root, {'source0': source}, BudgetLedger({}))
+            result = AnalysisToolGateway(root, workspace).call('analyze_table',
+                {'path': 'source0', 'spec': self.spec().to_config()}, identity='association')
+            self.assertTrue(result.ok, result.error)
+            package = workspace.resolve(result.data['analysis'])
+            source.unlink()
             moved = root / 'moved'
             shutil.copytree(package.parent, moved)
             restored, _, _ = load_analysis_package(moved / 'analysis.json')

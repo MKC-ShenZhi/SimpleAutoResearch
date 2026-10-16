@@ -269,29 +269,29 @@ def fallback_architecture_plan(
     resource_plan: Mapping[str, Any],
     domain_profile: Mapping[str, Any],
 ) -> dict[str, Any]:
+    """Build a development scaffold, not a guessed task implementation.
+
+    Resource limits remain ceilings. Task wording and spare file capacity do
+    not justify inventing modules or pretending the measurement exists.
+    """
     primary_metric = str(result_schema.get("primary_metric") or "score")
     required = result_schema.get("required_metrics")
     required_metrics = [str(item) for item in required if str(item).strip()] if isinstance(required, list) else []
     if primary_metric and primary_metric not in required_metrics:
         required_metrics.insert(0, primary_metric)
     objective = clean_text(contract.get("objective")) or "Run a bounded local experiment."
-    expected_entrypoints = domain_profile.get("expected_entrypoints")
-    entrypoint_hint = ""
-    if isinstance(expected_entrypoints, list) and expected_entrypoints:
-        entrypoint_hint = f" Domain entrypoint hint: {expected_entrypoints[0]}."
     plan = {
         "schema_version": "greenfield_architecture.v1",
         "mode": "greenfield_project",
         "objective": objective,
         "architecture_summary": (
-            "A compact generated project with a Python entrypoint, a small "
-            "experiment module, a JSON config, and machine-readable metric output."
-            + entrypoint_hint
+            "A minimal development scaffold with a Python entrypoint and configuration. "
+            "The runner refuses measurement until the requested implementation is supplied."
         ),
         "data_flow": [
             "Load lightweight configuration from config.json.",
-            "Run a deterministic local experiment/evaluation function.",
-            "Print every required metric as `name: value` for the execution parser.",
+            "Stop with an actionable unimplemented-measurement error until the task is implemented.",
+            "Only implemented computation may print required metrics as `name: value`.",
         ],
         "interfaces": [
             "`python main.py` is the execution command.",
@@ -299,18 +299,13 @@ def fallback_architecture_plan(
         ],
         "test_strategy": [
             "Run the configured command under the local ExecutionBackend.",
-            "Validate required metrics through result_schema and guard_report.",
+            "Confirm the unimplemented runner cannot emit successful measurement metrics.",
         ],
         "risks": [
-            "Fallback generation is a conservative runnable scaffold, not a domain-specific breakthrough.",
+            "The fallback is a development scaffold, not a completed task or measured result.",
             "LLM-generated files still require review and run guard validation.",
         ],
-        "files": _fallback_files(
-            required_metrics,
-            _positive_int(resource_plan.get("max_files"), 8),
-            contract=contract,
-            domain_profile=domain_profile,
-        ),
+        "files": _fallback_files(required_metrics),
     }
     return normalize_architecture_plan(plan, contract=contract, resource_plan=resource_plan)
 
@@ -446,32 +441,6 @@ def greenfield_architecture_prompt(
     domain_profile: Mapping[str, Any],
     retry_feedback: str = "",
 ) -> str:
-    max_files = _positive_int(resource_plan.get("max_files"), 8)
-    max_lines = _positive_int(resource_plan.get("max_generated_lines"), 1200)
-    if max_files >= 16 or max_lines >= 4000:
-        size_guidance = (
-            "- This is a medium-scale greenfield project: use 10-18 cohesive files when the task warrants it, "
-            "with clear modules for configuration, input loading/adaptation, processing or analysis, reusable "
-            "domain logic, execution orchestration, evaluation, reporting, CLI, diagnostics, and smoke tests.\n"
-            "- Prefer a maintainable package layout over one very large file, but do not create filler files just "
-            "to hit the budget.\n"
-            "- Preserve the task file's requested capabilities and acceptance criteria unless they conflict with "
-            "explicit resource limits.\n"
-        )
-    elif max_files >= 8 or max_lines >= 1400:
-        size_guidance = (
-            "- This is a medium-light local experiment: use 6-10 cohesive files when helpful, "
-            "with clear modules for inputs, processing or analysis, domain logic, metrics/checks, "
-            "execution orchestration, reporting/formatting, configuration, and self-checks.\n"
-            "- Keep modules purposeful; do not create filler files just to hit the budget.\n"
-            "- Preserve the task file's requested module boundaries unless they conflict with the resource budget.\n"
-        )
-    else:
-        size_guidance = (
-            "- Prefer 3-5 files for ordinary compact local experiments; do not add test files "
-            "unless they use only the standard library.\n"
-            "- Prefer a compact runnable project over a broad framework.\n"
-        )
     return (
         "Design a bounded greenfield project from this contract. "
         "Return JSON with fields: objective, architecture_summary, data_flow, "
@@ -483,13 +452,15 @@ def greenfield_architecture_prompt(
         "- Keep paths relative to the generated project root. If the run command names a directory such as "
         "`generated_project/main.py`, treat that directory as the generated project root and use `main.py` in the plan.\n"
         "- Include `main.py` as the command-line entrypoint relative to that root.\n"
-        "- Keep file count within resource_plan.max_files.\n"
-        f"{size_guidance}"
+        "- File and line budgets are upper limits, not target sizes or required module counts.\n"
+        "- Choose the smallest cohesive design that satisfies the actual contract within those limits. "
+        "Preserve requested responsibilities without filling spare capacity or inferring task complexity from the budget.\n"
         "- The entrypoint must print all required metrics as `metric_name: number`.\n"
         "- Define exactly one authoritative experiment orchestrator. Helper modules "
         "must not each reimplement their own full dataset/model/metric pipeline.\n"
-        "- You may use task-relevant installed packages listed in domain_profile.available_task_relevant_packages. "
-        "Do not require package installation during execution; provide fallbacks for optional packages when practical.\n"
+        "- Dependency lists are metadata observations scoped to their recorded interpreter, not proven imports or a whitelist. "
+        "An uninspected target is unknown, not an empty environment. Select libraries from actual task requirements; "
+        "installation requires separate authorization. Missing dependencies do not authorize replacing methods, data or evaluation conditions.\n"
         "- Design dependency interfaces before implementation. Every cross-file call must use an exact name "
         "declared in the dependency file's public_api; do not use vague prose as an interface contract.\n"
         "- Convert explicit task requirements into concrete module responsibilities, data structures, and "
@@ -520,27 +491,14 @@ GREENFIELD_ARCHITECT_SYSTEM = (
 
 def _fallback_files(
     required_metrics: list[str],
-    max_files: int = 4,
-    *,
-    contract: Mapping[str, Any] | None = None,
-    domain_profile: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     metric_note = ", ".join(required_metrics) if required_metrics else "configured metrics"
-    task_text = " ".join(
-        [
-            clean_text((contract or {}).get("objective")),
-            clean_text((contract or {}).get("task")),
-            clean_text((domain_profile or {}).get("task_excerpt")),
-        ]
-    ).lower()
-    if max_files >= 8:
-        return _fallback_capability_files(metric_note, max_files, task_text)
     return [
         {
             "path": "main.py",
             "purpose": "Command-line entrypoint that calls the generated experiment runner.",
             "dependencies": ["generated_experiment/runner.py", "config.json"],
-            "acceptance_criteria": [f"Prints {metric_note} as parseable metric lines."],
+            "acceptance_criteria": [f"After implementation, prints {metric_note} as parseable metric lines; otherwise fails without invented metrics."],
             "entrypoint": True,
         },
         {
@@ -552,209 +510,19 @@ def _fallback_files(
         },
         {
             "path": "generated_experiment/runner.py",
-            "purpose": "Implements the bounded local experiment and returns metrics.",
+            "purpose": "Implementation placeholder; refuses measurement until the requested task is implemented.",
             "dependencies": ["config.json"],
-            "acceptance_criteria": [f"Returns numeric values for {metric_note}."],
+            "acceptance_criteria": ["Unimplemented measurement raises an actionable error, not a successful result."],
             "entrypoint": False,
         },
         {
             "path": "config.json",
             "purpose": "Small, auditable experiment configuration.",
             "dependencies": [],
-            "acceptance_criteria": ["Contains metric defaults and task metadata."],
+            "acceptance_criteria": ["Contains declared metric names and task metadata."],
             "entrypoint": False,
         },
     ]
-
-
-def _fallback_capability_files(metric_note: str, max_files: int, task_text: str) -> list[dict[str, Any]]:
-    """Build a generic fallback plan from requested capabilities.
-
-    The LLM planner remains the preferred path. This fallback only prevents a
-    planning failure from collapsing a medium task into one tiny file. It
-    deliberately avoids domain-specific templates; modules are selected by
-    broad capability words present in the task, then filled to a sensible
-    minimum when the resource budget is large.
-    """
-
-    selected = {"main", "package", "config_json", "runner", "core", "metrics"}
-    if _mentions_any(task_text, ("config", "preset", "setting", "schema", "option", "parameter")):
-        selected.add("config")
-    if _mentions_any(task_text, ("input", "data", "dataset", "file", "csv", "jsonl", "source", "ingest", "load")):
-        selected.add("inputs")
-    if _mentions_any(task_text, ("parse", "preprocess", "feature", "transform", "normalize", "token", "extract")):
-        selected.add("processing")
-    if _mentions_any(task_text, ("analy", "inspect", "audit", "rank", "screen", "compare", "evaluate", "experiment")):
-        selected.add("analysis")
-    if _mentions_any(task_text, ("report", "artifact", "result", "table", "markdown", "jsonl", "rich", "export")):
-        selected.add("reporting")
-    if _mentions_any(task_text, ("self-check", "self check", "test", "validate", "quality", "guard", "review")):
-        selected.add("validation")
-    if _mentions_any(task_text, ("resource", "gpu", "cuda", "memory", "hardware", "profile", "timeout")):
-        selected.add("resources")
-    if _mentions_any(task_text, ("readme", "documentation", "docs", "usage guide", "open-source", "open source")):
-        selected.add("readme")
-
-    if max_files >= 8:
-        selected.update(("config", "inputs", "analysis", "reporting"))
-    if max_files >= 12:
-        selected.update(("processing", "validation", "resources", "readme"))
-
-    catalog = _generic_file_catalog(metric_note)
-    order = [
-        "main",
-        "readme",
-        "config_json",
-        "package",
-        "runner",
-        "config",
-        "inputs",
-        "processing",
-        "core",
-        "metrics",
-        "analysis",
-        "reporting",
-        "validation",
-        "resources",
-    ]
-    files = [catalog[key] for key in order if key in selected][: max(1, max_files)]
-    return files
-
-
-def _generic_file_catalog(metric_note: str) -> dict[str, dict[str, Any]]:
-    return {
-        "main": {
-            "path": "main.py",
-            "purpose": "Thin command-line entrypoint that resolves arguments, calls the orchestrator, and prints metrics.",
-            "dependencies": [
-                "generated_experiment/runner.py",
-                "generated_experiment/validation.py",
-                "generated_experiment/reporting.py",
-                "config.json",
-            ],
-            "acceptance_criteria": [f"Prints {metric_note} as parseable metric lines."],
-            "entrypoint": True,
-            "public_api": ["main(argv=None)"],
-        },
-        "readme": {
-            "path": "README.md",
-            "purpose": "Generated project usage guide and extension notes.",
-            "dependencies": [],
-            "acceptance_criteria": ["Documents the run command, extension points, and fallback behavior."],
-            "entrypoint": False,
-            "public_api": [],
-        },
-        "config_json": {
-            "path": "config.json",
-            "purpose": "Auditable default configuration with bounded presets or settings.",
-            "dependencies": [],
-            "acceptance_criteria": ["Declares default runtime settings and required metric names."],
-            "entrypoint": False,
-            "public_api": [],
-        },
-        "package": {
-            "path": "generated_experiment/__init__.py",
-            "purpose": "Package marker for generated project code.",
-            "dependencies": [],
-            "acceptance_criteria": ["Importing generated_experiment succeeds."],
-            "entrypoint": False,
-            "public_api": [],
-        },
-        "config": {
-            "path": "generated_experiment/config.py",
-            "purpose": "Configuration loading, normalization, and preset resolution helpers.",
-            "dependencies": ["config.json"],
-            "acceptance_criteria": ["Resolves user settings into a bounded runtime configuration."],
-            "entrypoint": False,
-            "public_api": ["load_config(config_path=None) -> RuntimeConfig", "resolve_runtime_options(config, overrides=None) -> RuntimeOptions"],
-        },
-        "inputs": {
-            "path": "generated_experiment/inputs.py",
-            "purpose": "Input/source loading and provenance tracking for the generated task.",
-            "dependencies": ["generated_experiment/config.py"],
-            "acceptance_criteria": ["Loads task inputs deterministically and records provenance/fallback status."],
-            "entrypoint": False,
-            "public_api": ["list_sources() -> list[SourceSpec]", "load_input_bundle(config, source='auto') -> InputBundle"],
-        },
-        "processing": {
-            "path": "generated_experiment/processing.py",
-            "purpose": "Deterministic preprocessing or transformation pipeline shared by the runner.",
-            "dependencies": ["generated_experiment/inputs.py"],
-            "acceptance_criteria": ["Transforms loaded inputs without hidden global state or network access."],
-            "entrypoint": False,
-            "public_api": ["build_processor(config) -> Processor", "process_bundle(bundle, processor) -> ProcessedBundle"],
-        },
-        "core": {
-            "path": "generated_experiment/core.py",
-            "purpose": "Reusable domain logic for the requested project.",
-            "dependencies": ["generated_experiment/processing.py"],
-            "acceptance_criteria": ["Exposes cohesive functions/classes used by the orchestrator instead of embedding all logic in main.py."],
-            "entrypoint": False,
-            "public_api": ["build_conditions(config, processed=None) -> list[Condition]", "run_condition(condition, processed, config) -> ConditionResult"],
-        },
-        "metrics": {
-            "path": "generated_experiment/metrics.py",
-            "purpose": "Metric, score, and resource accounting helpers.",
-            "dependencies": [],
-            "acceptance_criteria": ["Returns numeric values for required metric calculations."],
-            "entrypoint": False,
-            "public_api": ["compute_metrics(records, config=None) -> dict[str, float]", "safe_float(value, default=0.0) -> float"],
-        },
-        "analysis": {
-            "path": "generated_experiment/analysis.py",
-            "purpose": "Aggregate condition/task outputs into comparisons, diagnostics, or evaluation summaries.",
-            "dependencies": ["generated_experiment/core.py", "generated_experiment/metrics.py"],
-            "acceptance_criteria": ["Produces auditable records and final summary values without duplicating orchestration."],
-            "entrypoint": False,
-            "public_api": ["analyze_records(records, config=None) -> AnalysisSummary"],
-        },
-        "reporting": {
-            "path": "generated_experiment/reporting.py",
-            "purpose": "Write human-readable and machine-readable run artifacts.",
-            "dependencies": ["generated_experiment/analysis.py"],
-            "acceptance_criteria": ["Keeps stdout parseable while preserving detailed outputs in artifact files."],
-            "entrypoint": False,
-            "public_api": ["final_metrics_from_summary(summary, context=None) -> dict[str, float]", "write_run_artifacts(summary, metrics, output_dir) -> dict[str, str]"],
-        },
-        "validation": {
-            "path": "generated_experiment/validation.py",
-            "purpose": "Offline self-checks and validation gates for generated behavior.",
-            "dependencies": ["generated_experiment/config.py", "generated_experiment/metrics.py"],
-            "acceptance_criteria": ["Self-checks run without network and return numeric status metrics."],
-            "entrypoint": False,
-            "public_api": ["run_self_check(config=None) -> dict[str, float]"],
-        },
-        "resources": {
-            "path": "generated_experiment/resources.py",
-            "purpose": "Runtime resource detection and bounded profile selection.",
-            "dependencies": [],
-            "acceptance_criteria": ["Detects CPU/GPU/resource hints without assuming a specific machine."],
-            "entrypoint": False,
-            "public_api": ["detect_resources() -> ResourceInfo", "select_profile(resources, config=None) -> str"],
-        },
-        "runner": {
-            "path": "generated_experiment/runner.py",
-            "purpose": "Single authoritative orchestrator for the requested task.",
-            "dependencies": [
-                "generated_experiment/config.py",
-                "generated_experiment/inputs.py",
-                "generated_experiment/processing.py",
-                "generated_experiment/core.py",
-                "generated_experiment/analysis.py",
-                "generated_experiment/reporting.py",
-                "generated_experiment/validation.py",
-                "generated_experiment/resources.py",
-            ],
-            "acceptance_criteria": [f"Returns numeric values for {metric_note} and writes required artifacts when requested."],
-            "entrypoint": False,
-            "public_api": ["run_experiment(preset='smoke', data_source='auto', mode='run', config=None) -> dict[str, float]"],
-        },
-    }
-
-
-def _mentions_any(text: str, needles: tuple[str, ...]) -> bool:
-    return any(needle in text for needle in needles)
-
 
 def _main_file_spec() -> dict[str, Any]:
     return {

@@ -1,6 +1,5 @@
 """A local bad observation must not erase valid peers or certify a batch."""
 import copy
-import json
 import unittest
 
 from pydantic import ValidationError
@@ -103,40 +102,48 @@ class PartialReviewTests(unittest.TestCase):
         self.assertEqual(_validated_document_review_subset(response, sections=drafts,
             prior_by_key=prior, evidence_view=self.view(drafts)), [])
 
-    def test_historical_subset_closes_only_exact_valid_opinions(self):
-        kwargs, checkpoint, old, drafts = finding_check_objects()
-        other = old.model_copy(update={"finding_id": "other-opinion"})
-        for field in (checkpoint["memory"], checkpoint):
-            field["reviewer_findings"].append(other.model_dump(mode="json"))
-        response = {"section_reviews": [{"section_id": "scope", "verdict": "pass", "finding_checks": [
-            {"finding_id": old.finding_id, "status": "resolved", "explanation": "Current draft states uncertainty.",
-             "draft_quotes": [drafts[0].draft_markdown]},
-            {"finding_id": other.finding_id, "status": "resolved", "explanation": "A fabricated quote cannot close it.",
-             "draft_quotes": ["This quote is absent."]}]}]}
-        labels, saved = [], []
-        class Client:
-            def ask_json(self, system, prompt, *, label="", **ignored):
-                labels.append(label)
-                return response if label.startswith("report-document-finding-checker") else {"section_reviews": []}
-        result = run_report_agent(client=Client(), gateway=ReportToolGateway(kwargs["context"]),
-            completed_checkpoint=checkpoint, checkpoint_sink=saved.append, **kwargs)
-        current = {f.finding_id for f in result.memory.reviewer_findings}
-        self.assertNotIn(old.finding_id, current)
-        self.assertIn(other.finding_id, current)
-        self.assertIn("document-finding-check-unavailable", current)
-        self.assertEqual(labels, ["report-document-reviewer", "report-document-finding-checker",
-                                  "report-document-finding-checker-format-correction"])
-        rejections = [event for event in result.iterations if event.action == "document_finding_check_rejected"]
-        self.assertEqual(len(rejections), 2)
-        self.assertEqual([event.rejected_review["response"] for event in rejections], [response, response])
-        self.assertFalse(rejections[0].rejected_review["partial_ready"])
-        self.assertTrue(rejections[1].rejected_review["partial_ready"])
-        self.assertTrue(saved[-1]["document_review_done"])
-        before = len(labels)
-        restored = run_report_agent(client=Client(), gateway=ReportToolGateway(kwargs["context"]),
-            completed_checkpoint=saved[-1], **kwargs)
-        self.assertEqual(len(labels), before)
-        self.assertEqual(restored.memory.reviewer_findings, result.memory.reviewer_findings)
+    def test_historical_subset_closure_and_failed_peer_survive_checkpoints(self):
+        for interrupted in (False, True):
+            with self.subTest(interrupted=interrupted):
+                kwargs, checkpoint, old, drafts = finding_check_objects()
+                other = old.model_copy(update={"finding_id": "unchecked-peer"})
+                for field in (checkpoint["memory"], checkpoint):
+                    field["reviewer_findings"].append(other.model_dump(mode="json"))
+                response = {"section_reviews": [{"section_id": "scope", "verdict": "pass", "finding_checks": [
+                    {"finding_id": old.finding_id, "status": "resolved", "explanation": "Current draft states uncertainty.",
+                     "draft_quotes": [drafts[0].draft_markdown]},
+                    {"finding_id": other.finding_id, "status": "resolved", "explanation": "A fabricated quote cannot close it.",
+                     "draft_quotes": ["This quote is absent."]}]}]}
+                labels, saved = [], []
+                class Client:
+                    def ask_json(self, system, prompt, *, label="", **ignored):
+                        labels.append(label)
+                        return response if label.startswith("report-document-finding-checker") else {"section_reviews": []}
+                def sink(value):
+                    saved.append(copy.deepcopy(value))
+                    if interrupted and any(event.get("rejected_review", {}).get("partial_ready") for event in value["iterations"]):
+                        raise RuntimeError("Interrupted before applying partial checks")
+                inputs = dict(client=Client(), gateway=ReportToolGateway(kwargs["context"]), **kwargs)
+                if interrupted:
+                    with self.assertRaisesRegex(RuntimeError, "partial checks"):
+                        run_report_agent(**inputs, completed_checkpoint=checkpoint, checkpoint_sink=sink)
+                    before = len(labels)
+                    result = run_report_agent(**inputs, completed_checkpoint=saved[-1], checkpoint_sink=saved.append)
+                    self.assertEqual(len(labels), before)
+                else:
+                    result = run_report_agent(**inputs, completed_checkpoint=checkpoint, checkpoint_sink=sink)
+                current = {f.finding_id for f in result.memory.reviewer_findings}
+                self.assertNotIn(old.finding_id, current)
+                self.assertIn(other.finding_id, current)
+                self.assertIn("document-finding-check-unavailable", current)
+                rejections = [event for event in result.iterations if event.action == "document_finding_check_rejected"]
+                self.assertEqual([event.rejected_review["response"] for event in rejections], [response, response])
+                self.assertEqual([event.rejected_review["partial_ready"] for event in rejections], [False, True])
+                self.assertTrue(saved[-1]["document_review_done"])
+                before = len(labels)
+                restored = run_report_agent(**inputs, completed_checkpoint=saved[-1])
+                self.assertEqual(len(labels), before)
+                self.assertEqual(restored.memory.reviewer_findings, result.memory.reviewer_findings)
 
     def test_valid_subcontract_reaches_writer_but_bad_record_and_instructions_do_not(self):
         for invalid_final in (False, True):
@@ -261,37 +268,6 @@ class PartialReviewTests(unittest.TestCase):
         subset = _validated_document_review_subset(response, sections=drafts, prior_by_key={}, evidence_view=self.view(drafts))
         self.assertEqual([f.finding_id for f in subset[0].findings], ["qualified-observation", "independent-peer"])
         self.assertFalse(subset[0].revision_instructions)
-
-    def test_partial_historical_resume_preserves_closure_and_failed_peer(self):
-        kwargs, checkpoint, old, drafts = finding_check_objects()
-        other = old.model_copy(update={"finding_id": "unchecked-peer"})
-        for field in (checkpoint["memory"], checkpoint):
-            field["reviewer_findings"].append(other.model_dump(mode="json"))
-        response = {"section_reviews": [{"section_id": "scope", "verdict": "pass", "finding_checks": [
-            {"finding_id": old.finding_id, "status": "resolved", "explanation": "Uncertainty is explicit.",
-             "draft_quotes": [drafts[0].draft_markdown]},
-            {"finding_id": other.finding_id, "status": "resolved", "explanation": "Bad quote must stay rejected.",
-             "draft_quotes": ["Not present."]}]}]}
-        labels, saved = [], []
-        class Client:
-            def ask_json(self, system, prompt, *, label="", **ignored):
-                labels.append(label)
-                return response if label.startswith("report-document-finding-checker") else {"section_reviews": []}
-        def sink(value):
-            saved.append(copy.deepcopy(value))
-            if any(event.get("rejected_review", {}).get("partial_ready") for event in value["iterations"]):
-                raise RuntimeError("Interrupted before applying partial checks")
-        with self.assertRaisesRegex(RuntimeError, "partial checks"):
-            run_report_agent(client=Client(), gateway=ReportToolGateway(kwargs["context"]),
-                completed_checkpoint=checkpoint, checkpoint_sink=sink, **kwargs)
-        before = len(labels)
-        result = run_report_agent(client=Client(), gateway=ReportToolGateway(kwargs["context"]),
-            completed_checkpoint=saved[-1], **kwargs)
-        self.assertEqual(len(labels), before)
-        current = {f.finding_id for f in result.memory.reviewer_findings}
-        self.assertNotIn(old.finding_id, current)
-        self.assertIn(other.finding_id, current)
-        self.assertIn("document-finding-check-unavailable", current)
 
     def test_partial_review_keeps_original_two_target_allowance(self):
         kwargs, checkpoint, _, drafts = finding_check_objects(historical=False)

@@ -16,9 +16,7 @@ from simple_ar.result_analysis.table import (
     load_analysis_package, table_values_markdown,
 )
 from simple_ar.report.narrative import _compact_execution_results
-from simple_ar.cli.main import main
 from simple_ar.cli.parser import build_parser
-from simple_ar.cli.research_config import research_defaults
 from simple_ar.cli.start import prepare_start
 
 
@@ -166,15 +164,20 @@ class TableAnalysisTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'no longer matches'):
                 rebuild(moved / 'analysis.json')
 
-    def test_plot_tasks_share_config_no_model_recovery_move_and_writing_import(self):
+    def test_plot_packages_preserve_formats_on_move_rebuild_and_writing_import(self):
+        from simple_ar.core.budget import BudgetLedger
+        from simple_ar.tools.analysis import AnalysisToolGateway
+        from simple_ar.tools.workspace import WorkspaceToolGateway
+        # Format/plot combinations belong to the table owner. Public CLI
+        # routing and completed-session recovery are covered independently.
         cases = [
-            ('bar', 'values', 'label\tscore\nA\t1\nB\t2\n', '.tsv', ['score'], 'label', []),
-            ('box', 'observations', '[{"label":"A","score":1},{"label":"A","score":5}]', '.json', ['score'], 'label', []),
+            ('bar', 'values', 'label\tscore\nA\t1\nB\t2\n', '.tsv', ['score'], 'label', {}),
+            ('box', 'observations', '[{"label":"A","score":1},{"label":"A","score":5}]', '.json', ['score'], 'label', {}),
             ('heatmap', 'values', '[{"label":"A","score":1,"b":null},{"label":"B","score":2,"b":3}]',
-             '.json', ['score', 'b'], 'label', []),
-            ('line', 'values', 'x\tscore\n2\t1\n1\t3\n3\t\n', '.tsv', ['score'], '', ['--x-column', 'x', '--x-unit', 'iteration']),
+             '.json', ['score', 'b'], 'label', {}),
+            ('line', 'values', 'x\tscore\n2\t1\n1\t3\n3\t\n', '.tsv', ['score'], '', {'x_column': 'x', 'x_unit': 'iteration'}),
             ('scatter', 'values', '[{"label":"A","x":1,"score":2},{"label":"B","x":1,"score":3}]',
-             '.json', ['score'], 'label', ['--x-column', 'x']),
+             '.json', ['score'], 'label', {'x_column': 'x'}),
         ]
         for plot, mode, text, suffix, columns, group, extras in cases:
             with self.subTest(plot=plot), tempfile.TemporaryDirectory() as directory:
@@ -182,29 +185,16 @@ class TableAnalysisTests(unittest.TestCase):
                 source = root / ('table with spaces' + suffix)
                 source.write_text(text, encoding='utf-8')
                 raw = source.read_bytes()
-                argv = ['start', '--kind', 'data_analysis', '--goal', 'Describe supplied data',
-                        '--data-file', str(source), '--observation-unit', 'one supplied row',
-                        '--data-mode', mode, '--data-plot', plot, '--data-missing', 'omit',
-                        '--output-root', str(root / 'runs'), '--prepare-only', *extras]
-                for column in columns:
-                    argv.extend(['--value-column', column])
-                if group:
-                    argv.extend(['--group-column', group])
-                with patch('sys.stdin.isatty', return_value=False), contextlib.redirect_stdout(io.StringIO()):
-                    config = prepare_start(build_parser().parse_args(argv))
-                defaults = research_defaults(['research-session', '--config', str(config)])
-                self.assertEqual((defaults['data_file'], defaults['data_mode'], defaults['data_plot']),
-                                 (str(source), mode, plot))
-                if extras:
-                    self.assertEqual(defaults['x_column'], 'x')
-                with patch('simple_ar.cli.main._optional_research_llm_client', side_effect=AssertionError('No API/model expected')), contextlib.redirect_stdout(io.StringIO()):
-                    self.assertIsNone(main(['research-session', '--config', str(config)]))
-                    package = next(config.parent.glob('sessions/*/attempts/data_analysis-*/analysis.json'))
-                    frozen = package.read_bytes()
-                    source.unlink()
-                    self.assertIsNone(main(['research-session', '--session-root', str(package.parents[2]), '--model', 'env']))
-                    self.assertEqual(package.read_bytes(), frozen)
-                original = json.loads(frozen)
+                spec = TableSpec.from_config({'value_columns': columns, 'group_column': group,
+                    'observation_unit': 'one supplied row', 'mode': mode, 'plot': plot, 'missing': 'omit', **extras})
+                workspace = WorkspaceToolGateway(root, {'source0': source}, BudgetLedger({}))
+                result = AnalysisToolGateway(root, workspace).call('analyze_table',
+                    {'path': 'source0', 'spec': spec.to_config()}, identity='plot')
+                self.assertTrue(result.ok, result.error)
+                package = workspace.resolve(result.data['analysis'])
+                source.unlink()
+                original = json.loads(package.read_text())
+                self.assertEqual(TableSpec.from_config(original['spec']), spec)
                 moved = root / 'moved'
                 shutil.copytree(package.parent, moved)
                 # Explicit rebuilding may use a user-chosen result filename.
@@ -226,6 +216,7 @@ class TableAnalysisTests(unittest.TestCase):
                         self.assertGreater((moved / asset).stat().st_size, 100)
                         self.assertTrue((root / 'writing-input' / asset).is_file())
                         self.assertIn(f'[{kind.upper()}]({asset})', (moved / 'analysis.md').read_text())
+
     def test_guided_analysis_rejects_unrelated_options_before_saving(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

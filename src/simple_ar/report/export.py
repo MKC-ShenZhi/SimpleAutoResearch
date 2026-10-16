@@ -195,7 +195,8 @@ def _bind_figure_captions(ast: dict, captions: dict[str, list[dict]], *,
 
 def _tex_literal(text: str) -> str:
     """Escape text, grouping each macro/UTF-8 glyph for seqsplit's scanner."""
-    escapes = {"\\": r"\textbackslash{}", "{": r"\{", "}": r"\}", "$": r"\$",
+    # seqsplit scans tokens and otherwise discards ordinary space tokens.
+    escapes = {" ": r"\ ", "\\": r"\textbackslash{}", "{": r"\{", "}": r"\}", "$": r"\$",
                "&": r"\&", "#": r"\#", "%": r"\%", "_": r"\_",
                "~": r"\textasciitilde{}", "^": r"\textasciicircum{}"}
     return "".join("{" + escapes.get(char, char) + "}" if char in escapes or ord(char) > 127

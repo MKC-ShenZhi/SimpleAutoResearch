@@ -6,7 +6,7 @@ from tests.report_review_fixtures import document_review_inputs, prompt_payload
 
 from simple_ar.integrations.llm import LLMError, LLMResponseError
 from simple_ar.report.editor import review_document
-from simple_ar.report.agent import _review_section_with_recovery
+from simple_ar.report.agent import _section_response
 from simple_ar.report.review_evidence import validate_evidence_quotes, review_evidence_locator, _resolve_pointer
 from simple_ar.report.schema import (
     ReportContext, ReportDraftQuote, ReportEvidenceQuote, ReportFindingCheck, ReportMemory, ReportRuntimeConfig,
@@ -104,6 +104,10 @@ class ReviewEvidenceTests(unittest.TestCase):
                 _, value = _resolve_pointer(view, pointer)
                 quote = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
                 validate_evidence_quotes([ReportEvidenceQuote(pointer=pointer, quote=quote, role=role)], view)
+                if role in {"executor_record", "declaration", "producer_output"}:
+                    with self.assertRaisesRegex(LLMResponseError, "role is"):
+                        validate_evidence_quotes([ReportEvidenceQuote(
+                            pointer=pointer, quote=quote, role="recorded_material")], view)
         encoded = json.dumps(locator)
         for absent in ("Original quantitative statement.", "observed", "Never index a rejected allegation.", "markdown", "previous_draft"):
             self.assertNotIn(absent, encoded)
@@ -150,7 +154,10 @@ class ReviewEvidenceTests(unittest.TestCase):
         from simple_ar.report.agent import _reviewer_context
         context, memory, config, draft = self.objects()
         passage = {"handle": "paper:p", "kind": "paper", "metadata": {
+            "reading_artifact": "reading/p.json", "reading_notes": {"method": "Prior interpretation."},
+            "bibliography": {"title": "Recorded title"}, "evidence_passages_truncated": True,
             "evidence_passages": [{"text": "Actual retained result."}]}}
+        original = json.dumps(passage)
         from simple_ar.report.schema import SourceHandle
         memory.source_handles = [SourceHandle.model_validate(passage)]
         captured = []
@@ -165,10 +172,21 @@ class ReviewEvidenceTests(unittest.TestCase):
         section = _reviewer_context(context=context, memory=memory, template=template,
             section=memory.section_plan[0], draft=draft, config=config)
         for view, root in ((document, "source_evidence"), (section, "allowed_sources")):
+            metadata = view[root][0]["metadata"]
+            self.assertNotIn("reading_notes", metadata)
+            self.assertEqual(len(metadata["evidence_passages"]), len(passage["metadata"]["evidence_passages"]))
+            for actual, original_passage in zip(metadata["evidence_passages"], passage["metadata"]["evidence_passages"]):
+                self.assertEqual({key: actual[key] for key in original_passage}, original_passage)
+            self.assertEqual(metadata["bibliography"]["title"], "Recorded title")
+            self.assertTrue(metadata["evidence_passages_truncated"])
+            self.assertTrue(metadata["derived_reading_notes_on_request"]["omitted_from_this_view"])
             pointer = f"/{root}/0/metadata/evidence_passages/0/text"
             self.assertIn(pointer, view["evidence_locator"]["pointers_by_role"]["recorded_material"].values())
             validate_evidence_quotes([ReportEvidenceQuote(pointer=pointer, quote="Actual retained result.",
                 role="recorded_material")], view)
+        self.assertEqual(document["source_evidence"][0]["metadata"]["bibliography"], passage["metadata"]["bibliography"])
+        self.assertEqual(json.dumps(passage), original)
+        self.assertEqual(memory.source_handles[0].metadata, passage["metadata"])
 
     def test_locator_does_not_cut_evidence_or_reject_an_existing_near_limit_request(self):
         context, memory, config, draft = self.objects()
@@ -241,10 +259,10 @@ class ReviewEvidenceTests(unittest.TestCase):
         common = dict(client=Client(), context=context, memory=memory, config=config,
             template=load_report_template_bundle(report_mode="experiment", config=config),
             section=memory.section_plan[0], draft=draft, label="candidate-heading", extra_context=[])
-        self.assertEqual(len(_review_section_with_recovery(**common).findings), 1)
+        self.assertEqual(len(_section_response(**common).findings), 1)
         quote["quote"] = memory.section_plan[0].heading
         with self.assertRaisesRegex(LLMError, "absent"):
-            _review_section_with_recovery(**common)
+            _section_response(**common)
 
     def test_neighbor_quote_sources_are_separate_visible_windows_and_candidate_wins(self):
         from simple_ar.report.review_evidence import review_draft_quote_sources, draft_quote_present
@@ -326,29 +344,6 @@ class ReviewEvidenceTests(unittest.TestCase):
             "metric_sources": {"rows": [["coverage", 0.91]]},
             "extra_tool_context": [{"tool_name": "get_synthesis_brief", "content": {"text": "Unverified interpretation."}}]}
 
-    def test_observations_declarations_and_producer_outputs_keep_distinct_roles(self):
-        view = self.view()
-        for pointer, quote, role in (
-            ("/execution_evidence/execution_records/0/cwd", "/actual-copy", "executor_record"),
-            ("/execution_evidence/declared_execution_context/text", "/original-copy", "declaration"),
-            ("/execution_evidence/output_evidence/0/preview/text", "elapsed 12.4", "producer_output"),
-        ):
-            reference = ReportEvidenceQuote(pointer=pointer, quote=quote, role=role)
-            validate_evidence_quotes([reference], view)
-            with self.assertRaisesRegex(LLMResponseError, "role is"):
-                validate_evidence_quotes([reference.model_copy(update={"role": "recorded_material"})], view)
-
-    def test_original_passages_metadata_and_reading_notes_are_not_conflated(self):
-        view = self.view()
-        literal = ReportEvidenceQuote(pointer="/source_evidence/0/metadata/evidence_passages/0/text",
-            quote="beyond 22 are a terminal bin", role="recorded_material")
-        validate_evidence_quotes([literal], view)
-        notes = ReportEvidenceQuote(pointer="/source_evidence/0/metadata/reading_notes/method_summary",
-            quote="A recorded interpretation.", role="recorded_material")
-        with self.assertRaisesRegex(LLMResponseError, "derived_context"):
-            validate_evidence_quotes([notes], view)
-        validate_evidence_quotes([notes.model_copy(update={"role": "derived_context"})], view)
-
     def test_bad_pointer_changed_quote_container_and_partial_numeric_value_are_rejected(self):
         view = self.view()
         for pointer, quote in (
@@ -367,11 +362,6 @@ class ReviewEvidenceTests(unittest.TestCase):
         validate_evidence_quotes([ReportEvidenceQuote(pointer="/execution_evidence/execution_records/0/duration_sec",
             quote="12.5", role="executor_record")], view)
 
-    def test_literal_json_keys_use_pointer_escapes_without_attribute_or_file_access(self):
-        view = {"metric_sources": {"a/b~c": 3}}
-        validate_evidence_quotes([ReportEvidenceQuote(pointer="/metric_sources/a~1b~0c", quote="3",
-            role="registered_result")], view)
-
     def test_invalid_location_explains_available_structure_without_guessing_a_reference(self):
         view = self.view()
         reference = ReportEvidenceQuote(pointer="/execution_records/0/cwd", quote="/actual-copy", role="executor_record")
@@ -380,6 +370,13 @@ class ReviewEvidenceTests(unittest.TestCase):
         self.assertEqual(reference.pointer, "/execution_records/0/cwd")
         reference.pointer = "/execution_evidence/execution_records/8/cwd"
         with self.assertRaisesRegex(LLMResponseError, 'has 1 elements'):
+            validate_evidence_quotes([reference], view)
+        reference.pointer = '/execution_evidence/execution_records/0'
+        with self.assertRaisesRegex(LLMResponseError, r'scalar field.*Available keys at /execution_evidence/execution_records/0:.*cwd'):
+            validate_evidence_quotes([reference], view)
+        self.assertEqual(reference.pointer, '/execution_evidence/execution_records/0')
+        reference.pointer = '/execution_evidence/execution_records'
+        with self.assertRaisesRegex(LLMResponseError, r'scalar field.*has 1 elements'):
             validate_evidence_quotes([reference], view)
 
     def test_new_factual_findings_require_current_draft_and_located_metric_counter_evidence(self):
@@ -437,34 +434,12 @@ class ReviewEvidenceTests(unittest.TestCase):
                     "message": "A bounded source question remains.", "draft_quotes": [{"section_id": "setup", "quote": draft.draft_markdown}],
                     "evidence_quotes": [{"pointer": "/extra_tool_context/0/content/chunks/0/text",
                         "quote": "Current original passage.", "role": "recorded_material"}]}]}
-        review = _review_section_with_recovery(client=Client(), context=context, memory=memory, config=config,
+        review = _section_response(client=Client(), context=context, memory=memory, config=config,
             template=load_report_template_bundle(report_mode="experiment", config=config),
             section=memory.section_plan[0], draft=draft, label="section-recheck", extra_context=tools)
         self.assertEqual(len(seen), 1)
         self.assertEqual(seen[0]["extra_tool_context"][0]["content"], tools[0].content)
         self.assertEqual(review.findings[0].evidence_quotes[0].role, "recorded_material")
-
-    def test_cold_document_review_keeps_passages_without_earlier_model_reading_cards(self):
-        import copy
-        context, memory, config, draft = self.objects()
-        source = {"handle": "paper:methods", "kind": "paper", "metadata": {
-            "reading_artifact": "reading/methods.json", "reading_notes": {"method": "An earlier interpretation."},
-            "reading_notes_truncated": True, "bibliography": {"title": "Recorded title"},
-            "evidence_passages": [{"text": "A literal original method passage."}], "evidence_passages_truncated": True}}
-        original = copy.deepcopy(source)
-        captured = []
-        class Client:
-            def ask_json(self, system, prompt, **ignored):
-                captured.append(json.loads(prompt))
-                return {"section_reviews": []}
-        review_document(client=Client(), **document_review_inputs(memory, config, [draft], source_evidence=[source]))
-        metadata = captured[0]["source_evidence"][0]["metadata"]
-        self.assertNotIn("reading_notes", metadata)
-        self.assertEqual(metadata["evidence_passages"], original["metadata"]["evidence_passages"])
-        self.assertEqual(metadata["bibliography"], original["metadata"]["bibliography"])
-        self.assertTrue(metadata["evidence_passages_truncated"])
-        self.assertTrue(metadata["derived_reading_notes_on_request"]["omitted_from_this_view"])
-        self.assertEqual(source, original)
 
     def test_old_brief_cards_stay_out_of_cold_review_but_explicit_requests_can_read_them(self):
         context, memory, config, draft = self.objects()
@@ -509,7 +484,7 @@ class ReviewEvidenceTests(unittest.TestCase):
                 if len(seen) == 1:
                     raise LLMResponseError("Malformed outer response")
                 return {"section_id": draft.section_id, "verdict": "pass"}
-        _review_section_with_recovery(client=Client(), context=context,
+        _section_response(client=Client(), context=context,
             template=load_report_template_bundle(report_mode=context.report_mode, config=config),
             memory=memory, section=memory.section_plan[0], draft=draft, label="review-primary", config=config)
         self.assertEqual(len(seen), 2)

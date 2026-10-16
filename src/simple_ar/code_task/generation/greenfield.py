@@ -208,6 +208,9 @@ def generate_greenfield_code_task(
     planning_review_rounds: int = 0,
     planning_snapshot_from: str | Path | None = None,
     message_callback: MessageCallback | None = None,
+    budget_profile: str | None = None,
+    edit_budget_overrides: dict[str, Any] | None = None,
+    allow_large_edits: bool = False,
 ) -> GreenfieldCodeTaskResult:
     """Generate a greenfield project inside a code-task workspace.
 
@@ -270,12 +273,12 @@ def generate_greenfield_code_task(
     result_schema = _result_schema_with_contract_metrics(result_schema, contract)
     resource_plan = _resource_plan(
         resource_decision,
-        task_text=task_text,
         max_files=max_files,
         max_generated_lines=max_generated_lines,
     )
-    dependency_advice = build_dependency_advice(task_text)
-    dependency_plan = _dependency_plan(task_text, dependency_advice=dependency_advice)
+    dependency_advice = build_dependency_advice(task_text,
+        python_executable=manifest['environment']['policy'].get('python_executable'))
+    dependency_plan = _dependency_plan(dependency_advice=dependency_advice)
     domain_profile = _domain_profile(task_text, dependency_advice=dependency_advice, benchmark_command=benchmark_command)
     dependency_advice_path = paths.meta_dir / "dependency_advice.json"
     write_json(dependency_advice_path, dependency_advice)
@@ -333,6 +336,31 @@ def generate_greenfield_code_task(
             planning_dir=planning_dir,
             message_callback=message_callback,
         )
+    native = manifest.get('code_task', {}).get('native_binding', {}).get('binding', {}).get('contract')
+    allowed = allowed_patterns_from_manifest(manifest)
+    protected = protected_patterns_from_manifest(manifest)
+    from simple_ar.code_task.editing.scope import DEFAULT_PROTECTED_EDIT_PATTERNS, edit_scope_rejection_reason
+    from simple_ar.code_task.editing.budget import edit_budget_for_profile
+    from simple_ar.code_task.editing.patching import PatchValidationError, validate_generated_project
+    explicit_budget = bool(native or budget_profile is not None or edit_budget_overrides or allow_large_edits)
+    policy = (native or {}).get('edit_policy') or {
+        'budget_profile': budget_profile, 'edit_budget_overrides': edit_budget_overrides,
+        'allow_large_edits': allow_large_edits}
+    validate_candidate = None
+    if native or allowed or set(protected) - set(DEFAULT_PROTECTED_EDIT_PATTERNS) or explicit_budget:
+        # The architecture is intent; reject forbidden paths before requesting
+        # their content. Publication checks the actual complete tree as well.
+        for relative in {*(str(row.get('path', '')) for row in architecture.get('files', []) if isinstance(row, dict)), 'main.py'}:
+            path = f'generated_project/{relative}'
+            rejection = edit_scope_rejection_reason(path, allowed_patterns=allowed, protected_patterns=protected)
+            if rejection:
+                raise PatchValidationError(f'Generated plan file `{path}` rejected: {rejection}')
+        budget = edit_budget_for_profile(policy.get('budget_profile'),
+            overrides=policy.get('edit_budget_overrides')) if explicit_budget else None
+        def validate_candidate(candidate: Path) -> None:
+            validate_generated_project(paths.workspace_dir, candidate, prefix='generated_project',
+                allowed_patterns=allowed, protected_patterns=protected, budget=budget,
+                allow_large_edits=policy.get('allow_large_edits', False))
     implementation_plan_path = paths.meta_dir / "implementation_plan.json"
     architecture_plan_path = paths.meta_dir / "architecture_plan.json"
     file_plan_path = paths.meta_dir / "file_plan.json"
@@ -401,6 +429,7 @@ def generate_greenfield_code_task(
             agent_model=implementation_agent_model,
             agent_binary=implementation_agent_binary,
             agent_args=implementation_agent_args,
+            validate_candidate=validate_candidate,
         )
     else:
         _emit(message_callback, "Writing related project files through the shared implementation generator.")
@@ -418,6 +447,7 @@ def generate_greenfield_code_task(
             allow_fallback=allow_planning_fallback or not use_llm,
             agent_step_dir=paths.meta_dir / "generation_steps",
             message_callback=message_callback,
+            validate_candidate=validate_candidate,
         )
     generated_files = tuple(
         f"generated_project/{row.get('path')}"
@@ -516,9 +546,19 @@ def _llm_client(
 
 def result_schema_from_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     benchmark = manifest.get("benchmark", {}) if isinstance(manifest.get("benchmark"), dict) else {}
-    primary = str(benchmark.get("primary_metric") or "score").strip() or "score"
+    bound = manifest.get('code_task', {}).get('native_binding', {}).get('binding', {})
+    native = bound.get('contract')
+    if bound.get('measurement_contract') is not None:
+        from simple_ar.experiment.execution.measurement import representative_measurement_execution
+        benchmark = representative_measurement_execution(bound['measurement_contract'])['result_schema']
+    # A technical exact validator is not a request for a fabricated score.
+    # Existing scientific/legacy generation keeps its saved result contract.
+    fallback = '' if native is not None else 'score'
+    primary = str(benchmark.get("primary_metric") or fallback).strip()
     directions = benchmark.get("metric_directions")
-    required = [primary]
+    required = list(benchmark.get('required_metrics', [])) if bound.get('measurement_contract') is not None else []
+    if primary and primary not in required:
+        required.append(primary)
     if isinstance(directions, dict):
         required.extend(str(name) for name in directions if str(name).strip() and str(name) != primary)
     return {
@@ -551,87 +591,30 @@ def _result_schema_with_contract_metrics(
 def _resource_plan(
     resource_decision: dict[str, Any],
     *,
-    task_text: str,
     max_files: int,
     max_generated_lines: int,
 ) -> dict[str, Any]:
     profile = str(resource_decision.get("profile") or "local_cpu")
-    task_cpu_only = _task_disallows_gpu(task_text)
-    allow_gpu = bool(resource_decision.get("allow_gpu")) and not task_cpu_only
-    if task_cpu_only:
-        profile = "local_cpu"
-    execution_budget = _execution_budget(task_text=task_text, profile=profile, max_files=max_files)
     return {
         "schema_version": "code_task_greenfield_resource_plan.v1",
         "profile": profile,
-        "allow_gpu": allow_gpu,
+        "gpu_observed": bool(resource_decision.get("allow_gpu")),
         "max_files": max_files,
         "max_generated_lines": max_generated_lines,
-        "execution_budget": execution_budget,
+        "execution_budget": {
+            "policy": "explicit_execution_contract_and_shared_ledger",
+            "guidance": [
+                "File and source-line ceilings do not determine runtime, trial counts or method complexity.",
+                "Hardware observations do not grant resource access; the user task and approved execution constraints remain authoritative.",
+                "Use actual declared timeouts, resources and scientific conditions. Estimate feasibility from the inspected task.",
+                "If the requested scope is infeasible, explain the gap and seek a scope decision; do not silently approximate the method.",
+            ],
+        },
         "decision": resource_decision,
-        "constraint_overrides": [
-            "Task text explicitly requires CPU-only execution; GPU preference from environment probe was disabled."
-        ]
-        if task_cpu_only
-        else [],
     }
 
 
-def _execution_budget(*, task_text: str, profile: str, max_files: int) -> dict[str, Any]:
-    text = " ".join(str(task_text or "").lower().replace("-", " ").split())
-    is_ml = any(
-        token in text
-        for token in (
-            "classifier",
-            "cross validation",
-            "dataset",
-            "experiment",
-            "model",
-            "regression",
-            "scikit",
-            "sklearn",
-            "training",
-        )
-    )
-    scale = "medium" if max_files >= 12 else "compact"
-    if profile in {"gpu", "large"}:
-        max_runtime = 900 if scale == "medium" else 600
-    elif profile == "local_cpu":
-        max_runtime = 300 if scale == "medium" else 180
-    else:
-        max_runtime = 450 if scale == "medium" else 240
-    return {
-        "schema_version": "code_task_execution_budget.v1",
-        "profile": profile,
-        "scale": scale,
-        "max_runtime_sec_hint": max_runtime,
-        "max_model_fit_operations_hint": 600 if is_ml and scale == "medium" else 180,
-        "guidance": [
-            "Keep benchmark paths bounded and deterministic; prefer smoke/standard presets over exhaustive sweeps.",
-            "When using model fitting, cap dataset, seed, fold, candidate, query, and hyperparameter loops explicitly.",
-            "If an exact method is expensive, implement a documented bounded approximation instead of an unbounded nested loop.",
-            "Runtime artifacts should preserve measured evidence without printing unbounded logs.",
-        ],
-    }
-
-
-def _task_disallows_gpu(task_text: str) -> bool:
-    text = " ".join(str(task_text or "").lower().replace("-", " ").split())
-    return any(
-        phrase in text
-        for phrase in (
-            "cpu only",
-            "cpu-only",
-            "no gpu",
-            "without gpu",
-            "do not use gpu",
-            "gpu disabled",
-        )
-    )
-
-
-def _dependency_plan(task_text: str, *, dependency_advice: dict[str, Any]) -> dict[str, Any]:
-    mentioned = _mentioned_packages(task_text)
+def _dependency_plan(*, dependency_advice: dict[str, Any]) -> dict[str, Any]:
     available = [
         str(row.get("package"))
         for row in dependency_advice.get("packages", [])
@@ -640,34 +623,15 @@ def _dependency_plan(task_text: str, *, dependency_advice: dict[str, Any]) -> di
     return {
         "schema_version": "code_task_greenfield_dependency_plan.v1",
         "install_allowed": False,
-        "allowed_dependency_policy": "standard_library_preferred_or_explicitly_available",
-        "mentioned_packages": mentioned,
+        "allowed_dependency_policy": "task_requirements_first_no_implicit_install_or_substitution",
+        "mentioned_packages": [row['package'] for row in dependency_advice.get('packages', [])],
         "available_task_relevant_packages": available,
         "notes": [
-            "Generated code should prefer the Python standard library for local smoke paths.",
-            "Generated code may use task-relevant installed packages listed in dependency_advice, but must not install new dependencies.",
-            "If an optional package is missing, fail clearly or provide a bounded fallback when the task allows it.",
+            "Dependency metadata describes only its recorded interpreter, not proven imports or compatibility.",
+            "Use the actual task/project dependency requirements; installation needs separate authorization.",
+            "Missing dependencies do not authorize substitute methods, datasets or evaluation conditions.",
         ],
     }
-
-
-def _mentioned_packages(task_text: str) -> list[str]:
-    text = task_text.lower()
-    candidates = [
-        "numpy",
-        "pandas",
-        "scikit-learn",
-        "sklearn",
-        "torch",
-        "pytorch",
-        "transformers",
-        "datasets",
-        "rich",
-        "pydantic",
-        "tree-sitter",
-        "lancedb",
-    ]
-    return [name for name in candidates if name in text]
 
 
 def _domain_profile(task_text: str, *, dependency_advice: dict[str, Any], benchmark_command: str) -> dict[str, Any]:
@@ -694,6 +658,9 @@ def _domain_profile(task_text: str, *, dependency_advice: dict[str, Any], benchm
             "`generated_project/main.py` in a run command corresponds to `main.py` in the file plan."
         ),
         "environment_package_count": dependency_advice.get("environment_package_count", 0),
+        **{key: dependency_advice[key] for key in ('environment_scope', 'target_python_executable',
+            'inspecting_python_executable') if key in dependency_advice},
+        "dependency_observation_limitations": dependency_advice.get('notes', []),
         "available_task_relevant_packages": relevant_packages[:60],
     }
 
@@ -800,6 +767,13 @@ def _update_manifest_after_generation(
 
 
 def _benchmark_command(manifest: dict[str, Any]) -> str:
+    measurement = manifest.get('code_task', {}).get('native_binding', {}).get('binding', {}).get('measurement_contract')
+    if measurement is not None:
+        from simple_ar.code_task.execution.runner import _argv_command
+        from simple_ar.code_task.execution.environment import project_command
+        from simple_ar.experiment.execution.measurement import representative_measurement_execution
+        measurement = representative_measurement_execution(measurement)
+        return _argv_command(project_command(measurement['command'], Path(measurement['cwd']), Path('.')))
     benchmark = manifest.get("benchmark")
     if isinstance(benchmark, dict) and benchmark.get("command"):
         return str(benchmark["command"])

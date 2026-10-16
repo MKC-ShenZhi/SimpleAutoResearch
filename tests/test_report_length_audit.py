@@ -203,14 +203,14 @@ class ReportLengthAuditTests(unittest.TestCase):
             adopted_sections=sections), count
 
     def review_candidate(self, objects, candidate):
-        from simple_ar.report.agent import _review_section_with_recovery
+        from simple_ar.report.agent import _section_response
         from simple_ar.report.schema import ReportSectionReview
         calls = []
         class Client:
             def ask_json(client, system, prompt, **kwargs):
                 calls.append(prompt)
                 return {"verdict": "pass"}
-        reviewed = _review_section_with_recovery(**objects, client=Client(), draft=candidate,
+        reviewed = _section_response(**objects, client=Client(), draft=candidate,
             previous_draft=objects["adopted_sections"][-1],
             revision_review=ReportSectionReview(section_id="second", verdict="revise_required"), label="candidate")
         self.assertEqual(len(calls), 1)  # A valid answer is not a format retry.

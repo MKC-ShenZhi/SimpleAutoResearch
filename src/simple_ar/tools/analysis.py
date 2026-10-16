@@ -16,11 +16,23 @@ from simple_ar.tools.specs import CommonToolSpec, ToolResult
 
 class TableSourceRequest(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
-    path: str = Field(description='Authorized CSV/TSV or homogeneous JSON record table, up to 20 MB.')
+    path: str = Field(min_length=1, description='Authorized CSV/TSV or homogeneous JSON record table, up to 20 MiB unless the owner holds an explicit frozen table contract.')
 
 
 class TableAnalysisRequest(TableSourceRequest):
     spec: TableSpec = Field(description='Existing analysis configuration. Establish row meaning, units and any pairing from evidence or user clarification, not filename guesses.')
+
+
+def validate_table_analysis_contract(workspace: Any, value: dict[str, Any], *, require_source: bool = True) -> dict[str, Any]:
+    """Freeze an explicit grant, before the caller creates task state.
+
+    Keep the literal locator and all TableSpec defaults; authorization is still
+    checked by the workspace on every call. This is not a global limit override.
+    """
+    request = TableAnalysisRequest.model_validate_json(json.dumps(value))
+    if not request.path.strip() or (require_source and not workspace.resolve(request.path).is_file()):
+        raise ValueError('Exact table analysis requires an authorized existing source file')
+    return request.model_dump(mode='json')
 
 
 def analysis_tool_specs() -> list[CommonToolSpec]:
@@ -37,8 +49,34 @@ def analysis_tool_specs() -> list[CommonToolSpec]:
 
 
 class AnalysisToolGateway:
-    def __init__(self, root: Path, workspace: Any) -> None:
+    def can_reconcile(self, name: str, identity: str) -> bool:
+        return name == 'analyze_table' and (
+            self.root / 'tools' / 'analysis' / identity / 'result.json').is_file()
+
+    def __init__(self, root: Path, workspace: Any, *, contract: dict[str, Any] | None = None) -> None:
         self.root, self.workspace = root, workspace
+        self._contract = (validate_table_analysis_contract(workspace, contract, require_source=False)
+            if contract is not None else None)
+        self._contract_path = workspace.resolve(self._contract['path']) if self._contract else None
+
+    def delivery_issues(self, observations: list[dict[str, Any]]) -> list[str]:
+        if self._contract is None:
+            return []
+        for row in observations:
+            if row.get('tool_name') != 'analyze_table' or row.get('status') != 'ok':
+                continue
+            arguments = TableAnalysisRequest.model_validate_json(json.dumps(row['arguments'])).model_dump(mode='json')
+            if arguments == self._contract:
+                hashes = row['data']['artifact_sha256']
+                if self.workspace.artifact_hashes(hashes) == hashes:
+                    return []
+        return ['The exact table analysis has no intact accepted result; disclose incomplete analysis']
+
+    def _source(self, locator: str) -> Path:
+        path = self.workspace.resolve(locator)
+        if self._contract is not None and (locator != self._contract['path'] or path != self._contract_path):
+            raise ValueError('Exact table analysis must use its original authorized path')
+        return path
 
     def call(self, name: str, arguments: dict[str, Any], *, identity: str) -> ToolResult:
         try:
@@ -46,18 +84,21 @@ class AnalysisToolGateway:
                 raise ValueError('Invalid analysis invocation')
             if name == 'inspect_table':
                 request = TableSourceRequest.model_validate(arguments)
-                path = self.workspace.resolve(request.path)
-                return ToolResult(tool_name=name, data=preview_table_source(path, max_mb=20),
+                path = self._source(request.path)
+                limit = self._contract['spec']['max_mb'] if self._contract else 20
+                return ToolResult(tool_name=name, data=preview_table_source(path, max_mb=limit),
                     summary='Complete bounded source shape; row meaning and statistical assumptions are not verified.')
             if name != 'analyze_table':
                 raise ValueError('Unknown analysis operation')
             # JSON validation preserves the dataclass's tuple fields without
             # maintaining another copy of its configuration/defaults.
             request = TableAnalysisRequest.model_validate_json(json.dumps(arguments))
-            path = self.workspace.resolve(request.path)
-            if request.spec.max_mb > 20 or request.spec.max_figures > 100 or request.spec.max_points > 10000:
-                raise ValueError('Built-in analysis is bounded to 20 MB, 100 figures and 10000 points; use an explicitly resourced code task for larger work')
+            path = self._source(request.path)
             binding = request.model_dump(mode='json')
+            if self._contract is not None and binding != self._contract:
+                raise ValueError('Exact table analysis must preserve its frozen TableSpec')
+            if self._contract is None and (request.spec.max_mb > 20 or request.spec.max_figures > 100 or request.spec.max_points > 10000):
+                raise ValueError('Built-in analysis is bounded to 20 MB, 100 figures and 10000 points; use an explicitly resourced code task for larger work')
             owner = ArtifactStore(self.root / 'tools/analysis' / identity)
             if owner.exists('request.json'):
                 if owner.read_json('request.json') != binding:
@@ -93,6 +134,7 @@ class AnalysisToolGateway:
                 'report': f'{prefix}/analysis.md', 'row_count': analysis['row_count'], 'artifact_sha256': hashes,
                 'scope': 'Deterministically computed from frozen supplied data under the recorded configuration; input semantics, collection and inferential claims are not independently verified.'},
                 'summary': 'Portable analysis, copied source and figures saved. Writing can consume analysis.md/analysis.json and existing figures; reuse valid results rather than rerunning to change prose.'}
+            saved['metadata'] = {'reusable_materials': {'data_analysis': [saved['data']['analysis']]}}
             owner.write_json('result.json', saved)
             return ToolResult(tool_name=name, **saved)
         except Exception as exc:

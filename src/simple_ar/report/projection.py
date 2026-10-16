@@ -80,7 +80,7 @@ def _output_handles(rows: list[dict[str, Any]]) -> list[SourceHandle]:
                          artifact=row["artifact"], title=row.get("name", ""),
                          summary="Recorded producer text, not independent implementation verification.")
             for row in rows if row.get("status") == "available" and row.get("handle")]
-from simple_ar.report.execution_evidence import execution_record
+from simple_ar.report.execution_evidence import compact_failure_diagnosis, execution_record
 
 if TYPE_CHECKING:
     from simple_ar.research.evidence.reader import ReadResult
@@ -91,9 +91,17 @@ class ReportProjectionError(ValueError):
 
 
 def build_implementation_report_inputs(*, topic: str, store: ArtifactStore,
-        implementation_ref: ArtifactRef, lineage_refs: Sequence[ArtifactRef] = (),
+        implementation_ref: ArtifactRef | None = None, lineage_refs: Sequence[ArtifactRef] = (),
+        measurement_refs: Sequence[ArtifactRef] = (),
+        analysis_artifacts: Mapping[str, str] | None = None,
         documents=None, documents_ref=None, read=None, read_ref=None):
-    """Use actual code checks and optional source evidence without a fake study."""
+    """Project accepted execution evidence without inventing a study.
+
+    The scientific owner verifies measurement/analysis identities, hashes and
+    frozen coverage before supplying these references. This join does not
+    certify receipts or rediscover accepted analyses by scanning attempts.
+    The historical name remains valid for implementation-only callers.
+    """
     if documents is not None:
         from simple_ar.research.sources.capability import provided_materials_result
         context, memory = build_literature_report_inputs(topic=topic, brief=None,
@@ -105,10 +113,136 @@ def build_implementation_report_inputs(*, topic: str, store: ArtifactStore,
         context = ReportContext(topic=topic, report_mode="supplied_materials")
         memory = ReportMemory(objective=topic, report_mode="supplied_materials")
     context.report_mode = memory.report_mode = "supplied_materials"
-    attach_implementation_evidence(context, store, implementation_ref, lineage_refs=lineage_refs)
+    if implementation_ref is not None:
+        attach_implementation_evidence(context, store, implementation_ref, lineage_refs=lineage_refs)
+    elif lineage_refs:
+        raise ReportProjectionError('Implementation lineage requires a selected implementation')
+    legacy = implementation_ref is not None and analysis_artifacts is None
+    history = []
+    if measurement_refs and not legacy:
+        context.report_mode = memory.report_mode = 'experiment'
+    if measurement_refs and legacy:
+        # Preserve the old composition/checkpoint input shape. New contracts
+        # supply explicit normalized analysis artifacts (including an empty map).
+        allowed = {ref.path for ref in (*lineage_refs, implementation_ref)}
+        history = [(f'measurement-{index + 1}', ref, store.read_json(ref)) for index, ref in enumerate(measurement_refs)]
+        if any((row.get('implementation_ref') or {}).get('path') not in allowed for _, _, row in history):
+            raise ReportProjectionError('Measurement evidence is not part of the accepted implementation lineage')
+        current = [(ref, row) for _, ref, row in history if row['implementation_ref']['path'] == implementation_ref.path]
+        if current:
+            ref, row = current[-1]
+            context.results = {**row, **context.results}
+            context.experiment_plan = dict(row.get('experiment_contract') or {})
+            context.metric_sources = metric_sources_from_execution(row, artifact=ref.path)
+        context, memory = attach_experiment_history(context, memory, history,
+            current_ref=current[-1][0] if current else implementation_ref, include_prior_metrics=False,
+            output_store=store)
+        if not current:
+            memory.limitations.append('The selected implementation has no formal measurement; earlier revisions are history, not current results.')
+    elif measurement_refs:
+        history = [(f'measurement-{index + 1}', ref, store.read_json(ref))
+            for index, ref in enumerate(measurement_refs)]
+        # A single observation may retain the historical flat result shape.
+        # Multiple conditions/revisions have no implicit representative run.
+        if len(history) == 1:
+            _, ref, row = history[0]
+            context.results = {**row, **context.results}
+            if row.get('status') != 'passed':
+                context.results['metrics'] = {}
+            context.experiment_plan = dict(row.get('experiment_contract') or {})
+        else:
+            context.experiment_plan = {'measurement_protocols': [
+                {'artifact': ref.path, 'protocol': row.get('experiment_contract')}
+                for _, ref, row in history]}
+        for action, ref, row in history:
+            if row.get('status') == 'passed':
+                context.metric_sources.extend(metric.model_copy(update={
+                    'metric_id': f'metric:{action}:{metric.label}:{metric.name}', 'label': action,
+                }) for metric in metric_sources_from_execution(row, artifact=ref.path))
+        context, memory = attach_experiment_history(context, memory, history,
+            current_ref=history[0][1] if len(history) == 1 else None,
+            include_prior_metrics=False,
+            output_store=store)
+        observations = {ref.path: row for _, ref, row in history}
+        context.source_handles = [handle.model_copy(update={'metadata': {
+            **handle.metadata,
+            **{key: observations[handle.artifact][key] for key in
+                ('measurement', 'implementation_ref', 'preparation')
+                if key in observations[handle.artifact]},
+        }}) if handle.kind == 'experiment_result' and handle.artifact in observations else handle
+            for handle in context.source_handles]
+        if implementation_ref is not None and not any(
+                (row.get('implementation_ref') or {}).get('path') == implementation_ref.path
+                for _, _, row in history):
+            memory.limitations.append('The selected implementation has no formal measurement; earlier revisions are history, not current results.')
+    if analysis_artifacts:
+        _attach_analysis_artifacts(context, memory, store=store,
+            artifacts=analysis_artifacts, history=history)
     memory.source_handles = list(context.source_handles)
-    memory.limitations.append("Code validation establishes the recorded behavior only; it is not a scientific measurement or evidence of performance improvement.")
+    memory.metric_sources = list(context.metric_sources)
+    if implementation_ref is not None:
+        memory.limitations.append("Code validation establishes the recorded behavior only; it is not a scientific measurement or evidence of performance improvement.")
+    if measurement_refs and not legacy:
+        memory.limitations.append('Recorded measurements and descriptive analyses do not independently establish scientific validity, significance or performance improvement.')
     return context, memory
+
+
+def _attach_analysis_artifacts(context: ReportContext, memory: ReportMemory, *,
+        store: ArtifactStore, artifacts: Mapping[str, str],
+        history: Sequence[tuple[str, ArtifactRef, Mapping[str, Any]]]) -> None:
+    """Project one owner-verified analysis using canonical task-relative refs.
+
+    Receipt authenticity, registration and hashes belong to the scientific
+    owner. Only the join between analysis content and selected measurements
+    is asserted here; comparison and summary algorithms stay with their owners.
+    """
+    refs = {kind: ArtifactRef(path=path, kind=kind) for kind, path in artifacts.items()}
+    rows = {kind: store.read_json(ref) for kind, ref in refs.items()}
+    analysis = AnalysisResult.model_validate(rows['analysis_result']['analysis'])
+    measured = {ref.path: (ref, row) for _, ref, row in history}
+    payload: dict[str, Any] = {}
+    if 'experiment_set_analysis' in rows:
+        collection = rows['experiment_set']
+        joined = {pair[role]['path'] for pair in collection['pairs']
+            for role in ('baseline', 'candidate') if pair[role] is not None}
+        if (joined != set(measured)
+                or rows['analysis_result']['execution_ref']['path'] != refs['experiment_set'].path
+                or rows['experiment_set_analysis']['collection_ref']['path'] != refs['experiment_set'].path):
+            raise ReportProjectionError('Analysis collection does not match the selected report measurements')
+        measurements = [(pair['seed'], role, *measured[pair[role]['path']])
+            for pair in collection['pairs'] for role in ('baseline', 'candidate')
+            if pair[role] is not None]
+        payload = rows['experiment_set_analysis']
+        attach_paired_report_measurements(context, memory, measurements,
+            comparisons=payload['comparisons'], comparison_ref=refs['experiment_set_analysis'],
+            summaries=payload.get('paired_summary', []),
+            condition_summaries=payload.get('condition_summary', []))
+        roles = {ref.path: f'{role}:seed={seed}' for seed, role, ref, _ in measurements}
+        for row in context.results['measurement_history']:
+            row['action'] = roles[row['artifact']]
+    else:
+        joined = {rows['analysis_result']['execution_ref']['path']}
+        if 'experiment_comparison' in rows:
+            comparison = rows['experiment_comparison']
+            joined.add(comparison['baseline_ref']['path'])
+            if comparison['candidate_ref']['path'] != rows['analysis_result']['execution_ref']['path']:
+                raise ReportProjectionError('Comparison candidate differs from the analyzed measurement')
+            payload = {'comparisons': [comparison]}
+        if joined != set(measured):
+            raise ReportProjectionError('Analysis does not match the selected report measurements')
+        if payload and all(row.get('status') == 'passed' for _, row in measured.values()):
+            context.metric_sources.extend(metric_sources_from_execution(payload,
+                artifact=refs['experiment_comparison'].path))
+    context.results = {**context.results, **payload, 'accepted_analyses': [{
+        'artifact': refs['analysis_result'].path,
+        'analysis': analysis.model_dump(mode='json'), 'execution': payload}]}
+    context.source_handles.extend(SourceHandle(handle=f'artifact:{ref.path}', kind=kind,
+        artifact=ref.path, metadata=({'analysis': analysis.model_dump(mode='json')}
+            if kind == 'analysis_result' else {'execution': rows[kind]}))
+        for kind, ref in refs.items())
+    memory.limitations.extend([*analysis.audit.limitations, *payload.get('limitations', [])])
+    memory.key_decisions.extend([f'analysis_status={analysis.status}', *analysis.status_reasons])
+    memory.claims_evidence_matrix.extend(claim_evidence_record_from_analysis(claim) for claim in analysis.claims)
 
 
 def attach_implementation_evidence(
@@ -133,6 +267,8 @@ def attach_implementation_evidence(
             continue
         seen.add(ref.path)
         ordered_refs.append(ref)
+        if ref.path == implementation_ref.path:
+            break  # Later accepted patches were not used by this measurement.
 
     revisions: list[dict[str, Any]] = []
     for ref in ordered_refs:
@@ -217,10 +353,44 @@ def build_research_report_inputs(
     design: ResearchDesignResult | None = None,
     design_ref: ArtifactRef | None = None,
     metric_artifacts: Mapping[str, str] | None = None,
+    evidence_store: ArtifactStore | None = None,
+    related_refs: Mapping[str, ArtifactRef] | None = None,
+    measurement_history: Sequence[tuple[str, ArtifactRef, Mapping[str, Any]]] = (),
+    implementation_lineage: Sequence[ArtifactRef] = (),
+    implementation_requested: bool = False,
 ) -> tuple[ReportContext, ReportMemory]:
     """Build experiment-report inputs from canonical persisted artifacts."""
 
     execution = dict(execution)
+    related = dict(related_refs or {})
+    paired = None
+    paired_ref = None
+    if evidence_store is not None:
+        if execution_ref.kind == "experiment_set":
+            paired_ref = evidence_store.ref(Path(analysis_ref.path).parent / "paired_analysis.json",
+                kind="experiment_set_analysis", schema="experiment_set_analysis.v1", producer="research.analysis")
+            paired = evidence_store.read_json(paired_ref)
+            if (paired.get("schema_version") != "experiment_set_analysis.v1"
+                    or ArtifactRef.from_dict(paired["collection_ref"]) != execution_ref):
+                raise ReportProjectionError("Paired analysis does not describe the accepted measurement collection.")
+            collection = execution
+            execution = {"status": paired["status"], "metrics": {}}
+        else:
+            comparison_ref = related.get("comparison")
+            if comparison_ref is not None:
+                comparison = evidence_store.read_json(comparison_ref)
+                if ArtifactRef.from_dict(comparison["candidate_ref"]) != execution_ref:
+                    raise ReportProjectionError("Comparison does not describe the accepted candidate measurement.")
+                related["baseline"] = ArtifactRef.from_dict(comparison["baseline_ref"])
+                execution["comparisons"] = [comparison]
+            if "baseline" in related:
+                execution["baseline"] = evidence_store.read_json(related["baseline"])
+            if "failure_diagnosis" in related:
+                execution["failure_diagnosis"] = compact_failure_diagnosis(
+                    evidence_store.read_json(related["failure_diagnosis"]))
+            metric_artifacts = {**(metric_artifacts or {}), **{
+                label: related[key].path for label, key in
+                (("baseline", "baseline"), ("comparison_delta", "comparison")) if key in related}}
     fallback_contract = (
         design.contract
         if design is not None and design.contract is not None
@@ -252,9 +422,14 @@ def build_research_report_inputs(
             "Research session has no topic in its persisted research plan."
         )
 
+    # Literature facts have the same owner in surveys and experiment reports.
+    # Add measured evidence only after that projection; its no-experiment
+    # limitation and survey objective are replaced below, never carried over.
+    context, memory = build_literature_report_inputs(
+        topic=topic, brief=brief, search=search, documents=documents, brief_ref=brief_ref,
+    )
     source_handles = _research_source_handles(
-        search=search,
-        brief_ref=brief_ref,
+        literature_handles=context.source_handles,
         execution_ref=execution_ref,
         analysis_ref=analysis_ref,
         design_ref=design_ref,
@@ -269,7 +444,6 @@ def build_research_report_inputs(
         metric_artifacts=metric_artifacts,
     )
     selected_papers = search.selected_papers
-    citation_key_map = _citation_key_map(selected_papers)
     evidence_summary = (
         f"Search returned {len(search.papers)} raw paper record(s) and retained "
         f"{len(selected_papers)} selected paper(s); "
@@ -278,46 +452,77 @@ def build_research_report_inputs(
         f"Execution status={execution.get('status', 'unknown')}; "
         f"analysis status={analysis.status}."
     )
-    context = ReportContext(
-        topic=topic,
-        report_mode="experiment",
-        synthesis_markdown=_synthesis_markdown(brief),
-        source_comparisons=[dict(row) for row in getattr(brief, "comparisons", ())],
-        hypothesis_markdown=contract.hypothesis,
-        evidence_summary=evidence_summary,
-        execution_context=brief.execution_context,
-        search_meta={
-            "status": search.status,
+    context = ReportContext.model_validate({
+        **context.model_dump(),
+        "report_mode": "experiment",
+        "hypothesis_markdown": contract.hypothesis,
+        "evidence_summary": evidence_summary,
+        "execution_context": brief.execution_context,
+        "search_meta": {
+            "status": context.search_meta["status"],
             "paper_count": len(search.papers),
             "selected_paper_count": len(selected_papers),
             "response_count": len(search.responses),
-            "coverage": dict(search.coverage_report),
-            "diagnostics": list(search.diagnostics),
+            "coverage": context.search_meta["coverage"],
+            "diagnostics": context.search_meta["diagnostics"],
         },
-        experiment_plan=contract.to_row(),
-        results=execution,
-        papers=[paper.to_row() for paper in selected_papers],
-        source_handles=source_handles,
-        metric_sources=metric_sources,
-        citation_key_map=citation_key_map,
-    )
-    memory = ReportMemory(
-        objective=contract.hypothesis,
-        template="experiment",
-        report_mode="experiment",
-        claims_evidence_matrix=[
+        "experiment_plan": contract.to_row(),
+        "results": execution,
+        "source_handles": source_handles,
+        "metric_sources": metric_sources,
+    })
+    memory = ReportMemory.model_validate({
+        **memory.model_dump(),
+        "objective": contract.hypothesis,
+        "template": "experiment",
+        "report_mode": "experiment",
+        "claims_evidence_matrix": [
             claim_evidence_record_from_analysis(claim)
             for claim in analysis.claims
         ],
-        source_handles=source_handles,
-        metric_sources=metric_sources,
-        limitations=[*analysis.audit.limitations, *contract.risks],
-        key_decisions=[
+        "source_handles": source_handles,
+        "metric_sources": metric_sources,
+        "limitations": [*analysis.audit.limitations, *contract.risks],
+        "key_decisions": [
             f"execution_status={execution.get('status', 'unknown')}",
             f"analysis_status={analysis.status}",
             *analysis.status_reasons,
         ],
-    )
+    })
+    if evidence_store is not None:
+        if paired is not None:
+            context.results = paired
+            memory.limitations.append(f"Metrics describe candidate revision {paired.get('candidate_revision', 0)}; "
+                f"{len(paired.get('superseded_candidates', []))} superseded candidate measurements are retained separately, not pooled.")
+            measurements = [(pair["seed"], role, ref, evidence_store.read_json(ref))
+                for pair in collection["pairs"] for role in ("baseline", "candidate")
+                if pair[role] is not None for ref in (ArtifactRef.from_dict(pair[role]),)]
+            context, memory = attach_paired_report_measurements(context, memory, measurements,
+                comparisons=paired["comparisons"], comparison_ref=paired_ref, summaries=paired.get("paired_summary", []),
+                condition_summaries=paired.get("condition_summary", []))
+            context.source_handles.append(SourceHandle(handle="artifact:paired_analysis", kind="experiment_set_analysis", artifact=paired_ref.path))
+            implementation = paired.get("implementation_ref")
+            if implementation is None and collection.get("implementation_ref") is not None:
+                memory.limitations.append("The collection's implementation revision was not confirmed by every candidate measurement.")
+        else:
+            context.source_handles.extend(SourceHandle(handle=f"artifact:{key}",
+                kind="experiment_diagnosis" if key == "failure_diagnosis" else key, artifact=ref.path,
+                summary="Captured failed-run diagnosis and stderr tail; not a scientific verdict." if key == "failure_diagnosis" else "")
+                for key, ref in related.items())
+            implementation = execution.get("implementation_ref")
+            if implementation is None and implementation_requested:
+                memory.limitations.append("This measurement has no implementation revision reference; the current patch is not attributed to it.")
+            if "experiment_contract" in execution:
+                context.experiment_plan = dict(execution["experiment_contract"])
+                memory.key_decisions.append("Experiment protocol comes from the measured execution; research design records motivation, not proof of implementation.")
+        if implementation is not None:
+            implementation_ref = ArtifactRef.from_dict(implementation)
+            if implementation_ref.kind != "implementation_result":
+                raise ReportProjectionError("A measurement references a non-implementation artifact as its producing patch.")
+            attach_implementation_evidence(context, evidence_store, implementation_ref,
+                lineage_refs=implementation_lineage)
+        context, memory = attach_experiment_history(context, memory, measurement_history,
+            current_ref=execution_ref, include_prior_metrics=paired is None, output_store=evidence_store)
     return context, memory
 
 
@@ -361,7 +566,8 @@ def build_material_report_inputs(
                      replace(record, abstract="") if record.document_id in parsed_ids else record
                      for record in paper_records]
     search = provided_materials_result(paper_records)
-    by_paper_id = {handle.paper_id: handle for handle in _paper_source_handles(search)}
+    paper_sources = _paper_source_handles(search)
+    by_paper_id = {handle.paper_id: handle for handle in paper_sources}
     paper_handles = {record.document_id: by_paper_id[paper.id]
                      for record, paper in zip(paper_records, search.selected_papers, strict=True)}
     chunks_by_document: dict[str, list[Any]] = {}
@@ -436,7 +642,7 @@ def build_material_report_inputs(
         limitations.extend(document_extraction_limitations(documents.records))
     context = ReportContext(topic=topic, report_mode="supplied_materials", source_handles=handles,
         papers=[paper.to_row() for paper in search.selected_papers],
-        citation_key_map=_citation_key_map(search.selected_papers),
+        citation_key_map={handle.citation_key: handle.paper_id for handle in paper_sources},
         evidence_summary=f"Retained source passages from {sum(bool(chunks_by_document.get(record.document_id)) for record in documents.records)} of {len(documents.records)} supplied materials. Method and result assertions remain source-reported.",
         results={"evidence_origin": "user_supplied_unverified", "session_execution": "not_requested"})
     # Assign linked-material citation identities before joining a saved map;
@@ -529,7 +735,6 @@ def build_literature_report_inputs(
     handles = _paper_source_handles(search)
     if brief_ref is not None:
         handles.insert(0, SourceHandle(handle="artifact:synthesis", kind="synthesis", artifact=brief_ref.path))
-    citation_key_map = _citation_key_map(search.selected_papers)
     limitation = (
         "No experiment was requested or executed; cited results describe "
         "prior work, not measurements from this session."
@@ -551,7 +756,7 @@ def build_literature_report_inputs(
         },
         papers=[paper.to_row() for paper in search.selected_papers],
         source_handles=handles,
-        citation_key_map=citation_key_map,
+        citation_key_map={handle.citation_key: handle.paper_id for handle in handles if handle.kind == "paper"},
     )
     memory = ReportMemory(
         objective=topic,
@@ -571,6 +776,7 @@ def attach_paired_report_measurements(
     comparisons: list[Mapping[str, Any]],
     comparison_ref: ArtifactRef,
     summaries: Sequence[Mapping[str, Any]] = (),
+    condition_summaries: Sequence[Mapping[str, Any]] = (),
 ) -> tuple[ReportContext, ReportMemory]:
     """Project measured conditions into report provenance rows."""
 
@@ -619,9 +825,14 @@ def attach_paired_report_measurements(
                 artifact=comparison_ref.path,
             )
         )
-    for summary in summaries:
-        label = f"paired_summary:{summary['group_id']}"
-        for field in ("n", "baseline_mean", "candidate_mean", "delta_mean", "delta_sample_std"):
+    for summary, prefix, fields in [
+        *((row, 'paired_summary', ('n', 'baseline_mean', 'candidate_mean', 'delta_mean', 'delta_sample_std'))
+            for row in summaries),
+        *((row, 'condition_summary', ('n', 'candidate_mean', 'candidate_sample_std'))
+            for row in condition_summaries),
+    ]:
+        label = f"{prefix}:{summary['group_id']}"
+        for field in fields:
             if summary[field] is not None:
                 name = f"{summary['metric']}.{field}"
                 metrics.append(
@@ -657,6 +868,8 @@ def attach_paired_report_measurements(
         "Report every seed separately. Do not turn the last run into a mean, "
         "or claim significance from these descriptive comparisons."
     )
+    if condition_summaries:
+        memory.limitations.append('Candidate-only descriptive summaries have no baseline comparison; no performance improvement or significance is established.')
     return context, memory
 
 
@@ -665,7 +878,7 @@ def attach_experiment_history(
     memory: ReportMemory,
     measurements: Sequence[tuple[str, ArtifactRef, Mapping[str, Any]]],
     *,
-    current_ref: ArtifactRef,
+    current_ref: ArtifactRef | None,
     include_prior_metrics: bool = True,
     output_store: ArtifactStore | None = None,
 ) -> tuple[ReportContext, ReportMemory]:
@@ -707,14 +920,14 @@ def attach_experiment_history(
             artifact=ref.path, summary=f"{action}: {status}",
         ))
         if (include_prior_metrics and status == "passed"
-                and ref.path != current_ref.path and action != "baseline"):
+                and (current_ref is None or ref.path != current_ref.path) and action != "baseline"):
             metrics.extend(metric.model_copy(update={
                 "metric_id": f"metric:history:{action}:{metric.name}",
                 "label": action,
             }) for metric in metric_sources_from_execution(result, artifact=ref.path)
                 if metric.label == "candidate")
     context.results = {**context.results, "measurement_history": history}
-    current = next((row for row in history if row["artifact"] == current_ref.path), None)
+    current = next((row for row in history if current_ref is not None and row["artifact"] == current_ref.path), None)
     if current is not None:
         context.results["output_evidence"] = current["output_evidence"]
     context.source_handles = handles
@@ -1349,15 +1562,19 @@ def _paired_summary_markdown(
     ]
     if not rows:
         return ""
+    grouped = len({row.get('group_id') for row in rows}) > 1
     table = [
-        "| Metric | Seeds | Baseline mean | Candidate mean | Mean delta (derived) | Delta std |",
-        "| --- | ---: | ---: | ---: | ---: | ---: |",
+        ("| Protocol group | Metric | Seeds | Baseline mean | Candidate mean | Mean delta (derived) | Delta std |"
+            if grouped else "| Metric | Seeds | Baseline mean | Candidate mean | Mean delta (derived) | Delta std |"),
+        ("| --- | --- | ---: | ---: | ---: | ---: | ---: |"
+            if grouped else "| --- | ---: | ---: | ---: | ---: | ---: |"),
     ]
     for row in rows:
         table.append(
             "| "
             + " | ".join(
                 (
+                    *([_markdown_cell(str(row.get('group_id', '')))] if grouped else []),
                     f"`{_markdown_cell(str(row['metric']))}`",
                     _format_report_metric(row.get("n")),
                     _format_report_metric(row.get("baseline_mean")),
@@ -1553,8 +1770,7 @@ def _synthesis_markdown(synthesis: Any) -> str:
 
 def _research_source_handles(
     *,
-    search: SearchResult,
-    brief_ref: ArtifactRef,
+    literature_handles: Sequence[SourceHandle],
     execution_ref: ArtifactRef,
     analysis_ref: ArtifactRef,
     design_ref: ArtifactRef | None,
@@ -1562,12 +1778,9 @@ def _research_source_handles(
     analysis: AnalysisResult,
 ) -> list[SourceHandle]:
     handles = [
-        SourceHandle(
-            handle="artifact:synthesis",
-            kind="synthesis",
-            artifact=brief_ref.path,
-            summary="Evidence-derived research direction and experiment contract.",
-        ),
+        literature_handles[0].model_copy(update={
+            "summary": "Evidence-derived research direction and experiment contract.",
+        }),
         SourceHandle(
             handle="artifact:experiment_execution",
             kind="experiment",
@@ -1591,7 +1804,7 @@ def _research_source_handles(
                 summary="Selected research direction and executable contract.",
             ),
         )
-    handles.extend(_paper_source_handles(search))
+    handles.extend(literature_handles[1:])
     return handles
 
 
@@ -1618,17 +1831,12 @@ def _paper_source_handles(search: SearchResult) -> list[SourceHandle]:
     ]
 
 
-def _citation_key_map(papers: Sequence[Paper]) -> dict[str, str]:
-    """Assign stable, compact keys for the current selected-paper order."""
-
-    return {f"P{index}": paper.id for index, paper in enumerate(papers, start=1)}
-
-
 __all__ = [
     "ReportProjectionError",
     "attach_paired_report_measurements",
     "attach_report_read_evidence",
     "build_literature_report_inputs",
+    "build_implementation_report_inputs",
     "build_research_report_inputs",
     "claim_evidence_record_from_analysis",
     "evidence_handles_from_claim",

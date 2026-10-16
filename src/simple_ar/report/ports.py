@@ -1,8 +1,7 @@
 """Replaceable report rendering ports.
 
-The default renderer remains the existing deterministic SVG implementation.
-External image tools may implement the same protocol without changing report
-assembly or audit behavior.
+Explicit renderers keep their public contract. Assembly opts out of historical
+template inference; registered data/asset consumers remain the figure owners.
 """
 
 from __future__ import annotations
@@ -34,9 +33,13 @@ class FigureRenderer(Protocol):
 
 
 class DeterministicFigureRenderer:
-    """Default renderer backed by the existing local SVG implementation."""
+    """SVG views with an isolated historical config/template selection mode."""
 
     name = "deterministic_svg"
+
+    def __init__(self, *, legacy: bool = True, section_headings: dict[str, str] | None = None):
+        self.legacy = legacy
+        self.section_headings = section_headings
 
     def render(
         self,
@@ -55,6 +58,8 @@ class DeterministicFigureRenderer:
             template_name=template_name,
             document_plan=document_plan,
             emit=emit,
+            legacy=self.legacy,
+            section_headings=self.section_headings,
         )
 
 

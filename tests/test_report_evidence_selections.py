@@ -4,10 +4,11 @@ import json
 import unittest
 
 from simple_ar.integrations.llm import LLMResponseError
-from simple_ar.report.agent import _review_section
+from simple_ar.report.agent import _section_response
 from simple_ar.report.editor import review_document
 from simple_ar.report.review_evidence import (
-    resolve_review_evidence, review_evidence_locator, validate_evidence_quotes,
+    GAP_EVIDENCE_CONTRACT, resolve_review_evidence, review_evidence_locator, validate_evidence_quotes,
+    validate_finding_anchors,
 )
 from simple_ar.report.schema import (
     ReportContext, ReportEvidenceQuote, ReportMemory, ReportRuntimeConfig,
@@ -105,9 +106,9 @@ class EvidenceSelectionTests(unittest.TestCase):
             with self.subTest(pointer=pointer):
                 quote, _ = self.resolve({"pointer": pointer}, view)
                 self.assertEqual((quote.quote, quote.role, quote.mode), (value, role, "field_reference"))
+                view["evidence_locator"] = review_evidence_locator(view)
+                self.assertEqual(self.resolve({"anchor": select(view, role, pointer)}, view)[0], quote)
                 if value == "":
-                    view["evidence_locator"] = review_evidence_locator(view)
-                    self.assertEqual(self.resolve({"anchor": select(view, role, pointer)}, view)[0], quote)
                     restored = ReportEvidenceQuote.model_validate(quote.model_dump(mode="json"))
                     validate_evidence_quotes([restored], view)
                     with self.assertRaises(LLMResponseError):
@@ -132,15 +133,47 @@ class EvidenceSelectionTests(unittest.TestCase):
             with self.subTest(reference=reference), self.assertRaises(LLMResponseError):
                 self.resolve(reference, view)
 
-    def test_direct_selection_stays_bound_to_original_value_on_restore(self):
-        view = self.view()
-        quote, review = self.resolve({"pointer": "/metric_sources/a~1b~0c"}, view)
+    def test_empty_observation_is_only_a_version_bound_unresolved_gap_not_counter_evidence(self):
+        view = {"evidence_reference_contract": GAP_EVIDENCE_CONTRACT,
+            "metric_sources": {"rows": []}, "execution_evidence": {"output_evidence": {}},
+            "source_evidence": [{"text": "Reported mean 2.0; no dispersion supplied here."}]}
+        raw = {"section_id": "results", "verdict": "warning", "findings": [{
+            "finding_id": "missing-observation", "type": "evidence_gap", "required_action": "verify",
+            "message": "No dispersion record was supplied for this check; not proof the experiment lacks it.",
+            "draft_quotes": [{"section_id": "results", "quote": "Dispersion was 0.3."}],
+            "evidence_quotes": [{"pointer": "/metric_sources/rows"},
+                                {"pointer": "/execution_evidence/output_evidence"}]}]}
+        before = copy.deepcopy(raw)
+        review = ReportSectionReview.model_validate(resolve_review_evidence(raw, view))
+        self.assertEqual(raw, before)
+        self.assertEqual([row.quote for row in review.findings[0].evidence_quotes], ["[]", "{}"])
+        drafts = {"results": "Dispersion was 0.3."}
+        validate_finding_anchors(review, drafts, view)
         restored = ReportSectionReview.model_validate(review.model_dump(mode="json"))
-        changed = copy.deepcopy(view)
-        changed["metric_sources"]["a/b~c"] = 4
-        with self.assertRaisesRegex(LLMResponseError, "absent or changed"):
-            validate_evidence_quotes(restored.findings[0].evidence_quotes, changed)
-        self.assertEqual(quote.quote, "3")
+        validate_finding_anchors(restored, drafts, view)
+        for changed in ({key: val for key, val in view.items() if key != "evidence_reference_contract"},
+                {**view, "metric_sources": {"rows": [2.0]}}):
+            with self.subTest(changed=changed), self.assertRaises(LLMResponseError):
+                validate_finding_anchors(restored, drafts, changed)
+        for kind, action in (("metric_mismatch", "revise"), ("unsupported_claim", "verify"),
+                ("style", "advisory"), ("evidence_gap", "revise")):
+            changed = copy.deepcopy(raw)
+            changed["findings"][0].update(type=kind, required_action=action)
+            with self.subTest(kind=kind, action=action), self.assertRaises(LLMResponseError):
+                resolve_review_evidence(changed, view)
+        for reference in ({"pointer": "/metric_sources/absent"},
+                {"pointer": "/source_evidence"},
+                {"pointer": "/metric_sources/rows", "quote": "[0]", "role": "registered_result"}):
+            changed = copy.deepcopy(raw)
+            changed["findings"][0]["evidence_quotes"] = [reference]
+            with self.subTest(reference=reference), self.assertRaises(LLMResponseError):
+                result = ReportSectionReview.model_validate(resolve_review_evidence(changed, view))
+                validate_finding_anchors(result, drafts, view)
+        # Even a valid gap must not use emptiness as closure of an old opinion.
+        check = {"finding_checks": [{"finding_id": "old", "status": "resolved",
+            "evidence_quotes": [{"pointer": "/metric_sources/rows"}]}]}
+        with self.assertRaises(LLMResponseError):
+            resolve_review_evidence(check, view)
 
     def test_unknown_omitted_conflicting_and_forged_selections_are_rejected(self):
         view = self.view()
@@ -162,7 +195,9 @@ class EvidenceSelectionTests(unittest.TestCase):
     def test_saved_selection_does_not_rebind_to_changed_source_or_locator(self):
         view = self.view()
         pointer = "/execution_evidence/execution_records/0/cwd"
-        quote, review = self.resolve({"anchor": select(view, "executor_record", pointer)}, view)
+        selected, review = self.resolve({"anchor": select(view, "executor_record", pointer)}, view)
+        quote, direct = self.resolve({"pointer": pointer}, view)
+        self.assertEqual((quote, direct), (selected, review))
         restored = ReportSectionReview.model_validate(review.model_dump(mode="json"))
         changed = self.view()
         changed["execution_evidence"]["execution_records"][0]["cwd"] = "/other-copy"
@@ -194,15 +229,7 @@ class EvidenceSelectionTests(unittest.TestCase):
         with self.assertRaisesRegex(LLMResponseError, "non-derived"):
             validate_finding_anchors(review, {"setup": "Reported result."}, view)
 
-    def test_null_boolean_and_negative_values_are_recorded_without_transcription(self):
-        view = {"metric_sources": {"missing": None, "enabled": False, "delta": -0.5}}
-        view["evidence_locator"] = review_evidence_locator(view)
-        for key, expected in (("missing", "null"), ("enabled", "false"), ("delta", "-0.5")):
-            quote, _ = self.resolve({"anchor": select(view, "registered_result", f"/metric_sources/{key}")}, view)
-            self.assertEqual(quote.quote, expected)
-
     def test_format_correction_uses_same_minimal_selection_without_retyping_source(self):
-        from simple_ar.report.agent import _review_section_with_recovery
         context = ReportContext(topic="Observed conditions", report_mode="experiment",
             results={"execution_record": {"invocation_id": "run-1", "cwd": "/actual-copy"}})
         memory = ReportMemory(section_plan=[ReportSectionPlan(section_id="setup", heading="Setup", goal="Conditions")])
@@ -218,7 +245,7 @@ class EvidenceSelectionTests(unittest.TestCase):
                 return {"section_id": "setup", "verdict": "warning", "findings": [{
                     "finding_id": "observation", "type": "style", "message": "Recorded context.",
                     "evidence_quotes": [{"anchor": select(view, "executor_record", "/execution_evidence/execution_records/0/cwd")}]}]}
-        result = _review_section_with_recovery(client=Client(), context=context, memory=memory,
+        result = _section_response(client=Client(), context=context, memory=memory,
             section=memory.section_plan[0], draft=draft, config=config,
             template=load_report_template_bundle(report_mode=context.report_mode, config=config), label="field-recovery")
         self.assertEqual(len(seen), 2)
@@ -304,7 +331,7 @@ class EvidenceSelectionTests(unittest.TestCase):
                     execution_summary={}, metric_summary={}, execution_evidence=report_execution_evidence(context), historical_findings=prior)
                 refs = rows[0].finding_checks[0].evidence_quotes if prior else rows[0].findings[0].evidence_quotes
                 self.assertEqual(refs[0].quote, "/actual-copy")
-            result = _review_section(client=Client(direct), context=context, template=template, memory=memory,
+            result = _section_response(client=Client(direct), recover=False, context=context, template=template, memory=memory,
                 section=memory.section_plan[0], draft=draft, config=config, label="section-selection")
             self.assertEqual(result.findings[0].evidence_quotes[0].pointer, "/execution_evidence/execution_records/0/cwd")
 

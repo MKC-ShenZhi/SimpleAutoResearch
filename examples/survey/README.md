@@ -4,7 +4,7 @@ Produce a literature survey of small-memory continual learning for image
 classification, comparing methods, evidence and open questions. The entire user
 request and limits are in `research.toml`; no project, dataset or GPU is needed.
 
-From the repository root, configure the provider in `.env`, then run:
+Complete [model setup](../../docs/USAGE.md), then run from the repository root:
 
 ```bash
 uv run --no-sync simple-ar research-session --config examples/survey/research.toml

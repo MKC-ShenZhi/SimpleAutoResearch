@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import contextlib
 import io
+import hashlib
+import os
 import json
 import shutil
 import subprocess
@@ -36,7 +38,7 @@ from simple_ar.code_task import (
 )
 from simple_ar.code_task.runtime.config import CodeTaskConfigError, load_code_task_init_options
 from simple_ar.code_task.editing.actions import apply_repair_actions
-from simple_ar.code_task.generation.dependencies import DEPENDENCY_CATALOG, build_dependency_advice
+from simple_ar.code_task.generation.dependencies import build_dependency_advice
 from simple_ar.code_task.generation.file_specs import infer_file_kind
 from simple_ar.code_task.analysis.resource_static import analyze_resource_risks, resource_review_findings
 from simple_ar.code_task.generation.generated_project_repair import (
@@ -50,24 +52,24 @@ from simple_ar.code_task.orchestration.execute import (
 )
 from simple_ar.code_task.editing.patching import _write_text_atomically
 from simple_ar.code_task.editing.work_plan import _normalize_work_items
-from simple_ar.code_task.runtime.state import code_task_paths
+from simple_ar.code_task.runtime.state import code_task_paths, implementation_file_hashes
+from simple_ar.code_task.workspace.modes import (
+    WorkspaceSpec, WorkspaceModeError, create_workspace, workspace_source_binding,
+    _source_venv_python,
+)
+from simple_ar.code_task.analysis.index import build_codebase_index
 from simple_ar.integrations.llm import LLMError, LLMClient, LLMSettings
 from simple_ar.core.budget import BudgetLedger
+from tests.code_task_fixtures import (
+    TOY_PREDICT_SOURCE,
+    TOY_PREDICT_WITH_PRIZE,
+    keyword_code_responses,
+    write_toy_project as _write_toy_project,
+)
 
 
 TEST_ROOT = Path(__file__).resolve().parents[1] / ".tmp_tests"
-
-
 TOY_BENCHMARK_COMMAND = "python -m unittest discover -s tests"
-TOY_PREDICT_SOURCE = (
-    "def predict(text):\n"
-    "    return 'spam' if 'win' in text.lower() else 'ham'\n"
-)
-TOY_PREDICT_WITH_PRIZE = (
-    "def predict(text):\n"
-    "    lowered = text.lower()\n"
-    "    return 'spam' if any(keyword in lowered for keyword in ('win', 'prize')) else 'ham'\n"
-)
 
 
 def _invoke_generated_repair(phase, kwargs, diagnostics=None):
@@ -116,6 +118,239 @@ class _RelatedRepairClient:
 
 
 class CodeTaskTests(unittest.TestCase):
+    @contextlib.contextmanager
+    def _orphan_validator(self, *, after_archive=False, returncode=0, watchdog=False, preparation=False):
+        from simple_ar.code_task.runtime.state import load_code_task_manifest, save_code_task_manifest
+        from simple_ar.code_task.execution.runner import _safe_env
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / 'source'
+            project.mkdir()
+            write_text(project / 'main.py', 'VALUE = 1\n')
+            write_text(project / 'check.py', f"import sys\nprint('score: 0.75')\nsys.exit({returncode})\n")
+            task = root / 'task.md'
+            write_text(task, 'Fix VALUE, preserving the independent checker')
+            initialized = initialize_code_task(run_dir=root / 'run', code_root=project, task_file=task,
+                env_mode='external', python_executable=sys.executable,
+                edit_scope_allowed_patterns=('main.py',), edit_scope_protected_patterns=('check.py',))
+            run = initialized.run_dir
+            manifest = load_code_task_manifest(run)
+            manifest['code_task']['native_binding'] = {'token': 'original-approved-contract', 'binding': {
+                'contract': {'validation_command': ['python', 'check.py'], 'timeout_sec': 5},
+                'python_executable': sys.executable, 'environment': _safe_env(initialized.workspace_dir)}}
+            if preparation:
+                store_root = root / 'attempts/native-tool-001'
+                manifest['code_task']['native_binding']['binding']['environment_preparations'] = {
+                    manifest['workspace']['selected_mode']: {
+                        'store_root': str(store_root), 'cwd': str(initialized.workspace_dir),
+                        'command': ['python', 'check.py'], 'argv': [sys.executable, 'check.py'],
+                        'result_schema': {}, 'protocol': None, 'interpreter': sys.executable,
+                        'environment_preparation': {'profile': {'mode': 'current', 'timeout_sec': 5},
+                            'steps': [[sys.executable, '-c', 'pass']]}}}
+                # Boundary fixture only: the shared physical-proof owner is stubbed by its caller.
+                write_json(store_root / 'environment_setup.json', {'steps': [
+                    {'process_record': {'session_id': 'same-session'}}]})
+                write_json(store_root / 'environment_observation.json', {'boundary_fixture': True})
+            save_code_task_manifest(run, manifest)
+            ledger = BudgetLedger({'process_invocations': 2 if preparation else 1,
+                'process_wall_seconds': 10 if preparation else 5}, storage_path=root / 'ledger.json')
+            if preparation:
+                ledger.reserve('process-' + 'a' * 32, {'process_invocations': 1, 'process_wall_seconds': 5},
+                    session_id='same-session', attempt_id='native-tool-001', logical_call_id='a' * 32,
+                    purpose='local_process')
+                ledger.settle('process-' + 'a' * 32, {'process_invocations': 1, 'process_wall_seconds': 0.01},
+                    actual_source='executor_wall_clock')
+            report = initialized.task_dir / 'run/patched/execution_report.json'
+
+            def interrupt_latest(path, value):
+                if path == report:
+                    raise RuntimeError('stopped before latest validator report')
+                write_json(path, value)
+
+            target = 'simple_ar.code_task.execution.runner.' + ('write_json' if after_archive else '_write_execution_result')
+            failure = interrupt_latest if after_archive else RuntimeError('stopped after process settlement')
+            def rejected_output(owner, stream, text):
+                if text.strip():
+                    owner.triggered = {'detail': 'Recorded watchdog rejection'}
+
+            guard = patch('simple_ar.code_task.execution.runner._OutputWatchdog.observe', autospec=True,
+                          side_effect=rejected_output) if watchdog else contextlib.nullcontext()
+            with guard, patch(target, side_effect=failure), self.assertRaisesRegex(RuntimeError, 'stopped'):
+                run_code_task_benchmark(run, command='python check.py', timeout_sec=5, skip_validation=True,
+                    budget_ledger=ledger, session_id='same-session', attempt_id='native-tool-001')
+            self.assertFalse(report.exists())
+            invocation = next((initialized.task_dir / 'run/patched/process').glob('*/invocation.json'))
+            yield root, initialized, ledger, invocation
+
+    def test_orphan_validator_completes_domain_result_without_process_or_model_replay(self):
+        from simple_ar.code_task.orchestration.execute import implementation_resume_allowed
+        from simple_ar.research.implementation import ImplementationRequest, run_implementation_capability
+        from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
+        for after_archive in (False, True):
+            proof = patch('simple_ar.research.project_environment.verify_environment_preparation',
+                return_value=({'a' * 32}, [])) if after_archive else contextlib.nullcontext()
+            with self.subTest(after_archive=after_archive), proof, self._orphan_validator(
+                    after_archive=after_archive, preparation=after_archive) as (root, initialized, ledger, invocation):
+                run = initialized.run_dir
+                before, original = ledger.to_dict(), invocation.read_bytes()
+                self.assertTrue(implementation_resume_allowed(run, ledger=ledger, attempt_id='native-tool-001'))
+                store = ArtifactStore(root / 'attempts/native-tool-001' if after_archive else run / 'domain-attempt')
+                brief = store.write_json('brief.json', {'objective': 'Fix VALUE', 'request_text': 'Fix VALUE'}, kind='research_brief')
+                context = CapabilityContext(store, AttemptManifest('native-tool-001'), inputs=(brief,))
+                client = Mock()
+                with patch('simple_ar.core.process.subprocess.Popen') as launch, \
+                        patch('simple_ar.research.implementation.implement_code_task', return_value=SimpleNamespace(
+                            stop_reason='stop_point', next_action='Inspect', steps=())):
+                    result = run_implementation_capability(context=context, request=ImplementationRequest(
+                        run, initialized.workspace_dir, 'Original approval', client,
+                        validation_command=('python', 'check.py'), validation_timeout_sec=5,
+                        budget_ledger=ledger, session_id='same-session', attempt_id='native-tool-001'))
+                    self.assertEqual(result.status, 'completed')
+                    launch.assert_not_called()
+                    client.ask_json.assert_not_called()
+                domain = store.read_json('implementation.json')
+                self.assertEqual(domain['status'], 'validated')
+                report = read_json(initialized.task_dir / 'run/patched/execution_report.json')
+                self.assertEqual(report['process']['invocation_id'], read_json(invocation)['invocation_id'])
+                self.assertEqual(report['metric_values'], {'score': 0.75})
+                self.assertEqual(ledger.to_dict(), before)
+                self.assertEqual(invocation.read_bytes(), original)
+                histories = list((initialized.task_dir / 'run/patched/attempts').glob('*/execution_report.json'))
+                self.assertEqual(len(histories), 1)
+
+    def test_orphan_validator_rejects_changed_or_unknown_execution_bindings(self):
+        from simple_ar.code_task.orchestration.verification import verify_implementation
+        from simple_ar.code_task.execution.runner import CodeTaskRunError
+        from simple_ar.code_task.orchestration.execute import implementation_resume_allowed
+        with self._orphan_validator() as (root, initialized, ledger, invocation):
+            original = read_json(invocation)
+            mutations = {
+                'argv': lambda r: r.update(argv=[sys.executable, 'main.py']),
+                'cwd': lambda r: r.update(cwd=str(root)),
+                'env': lambda r: r['environment'].update(PYTHONPATH='other-source'),
+                'hash': lambda r: r['input_binding']['implementation_file_hashes'].update({'main.py': 'changed'}),
+                'approval': lambda r: r['input_binding']['native_binding'].update(token='other-approval'),
+                'attempt': lambda r: r.update(attempt_id='other-attempt'),
+                'session': lambda r: r.update(session_id='other-session'),
+                'pending': lambda r: r.update(status='running'),
+                'unbound_legacy': lambda r: r.pop('input_binding'),
+            }
+            with patch('simple_ar.core.process.subprocess.Popen') as launch:
+                for label, mutate in mutations.items():
+                    changed = json.loads(json.dumps(original))
+                    mutate(changed)
+                    write_json(invocation, changed)
+                    with self.subTest(label=label):
+                        self.assertFalse(implementation_resume_allowed(initialized.run_dir, ledger=ledger, attempt_id='native-tool-001'))
+                        with self.assertRaises(CodeTaskRunError):
+                            verify_implementation(initialized.run_dir, command=('python', 'check.py'),
+                                timeout_sec=5, approval_note='Original approval', llm_client=Mock(),
+                                asset_guard=lambda: {'status': 'unchanged'}, budget_ledger=ledger,
+                                session_id='same-session', attempt_id='native-tool-001')
+                write_json(invocation, original)
+                for field, value in (('status', 'unknown'), ('logical_call_id', 'other-invocation'),
+                                     ('attempt_id', 'other-attempt'), ('session_id', 'other-session'),
+                                     ('actual', {'process_invocations': 1, 'process_wall_seconds': 999})):
+                    data = ledger.to_dict()
+                    data['entries'][0][field] = value
+                    path = root / 'altered-ledger.json'
+                    write_json(path, data)
+                    changed_ledger = BudgetLedger.load(path)
+                    with self.subTest(ledger_field=field):
+                        self.assertFalse(implementation_resume_allowed(initialized.run_dir,
+                            ledger=changed_ledger, attempt_id='native-tool-001'))
+                        with self.assertRaises(CodeTaskRunError):
+                            verify_implementation(initialized.run_dir, command=('python', 'check.py'), timeout_sec=5,
+                                approval_note='Original approval', llm_client=Mock(),
+                                asset_guard=lambda: {'status': 'unchanged'}, budget_ledger=changed_ledger,
+                                session_id='same-session', attempt_id='native-tool-001')
+                (initialized.workspace_dir / 'main.py').write_text('VALUE = 2\n')
+                self.assertFalse(implementation_resume_allowed(initialized.run_dir, ledger=ledger, attempt_id='native-tool-001'))
+                launch.assert_not_called()
+
+        from simple_ar.code_task.execution.runner import recover_implementation_process
+        from simple_ar.code_task.runtime.state import native_preparation_processes
+        with patch('simple_ar.research.project_environment.verify_environment_preparation',
+                return_value=({'a' * 32}, [])) as proof, self._orphan_validator(preparation=True) as (
+                    root, initialized, ledger, invocation), patch('simple_ar.core.process.subprocess.Popen') as launch:
+            run = initialized.run_dir
+            manifest = read_json(run / 'manifest.json')
+            view = manifest['code_task']['native_binding']['binding']['environment_preparations'][
+                manifest['workspace']['selected_mode']]
+            before = ledger.to_dict()
+            self.assertEqual(native_preparation_processes(run, ledger=ledger,
+                session_id='', attempt_id='native-tool-001'), {'a' * 32})
+            self.assertEqual(proof.call_args.kwargs['session_id'], 'same-session')
+            self.assertEqual(proof.call_args.args[0].root, Path(view['store_root']))
+            for failure in ('unknown', 'duplicate', 'omitted'):
+                with self.subTest(preparation=failure):
+                    proof.side_effect = ValueError('Unresolved preparation: ' + failure)
+                    self.assertFalse(implementation_resume_allowed(run, ledger=ledger, attempt_id='native-tool-001'))
+                    with self.assertRaises(CodeTaskRunError):
+                        recover_implementation_process(run, budget_ledger=ledger,
+                            session_id='same-session', attempt_id='native-tool-001')
+            proof.side_effect = None
+            proof.return_value = (set(), [])  # No proven IDs: a settled preparation is not a validator.
+            with self.assertRaises(CodeTaskRunError):
+                recover_implementation_process(run, budget_ledger=ledger,
+                    session_id='same-session', attempt_id='native-tool-001')
+            self.assertFalse(implementation_resume_allowed(run, ledger=ledger, attempt_id='native-tool-001'))
+            proof.return_value = ({'a' * 32}, [])
+            changed = json.loads(json.dumps(manifest))
+            changed['code_task']['native_binding']['binding']['environment_preparations'][
+                changed['workspace']['selected_mode']]['store_root'] = str(root / 'attempts/other-attempt')
+            write_json(run / 'manifest.json', changed)
+            proof.reset_mock()
+            with self.assertRaises(CodeTaskRunError):
+                recover_implementation_process(run, budget_ledger=ledger,
+                    session_id='same-session', attempt_id='native-tool-001')
+            proof.assert_not_called()
+            write_json(run / 'manifest.json', manifest)
+            duplicate = ledger.to_dict()
+            duplicate['entries'].append({**duplicate['entries'][0], 'reservation_id': 'duplicate-preparation'})
+            write_json(root / 'duplicate-ledger.json', duplicate)
+            with self.assertRaises(CodeTaskRunError):
+                recover_implementation_process(run, budget_ledger=BudgetLedger.load(root / 'duplicate-ledger.json'),
+                    session_id='same-session', attempt_id='native-tool-001')
+            inherited = json.loads(json.dumps(manifest))
+            inherited['code_task']['native_binding']['binding']['environment_origin'] = {'record': 'prior'}
+            write_json(run / 'manifest.json', inherited)
+            proof.reset_mock()
+            self.assertEqual(native_preparation_processes(run, ledger=ledger,
+                session_id='same-session', attempt_id='native-tool-001'), set())
+            proof.assert_not_called()
+            self.assertEqual(ledger.to_dict(), before)
+            launch.assert_not_called()
+
+    def test_orphan_failed_validator_remains_failed_without_rerun(self):
+        from simple_ar.code_task.orchestration.verification import verify_implementation
+        with self._orphan_validator(returncode=1) as (_, initialized, ledger, invocation):
+            before = ledger.to_dict()
+            with patch('simple_ar.core.process.subprocess.Popen') as launch, \
+                    patch('simple_ar.code_task.orchestration.verification.propose_repair_edits') as repair:
+                result = verify_implementation(initialized.run_dir, command=('python', 'check.py'), timeout_sec=5,
+                    approval_note='Original approval', llm_client=Mock(), max_repairs=0,
+                    asset_guard=lambda: {'status': 'unchanged'}, budget_ledger=ledger,
+                    session_id='same-session', attempt_id='native-tool-001')
+                self.assertEqual(result.validation.status, 'failed')
+                launch.assert_not_called()
+                repair.assert_not_called()
+            self.assertEqual(ledger.to_dict(), before)
+
+    def test_orphan_validator_retains_watchdog_rejection(self):
+        from simple_ar.code_task.orchestration.verification import verify_implementation
+        with self._orphan_validator(watchdog=True) as (_, initialized, ledger, invocation):
+            self.assertEqual(read_json(invocation)['input_binding']['runtime_watchdog'],
+                             {'detail': 'Recorded watchdog rejection'})
+            with patch('simple_ar.core.process.subprocess.Popen') as launch:
+                result = verify_implementation(initialized.run_dir, command=('python', 'check.py'), timeout_sec=5,
+                    approval_note='Original approval', llm_client=Mock(), max_repairs=0,
+                    asset_guard=lambda: {'status': 'unchanged'}, budget_ledger=ledger,
+                    session_id='same-session', attempt_id='native-tool-001')
+                self.assertEqual(result.validation.status, 'failed')
+                self.assertEqual(result.validation.returncode, 124)
+                launch.assert_not_called()
+
     def test_bug_validation_repair_keeps_failed_and_repaired_evidence_distinct(self) -> None:
         from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
         from simple_ar.research.implementation import ImplementationRequest, run_implementation_capability
@@ -197,7 +432,30 @@ class CodeTaskTests(unittest.TestCase):
             self.assertIn("prize", (workspace / "spam_model.py").read_text(encoding="utf-8"))
 
     def test_implementation_authorization_preserves_rejections_and_dry_run(self):
-        from simple_ar.code_task.orchestration.execute import implement_code_task
+        from simple_ar.code_task.orchestration.execute import implement_code_task, CodeTaskExecuteResult
+        for reason in ("patch_apply_failed", "edit_budget_rejected", "patch_rollback_failed", "no_edits_proposed", "plan_rejected"):
+            for corrections in (0, 1):
+                first = CodeTaskExecuteResult(Path("run"), ("failed",), reason, "Inspect", Path("summary.md"))
+                second = CodeTaskExecuteResult(Path("run"), ("still rejected",), reason, "Inspect", Path("summary.md"))
+                messages = []
+                with self.subTest(reason=reason, corrections=corrections), patch(
+                    "simple_ar.code_task.orchestration.execute.execute_code_task", side_effect=[first, second],
+                ) as call:
+                    result = implement_code_task(Path("run"), approval_note="approved",
+                        proposal_corrections=corrections, message_callback=messages.append,
+                        edit_budget_overrides={"max_new_chars": 32000})
+                repeated = corrections and reason in {"patch_apply_failed", "edit_budget_rejected"}
+                self.assertEqual(call.call_count, 2 if repeated else 1)
+                self.assertEqual(result.steps, ("failed", "still rejected") if repeated else ("failed",))
+                self.assertEqual(bool(messages), bool(repeated))
+                for recorded in call.call_args_list:
+                    self.assertEqual(recorded.kwargs["edit_budget_overrides"], {"max_new_chars": 32000})
+                if repeated:
+                    self.assertIn("unchanged limits", messages[0])
+        with patch("simple_ar.code_task.orchestration.execute.execute_code_task", side_effect=LLMError("Unknown use")) as call:
+            with self.assertRaisesRegex(LLMError, "Unknown use"):
+                implement_code_task(Path("run"), approval_note="approved", proposal_corrections=1)
+            call.assert_called_once()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             _write_toy_project(root / "project")
@@ -216,6 +474,73 @@ class CodeTaskTests(unittest.TestCase):
                 self.assertEqual(result.stop_reason, expected)
                 self.assertEqual(read_json(run_dir / "manifest.json")["plan"], before)
             self.assertFalse((run_dir / "code_task" / "meta" / "applied_edits.json").exists())
+
+    def test_native_verification_recovers_saved_validator_without_running_it_again(self):
+        from simple_ar.code_task.orchestration.verification import verify_implementation
+        from simple_ar.code_task.runtime.state import load_code_task_manifest, save_code_task_manifest, implementation_file_hashes
+        import os
+        import shlex
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / 'source'
+            project.mkdir()
+            (project / 'main.py').write_text('VALUE = 1\n')
+            task = root / 'task.md'
+            task.write_text('Fix VALUE')
+            initialized = initialize_code_task(run_dir=root / 'run', code_root=project, task_file=task)
+            manifest = load_code_task_manifest(initialized.run_dir)
+            manifest['code_task']['native_binding'] = {'token': 'approved-original-contract'}
+            save_code_task_manifest(initialized.run_dir, manifest)
+            command = (sys.executable, 'check.py')
+            command_text = subprocess.list2cmdline(command) if os.name == 'nt' else shlex.join(command)
+            report = initialized.task_dir / 'run/patched/execution_report.json'
+            write_json(report, {'native_binding': manifest['code_task']['native_binding'],
+                'implementation_file_hashes': implementation_file_hashes(initialized.run_dir),
+                'command_text': command_text, 'timeout_sec': 20, 'status': 'passed',
+                'metric_values': {}, 'returncode': 0, 'timed_out': False})
+            with patch('simple_ar.code_task.orchestration.verification.run_code_task_benchmark') as run, \
+                    patch('simple_ar.code_task.orchestration.verification.propose_repair_edits') as repair:
+                result = verify_implementation(initialized.run_dir, command=command,
+                    approval_note='Original approved validator', llm_client=Mock(), timeout_sec=20,
+                    max_repairs=1, asset_guard=lambda: {'status': 'unchanged'})
+                self.assertEqual(result.validation.status, 'passed')
+                run.assert_not_called()
+                repair.assert_not_called()
+                (initialized.workspace_dir / 'main.py').write_text('VALUE = 9\n')
+                with self.assertRaisesRegex(ValueError, 'different candidate'):
+                    verify_implementation(initialized.run_dir, command=command,
+                        approval_note='Original approved validator', llm_client=Mock(), timeout_sec=20,
+                        max_repairs=1, asset_guard=lambda: {'status': 'unchanged'})
+                run.assert_not_called()
+
+    def test_technical_verification_stops_before_repair_when_protected_assets_change(self):
+        from simple_ar.code_task.orchestration.verification import verify_implementation, apply_verified_repair
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            validation = SimpleNamespace(status="failed")
+            ledger = BudgetLedger({"process_invocations": 2})
+            before = ledger.to_dict()
+            for status, limits in (("changed", None), ("unchanged", {"process_invocations": 0}),
+                                   ("unchanged", {"process_invocations": 2, "process_wall_seconds": 1})):
+                # With no remaining process allowance, even an intact failed
+                # check must not buy a repair that cannot be verified.
+                budget = ledger if limits is None else BudgetLedger(limits)
+                with self.subTest(status=status, limits=limits), patch(
+                    "simple_ar.code_task.orchestration.verification.run_code_task_benchmark", return_value=validation,
+                ) as run, patch("simple_ar.code_task.orchestration.verification.propose_repair_edits") as propose:
+                    result = verify_implementation(root, command=(sys.executable, "check.py"),
+                        approval_note="Authorized technical validation", llm_client=Mock(), max_repairs=1,
+                        budget_ledger=budget, asset_guard=lambda: {"status": status})
+                self.assertIs(result.validation, validation)
+                self.assertEqual(result.repairs, ())
+                propose.assert_not_called()
+                run.assert_called_once()
+                self.assertIs(run.call_args.kwargs["budget_ledger"], budget)
+            self.assertEqual(ledger.to_dict(), before)
+            with patch("simple_ar.code_task.orchestration.verification.apply_patch_edits") as apply:
+                with self.assertRaisesRegex(ValueError, "approval"):
+                    apply_verified_repair(root, Mock(), approval_note="", llm_client=Mock())
+                apply.assert_not_called()
 
     def test_repair_accounting_keeps_review_and_run_facts_out_of_implementation(self):
         from simple_ar.code_task.orchestration.execute import (
@@ -236,329 +561,6 @@ class CodeTaskTests(unittest.TestCase):
             self.assertEqual(manifest["repair"]["run_repair_count"], 1)
             self.assertEqual(manifest["repair"]["latest_review_repair"], "code_task/meta/review_repair.json")
             self.assertNotIn("effective_status", manifest["repair"])
-
-    def test_application_modifies_code_between_two_canonical_measurements(self):
-        self._exercise_application_code_change(repair_failure=False)
-
-    def test_application_repairs_failed_candidate_without_repeating_baseline(self):
-        self._exercise_application_code_change(repair_failure=True)
-
-    def test_application_stops_after_authorized_repair_limit(self):
-        self._exercise_application_code_change(repair_failure=True, repair_succeeds=False)
-
-    def test_application_prepares_source_project_and_resumes_without_reinitializing(self):
-        self._exercise_application_code_change(repair_failure=False, prepare_source=True)
-
-    def test_application_prepares_declared_large_data_and_resumes_without_recopied_inputs(self):
-        self._exercise_application_code_change(repair_failure=False, prepare_source=True, declared_data=True)
-
-    def test_application_accepts_code_task_protocol_before_preparation_and_reload(self):
-        self._exercise_application_code_change(
-            repair_failure=False, prepare_source=True, protocol_gate=True,
-        )
-
-    def test_application_implements_once_after_all_paired_baselines(self):
-        self._exercise_application_code_change(repair_failure=False, prepare_source=True, paired=True)
-
-    def test_application_does_not_edit_after_a_failed_paired_baseline(self):
-        self._exercise_application_code_change(repair_failure=False, prepare_source=True, paired=True, baseline_failure=True)
-
-    def test_application_repairs_paired_candidate_without_mixing_revisions(self):
-        self._exercise_application_code_change(repair_failure=True, prepare_source=True, paired=True)
-
-    def test_application_does_not_pool_a_successful_old_seed_after_later_failure(self):
-        self._exercise_application_code_change(repair_failure=True, prepare_source=True, paired=True, late_failure=True)
-
-    def test_paired_repair_limit_keeps_failure_and_missing_seed(self):
-        self._exercise_application_code_change(repair_failure=True, repair_succeeds=False, prepare_source=True, paired=True)
-
-    def _exercise_application_code_change(self, *, repair_failure, repair_succeeds=True, prepare_source=False, paired=False, baseline_failure=False, late_failure=False, protocol_gate=False, declared_data=False):
-        from dataclasses import replace
-        from simple_ar.app.research_application import ResearchApplicationServices, create_session, load_session
-        from simple_ar.research.workflow_contracts import ResearchBrief
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            project, task, code_run = root / "project", root / "task.md", root / "code-task"
-            _write_toy_project(project)
-            if declared_data:
-                (project / "input.bin").write_bytes(b"x" * 2_000_001)
-            (project / "evaluate.py").write_text(
-                "from spam_model import predict\nimport sys\n"
-                "with open('evaluation_count.txt', 'a') as log: log.write('run\\n')\n"
-                "print('accuracy:', sum(predict(x) == 'spam' for x in ('win', 'prize')) / 2)\n"
-                + ("assert len(open('input.bin', 'rb').read()) == 2000001\n" if declared_data else "")
-                + ("raise SystemExit(3 if sys.argv[-1] == '1' else 0)\n" if baseline_failure else ""),
-                encoding="utf-8",
-            )
-            task.write_text("Improve spam prediction for prize messages.", encoding="utf-8")
-            if not prepare_source:
-                initialize_code_task(run_dir=code_run, code_root=project, task_file=task,
-                                     benchmark_command="python evaluate.py")
-            workspace = project if prepare_source else code_task_paths(code_run).workspace_dir
-            paper = root / "paper.md"
-            paper.write_text("# Keyword classifier improvement\n\nCompare a keyword classifier improvement using spam features.\n", encoding="utf-8")
-            command = [sys.executable, "evaluate.py"]
-            app = create_session(ResearchBrief(
-                request_text="Compare a keyword classifier improvement.", requested_outputs=("experiments",),
-                asset_requests=({"locator": str(paper), "role": "paper"},
-                    *(({"locator": str(project / "input.bin"), "role": "dataset"},) if declared_data else ())),
-            ), root=root / "session", services=ResearchApplicationServices(max_results=1, max_attempts=24 if paired else 16, config={
-                **({"interaction": "assisted"} if protocol_gate else {}),
-                "execution": {"command": command, "baseline": {"command": command},
-                              **({"pairs": [{"seed": seed, "baseline_command": command + [str(seed)],
-                                               "candidate_command": command + [str(seed)]} for seed in (0, 1)]} if paired else {}),
-                              "cwd": str(workspace), "timeout_sec": 5,
-                              "code_task": {("code_root" if prepare_source else "run_dir"): str(project if prepare_source else code_run), "approval_note": "Authorize isolated source edits only.",
-                                            "max_repairs": int(repair_failure)},
-                              "result_schema": {"primary_metric": "accuracy", "direction": "higher"},
-                              "protocol": {"contract_id": "keyword-pair", "hypothesis": "Improve keyword coverage.",
-                                           "dataset_refs": [{"asset_id": "two-messages", "revision": "1"}],
-                                           "split_spec": {"held_out": [0, 1]},
-                                           "metric_specs": [{"name": "accuracy", "unit": "fraction"}],
-                                           "comparison_conditions": {"seed": 0},
-                                           "protected_assets": [{"asset_id": "evaluator", "path": "evaluate.py"}]}},
-            }, budget_limits={"llm_requests": 12, "total_tokens": 50000,
-                              "process_invocations": (5 + int(late_failure) if repair_failure else 4) if paired else 3 if repair_failure else 2,
-                               "process_wall_seconds": 30 if paired else 15}))
-            def advance_until(*actions):
-                for _ in range(6):
-                    view = app.view()
-                    if view.next_action in actions:
-                        return view
-                    self.assertEqual(view.status, "running", view.status_reason)
-                    app.advance(max_actions=1)
-                self.fail(f"Did not reach {actions!r}; next={app.view().next_action!r}")
-
-            if prepare_source:
-                app.advance(max_actions=20 if protocol_gate else 8)
-                if protocol_gate:
-                    pending = app.view()
-                    self.assertEqual(pending.status, "paused", pending.status_reason)
-                    gate = pending.work_plan["interaction"]["decision"]
-                    self.assertEqual(gate["stage"], "execution_protocol")
-                    self.assertFalse((project / "evaluation_count.txt").exists())
-                    app.continue_session(decision_id=gate["id"], decision_response="accept")
-                    app = load_session(root / "session")
-                advance_until("prepare_execution")
-                self.assertEqual(app.view().next_action, "prepare_execution")
-                with patch.object(app, "_persist_application_views", side_effect=RuntimeError("interrupted preparation")):
-                    with self.assertRaisesRegex(RuntimeError, "interrupted preparation"):
-                        app.advance()
-                app = load_session(root / "session")
-                with patch("simple_ar.research.preparation.initialize_code_task", side_effect=AssertionError("Do not prepare twice")):
-                    app.advance()
-                prepared = app.controller.store.read_json(app.view().state_refs["preparation"])
-                code_run = Path(prepared["execution"]["code_task"]["run_dir"])
-                workspace = Path(prepared["execution"]["cwd"])
-                self.assertNotEqual(workspace, project)
-                self.assertEqual(prepared["source_project"], str(project))
-                if declared_data:
-                    self.assertEqual((workspace / "input.bin").read_bytes(), (project / "input.bin").read_bytes())
-                    self.assertEqual(prepared["workspace_info"]["patterns"]["data_inputs"], ["input.bin"])
-            else:
-                app.advance(max_actions=9)
-            if paired:
-                app.advance()
-            advance_until("implement")
-            self.assertEqual(app.view().next_action, "implement", repr(app.view()))
-            if baseline_failure:
-                stopped = app.advance()
-                self.assertEqual(stopped.status, "paused")
-                self.assertIn("paired baseline failed", stopped.status_reason)
-                self.assertNotIn("implementation", stopped.state_refs)
-                self.assertEqual((workspace / "evaluation_count.txt").read_text().splitlines(), ["run"] * 2)
-                self.assertNotIn("lowered =", (workspace / "spam_model.py").read_text())
-                return
-            client = LLMClient(LLMSettings(api_key="test-key", api_mode="chat", max_output_tokens=2048))
-            app.services = replace(app.services, llm_client=client)
-            fake = _FakeCodeTaskClient()
-            payloads = [fake.ask_json("", "", label=label) for label in
-                        ("code-task-work-plan", "code-task-plan", "code-task-propose-edits")]
-            if repair_failure:
-                broken = "(text.lower() if __import__('sys').argv[-1] == '0' else text.lowerr())" if late_failure else "text.lowerr()"
-                payloads[2]["edits"][0]["new"] = payloads[2]["edits"][0]["new"].replace("text.lower()", broken)
-            payloads += [{"findings": []}] * 8
-            responses = [{"choices": [{"message": {"content": json.dumps(payload)}}],
-                          "usage": {"prompt_tokens": 30, "completion_tokens": 20, "total_tokens": 50}}
-                         for payload in payloads]
-            with patch("simple_ar.integrations.llm._call_openai_sdk", side_effect=responses) as transport, patch.object(
-                LLMClient, "from_env", side_effect=AssertionError("Use the session client"),
-            ):
-                with patch.object(app, "_persist_application_views", side_effect=RuntimeError("interrupted implementation")):
-                    with self.assertRaisesRegex(RuntimeError, "interrupted implementation"):
-                        app.advance()
-            sent = json.dumps(transport.call_args_list[0].args[1], ensure_ascii=False)
-            self.assertIn("Execution boundary and observed baseline", sent)
-            self.assertIn("keyword-pair", sent)
-            design = app.controller.store.read_json(app.controller.manifest.state_refs["design"])
-            self.assertIn(design["contract"]["hypothesis"], sent)
-            frozen = read_json(code_task_paths(code_run).task_dir / "research_handoff.json")
-            implementation_task = (code_task_paths(code_run).task_dir / "task.md").read_text(encoding="utf-8")
-            self.assertIn("Implementation-only CodeTask", implementation_task)
-            self.assertIn("outer ResearchApplication owns", implementation_task)
-            self.assertNotIn("complete academic Markdown paper", implementation_task)
-            if paired:
-                self.assertEqual(len(frozen["consumed"]["paired_baselines"]), 2)
-                self.assertEqual([row["metrics"]["accuracy"] for row in frozen["consumed"]["paired_baselines"]], [0.5, 0.5])
-            self.assertEqual(frozen["consumed"]["baseline"]["metrics"]["accuracy"], 0.5)
-            if prepare_source:
-                self.assertIn("Compare a keyword classifier improvement.", frozen["original_task"])
-                self.assertNotIn("lowered =", (project / "spam_model.py").read_text())
-                self.assertFalse((project / "evaluation_count.txt").exists())
-            else:
-                self.assertEqual(frozen["original_task"], "Improve spam prediction for prize messages.")
-            app = load_session(root / "session")
-            if repair_failure:
-                self.assertEqual(app.advance(max_actions=2 if late_failure else 1).next_action, "matrix_repair_1" if paired else "repair:1")
-                failure_key = f"matrix_candidate_{int(late_failure)}" if paired else "experiment"
-                initial_failure = app.controller.store.read_json(app.view().state_refs[failure_key])
-                self.assertEqual(initial_failure["execution_status"], "failed")
-                app.services = replace(app.services, llm_client=client)
-                repair_payload = {"summary": "Fix typo", "edits": [{"path": "spam_model.py",
-                    "old": "text.lowerr()", "new": "text.lower()" if repair_succeeds else "text.lower_again()", "reason": "AttributeError"}],
-                    "validation": ["Run evaluator separately"], "risks": []}
-                repaired_responses = [{"choices": [{"message": {"content": json.dumps(payload)}}],
-                    "usage": {"prompt_tokens": 30, "completion_tokens": 20, "total_tokens": 50}}
-                    for payload in [repair_payload] + [{"findings": []}] * 8]
-                with patch("simple_ar.integrations.llm._call_openai_sdk", side_effect=repaired_responses):
-                    with patch.object(app, "_persist_application_views", side_effect=RuntimeError("interrupted repair")):
-                        with self.assertRaisesRegex(RuntimeError, "interrupted repair"):
-                            app.advance()
-                app = load_session(root / "session")
-            view = app.advance(max_actions=3 if paired else 2)
-            if paired:
-                self.assertEqual(view.status, "completed", view.status_reason)
-                if not repair_succeeds:
-                    collection = app.controller.store.read_json(view.state_refs["matrix_results"])
-                    self.assertEqual(collection["candidate_revision"], 1)
-                    self.assertEqual(collection["pairs"][0]["candidate"], view.state_refs["matrix_candidate_r1_0"].to_dict())
-                    self.assertIsNone(collection["pairs"][1]["candidate"])
-                    self.assertNotIn("matrix_repair_2", view.state_refs)
-                    analysis = app.controller.store.read_json(view.state_refs["analysis"])
-                    self.assertEqual(analysis["execution_status"], "incomplete")
-                    self.assertEqual((workspace / "evaluation_count.txt").read_text().splitlines(), ["run"] * 4)
-                    self.assertEqual(app.budget_ledger.remaining("process_invocations"), 1)
-                    return
-                revision = 1 if repair_failure else 0
-                for i in range(2):
-                    self.assertEqual(app.controller.store.read_json(view.state_refs[f"matrix_baseline_{i}"])["metrics"]["accuracy"], 0.5)
-                    key = f"matrix_candidate_r{revision}_{i}" if revision else f"matrix_candidate_{i}"
-                    candidate_result = app.controller.store.read_json(view.state_refs[key])
-                    self.assertEqual(candidate_result["metrics"]["accuracy"], 1.0)
-                    expected_revision = "matrix_repair_1" if revision else "implementation"
-                    self.assertEqual(candidate_result["implementation_ref"], view.state_refs[expected_revision].to_dict())
-                collection = app.controller.store.read_json(view.state_refs["matrix_results"])
-                self.assertEqual(collection["candidate_revision"], revision)
-                implementation_key = "matrix_repair_1" if revision else "implementation"
-                self.assertEqual(collection["implementation_ref"], view.state_refs[implementation_key].to_dict())
-                self.assertEqual(len(collection["superseded_candidates"]), revision * (1 + int(late_failure)))
-                if late_failure:
-                    old_success = app.controller.store.read_json(view.state_refs["matrix_candidate_0"])
-                    self.assertEqual(old_success["status"], "passed")
-                    self.assertNotIn(view.state_refs["matrix_candidate_0"].to_dict(), [row["candidate"] for row in collection["pairs"]])
-                self.assertEqual(len([a for a in view.attempts if a["capability"] == "implement"]), 1 + revision)
-                for attempt in view.attempts:
-                    if attempt["trigger"].startswith("application:matrix_candidate_"):
-                        expected = "matrix_repair_1" if "_r1_" in attempt["trigger"] else "implementation"
-                        self.assertIn(view.state_refs[expected].to_dict(), attempt["inputs"])
-                self.assertEqual((workspace / "evaluation_count.txt").read_text().splitlines(), ["run"] * (4 + revision + int(late_failure)))
-                self.assertEqual(app.budget_ledger.remaining("process_invocations"), 0)
-                return
-            self.assertEqual(view.status, "completed", view.status_reason)
-            self.assertIn("implementation", view.state_refs)
-            implementation_payload = app.controller.store.read_json(view.state_refs["implementation"])
-            self.assertEqual(implementation_payload["status"], "validated")
-            self.assertEqual(implementation_payload["method_validation"]["status"], "未检查")
-            final_key = "experiment_repair_1" if repair_failure else "experiment"
-            expected_implementation = view.state_refs["repair_1"] if repair_failure else view.state_refs["implementation"]
-            final_result = app.controller.store.read_json(view.state_refs[final_key])
-            self.assertEqual(final_result["implementation_ref"], expected_implementation.to_dict())
-            self.assertEqual(app.latest_experiment_ref(), view.state_refs[final_key])
-            delivery = next(row for row in view.work_plan["requested_outputs"] if row["name"] == "experiments")
-            self.assertEqual(delivery["artifact"], view.state_refs[final_key].to_dict())
-            analysis_payload = app.controller.store.read_json(view.state_refs["analysis"])
-            self.assertEqual(analysis_payload["execution_ref"], delivery["artifact"])
-            snapshot = app.controller.store.read_text(app.export_session())
-            self.assertIn("## Latest candidate measurement", snapshot)
-            self.assertIn(view.state_refs[final_key].path, snapshot.split("## Latest candidate measurement")[1])
-            comparison = app.controller.store.read_json(view.state_refs["comparison"])
-            self.assertEqual(comparison["verdict"], "improved" if repair_succeeds else "inconclusive")
-            report_context, report_memory = app.report_inputs()
-            self.assertEqual(report_context.results["implementation"]["artifact"], expected_implementation.path)
-            unrelated = app.controller.store.write_json(
-                "outputs/unrelated_implementation.json", {"status": "validated", "artifact_refs": {}},
-                kind="implementation_result",
-            )
-            app.controller.manifest.state_refs["unrelated_implementation"] = unrelated
-            with patch.object(app, "_accepted_plan_steps", return_value=[
-                {"capability": "implement", "state_name": "unrelated_implementation"},
-            ]):
-                measured_report, _ = app.report_inputs()
-            self.assertEqual(measured_report.results["implementation"]["artifact"], expected_implementation.path)
-            self.assertEqual(report_context.results["execution_status"], "passed" if repair_succeeds else "failed")
-            for metric in report_context.metric_sources:
-                expected_ref = view.state_refs["baseline"] if metric.label == "baseline" else (
-                    view.state_refs["comparison"] if metric.label == "comparison_delta" else view.state_refs[final_key])
-                self.assertEqual(metric.artifact, expected_ref.path)
-            self.assertEqual(report_memory.metric_sources, report_context.metric_sources)
-            self.assertEqual(report_context.results["comparisons"][0]["verdict"], comparison["verdict"])
-            if repair_succeeds:
-                self.assertEqual(comparison["deltas"]["accuracy"], 0.5)
-            self.assertEqual((workspace / "evaluation_count.txt").read_text().splitlines(), ["run"] * (3 if repair_failure else 2))
-            if repair_failure:
-                self.assertEqual(app.controller.store.read_json(view.state_refs["experiment"]), initial_failure)
-                self.assertIn("repair_1", view.state_refs)
-                self.assertIn("experiment_repair_1", view.state_refs)
-                self.assertNotIn("repair_2", view.state_refs)
-                repair_artifact = app.controller.store.read_json(view.state_refs["repair_1"])
-                self.assertIn("failure_evidence", repair_artifact["artifact_refs"])
-                self.assertIn("repair_proposal", repair_artifact["artifact_refs"])
-                expected_status = "passed" if repair_succeeds else "failed"
-                self.assertEqual(app.controller.store.read_json(view.state_refs["experiment_repair_1"])["execution_status"], expected_status)
-            self.assertEqual(app.budget_ledger.remaining("process_invocations"), 0)
-            implementation_id = next(item["attempt_id"] for item in view.attempts if item["capability"] == "implement")
-            implementation_attempt = next(item for item in view.attempts if item["attempt_id"] == implementation_id)
-            self.assertIn(view.state_refs["baseline"].path, [ref["path"] for ref in implementation_attempt["inputs"]])
-            model_entries = [entry for entry in app.budget_ledger.entries if "llm_requests" in entry.actual]
-            self.assertGreater(len(model_entries), 2)
-            implementation_ids = {item["attempt_id"] for item in view.attempts if item["capability"] == "implement"}
-            self.assertTrue(all(entry.attempt_id in implementation_ids for entry in model_entries))
-            self.assertIn("evaluate.py", read_json(code_run / "manifest.json")["edit_scope"]["protected_patterns"])
-            # A later research revision must not silently reuse this accepted patch plan.
-            from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
-            from simple_ar.research.implementation import ImplementationRequest, run_implementation_capability
-            changed_store = ArtifactStore(root / "revised-inputs")
-            design["contract"]["proposed_change"] = "A different research intervention"
-            revised_design = changed_store.write_json("design.json", design, kind="research_design")
-            baseline_payload = app.controller.store.read_json(view.state_refs["baseline"])
-            baseline_ref = changed_store.write_json("baseline.json", baseline_payload, kind="experiment_result")
-            context = CapabilityContext(store=ArtifactStore(root / "revision-attempt"),
-                                        attempt=AttemptManifest("implement-revised"),
-                                        inputs=(revised_design, baseline_ref), input_store=changed_store)
-            request = ImplementationRequest(code_run, workspace, "Allow source edits", client,
-                                            frozen["consumed"]["protocol"])
-            old_task = (code_task_paths(code_run).task_dir / "task.md").read_text(encoding="utf-8")
-            with patch("simple_ar.integrations.llm._call_openai_sdk", side_effect=AssertionError("No stale-plan execution")):
-                with self.assertRaisesRegex(ValueError, "Research inputs changed"):
-                    run_implementation_capability(context=context, request=request)
-            self.assertEqual((code_task_paths(code_run).task_dir / "task.md").read_text(encoding="utf-8"), old_task)
-            # The session evidence remains readable without the external CodeTask run.
-            copied_session = root / "portable-session"
-            shutil.copytree(root / "session", copied_session)
-            code_run.rename(root / "code-task-unavailable")
-            portable = load_session(copied_session)
-            implementation_ref = portable.view().state_refs["implementation"]
-            implementation = portable.controller.store.read_json(implementation_ref)
-            self.assertEqual(implementation["artifact_base"], "attempt")
-            self.assertTrue({"patch", "validation", "patch_plan", "research_handoff"}.issubset(implementation["artifact_refs"]))
-            attempt_store = ArtifactStore(copied_session / Path(implementation_ref.path).parent)
-            from simple_ar.core.capabilities import ArtifactRef
-            for name, row in implementation["artifact_refs"].items():
-                contents = attempt_store.read_text(ArtifactRef.from_dict(row))
-                self.assertTrue(contents.strip(), name)
-            patch_ref = ArtifactRef.from_dict(implementation["artifact_refs"]["patch"])
-            self.assertIn("prize", attempt_store.read_text(patch_ref))
-            self.assertEqual(portable.advance().status, "completed")
 
     def test_execute_keeps_shared_budget_and_local_usage_through_edits_and_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -613,21 +615,70 @@ class CodeTaskTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=TEST_ROOT) as tmp:
             target = Path(tmp) / "result.txt"
             target.write_text("old\n", encoding="utf-8")
-            original_replace = Path.replace
+            from simple_ar.core.artifacts import os
+            original_replace = os.replace
             attempts = 0
 
-            def flaky_replace(source: Path, destination: Path) -> Path:
+            def flaky_replace(source: Path, destination: Path) -> None:
                 nonlocal attempts
                 attempts += 1
                 if attempts < 3:
                     raise PermissionError("transient destination lock")
                 return original_replace(source, destination)
 
-            with patch.object(Path, "replace", new=flaky_replace):
+            with patch.object(os, "replace", new=flaky_replace):
                 _write_text_atomically(target, "new\n")
 
             self.assertEqual(attempts, 3)
             self.assertEqual(target.read_text(encoding="utf-8"), "new\n")
+            self.assertEqual(list(target.parent.glob('.*.tmp')), [])
+
+    def test_related_patch_write_failure_restores_unit_and_keeps_diagnostics(self) -> None:
+        for failure in ('write', 'interrupt', 'restore'):
+            with self.subTest(failure=failure), _temporary_root() as root:
+                _, _, run_dir = _initialize_toy_task(root, '# Task\n\nApply a related patch.\n')
+                _approve_offline_patch_plan(run_dir)
+                workspace = code_task_paths(run_dir).workspace_dir
+                original = b'VALUE = 1\r\n'
+                (workspace / 'first.py').write_bytes(original)
+                write_text(workspace / 'last.py', 'VALUE = 1\n')
+                proposal = root / 'related.json'
+                write_json(proposal, {'edits': [
+                    {'path': 'first.py', 'old': 'VALUE = 1', 'new': 'VALUE = 2'},
+                    {'path': 'new.py', 'old': '', 'new': 'NEW = 1\n'},
+                    {'path': 'last.py', 'old': 'VALUE = 1', 'new': 'VALUE = 2'}]})
+
+                def write_or_fail(path, text):
+                    if path.name == 'last.py':
+                        raise (KeyboardInterrupt('interrupted unit') if failure == 'interrupt'
+                            else OSError('failed unit write'))
+                    _write_text_atomically(path, text)
+
+                def restore_or_fail(path, data):
+                    if path.name == 'first.py':
+                        raise OSError('restore destination locked')
+                    _write_text_atomically(path, data)
+
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(patch('simple_ar.code_task.editing.patching._write_text_atomically',
+                        side_effect=write_or_fail))
+                    if failure == 'restore':
+                        stack.enter_context(patch('simple_ar.code_task.editing.snapshots.write_atomically',
+                            side_effect=restore_or_fail))
+                    with self.assertRaises(KeyboardInterrupt if failure == 'interrupt' else OSError) as caught:
+                        apply_patch_edits(run_dir, edits_file=proposal)
+                self.assertFalse((run_dir / 'code_task/meta/applied_edits.json').exists())
+                if failure == 'restore':
+                    self.assertIn('failed unit write', str(caught.exception))
+                    self.assertIn('restore destination locked', str(caught.exception.__notes__))
+                    self.assertIn('byte check failed', str(caught.exception.__notes__))
+                else:
+                    self.assertEqual((workspace / 'first.py').read_bytes(), original)
+                self.assertFalse((workspace / 'new.py').exists())
+                self.assertEqual(read_text(workspace / 'last.py'), 'VALUE = 1\n')
+                snapshots = list((workspace.parent / 'meta/file_snapshots').glob('*/snapshot.json'))
+                self.assertEqual(len(snapshots), 1)
+                self.assertEqual(len(read_json(snapshots[0])['files']), 3)
 
     def test_python_file_in_runtime_named_directory_remains_source(self) -> None:
         self.assertEqual(infer_file_kind("artifacts/artifacts_io.py"), "source")
@@ -817,35 +868,46 @@ class CodeTaskTests(unittest.TestCase):
             self.assertIn("    def run(self):\n        return 2", read_text(module))
 
     def test_dependency_advice_scans_environment_beyond_static_hints(self) -> None:
-        base = build_dependency_advice("Use pydantic if available for schema validation.")
-        self.assertEqual(base["selection_policy"], "dynamic_environment_scan_plus_semantic_hints")
-        self.assertGreater(base["environment_package_count"], 0)
-        self.assertTrue(base["environment_packages"])
-        self.assertTrue(
-            any(
-                row.get("package", "").lower() == "pydantic" and row.get("status") == "installed"
-                for row in base["packages"]
-            )
-        )
-
-        hinted = {candidate.package.lower() for candidate in DEPENDENCY_CATALOG}
-        dynamic_package = next(
-            (
-                str(row["package"])
-                for row in base["environment_packages"]
-                if row.get("package") and str(row["package"]).lower() not in hinted
-            ),
-            "",
-        )
-        if dynamic_package:
-            dynamic = build_dependency_advice(f"Use {dynamic_package} if available for this task.")
-            self.assertTrue(
-                any(
-                    str(row.get("package", "")).lower() == dynamic_package.lower()
-                    and row.get("status") == "installed"
-                    for row in dynamic["packages"]
-                )
-            )
+        from simple_ar.code_task.generation.dependencies import render_dependency_advice_markdown
+        from simple_ar.code_task.generation.writer import _dependency_advice_for_prompt
+        distributions = [SimpleNamespace(metadata={'Name': 'Different-Library'}, version='1.2',
+            read_text=lambda name: 'unrelated_import\n', files=[]),
+            SimpleNamespace(metadata={'Name': 'Another.Distribution'}, version='3.4',
+                read_text=lambda name: None, files=[Path('actual_namespace/__init__.py')])]
+        with patch('importlib.metadata.distributions', return_value=distributions) as scan, \
+                patch('importlib.util.find_spec', side_effect=AssertionError('Metadata observation must not import code')) as imports:
+            base = build_dependency_advice('Use unrelated_import. Investigate actual_namespace, not Different-Library-extra.')
+            self.assertEqual(base['selection_policy'], 'observed_metadata_and_explicit_names')
+            self.assertEqual(base['environment_package_count'], 2)
+            self.assertEqual({row['package'] for row in base['packages']}, {'Different-Library', 'Another.Distribution'})
+            self.assertTrue(all(row['importable'] is None for row in base['packages']))
+            self.assertEqual(base['missing_recommended'], [])
+            self.assertEqual(base['install_command'], '')
+            # A domain or resource word does not choose packages, algorithms or fallback datasets.
+            ordinary = build_dependency_advice('Classification, baseline, neural GPU, plots and statistics.')
+            self.assertEqual(ordinary['packages'], [])
+            self.assertEqual(build_dependency_advice('Different-Library-extra')['packages'], [])
+            scan.reset_mock()
+            other = str(Path(sys.executable).absolute().parent / 'separate-task-env/python')
+            foreign = build_dependency_advice('Use unrelated_import.', python_executable=other)
+            scan.assert_not_called()
+            imports.assert_not_called()
+            self.assertEqual(foreign['environment_scope'], 'target_not_inspected')
+            self.assertIsNone(foreign['environment_package_count'])
+            self.assertEqual(foreign['packages'], [])
+            self.assertFalse(foreign['target_matches_inspecting_interpreter'])
+            self.assertEqual(_dependency_advice_for_prompt(foreign)['target_python_executable'], other)
+        legacy = {'schema_version': 'code_task_dependency_advice.v1', 'packages': [{'package': 'saved-library',
+            'import_name': 'saved_import', 'status': 'missing', 'role': 'Original recorded advice'}],
+            'installed_packages': ['old-default-library'], 'notes': ['Original limitation'],
+            'install_command': 'pip install saved-library'}
+        markdown = render_dependency_advice_markdown(legacy)
+        self.assertIn('saved-library', markdown)
+        self.assertIn('Original limitation', markdown)
+        self.assertIn('not authorization', markdown)
+        self.assertIn('saved_import', markdown)
+        self.assertIn('Recorded installed distributions: old-default-library', markdown)
+        self.assertNotIn('Explicitly named installed distributions', markdown)
 
     def test_generated_repair_shared_unit_preserves_diagnostics_and_obligations(self) -> None:
         for phase in ('review', 'run'):
@@ -1011,11 +1073,15 @@ class CodeTaskTests(unittest.TestCase):
 
     def test_generated_repair_interrupted_generation_and_application_are_not_replayed(self) -> None:
         from simple_ar.integrations.llm import LLMStreamError
-        for interruption in ('unknown_generation', 'candidate_application'):
+        for interruption in ('unknown_generation', 'candidate_application', 'application_after_write'):
             with self.subTest(interruption=interruption), _temporary_root() as root:
                 project = root / 'project'
                 write_text(project / 'module.py', 'VALUE = 1\n')
                 client = _RelatedRepairClient({'module.py': [('VALUE = 1', 'VALUE = 2')]})
+                if interruption == 'application_after_write':
+                    write_text(project / 'second.py', 'VALUE = 1\n')
+                    client = _RelatedRepairClient({'module.py': [('VALUE = 1', 'VALUE = 2')],
+                        'second.py': [('VALUE = 1', 'VALUE = 2')]})
                 kwargs = dict(project_dir=project, output_path=root / 'run_repair.json', client=client, attempt_id='round-1')
                 if interruption == 'unknown_generation':
                     client.generation_error = LLMStreamError('Incomplete generation response')
@@ -1024,9 +1090,15 @@ class CodeTaskTests(unittest.TestCase):
                     # Interrupted before completed consumer receipt persistence.
                     (root / 'repair_attempts/run/round-1/result.json').unlink()
                 else:
+                    def interrupt_application(project, actions, **options):
+                        if interruption == 'application_after_write' and actions[0]['path'] == 'module.py':
+                            return apply_repair_actions(project, actions, **options)
+                        raise (KeyboardInterrupt('application interrupted')
+                            if interruption == 'application_after_write' else RuntimeError('application interrupted'))
                     with patch('simple_ar.code_task.generation.generated_project_repair.apply_repair_actions',
-                               side_effect=RuntimeError('application interrupted')):
-                        with self.assertRaisesRegex(RuntimeError, 'application interrupted'):
+                               side_effect=interrupt_application):
+                        with self.assertRaisesRegex(KeyboardInterrupt if interruption == 'application_after_write'
+                                else RuntimeError, 'application interrupted'):
                             _invoke_generated_repair('run', kwargs)
                     self.assertTrue((root / 'repair_attempts/run/round-1/candidate.json').is_file())
                     self.assertIn('application interrupted',
@@ -1035,11 +1107,13 @@ class CodeTaskTests(unittest.TestCase):
                 resumed = _invoke_generated_repair('run', kwargs)
                 self.assertEqual(resumed['status'], 'failed')
                 self.assertIn('no request or edit replayed', str(resumed['unresolved_errors']))
-                self.assertIn('candidate saved' if interruption == 'candidate_application' else 'generation incomplete',
+                self.assertIn('generation incomplete' if interruption == 'unknown_generation' else 'candidate saved',
                     str(resumed['unresolved_errors']))
                 self.assertEqual(len(client.requests), 2)
                 self.assertEqual(client._budget_ledger.to_dict(), before)
                 self.assertEqual(read_text(project / 'module.py'), 'VALUE = 1\n')
+                if interruption == 'application_after_write':
+                    self.assertEqual(read_text(project / 'second.py'), 'VALUE = 1\n')
 
     def test_generated_repair_restore_failure_retains_original_rejection(self) -> None:
         with _temporary_root() as root:
@@ -1188,6 +1262,9 @@ class CodeTaskTests(unittest.TestCase):
             write_text(task_file, "# Task\n\nImprove the spam classifier without changing the API.\n")
 
             run_dir = root / "runs" / "code-task-run"
+            binding = workspace_source_binding(WorkspaceSpec(
+                code_root, run_dir / "code_task", "copy", max_file_bytes=10_000,
+            ))
             result = initialize_code_task(
                 run_dir=run_dir,
                 code_root=code_root,
@@ -1206,6 +1283,8 @@ class CodeTaskTests(unittest.TestCase):
                 read_text(workspace / "spam_model.py"),
             )
 
+            self.assertEqual(binding["source_snapshots"][result.workspace.selected_mode],
+                             implementation_file_hashes(run_dir))
             manifest = read_json(run_dir / "manifest.json")
             self.assertEqual(manifest["workflow"], "code_task")
             self.assertEqual(manifest["layout"]["workspace"], "code_task/workspace")
@@ -1514,6 +1593,13 @@ primary_metric = "accuracy"
                                              planner_model="profile:saved")
             meta = source_run / "code_task/meta"
             plan = read_json(meta / "architecture_plan.json")
+            resources = read_json(meta / 'implementation_plan.json')['resource_plan']
+            self.assertEqual(resources['max_files'], 3)
+            self.assertEqual(resources['execution_budget']['policy'], 'explicit_execution_contract_and_shared_ledger')
+            self.assertNotIn('max_model_fit_operations_hint', resources['execution_budget'])
+            self.assertNotIn('max_runtime_sec_hint', resources['execution_budget'])
+            self.assertNotIn('allow_gpu', resources)
+            self.assertIn('gpu_observed', resources)
             self.assertEqual(plan, read_json(meta / "planning/architecture_unit/attempt-001/final_plan.json"))
             self.assertEqual(read_json(meta / "planning/method_migration.json")["planner_selector"], "profile:saved")
             self.assertEqual(requests[0]["architecture"], plan)
@@ -2103,10 +2189,14 @@ protected_patterns = ["pyproject.toml"]
             _git(code_root, "init")
             _git(code_root, "config", "user.email", "test@example.com")
             _git(code_root, "config", "user.name", "SimpleAR Test")
+            _git(code_root, "config", "core.autocrlf", "false")
             _git(code_root, "add", ".")
             _git(code_root, "commit", "-m", "initial")
 
             run_dir = root / "runs" / "git-worktree-run"
+            binding = workspace_source_binding(WorkspaceSpec(
+                code_root, run_dir / "code_task", "git_worktree", max_file_bytes=10_000,
+            ))
             result = initialize_code_task(
                 run_dir=run_dir,
                 code_root=code_root,
@@ -2118,6 +2208,8 @@ protected_patterns = ["pyproject.toml"]
 
             self.assertTrue((result.workspace_dir / "spam_model.py").is_file())
             self.assertTrue((result.workspace_dir / ".git").exists())
+            self.assertEqual(binding["source_snapshots"][result.workspace.selected_mode],
+                             implementation_file_hashes(run_dir))
             manifest = read_json(run_dir / "manifest.json")
             self.assertEqual(manifest["workspace"]["mode"], "git_worktree")
             self.assertEqual(manifest["workspace"]["workspace_dir"], "code_task/workspace")
@@ -2141,10 +2233,14 @@ protected_patterns = ["pyproject.toml"]
             _git(code_root, "init")
             _git(code_root, "config", "user.email", "test@example.com")
             _git(code_root, "config", "user.name", "SimpleAR Test")
+            _git(code_root, "config", "core.autocrlf", "false")
             _git(code_root, "add", ".")
             _git(code_root, "commit", "-m", "initial")
 
             run_dir = root / "runs" / "auto-worktree-run"
+            binding = workspace_source_binding(WorkspaceSpec(
+                code_root, run_dir / "code_task", "auto", max_file_bytes=10_000,
+            ))
             result = initialize_code_task(
                 run_dir=run_dir,
                 code_root=code_root,
@@ -2157,16 +2253,25 @@ protected_patterns = ["pyproject.toml"]
             self.assertEqual(result.workspace.requested_mode, "auto")
             self.assertEqual(result.workspace.selected_mode, "git_worktree")
             self.assertTrue((result.workspace.workspace_dir / ".git").exists())
+            self.assertEqual(binding["source_snapshots"][result.workspace.selected_mode],
+                             implementation_file_hashes(run_dir))
             manifest = read_json(run_dir / "manifest.json")
             self.assertEqual(manifest["workspace"]["requested_mode"], "auto")
             self.assertEqual(manifest["workspace"]["selected_mode"], "git_worktree")
             self.assertEqual(manifest["workspace"]["fallback_reason"], "")
 
+            self.assertEqual(set(binding["source_snapshots"]), {"copy", "git_worktree"})
             write_text(code_root / "uncommitted.py", "VALUE = 7\n")
+            dirty_binding = workspace_source_binding(WorkspaceSpec(
+                code_root, root / "runs/dirty-auto/code_task", "auto",
+            ))
+            self.assertEqual(set(dirty_binding["source_snapshots"]), {"copy"})
             dirty = initialize_code_task(
                 run_dir=root / "runs" / "dirty-auto", code_root=code_root,
                 task_file=task_file, workspace_mode="auto",
             )
+            self.assertEqual(dirty_binding["source_snapshots"]["copy"],
+                             implementation_file_hashes(dirty.run_dir))
             self.assertEqual(dirty.workspace.mode, "copy")
             self.assertIn("uncommitted", dirty.workspace.fallback_reason)
             self.assertEqual((dirty.workspace_dir / "uncommitted.py").read_text(), "VALUE = 7\n")
@@ -2185,10 +2290,14 @@ protected_patterns = ["pyproject.toml"]
             _git(repo, "init")
             _git(repo, "config", "user.email", "test@example.com")
             _git(repo, "config", "user.name", "SimpleAR Test")
+            _git(repo, "config", "core.autocrlf", "false")
             _git(repo, "add", ".")
             _git(repo, "commit", "-m", "initial")
 
             run_dir = root / "runs" / "subdir-worktree-run"
+            binding = workspace_source_binding(WorkspaceSpec(
+                code_root, run_dir / "code_task", "git_worktree",
+            ))
             result = initialize_code_task(
                 run_dir=run_dir,
                 code_root=code_root,
@@ -2200,6 +2309,8 @@ protected_patterns = ["pyproject.toml"]
             self.assertTrue((result.workspace_dir / "module.py").is_file())
             self.assertFalse((result.workspace_dir / ".git").exists())
             self.assertTrue((result.workspace.workspace_dir / ".git").exists())
+            self.assertEqual(binding["source_snapshots"]["git_worktree"],
+                             implementation_file_hashes(run_dir))
             manifest = read_json(root / "runs" / "subdir-worktree-run" / "manifest.json")
             self.assertEqual(manifest["workspace"]["mode"], "git_worktree")
             self.assertEqual(manifest["workspace"]["workspace_dir"], "code_task/workspace")
@@ -2266,6 +2377,10 @@ protected_patterns = ["pyproject.toml"]
             write_text(task_file, "# Task\n\nImprove sparse project.\n")
 
             run_dir = root / "runs" / "sparse-run"
+            binding = workspace_source_binding(WorkspaceSpec(
+                code_root, run_dir / "code_task", "sparse_copy", include=("src/**", "tests/**", "benchmark.py", "pyproject.toml"),
+                exclude=("models/**",),
+            ))
             result = initialize_code_task(
                 run_dir=run_dir,
                 code_root=code_root,
@@ -2285,6 +2400,8 @@ protected_patterns = ["pyproject.toml"]
             self.assertFalse((workspace / "models" / "weights.bin").exists())
             self.assertFalse((workspace / ".env").exists())
 
+            self.assertEqual(binding["source_snapshots"][result.workspace.selected_mode],
+                             implementation_file_hashes(run_dir))
             manifest = read_json(run_dir / "manifest.json")
             self.assertEqual(manifest["workspace"]["mode"], "sparse_copy")
             self.assertEqual(
@@ -2700,6 +2817,70 @@ protected_patterns = ["pyproject.toml"]
             self.assertEqual(manifest["layout"]["work_plan"], "code_task/work_plan.json")
             self.assertEqual(manifest["work_plan"]["status"], "pending_approval")
             self.assertEqual(manifest["work_plan"]["item_count"], 1)
+
+    def test_work_plan_creation_targets_reach_batch_without_fabricated_sources(self) -> None:
+        with _temporary_root() as root:
+            _, _, run_dir = _initialize_toy_task(root, "Create the required adapter and a planned helper.")
+            _approve_offline_patch_plan(run_dir)
+            paths = code_task_paths(run_dir)
+            manifest = read_json(paths.manifest_path)
+            manifest['code_task']['native_binding'] = {'binding': {'contract': {
+                'new_files': ['src/adapter.py']}}}
+            manifest['edit_scope']['allowed_patterns'] = ['spam_model.py', 'src/*.py']
+            write_json(paths.manifest_path, manifest)
+            write_text(paths.task_dir / 'patch_plan.md', '# Patch Plan\n\n## New Files\n\n'
+                       '- `src/patch_adapter.py`: Accepted model-selected creation.\n\n## Validation\nCheck source.\n')
+            original_index = read_json(paths.meta_dir / 'codebase_index.json')
+            data = {'new_files': [{'path': 'src/helper.py', 'reason': 'Model-selected helper'},
+                                  {'path': '../escape.py'}, {'path': 'tests/new_test.py'}],
+                'items': [{'id': 'W1', 'target_files': ['src/adapter.py', 'src/patch_adapter.py', 'src/helper.py', 'spam_model.py',
+                                                     'src/undeclared.py', 'tests/new_test.py'],
+                    'read_only_evidence': ['src/adapter.py', 'tests/test_spam_model.py'],
+                    'context_request': {'files': ['src/helper.py', 'spam_model.py']}}]}
+            with patch('simple_ar.code_task.editing.work_plan._generate_plan_data', return_value=(data, 'llm')):
+                result = generate_code_task_work_plan(run_dir, use_llm=False)
+            plan = read_json(result.work_plan_path)
+            self.assertEqual(plan['new_files'], ['src/adapter.py', 'src/patch_adapter.py', 'src/helper.py'])
+            self.assertEqual(plan['items'][0]['target_files'],
+                             ['src/adapter.py', 'src/patch_adapter.py', 'src/helper.py', 'spam_model.py'])
+            self.assertEqual(plan['items'][0]['read_only_evidence'], ['tests/test_spam_model.py'])
+            self.assertEqual(plan['items'][0]['context_request']['files'], ['spam_model.py'])
+            self.assertNotIn('src/adapter.py', plan['selected_files'])
+            self.assertEqual(read_json(paths.meta_dir / 'codebase_index.json'), original_index)
+            self.assertFalse((paths.workspace_dir / 'src/adapter.py').exists())
+            batch = create_code_task_batch(run_dir, work_item_id='W1')
+            self.assertEqual(read_json(batch.batch_state_path)['work_item']['target_files'],
+                             plan['items'][0]['target_files'])
+            record_plan_decision(run_dir, decision='approve')
+            client = _FakeRepairClient({'edits': [
+                {'path': name, 'old': '', 'new': 'VALUE = 1\n', 'reason': 'Create actual source'}
+                for name in ('src/adapter.py', 'src/patch_adapter.py', 'src/helper.py', 'src/undeclared.py')]})
+            with patch('simple_ar.code_task.editing.patching.LLMClient.from_env', return_value=client):
+                proposed = propose_patch_edits(run_dir, use_llm=True)
+            self.assertEqual([row['path'] for row in read_json(proposed.proposal_path)['edits']],
+                             ['src/adapter.py', 'src/patch_adapter.py', 'src/helper.py'])
+            apply_patch_edits(run_dir, edits_file=proposed.proposal_path, allow_large_edits=True)
+            self.assertEqual(read_text(paths.workspace_dir / 'src/adapter.py'), 'VALUE = 1\n')
+            self.assertFalse((paths.workspace_dir / 'src/undeclared.py').exists())
+
+    def test_work_plan_creation_fallback_keeps_scope_and_real_context(self) -> None:
+        from simple_ar.code_task.editing.work_plan import _normalize_work_plan_data, _work_plan_user_prompt
+        index = {'files': [{'path': 'main.py', 'kind': 'python'}]}
+        context = {'new_files': ['src/adapter.py', 'src/private.py', '../escape.py', 'other.py',
+                                'src/../escape.py', 'src//alias.py', ' src/spaced.py',
+                                'src/*.py', 'src/ADAPTER.py', 'src\\backslash.py']}
+        plan = _normalize_work_plan_data({}, index, selected_files=['main.py'], task_text='Create an adapter',
+            benchmark_command='', mode='offline', run_context=context, context_pack=None,
+            allowed_patterns=('main.py', 'src/*.py'), protected_patterns=('src/private.py',))
+        self.assertEqual(plan['new_files'], ['src/adapter.py'])
+        self.assertEqual(plan['items'][0]['target_files'], ['src/adapter.py', 'main.py'])
+        self.assertEqual(plan['items'][0]['context_request']['files'], ['main.py'])
+        self.assertEqual(plan['selected_files'], ['main.py'])
+        prompt = _work_plan_user_prompt(task_text='Create adapter', index=index, snippets=[],
+            benchmark_command='', run_context=context, memory_context='',
+            allowed_patterns=('main.py', 'src/*.py'), protected_patterns=('src/private.py',))
+        self.assertIn('not observed source', prompt)
+        self.assertEqual(index['files'], [{'path': 'main.py', 'kind': 'python'}])
 
     def test_work_plan_and_batch_cli_create_attempt_state(self) -> None:
         with _temporary_root() as root:
@@ -4577,30 +4758,26 @@ protected_patterns = ["pyproject.toml"]
                 ],
             )
 
-    def test_execute_blocks_on_llm_work_plan_failure_without_fallback(self) -> None:
-        with _temporary_root() as root:
-            code_root, task_file, run_dir = _initialize_toy_task(
-                root, "# Task\n\nImprove the spam classifier with LLM planning.\n",
-                benchmark_command=TOY_BENCHMARK_COMMAND,
-            )
-            fake_client = _FailingCodeTaskClient()
-
-            with patch("simple_ar.code_task.editing.work_plan.LLMClient.from_env", return_value=fake_client):
-                result = execute_code_task(
-                    run_dir,
-                    use_llm=True,
-                    to_step="work-plan",
-                    timeout_sec=10,
-                    llm_retry_attempts=2,
-                )
-
-            self.assertEqual(result.stop_reason, "llm_planning_failed")
-            self.assertEqual(result.steps[-1].step, "work-plan")
-            self.assertEqual(result.steps[-1].status, "blocked")
-            self.assertIn("LLM response did not contain a JSON object", result.steps[-1].detail)
-            self.assertEqual(fake_client.calls, 1)
-            self.assertFalse((run_dir / "code_task" / "work_plan.json").exists())
-            self.assertFalse((run_dir / "code_task" / "work_plan.md").exists())
+    def test_execute_blocks_on_model_planning_failure_without_fallback(self) -> None:
+        for step, module in (('work-plan', 'work_plan'), ('plan', 'planning')):
+            with self.subTest(step=step), _temporary_root() as root:
+                _, _, run_dir = _initialize_toy_task(root, '# Task\n\nImprove the spam classifier.\n',
+                    benchmark_command=TOY_BENCHMARK_COMMAND)
+                if step == 'plan':
+                    first = execute_code_task(run_dir, use_llm=False, to_step='batch', timeout_sec=10)
+                    self.assertEqual(first.stop_reason, 'stop_point')
+                records = [run_dir / 'code_task' / name for name in ('work_plan.json', 'work_plan.md', 'patch_plan.md')]
+                retained = {path: path.read_bytes() for path in records if path.is_file()}
+                client = _FailingCodeTaskClient()
+                with patch('simple_ar.code_task.editing.' + module + '.LLMClient.from_env', return_value=client):
+                    result = execute_code_task(run_dir, use_llm=True, to_step=step,
+                        timeout_sec=10, llm_retry_attempts=2)
+                self.assertEqual(result.stop_reason, 'llm_planning_failed')
+                self.assertEqual(result.steps[-1].step, step)
+                self.assertEqual(result.steps[-1].status, 'blocked')
+                self.assertIn('LLM response did not contain a JSON object', result.steps[-1].detail)
+                self.assertEqual(client.calls, 1)
+                self.assertEqual({path: path.read_bytes() for path in records if path.is_file()}, retained)
 
     def test_execute_uses_planning_fallback_only_when_explicitly_allowed(self) -> None:
         from simple_ar.integrations.llm import LLMResponseError, LLMStreamError, LLMDeadlineError
@@ -4713,87 +4890,68 @@ protected_patterns = ["pyproject.toml"]
                     self.assertEqual(ledger.remaining('llm_requests'), 0)
                     self.assertEqual(ledger.remaining('total_tokens'), 150)
 
-    def test_execute_blocks_on_llm_patch_plan_failure_without_fallback(self) -> None:
-        with _temporary_root() as root:
-            code_root, task_file, run_dir = _initialize_toy_task(
-                root, "# Task\n\nImprove the spam classifier patch plan.\n",
-                benchmark_command=TOY_BENCHMARK_COMMAND,
-            )
-            first = execute_code_task(run_dir, use_llm=False, to_step="batch", timeout_sec=10)
-            self.assertEqual(first.stop_reason, "stop_point")
-            fake_client = _FailingCodeTaskClient()
-
-            with patch("simple_ar.code_task.editing.planning.LLMClient.from_env", return_value=fake_client):
-                result = execute_code_task(
-                    run_dir,
-                    use_llm=True,
-                    to_step="plan",
-                    timeout_sec=10,
-                    llm_retry_attempts=2,
+    def test_execute_baseline_policies_stop_before_planning(self) -> None:
+        for policy in ("auto", "run", "skip", "none", "provided"):
+            with self.subTest(policy=policy), _temporary_root() as root:
+                _, _, run_dir = _initialize_toy_task(
+                    root, "# Task\n\nUse the requested baseline policy.\n",
+                    benchmark_command=TOY_BENCHMARK_COMMAND,
                 )
+                metrics_file = root / "baseline_metrics.json"
+                if policy == "provided":
+                    write_json(metrics_file, {"accuracy": 0.75, "loss": 1.25})
+                result = execute_code_task(
+                    run_dir, use_llm=False, to_step="baseline", timeout_sec=10,
+                    baseline_policy=policy, baseline_metrics_file=metrics_file,
+                )
+                self.assertEqual(result.stop_reason, "stop_point")
+                self.assertEqual([step.step for step in result.steps], ["probe", "baseline"])
+                self.assertFalse((run_dir / "code_task" / "patch_plan.md").exists())
+                manifest = read_json(run_dir / "manifest.json")
+                recorded = manifest["benchmark"]["baseline_policy"]
+                report = run_dir / "code_task" / "run" / "baseline" / "execution_report.json"
+                if policy in {"skip", "none"}:
+                    self.assertFalse(report.exists())
+                    self.assertEqual(recorded["policy"], policy)
+                    self.assertEqual(recorded["status"], "skipped")
+                    summary = read_text(run_dir / "code_task" / "summary.md")
+                    self.assertIn("Baseline policy", summary)
+                    self.assertIn(policy, summary)
+                else:
+                    self.assertEqual(read_json(report)["status"], "passed")
+                    self.assertEqual(recorded["policy"], "provided" if policy == "provided" else "run")
+                    if policy == "provided":
+                        self.assertTrue(read_json(report)["provided_baseline"])
+                        self.assertEqual(read_json(report)["metric_values"]["accuracy"], 0.75)
+                        self.assertTrue(manifest["benchmark"]["runs"]["baseline"]["provided"])
 
-            self.assertEqual(result.stop_reason, "llm_planning_failed")
-            self.assertEqual(result.steps[-1].step, "plan")
-            self.assertEqual(result.steps[-1].status, "blocked")
-            self.assertIn("LLM response did not contain a JSON object", result.steps[-1].detail)
-            self.assertEqual(fake_client.calls, 1)
-            self.assertFalse((run_dir / "code_task" / "patch_plan.md").exists())
+    def test_execute_baseline_failure_keeps_immediate_and_committed_guards(self) -> None:
+        for status in ("failed", "timed_out", "blocked_by_validation", "unknown"):
+            for cached, recorded_status in ((False, status), (True, status), (False, None), (False, "passed")):
+                with self.subTest(status=status, cached=cached, recorded=recorded_status), _temporary_root() as root:
+                    _, _, run_dir = _initialize_toy_task(root, "# Task\n\nKeep baseline evidence.\n",
+                        benchmark_command=TOY_BENCHMARK_COMMAND)
+                    paths = code_task_paths(run_dir)
 
-    def test_execute_can_skip_expensive_baseline(self) -> None:
-        with _temporary_root() as root:
-            code_root, task_file, run_dir = _initialize_toy_task(
-                root, "# Task\n\nSkip unchanged baseline for an expensive task.\n",
-                benchmark_command=TOY_BENCHMARK_COMMAND,
-            )
+                    def commit_baseline(*_args, **_kwargs):
+                        if recorded_status is not None:
+                            manifest = read_json(run_dir / "manifest.json")
+                            manifest.setdefault("benchmark", {}).setdefault("runs", {})["baseline"] = {"status": recorded_status}
+                            write_json(run_dir / "manifest.json", manifest)
+                        return SimpleNamespace(status=status, metrics={},
+                            report_path=paths.run_artifact_dir / "baseline/execution_report.json",
+                            metrics_path=paths.run_artifact_dir / "baseline/metrics.json")
 
-            result = execute_code_task(
-                run_dir,
-                use_llm=False,
-                to_step="baseline",
-                baseline_policy="skip",
-            )
-
-            self.assertEqual(result.stop_reason, "stop_point")
-            self.assertFalse((run_dir / "code_task" / "run" / "baseline" / "execution_report.json").exists())
-            manifest = read_json(run_dir / "manifest.json")
-            self.assertEqual(manifest["benchmark"]["baseline_policy"]["policy"], "skip")
-            self.assertEqual(manifest["benchmark"]["baseline_policy"]["status"], "skipped")
-            summary = read_text(run_dir / "code_task" / "summary.md")
-            self.assertIn("Baseline policy", summary)
-            self.assertIn("skip", summary)
-
-    def test_execute_can_record_provided_baseline_metrics(self) -> None:
-        with _temporary_root() as root:
-            code_root = root / "toy_project"
-            task_file = root / "task.md"
-            metrics_file = root / "baseline_metrics.json"
-            _write_toy_project(code_root)
-            write_text(task_file, "# Task\n\nUse existing baseline evidence.\n")
-            write_json(metrics_file, {"accuracy": 0.75, "loss": 1.25})
-            run_dir = root / "runs" / "code-task-run"
-            initialize_code_task(
-                run_dir=run_dir,
-                code_root=code_root,
-                task_file=task_file,
-                benchmark_command="python -m unittest discover -s tests",
-            )
-
-            result = execute_code_task(
-                run_dir,
-                use_llm=False,
-                to_step="baseline",
-                baseline_policy="provided",
-                baseline_metrics_file=metrics_file,
-            )
-
-            self.assertEqual(result.stop_reason, "stop_point")
-            report = read_json(run_dir / "code_task" / "run" / "baseline" / "execution_report.json")
-            self.assertTrue(report["provided_baseline"])
-            self.assertEqual(report["metric_values"]["accuracy"], 0.75)
-            manifest = read_json(run_dir / "manifest.json")
-            baseline = manifest["benchmark"]["runs"]["baseline"]
-            self.assertTrue(baseline["provided"])
-            self.assertEqual(manifest["benchmark"]["baseline_policy"]["policy"], "provided")
+                    if cached:
+                        commit_baseline()
+                    with patch("simple_ar.code_task.orchestration.execute.run_code_task_baseline",
+                               side_effect=commit_baseline) as baseline, \
+                         patch("simple_ar.code_task.orchestration.execute.generate_patch_plan") as plan:
+                        result = execute_code_task(run_dir, use_llm=False)
+                    self.assertEqual(result.stop_reason, "baseline_failed")
+                    self.assertEqual(result.steps[-1].status, "skipped" if cached else "done")
+                    self.assertEqual(baseline.call_count, 0 if cached else 1)
+                    plan.assert_not_called()
 
     def test_execute_dry_run_has_no_side_effects(self) -> None:
         with _temporary_root() as root:
@@ -4975,6 +5133,21 @@ protected_patterns = ["pyproject.toml"]
             manifest = read_json(run_dir / "manifest.json")
             self.assertEqual(manifest["work_plan"]["status"], "completed")
 
+            # Completed artifacts still honor every preparation stop point.
+            preparation = ("probe", "baseline", "work-plan", "batch", "plan",
+                           "propose-edits", "apply-edits", "review", "validate")
+            for boundary in preparation:
+                with self.subTest(to_step=boundary), patch(
+                    "simple_ar.code_task.orchestration.execute.run_code_task_benchmark",
+                ) as benchmark:
+                    stopped = execute_code_task(run_dir, use_llm=False, to_step=boundary)
+                self.assertEqual(stopped.stop_reason, "stop_point")
+                expected = list(preparation[:preparation.index(boundary) + 1])
+                if boundary not in {"work-plan", "batch"} and "work-plan" in expected:
+                    expected.remove("work-plan")
+                self.assertEqual([step.step for step in stopped.steps], expected)
+                benchmark.assert_not_called()
+
             # A saved failure must not turn into success merely on resume.
             report_path = run_dir / "code_task" / "meta" / "review_report.json"
             saved_review = read_json(report_path)
@@ -4998,6 +5171,43 @@ protected_patterns = ["pyproject.toml"]
             self.assertEqual(resumed.stop_reason, "review_failed")
             reviewer.assert_not_called()
             self.assertEqual(post_run.read_bytes(), before)
+
+    def test_execute_failure_boundaries_keep_analysis_and_repair_separate(self) -> None:
+        for failed_step in ("validate", "run"):
+            with self.subTest(failed_step=failed_step), _temporary_root() as root:
+                _, _, run_dir = _initialize_toy_task(root, "# Task\n\nRepair within the approved scope.\n",
+                    benchmark_command=TOY_BENCHMARK_COMMAND)
+                execute_code_task(run_dir, use_llm=False, baseline_policy="skip")
+                record_plan_decision(run_dir, decision="approve")
+                _write_valid_edit_proposal(run_dir)
+                apply_patch_edits(run_dir)
+                paths = code_task_paths(run_dir)
+                for boundary in ("validate", "run", "analyze-failure", "repair"):
+                    with self.subTest(to_step=boundary), contextlib.ExitStack() as stack:
+                        def stub(name, **values):
+                            return stack.enter_context(patch(
+                                "simple_ar.code_task.orchestration.execute." + name,
+                                return_value=SimpleNamespace(**values)))
+                        stub("review_code_task_changes", status="passed", blocking_count=0, warning_count=0)
+                        stub("validate_code_task", status="failed" if failed_step == "validate" else "passed",
+                             error_count=int(failed_step == "validate"), warning_count=0)
+                        benchmark = stub("run_code_task_benchmark", status="failed", metrics={},
+                            report_path=paths.run_artifact_dir / "patched/execution_report.json",
+                            metrics_path=paths.run_artifact_dir / "patched/metrics.json")
+                        analysis = stub("analyze_code_task_failure", source=failed_step, status="failed",
+                            analysis_path=paths.run_artifact_dir / "patched/failure_analysis.md")
+                        repair = stub("propose_repair_edits", mode="offline", edit_count=1, selected_files=(),
+                            proposal_path=paths.task_dir / "repairs/repair-001/proposed_edits.json")
+                        result = execute_code_task(run_dir, use_llm=False, to_step=boundary, repair_rounds=1)
+                        expected = ("repair_review_required" if boundary == "repair" else
+                                    "failure_analyzed" if boundary == "analyze-failure" else
+                                    "stop_point" if failed_step == "run" and boundary == "validate" else
+                                    "validation_failed" if failed_step == "validate" else "benchmark_failed")
+                        self.assertEqual(result.stop_reason, expected)
+                        self.assertEqual(benchmark.call_count, int(failed_step == "run" and boundary != "validate"))
+                        self.assertEqual(analysis.call_count, int(boundary in {"analyze-failure", "repair"}))
+                        self.assertEqual(repair.call_count, int(boundary == "repair"))
+                        self.assertEqual(read_text(paths.workspace_dir / "spam_model.py").count("'prize'"), 1)
 
     def test_execute_generates_repair_proposal_after_failed_run(self) -> None:
         with _temporary_root() as root:
@@ -5078,6 +5288,15 @@ protected_patterns = ["pyproject.toml"]
             self.assertEqual(result.steps[-1].step, "apply-edits")
             self.assertEqual(result.steps[-1].status, "blocked")
             self.assertIn("old text was not found", result.steps[-1].detail)
+
+            restoration_failure = PatchValidationError("Rejected write")
+            restoration_failure.add_note("Snapshot restore byte check failed for spam_model.py")
+            with patch("simple_ar.code_task.orchestration.execute.apply_patch_edits",
+                       side_effect=restoration_failure):
+                restored = execute_code_task(run_dir, use_llm=False, timeout_sec=10, apply_proposed_edits=True)
+            self.assertEqual(restored.stop_reason, "patch_rollback_failed")
+            self.assertIn("byte check failed", restored.steps[-1].detail)
+            self.assertIn("current workspace", restored.next_action)
 
             # File permissions are not an edit-budget approval request, even
             # when the failing file happens to contain 'budget' in its name.
@@ -5246,6 +5465,97 @@ protected_patterns = ["pyproject.toml"]
             self.assertIn("spam_model.py", proposal["selected_files"])
             self.assertIn("Dropped edit outside repair context: extra.py", proposal["warnings"])
 
+    def test_repair_creates_declared_missing_files_through_existing_apply(self) -> None:
+        from simple_ar.code_task.execution.repair import RepairEvidence
+        with _temporary_root() as root:
+            _, _, run_dir = _initialize_toy_task(root, 'Create the missing adapter without replacing source.')
+            _approve_offline_patch_plan(run_dir)
+            paths = code_task_paths(run_dir)
+            manifest = read_json(paths.manifest_path)
+            manifest['code_task']['native_binding'] = {'binding': {'contract': {
+                'new_files': ['src/adapter.py', 'src/empty.py', 'tests/new_test.py',
+                              '../escape.py', 'spam_model.py/child.py', 'other.py']}}}
+            manifest['edit_scope']['allowed_patterns'] = ['spam_model.py', 'src/*.py', 'tests/*']
+            manifest['work_plan'] = {'approval': {'status': 'approved'}}
+            write_json(paths.manifest_path, manifest)
+            write_json(paths.task_dir / 'work_plan.json', {'new_files': [{'path': 'src/planned.py'}]})
+            original_index = read_json(paths.meta_dir / 'codebase_index.json')
+            original_source = read_text(paths.workspace_dir / 'spam_model.py')
+            client = _FakeRepairClient({'edits': [
+                {'path': name, 'old': '', 'new': '' if name.endswith('empty.py') else 'VALUE = 1\n',
+                 'reason': 'Create missing source'} for name in
+                ('src/adapter.py', 'src/planned.py', 'src/empty.py', 'src/unknown.py',
+                 'tests/new_test.py', '../escape.py', 'spam_model.py/child.py', 'other.py')]})
+            with patch.object(client, 'ask_json', wraps=client.ask_json) as call, patch(
+                    'simple_ar.code_task.execution.repair.LLMClient.from_env', return_value=client):
+                repair = propose_repair_edits(run_dir, max_files=5,
+                    failure_evidence=RepairEvidence('validator/report.json', {'execution_status': 'failed'},
+                                                   'Required creation missing: src/adapter.py'))
+            proposal = read_json(repair.proposal_path)
+            self.assertEqual([row['path'] for row in proposal['edits']], ['src/adapter.py', 'src/planned.py'])
+            self.assertNotIn('src/adapter.py', proposal['selected_files'])
+            prompt = call.call_args.args[1]
+            self.assertIn('Declared missing creation targets', prompt)
+            self.assertIn('src/adapter.py', prompt.split('Selected source snippets:')[0])
+            self.assertNotIn('src/adapter.py', prompt.split('Selected source snippets:')[1])
+            self.assertEqual(read_json(paths.meta_dir / 'codebase_index.json'), original_index)
+            apply_patch_edits(run_dir, edits_file=repair.proposal_path)
+            self.assertEqual(read_text(paths.workspace_dir / 'src/adapter.py'), 'VALUE = 1\n')
+            self.assertEqual(read_text(paths.workspace_dir / 'src/planned.py'), 'VALUE = 1\n')
+            self.assertEqual(read_text(paths.workspace_dir / 'spam_model.py'), original_source)
+            self.assertFalse((paths.workspace_dir / 'src/unknown.py').exists())
+
+            # An approved named JSON patch plan also works without a work-plan.
+            manifest = read_json(paths.manifest_path)
+            manifest.pop('work_plan', None)
+            manifest['code_task'].pop('native_binding', None)
+            manifest['plan']['patch_plan'] = 'code_task/patch_plan.json'
+            write_json(paths.manifest_path, manifest)
+            write_json(paths.task_dir / 'patch_plan.json', {'new_files': [{'path': 'src/json_adapter.py'}]})
+            client = _FakeRepairClient({'edits': [{'path': 'src/json_adapter.py', 'old': '',
+                'new': 'VALUE = 2\n', 'reason': 'Create the accepted plan target'}]})
+            with patch('simple_ar.code_task.execution.repair.LLMClient.from_env', return_value=client):
+                repair = propose_repair_edits(run_dir,
+                    failure_evidence=RepairEvidence('validator/report.json', {'execution_status': 'failed'},
+                                                   'Required creation missing: src/json_adapter.py'))
+            self.assertEqual(repair.edit_count, 1)
+            apply_patch_edits(run_dir, edits_file=repair.proposal_path)
+            self.assertEqual(read_text(paths.workspace_dir / 'src/json_adapter.py'), 'VALUE = 2\n')
+
+    def test_repair_creation_rechecks_absence_and_does_not_grant_unseen_source(self) -> None:
+        from simple_ar.code_task.execution.repair import RepairEvidence
+        with _temporary_root() as root:
+            _, _, run_dir = _initialize_toy_task(root, 'Create only the frozen missing file.')
+            _approve_offline_patch_plan(run_dir)
+            paths = code_task_paths(run_dir)
+            manifest = read_json(paths.manifest_path)
+            manifest['code_task']['native_binding'] = {'binding': {'contract': {'new_files': ['src/raced.py']}}}
+            manifest['work_plan'] = {'approval': {'status': 'pending'}}
+            manifest['plan']['status'] = 'pending_approval'
+            write_json(paths.manifest_path, manifest)
+            write_text(paths.task_dir / 'patch_plan.md', '## New Files\n\n- `src/unapproved.py`: Not approved.\n')
+            write_json(paths.task_dir / 'work_plan.json', {'new_files': ['src/unapproved.py']})
+            source = read_text(paths.workspace_dir / 'spam_model.py')
+            def reply(*args, **kwargs):
+                write_text(paths.workspace_dir / 'src/raced.py', 'OWNER = 7\n')
+                return {'edits': [
+                    {'path': 'src/raced.py', 'old': '', 'new': 'OWNER = 9\n'},
+                    {'path': 'src/unapproved.py', 'old': '', 'new': 'VALUE = 1\n'},
+                    {'path': 'spam_model.py', 'old': source, 'new': 'VALUE = 1\n'}]}
+            client = _FakeRepairClient({})
+            with patch.object(client, 'ask_json', side_effect=reply) as call, patch(
+                    'simple_ar.code_task.execution.repair.LLMClient.from_env', return_value=client):
+                repair = propose_repair_edits(run_dir, max_files=1,
+                    failure_evidence=RepairEvidence('validator/report.json', {'execution_status': 'failed'},
+                                                   'Required creation missing: src/raced.py'))
+            self.assertEqual(read_json(repair.proposal_path)['edits'], [])
+            self.assertEqual(repair.selected_files, ())
+            self.assertEqual(read_text(paths.workspace_dir / 'src/raced.py'), 'OWNER = 7\n')
+            self.assertEqual(read_text(paths.workspace_dir / 'spam_model.py'), source)
+            declaration = call.call_args.args[1].split('Declared missing creation targets')[1].split('Read-only context paths')[0]
+            self.assertNotIn('src/unapproved.py', declaration)
+            self.assertFalse((paths.workspace_dir / 'src/unapproved.py').exists())
+
     def test_repair_proposal_drops_diff_marker_edits(self) -> None:
         with _temporary_root() as root:
             code_root, task_file, run_dir = _initialize_toy_task(
@@ -5378,38 +5688,6 @@ def _approve_offline_patch_plan(run_dir: Path) -> None:
     """Prepare an approved plan only in scenarios that already grant approval."""
     generate_patch_plan(run_dir, use_llm=False)
     record_plan_decision(run_dir, decision="approve")
-
-
-def _write_toy_project(code_root: Path) -> None:
-    write_text(
-        code_root / "spam_model.py",
-        (
-            "import math\n\n\n"
-            "class SpamModel:\n"
-            "    def score(self, text):\n"
-            "        return math.log(len(text) + 1)\n\n\n"
-            "def predict(text):\n"
-            "    return 'spam' if 'win' in text.lower() else 'ham'\n\n\n"
-            "if __name__ == \"__main__\":\n"
-            "    print(predict('win a prize'))\n"
-        ),
-    )
-    write_text(
-        code_root / "tests" / "test_spam_model.py",
-        (
-            "import unittest\n\n"
-            "from spam_model import predict\n\n\n"
-            "class SpamModelTests(unittest.TestCase):\n"
-            "    def test_predicts_spam_keyword(self):\n"
-            "        self.assertEqual(predict('win now'), 'spam')\n"
-        ),
-    )
-    write_text(code_root / ".git" / "config", "[core]\nrepositoryformatversion = 0\n")
-    write_text(code_root / ".env", "TOKEN=secret\n")
-    write_text(
-        code_root / "pyproject.toml",
-        "[project]\nname = \"toy-project\"\nversion = \"0.1.0\"\n",
-    )
 
 
 def _write_metric_project(
@@ -5649,67 +5927,10 @@ class _FakeCodeTaskClient:
     def ask_json(self, system: str, user: str, *, label: str = "") -> dict[str, object]:
         if label.startswith("code-task-review-"):
             return {"findings": []}
-        if label == "code-task-work-plan":
-            return {
-                "summary": "Improve prize-message classification in one small batch.",
-                "goal": "Classify prize messages as spam without changing tests.",
-                "success_criteria": ["Benchmark passes after the patch."],
-                "items": [
-                    {
-                        "id": "W1",
-                        "objective": "Implement a small keyword handling improvement.",
-                        "target_files": ["spam_model.py"],
-                        "read_only_evidence": ["tests/test_spam_model.py"],
-                        "depends_on": [],
-                        "validation": ["python -m unittest discover -s tests"],
-                        "done_criteria": ["Prediction handles prize messages."],
-                        "risk": "Low.",
-                        "parallelizable": False,
-                        "budget_profile": "normal",
-                        "requires_budget_override": False,
-                        "suggested_budget_override": "",
-                        "context_request": {"query": "predict prize", "files": ["spam_model.py"], "symbols": ["predict"]},
-                    }
-                ],
-                "context_requests": [],
-                "risks": [],
-                "approval": {"required": True, "reason": "Review before editing."},
-            }
-        if label == "code-task-plan":
-            return {
-                "summary": "Patch the classifier keyword logic.",
-                "goals": ["Handle prize messages as spam."],
-                "files_to_modify": [
-                    {
-                        "path": "spam_model.py",
-                        "reason": "Contains predict keyword logic.",
-                        "change_type": "modify",
-                    }
-                ],
-                "new_files": [],
-                "proposed_steps": ["Update predict keyword check."],
-                "validation": ["python -m unittest discover -s tests"],
-                "risks": ["Keep API stable."],
-                "rollback": ["Discard workspace changes."],
-                "open_questions": [],
-                "requires_approval_before_patch": True,
-            }
-        if label == "code-task-propose-edits":
-            return {
-                "summary": "Add prize keyword support.",
-                "edits": [
-                    {
-                        "path": "spam_model.py",
-                        "old": TOY_PREDICT_SOURCE,
-                        "new": TOY_PREDICT_WITH_PRIZE,
-                        "reason": "Classify prize messages as spam.",
-                    }
-                ],
-                "validation": ["python -m unittest discover -s tests"],
-                "risks": [],
-            }
-        raise AssertionError(f"Unexpected LLM label: {label}")
-
+        responses = keyword_code_responses()
+        if label not in responses:
+            raise AssertionError(f"Unexpected LLM label: {label}")
+        return responses[label]
 
 class _FailingCodeTaskClient:
     def __init__(self, error: LLMError | None = None) -> None:
@@ -5728,6 +5949,648 @@ def _indexed_file(index: dict[str, object], path: str) -> dict[str, object]:
             if isinstance(item, dict) and item.get("path") == path:
                 return item
     raise AssertionError(f"Missing indexed file: {path}")
+
+
+class WorkspaceSourceBindingTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("git"), "git executable is not available")
+    def test_git_head_dirty_data_overlay_and_checkout_blockers(self):
+        with _temporary_root() as root:
+            repo = root / "repo"
+            source = repo / "package"
+            write_text(source / "main.py", "VALUE = 1\n")
+            write_text(source / "custom_env/pyvenv.cfg", "home = base\n")
+            write_text(source / "custom_env/installed.py", "DEPENDENCY = 1\n")
+            write_text(source / "data/input.txt", "committed\n")
+            write_text(repo / "outside.py", "OTHER = 1\n")
+            for args in (("init",), ("config", "user.email", "test@example.com"),
+                         ("config", "user.name", "SimpleAR Test"),
+                         ("config", "core.autocrlf", "false"),
+                         ("add", "."), ("commit", "-m", "baseline")):
+                _git(repo, *args)
+            committed = hashlib.sha256((source / "main.py").read_bytes()).hexdigest()
+            write_text(source / "main.py", "VALUE = 2\n")
+            write_text(source / "untracked.py", "NEW = 1\n")
+            write_text(source / "data/input.txt", "declared\n" * 500_001)
+            spec = WorkspaceSpec(source, root / "explicit", "git_worktree",
+                                 max_file_bytes=1, data_inputs=("data",))
+            before_worktrees = subprocess.run(
+                ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+                capture_output=True, check=True,
+            ).stdout
+            binding = workspace_source_binding(spec)
+            expected = binding["source_snapshots"]["git_worktree"]
+            self.assertEqual(binding["git"]["project_relative_path"], "package")
+            self.assertTrue(binding["git"]["origin_dirty"])
+            self.assertEqual(expected["main.py"], committed)
+            self.assertNotIn("untracked.py", expected)
+            self.assertNotIn("custom_env/installed.py", expected)
+            self.assertNotIn("outside.py", expected)
+            self.assertEqual(expected["data/input.txt"],
+                             hashlib.sha256((source / "data/input.txt").read_bytes()).hexdigest())
+            self.assertFalse(spec.task_dir.exists())
+            self.assertEqual(before_worktrees, subprocess.run(
+                ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+                capture_output=True, check=True,
+            ).stdout)
+            result = create_workspace(spec)
+            self.assertEqual(expected, {row["path"]: row["sha256"]
+                                       for row in build_codebase_index(result.project_root)["files"]})
+            auto = workspace_source_binding(WorkspaceSpec(source, root / "auto", "auto"))
+            self.assertEqual(set(auto["source_snapshots"]), {"copy"})
+            self.assertNotEqual(auto["source_snapshots"]["copy"]["main.py"], committed)
+            _git(repo, "config", "core.autocrlf", "true")
+            blocked = workspace_source_binding(WorkspaceSpec(source, root / "blocked", "git_worktree"))
+            self.assertEqual(blocked["source_snapshots"], {})
+            self.assertIn("autocrlf", blocked["blocked_modes"]["git_worktree"])
+            _git(repo, "config", "core.autocrlf", "false")
+            write_text(repo / ".gitattributes", "*.py text\n")
+            _git(repo, "add", ".gitattributes")
+            _git(repo, "commit", "-m", "attributes")
+            blocked = workspace_source_binding(WorkspaceSpec(source, root / "attrs", "git_worktree"))
+            self.assertIn(".gitattributes", blocked["blocked_modes"]["git_worktree"])
+            _git(repo, "rm", ".gitattributes")
+            _git(repo, "commit", "-m", "remove attributes")
+            try:
+                (source / "linked.py").symlink_to("main.py")
+            except OSError:
+                return  # Other Git assertions still run on Windows without symlink privilege.
+            _git(repo, "config", "core.symlinks", "true")
+            _git(repo, "add", "package/linked.py")
+            _git(repo, "commit", "-m", "tracked symlink")
+            blocked = workspace_source_binding(WorkspaceSpec(source, root / "links", "git_worktree"))
+            self.assertIn("symlinks", blocked["blocked_modes"]["git_worktree"])
+
+    def test_copy_and_sparse_share_binding_selection_and_index_boundary(self):
+        with _temporary_root() as root:
+            source = root / "source"
+            for name in ("main.py", "src/keep.py", "src/drop.py", "data/input.txt",
+                         "build/generated.py", ".hidden/hidden.py", ".env",
+                         ".env.example", "custom_env/pyvenv.cfg", "custom_env/lib.py",
+                         "cache/notes.txt"):
+                write_text(source / name, "VALUE = 1\n")
+            write_text(source / "huge.py", "x" * 2_000_001)
+            # More skips than CopyReport records; inventories must remain exact.
+            for number in range(205):
+                write_text(source / f".env.{number}", "hidden")
+            for mode, ceiling in (("copy", 2_000_000), ("sparse_copy", 2_000_000),
+                                  ("copy", 0), ("sparse_copy", 0)):
+                with self.subTest(mode=mode, ceiling=ceiling):
+                    spec = WorkspaceSpec(source, source / f"output_{mode}_{ceiling}", mode,
+                                         max_file_bytes=ceiling, include=("**",),
+                                         exclude=("src/drop.py",))
+                    write_text(spec.task_dir / "workspace/previous.py", "old")
+                    # Recovery can rebind without consuming generated output.
+                    rebound = workspace_source_binding(spec)
+                    self.assertFalse(any(name.startswith(spec.task_dir.name + "/")
+                                         for name in rebound["source_snapshots"][mode]))
+                    with self.assertRaises(FileExistsError):
+                        create_workspace(spec)
+                    (spec.task_dir / "workspace/previous.py").unlink()
+                    from simple_ar.code_task.analysis.index import _sha256
+                    with patch("simple_ar.code_task.workspace.copy._sha256", wraps=_sha256) as hashed:
+                        with patch("simple_ar.code_task.workspace.copy.shutil.copy2") as copied:
+                            binding = workspace_source_binding(spec)
+                            copied.assert_not_called()
+                    self.assertEqual(
+                        {call.args[0].relative_to(source).as_posix() for call in hashed.call_args_list},
+                        set(binding["source_snapshots"][mode]),
+                    )
+                    expected = binding["source_snapshots"][mode]
+                    self.assertNotIn("custom_env/lib.py", expected)
+                    self.assertNotIn(".env.example", expected)
+                    self.assertNotIn("build/generated.py", expected)
+                    self.assertEqual("huge.py" in expected, ceiling == 0)
+                    if mode == "sparse_copy":
+                        self.assertNotIn("src/drop.py", expected)
+                        self.assertNotIn("data/input.txt", expected)
+                    result = create_workspace(spec)
+                    actual = {row["path"]: row["sha256"] for row in build_codebase_index(result.project_root)["files"]}
+                    self.assertEqual(expected, actual)
+                    self.assertEqual(binding, workspace_source_binding(spec))
+                    self.assertGreater(result.copy_report.skipped_count, len(result.copy_report.skipped))
+                    self.assertTrue((result.project_root / "custom_env").exists())
+                    self.assertFalse(any(name.startswith(spec.task_dir.name + "/") for name in expected))
+            changed = WorkspaceSpec(source, root / "changed", "copy")
+            before = workspace_source_binding(changed)
+            write_text(source / "main.py", "VALUE = 2\n")
+            after = workspace_source_binding(changed)
+            self.assertNotEqual(before["source_snapshots"]["copy"]["main.py"],
+                                after["source_snapshots"]["copy"]["main.py"])
+
+    def test_declared_data_bypasses_cap_without_snapshot_truncation(self):
+        with _temporary_root() as root:
+            source = root / "source"
+            write_text(source / "main.py", "VALUE = 1\n")
+            write_text(source / "data/large.txt", "data\n" * 500_001)
+            spec = WorkspaceSpec(source, root / "task", "copy", max_file_bytes=1,
+                                 data_inputs=("data",))
+            binding = workspace_source_binding(spec)
+            expected = binding["source_snapshots"]["copy"]
+            self.assertEqual(set(expected), {"data/large.txt"})
+            self.assertFalse(spec.task_dir.exists())
+            result = create_workspace(spec)
+            self.assertEqual(expected, {row["path"]: row["sha256"]
+                                       for row in build_codebase_index(result.project_root)["files"]})
+            for mode in ("sparse_copy", "empty"):
+                invalid = WorkspaceSpec(source, root / mode, mode, data_inputs=("data",))
+                with self.assertRaises(WorkspaceModeError):
+                    workspace_source_binding(invalid)
+                with self.assertRaises(WorkspaceModeError):
+                    create_workspace(invalid)
+            for name in ("../outside", "/absolute", ".env"):
+                write_text(source / ".env", "secret")
+                with self.assertRaises(ValueError):
+                    workspace_source_binding(WorkspaceSpec(source, root / "bad", "copy", data_inputs=(name,)))
+
+    def test_copy_quota_rejection_precedes_materialization_and_sparse_defaults(self):
+        from simple_ar.code_task.workspace.copy import copy_code_workspace
+        with _temporary_root() as root:
+            source = root / "source"
+            write_text(source / "main.py", "VALUE = 1\n")
+            write_text(source / "other.py", "OTHER = 1\n")
+            write_text(source / "opaque.bin", "opaque")
+            for limits in ({"max_files": 1}, {"max_total_bytes": 1}):
+                destination = root / "overflow"
+                with self.assertRaises(ValueError):
+                    copy_code_workspace(source, destination, **limits)
+                self.assertFalse(destination.exists())
+            spec = WorkspaceSpec(source, root / "sparse", "sparse_copy")
+            binding = workspace_source_binding(spec)
+            self.assertNotIn("opaque.bin", binding["source_snapshots"]["sparse_copy"])
+            result = create_workspace(spec)
+            self.assertEqual(binding["source_snapshots"]["sparse_copy"],
+                             {row["path"]: row["sha256"] for row in build_codebase_index(result.project_root)["files"]})
+            write_text(source / "custom_env/pyvenv.cfg", "home = base\n")
+            write_text(source / "custom_env/installed.py", "x")
+            for mode, cap, includes in (("copy", 1, ()), ("sparse_copy", 0, ("*.py",))):
+                spec = WorkspaceSpec(source, root / f"marker_{mode}", mode,
+                                     max_file_bytes=cap, include=includes)
+                blocked = workspace_source_binding(spec)
+                self.assertNotIn(mode, blocked["source_snapshots"])
+                self.assertIn("pyvenv.cfg", blocked["blocked_modes"][mode])
+                # Keep the existing initializer available, but do not invent an
+                # approval inventory when its venv boundary differs from source.
+                result = create_workspace(spec)
+                self.assertTrue((result.project_root / "custom_env/installed.py").exists())
+                self.assertFalse((result.project_root / "custom_env/pyvenv.cfg").exists())
+
+    def test_empty_binding_and_non_git_auto_are_read_only(self):
+        with _temporary_root() as root:
+            empty = WorkspaceSpec(None, root / "empty", "empty")
+            binding = workspace_source_binding(empty)
+            self.assertEqual(binding["source_snapshots"], {"empty": {}})
+            self.assertIsNone(binding["source_root"])
+            self.assertFalse(empty.task_dir.exists())
+            source = root / "source"
+            write_text(source / "main.py", "VALUE = 1\n")
+            spec = WorkspaceSpec(source, root / "auto", "auto")
+            binding = workspace_source_binding(spec)
+            self.assertEqual(binding["requested_mode"], "auto")
+            self.assertEqual(set(binding["source_snapshots"]), {"copy"})
+            self.assertIn("git_worktree", binding["blocked_modes"])
+            self.assertFalse(spec.task_dir.exists())
+
+    def test_links_and_reparse_boundaries_and_venv_entrypoint(self):
+        with _temporary_root() as root:
+            source = root / "source"
+            write_text(source / "main.py", "VALUE = 1\n")
+            write_text(root / "outside.py", "PRIVATE = 1\n")
+            try:
+                (source / "linked.py").symlink_to(root / "outside.py")
+                (root / "linked_source").symlink_to(source, target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f"Creating symlinks is unavailable: {exc}")
+            spec = WorkspaceSpec(source, root / "task", "copy")
+            binding = workspace_source_binding(spec)
+            self.assertNotIn("linked.py", binding["source_snapshots"]["copy"])
+            with self.assertRaises(ValueError):
+                workspace_source_binding(WorkspaceSpec(root / "linked_source", root / "bad", "copy"))
+            with self.assertRaises(ValueError):
+                workspace_source_binding(WorkspaceSpec(source, root / "bad", "copy", data_inputs=("linked.py",)))
+            result = create_workspace(spec)
+            self.assertFalse((result.project_root / "linked.py").exists())
+            # Linux venv entrypoints are commonly symlinks to the base interpreter.
+            entrypoint = source / ".venv/bin/python"
+            entrypoint.parent.mkdir(parents=True)
+            entrypoint.symlink_to(Path(sys.executable))
+            self.assertEqual(_source_venv_python(source), Path(os.path.abspath(entrypoint)))
+            self.assertNotEqual(_source_venv_python(source), entrypoint.resolve())
+            if os.name != 'nt':
+                # Prove interpreter identity, not only spelling of a fake link.
+                subprocess.run([sys.executable, '-m', 'venv', '--without-pip', '--symlinks', str(source / '.venv')],
+                    check=True, capture_output=True, text=True, timeout=30)
+                selected = _source_venv_python(source)
+                actual = subprocess.run([str(selected), '-c', 'import sys;print(sys.prefix)'],
+                    check=True, capture_output=True, text=True, timeout=5)
+                self.assertEqual(Path(actual.stdout.strip()), source / '.venv')
+            # Exercise the Windows reparse predicate on every platform too.
+            from simple_ar.code_task.workspace.copy import _is_link_or_reparse
+            with patch("simple_ar.code_task.workspace.copy.stat.FILE_ATTRIBUTE_REPARSE_POINT", 1024, create=True):
+                fake = Mock()
+                fake.is_symlink.return_value = False
+                fake.lstat.return_value.st_file_attributes = 1024
+                self.assertTrue(_is_link_or_reparse(fake))
+
+
+class GenerationAuthorizationTests(unittest.TestCase):
+    """Exercise publication authority through real staging; only the model is fake."""
+
+    @staticmethod
+    def _client(contents):
+        client = Mock()
+
+        def respond(_system, prompt, *, label, **_kwargs):
+            if label == 'greenfield-architecture':
+                return {'objective': 'Print score.', 'architecture_summary': 'Bounded project.',
+                        'files': [{'path': path, 'purpose': 'Implement score.'} for path in contents]}
+            if not label.startswith('greenfield-unit-'):
+                raise AssertionError(f'Unexpected model call: {label}')
+            request = json.loads(prompt)
+            return {'files': [{'path': row['path'], 'content': contents[row['path']]}
+                              for row in request['planned_files']]}
+
+        client.ask_json.side_effect = respond
+        return client
+
+    @staticmethod
+    def _write(workspace, contents, memory, **policy):
+        from functools import partial
+        from simple_ar.code_task.editing.patching import validate_generated_project
+        from simple_ar.code_task.generation.writer import write_generated_project
+
+        # Omission must exercise the old public writer signature too.
+        callback = {} if policy.pop('legacy', False) else {'validate_candidate': partial(
+            validate_generated_project, workspace, prefix='generated_project',
+            allowed_patterns=policy.pop('allowed_patterns', ('generated_project/**',)),
+            protected_patterns=policy.pop('protected_patterns', ()), **policy)}
+        return write_generated_project(project_dir=workspace / 'generated_project',
+            architecture_plan={'files': [{'path': path, 'purpose': 'Implement score.'}
+                                         for path in contents]},
+            result_schema={'primary_metric': 'score'}, contract={}, memory=memory,
+            client=GenerationAuthorizationTests._client(contents), files_per_batch=1, **callback)
+
+    def _retained(self, workspace, expected):
+        candidates = list(workspace.glob('.generated_project.candidate-*'))
+        self.assertEqual(len(candidates), 1)
+        for path, content in expected.items():
+            self.assertEqual(read_text(candidates[0] / path), content)
+        self.assertFalse(list(workspace.glob('.generated_project.previous-*')))
+        return candidates[0]
+
+    def test_writer_scope_checks_complete_candidate_and_preserves_previous_state(self):
+        cases = (
+            ('allowed', {}, {}, None),
+            ('narrow', {'allowed_patterns': ('generated_project/main.py',)}, {}, 'outside_allowed_patterns'),
+            ('protected_source', {'protected_patterns': ('generated_project/helper.py',)},
+             {'helper.py': 'ORIGINAL = 7\n', 'main.py': 'ORIGINAL = 8\n'}, 'protected_path'),
+            ('planned_file', {'protected_patterns': ('generated_project/helper.py',)}, {}, 'protected_path'),
+            ('package_init', {'protected_patterns': ('generated_project/pkg/__init__.py',)}, {}, 'protected_path'),
+            ('required_main', {'allowed_patterns': ('generated_project/helper.py',)}, {}, 'outside_allowed_patterns'),
+            ('legacy', {'legacy': True}, {'old.py': 'ORIGINAL = 7\n'}, None),
+        )
+        for name, policy, previous, rejection in cases:
+            with self.subTest(name=name), _temporary_root() as root:
+                workspace = root / 'workspace'
+                project = workspace / 'generated_project'
+                contents = {'main.py': "print('score: 0.5')\n", 'helper.py': 'VALUE = 2\n'}
+                if name == 'package_init':
+                    contents['pkg/__init__.py'] = 'VALUE = 3\n'
+                if name == 'required_main':
+                    del contents['main.py']  # Writer's deterministic entrypoint is also guarded.
+                for path, content in previous.items():
+                    write_text(project / path, content)
+                before = _project_bytes(project)
+                memory = {'file_summaries': [{'path': 'original.py'}], 'accepted_decisions': ['keep']}
+                saved_memory = json.dumps(memory, sort_keys=True)
+                if rejection:
+                    with self.assertRaisesRegex(PatchValidationError, rejection) as caught:
+                        self._write(workspace, contents, memory, **policy)
+                    self.assertEqual(_project_bytes(project), before)
+                    self.assertEqual(project.exists(), bool(previous))
+                    self.assertEqual(json.dumps(memory, sort_keys=True), saved_memory)
+                    candidate = self._retained(workspace, contents)
+                    self.assertTrue((candidate / 'main.py').is_file())
+                    self.assertIn(str(candidate), '\n'.join(caught.exception.__notes__))
+                else:
+                    result = self._write(workspace, contents, memory, **policy)
+                    self.assertEqual(_project_bytes(project),
+                                     {Path(path): text.encode() for path, text in contents.items()})
+                    self.assertEqual(result['project_dir'], str(project))
+                    self.assertNotEqual(json.dumps(memory, sort_keys=True), saved_memory)
+                    self.assertFalse(list(workspace.glob('.generated_project.candidate-*')))
+                    if previous:
+                        backups = list(workspace.glob('.generated_project.previous-*'))
+                        self.assertEqual(len(backups), 1)
+                        self.assertEqual(_project_bytes(backups[0]), before)
+
+    def test_writer_budget_is_cumulative_and_approval_cannot_bypass_absolute_cap(self):
+        from simple_ar.code_task.editing.budget import edit_budget_for_profile
+        from simple_ar.code_task.editing.patching import EditBudgetApprovalRequired
+
+        cases = (
+            ('fits', 'normal', {}, False, False),
+            ('whole_project_files', 'normal', {'max_files': 1}, False, True),
+            ('whole_project_chars', 'normal', {'max_total_edit_chars': 25}, False, True),
+            ('large_requires_approval', 'large', {}, False, True),
+            ('large_approved', 'large', {}, True, False),
+            ('normal_overflow_approved', 'normal', {'max_files': 1}, True, False),
+            ('absolute_even_with_approval', 'absolute', {'max_new_chars': 100_000}, True, True),
+        )
+        for name, profile, overrides, approved, rejects in cases:
+            with self.subTest(name=name), _temporary_root() as root:
+                contents = {'main.py': "print('score: 0.5')\n", 'helper.py': 'VALUE = 2\n'}
+                if name == 'absolute_even_with_approval':
+                    contents['helper.py'] = "VALUE = '" + 'x' * 32_001 + "'\n"
+                memory = {'accepted_decisions': ['preserve']}
+                saved_memory = json.dumps(memory, sort_keys=True)
+                policy = dict(budget=edit_budget_for_profile(profile, overrides=overrides),
+                              allow_large_edits=approved)
+                workspace = root / 'workspace'
+                if rejects:
+                    with self.assertRaises(EditBudgetApprovalRequired):
+                        self._write(workspace, contents, memory, **policy)
+                    self.assertFalse((workspace / 'generated_project').exists())
+                    self.assertEqual(json.dumps(memory, sort_keys=True), saved_memory)
+                    self._retained(workspace, contents)
+                else:
+                    self._write(workspace, contents, memory, **policy)
+                    self.assertEqual(len(memory['generated_batches']), 2)
+                    self.assertEqual(_project_bytes(workspace / 'generated_project'),
+                                     {Path(path): text.encode() for path, text in contents.items()})
+
+    def test_public_greenfield_explicit_scope_consumes_publication_guard(self):
+        from simple_ar.code_task.editing.patching import EditBudgetApprovalRequired
+        from simple_ar.code_task.generation.greenfield import generate_greenfield_code_task
+
+        with _temporary_root() as root:
+            write_text(root / 'task.md', 'Generate a bounded project printing score.')
+            run = root / 'run'
+            _initialize_greenfield(run_dir=run, task_file=root / 'task.md', primary_metric='score',
+                                  edit_scope_allowed_patterns=('generated_project/**',))
+            workspace = run / 'code_task/workspace'
+            contents = {'main.py': "print('score: 0.5')\n", 'helper.py': 'VALUE = 2\n'}
+            # Existing output and durable memory survive a real late publication failure.
+            for path in contents:
+                write_text(workspace / 'generated_project' / path, 'ORIGINAL = 1\n')
+            before = _project_bytes(workspace / 'generated_project')
+            memory_path = run / 'code_task/memory/implementation_memory.json'
+            write_json(memory_path, {'accepted_decisions': ['preserve']})
+            old_memory = memory_path.read_bytes()
+            client = self._client(contents)
+            with patch('simple_ar.code_task.generation.greenfield._llm_client', return_value=client), \
+                    self.assertRaises(EditBudgetApprovalRequired):
+                generate_greenfield_code_task(run, llm_client=client, max_files=2,
+                    budget_profile='normal', edit_budget_overrides={'max_files': 1})
+            self.assertTrue(any(call.kwargs['label'].startswith('greenfield-unit-')
+                                for call in client.ask_json.call_args_list))
+            self.assertEqual(_project_bytes(workspace / 'generated_project'), before)
+            self.assertEqual(memory_path.read_bytes(), old_memory)
+            self._retained(workspace, contents)
+            self.assertFalse((run / 'code_task/meta/code_artifacts.json').exists())
+
+    def test_public_greenfield_rejects_forbidden_plan_before_content_generation(self):
+        from simple_ar.code_task.generation.greenfield import generate_greenfield_code_task
+
+        for forbidden in ('helper.py', 'pkg/__init__.py', 'main.py'):
+            with self.subTest(forbidden=forbidden), _temporary_root() as root:
+                write_text(root / 'task.md', 'Generate a bounded project printing score.')
+                run = root / 'run'
+                _initialize_greenfield(run_dir=run, task_file=root / 'task.md', primary_metric='score',
+                    edit_scope_allowed_patterns=('generated_project/**',),
+                    edit_scope_protected_patterns=(f'generated_project/{forbidden}',))
+                contents = {'main.py': "print('score: 0.5')\n", forbidden: 'VALUE = 2\n'}
+                client = self._client(contents)
+                with patch('simple_ar.code_task.generation.greenfield._llm_client', return_value=client), \
+                        self.assertRaisesRegex(PatchValidationError, 'protected_path'):
+                    generate_greenfield_code_task(run, llm_client=client, max_files=2)
+                self.assertFalse(any(call.kwargs['label'].startswith('greenfield-unit-')
+                                     for call in client.ask_json.call_args_list))
+                self.assertFalse((run / 'code_task/workspace/generated_project').exists())
+
+    def test_exact_greenfield_generation_feedback_and_api_guard_use_real_owners(self):
+        for mode, failed_baseline in (('empty', False), ('copy', False), ('sparse_copy', False), ('copy', True)):
+            with self.subTest(workspace=mode, failed_baseline=failed_baseline):
+                self._exact_greenfield_generation_feedback(mode, failed_baseline=failed_baseline)
+
+    def _exact_greenfield_generation_feedback(self, mode, *, failed_baseline):
+        from simple_ar.app.tool_application import ToolApplication
+        from simple_ar.tools.implementation import ImplementationToolGateway
+        from simple_ar.tools.scientific import ScientificToolGateway
+        from simple_ar.tools.specs import ToolResult
+        from simple_ar.tools.workspace import WorkspaceToolGateway
+        from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext, CapabilityRegistry, CapabilityResult
+        from simple_ar.core.session import SessionController, BudgetState
+        from simple_ar.code_task.runtime.state import load_code_task_manifest
+        from simple_ar.research.preparation import run_preparation_capability
+        with _temporary_root() as root, patch('simple_ar.research.preparation.run_preparation_capability',
+                wraps=run_preparation_capability) as prepare:
+            ledger = BudgetLedger({'llm_requests': 30, 'total_tokens': 50000,
+                                   'process_invocations': 8, 'process_wall_seconds': 120})
+            (root / 'attempts').mkdir()
+            source = root / 'source'
+            if mode != 'empty':
+                write_text(source / 'baseline.py', 'raise SystemExit(1)\n' if failed_baseline else 'print("score: 0.5")\n')
+                write_text(source / 'notes.txt', 'Read-only scaffold material.\n')
+            original_source = _project_bytes(source)
+            workspace = WorkspaceToolGateway(root, {'records': root / 'attempts',
+                **({'source': source} if mode != 'empty' else {})}, ledger)
+            fake = Mock()
+            fake.effective_output_limit.return_value = None
+            fake._budget_ledger = ledger
+            broken = False
+            labels = []
+            contents = {'main.py': 'from model import predict\nprint("score:", int(predict("win") == "spam"))\n',
+                        'model.py': TOY_PREDICT_SOURCE}
+            responses = json.loads(json.dumps(keyword_code_responses()).replace(
+                'tests/test_spam_model.py', 'generated_project/main.py').replace(
+                'spam_model.py', 'generated_project/model.py'))
+            def respond(_system, prompt, *, label='', **_kwargs):
+                labels.append(label)
+                call = f'fake-model-{len(labels)}'
+                ledger.reserve(call, {'llm_requests': 1, 'total_tokens': 100},
+                    session_id='same-task', attempt_id=identity, purpose=label)
+                ledger.settle(call, {'llm_requests': 1, 'total_tokens': 100})
+                if label == 'greenfield-architecture':
+                    return {'objective': 'Create a local classifier.', 'files': [
+                        {'path': 'main.py', 'purpose': 'CLI', 'entrypoint': True, 'dependencies': ['model.py'], 'public_api': []},
+                        {'path': 'model.py', 'purpose': 'Classify text', 'public_api': ['predict(text)']}]}
+                if label.startswith('greenfield-unit-'):
+                    return {'files': [{'path': row['path'], 'content': contents[row['path']]}
+                                      for row in json.loads(prompt)['planned_files']]}
+                if label in responses:
+                    if broken and label == 'code-task-propose-edits':
+                        return {**responses[label], 'edits': [{'path': 'generated_project/model.py',
+                            'old': TOY_PREDICT_WITH_PRIZE, 'new': 'def replacement(text):\n    return "spam"\n',
+                            'reason': 'Break API to prove whole-project check'}]}
+                    return responses[label]
+                if 'review' in label:
+                    return {'status': 'passed', 'summary': 'Mock model review only.', 'findings': []}
+                raise AssertionError(f'Unexpected model label: {label}')
+            fake.ask_json.side_effect = respond
+            contract = {'project_path': '' if mode == 'empty' else 'source', 'goal': 'Create a local text classifier preserving predict(text).',
+                'allowed_patterns': ['generated_project/**'], 'validation_command': ['python', '-m', 'compileall', '-q', 'generated_project'],
+                'timeout_sec': 10,
+                'preparation': {'kind': 'greenfield', 'workspace_mode': mode, 'max_file_bytes': 0, 'max_repairs': 0,
+                    **({'workspace_include': ['baseline.py']} if mode == 'sparse_copy' else {})}}
+            formal = {'command': ['python', 'generated_project/main.py'], 'cwd': str(root if mode == 'empty' else source),
+                'timeout_sec': 6, 'result_schema': {'primary_metric': 'score', 'required_metrics': ['score']}}
+            measurement = formal if mode == 'empty' else {'conditions': [
+                {'id': 'baseline', 'role': 'baseline', 'seed': None, 'source': 'preparation', 'before_implementation': True,
+                    'execution': {**formal, 'command': ['python', 'baseline.py']}},
+                {'id': 'candidate', 'role': 'candidate', 'seed': None, 'source': 'implementation', 'execution': formal}]}
+            owner = ImplementationToolGateway(root, workspace, ledger, 'fixture', 'same-task',
+                exact=contract, client_factory=lambda _: fake, measurement=measurement)
+            science = ScientificToolGateway(root, workspace, ledger, 'same-task', implementation=owner,
+                execution_contract=measurement)
+            measured = []
+            owner.measurement_inputs = lambda origin, required: science.implementation_inputs(measured, origin, required=required)
+            registry = CapabilityRegistry()
+            def native(*, context, tool_name, arguments, approval):
+                gateway = owner if tool_name in owner.context_tools else science
+                result = gateway.execute_tool(tool_name, context, arguments, approval=approval)
+                context.store.write_json('native_result.json', result.model_dump(mode='json'))
+                if tool_name == 'measure_experiment' and result.data.get('result_ref'):
+                    measured.append(result.data['result_ref'])
+                return CapabilityResult(status='completed', artifacts=ToolApplication._native_artifacts(
+                    context.store, result.model_dump(mode='json'), name=tool_name))
+            registry.register('native_tool', native)
+            controller = SessionController.create(root, session_id='same-task', topic=contract['goal'],
+                registry=registry, budget=BudgetState(max_attempts=10))
+            def invoke(tool_name, arguments, identity):
+                gateway = owner if tool_name in owner.context_tools else science
+                token = {'token': identity, 'binding': gateway.approval_binding(arguments, identity=identity)}
+                controller.execute_attempt('native_tool', attempt_id=identity, tool_name=tool_name,
+                    arguments=arguments, approval=token)
+                store = ArtifactStore(root / 'attempts' / identity)
+                self.assertEqual(store.read_capability_result().status, 'completed', store.read_json('capability_result.json'))
+                result = store.read_json('native_result.json')
+                return result, token
+            prepared_locator = 'records/prepared/execution.json'
+            if mode != 'empty':
+                identity = 'prepared'
+                result, _ = invoke('prepare_code_task', {}, identity)
+                self.assertEqual(result['status'], 'ok', result)
+                self.assertEqual(prepare.call_count, 1)
+                fake.ask_json.assert_not_called()
+                prepared = owner.prepared_source(prepared_locator, identity='baseline')
+                prepared_cwd = Path(prepared['cwd'])
+                self.assertEqual((prepared_cwd / 'baseline.py').read_bytes(), original_source[Path('baseline.py')])
+                self.assertEqual((prepared_cwd / 'notes.txt').exists(), mode == 'copy')
+                retained_preparation = _project_bytes(root / 'attempts/prepared')
+                def reject_generation(reason):
+                    calls, model_calls, budget = prepare.call_count, fake.ask_json.call_count, ledger.to_dict()
+                    with self.assertRaisesRegex(ValueError, reason):
+                        owner.approval_binding({'prepared_result': prepared_locator}, identity='denied')
+                    # A direct implementation without its required ancestor must
+                    # also stop before real preparation or any generation call.
+                    token = {'token': 'denied', 'binding': owner.approval_binding({}, identity='denied')}
+                    with self.assertRaisesRegex(ValueError, 'required prior measurements'):
+                        owner.execute(CapabilityContext(ArtifactStore(root / 'attempts/denied'),
+                            AttemptManifest('denied')), {}, approval=token)
+                    self.assertEqual(prepare.call_count, calls)
+                    self.assertEqual(fake.ask_json.call_count, model_calls)
+                    self.assertEqual(ledger.to_dict(), budget)
+                    self.assertFalse((workspace.workspace / 'code_tasks/denied').exists())
+                    self.assertEqual(_project_bytes(source), original_source)
+                reject_generation('required prepared-source measurements')
+                identity = 'baseline'
+                baseline_result, _ = invoke('measure_experiment', {**formal, 'command': ['python', 'baseline.py'],
+                    'cwd': prepared['cwd'], 'condition_id': 'baseline', 'preparation_ref': prepared_locator}, identity)
+                self.assertEqual(baseline_result['status'], 'ok', baseline_result)
+                baseline = read_json(root / 'attempts/baseline/results.json')
+                self.assertEqual(len(measured), 1)
+                if failed_baseline:
+                    self.assertEqual(baseline['status'], 'failed')
+                    self.assertEqual(baseline['returncode'], 1)
+                    reject_generation('required prepared-source measurements')
+                    fake.ask_json.assert_not_called()
+                    self.assertEqual(prepare.call_count, 1)
+                    self.assertEqual(_project_bytes(root / 'attempts/prepared'), retained_preparation)
+                    self.assertEqual(len([row for row in ledger.entries if row.purpose == 'local_process']), 1)
+                    return
+                self.assertEqual(baseline['status'], 'passed')
+                self.assertEqual(baseline['metrics']['score'], 0.5)
+                self.assertEqual(prepare.call_count, 1)
+                fake.ask_json.assert_not_called()
+                baseline_records = _project_bytes(root / 'attempts/baseline')
+            prior = ''
+            for number in range(1, 4):
+                broken = number == 3
+                identity = f'native-tool-{number:03d}'
+                work = ({'prepared_result': prepared_locator} if mode != 'empty' else {}) if not prior else {
+                    'instruction': 'Handle prize while preserving public API.', 'prior_result': prior}
+                store = ArtifactStore(root / 'attempts' / identity)
+                original = {}
+                if number > 1:
+                    previous_run = workspace.workspace / 'code_tasks' / f'native-tool-{number - 1:03d}'
+                    previous_store = root / 'attempts' / f'native-tool-{number - 1:03d}'
+                    original = {path: path.read_bytes() for folder in (previous_run, previous_store)
+                                for path in folder.rglob('*') if path.is_file()}
+                with patch('simple_ar.integrations.llm.LLMClient.for_task', return_value=fake), \
+                        patch('simple_ar.code_task.generation.greenfield._llm_client', return_value=fake):
+                    observed, approval = invoke('implement_code_task', work, identity)
+                result = ToolResult.model_validate(observed)
+                context = CapabilityContext(store, store.read_attempt_manifest())
+                self.assertEqual({path: path.read_bytes() for path in original}, original)
+                run = workspace.workspace / 'code_tasks' / identity
+                manifest = load_code_task_manifest(run)
+                self.assertEqual(manifest['code_task']['kind'], 'greenfield')
+                self.assertEqual(len([name for name in labels if name == 'greenfield-architecture']), 1)
+                if number < 3:
+                    self.assertEqual(result.status, 'ok', result.error)
+                    self.assertIn('generation_architecture_plan', result.data['artifact_refs'])
+                    self.assertEqual(result.data['validation']['status'], 'passed')
+                    self.assertEqual(result.data['validation']['metrics'], {})  # Compile/API validation is not a measured score.
+                    from simple_ar.code_task.generation.greenfield import result_schema_from_manifest, _benchmark_command
+                    self.assertEqual(result_schema_from_manifest(manifest)['primary_metric'], 'score')
+                    self.assertIn('generated_project/main.py', _benchmark_command(manifest))
+                    if mode != 'empty':
+                        facts = approval['binding']['measurement_inputs']['observations']
+                        self.assertEqual([fact['condition_id'] for fact in facts], ['baseline'])
+                        self.assertEqual(facts[0]['metrics']['score'], 0.5)
+                        self.assertIn('Recorded prior measurement evidence', store.read_json('inputs/brief.json')['request_text'])
+                    if number == 1:
+                        # A settled validator with no outer domain result must
+                        # reuse committed generation, never call its model again.
+                        (store.root / 'implementation.json').unlink()
+                        before = ledger.to_dict()
+                        with patch.object(fake, 'ask_json', side_effect=AssertionError('No model replay')), \
+                                patch('simple_ar.integrations.llm.LLMClient.for_task', return_value=fake):
+                            recovered = owner.execute(context, work, approval=approval)
+                        self.assertEqual(recovered.status, 'ok', recovered.error)
+                        self.assertEqual(recovered.data, result.data)
+                        self.assertEqual(ledger.to_dict(), before)
+                    prior = f'records/{identity}/implementation.json'
+                    if number == 2:
+                        self.assertEqual(manifest['implementation']['mode'], 'controlled_patch')
+                        self.assertIn('prize', (code_task_paths(run).workspace_dir / 'generated_project/model.py').read_text())
+                        self.assertEqual(approval['binding']['prior_source']['record'], 'records/native-tool-001/implementation.json')
+                    measurement_identity = 'formal-' + identity
+                    source_facts = owner.measurement_source(prior, identity=measurement_identity)
+                    if mode != 'empty':
+                        self.assertEqual(source_facts['preparation_origin']['path'], 'attempts/prepared/execution.json')
+                    measured_result, _ = invoke('measure_experiment', {**formal, 'cwd': source_facts['cwd'],
+                        'implementation_ref': prior, **({'condition_id': 'candidate'} if mode != 'empty' else {})}, measurement_identity)
+                    self.assertEqual(measured_result['status'], 'ok', measured_result)
+                    candidate = read_json(root / 'attempts' / measurement_identity / 'results.json')
+                    self.assertEqual(candidate['status'], 'passed')
+                    self.assertEqual(candidate['metrics']['score'], 1)
+                    validation = read_json(store.resolve(result.data['artifact_refs']['validation_report']['path']))
+                    self.assertNotEqual(candidate['measurement']['measurement_id'], validation['process']['invocation_id'])
+                else:
+                    self.assertEqual(result.status, 'blocked')
+                    self.assertIsNone(result.data['validation'])
+                    self.assertTrue(any(row['category'] in {'missing_local_api', 'interface_contract'}
+                        for row in read_json(code_task_paths(run).meta_dir / 'review_report.json')['findings']))
+                self.assertEqual(_project_bytes(source), original_source)
+                if mode != 'empty':
+                    self.assertEqual(_project_bytes(root / 'attempts/prepared'), retained_preparation)
+                    self.assertEqual(_project_bytes(root / 'attempts/baseline'), baseline_records)
+                    self.assertEqual((prepared_cwd / 'baseline.py').read_bytes(), original_source[Path('baseline.py')])
+            self.assertEqual(prepare.call_count, 3 if mode == 'empty' else 4)
+            self.assertEqual(len([row for row in ledger.entries if row.purpose == 'local_process']),
+                4 if mode == 'empty' else 5)
+            self.assertEqual(len(measured), 2 if mode == 'empty' else 3)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from simple_ar.core.artifacts import read_json, read_text, write_json, write_text
+from simple_ar.core.artifacts import write_atomically as _write_text_atomically
 from simple_ar.code_task.editing.attempts import (
     LoadedCodeTaskBatch,
     load_latest_code_task_batch,
@@ -595,8 +596,9 @@ def apply_patch_edits(
     try:
         for path, new_text in new_text_by_path.items():
             _write_text_atomically(path, new_text)
-    except Exception:
-        snapshot.restore(_unique_prepared_paths(prepared))
+    except BaseException as exc:
+        for error in snapshot.restore_verified():
+            exc.add_note(error)
         raise
 
     post_hash_rows = _hash_rows_for_prepared(workspace_dir, prepared)
@@ -977,6 +979,55 @@ def _normalize_edit_proposal(
     }
 
 
+def validate_generated_project(
+    workspace_dir: Path, candidate: Path, *, prefix: str,
+    allowed_patterns: tuple[str, ...], protected_patterns: tuple[str, ...],
+    budget: EditBudget | None = None, allow_large_edits: bool = False,
+) -> None:
+    """Check a complete staged generation before publication, using edit policy.
+
+    Generation is not permission to replace protected originals, delete files,
+    or reset the edit allowance per batch. Rejected staging stays unpublished.
+    """
+    destination = _workspace_file(workspace_dir, prefix)
+    if destination is None:
+        raise PatchValidationError('Generation destination escapes the workspace')
+    from simple_ar.code_task.workspace.copy import _validate_root_boundary
+    _validate_root_boundary(Path(workspace_dir) / prefix)
+    _validate_root_boundary(candidate)
+    files: dict[str, Path] = {}
+    for path in candidate.rglob('*'):
+        _validate_root_boundary(path)
+        if path.is_file():
+            files[path.relative_to(candidate).as_posix()] = path
+        elif not path.is_dir():
+            raise PatchValidationError('Generated project contains a non-regular path')
+    previous = {path.relative_to(destination).as_posix(): path for path in destination.rglob('*')
+                if path.is_file()} if destination.exists() else {}
+    if set(previous) - set(files):
+        raise PatchValidationError('Generation would delete existing project files; use controlled edits')
+    edits = []
+    for name, path in files.items():
+        relative = (Path(prefix) / name).as_posix()
+        target = _workspace_file(workspace_dir, relative)
+        if target is None or any(p.is_symlink() for p in (target, *target.parents)):
+            raise PatchValidationError('Generated target escapes or links outside the workspace')
+        old = target.read_text(encoding='utf-8') if target.is_file() else ''
+        new = path.read_text(encoding='utf-8')
+        if target.exists() and old == new:
+            continue
+        rejection = edit_scope_rejection_reason(relative, allowed_patterns=allowed_patterns,
+                                                protected_patterns=protected_patterns)
+        if rejection:
+            raise PatchValidationError(f'Generated file `{relative}` rejected: {rejection}')
+        edits.append({'path': relative, 'old': old, 'new': new, 'reason': 'Generated project publication'})
+    if budget is not None and edits:
+        checked = _evaluate_budget(edits, proposal={'edits': edits}, workspace_dir=workspace_dir,
+                                   budget=budget, allow_large_edits=allow_large_edits)
+        if checked['drop_edits'] or (checked['budget']['requires_approval'] and not checked['budget']['approved']):
+            raise EditBudgetApprovalRequired(f"Generated project exceeds its approved edit policy: {checked['status']}")
+
+
 def _prepare_edits(
     workspace_dir: Path,
     edits: list[dict[str, Any]],
@@ -1265,30 +1316,6 @@ def _unique_prepared_paths(prepared: list[_PreparedEdit]) -> list[str]:
         if item.path not in paths:
             paths.append(item.path)
     return paths
-
-
-def _write_text_atomically(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_name(path.name + ".simple_ar_tmp")
-    temp_path.write_text(text, encoding="utf-8")
-    try:
-        for attempt in range(3):
-            try:
-                temp_path.replace(path)
-                return
-            except PermissionError:
-                if attempt == 2:
-                    raise
-                # Windows scanners can briefly hold the destination between
-                # the write and replace; keep the operation atomic and retry
-                # only that observed transient lock.
-                time.sleep(0.05 * (attempt + 1))
-    finally:
-        if temp_path.exists():
-            try:
-                temp_path.unlink()
-            except OSError:
-                pass
 
 
 def _applied_edits_record(

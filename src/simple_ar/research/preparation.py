@@ -134,6 +134,7 @@ class PreparationRequest:
     run_dir: Path | None = None
     source_project: Path | None = None
     data_paths: tuple[Path, ...] = ()
+    generation_source: Mapping[str, Any] | None = None
 
 
 def inspect_project_preparation(
@@ -394,6 +395,32 @@ def inspect_execution_entry(execution: Mapping[str, Any]) -> dict[str, Any]:
     return facts
 
 
+def revision_preparation_config(config: Mapping[str, Any], prepared: Mapping[str, Any], *,
+                                source_root: Path) -> dict[str, Any]:
+    """Re-import the declared baseline or copy the accepted candidate, not both.
+
+    Candidate continuation inherits its resolved interpreter. Import filters and
+    venv discovery belong to the original source, not an already selected copy.
+    The file-size ceiling remains explicit; a lossy candidate copy is rejected.
+    """
+    raw = dict(config)
+    task = dict(raw["code_task"])
+    task.pop("run_dir", None)
+    task["code_root"] = str(source_root)
+    if source_root.resolve() == Path(prepared["workspace"]).resolve():
+        task["workspace_mode"] = "copy"
+        for key in ("workspace_include", "workspace_exclude", "workspace_reuse_source_venv"):
+            task.pop(key, None)
+        actual = prepared["execution"]["code_task"]
+        task.update({key: actual[key] for key in ("env_mode", "python_executable") if key in actual})
+    else:
+        task.setdefault("workspace_mode", "copy")
+    raw.update(code_task=task, cwd=str(source_root))
+    if isinstance(raw.get("baseline"), Mapping):
+        raw["baseline"] = {**raw["baseline"], "cwd": str(source_root)}
+    return raw
+
+
 def run_preparation_capability(*, context: CapabilityContext, request: PreparationRequest, backend=None) -> CapabilityResult:
     if "environment" in request.execution and "code_task" not in request.execution:
         from simple_ar.research.project_environment import prepare_project_environment
@@ -407,10 +434,13 @@ def run_preparation_capability(*, context: CapabilityContext, request: Preparati
         "budget_profile", "allow_large_edits", "edit_budget_overrides", "workspace_mode", "protected_patterns",
         "env_mode", "python_executable",
         "validation_command", "validation_timeout_sec", "initial_files",
+        "max_file_bytes", "workspace_include", "workspace_exclude", "workspace_reuse_source_venv",
     }:
         raise ValueError(
             "Preparing code_task accepts code_root, approval_note, max_repairs, "
-            "allowed_patterns, protected_patterns, budget_profile, allow_large_edits, workspace_mode, env_mode, python_executable, validation_command, validation_timeout_sec and initial_files."
+            "allowed_patterns, protected_patterns, budget_profile, allow_large_edits, workspace_mode, "
+            "max_file_bytes, workspace_include, workspace_exclude, workspace_reuse_source_venv, "
+            "env_mode, python_executable, validation_command, validation_timeout_sec and initial_files."
         )
     allowed = task.pop("allowed_patterns", None)
     initial_files = task.pop("initial_files", ())
@@ -419,19 +449,30 @@ def run_preparation_capability(*, context: CapabilityContext, request: Preparati
         code_task_validation(config, required=True)
     protected = task.pop("protected_patterns", ())
     workspace_mode = task.pop("workspace_mode", "auto")
+    workspace_options = {name: task.pop(name) for name in (
+        "max_file_bytes", "workspace_include", "workspace_exclude", "workspace_reuse_source_venv") if name in task}
+    if "environment" in config and workspace_options.get("workspace_reuse_source_venv"):
+        raise ValueError("Choose source-venv reuse or task environment preparation, not both.")
     kind = task.pop("kind", "existing_project")
     if kind not in {"existing_project", "greenfield"}:
         raise ValueError("Code preparation kind must be existing_project or greenfield.")
+    if workspace_mode == "empty" and kind != "greenfield":
+        raise ValueError("An empty research workspace requires greenfield creation, not an existing-project edit.")
     env_mode = task.get("env_mode", "current")
     python_executable = task.get("python_executable")
-    if workspace_mode not in {"auto", "copy", "git_worktree"} and not (kind == "greenfield" and workspace_mode == "empty"):
-        raise ValueError("Research project preparation supports auto, copy or git_worktree; sparse/empty workspaces require standalone CodeTask.")
     for name, patterns in (("allowed_patterns", () if allowed is None else allowed), ("protected_patterns", protected)):
         if not isinstance(patterns, (list, tuple)) or any(not isinstance(p, str) or not p.strip() for p in patterns):
             raise ValueError(f"{name} must be a list of workspace-relative patterns; empty uses CodeTask defaults.")
     source_root = Path(task["code_root"]) if task.get("code_root") else None
     if source_root is None and (kind != "greenfield" or workspace_mode != "empty"):
         raise ValueError("Only greenfield with an empty workspace may omit code_root.")
+    inherited = request.generation_source
+    names = {'task_contract', 'architecture_plan', 'code_artifacts', 'dependency_advice', 'implementation_plan'}
+    if inherited is not None and (kind != 'greenfield' or source_root is None or workspace_mode != 'copy'
+            or set(inherited) != {'documents', 'result_schema'} or set(inherited['documents']) != names
+            or any(not isinstance(row, dict) for row in inherited['documents'].values())
+            or set(inherited['result_schema']) - {'primary_metric', 'metric_directions'}):
+        raise ValueError('Generated revision requires its complete accepted generation contract and a copied project')
     root = source_root or request.run.cwd
     if not root.is_absolute() or not root.is_dir():
         raise ValueError("code_task.code_root must be an existing absolute project directory.")
@@ -452,6 +493,10 @@ def run_preparation_capability(*, context: CapabilityContext, request: Preparati
         if path.is_relative_to(lineage_root):
             data_inputs.append(path.relative_to(lineage_root).as_posix())
     data_inputs = tuple(dict.fromkeys(data_inputs))
+    source_snapshot = None
+    if source_root is not None and source_root.resolve() != lineage_root:
+        from simple_ar.code_task.analysis.index import build_codebase_index
+        source_snapshot = {row["path"]: row["sha256"] for row in build_codebase_index(source_root)["files"]}
     task_ref = context.store.write_text("inputs/task.md", request.task_text, kind="task_input", schema="markdown.v1")
     # Keep the checker portable until the approved environment has been built.
     # request.run already resolves current Python, and is NOT the formal command.
@@ -461,12 +506,29 @@ def run_preparation_capability(*, context: CapabilityContext, request: Preparati
         run_dir=context.store.root / (request.run_dir or Path("project_run")), code_root=source_root, kind=kind,
         task_file=context.store.resolve(task_ref), benchmark_command=command,
         workspace_mode=workspace_mode,
+        **workspace_options,
         env_mode=env_mode, python_executable=python_executable,
         edit_scope_allowed_patterns=tuple(allowed or ()),
         edit_scope_protected_patterns=tuple(protected),
         data_inputs=data_inputs,
         initial_files=initial_files,
     )
+    if source_snapshot is not None:
+        from simple_ar.code_task.runtime.state import implementation_file_hashes
+        copied = implementation_file_hashes(initialized.run_dir)
+        if any(copied.get(name) != digest for name, digest in source_snapshot.items()):
+            raise ValueError("Candidate revision copy omitted or changed accepted source; inspect copy limits before implementation.")
+    if inherited is not None:
+        from simple_ar.code_task.runtime.state import load_code_task_manifest, save_code_task_manifest
+        from simple_ar.core.artifacts import write_json
+        for name, value in inherited['documents'].items():
+            write_json(initialized.task_dir / 'meta' / f'{name}.json', value)
+        current = load_code_task_manifest(initialized.run_dir)
+        # Logical generation contract survives; only implementation strategy
+        # changes to controlled edits of the actual accepted candidate.
+        current['implementation'] = {'mode': 'controlled_patch', 'status': 'revision_prepared'}
+        current['benchmark'].update(inherited['result_schema'])
+        save_code_task_manifest(initialized.run_dir, current)
     config["cwd"] = str(initialized.workspace_dir)
     if "baseline" in config:
         baseline = dict(config["baseline"])
@@ -474,6 +536,9 @@ def run_preparation_capability(*, context: CapabilityContext, request: Preparati
             baseline["cwd"] = str(initialized.workspace_dir)
         config["baseline"] = baseline
     task.pop("code_root")
+    if workspace_options.get("workspace_reuse_source_venv"):
+        task.update(env_mode=initialized.environment_policy["mode"],
+                    python_executable=initialized.environment_policy.get("python_executable"))
     task["run_dir"] = str(initialized.run_dir)
     config["code_task"] = task
     payload = {

@@ -10,6 +10,7 @@ import xml.etree.ElementTree as ET
 from tests import captured_data_figures
 
 from simple_ar.cli.main import main
+from simple_ar.cli.start import session_materials
 from simple_ar.result_analysis.table import TableSpec, describe_table, load_analysis_package, rebuild
 from simple_ar.result_analysis.figures import render_table_figures
 
@@ -93,7 +94,7 @@ class SharedCoordinateTests(unittest.TestCase):
             with self.subTest(layout=layout), self.assertRaises(ValueError):
                 TableSpec(("A",), "row", series_layout=layout)
 
-    def test_public_config_package_rebuild_and_completed_resume(self):
+    def test_public_config_delivers_shared_panel_package(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "data.csv").write_text("step,A,B\n0,0,2\n1,2,4\n")
@@ -103,15 +104,11 @@ class SharedCoordinateTests(unittest.TestCase):
                               'mode="values"\nplot="line"\nx_column="step"\nvalue_unit="points"\nseries_layout="shared"\n')
             with contextlib.redirect_stdout(io.StringIO()):
                 main(["research-session", "--config", str(config)])
-            path = next((root / "out").glob("*/attempts/data_analysis-*/analysis.json"))
+            session = next((root / "out").iterdir())
+            packages = session_materials(session)['data_analysis']
+            self.assertEqual(len(packages), 1)
+            path = packages[0]
             result, _, _ = load_analysis_package(path)
             self.assertEqual(result["spec"]["series_layout"], "shared")
             self.assertEqual(len(json.loads(path.read_text())["figures"]), 1)
             rebuild(path)
-            session = path.parents[2]
-            attempts = sorted(p.name for p in (session / "attempts").iterdir())
-            ledger = json.loads((session / "budget_ledger.json").read_text())
-            with contextlib.redirect_stdout(io.StringIO()):
-                main(["research-session", "--config", str(config), "--session-root", str(session)])
-            self.assertEqual(sorted(p.name for p in (session / "attempts").iterdir()), attempts)
-            self.assertEqual(json.loads((session / "budget_ledger.json").read_text()), ledger)

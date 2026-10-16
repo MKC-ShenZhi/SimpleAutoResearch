@@ -12,6 +12,54 @@ from simple_ar.cli.research_config import FIELDS, report_settings, research_defa
 
 
 class ReportDocumentArgumentsTests(unittest.TestCase):
+    def test_public_cli_article_and_sections_control_contract(self):
+        from simple_ar.cli.research_config import report_writing_method
+
+        parser = build_parser()
+        for command, required, prefix in (
+                ('research-session', ['--topic', 'Explain supplied evidence'], 'report-'),
+                ('research-report', ['--session-root', 'run', '--model', 'fixture'], '')):
+            for flags in ([], [f'--{prefix}reviewer', 'llm'],
+                          [f'--no-{prefix}document-review', '--max-review-iterations', '0']):
+                with self.subTest(command=command, flags=flags):
+                    from simple_ar.cli.main import _explicit_session_option_destinations
+                    args = parser.parse_args([command, *required, *flags])
+                    args._explicit_resume_destinations = _explicit_session_option_destinations(
+                        parser, [command, *required, *flags], set(), command=command)
+                    settings = report_settings(args)
+                    expected = set() if not flags else ({'reviewer'} if 'llm' in flags
+                                                        else {'document_review', 'max_review_iterations'})
+                    original = settings.copy()
+                    with patch('simple_ar.report.writing.resolve_report_writing_config',
+                               return_value=('sections', original)) as owner:
+                        self.assertEqual(report_writing_method(args, settings), ('sections', original))
+                    owner.assert_called_once_with(settings, method=None, explicit_fields=expected)
+                    self.assertEqual(settings, original)
+
+    def test_toml_report_controls_forward_explicit_fields_to_writing_owner(self):
+        from simple_ar.cli.research_config import report_writing_method
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'task.toml'
+            path.write_text('[task]\ngoal="Explain supplied evidence"\n[report]\n'
+                'reviewer="disabled"\ndocument_review=false\nmax_review_iterations=0\n'
+                'max_cited_sources=2\n', encoding='utf-8')
+            argv = ['research-session', '--config', str(path)]
+            explicit = set()
+            defaults = research_defaults(argv, explicit_destinations=explicit)
+            args = build_parser(research_defaults=defaults).parse_args(argv)
+            args._explicit_resume_destinations = explicit
+            settings = report_settings(args)
+            self.assertEqual({key: settings[key] for key in (
+                'reviewer', 'document_review', 'max_review_iterations', 'max_cited_sources')},
+                {'reviewer': 'disabled', 'document_review': False,
+                 'max_review_iterations': 0, 'max_cited_sources': 2})
+            with patch('simple_ar.report.writing.resolve_report_writing_config',
+                       return_value=('article', settings)) as owner:
+                self.assertEqual(report_writing_method(args, settings), ('article', settings))
+            owner.assert_called_once_with(settings, method=None, explicit_fields={
+                'reviewer', 'document_review', 'max_review_iterations', 'max_cited_sources'})
+
     def test_report_projection_uses_existing_field_owner_for_both_commands(self):
         from argparse import Namespace
 
@@ -119,6 +167,22 @@ class DocumentReviewCapacityConfigTests(unittest.TestCase):
 
 
 class ResearchConfigTests(unittest.TestCase):
+    def _historical_summary(self, session, papers, *, goal, limits=None):
+        """Seed the retained historical owner, not today's public new route."""
+        from simple_ar.app.research_application import ResearchApplication, ResearchApplicationServices
+        from simple_ar.research.workflow_contracts import ResearchBrief
+        app = ResearchApplication.create(ResearchBrief(request_text=goal, objective=goal,
+            intents=('research',), requested_outputs=('summary',), asset_requests=tuple({
+                'locator': str(path), 'kind': 'file', 'role': 'paper', 'mutability': 'read_only',
+                'allowed_uses': ['read', 'reference']} for path in papers)), root=session,
+            services=ResearchApplicationServices(max_results=10, max_chunks=300,
+                budget_limits=limits or {}, max_attempts=20,
+                config={'research_sources': ['local_files'], 'research_materials_only': True,
+                    'interaction': 'autonomous', 'report_writing_method': 'sections',
+                    'report': {'mode': 'research_only', 'template': 'survey', 'reviewer': 'llm'}}))
+        self.assertEqual(app.advance(max_actions=20).status, 'completed')
+        return app
+
     def test_named_experiment_data_resolves_relative_config_paths_and_explicit_cli_override(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -162,11 +226,17 @@ class ResearchConfigTests(unittest.TestCase):
                 research_defaults(argv)
 
     def test_invalid_document_first_combination_fails_before_model_setup(self):
-        from simple_ar.cli.research_config import validate_session_arguments
-        args = build_parser().parse_args(["research-session", "--topic", "Explain supplied material",
-            "--report-review-scope", "document"])
-        with self.assertRaisesRegex(SystemExit, "requires report.document_review"):
-            validate_session_arguments(args)
+        from simple_ar.cli.main import main
+        for flags, message in ((['--report-review-scope', 'document'], 'requires document_review'),
+                               (['--report-writing-method', 'article', '--report-outline-strategy', 'adaptive'],
+                                'cannot execute.*outline_strategy')):
+            with self.subTest(flags=flags), \
+                 patch('simple_ar.cli.main._optional_research_llm_client') as setup, \
+                 patch('simple_ar.app.research_application.create_session') as create:
+                with self.assertRaisesRegex(SystemExit, message):
+                    main(['research-session', '--topic', 'Explain supplied material', '--model', 'fixture', *flags])
+                setup.assert_not_called()
+                create.assert_not_called()
 
     def test_data_tables_share_toml_cli_and_resume_override(self):
         from simple_ar.cli.main import _report_config_overrides
@@ -214,6 +284,7 @@ class ResearchConfigTests(unittest.TestCase):
                 research_defaults(argv)
 
     def test_direct_measurement_kind_requires_experiments_output(self):
+        from simple_ar.cli.main import main
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "measurement.toml"
             path.write_text('[task]\ngoal="Measure supplied command"\nkind="measurement"\noutputs=["experiments"]\n', encoding="utf-8")
@@ -221,8 +292,12 @@ class ResearchConfigTests(unittest.TestCase):
             args = build_parser(research_defaults=defaults).parse_args(["research-session", "--config", str(path)])
             self.assertEqual((args.task_kind, args.outputs), ("measurement", ["experiments"]))
             path.write_text(path.read_text(encoding="utf-8").replace('outputs=["experiments"]', 'outputs=["report"]'), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, 'requires task.outputs'):
-                research_defaults(["research-session", "--config", str(path)])
+            # Combination rules apply once after TOML and CLI are merged,
+            # rather than a second, divergent policy in the defaults loader.
+            with patch('simple_ar.cli.main._optional_research_llm_client') as client:
+                with self.assertRaisesRegex(SystemExit, 'requires --outputs experiments'):
+                    main(["research-session", "--config", str(path)])
+                client.assert_not_called()
 
     def test_document_review_is_explicit_and_can_be_disabled_on_resume(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -244,7 +319,7 @@ class ResearchConfigTests(unittest.TestCase):
 
     def test_resume_without_config_restores_saved_goal_and_keeps_outputs(self):
         from simple_ar.cli.main import main
-        from simple_ar.app.research_application import load_session
+        from simple_ar.app.tool_application import ToolApplication
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -259,13 +334,13 @@ class ResearchConfigTests(unittest.TestCase):
             with redirect_stdout(io.StringIO()):
                 main(["research-session", "--config", str(config), "--interaction", "autonomous"])
             session = next((root / "out").iterdir())
-            before = load_session(session).view()
+            before = ToolApplication.load(session)
+            original = (before.session.status_snapshot(), before.state, before.ledger.to_dict())
             with redirect_stdout(io.StringIO()):
                 main(["research-session", "--session-root", str(session)])
-            after = load_session(session).view()
-            self.assertEqual(after.status, "completed")
-            self.assertEqual(after.attempts, before.attempts)
-            self.assertEqual(after.state_refs, before.state_refs)
+            after = ToolApplication.load(session)
+            self.assertEqual(after.session.manifest.status, "completed")
+            self.assertEqual((after.session.status_snapshot(), after.state, after.ledger.to_dict()), original)
 
     def test_toml_interaction_and_decision_reply_reach_the_canonical_parser(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -294,20 +369,8 @@ class ResearchConfigTests(unittest.TestCase):
     def test_config_accepts_compact_seed_protocol_fields(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "research.toml"
-            (Path(directory) / "paper.md").write_text(
-                "# Seed fixture\nA small supplied document supports a bounded comparison.\n",
-                encoding="utf-8",
-            )
-            (Path(directory) / "measure.py").write_text(
-                "import sys\nfrom pathlib import Path\n"
-                "with Path('calls.txt').open('a') as handle: handle.write(sys.argv[-1] + '\\n')\n"
-                "print('accuracy:', 0.5 + int(sys.argv[-1]) / 10)\n",
-                encoding="utf-8",
-            )
             path.write_text(
-                '[task]\ngoal="Run two different seeds for the seed fixture"\noutputs=["experiments"]\noutput_root="out"\n'
-                '[model]\nname=""\n[research]\nproviders=["local_files"]\nmaterials_only=true\n'
-                '[assets]\npapers=["paper.md"]\n[budget]\nprocess_invocations=2\nprocess_wall_seconds=20\n'
+                '[task]\ngoal="Run two different seeds for the seed fixture"\noutputs=["experiments"]\n'
                 f'[execution]\ncommand={json.dumps([sys.executable, "measure.py"])}\ncwd="."\n'
                 'timeout_sec=5\nseed_count=2\nseed_flag="--seed"\nbaseline_policy="skip"\n',
                 encoding="utf-8",
@@ -316,13 +379,6 @@ class ResearchConfigTests(unittest.TestCase):
             self.assertEqual(defaults["execution_details"]["seed_count"], 2)
             self.assertEqual(defaults["execution_details"]["seed_flag"], "--seed")
             self.assertEqual(defaults["execution_details"]["baseline_policy"], "skip")
-            from simple_ar.cli.main import main
-            from simple_ar.app.research_application import load_session
-            with redirect_stdout(io.StringIO()):
-                main(["research-session", "--config", str(path), "--interaction", "autonomous"])
-            session = next((Path(directory) / "out").iterdir())
-            self.assertEqual(load_session(session).view().status, "completed")
-            self.assertEqual((Path(directory) / "calls.txt").read_text(encoding="utf-8").splitlines(), ["0", "1"])
 
     def test_config_pair_protocol_real_processes_and_completed_resume(self):
         from simple_ar.cli.main import main
@@ -455,10 +511,9 @@ class ResearchConfigTests(unittest.TestCase):
                 )
 
             write_config(papers[:1], continuation=False)
-            with redirect_stdout(io.StringIO()):
-                main(["research-session", "--config", str(config)])
-            session = next((root / "out").iterdir())
-            initial = load_session(session)
+            session = root / 'out' / 'historical'
+            initial = self._historical_summary(session, papers[:1], goal='Summarize the supplied local sources',
+                limits={'total_tokens': 100, 'llm_requests': 2, 'process_invocations': 0, 'process_wall_seconds': 0})
             initial_view = initial.view()
             original_attempts = initial_view.attempts
             initial_cap = initial.controller.manifest.budget.max_attempts
@@ -547,10 +602,12 @@ class ResearchConfigTests(unittest.TestCase):
             ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
             self.assertEqual(ledger["limits"]["total_tokens"], 123456)
             self.assertEqual(ledger["entries"], [])
-            runtime = json.loads((ledger_path.parent / "inputs/runtime_config.json").read_text())
-            for name in ("research_use_fulltext", "research_allow_pdf_download", "research_keep_raw_pdf"):
-                self.assertIs(runtime["config"][name], False)
-            self.assertTrue((ledger_path.parent / "outputs/research_summary.md").is_file())
+            from simple_ar.app.tool_application import ToolApplication
+            from simple_ar.cli.start import session_materials
+            runtime = ToolApplication.load(ledger_path.parent)
+            for name in ('require_fulltext', 'allow_pdf_download', 'keep_raw_pdf'):
+                self.assertIs(runtime.state['config']['research_policy'][name], False)
+            self.assertTrue(session_materials(ledger_path.parent)['summary'])
             path.write_text(path.read_text(encoding="utf-8").replace('outputs=["summary"]', 'outputs=["experiments"]'), encoding="utf-8")
             output = io.StringIO()
             with redirect_stdout(output), self.assertRaisesRegex(SystemExit, "status 'paused'"):
@@ -676,8 +733,11 @@ class ResearchConfigTests(unittest.TestCase):
             self.assertEqual(args.selected_idea_id, "idea-replay")
 
     def test_resume_applies_report_only_changes_and_rejects_unapplied_research_changes(self):
+        from dataclasses import replace
         from simple_ar.cli.main import main
-        from simple_ar.app.research_application import ResearchApplication, load_session
+        from simple_ar.app.research_application import (
+            ResearchApplication, ResearchApplicationError, ResearchApplicationServices, load_session,
+        )
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -698,10 +758,32 @@ class ResearchConfigTests(unittest.TestCase):
                 )
 
             write_config()
-            with redirect_stdout(io.StringIO()):
-                main(["research-session", "--config", str(config)])
-            session = next((root / "out").iterdir())
+            session = root / 'out' / 'historical'
+            self._historical_summary(session, [paper], goal='Summarize local evidence')
             before = load_session(session).view()
+
+            def snapshot():
+                return {str(path.relative_to(session)): path.read_bytes()
+                        for path in session.rglob("*") if path.is_file()}
+
+            # The same application entry owns CLI and programmatic rejection;
+            # explicit empty/zero terms cannot disappear into omitted defaults.
+            original_files = snapshot()
+            for request, message in (
+                ({"research_settings": {"max_results": 11}}, "max_results.*not applied"),
+                ({"research_settings": {"research_materials_only": False}}, "research_materials_only.*not applied"),
+                ({"report_writing_method": "article"}, "Saved reports keep their writing method"),
+                ({"reanalyze": True, "additional_attempts": 0}, "cannot be combined"),
+                ({"recover_interrupted": True, "authorize_remaining": {}}, "separate resume"),
+                ({"recover_interrupted": True, "revised_report_config": {}}, "separate resume"),
+                ({"reanalyze": True, "revised_brief": replace(load_session(session).brief, objective="Changed goal")}, "cannot be combined"),
+                ({"decision_id": "0123456789abcdef", "decision_response": "reject"}, "not the current pending"),
+            ):
+                with self.subTest(request=request), self.assertRaisesRegex(ResearchApplicationError, message):
+                    load_session(session).continue_session(**request)
+                self.assertEqual(snapshot(), original_files)
+            load_session(session).continue_session(resume_if_needed=True)
+            self.assertEqual(snapshot(), original_files)
 
             write_config(max_results=11)
             with redirect_stdout(io.StringIO()), self.assertRaisesRegex(SystemExit, "max_results.*not applied"):
@@ -720,6 +802,12 @@ class ResearchConfigTests(unittest.TestCase):
             self.assertEqual(no_report_change.attempts, before.attempts)
 
             report_app = load_session(session)
+            # Pre-method sessions retain section/checkpoint behavior when the
+            # caller omits today's new-task Writer default.
+            report_app.services = replace(report_app.services, config={
+                key: value for key, value in report_app.services.config.items()
+                if key != "report_writing_method"
+            })
             report_app.request_report()
             report_app.controller.pause("test checkpoint before report writing")
             before_report = load_session(session).view()
@@ -728,16 +816,56 @@ class ResearchConfigTests(unittest.TestCase):
                 reviewer="disabled", outputs=("summary", "report"), model="scripted",
             )
             with (
+                patch.object(ResearchApplication, "continue_session", autospec=True,
+                             side_effect=ResearchApplication.continue_session) as resume,
                 patch.object(ResearchApplication, "advance", side_effect=RuntimeError("stop before report work")),
                 patch("simple_ar.cli.main._optional_research_llm_client", return_value=object()),
                 redirect_stdout(io.StringIO()),
                 self.assertRaisesRegex(SystemExit, "stop before report work"),
             ):
                 main(["research-session", "--config", str(config), "--session-root", str(session)])
-            refreshed = load_session(session)
+            forwarded = resume.call_args.kwargs
+            self.assertTrue(forwarded["resume_if_needed"])
+            self.assertEqual(forwarded["revised_report_config"], {"reviewer": "disabled"})
+            for key in ("interaction", "report_writing_method", "authorize_remaining",
+                        "additional_attempts", "additional_no_progress"):
+                self.assertIsNone(forwarded[key], key)
+            reply_services = ResearchApplicationServices(llm_client=object())
+            refreshed = load_session(session, services=reply_services)
             self.assertEqual(refreshed.services.config["report"]["reviewer"], "disabled")
             self.assertEqual(refreshed.view().state_refs["summary"], before_report.state_refs["summary"])
             self.assertEqual(refreshed.view().attempts, before_report.attempts)
+
+            # A delivery answer binds the complete explicit revision, including
+            # false, zero and an empty mapping. Later replies retain that binding
+            # even after another decision becomes current.
+            refreshed._store_interaction_checkpoint(
+                stage="delivery", action="report_write", question="Confirm delivery",
+                reason="Review report configuration", options=({"id": "revise", "label": "Revise"},),
+                evidence_refs=[], identity=refreshed._interaction_identity("delivery", "report_write"),
+            )
+            gate = refreshed.view().work_plan["interaction"]["decision"]
+            terms = {"reviewer": "llm", "document_review": False, "max_section_tokens": 0, "figures": {}}
+            reply = {"decision_id": gate["id"], "decision_response": "revise", "revised_report_config": terms}
+            revised = refreshed.continue_session(**reply)
+            self.assertEqual(revised.attempts, before_report.attempts)
+            self.assertEqual(revised.state_refs["summary"], before_report.state_refs["summary"])
+            for key, value in terms.items():
+                self.assertEqual(refreshed.services.config["report"][key], value)
+            self.assertNotIn("report_writing_method", refreshed.services.config)
+            refreshed._store_interaction_checkpoint(
+                stage="required_input", action="report_write", question="Specify audience",
+                reason="Await audience", options=({"id": "revise", "label": "Clarify"},),
+                evidence_refs=[], identity=refreshed._interaction_identity("required_input", "report_write"),
+            )
+            saved_files = snapshot()
+            load_session(session, services=reply_services).continue_session(**reply)
+            self.assertEqual(snapshot(), saved_files)
+            with self.assertRaisesRegex(ResearchApplicationError, "different terms"):
+                load_session(session, services=reply_services).continue_session(
+                    **{**reply, "revised_report_config": {**terms, "max_section_tokens": 1}},
+                )
+            self.assertEqual(snapshot(), saved_files)
 
     def test_unknown_or_invalid_values_do_not_silently_use_defaults(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -751,6 +879,32 @@ class ResearchConfigTests(unittest.TestCase):
                     path.write_text(source, encoding="utf-8")
                     with self.assertRaises(ValueError):
                         research_defaults(["research-session", "--config", str(path)])
+            for fields, message in (
+                    ('seeds=[true]', 'execution.seeds'),
+                    ('seeds=[4,9]\nseed_count=true', 'seed_count'),
+                    ('seeds=[4,9]\nseed_count=0', 'seed_count'),
+                    ('seed_count=2\nseed_flag=false', 'seed_flag'),
+                    ('seed_flag=" "', 'seed_flag'),
+                    ('baseline_policy=false', 'baseline_policy'),
+                    ('baseline_policy=""', 'baseline_policy'),
+                    ('baseline_policy=" "', 'baseline_policy'),
+                    ('baseline_ref=3', 'baseline_ref'),
+                    ('baseline_ref=" "', 'baseline_ref')):
+                with self.subTest(fields=fields):
+                    path.write_text('[execution]\n' + fields, encoding='utf-8')
+                    with self.assertRaisesRegex(ValueError, message):
+                        research_defaults(['research-session', '--config', str(path)])
+            path.write_text('[execution]\nseed_count=2\nseed_flag="--seed"\nbaseline_policy="skip"', encoding='utf-8')
+            argv = ['research-session', '--config', str(path)]
+            with patch('simple_ar.app.research_execution.normalize_execution_config',
+                       side_effect=AssertionError('Config-only declarations must not normalize argv')):
+                defaults = research_defaults(argv)
+            self.assertNotIn('command_argv', defaults)
+            self.assertEqual(defaults['execution_details'],
+                {'seed_count': 2, 'seed_flag': '--seed', 'baseline_policy': 'skip'})
+            args = build_parser(research_defaults=defaults).parse_args([
+                *argv, '--topic', 'Explicit command', '--command', sys.executable])
+            self.assertEqual(args.command_argv, [sys.executable])
 
     def test_external_command_config_is_not_a_research_config(self):
         self.assertEqual(research_defaults(["research-session", "--topic", "test", "--command",

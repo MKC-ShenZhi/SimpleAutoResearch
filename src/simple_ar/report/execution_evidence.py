@@ -37,6 +37,19 @@ def execution_record(result: Mapping[str, Any]) -> dict[str, Any]:
     return record
 
 
+def compact_failure_diagnosis(diagnosis: Mapping[str, Any]) -> dict[str, Any]:
+    """A bounded report view of an observed failure, not a scientific verdict."""
+    details = diagnosis.get("context")
+    return {
+        "status": str(diagnosis.get("status") or "unknown"),
+        "summary": str(diagnosis.get("summary") or "")[:600],
+        "deficiencies": [{key: row[key] for key in ("category", "code", "message") if key in row}
+            for row in diagnosis.get("deficiencies", [])[:8] if isinstance(row, Mapping)]
+            if isinstance(diagnosis.get("deficiencies"), list) else [],
+        "stderr_tail": str(details.get("stderr_tail") or "")[-2200:] if isinstance(details, Mapping) else "",
+    }
+
+
 def report_execution_evidence(context: ReportContext) -> dict[str, Any]:
     """Preserve factual roles without loading files or rerunning an experiment."""
     plan = context.experiment_plan

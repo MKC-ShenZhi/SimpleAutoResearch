@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import stat
 import sys
 
 from simple_ar.app.session_roots import new_research_session_root
@@ -120,6 +121,9 @@ def add_start_parser(subparsers: argparse._SubParsersAction) -> None:
     native.add_argument("--allow-vision", action="store_true", help="Native task: authorize sending mounted rendered images to the named TOML vision route, sharing the task model budget.")
     native.add_argument("--max-images", type=int, default=0, help="Native task: authorize this many image generation/edit submissions through the named image route (default: disabled); retained on resume.")
     native.add_argument("--approve-execution", default="", help="Native resume: exact approval token printed for its pending process.")
+    native.add_argument("--decision-id", default=None, help="Exact pending research design/protocol decision; requires --resume-task.")
+    native.add_argument("--decision-response", choices=("accept", "reject", "revise"), default=None)
+    native.add_argument("--decision-guidance", default=None, help="Facts or direction for a revise response; not execution authorization.")
     native.add_argument("--max-turns", type=int, default=30, help="Native task: model request allowance, retained across feedback/resume.")
     native.add_argument("--max-tokens", type=int, default=600000, help="Native task: shared model token allowance, retained across feedback/resume.")
     parser.set_defaults(_native_start_destinations={action.dest for action in native._group_actions},
@@ -218,8 +222,18 @@ def migrate_new_start(args: argparse.Namespace) -> bool:
     controls are rejected before any model selection or session creation.
     """
     reuse_inputs = bool(args.from_session or args.reuse)
-    if reuse_inputs and ("code_project" in args.reuse or args.kind not in {None, "writing"}):
-        return False  # Registered editing/measurement contracts remain exact.
+    registered_origin = None
+    if reuse_inputs and "code_project" in args.reuse:
+        if args.kind == 'reproduction' or args.chat or args.resume_setup or hasattr(args, '_setup_state'):
+            return False  # Scientific/confirmed technical protocols keep their original owner.
+        registered_origin = {'session': str(args.from_session.resolve()) if args.from_session else None,
+                             'results': list(args.reuse)}
+        reuse_session_materials(args)
+        reuse_inputs = False
+    elif reuse_inputs and args.kind not in {None, "writing"}:
+        return False
+    if hasattr(args, '_reuse_edit_policy') and args.kind == 'reproduction':
+        return False
     if args.chat or args.resume_setup or hasattr(args, "_setup_state"):
         if args.kind == "figure" or args.scripted:
             raise ValueError("Native creation cannot preserve chat/resume_setup structured controls; use ordinary preferences or an explicit supported protocol.")
@@ -237,6 +251,7 @@ def migrate_new_start(args: argparse.Namespace) -> bool:
             _select_start_preference(args, interactive=sys.stdin.isatty())
     scripted = args.scripted
     figure = args.kind == "figure"
+    exact_code = args.kind == 'bug_fix' and bool(args.allow or args.validate)
     if scripted and args.kind != "data_analysis":
         raise ValueError("--scripted requires --kind data_analysis.")
     if args.resume_task:
@@ -253,18 +268,22 @@ def migrate_new_start(args: argparse.Namespace) -> bool:
     supported = (args._native_start_destinations | args._shared_start_destinations
                  | {"kind", "guided", "scripted", "project", "data_file", "data_path", "document", "material", "with_report", "from_session", "reuse"}
                  | args._data_declaration_destinations)
+    if exact_code:
+        supported |= {'allow', 'validate', 'timeout_sec'}
     protocol_controls = explicit - supported
     # Explicit value/coordinate/baseline selectors request the table shortcut.
     # Scripted declarations remain exact user intent for the native analysis.
     table_protocol = args.kind == "data_analysis" and not scripted and bool(
         explicit & {"value_column", "x_column", "paired_baseline"})
     if protocol_controls or table_protocol:
-        if not (figure or scripted):
+        if hasattr(args, '_reuse_edit_policy'):
+            return False  # Explicit extra controls still require the confirmed structured protocol.
+        if not (figure or scripted or exact_code):
             return False
         raise ValueError("Native creation cannot preserve these structured controls: "
                          + ", ".join(sorted(protocol_controls))
                          + ". Use the explicit research-session/code-task protocol when required; no options were applied.")
-    reuse_origin = None
+    reuse_origin = registered_origin
     if reuse_inputs:
         reuse_origin = {"session": str(args.from_session.resolve()) if args.from_session else None,
                         "results": list(args.reuse)}
@@ -299,6 +318,25 @@ def migrate_new_start(args: argparse.Namespace) -> bool:
     sources = list(dict.fromkeys(Path(value)
         for name in ("source", "document", "material", "data_path", "project", "data_file")
         for value in roles.get(name, ())))
+    if exact_code:
+        from simple_ar.tools.implementation import ExactCodeTask
+        if args.project is None or not args.allow or not args.validate:
+            raise ValueError('Exact bug_fix requires --project, --allow and --validate together')
+        command = shlex.split(args.validate, posix=os.name != 'nt')
+        command = [value[1:-1] if len(value) > 1 and value[0] == value[-1] and value[0] in {'"', "'"}
+                   else value for value in command]
+        project = resolve_source_mount(args.project)
+        code_goal = goal
+        if getattr(args, '_analysis_project', False):
+            from simple_ar.result_analysis.script_project import SCRIPT_RESULT_REQUIREMENTS
+            code_goal += '\n\n' + SCRIPT_RESULT_REQUIREMENTS
+        policy = getattr(args, '_reuse_edit_policy', None)
+        args._code_task = ExactCodeTask(project_path=f'source{sources.index(project)}', goal=code_goal,
+            allowed_patterns=args.allow, validation_command=command,
+            protected_patterns=list(getattr(args, '_reuse_protected', []) or []),
+            timeout_sec=args.timeout_sec or 300,
+            **({'edit_policy': policy} if policy is not None else {})).model_dump()
+        args.allow_execution = True
     if args.project is not None and not args.project.expanduser().resolve().is_dir():
         raise ValueError("--project must be a read-only project directory.")
     from simple_ar.research.documents.ingest import analysis_material_paths
@@ -335,6 +373,11 @@ def migrate_new_start(args: argparse.Namespace) -> bool:
         "data_analysis": "Deliver analysis source or a rebuildable analysis package, actually computed results and explanation, with figures when useful to the goal. Inspect data meanings and units; never infer pairing from row order. Record assumptions, missing/excluded rows and provenance; verify actual outputs before delivery. File readability does not establish statistical correctness.",
     }
     additions.append("Requested outcome preference (not an access grant): " + delivery[args.kind])
+    if exact_code:
+        additions.append('Exact implementation contract: use implement_code_task for the scoped repair and declared independent validation. '
+            'Its current source identity and bounded repair require approval through the existing execution gate. '
+            'The frozen edit scope and protected checkers cannot be replaced by generic candidate generation.\n'
+            + json.dumps(args._code_task, ensure_ascii=False))
     if args.with_report:
         additions.append("Include a report based on the actual materials and results.")
     if reuse_origin:
@@ -359,6 +402,447 @@ def migrate_new_start(args: argparse.Namespace) -> bool:
 def _quote(value: str) -> str:
     # JSON strings are valid TOML basic strings for these ordinary text values.
     return json.dumps(value, ensure_ascii=False)
+
+
+def native_creation_options(args: argparse.Namespace) -> dict:
+    """One projection of native creation access, frozen contracts and budgets."""
+    return dict(model=args.model or None,
+        sources={f'source{index}': path for index, path in enumerate(args.source)},
+        allow_execution=args.allow_execution, allow_network=args.allow_network, allow_vision=args.allow_vision,
+        max_turns=args.max_turns, max_tokens=args.max_tokens, max_images=args.max_images,
+        project_python=args.project_python, code_task=getattr(args, '_code_task', None),
+        process_limits=getattr(args, '_process_limits', None),
+        execution_contract=getattr(args, '_execution_contract', None),
+        report_requirement=getattr(args, '_report_requirement', None),
+        research_policy=getattr(args, '_research_policy', None),
+        table_analysis=getattr(args, '_table_analysis', None),
+        source_operations=getattr(args, '_source_operations', None),
+        max_attempts=getattr(args, '_task_attempt_limit', None),
+        max_output_tokens=getattr(args, '_task_output_limit', None))
+
+
+def migrate_structured_creation(args: argparse.Namespace, *, request: str, outputs: tuple,
+                                sources: tuple, limits: dict, root: Path, research_config: dict,
+                                report_config: dict, writing_method: str | None,
+                                data_analysis: dict | None, review_model: str | None = None) -> None:
+    """Project precise domain contracts into the existing common task owner.
+
+    There is no stage scheduler here. Model tasks choose tools; a no-model
+    caller requests one existing deterministic capability and delivers its
+    actual result. Historical recipes continue through their saved owner.
+    """
+    from simple_ar.app.tool_application import ToolApplication
+    from simple_ar.cli.main import _render_native_result, _ensure_research_cli_success
+    from simple_ar.cli.parser import build_parser
+    from simple_ar.tools.sources import SourcePolicy
+    from simple_ar.tools.writing import freeze_report_requirement
+    native = build_parser().parse_args(['start'])
+    native.model = args.model if data_analysis is None or 'report' in outputs else None
+    if 'experiments' in outputs and not native.model:
+        raise ValueError('Open-ended experiments require a model or an explicitly prepared execution command')
+    native.source = [Path(row['locator']) for row in sources]
+    aliases = {str(path.resolve()): f'source{index}' for index, path in enumerate(native.source)}
+    material_paths = [aliases[str(Path(row['locator']).resolve())] for row in sources if row['role'] != 'dataset']
+    online = data_analysis is None and args.task_kind != 'writing' and not research_config.get('research_materials_only', False)
+    native.allow_network = online
+    native.max_turns = limits.get('llm_requests') if limits.get('llm_requests') is not None else native.max_turns if native.model else 0
+    native.max_tokens = limits.get('total_tokens') if limits.get('total_tokens') is not None else native.max_tokens if native.model else 0
+    policy = dict(queries=list(args.queries or ()),
+        providers=list(args.providers or ('openalex', 'semantic_scholar', 'arxiv')),
+        materials=material_paths, max_results=args.max_results,
+        max_documents=research_config.get('research_max_documents', args.max_results),
+        max_chunks=args.max_chunks, idea_limit=args.idea_limit,
+        cache_dir=str(Path(args.cache_dir).resolve()) if args.cache_dir else None,
+        require_fulltext=research_config.get('research_use_fulltext', False),
+        allow_pdf_download=research_config.get('research_allow_pdf_download', False),
+        keep_raw_pdf=research_config.get('research_keep_raw_pdf', False),
+        allow_network=not research_config.get('research_materials_only', False),
+        max_fulltext_documents=research_config.get('research_max_fulltext_documents', args.max_results),
+        max_pdf_mb=research_config.get('research_max_pdf_mb', 20),
+        max_pdf_pages=research_config.get('research_max_pdf_pages', 100),
+        read_max_shortlist=research_config.get('research_read_max_shortlist', args.max_results),
+        web_extract_backend=research_config.get('research_web_extract_backend', 'direct'),
+        feasibility_connection=review_model or '',
+        require_design='experiments' in outputs,
+        execution_boundary={'timeout_sec': args.timeout_sec if args.timeout_sec is not None else 300},
+        max_iterations=research_config.get('research_max_iterations', 0),
+        interaction=research_config.get('interaction', 'checkpoints'),
+        require_summary='summary' in outputs,
+        selected_idea_id=research_config.get('research_selected_idea_id'))
+    native._research_policy = SourcePolicy.model_validate(policy).model_dump(mode='json')
+    native.allow_execution = 'experiments' in outputs
+    native._report_requirement = freeze_report_requirement(report_config, method=writing_method) if 'report' in outputs else None
+    native._task_output_limit = getattr(args, 'max_output_tokens', None) if native.model else None
+    native._task_attempt_limit = max(30, native.max_turns * 10)
+    # Search processes are network work, not permission to execute project code.
+    source_count = max(1, len(args.queries or ())) * len(policy['providers'])
+    native._source_operations = source_count + policy['max_documents'] * 3
+    native._process_limits = {name: getattr(args, name, None) if getattr(args, name, None) is not None else default
+        for name, default in (('process_invocations', source_count * 4 if online else 0),
+                              ('process_wall_seconds', source_count * 120 if online else 0))}
+    if data_analysis is not None:
+        source = aliases[str(Path(data_analysis['file']).resolve())]
+        native._table_analysis = {'path': source, 'spec': {key: value for key, value in data_analysis.items() if key != 'file'}}
+    request += '\nRequested deliverables: ' + ', '.join(outputs)
+    if sources:
+        request += '\nSupplied material roles (caller declarations, not verified facts):\n' + json.dumps([
+            {'path': aliases[str(Path(row['locator']).resolve())], 'role': row['role']} for row in sources], ensure_ascii=False)
+    app = ToolApplication.create(root, request, **native_creation_options(native))
+    print_line(f'Structured inputs use the common task owner. Task session: {root}')
+    print_line(f'Resume: simple-ar start --resume-task "{root}"')
+    if native.model:
+        status = app.run(progress=print_line)
+    else:
+        action = ({'tool_name': 'analyze_table', 'arguments': native._table_analysis} if data_analysis is not None else
+            {'tool_name': 'research_collect' if online else 'research', 'arguments': {
+                'operation': 'summary', 'question': args.topic, 'materials': material_paths, 'use_llm': False}})
+        status = app.run(actions=[action], progress=print_line)
+        turn = app.state['turns'][-1]
+        result = app.session.store.read_json(turn['tools'][-1]['result']) if turn['tools'] else {}
+        if result.get('status') == 'ok' and result.get('artifacts'):
+            status = app.run(actions=[{'tool_name': 'deliver_result', 'arguments': {
+                'summary': request, 'artifacts': result['artifacts'],
+                'unresolved': result.get('data', {}).get('unresolved', [])}}], progress=print_line)
+    _render_native_result(app, status)
+    _ensure_research_cli_success(status['status'], operation='Research task', root=root)
+
+
+def resume_structured_task(args: argparse.Namespace) -> None:
+    """Compatibility spelling selects the saved common owner, never legacy load."""
+    from simple_ar.cli.parser import build_parser
+    from simple_ar.cli.main import _run_native_start
+    native = build_parser().parse_args(['start'])
+    supported = {'session_root', 'topic', 'model', 'config', 'decision_id', 'decision_response',
+        'decision_guidance', 'authorization_id', 'authorization_reason', 'authorize_remaining'}
+    unsupported = set(getattr(args, '_explicit_resume_destinations', ())) - supported
+    if unsupported:
+        raise ValueError('This common task retains frozen domain contracts. Use start --resume-task for feedback; '
+                         'cannot reinterpret saved controls: ' + ', '.join(sorted(unsupported)))
+    native.resume_task, native.yes = Path(args.session_root), True
+    if 'topic' in getattr(args, '_explicit_resume_destinations', ()):
+        native.request = args.topic
+    native._explicit_start_destinations = set(getattr(args, '_explicit_resume_destinations', ())) & {'model'}
+    for name in ('model', 'decision_id', 'decision_response', 'decision_guidance',
+                 'authorization_id', 'authorization_reason', 'authorize_remaining'):
+        setattr(native, name, getattr(args, name, None))
+    _run_native_start(native)
+
+
+def migrate_exact_code_creation(args: argparse.Namespace, *, execution: dict,
+                                request: str, outputs: tuple, sources: tuple,
+                                limits: dict, root: Path, report_config: dict | None = None,
+                                writing_method: str | None = None) -> bool:
+    """Adapt exact code work and declared measurements, not research design/reuse."""
+    from simple_ar.research.task_plan import implementation_only
+    reproduction = getattr(args, 'task_kind', None) == 'reproduction'
+    flat_fields = {'command', 'cwd', 'timeout_sec', 'label', 'result_schema', 'protocol'}
+    controls = {'baseline', 'baseline_policy', 'pairs', 'seeds', 'seed_count', 'seed_flag'}
+    if (not isinstance(execution.get('code_task'), dict)
+            or execution.get('baseline_policy', 'skip') not in {'run', 'skip', 'none'}):
+        return False
+    from simple_ar.cli.parser import build_parser
+    native = build_parser().parse_args(['start'])
+    limits = {**limits,
+        'llm_requests': native.max_turns if limits.get('llm_requests') is None else limits['llm_requests'],
+        'total_tokens': native.max_tokens if limits.get('total_tokens') is None else limits['total_tokens']}
+    task = execution['code_task']
+    scientific = 'experiments' in outputs and not set(outputs) - {'experiments', 'report'}
+    preparation_names = ('kind', 'workspace_mode', 'max_file_bytes', 'workspace_include', 'workspace_exclude',
+        'workspace_reuse_source_venv', 'env_mode', 'python_executable', 'max_repairs')
+    formal = None
+    conditions = []
+    if scientific:
+        if (not reproduction and not controls.intersection(execution)
+                or set(execution) - (flat_fields | controls | {'code_task', 'environment'})
+                or set(task) - (set(preparation_names) | {'code_root', 'allowed_patterns', 'protected_patterns',
+                    'approval_note', 'budget_profile', 'edit_budget_overrides', 'allow_large_edits',
+                    'validation_command', 'validation_timeout_sec', 'initial_files'})):
+            return False
+        from simple_ar.cli.research_config import FIELDS
+        supported = {'config', 'topic', 'task_kind', 'outputs', 'command_argv', 'cwd', 'timeout_sec', 'label',
+            'primary_metric', 'metric', 'metric_direction', 'code_task_config', 'local_document', 'material', 'data_path',
+            'model', 'max_output_tokens', 'output_root', 'with_report', 'no_report',
+            'llm_requests', 'total_tokens', 'process_invocations', 'process_wall_seconds'}
+        supported.update(destination for destination, _ in FIELDS['report'].values())
+        if getattr(args, 'research_materials_only', None) is True:
+            supported.add('research_materials_only')  # Preserve the existing supplied-material-only restriction.
+        if set(getattr(args, '_explicit_resume_destinations', ())) - supported:
+            return False
+        from simple_ar.app.research_execution import code_task_validation, normalize_execution_config
+        from simple_ar.tools.scientific import freeze_measurement_set, measurement_contract
+        if reproduction:
+            if 'pairs' in execution or execution.get('baseline_policy') == 'run' or 'baseline' in execution:
+                return False  # The structured reproduction entry retains its single-command policy.
+            code_task_validation(execution, required=True)
+        if reproduction and not (controls - {'baseline_policy'}).intersection(execution):
+            formal = measurement_contract({**{key: value for key, value in execution.items() if key in flat_fields},
+                'command': list(execution['command']) if isinstance(execution['command'], tuple) else execution['command']})
+        else:
+            declaration = {key: value for key, value in execution.items() if key in flat_fields | controls}
+            declaration['baseline_policy'] = normalize_execution_config(execution)['baseline_policy']
+            # Materialize the existing CodeTask interpreter policy, not a new
+            # argv rule. freeze receives measurement fields only.
+            from simple_ar.code_task.execution.environment import resolve_code_task_command
+            from simple_ar.code_task.workspace.modes import _source_venv_python
+            reused = (_source_venv_python(Path(task['code_root'])) if task.get('code_root')
+                and task['workspace_reuse_source_venv'] and not task['python_executable'] else None)
+            commands = [(declaration, 'command')]
+            if 'baseline' in declaration:
+                declaration['baseline'] = dict(declaration['baseline'])
+                commands.append((declaration['baseline'], 'command'))
+            if 'pairs' in declaration:
+                declaration['pairs'] = [dict(pair) for pair in declaration['pairs']]
+            commands.extend((pair, key) for pair in declaration.get('pairs', [])
+                for key in ('baseline_command', 'candidate_command'))
+            for row, key in commands:
+                row[key] = (list(row[key]) if (execution.get('environment') or {}).get('mode') == 'venv' else
+                    resolve_code_task_command(row[key], env_mode='external' if reused else task['env_mode'],
+                        python_executable=str(reused) if reused else task['python_executable']))
+            formal = freeze_measurement_set(declaration)
+            if task['kind'] == 'greenfield' and any(row['role'] == 'baseline' for row in formal['conditions']):
+                if (task['workspace_mode'] not in {'copy', 'sparse_copy'}
+                        or not task.get('code_root') or not Path(task['code_root']).is_dir()):
+                    return False  # A source baseline requires a real copied source project.
+            for row in formal['conditions']:
+                row['source'] = 'preparation' if row['role'] == 'baseline' else 'implementation'
+                if row['source'] == 'preparation':
+                    row['before_implementation'] = True
+            formal = measurement_contract(formal)
+        if not getattr(args, 'model', None) or any(type(limits.get(name)) is not int or limits[name] < 1
+                for name in ('llm_requests', 'total_tokens')):
+            raise ValueError('Native code measurements require a model and finite positive llm_requests/total_tokens')
+    elif (not implementation_only(execution, outputs) or set(outputs) - {'bug_fix', 'code_task', 'report'}
+            or set(execution) - ((flat_fields - {'protocol'}) | {'code_task', 'baseline_policy', 'environment'})
+            or task['kind'] == 'greenfield' and execution.get('result_schema', {}).get('required_metrics')):
+        return False
+    from simple_ar.tools.implementation import ExactCodeTask
+    from simple_ar.cli.main import _run_native_start
+    project = Path(task['code_root']).resolve() if task['code_root'] else None
+    if scientific:
+        from simple_ar.experiment.execution.measurement import representative_measurement_execution
+        selected = representative_measurement_execution(formal)
+        conditions = formal.get('conditions', [{'execution': selected}])
+        if project is not None and (not project.is_dir() or any(
+                Path(row['execution']['cwd']).resolve() != project for row in conditions)):
+            raise ValueError('Reproduction measurement cwd must match the original code_root')
+        if project is None and (task['kind'] != 'greenfield' or task['workspace_mode'] != 'empty'):
+            raise ValueError('Source-less reproduction requires empty greenfield preparation')
+    mounts = list(dict.fromkeys([*([project] if project is not None else []),
+                                *(Path(row['locator']).resolve() for row in sources)]))
+    # Exact argv explicitly names these file inputs. Mount only those files,
+    # never their parent directories or arbitrary directory-valued arguments.
+    # The implementation owner binds their bytes as protected external inputs.
+    commands = [task.get('validation_command') or execution['command']]
+    if (execution.get('environment') or {}).get('check_command'):
+        commands.append(execution['environment']['check_command'])
+    if formal is not None:
+        commands.extend(row['execution']['command'] for row in conditions)
+    for command in commands:
+        for argument in command[1:]:
+            value = argument.split('=', 1)[1] if argument.startswith('-') and '=' in argument else argument
+            try:
+                named = (Path(value) if Path(value).is_absolute() else Path(execution['cwd']) / value).absolute()
+                path = named.resolve()
+                if path.is_file() and (project is None or not path.is_relative_to(project)) and path not in mounts:
+                    from simple_ar.tools.scientific import _reject_links
+                    _reject_links(named)
+                    mounts.append(path)
+            except (OSError, ValueError):
+                pass  # Literal argv need not represent filesystem paths.
+    data = [Path(row['locator']).resolve().relative_to(project).as_posix() for row in sources
+            if project is not None and row['role'] == 'dataset' and Path(row['locator']).resolve().is_relative_to(project)]
+    if sources:
+        request += '\n\nSupplied material roles (read-only user declarations, not verified evidence):\n' + json.dumps(
+            [{'path': row['locator'], 'role': row['role']} for row in sources], ensure_ascii=False)
+    if scientific:
+        request += ('\n\nRun validation and formal measurements as separate physical calls, even when '
+            'their argv match; validator results are not measurements.')
+        if any(row.get('before_implementation') for row in conditions):
+            request += (' First prepare the unchanged source, then complete all declared baseline measurements '
+                'before implement(prepared_result). Pass the actual successful baseline facts to implementation; '
+                'failed or missing baselines do not authorize generation.')
+    preparation = {name: task[name] for name in preparation_names}
+    new_files = task.get('initial_files', [])
+    protected = task['protected_patterns']
+    if 'initial_files' in task:
+        if (task['kind'] != 'existing_project' or project is None
+                or task['workspace_mode'] not in {'auto', 'copy', 'git_worktree'}):
+            raise ValueError('initial_files requires an isolated existing project with auto/copy/git_worktree preparation')
+        if (not isinstance(new_files, (list, tuple)) or not new_files
+                or any(not isinstance(name, str) or Path(name).suffix != '.py'
+                       or name not in task['allowed_patterns'] for name in new_files)):
+            raise ValueError('initial_files requires explicit exact allowed new Python paths')
+        from simple_ar.code_task.editing.scope import default_edit_scope
+        protected = default_edit_scope(protected_patterns=protected)['protected_patterns']
+    exact = ExactCodeTask(project_path='source0' if project is not None else '', goal=request,
+        allowed_patterns=task['allowed_patterns'] or ['**'], protected_patterns=protected, new_files=list(new_files),
+        validation_command=list(task.get('validation_command') or execution['command']),
+        timeout_sec=task.get('validation_timeout_sec') or execution['timeout_sec'],
+        preparation={**preparation, 'data_inputs': list(dict.fromkeys(data))},
+        environment=execution.get('environment'),
+        edit_policy={name: task[name] for name in ('budget_profile', 'edit_budget_overrides', 'allow_large_edits')})
+    for name in exact.new_files:
+        target = project / name
+        if target.exists():
+            raise ValueError('initial_files must not replace an original project path')
+        for part in (target, *target.parents):
+            if part == project:
+                break
+            reparse = part.exists() and (getattr(part.lstat(), 'st_file_attributes', 0)
+                & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0))
+            if part.is_symlink() or reparse:
+                raise ValueError('initial_files cannot traverse links')
+    native.request, native.goal, native.source = request, None, mounts
+    native.model, native._model_confirmed = args.model, True
+    native.max_turns, native.max_tokens = limits['llm_requests'], limits['total_tokens']
+    native.allow_execution, native.yes = True, True  # Creation is requested; a command is NOT approved.
+    native._code_task, native._native_root = exact.model_dump(), root
+    if formal is not None:
+        native._execution_contract = formal
+        native._task_attempt_limit = max(20, limits['llm_requests'] * 10 + len(conditions) + 2)
+    native._report_requirement = None
+    if 'report' in outputs:
+        from simple_ar.tools.writing import freeze_report_requirement
+        native._report_requirement = freeze_report_requirement(report_config or {}, method=writing_method)
+    native._task_output_limit = getattr(args, 'max_output_tokens', None)
+    native._process_limits = {name: limits[name] for name in ('process_invocations', 'process_wall_seconds')}
+    if scientific or exact.environment is not None:
+        validators = 1 + preparation['max_repairs']
+        required = {'process_invocations': len(conditions) + validators,
+            'process_wall_seconds': sum(row['execution']['timeout_sec'] for row in conditions)
+                + validators * exact.timeout_sec}
+        if exact.environment is not None:
+            from simple_ar.research.project_environment import project_environment_plan
+            plan = project_environment_plan(exact.environment, project or Path(execution['cwd']),
+                Path('__attempt__') / 'environment', selected['command'] if scientific else exact.validation_command)
+            required['process_invocations'] += len(plan['steps'])
+            required['process_wall_seconds'] += len(plan['steps']) * plan['profile']['timeout_sec']
+        for name, minimum in required.items():
+            if getattr(args, name, None) is None:
+                native._process_limits[name] = max(native._process_limits[name], minimum)
+    print_line('Code/measurement/report creation uses the common task owner; no second research plan is created. '
+               'Exact source, environment and validator approval is still required; resume with simple-ar start --resume-task.')
+    _run_native_start(native)
+    return True
+
+
+def migrate_measurement_creation(args: argparse.Namespace, *, execution: dict,
+                                request: str, outputs: tuple, root: Path, limits: dict,
+                                sources: tuple = (), report_config: dict | None = None,
+                                writing_method: str | None = None) -> bool:
+    """Adapt an explicit fixed execution, without another plan or resume owner."""
+    flat_fields = {'command', 'cwd', 'timeout_sec', 'label', 'result_schema', 'protocol', 'environment'}
+    autonomous = (args.task_kind == 'auto' and getattr(args, 'interaction', None) == 'autonomous'
+        and all(row['role'] == 'dataset' for row in sources))
+    if (args.task_kind != 'measurement' and not autonomous or 'experiments' not in outputs
+            or set(outputs) - {'experiments', 'report'}
+            or set(execution) - (flat_fields | {'baseline', 'pairs', 'seeds', 'seed_count', 'seed_flag', 'baseline_policy'})
+            or execution.get('baseline_policy') == 'reuse'):
+        return False
+    extended = set(execution) - flat_fields
+    from simple_ar.app.research_execution import normalize_execution_config
+    if extended:
+        policy = normalize_execution_config(execution)['baseline_policy']
+        if policy == 'skip' and extended == {'baseline_policy'}:
+            execution = {key: value for key, value in execution.items() if key in flat_fields}
+            extended = set()
+    supported = {'config', 'topic', 'task_kind', 'outputs', 'command_argv', 'cwd', 'timeout_sec',
+        'label', 'primary_metric', 'metric', 'metric_direction', 'output_root', 'data_path',
+        'process_invocations', 'process_wall_seconds', 'total_tokens', 'llm_requests', 'no_report', 'model'}
+    if args.model:
+        supported.add('max_output_tokens')
+    if 'report' in outputs:
+        from simple_ar.cli.research_config import FIELDS
+        supported.update(destination for destination, _ in FIELDS['report'].values())
+        supported.update({'with_report', 'local_document', 'material'})
+        if not args.model:
+            raise ValueError('A requested authored report requires a model; use --no-report for caller-directed measurement')
+    if autonomous:
+        supported.add('interaction')
+    unsupported = set(getattr(args, '_explicit_resume_destinations', ())) - supported
+    if unsupported:
+        if autonomous:
+            return False  # Preserve other explicitly requested research/interaction work.
+        raise ValueError('Fixed measurement creation cannot reinterpret these explicit controls: '
+                         + ', '.join(sorted(unsupported)))
+    from simple_ar.cli.parser import build_parser
+    native = build_parser().parse_args(['start'])
+    limits = {**limits,
+        'llm_requests': native.max_turns if limits.get('llm_requests') is None else limits['llm_requests'],
+        'total_tokens': native.max_tokens if limits.get('total_tokens') is None else limits['total_tokens']}
+    if args.model and any(type(limits.get(name)) is not int or limits[name] < 1
+                          for name in ('llm_requests', 'total_tokens')):
+        raise ValueError('Model-assisted fixed measurement requires finite positive --llm-requests and --total-tokens')
+    from simple_ar.app.tool_application import ToolApplication
+    from simple_ar.tools.scientific import freeze_measurement_set, measurement_contract, measurement_conditions
+    from simple_ar.cli.main import _render_native_result, _ensure_research_cli_success
+    contract = freeze_measurement_set(execution) if extended else measurement_contract(execution)
+    conditions = measurement_conditions(contract)
+    grouped = 'conditions' in contract
+    actions = [{'tool_name': 'measure_experiment', 'arguments':
+        {**row['execution'], 'condition_id': row['id']} if grouped else
+        row['execution'] if args.model else {**row['execution'], 'delivery': {'summary': request, 'artifacts': []}}}
+        for row in conditions]
+    native.model, native.source, native.allow_execution = args.model, [Path(row['locator']) for row in sources], True
+    native.max_turns, native.max_tokens = (limits['llm_requests'], limits['total_tokens']) if args.model else (0, 0)
+    native._task_output_limit = getattr(args, 'max_output_tokens', None)
+    native._task_attempt_limit = max(20, len(conditions) + int(grouped) + native.max_turns * 10)
+    native._execution_contract = contract
+    if 'report' in outputs:
+        from simple_ar.tools.writing import freeze_report_requirement
+        native._report_requirement = freeze_report_requirement(report_config or {}, method=writing_method)
+        if sources:
+            request += '\n\nSupplied read-only material roles (not verified evidence):\n' + json.dumps(
+                [{'path': row['locator'], 'role': row['role']} for row in sources], ensure_ascii=False)
+    native._process_limits = {name: limits[name] for name in ('process_invocations', 'process_wall_seconds')}
+    if grouped and execution.get('environment') is not None:
+        from simple_ar.research.project_environment import project_environment_plan
+        first = conditions[0]['execution']
+        plan = project_environment_plan(first['environment'], Path(first['cwd']),
+            Path('__attempt__') / 'environment', first['command'])
+        required = {'process_invocations': len(conditions) + len(plan['steps']),
+            'process_wall_seconds': sum(row['execution']['timeout_sec'] for row in conditions)
+                + len(plan['steps']) * plan['profile']['timeout_sec']}
+        for name, minimum in required.items():
+            if getattr(args, name, None) is None:
+                native._process_limits[name] = max(native._process_limits[name], minimum)
+    app = ToolApplication.create(root, request, **native_creation_options(native))
+    print_line('Fixed measurement uses the common task owner, original cwd/argv and '
+               + ('declared environment preparation. ' if execution.get('environment') is not None else 'inherited environment. ')
+               + ('Each literal caller condition authorizes one initial execution through the common approval gate; '
+                  if grouped else 'The caller-supplied command authorizes this one initial execution through the common approval gate; ')
+               + 'later proposals require approval. Model interpretation, when selected, uses this same task and ledger. '
+               'This is not an OS sandbox.')
+    print_line(f'Task session: {root}\nResume: simple-ar start --resume-task "{root}" --approve-execution TOKEN')
+    remaining = {f'caller-0-{index}': row['arguments'] for index, row in enumerate(actions)}
+    def approve(call: dict, token: str) -> bool:
+        print_line(f"Execution proposal: {call['function']['arguments']}\nApproval token: {token}")
+        arguments = json.loads(call['function']['arguments'])
+        if (len(app.state['turns']) != 1 or app.state['turns'][0].get('origin') != 'caller'
+                or call['id'] not in remaining or call['function']['name'] != 'measure_experiment'
+                or arguments != remaining[call['id']]):
+            return False
+        if arguments.get('environment') is not None:
+            binding = app.scientific.approval_binding(arguments, identity=app.state['pending']['attempt'])
+            if preparation := binding.get('environment_preparation'):
+                steps = preparation['steps']
+                wall = len(steps) * preparation['profile']['timeout_sec'] + sum(
+                    row['execution']['timeout_sec'] for row in conditions)
+                print_line('Environment preparation steps (literal argv): ' + json.dumps(steps, ensure_ascii=False))
+                print_line(f"Preparation once + {len(conditions)} formal measurements: {len(steps) + len(conditions)} invocations; <= {wall}s declared wall reservation. "
+                           f"Shared process limits: {json.dumps(binding['limits'], sort_keys=True)}")
+            else:
+                print_line('Reuse verified shared environment: ' + json.dumps(binding['shared_environment'], sort_keys=True))
+        del remaining[call['id']]  # Once per literal initial caller proposal, never a retry/model proposal.
+        return True
+    status = app.run(actions=actions, approve=approve, progress=print_line)
+    if grouped and not args.model:
+        completion = app.measurement_completion_actions()
+        if completion:
+            status = app.run(actions=completion, progress=print_line)
+    _render_native_result(app, status)
+    _ensure_research_cli_success(status['status'], operation='Measurement', root=root)
+    return True
 
 
 def _array(values: list[str]) -> str:
@@ -460,15 +944,16 @@ def _reproduction_rows(args: argparse.Namespace, *, interactive: bool) -> list[s
     if getattr(args, "check_argv", None) is not None and not args.check_argv:
         raise ValueError("--check-argv must name a nonempty check command; omit it to skip the check.")
     if args.environment == "venv" or getattr(args, "check_argv", None) is not None:
-        from simple_ar.research.project_environment import environment_profile
+        from simple_ar.research.project_environment import project_environment_plan
         requirements = (args.requirements or (["requirements.txt"] if (cwd / "requirements.txt").is_file() else [])) if args.environment == "venv" else []
-        profile = environment_profile({"mode": args.environment, "requirements": requirements,
+        # Planning-only path: export the caller's original argv, never this future interpreter.
+        plan = project_environment_plan({"mode": args.environment, "requirements": requirements,
                                        **({"python_executable": str(python)} if python is not None and args.environment == "venv" else {}),
                                        "install_project": args.install_project, "timeout_sec": timeout,
-                                       "check_command": getattr(args, "check_argv", None) or []}, project=cwd)
-        if args.environment == "venv" and argv[0] not in {"python", "python3", "python.exe", "python3.exe"}:
-            raise ValueError("Task venv requires a python/python3 command alias; do not silently replace an explicit interpreter or launcher.")
-        setup_steps = (2 + bool(profile["requirements"] or profile["install_project"]) if args.environment == "venv" else 0) + bool(profile.get("check_command"))
+                                       "check_command": getattr(args, "check_argv", None) or []},
+                                       project=cwd, directory=Path('__attempt__') / 'environment', command=argv)
+        profile = plan['profile']
+        setup_steps = len(plan['steps'])
         environment_rows = ["", "[execution.environment]", f'mode = "{args.environment}"',
                             f"requirements = {_array(profile['requirements'])}",
                             f"install_project = {'true' if profile['install_project'] else 'false'}", f"timeout_sec = {timeout}"]
@@ -516,6 +1001,12 @@ def _reproduction_rows(args: argparse.Namespace, *, interactive: bool) -> list[s
 
 def _session_project(session) -> tuple[Path, dict, dict] | None:
     """Resolve a validated owned workspace and its original scope/verification."""
+    from simple_ar.app.tool_application import ToolApplication
+    if session.manifest.transition_recipe == ToolApplication.RECIPE:
+        try:
+            return ToolApplication.load(session.store.root).reusable_code_project()
+        except (OSError, ValueError, KeyError, TypeError):
+            return None  # Portable deliveries may outlive their executable task state.
     from simple_ar.code_task.runtime.state import code_task_paths, load_code_task_manifest
     ref = session.manifest.state_refs.get("implementation")
     if ref is None or ref.status != "available":
@@ -556,13 +1047,11 @@ def session_materials(root: Path) -> dict[str, list[Path]]:
         # current completion while the revised task is active or paused.
         if session.manifest.status not in {"completed", "partial"}:
             return {}
-        from simple_ar.tools.workspace import resolve_mounted_path, validate_workspace_arguments
-        delivery = validate_workspace_arguments("deliver_result", session.store.read_json("delivery.json"))
-        paths = [resolve_mounted_path({"workspace": root / "workspace"}, value, write=True)
-                 for value in delivery.artifacts]
-        if not all(path.is_file() for path in paths):
-            raise ValueError("Registered native delivery references a missing workspace file.")
-        return {"artifacts": paths} if paths else {}
+        available = ToolApplication.load(root).reusable_materials()
+        project = _session_project(session)
+        if project is not None:
+            available['code_project'] = [project[0]]
+        return available
     available: dict[str, list[Path]] = {}
     project = _session_project(session)
     if project is not None:
@@ -655,7 +1144,11 @@ def reuse_session_materials(args: argparse.Namespace) -> None:
                     args.check_argv is not None, args.project_python)):
                 raise ValueError("Reusing reproduction retains its measured protocol, checker and interpreter; start a separate task to change execution conditions.")
             prepared = session.manifest.state_refs.get("preparation")
-            execution = session.store.read_json(prepared).get("execution", {}) if prepared and prepared.status == "available" else {}
+            from simple_ar.app.tool_application import ToolApplication
+            if session.manifest.transition_recipe == ToolApplication.RECIPE:
+                execution = ToolApplication.load(root).reusable_execution() or {}
+            else:
+                execution = session.store.read_json(prepared).get("execution", {}) if prepared and prepared.status == "available" else {}
             if (not isinstance(execution, dict) or not execution.get("command")
                     or Path(execution.get("cwd", "")).resolve() != workspace
                     or not isinstance(execution.get("protocol"), dict)
@@ -1099,11 +1592,8 @@ def prepare_start(args: argparse.Namespace) -> Path | None:
         write_json(root / "setup.json", state)
     print_line(f"Saved task configuration: {config}")
     print_line("Run: " + _command(["simple-ar", "research-session", "--config", str(config)]))
-    resume = ["simple-ar", "research-session", "--session-root", "PATH"]
-    if model:
-        resume.extend(["--model", model])
-    print_line("After a session starts, resume its printed path with " + _command(resume) +
-               "; replace PATH with that session path, and do not rerun this setup to resume.")
+    print_line("After a session starts, use the resume command printed by the task owner. "
+               "The setup command starts a new task; do not rerun this setup to resume.")
     if args.prepare_only:
         return config
     if not args.yes:

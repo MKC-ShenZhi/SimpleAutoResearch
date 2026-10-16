@@ -693,11 +693,12 @@ def insert_evidence_followup(
 
 def _row(action: str, *, condition: str = "") -> dict[str, Any]:
     problem, observation = _STEP_TEXT.get(action.split(":", 1)[0], ("Advance the accepted task plan.", "Inspect the declared capability result."))
+    capability, state_name = action_binding(action)
     return {
         "step_id": action,
         "action": action,
-        "capability": _capability(action),
-        "state_name": _state_name(action),
+        "capability": capability,
+        "state_name": state_name,
         "problem_solved": problem,
         "observation": observation,
         "condition": condition,
@@ -722,7 +723,7 @@ def _normalize_steps(rows: list[Any]) -> tuple[TaskPlanStep, ...]:
         if not step_id or step_id in seen:
             raise ValueError(f"Task plan step ids must be unique: {step_id!r}")
         seen.add(step_id)
-        expected_capability, expected_state = _capability(action), _state_name(action)
+        expected_capability, expected_state = action_binding(action)
         capability = str(raw.get("capability") or expected_capability).strip()
         state_name = str(raw.get("state_name") or expected_state).strip()
         if capability != expected_capability or state_name != expected_state:
@@ -1087,6 +1088,14 @@ def _action_matches(action: str, expected: str) -> bool:
 
 def _is_known_action(action: str) -> bool:
     return action in _ACTION_CAPABILITIES or bool(_ACTION_RE.match(action))
+
+
+def action_binding(action: str) -> tuple[str, str]:
+    """Bind dispatch/output identity, not permissions, for new and saved actions."""
+    if not _is_known_action(action) or (
+            action.split(":", 1)[0] in _EVIDENCE_CAPABILITIES and action.rsplit(":", 1)[-1] != "1"):
+        raise ValueError(f"Unsupported task plan action: {action!r}")
+    return _capability(action), _state_name(action)
 
 
 def _capability(action: str) -> str:

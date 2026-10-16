@@ -28,6 +28,30 @@ def archive_run_attempt(
     """
 
     paths = code_task_paths(Path(run_dir))
+    invocation_id = execution_report.get('process', {}).get('invocation_id')
+    if invocation_id and execution_report.get('native_binding'):
+        for existing in (paths.run_artifact_dir / run_label / 'attempts').glob('*/execution_report.json'):
+            saved = read_json(existing)
+            if saved.get('process', {}).get('invocation_id') != invocation_id:
+                continue
+            keys = ('status', 'returncode', 'timed_out', 'command', 'cwd', 'timeout_sec',
+                    'native_binding', 'implementation_file_hashes', 'process', 'metric_values')
+            if (any(saved.get(key) != execution_report.get(key) for key in keys)
+                    or read_text(existing.parent / 'stdout.txt') != (stdout or '')
+                    or read_text(existing.parent / 'stderr.txt') != (stderr or '')
+                    or read_json(existing.parent / 'metrics.json') != metrics):
+                raise ValueError('Archived validator facts disagree with the original invocation; no replacement')
+            record = {'id': saved['history_attempt'], 'label': run_label, 'status': saved['status'],
+                'run_at': saved['generated_at'], 'returncode': saved['returncode'], 'timed_out': saved['timed_out'],
+                'execution_report': existing.relative_to(paths.run_dir).as_posix(),
+                **{name: saved[name] for name in ('stdout', 'stderr', 'metrics')}}
+            meta = existing.parent / 'attempt_meta.json'
+            if meta.is_file():
+                if read_json(meta) != record:
+                    raise ValueError('Archived validator metadata disagrees with its original report')
+            else:
+                write_json(meta, record)
+            return record
     attempt_id = next_run_attempt_id(paths.run_artifact_dir, run_label)
     attempt_dir = paths.run_artifact_dir / run_label / "attempts" / attempt_id
     rel_base = f"code_task/run/{run_label}/attempts/{attempt_id}"

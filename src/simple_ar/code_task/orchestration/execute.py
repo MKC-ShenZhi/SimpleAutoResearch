@@ -280,7 +280,8 @@ def execute_code_task(
     manifest = load_code_task_manifest(root)
     ensure_task_memory(root)
     steps: list[ExecuteStepRecord] = []
-    if _code_task_kind(manifest) == "greenfield":
+    if (_code_task_kind(manifest) == "greenfield"
+            and manifest.get('implementation', {}).get('mode') != 'controlled_patch'):
         return _execute_greenfield_code_task(
             root,
             paths,
@@ -312,6 +313,8 @@ def execute_code_task(
             repair_rounds=repair_rounds,
             planning_snapshot_from=planning_snapshot_from,
             review_gate=review_gate,
+            budget_profile=budget_profile, edit_budget_overrides=edit_budget_overrides,
+            allow_large_edits=allow_large_edits,
             implementation_provider=implementation_provider,
             implementation_agent_mode=implementation_agent_mode,
             implementation_allow_external_agent=implementation_allow_external_agent,
@@ -327,129 +330,136 @@ def execute_code_task(
         if report_path.is_file():
             status = read_json(report_path)["status"]
             _record(steps, "review", "skipped", f"{phase} review already recorded: {status}")
-            return status
-        _emit(message_callback, f"Running {phase} code review.")
-        review = review_code_task_changes(
-            root, phase=phase, llm_client=llm_client,
-            model=reviewer_model or model, use_llm=use_llm,
-            max_source_chars_per_file=max_source_chars_per_file,
-            message_callback=message_callback,
-        )
-        _record(steps, "review", "done",
-                f"{phase} status {review.status}; blocking {review.blocking_count}; warnings {review.warning_count}")
-        return review.status
-
-    if _should_run("probe", to_step):
-        manifest = load_code_task_manifest(root)
-        if _environment_report_exists(paths):
-            _record(steps, "probe", "skipped", "environment_report.json already exists")
-        elif dry_run:
-            return _dry_result(paths, steps, "probe", "record environment signals")
         else:
-            _emit(message_callback, "Running environment probe.")
-            result = probe_code_task_environment(
-                root,
-                env_mode=env_mode,
-                python_executable=python_executable,
+            _emit(message_callback, f"Running {phase} code review.")
+            review = review_code_task_changes(
+                root, phase=phase, llm_client=llm_client,
+                model=reviewer_model or model, use_llm=use_llm,
+                max_source_chars_per_file=max_source_chars_per_file,
+                message_callback=message_callback,
             )
-            _record(steps, "probe", "done", f"wrote {result.report_path}")
-            _memory_event(
-                root,
-                "probe",
-                "Recorded environment and dependency signals.",
-                status="done",
-                artifacts=[_relative_to_run(root, result.report_path)],
-            )
-    if _stop_after("probe", to_step):
+            status = review.status
+            _record(steps, "review", "done",
+                    f"{phase} status {review.status}; blocking {review.blocking_count}; warnings {review.warning_count}")
+        if (_code_task_kind(manifest) == 'greenfield'
+                and manifest.get('implementation', {}).get('mode') == 'controlled_patch'):
+            whole = _rerun_greenfield_review(root, paths, max_files=max_files,
+                                             max_generated_lines=max_generated_lines)
+            if whole['status'] == 'failed':
+                status = 'failed'
+        return status
+
+    manifest = load_code_task_manifest(root)
+    # Stages are sequential: each stop point owns admission to the next stage.
+    # Only failure analysis/repair need a separate requested-boundary check.
+    if _environment_report_exists(paths):
+        _record(steps, "probe", "skipped", "environment_report.json already exists")
+    elif dry_run:
+        return _dry_result(paths, steps, "probe", "record environment signals")
+    else:
+        _emit(message_callback, "Running environment probe.")
+        result = probe_code_task_environment(
+            root,
+            env_mode=env_mode,
+            python_executable=python_executable,
+        )
+        _record(steps, "probe", "done", f"wrote {result.report_path}")
+        _memory_event(
+            root,
+            "probe",
+            "Recorded environment and dependency signals.",
+            status="done",
+            artifacts=[_relative_to_run(root, result.report_path)],
+        )
+    if to_step == "probe":
         return _result(paths, steps, "stop_point", "Stopped after probe as requested.")
 
-    if _should_run("baseline", to_step):
-        manifest = load_code_task_manifest(root)
-        baseline = _run_record(manifest, "baseline")
-        if baseline:
-            _record(steps, "baseline", "skipped", f"baseline status is {baseline.get('status', 'unknown')}")
-        elif dry_run:
-            return _dry_result(paths, steps, "baseline", _baseline_dry_run_detail(baseline_policy))
-        elif baseline_policy in {"skip", "none"}:
-            _record_baseline_policy(root, policy=baseline_policy, status="skipped")
-            write_code_task_summary(root)
-            _record(steps, "baseline", "skipped", f"baseline policy is {baseline_policy}")
-            _memory_event(
-                root,
-                "baseline",
-                f"Skipped unchanged baseline because baseline_policy={baseline_policy}.",
-                status="skipped",
-                metadata={"baseline_policy": baseline_policy},
-            )
-        elif baseline_policy == "provided":
-            metrics, source = load_provided_baseline_metrics(
-                root,
-                baseline_metrics_file,
-                missing_message=(
-                    "baseline_policy=provided requires [execute].baseline_metrics_file "
-                    "or --baseline-metrics-file."
-                ),
-            )
-            _emit(message_callback, f"Recording provided baseline metrics from {source}.")
-            result = record_provided_code_task_baseline(
-                root,
-                metrics=metrics,
-                source_path=source,
-                env_mode=env_mode,
-                python_executable=python_executable,
-            )
-            _record(steps, "baseline", "done", f"provided metrics from {source}")
-            _memory_event(
-                root,
-                "baseline",
-                "Recorded user-provided baseline metrics.",
-                status="provided",
-                artifacts=[
-                    _relative_to_run(root, result.report_path),
-                    _relative_to_run(root, result.metrics_path),
-                ],
-                metadata={"metrics": result.metrics, "source": source},
-            )
-        else:
-            _emit(message_callback, "Running baseline benchmark.")
-            result = run_code_task_baseline(
-                root,
-                timeout_sec=timeout_sec,
-                skip_validation=skip_validation,
-                env_mode=env_mode,
-                python_executable=python_executable,
-                stream_output=stream_benchmark_output,
-                output_callback=_benchmark_output_callback(message_callback),
-                budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
-            )
-            _record(steps, "baseline", "done", f"status {result.status}")
-            _memory_event(
-                root,
-                "baseline",
-                f"Baseline benchmark finished with status {result.status}.",
-                status=result.status,
-                artifacts=[
-                    _relative_to_run(root, result.report_path),
-                    _relative_to_run(root, result.metrics_path),
-                ],
-                metadata={"metrics": result.metrics},
-            )
-            if result.status != "passed":
-                return _result(
-                    paths,
-                    steps,
-                    "baseline_failed",
-                    "Review code_task/run/baseline/ before asking for edits.",
-                )
-        baseline = _run_record(load_code_task_manifest(root), "baseline")
-        if baseline and baseline.get("status") != "passed":
+    manifest = load_code_task_manifest(root)
+    baseline = _run_record(manifest, "baseline")
+    if baseline:
+        _record(steps, "baseline", "skipped", f"baseline status is {baseline.get('status', 'unknown')}")
+    elif dry_run:
+        return _dry_result(paths, steps, "baseline", _baseline_dry_run_detail(baseline_policy))
+    elif baseline_policy in {"skip", "none"}:
+        _record_baseline_policy(root, policy=baseline_policy, status="skipped")
+        write_code_task_summary(root)
+        _record(steps, "baseline", "skipped", f"baseline policy is {baseline_policy}")
+        _memory_event(
+            root,
+            "baseline",
+            f"Skipped unchanged baseline because baseline_policy={baseline_policy}.",
+            status="skipped",
+            metadata={"baseline_policy": baseline_policy},
+        )
+    elif baseline_policy == "provided":
+        metrics, source = load_provided_baseline_metrics(
+            root,
+            baseline_metrics_file,
+            missing_message=(
+                "baseline_policy=provided requires [execute].baseline_metrics_file "
+                "or --baseline-metrics-file."
+            ),
+        )
+        _emit(message_callback, f"Recording provided baseline metrics from {source}.")
+        result = record_provided_code_task_baseline(
+            root,
+            metrics=metrics,
+            source_path=source,
+            env_mode=env_mode,
+            python_executable=python_executable,
+        )
+        _record(steps, "baseline", "done", f"provided metrics from {source}")
+        _memory_event(
+            root,
+            "baseline",
+            "Recorded user-provided baseline metrics.",
+            status="provided",
+            artifacts=[
+                _relative_to_run(root, result.report_path),
+                _relative_to_run(root, result.metrics_path),
+            ],
+            metadata={"metrics": result.metrics, "source": source},
+        )
+    else:
+        _emit(message_callback, "Running baseline benchmark.")
+        result = run_code_task_baseline(
+            root,
+            timeout_sec=timeout_sec,
+            skip_validation=skip_validation,
+            env_mode=env_mode,
+            python_executable=python_executable,
+            stream_output=stream_benchmark_output,
+            output_callback=_benchmark_output_callback(message_callback),
+            budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
+        )
+        _record(steps, "baseline", "done", f"status {result.status}")
+        _memory_event(
+            root,
+            "baseline",
+            f"Baseline benchmark finished with status {result.status}.",
+            status=result.status,
+            artifacts=[
+                _relative_to_run(root, result.report_path),
+                _relative_to_run(root, result.metrics_path),
+            ],
+            metadata={"metrics": result.metrics},
+        )
+        if result.status != "passed":
             return _result(
                 paths,
                 steps,
                 "baseline_failed",
                 "Review code_task/run/baseline/ before asking for edits.",
             )
-    if _stop_after("baseline", to_step):
+    baseline = _run_record(load_code_task_manifest(root), "baseline")
+    if baseline and baseline.get("status") != "passed":
+        return _result(
+            paths,
+            steps,
+            "baseline_failed",
+            "Review code_task/run/baseline/ before asking for edits.",
+        )
+    if to_step == "baseline":
         return _result(paths, steps, "stop_point", "Stopped after baseline as requested.")
 
     # Batch decomposition is explicit; ordinary tasks need one approved patch plan.
@@ -499,404 +509,477 @@ def execute_code_task(
                 ],
                 metadata={"selected_files": list(result.selected_files)},
             )
-    if _stop_after("work-plan", to_step):
+    if to_step == "work-plan":
         return _result(paths, steps, "stop_point", "Stopped after work-plan as requested.")
 
-    if _should_run("batch", to_step):
-        manifest = load_code_task_manifest(root)
-        latest_batch = _latest_batch(manifest)
-        if latest_batch:
-            _record(steps, "batch", "skipped", f"latest batch is {latest_batch}")
-        elif not _work_plan_exists(paths):
-            _record(steps, "batch", "skipped", "single-task path uses the patch plan directly")
-        elif dry_run:
-            return _dry_result(paths, steps, "batch", "create attempt/batch state for first work item")
-        elif _batch_cap_exceeded(root, max_batches):
-            return _result(paths, steps, "batch_budget_exceeded", "Configured batch cap was reached.")
-        else:
-            work_item = _first_work_item_id(paths)
-            _emit(message_callback, f"Creating batch state for {work_item}.")
-            result = create_code_task_batch(root, work_item_id=work_item)
-            _record(steps, "batch", "done", f"{result.attempt_id}/{result.batch_id} for {result.work_item_id}")
-    if _stop_after("batch", to_step):
+    manifest = load_code_task_manifest(root)
+    latest_batch = _latest_batch(manifest)
+    if latest_batch:
+        _record(steps, "batch", "skipped", f"latest batch is {latest_batch}")
+    elif not _work_plan_exists(paths):
+        _record(steps, "batch", "skipped", "single-task path uses the patch plan directly")
+    elif dry_run:
+        return _dry_result(paths, steps, "batch", "create attempt/batch state for first work item")
+    elif _batch_cap_exceeded(root, max_batches):
+        return _result(paths, steps, "batch_budget_exceeded", "Configured batch cap was reached.")
+    else:
+        work_item = _first_work_item_id(paths)
+        _emit(message_callback, f"Creating batch state for {work_item}.")
+        result = create_code_task_batch(root, work_item_id=work_item)
+        _record(steps, "batch", "done", f"{result.attempt_id}/{result.batch_id} for {result.work_item_id}")
+    if to_step == "batch":
         return _result(paths, steps, "stop_point", "Stopped after batch as requested.")
 
-    if _should_run("plan", to_step):
-        manifest = load_code_task_manifest(root)
-        plan_status = _plan_status(manifest)
-        if plan_status in {"approved", "rejected", "revision_requested", "pending_approval"}:
-            _record(steps, "plan", "skipped", f"plan status is {plan_status}")
-        elif dry_run:
-            return _dry_result(paths, steps, "plan", "generate patch_plan.md")
-        elif _cost_cap_exceeded(paths.meta_dir, cost_cap_usd):
-            return _result(paths, steps, "cost_cap_exceeded", "LLM cost cap reached before patch planning.")
-        else:
-            _emit(message_callback, "Generating patch plan.")
-            try:
-                result = generate_patch_plan(
-                    root,
-                    llm_client=llm_client,
-                    model=planner_model or model,
-                    use_llm=use_llm,
-                    allow_llm_fallback=allow_planning_fallback,
-                    llm_retry_attempts=llm_retry_attempts,
-                    max_files=max_files,
-                    max_source_chars_per_file=max_source_chars_per_file,
-                    message_callback=message_callback,
-                )
-            except LLMError as exc:
-                _record(steps, "plan", "blocked", _first_error_line(str(exc)))
-                return _result(
-                    paths,
-                    steps,
-                    "llm_planning_failed",
-                    (
-                        "LLM patch planning failed and no offline fallback was written. "
-                        "Rerun the same execute command to retry, use --no-llm for a "
-                        "deterministic plan, or pass --allow-planning-fallback if an "
-                        "offline fallback is acceptable."
-                    ),
-                )
-            _record(steps, "plan", "done", f"mode {result.mode}; pending approval")
-            _memory_event(
+    manifest = load_code_task_manifest(root)
+    plan_status = _plan_status(manifest)
+    if plan_status in {"approved", "rejected", "revision_requested", "pending_approval"}:
+        _record(steps, "plan", "skipped", f"plan status is {plan_status}")
+    elif dry_run:
+        return _dry_result(paths, steps, "plan", "generate patch_plan.md")
+    elif _cost_cap_exceeded(paths.meta_dir, cost_cap_usd):
+        return _result(paths, steps, "cost_cap_exceeded", "LLM cost cap reached before patch planning.")
+    else:
+        _emit(message_callback, "Generating patch plan.")
+        try:
+            result = generate_patch_plan(
                 root,
-                "patch_plan",
-                f"Generated patch plan in {result.mode} mode; waiting for review.",
-                status="pending_approval",
-                artifacts=[_relative_to_run(root, result.patch_plan_path)],
-                metadata={"selected_files": list(result.selected_files)},
+                llm_client=llm_client,
+                model=planner_model or model,
+                use_llm=use_llm,
+                allow_llm_fallback=allow_planning_fallback,
+                llm_retry_attempts=llm_retry_attempts,
+                max_files=max_files,
+                max_source_chars_per_file=max_source_chars_per_file,
+                message_callback=message_callback,
             )
-            plan_status = "pending_approval"
-        if plan_status == "pending_approval" and approval_note.strip() and not dry_run:
-            record_plan_decision(root, decision="approve", note=approval_note, reviewer="research-application")
-            plan_status = "approved"
-        if plan_status == "pending_approval":
+        except LLMError as exc:
+            _record(steps, "plan", "blocked", _first_error_line(str(exc)))
             return _result(
                 paths,
                 steps,
-                "approval_required",
-                "Review code_task/patch_plan.md, then run code-task decide-plan --decision approve.",
+                "llm_planning_failed",
+                (
+                    "LLM patch planning failed and no offline fallback was written. "
+                    "Rerun the same execute command to retry, use --no-llm for a "
+                    "deterministic plan, or pass --allow-planning-fallback if an "
+                    "offline fallback is acceptable."
+                ),
             )
-        if plan_status == "revision_requested":
-            return _result(paths, steps, "plan_revision_requested", "Revise the task or regenerate the plan.")
-        if plan_status == "rejected":
-            return _result(paths, steps, "plan_rejected", "Stop this run or create a new plan.")
+        _record(steps, "plan", "done", f"mode {result.mode}; pending approval")
+        _memory_event(
+            root,
+            "patch_plan",
+            f"Generated patch plan in {result.mode} mode; waiting for review.",
+            status="pending_approval",
+            artifacts=[_relative_to_run(root, result.patch_plan_path)],
+            metadata={"selected_files": list(result.selected_files)},
+        )
+        plan_status = "pending_approval"
+    if plan_status == "pending_approval" and approval_note.strip() and not dry_run:
+        record_plan_decision(root, decision="approve", note=approval_note, reviewer="research-application")
+        plan_status = "approved"
+    if plan_status == "pending_approval":
+        return _result(
+            paths,
+            steps,
+            "approval_required",
+            "Review code_task/patch_plan.md, then run code-task decide-plan --decision approve.",
+        )
+    if plan_status == "revision_requested":
+        return _result(paths, steps, "plan_revision_requested", "Revise the task or regenerate the plan.")
+    if plan_status == "rejected":
+        return _result(paths, steps, "plan_rejected", "Stop this run or create a new plan.")
 
-    if _stop_after("plan", to_step):
+    if to_step == "plan":
         return _result(paths, steps, "stop_point", "Stopped after plan as requested.")
 
-    if _should_run("propose-edits", to_step):
-        manifest = load_code_task_manifest(root)
-        patch_status = _patch_status(manifest)
-        proposal_exists = _proposal_exists(paths)
-        patch_recovery = proposal_exists and use_llm and _patch_validation_recovery_needed(root)
-        if patch_status == "applied":
-            _record(steps, "propose-edits", "skipped", "patch already applied")
-        elif proposal_exists and _proposal_edit_count(paths) > 0 and not patch_recovery:
-            _record(steps, "propose-edits", "skipped", "proposed_edits.json already exists")
-        elif _plan_status(manifest) != "approved":
-            return _result(paths, steps, "approval_required", "Approve the patch plan before proposing edits.")
-        elif dry_run:
-            return _dry_result(paths, steps, "propose-edits", "generate controlled edit proposal")
-        elif _cost_cap_exceeded(paths.meta_dir, cost_cap_usd):
-            return _result(paths, steps, "cost_cap_exceeded", "LLM cost cap reached before edit proposal.")
-        else:
-            if patch_recovery:
-                _emit(message_callback, "Regenerating edit proposal after patch validation failure.")
-            elif proposal_exists:
-                _emit(message_callback, "Regenerating empty edit proposal with refreshed context.")
-            _ensure_context_pack_for_current_batch(
+    manifest = load_code_task_manifest(root)
+    patch_status = _patch_status(manifest)
+    proposal_exists = _proposal_exists(paths)
+    patch_recovery = proposal_exists and use_llm and _patch_validation_recovery_needed(root)
+    if patch_status == "applied":
+        _record(steps, "propose-edits", "skipped", "patch already applied")
+    elif proposal_exists and _proposal_edit_count(paths) > 0 and not patch_recovery:
+        _record(steps, "propose-edits", "skipped", "proposed_edits.json already exists")
+    elif _plan_status(manifest) != "approved":
+        return _result(paths, steps, "approval_required", "Approve the patch plan before proposing edits.")
+    elif dry_run:
+        return _dry_result(paths, steps, "propose-edits", "generate controlled edit proposal")
+    elif _cost_cap_exceeded(paths.meta_dir, cost_cap_usd):
+        return _result(paths, steps, "cost_cap_exceeded", "LLM cost cap reached before edit proposal.")
+    else:
+        if patch_recovery:
+            _emit(message_callback, "Regenerating edit proposal after patch validation failure.")
+        elif proposal_exists:
+            _emit(message_callback, "Regenerating empty edit proposal with refreshed context.")
+        _ensure_context_pack_for_current_batch(
+            root,
+            max_files=max_files,
+            max_source_chars_per_file=max_source_chars_per_file,
+            message_callback=message_callback,
+        )
+        _emit(message_callback, "Generating controlled edit proposal.")
+        result = propose_patch_edits(
+            root,
+            llm_client=llm_client,
+            model=editor_model or model,
+            use_llm=use_llm,
+            force=proposal_exists,
+            max_files=max_files,
+            max_source_chars_per_file=max_source_chars_per_file,
+            allow_large_edits=allow_large_edits,
+            budget_profile=budget_profile,
+            edit_budget_overrides=edit_budget_overrides,
+            message_callback=message_callback,
+        )
+        if patch_recovery:
+            record_review_finding(
                 root,
-                max_files=max_files,
-                max_source_chars_per_file=max_source_chars_per_file,
-                message_callback=message_callback,
+                {
+                    "key": "apply-edits-validation-recovery-completed",
+                    "severity": "info",
+                    "category": "patch_validation",
+                    "summary": "A corrected edit proposal was generated using the recorded failure and current source context.",
+                    "evidence": [
+                        "code_task/meta/proposed_edits.json",
+                        "code_task/memory/review_findings.jsonl",
+                    ],
+                    "recommendation": "Use exact current source snippets; stop if the corrected proposal fails validation again.",
+                    "source": "code-task.execute",
+                },
             )
-            _emit(message_callback, "Generating controlled edit proposal.")
-            result = propose_patch_edits(
-                root,
-                llm_client=llm_client,
-                model=editor_model or model,
-                use_llm=use_llm,
-                force=proposal_exists,
-                max_files=max_files,
-                max_source_chars_per_file=max_source_chars_per_file,
-                allow_large_edits=allow_large_edits,
-                budget_profile=budget_profile,
-                edit_budget_overrides=edit_budget_overrides,
-                message_callback=message_callback,
+        _record(steps, "propose-edits", "done", f"mode {result.mode}; edits {result.edit_count}")
+        _memory_event(
+            root,
+            "edit_proposal",
+            f"Generated controlled edit proposal with {result.edit_count} edit(s) in {result.mode} mode.",
+            status="proposal_ready" if result.edit_count else "empty",
+            artifacts=[_relative_to_run(root, result.proposal_path)],
+            metadata={"selected_files": list(result.selected_files)},
+        )
+        if result.edit_count == 0:
+            proposal = read_json(result.proposal_path)
+            budget_status = proposal.get("budget", {}).get("status", "")
+            if budget_status in {"rejected_absolute", "rejected_large"}:
+                detail = "; ".join(str(item) for item in proposal.get("warnings", []))
+                detail = detail or f"Edit proposal rejected by {budget_status}."
+                record_review_finding(root, {
+                    "key": "edit-proposal-budget-rejected", "severity": "blocking",
+                    "category": "patch_validation", "summary": detail,
+                    "evidence": ["code_task/meta/proposed_edits.json"],
+                    "recommendation": "Use focused exact-source edits within the existing limits; do not expand scope or rewrite the whole file.",
+                    "source": "code-task.execute",
+                })
+                return _result(paths, steps, "edit_budget_rejected", detail)
+            reasons = [str(item) for item in proposal.get("validation", []) if str(item).strip()]
+            detail = str(proposal.get("summary") or "No edits were proposed.")
+            if reasons:
+                detail += " " + "; ".join(reasons)
+            return _result(
+                paths,
+                steps,
+                "no_edits_proposed",
+                detail + " See code_task/meta/proposed_edits.json. "
+                + ("Resolve the reported implementation/design blocker before retrying."
+                   if result.mode == "llm" else "Provide edits or enable the LLM editor."),
             )
-            if patch_recovery:
-                record_review_finding(
-                    root,
-                    {
-                        "key": "apply-edits-validation-recovery-completed",
-                        "severity": "info",
-                        "category": "patch_validation",
-                        "summary": "A corrected edit proposal was generated using the recorded failure and current source context.",
-                        "evidence": [
-                            "code_task/meta/proposed_edits.json",
-                            "code_task/memory/review_findings.jsonl",
-                        ],
-                        "recommendation": "Use exact current source snippets; stop if the corrected proposal fails validation again.",
-                        "source": "code-task.execute",
-                    },
-                )
-            _record(steps, "propose-edits", "done", f"mode {result.mode}; edits {result.edit_count}")
-            _memory_event(
-                root,
-                "edit_proposal",
-                f"Generated controlled edit proposal with {result.edit_count} edit(s) in {result.mode} mode.",
-                status="proposal_ready" if result.edit_count else "empty",
-                artifacts=[_relative_to_run(root, result.proposal_path)],
-                metadata={"selected_files": list(result.selected_files)},
-            )
-            if result.edit_count == 0:
-                proposal = read_json(result.proposal_path)
-                budget_status = proposal.get("budget", {}).get("status", "")
-                if budget_status in {"rejected_absolute", "rejected_large"}:
-                    detail = "; ".join(str(item) for item in proposal.get("warnings", []))
-                    detail = detail or f"Edit proposal rejected by {budget_status}."
-                    record_review_finding(root, {
-                        "key": "edit-proposal-budget-rejected", "severity": "blocking",
-                        "category": "patch_validation", "summary": detail,
-                        "evidence": ["code_task/meta/proposed_edits.json"],
-                        "recommendation": "Use focused exact-source edits within the existing limits; do not expand scope or rewrite the whole file.",
-                        "source": "code-task.execute",
-                    })
-                    return _result(paths, steps, "edit_budget_rejected", detail)
-                reasons = [str(item) for item in proposal.get("validation", []) if str(item).strip()]
-                detail = str(proposal.get("summary") or "No edits were proposed.")
-                if reasons:
-                    detail += " " + "; ".join(reasons)
-                return _result(
-                    paths,
-                    steps,
-                    "no_edits_proposed",
-                    detail + " See code_task/meta/proposed_edits.json. "
-                    + ("Resolve the reported implementation/design blocker before retrying."
-                       if result.mode == "llm" else "Provide edits or enable the LLM editor."),
-                )
-            if not (approval_note.strip() and apply_proposed_edits):
-                return _result(
-                    paths,
-                    steps,
-                    "proposal_review_required",
-                    "Review code_task/meta/proposed_edits.json, then rerun execute with --apply-proposed-edits.",
-                )
-
-    if _stop_after("propose-edits", to_step):
-        return _result(paths, steps, "stop_point", "Stopped after propose-edits as requested.")
-
-    if _should_run("apply-edits", to_step):
-        manifest = load_code_task_manifest(root)
-        if _patch_status(manifest) == "applied":
-            _record(steps, "apply-edits", "skipped", "patch already applied")
-        elif not _proposal_exists(paths):
-            return _result(paths, steps, "missing_proposal", "Generate or provide proposed_edits.json first.")
-        elif not apply_proposed_edits:
+        if not (approval_note.strip() and apply_proposed_edits):
             return _result(
                 paths,
                 steps,
                 "proposal_review_required",
                 "Review code_task/meta/proposed_edits.json, then rerun execute with --apply-proposed-edits.",
             )
-        elif dry_run:
-            return _dry_result(paths, steps, "apply-edits", "apply reviewed proposed edits")
-        else:
-            _emit(message_callback, "Applying reviewed edit proposal.")
-            try:
-                result = apply_patch_edits(root, allow_large_edits=allow_large_edits)
-            except (PatchValidationError, EditBudgetApprovalRequired) as exc:
-                if isinstance(exc, EditBudgetApprovalRequired):
-                    key, category, stop_reason = "apply-edits-large-edit-approval-required", "edit_budget", "large_edit_approval_required"
-                    recommendation = "Confirm the broader edit is intentional before rerunning with large-edit approval."
-                    next_action = "Review the larger proposal, then rerun with --allow-large-edits if it is intentional."
-                else:
-                    key, category, stop_reason = "apply-edits-validation-failed", "patch_validation", "patch_apply_failed"
-                    recommendation = "Review and regenerate the proposed edit JSON before applying it."
-                    next_action = "Review code_task/meta/proposed_edits.json; patch validation failed before workspace files were changed."
-                detail = _first_error_line(str(exc))
-                _record(steps, "apply-edits", "blocked", detail)
-                record_review_finding(
-                    root,
-                    {
-                        "key": key,
-                        "severity": "blocking",
-                        "category": category,
-                        "summary": detail,
-                        "evidence": ["code_task/meta/proposed_edits.json"],
-                        "recommendation": recommendation,
-                        "source": "code-task.execute",
-                    },
-                )
-                return _result(paths, steps, stop_reason, next_action)
-            _record(steps, "apply-edits", "done", f"changed {len(result.changed_files)} file(s)")
-            record_edit_history(
-                root,
-                changed_files=list(result.changed_files),
-                reason=f"Applied reviewed edit proposal to {len(result.changed_files)} file(s).",
-                proposal="code_task/meta/proposed_edits.json",
-                patch_diff=_relative_to_run(root, result.patch_diff_path),
-                metadata={"applied_edits": _relative_to_run(root, result.applied_edits_path)},
-            )
 
-    if _stop_after("apply-edits", to_step):
-        return _result(paths, steps, "stop_point", "Stopped after apply-edits as requested.")
+    if to_step == "propose-edits":
+        return _result(paths, steps, "stop_point", "Stopped after propose-edits as requested.")
 
-    if _should_run("review", to_step):
-        if _patch_status(load_code_task_manifest(root)) != "applied":
-            return _result(paths, steps, "patch_not_applied", "Apply reviewed edits before review.")
-        if dry_run and not _review_report_exists(paths, "post_apply"):
-            return _dry_result(paths, steps, "review", "review applied patch for scope, interface, and risk")
-        if review_patch("post_apply") == "failed":
-            return _result(paths, steps, "review_failed",
-                           "Review code_task/meta/review_report.json before validation or benchmark execution.")
-    if _stop_after("review", to_step):
-        return _result(paths, steps, "stop_point", "Stopped after review as requested.")
-
-    if _should_run("validate", to_step):
-        if _patch_status(load_code_task_manifest(root)) != "applied":
-            return _result(paths, steps, "patch_not_applied", "Apply reviewed edits before validation.")
-        if dry_run:
-            return _dry_result(paths, steps, "validate", "run static validation")
-        _emit(message_callback, "Running static validation.")
-        validation = validate_code_task(
-            root,
-            strict=strict_validation,
-            max_file_bytes=validation_max_file_bytes,
+    manifest = load_code_task_manifest(root)
+    if _patch_status(manifest) == "applied":
+        _record(steps, "apply-edits", "skipped", "patch already applied")
+    elif not _proposal_exists(paths):
+        return _result(paths, steps, "missing_proposal", "Generate or provide proposed_edits.json first.")
+    elif not apply_proposed_edits:
+        return _result(
+            paths,
+            steps,
+            "proposal_review_required",
+            "Review code_task/meta/proposed_edits.json, then rerun execute with --apply-proposed-edits.",
         )
-        _record(steps, "validate", "done", f"status {validation.status}")
-        _memory_event(
-            root,
-            "validation",
-            f"Static validation finished with status {validation.status}.",
-            status=validation.status,
-            artifacts=["code_task/meta/validation_report.json"],
-            metadata={"error_count": validation.error_count, "warning_count": validation.warning_count},
-        )
-        if validation.error_count or validation.warning_count:
-            severity = "blocking" if validation.error_count else "warning"
+    elif dry_run:
+        return _dry_result(paths, steps, "apply-edits", "apply reviewed proposed edits")
+    else:
+        _emit(message_callback, "Applying reviewed edit proposal.")
+        try:
+            result = apply_patch_edits(root, allow_large_edits=allow_large_edits)
+        except (PatchValidationError, EditBudgetApprovalRequired) as exc:
+            if isinstance(exc, EditBudgetApprovalRequired):
+                key, category, stop_reason = "apply-edits-large-edit-approval-required", "edit_budget", "large_edit_approval_required"
+                recommendation = "Confirm the broader edit is intentional before rerunning with large-edit approval."
+                next_action = "Review the larger proposal, then rerun with --allow-large-edits if it is intentional."
+            else:
+                key, category, stop_reason = "apply-edits-validation-failed", "patch_validation", "patch_apply_failed"
+                recommendation = "Review and regenerate the proposed edit JSON before applying it."
+                next_action = "Review code_task/meta/proposed_edits.json; the rejected patch was not committed."
+            detail = _first_error_line(str(exc))
+            restoration_errors = getattr(exc, "__notes__", ())
+            if restoration_errors:
+                key, category, stop_reason = "apply-edits-rollback-failed", "rollback", "patch_rollback_failed"
+                detail += " " + "; ".join(restoration_errors)
+                recommendation = "Inspect the snapshot and current workspace before proposing or applying any new edits."
+                next_action = recommendation
+            _record(steps, "apply-edits", "blocked", detail)
             record_review_finding(
                 root,
                 {
-                    "key": f"static-validation-{validation.status}",
-                    "severity": severity,
-                    "category": "static_validation",
-                    "summary": (
-                        f"Static validation reported {validation.error_count} error(s) "
-                        f"and {validation.warning_count} warning(s)."
-                    ),
-                    "evidence": ["code_task/meta/validation_report.json"],
-                    "recommendation": "Inspect validation_report.json before running or repairing the benchmark.",
-                    "source": "code-task.validate",
+                    "key": key,
+                    "severity": "blocking",
+                    "category": category,
+                    "summary": detail,
+                    "evidence": ["code_task/meta/proposed_edits.json"],
+                    "recommendation": recommendation,
+                    "source": "code-task.execute",
                 },
             )
-        if validation.status == "failed":
-            if not _should_run("analyze-failure", to_step):
-                return _result(
-                    paths,
-                    steps,
-                    "validation_failed",
-                    "Review code_task/meta/validation_report.json or run execute --to-step analyze-failure.",
-                )
-            return _handle_failure(
-                root,
-                paths,
-                steps,
-                dry_run=dry_run,
-                allow_repair=_should_run("repair", to_step),
-                repair_rounds=repair_rounds,
-                max_batches=max_batches,
-                cost_cap_usd=cost_cap_usd,
-                llm_client=llm_client,
-                model=model,
-                repair_model=repair_model,
-                use_llm=use_llm,
-                max_files=max_files,
-                max_source_chars_per_file=max_source_chars_per_file,
-                message_callback=message_callback,
-            )
+            return _result(paths, steps, stop_reason, next_action)
+        _record(steps, "apply-edits", "done", f"changed {len(result.changed_files)} file(s)")
+        record_edit_history(
+            root,
+            changed_files=list(result.changed_files),
+            reason=f"Applied reviewed edit proposal to {len(result.changed_files)} file(s).",
+            proposal="code_task/meta/proposed_edits.json",
+            patch_diff=_relative_to_run(root, result.patch_diff_path),
+            metadata={"applied_edits": _relative_to_run(root, result.applied_edits_path)},
+        )
 
-    if _stop_after("validate", to_step):
+    if to_step == "apply-edits":
+        return _result(paths, steps, "stop_point", "Stopped after apply-edits as requested.")
+
+    if _patch_status(load_code_task_manifest(root)) != "applied":
+        return _result(paths, steps, "patch_not_applied", "Apply reviewed edits before review.")
+    if dry_run and not _review_report_exists(paths, "post_apply"):
+        return _dry_result(paths, steps, "review", "review applied patch for scope, interface, and risk")
+    if review_patch("post_apply") == "failed":
+        return _result(paths, steps, "review_failed",
+                       "Review code_task/meta/review_report.json before validation or benchmark execution.")
+    if to_step == "review":
+        return _result(paths, steps, "stop_point", "Stopped after review as requested.")
+
+    if _patch_status(load_code_task_manifest(root)) != "applied":
+        return _result(paths, steps, "patch_not_applied", "Apply reviewed edits before validation.")
+    if dry_run:
+        return _dry_result(paths, steps, "validate", "run static validation")
+    _emit(message_callback, "Running static validation.")
+    validation = validate_code_task(
+        root,
+        strict=strict_validation,
+        max_file_bytes=validation_max_file_bytes,
+    )
+    _record(steps, "validate", "done", f"status {validation.status}")
+    _memory_event(
+        root,
+        "validation",
+        f"Static validation finished with status {validation.status}.",
+        status=validation.status,
+        artifacts=["code_task/meta/validation_report.json"],
+        metadata={"error_count": validation.error_count, "warning_count": validation.warning_count},
+    )
+    if validation.error_count or validation.warning_count:
+        severity = "blocking" if validation.error_count else "warning"
+        record_review_finding(
+            root,
+            {
+                "key": f"static-validation-{validation.status}",
+                "severity": severity,
+                "category": "static_validation",
+                "summary": (
+                    f"Static validation reported {validation.error_count} error(s) "
+                    f"and {validation.warning_count} warning(s)."
+                ),
+                "evidence": ["code_task/meta/validation_report.json"],
+                "recommendation": "Inspect validation_report.json before running or repairing the benchmark.",
+                "source": "code-task.validate",
+            },
+        )
+    if validation.status == "failed":
+        return _handle_failure(
+            root,
+            paths,
+            steps,
+            to_step=to_step,
+            failed_step="validate",
+            repair_rounds=repair_rounds,
+            max_batches=max_batches,
+            cost_cap_usd=cost_cap_usd,
+            llm_client=llm_client,
+            model=model,
+            repair_model=repair_model,
+            use_llm=use_llm,
+            max_files=max_files,
+            max_source_chars_per_file=max_source_chars_per_file,
+            message_callback=message_callback,
+        )
+
+    if to_step == "validate":
         return _result(paths, steps, "stop_point", "Stopped after validate as requested.")
 
-    if _should_run("run", to_step):
-        if _patch_status(load_code_task_manifest(root)) != "applied":
-            return _result(paths, steps, "patch_not_applied", "Apply reviewed edits before running benchmark.")
-        if dry_run:
-            return _dry_result(paths, steps, "run", "run patched benchmark")
-        _emit(message_callback, "Running patched benchmark.")
-        result = run_code_task_benchmark(
+    if _patch_status(load_code_task_manifest(root)) != "applied":
+        return _result(paths, steps, "patch_not_applied", "Apply reviewed edits before running benchmark.")
+    _emit(message_callback, "Running patched benchmark.")
+    result = run_code_task_benchmark(
+        root,
+        timeout_sec=timeout_sec,
+        # The execute path runs static validation immediately before this
+        # benchmark step, so avoid recording the same validation twice.
+        skip_validation=True,
+        env_mode=env_mode,
+        python_executable=python_executable,
+        stream_output=stream_benchmark_output,
+        output_callback=_benchmark_output_callback(message_callback),
+        budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
+    )
+    _record(steps, "run", "done", f"status {result.status}")
+    _memory_event(
+        root,
+        "patched_run",
+        f"Patched benchmark finished with status {result.status}.",
+        status=result.status,
+        artifacts=[
+            _relative_to_run(root, result.report_path),
+            _relative_to_run(root, result.metrics_path),
+        ],
+        metadata={"metrics": result.metrics},
+    )
+    if result.status != "passed":
+        return _handle_failure(
             root,
-            timeout_sec=timeout_sec,
-            # The execute path runs static validation immediately before this
-            # benchmark step, so avoid recording the same validation twice.
-            skip_validation=True,
-            env_mode=env_mode,
-            python_executable=python_executable,
-            stream_output=stream_benchmark_output,
-            output_callback=_benchmark_output_callback(message_callback),
-            budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
+            paths,
+            steps,
+            to_step=to_step,
+            failed_step="run",
+            repair_rounds=repair_rounds,
+            max_batches=max_batches,
+            cost_cap_usd=cost_cap_usd,
+            llm_client=llm_client,
+            model=model,
+            repair_model=repair_model,
+            use_llm=use_llm,
+            max_files=max_files,
+            max_source_chars_per_file=max_source_chars_per_file,
+            message_callback=message_callback,
         )
-        _record(steps, "run", "done", f"status {result.status}")
-        _memory_event(
-            root,
-            "patched_run",
-            f"Patched benchmark finished with status {result.status}.",
-            status=result.status,
-            artifacts=[
-                _relative_to_run(root, result.report_path),
-                _relative_to_run(root, result.metrics_path),
-            ],
-            metadata={"metrics": result.metrics},
-        )
-        if result.status != "passed":
-            if not _should_run("analyze-failure", to_step):
-                return _result(
-                    paths,
-                    steps,
-                    "benchmark_failed",
-                    "Review code_task/run/patched/ or run execute --to-step analyze-failure.",
-                )
-            return _handle_failure(
-                root,
-                paths,
-                steps,
-                dry_run=dry_run,
-                allow_repair=_should_run("repair", to_step),
-                repair_rounds=repair_rounds,
-                max_batches=max_batches,
-                cost_cap_usd=cost_cap_usd,
-                llm_client=llm_client,
-                model=model,
-                repair_model=repair_model,
-                use_llm=use_llm,
-                max_files=max_files,
-                max_source_chars_per_file=max_source_chars_per_file,
-                message_callback=message_callback,
-            )
-        if review_patch("post_run") == "failed":
-            return _result(paths, steps, "review_failed",
-                           "Review code_task/meta/review_report_post_run.json before treating the patch as complete.")
+    if review_patch("post_run") == "failed":
+        return _result(paths, steps, "review_failed",
+                       "Review code_task/meta/review_report_post_run.json before treating the patch as complete.")
 
-    if _stop_after("run", to_step):
+    if to_step == "run":
         return _result(paths, steps, "completed", "Review code_task/summary.md and patch.diff.")
 
     return _result(paths, steps, "completed", "Review code_task/summary.md.")
 
 
-def implement_code_task(run_dir: Path, *, approval_note: str, **options: Any) -> CodeTaskExecuteResult:
+def implementation_resume_allowed(run_dir: Path, *, ledger: BudgetLedger, attempt_id: str) -> bool:
+    """Recognize committed CodeTask gates; never restart an uncommitted request."""
+    from simple_ar.code_task.runtime.state import implementation_file_hashes, native_preparation_processes
+    try:
+        manifest = load_code_task_manifest(run_dir)
+        paths = code_task_paths(run_dir)
+        if not manifest.get('code_task', {}).get('native_binding'):
+            return False
+        entries = [row for row in ledger.entries if row.attempt_id == attempt_id]
+        if any(row.status not in {'settled', 'released'} for row in entries):
+            return False
+        preparation_ids = native_preparation_processes(run_dir, ledger=ledger,
+            session_id='', attempt_id=attempt_id)
+        # The physical owner must be checked even when a changed/missing ledger
+        # attempt leaves no matching entries. Candidate hashes alone cannot
+        # establish that an existing invocation is safe to resume.
+        from simple_ar.code_task.execution.runner import recover_implementation_process
+        recovered = recover_implementation_process(run_dir, budget_ledger=ledger,
+            session_id='', attempt_id=attempt_id)
+        for entry in entries:
+            if entry.status == 'released':
+                continue
+            label = entry.purpose
+            if label.startswith('code-task-plan'):
+                ready = _plan_status(manifest) in {'approved', 'pending_approval', 'rejected', 'revision_requested'} and (paths.task_dir / 'patch_plan.md').is_file()
+            elif label.startswith('code-task-propose-edits'):
+                ready = _proposal_exists(paths)
+            elif label.startswith('code-task-review-post_apply'):
+                ready = (paths.meta_dir / 'review_report.json').is_file()
+            elif label.startswith('code-task-repair'):
+                ready = bool(manifest.get('repair', {}).get('latest_proposed_edits'))
+            elif label.startswith('code-task-review-post_repair'):
+                ready = (paths.meta_dir / 'review_report_post_repair.json').is_file()
+            elif label.startswith(('greenfield-architecture', 'greenfield-unit-', 'greenfield-code-review-')):
+                # Resume only a completely published/reviewed generation.
+                # Individual completed units in an unpublished staging tree
+                # do not authorize regenerating or replaying earlier calls.
+                ready = (manifest.get('code_task', {}).get('kind') == 'greenfield'
+                    and manifest.get('implementation', {}).get('status') == 'generated'
+                    and all((paths.meta_dir / name).is_file() for name in (
+                        'architecture_plan.json', 'task_contract.json', 'code_artifacts.json',
+                        'implementation_plan.json', 'review_report.json'))
+                    and is_current_greenfield_review(read_json(paths.meta_dir / 'review_report.json')))
+            elif label == 'local_process':
+                if entry.logical_call_id in preparation_ids:
+                    continue  # The shared owner already verified its actual preparation evidence.
+                reports = [paths.run_artifact_dir / 'patched' / 'execution_report.json',
+                    *(paths.run_artifact_dir / 'patched' / 'attempts').glob('*/execution_report.json')]
+                ready = any(path.is_file() and read_json(path).get('process', {}).get('invocation_id') == entry.logical_call_id
+                            for path in reports)
+                if not ready:
+                    ready = recovered is not None and recovered.record['invocation_id'] == entry.logical_call_id
+            else:
+                ready = False  # A new label needs evidence, not a permissive replay default.
+            if not ready:
+                return False
+        current = implementation_file_hashes(run_dir)
+        report = paths.run_artifact_dir / 'patched' / 'execution_report.json'
+        indexed = {row['path']: row['sha256'] for row in read_json(paths.meta_dir / 'codebase_index.json')['files']}
+        extra = set(current) - set(indexed)
+        if extra:
+            # Explicit paths omitted by the browsing index still need committed
+            # application evidence; do not bless arbitrary bytes on recovery.
+            receipts = [paths.meta_dir / 'applied_edits.json', *paths.task_dir.glob('batches/*/applied_edits.json')]
+            for receipt in receipts:
+                if receipt.is_file():
+                    for edit in read_json(receipt).get('edits', []):
+                        if edit.get('path') in extra and edit.get('new_sha256') == current[edit['path']]:
+                            indexed[edit['path']] = edit['new_sha256']
+        if report.is_file() and read_json(report).get('implementation_file_hashes') == current:
+            return True
+        return current == indexed
+    except (OSError, KeyError, IndexError, TypeError, ValueError, RuntimeError):
+        return False
+
+
+def implement_code_task(
+    run_dir: Path, *, approval_note: str, proposal_corrections: int = 0, **options: Any,
+) -> CodeTaskExecuteResult:
     """Run the existing preparation gates through validation, never a benchmark.
 
     The caller supplies explicit isolated-workspace approval and owns measurement.
-    Rejected plans remain rejected; retries reuse durable plans and proposals.
+    Rejected plans remain rejected. An explicitly requested single correction
+    only replaces a completed patch/budget rejection, never a transport failure,
+    rejected plan, runtime failure or unknown-use request. Limits stay unchanged.
     """
     if not approval_note.strip():
         raise ValueError("CodeTask implementation requires an explicit approval note.")
-    return execute_code_task(run_dir, **{
+    if type(proposal_corrections) is not int or proposal_corrections not in (0, 1):
+        raise ValueError("proposal_corrections must be zero or one")
+    settings = {
         **options, "baseline_policy": "skip", "to_step": "validate",
         "apply_proposed_edits": True, "approval_note": approval_note,
-    })
+    }
+    first = execute_code_task(run_dir, **settings)
+    if not proposal_corrections or first.stop_reason not in {"patch_apply_failed", "edit_budget_rejected"}:
+        return first
+    _emit(options.get("message_callback"),
+          "Edit proposal failed patch or budget validation; retrying once with recorded failure context and unchanged limits.")
+    second = execute_code_task(run_dir, **settings)
+    return CodeTaskExecuteResult(second.run_dir, (*first.steps, *second.steps),
+                                 second.stop_reason, second.next_action, second.summary_path)
 
 
 def _execute_greenfield_code_task(
@@ -930,6 +1013,9 @@ def _execute_greenfield_code_task(
     repair_rounds: int,
     planning_snapshot_from: str | Path | None,
     review_gate: str,
+    budget_profile: str | None,
+    edit_budget_overrides: dict[str, Any] | None,
+    allow_large_edits: bool,
     implementation_provider: str,
     implementation_agent_mode: str,
     implementation_allow_external_agent: bool,
@@ -963,253 +1049,244 @@ def _execute_greenfield_code_task(
             message_callback=message_callback, summary=summary,
         )
 
-    if _should_run("probe", to_step):
-        if _environment_report_exists(paths):
-            _record(steps, "probe", "skipped", "environment_report.json already exists")
-        elif dry_run:
-            return _dry_result(paths, steps, "probe", "record environment and resource signals")
-        else:
-            _emit(message_callback, "Running environment and resource probe.")
-            result = probe_code_task_environment(
-                root,
-                env_mode=env_mode,
-                python_executable=python_executable,
-            )
-            _record(steps, "probe", "done", f"wrote {result.report_path}")
-            _memory_event(
-                root,
-                "probe",
-                "Recorded environment and resource signals for greenfield generation.",
-                status="done",
-                artifacts=[
-                    _relative_to_run(root, result.report_path),
-                    "code_task/meta/resource_probe.json",
-                    "code_task/meta/resource_decision.json",
-                ],
-            )
-    if _stop_after("probe", to_step):
-        return _result(paths, steps, "stop_point", "Stopped after probe as requested.")
-
-    if _should_run("baseline", to_step):
-        _record(steps, "baseline", "skipped", "greenfield mode has no unchanged baseline")
-    if _stop_after("baseline", to_step):
-        return _result(paths, steps, "stop_point", "Stopped after baseline as requested.")
-
-    if _should_run("work-plan", to_step):
-        manifest = load_code_task_manifest(root)
-        implementation = manifest.get("implementation")
-        generated = isinstance(implementation, dict) and implementation.get("status") == "generated"
-        if generated:
-            _record(steps, "work-plan", "skipped", "greenfield implementation already generated")
-        elif dry_run:
-            return _dry_result(paths, steps, "work-plan", "plan and generate greenfield project")
-        else:
-            _emit(message_callback, "Planning and generating greenfield project.")
-            result = generate_greenfield_code_task(
-                root,
-                llm_client=llm_client,
-                model=model,
-                planner_model=planner_model or model,
-                writer_model=writer_model or model,
-                reviewer_model=reviewer_model or model,
-                use_llm=use_llm,
-                max_files=max_files,
-                max_generated_lines=max_generated_lines,
-                max_source_chars_per_file=max_source_chars_per_file,
-                allow_planning_fallback=allow_planning_fallback,
-                planning_mode=planning_mode,
-                planning_review_rounds=planning_review_rounds,
-                llm_retry_attempts=llm_retry_attempts,
-                implementation_provider=implementation_provider,
-                implementation_agent_mode=implementation_agent_mode,
-                implementation_allow_external_agent=implementation_allow_external_agent,
-                implementation_agent_model=implementation_agent_model,
-                implementation_agent_binary=implementation_agent_binary,
-                implementation_agent_args=implementation_agent_args,
-                implementation_agent_timeout_sec=implementation_agent_timeout_sec,
-                planning_snapshot_from=planning_snapshot_from,
-                message_callback=message_callback,
-            )
-            _record(
-                steps,
-                "work-plan",
-                "done",
-                f"generated {len(result.generated_files)} file(s); review {result.review_status}",
-            )
-            _memory_event(
-                root,
-                "greenfield_generation",
-                f"Generated greenfield project with {len(result.generated_files)} file(s).",
-                status=result.review_status,
-                artifacts=[
-                    _relative_to_run(root, result.implementation_plan_path),
-                    _relative_to_run(root, result.code_artifacts_path),
-                    _relative_to_run(root, result.review_report_path),
-                ],
-                metadata={"generated_files": list(result.generated_files)},
-            )
-            _record_review_report_findings(root, result.review_report_path)
-            if result.review_status == "failed":
-                if not resolve_review(
-                    result.review_report_path,
-                    summary="Repaired generated project after review failure and passed deterministic rereview.",
-                ):
-                    return _result(paths, steps, "review_failed",
-                                   "Review code_task/meta/review_report.json before validation or execution.")
-        if _stop_after("work-plan", to_step):
-            return _result(paths, steps, "stop_point", "Stopped after greenfield generation as requested.")
-
-    for skipped_step in ("batch", "plan", "propose-edits", "apply-edits"):
-        if _should_run(skipped_step, to_step):
-            _record(steps, skipped_step, "skipped", "greenfield mode uses generated implementation artifacts")
-        if _stop_after(skipped_step, to_step):
-            return _result(paths, steps, "stop_point", f"Stopped after {skipped_step} as requested.")
-
-    if _should_run("review", to_step):
-        review_path = paths.meta_dir / "review_report.json"
-        if review_path.is_file():
-            review = read_json(review_path)
-            if not isinstance(review, dict) or not is_current_greenfield_review(review):
-                _emit(message_callback, "Review contract changed; rerunning generated project review.")
-                review = _rerun_greenfield_review(
-                    root,
-                    paths,
-                    max_files=max_files,
-                    max_generated_lines=max_generated_lines,
-                )
-                _record(steps, "review", "done", f"refreshed status {review.get('status', 'unknown')}")
-            else:
-                _record(steps, "review", "skipped", "greenfield review_report.json is current")
-            if isinstance(review, dict) and review.get("status") == "failed":
-                if not resolve_review(
-                    review,
-                    summary="Repaired existing generated project after review failure and passed deterministic rereview.",
-                ):
-                    return _result(paths, steps, "review_failed",
-                                   "Review code_task/meta/review_report.json before validation or execution.")
-        elif dry_run:
-            return _dry_result(paths, steps, "review", "review generated project")
-        else:
-            return _result(paths, steps, "review_missing", "Generate the greenfield project before review.")
-    if _stop_after("review", to_step):
-        return _result(paths, steps, "stop_point", "Stopped after review as requested.")
-
-    if _should_run("validate", to_step):
-        if dry_run:
-            return _dry_result(paths, steps, "validate", "run static validation")
-        _emit(message_callback, "Running static validation.")
-        validation = validate_code_task(
+    if _environment_report_exists(paths):
+        _record(steps, "probe", "skipped", "environment_report.json already exists")
+    elif dry_run:
+        return _dry_result(paths, steps, "probe", "record environment and resource signals")
+    else:
+        _emit(message_callback, "Running environment and resource probe.")
+        result = probe_code_task_environment(
             root,
-            strict=strict_validation,
-            max_file_bytes=validation_max_file_bytes,
+            env_mode=env_mode,
+            python_executable=python_executable,
         )
-        _record(steps, "validate", "done", f"status {validation.status}")
+        _record(steps, "probe", "done", f"wrote {result.report_path}")
         _memory_event(
             root,
-            "validation",
-            f"Static validation finished with status {validation.status}.",
-            status=validation.status,
-            artifacts=["code_task/meta/validation_report.json"],
-            metadata={"error_count": validation.error_count, "warning_count": validation.warning_count},
+            "probe",
+            "Recorded environment and resource signals for greenfield generation.",
+            status="done",
+            artifacts=[
+                _relative_to_run(root, result.report_path),
+                "code_task/meta/resource_probe.json",
+                "code_task/meta/resource_decision.json",
+            ],
         )
-        if validation.status == "failed":
-            return _result(
-                paths,
-                steps,
-                "validation_failed",
-                "Review code_task/meta/validation_report.json before running.",
-            )
-        write_code_task_summary(root)
-    if _stop_after("validate", to_step):
-        return _result(paths, steps, "stop_point", "Stopped after validate as requested.")
+    if to_step == "probe":
+        return _result(paths, steps, "stop_point", "Stopped after probe as requested.")
 
-    if _should_run("run", to_step):
-        if dry_run:
-            return _dry_result(paths, steps, "run", "run generated project benchmark")
-        after_repair = False
-        while True:
-            _emit(message_callback, "Running generated project benchmark after repair." if after_repair else "Running generated project benchmark.")
-            result = run_code_task_benchmark(
-                root,
-                timeout_sec=timeout_sec,
-                # Static validation just ran in this execute path unless the user
-                # stopped earlier, so do not duplicate it inside the runner.
-                skip_validation=True,
-                run_label="patched",
-                env_mode=env_mode,
-                python_executable=python_executable,
-                stream_output=stream_benchmark_output,
-                output_callback=_benchmark_output_callback(message_callback),
-                budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
-            )
-            _record(steps, "run", "done", f"status {result.status}")
-            _memory_event(
-                root,
-                "generated_run_repair" if after_repair else "generated_run",
-                f"Generated project benchmark{' after repair' if after_repair else ''} finished with status {result.status}.",
-                status=result.status,
-                artifacts=[
-                    _relative_to_run(root, result.report_path),
-                    _relative_to_run(root, result.metrics_path),
-                    *(["code_task/meta/run_repair.json"] if after_repair else []),
-                ],
-                metadata={"metrics": result.metrics},
-            )
-            if result.status == "passed":
-                break
-            repaired = _attempt_greenfield_run_repair(
-                root,
-                paths,
-                steps,
-                repair_rounds=repair_rounds,
-                llm_client=llm_client,
-                model=model,
-                repair_model=repair_model or model,
-                use_llm=use_llm,
-                message_callback=message_callback,
-            )
-            if not repaired:
-                return _result(paths, steps, "benchmark_failed", "Review code_task/run/patched/ for generated project failure.")
+    _record(steps, "baseline", "skipped", "greenfield mode has no unchanged baseline")
+    if to_step == "baseline":
+        return _result(paths, steps, "stop_point", "Stopped after baseline as requested.")
+
+    manifest = load_code_task_manifest(root)
+    implementation = manifest.get("implementation")
+    generated = isinstance(implementation, dict) and implementation.get("status") == "generated"
+    if generated:
+        _record(steps, "work-plan", "skipped", "greenfield implementation already generated")
+    elif dry_run:
+        return _dry_result(paths, steps, "work-plan", "plan and generate greenfield project")
+    else:
+        _emit(message_callback, "Planning and generating greenfield project.")
+        result = generate_greenfield_code_task(
+            root,
+            llm_client=llm_client,
+            model=model,
+            planner_model=planner_model or model,
+            writer_model=writer_model or model,
+            reviewer_model=reviewer_model or model,
+            use_llm=use_llm,
+            max_files=max_files,
+            max_generated_lines=max_generated_lines,
+            max_source_chars_per_file=max_source_chars_per_file,
+            allow_planning_fallback=allow_planning_fallback,
+            planning_mode=planning_mode,
+            planning_review_rounds=planning_review_rounds,
+            llm_retry_attempts=llm_retry_attempts,
+            implementation_provider=implementation_provider,
+            implementation_agent_mode=implementation_agent_mode,
+            implementation_allow_external_agent=implementation_allow_external_agent,
+            implementation_agent_model=implementation_agent_model,
+            implementation_agent_binary=implementation_agent_binary,
+            implementation_agent_args=implementation_agent_args,
+            implementation_agent_timeout_sec=implementation_agent_timeout_sec,
+            planning_snapshot_from=planning_snapshot_from,
+            message_callback=message_callback,
+            budget_profile=budget_profile, edit_budget_overrides=edit_budget_overrides,
+            allow_large_edits=allow_large_edits,
+        )
+        _record(
+            steps,
+            "work-plan",
+            "done",
+            f"generated {len(result.generated_files)} file(s); review {result.review_status}",
+        )
+        _memory_event(
+            root,
+            "greenfield_generation",
+            f"Generated greenfield project with {len(result.generated_files)} file(s).",
+            status=result.review_status,
+            artifacts=[
+                _relative_to_run(root, result.implementation_plan_path),
+                _relative_to_run(root, result.code_artifacts_path),
+                _relative_to_run(root, result.review_report_path),
+            ],
+            metadata={"generated_files": list(result.generated_files)},
+        )
+        _record_review_report_findings(root, result.review_report_path)
+        if result.review_status == "failed":
+            if not resolve_review(
+                result.review_report_path,
+                summary="Repaired generated project after review failure and passed deterministic rereview.",
+            ):
+                return _result(paths, steps, "review_failed",
+                               "Review code_task/meta/review_report.json before validation or execution.")
+    if to_step == "work-plan":
+        return _result(paths, steps, "stop_point", "Stopped after greenfield generation as requested.")
+
+    for skipped_step in ("batch", "plan", "propose-edits", "apply-edits"):
+        _record(steps, skipped_step, "skipped", "greenfield mode uses generated implementation artifacts")
+        if to_step == skipped_step:
+            return _result(paths, steps, "stop_point", f"Stopped after {skipped_step} as requested.")
+
+    review_path = paths.meta_dir / "review_report.json"
+    if review_path.is_file():
+        review = read_json(review_path)
+        if not isinstance(review, dict) or not is_current_greenfield_review(review):
+            _emit(message_callback, "Review contract changed; rerunning generated project review.")
             review = _rerun_greenfield_review(
                 root,
                 paths,
                 max_files=max_files,
                 max_generated_lines=max_generated_lines,
             )
-            _record(steps, "review", "done", f"post-run-repair status {review.get('status', 'unknown')}")
-            if isinstance(review, dict) and review.get("status") == "failed":
-                if not resolve_review(
-                    review, gate="strict",
-                    summary="Repaired generated project after run repair introduced review-blocking contract issues.",
-                ):
-                    return _result(
-                        paths,
-                        steps,
-                        "review_failed",
-                        "Review code_task/meta/review_report.json after generated project run repair.",
-                    )
-            _emit(message_callback, "Run repair patched generated project; rerunning static validation.")
-            validation = validate_code_task(
-                root,
-                strict=strict_validation,
-                max_file_bytes=validation_max_file_bytes,
-            )
-            _record(steps, "validate", "done", f"post-repair status {validation.status}")
-            if validation.status == "failed":
+            _record(steps, "review", "done", f"refreshed status {review.get('status', 'unknown')}")
+        else:
+            _record(steps, "review", "skipped", "greenfield review_report.json is current")
+        if isinstance(review, dict) and review.get("status") == "failed":
+            if not resolve_review(
+                review,
+                summary="Repaired existing generated project after review failure and passed deterministic rereview.",
+            ):
+                return _result(paths, steps, "review_failed",
+                               "Review code_task/meta/review_report.json before validation or execution.")
+    elif dry_run:
+        return _dry_result(paths, steps, "review", "review generated project")
+    else:
+        return _result(paths, steps, "review_missing", "Generate the greenfield project before review.")
+    if to_step == "review":
+        return _result(paths, steps, "stop_point", "Stopped after review as requested.")
+
+    if dry_run:
+        return _dry_result(paths, steps, "validate", "run static validation")
+    _emit(message_callback, "Running static validation.")
+    validation = validate_code_task(
+        root,
+        strict=strict_validation,
+        max_file_bytes=validation_max_file_bytes,
+    )
+    _record(steps, "validate", "done", f"status {validation.status}")
+    _memory_event(
+        root,
+        "validation",
+        f"Static validation finished with status {validation.status}.",
+        status=validation.status,
+        artifacts=["code_task/meta/validation_report.json"],
+        metadata={"error_count": validation.error_count, "warning_count": validation.warning_count},
+    )
+    if validation.status == "failed":
+        return _result(
+            paths,
+            steps,
+            "validation_failed",
+            "Review code_task/meta/validation_report.json before running.",
+        )
+    write_code_task_summary(root)
+    if to_step == "validate":
+        return _result(paths, steps, "stop_point", "Stopped after validate as requested.")
+
+    after_repair = False
+    while True:
+        _emit(message_callback, "Running generated project benchmark after repair." if after_repair else "Running generated project benchmark.")
+        result = run_code_task_benchmark(
+            root,
+            timeout_sec=timeout_sec,
+            # Static validation just ran in this execute path unless the user
+            # stopped earlier, so do not duplicate it inside the runner.
+            skip_validation=True,
+            run_label="patched",
+            env_mode=env_mode,
+            python_executable=python_executable,
+            stream_output=stream_benchmark_output,
+            output_callback=_benchmark_output_callback(message_callback),
+            budget_ledger=budget_ledger, session_id=session_id, attempt_id=attempt_id,
+        )
+        _record(steps, "run", "done", f"status {result.status}")
+        _memory_event(
+            root,
+            "generated_run_repair" if after_repair else "generated_run",
+            f"Generated project benchmark{' after repair' if after_repair else ''} finished with status {result.status}.",
+            status=result.status,
+            artifacts=[
+                _relative_to_run(root, result.report_path),
+                _relative_to_run(root, result.metrics_path),
+                *(["code_task/meta/run_repair.json"] if after_repair else []),
+            ],
+            metadata={"metrics": result.metrics},
+        )
+        if result.status == "passed":
+            break
+        repaired = _attempt_greenfield_run_repair(
+            root,
+            paths,
+            steps,
+            repair_rounds=repair_rounds,
+            llm_client=llm_client,
+            model=model,
+            repair_model=repair_model or model,
+            use_llm=use_llm,
+            message_callback=message_callback,
+        )
+        if not repaired:
+            return _result(paths, steps, "benchmark_failed", "Review code_task/run/patched/ for generated project failure.")
+        review = _rerun_greenfield_review(
+            root,
+            paths,
+            max_files=max_files,
+            max_generated_lines=max_generated_lines,
+        )
+        _record(steps, "review", "done", f"post-run-repair status {review.get('status', 'unknown')}")
+        if isinstance(review, dict) and review.get("status") == "failed":
+            if not resolve_review(
+                review, gate="strict",
+                summary="Repaired generated project after run repair introduced review-blocking contract issues.",
+            ):
                 return _result(
                     paths,
                     steps,
-                    "validation_failed",
-                    "Review code_task/meta/validation_report.json after generated project repair.",
+                    "review_failed",
+                    "Review code_task/meta/review_report.json after generated project run repair.",
                 )
-            write_code_task_summary(root)
-            after_repair = True
+        _emit(message_callback, "Run repair patched generated project; rerunning static validation.")
+        validation = validate_code_task(
+            root,
+            strict=strict_validation,
+            max_file_bytes=validation_max_file_bytes,
+        )
+        _record(steps, "validate", "done", f"post-repair status {validation.status}")
+        if validation.status == "failed":
+            return _result(
+                paths,
+                steps,
+                "validation_failed",
+                "Review code_task/meta/validation_report.json after generated project repair.",
+            )
         write_code_task_summary(root)
-    if _stop_after("run", to_step):
-        write_code_task_summary(root)
+        after_repair = True
+    write_code_task_summary(root)
+    if to_step == "run":
         return _result(paths, steps, "completed", "Review code_task/summary.md and generated_project/.")
 
-    write_code_task_summary(root)
     return _result(paths, steps, "completed", "Review code_task/summary.md.")
 
 
@@ -1218,8 +1295,8 @@ def _handle_failure(
     paths: object,
     steps: list[ExecuteStepRecord],
     *,
-    dry_run: bool,
-    allow_repair: bool,
+    to_step: str,
+    failed_step: str,
     repair_rounds: int,
     max_batches: int | None,
     cost_cap_usd: float | None,
@@ -1231,8 +1308,14 @@ def _handle_failure(
     max_source_chars_per_file: int,
     message_callback: MessageCallback | None,
 ) -> CodeTaskExecuteResult:
-    if dry_run:
-        return _dry_result(paths, steps, "analyze-failure", "summarize latest failure")
+    # Both callers have already stopped dry runs before validation/execution.
+    # Failure analysis and repair share one boundary, independent of the source.
+    if to_step not in {"analyze-failure", "repair"}:
+        if failed_step == "validate":
+            return _result(paths, steps, "validation_failed",
+                           "Review code_task/meta/validation_report.json or run execute --to-step analyze-failure.")
+        return _result(paths, steps, "benchmark_failed",
+                       "Review code_task/run/patched/ or run execute --to-step analyze-failure.")
     _emit(message_callback, "Analyzing latest failure.")
     analysis = analyze_code_task_failure(run_dir)
     _record(steps, "analyze-failure", "done", f"source {analysis.source}; status {analysis.status}")
@@ -1251,7 +1334,7 @@ def _handle_failure(
         },
         key=f"failure-analysis:{analysis.source}:{analysis.status}:{repair_index}:{_failure_signature(analysis_text)[:40]}",
     )
-    if not allow_repair or repair_rounds <= _repair_count(load_code_task_manifest(run_dir)):
+    if to_step != "repair" or repair_rounds <= _repair_count(load_code_task_manifest(run_dir)):
         return _result(
             paths,
             steps,
@@ -1352,14 +1435,6 @@ def _result(
         next_action=next_action,
         summary_path=paths.task_dir / "summary.md",
     )
-
-
-def _should_run(step: str, to_step: str) -> bool:
-    return EXECUTE_STEPS.index(step) <= EXECUTE_STEPS.index(to_step)
-
-
-def _stop_after(step: str, to_step: str) -> bool:
-    return EXECUTE_STEPS.index(step) >= EXECUTE_STEPS.index(to_step)
 
 
 def _environment_report_exists(paths: object) -> bool:
@@ -1759,11 +1834,22 @@ def _rerun_greenfield_review(
 ) -> dict[str, Any]:
     manifest = load_code_task_manifest(run_dir)
     code_artifacts = _read_optional_dict(paths.meta_dir / "code_artifacts.json")
+    resource_plan = _greenfield_resource_plan(paths, max_files=max_files, max_generated_lines=max_generated_lines)
+    if manifest.get('implementation', {}).get('mode') == 'controlled_patch':
+        if not (paths.meta_dir / 'task_contract.json').is_file():
+            raise ValueError('Generated revision is missing its original task contract')
+        resource_plan = read_json(paths.meta_dir / 'implementation_plan.json')['resource_plan']
+        project = paths.workspace_dir / 'generated_project'
+        from simple_ar.code_task.analysis.index import build_codebase_index
+        code_artifacts = {**code_artifacts, 'generated_files': [
+            {'path': row['path'], 'mode': 'controlled_revision',
+             'line_count': len((project / row['path']).read_text(encoding='utf-8', errors='replace').splitlines())}
+            for row in build_codebase_index(project)['files']]}
     review = review_generated_project(
         project_dir=paths.workspace_dir / "generated_project",
         code_artifacts=code_artifacts,
         result_schema=result_schema_from_manifest(manifest),
-        resource_plan=_greenfield_resource_plan(paths, max_files=max_files, max_generated_lines=max_generated_lines),
+        resource_plan=resource_plan,
         contract=_greenfield_contract_for_review(paths),
         dependency_advice=_read_optional_dict(paths.meta_dir / "dependency_advice.json"),
         implementation_memory=_read_optional_dict(paths.task_dir / "memory" / "implementation_memory.json"),

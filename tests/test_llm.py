@@ -201,7 +201,7 @@ class LLMParsingTests(unittest.TestCase):
                 self.assertEqual(transport.call_args.kwargs['http2'], False)
                 self.assertEqual(transport.call_args.kwargs['proxy'], proxy)
                 self.assertEqual(set(transport.call_args.kwargs),
-                    {'http2', 'proxy', 'event_hooks'} if streamed else {'http2', 'proxy'})
+                    {'http2', 'proxy', 'event_hooks'})
                 create = sdk.responses.create if mode == "responses" else sdk.chat.completions.create
                 self.assertNotIn("proxy", create.call_args.kwargs)
                 self.assertNotIn("proxy_env", create.call_args.kwargs)
@@ -514,6 +514,115 @@ class LLMParsingTests(unittest.TestCase):
                         self.assertEqual(ledger.entries[0].status, 'unknown')
                         self.assertIsNone(ledger.remaining('total_tokens'))
 
+    def test_sdk_transport_failures_preserve_safe_observation_and_accounting(self):
+        import httpx
+        import ssl
+        from openai import APIConnectionError, APITimeoutError
+        from simple_ar.integrations.llm import _provider_failure_summary, _transport_failure_phase
+
+        # Share the same failure contract across both sync APIs and async Chat.
+        # A redirected request can fail TLS after an earlier request was sent.
+        failures = (
+            (('connection.connect_tcp.failed',), httpx.ConnectError, False),
+            (('connection.start_tls.failed',), httpx.ConnectTimeout, False),
+            (('http11.send_request_headers.started', 'http11.receive_response_headers.failed'),
+             httpx.ReadTimeout, True),
+            (('http2.send_request_headers.started', 'connection.start_tls.failed'),
+             httpx.ConnectError, True),
+        )
+        secret = 'secret-trace-fixture'
+        for mode, streamed in (('chat', False), ('responses', False), ('chat', True)):
+            for events, cause_type, sent in failures:
+                with self.subTest(mode=mode, streamed=streamed, events=events), \
+                        patch('openai.OpenAI') as sync_factory, \
+                        patch('openai.AsyncOpenAI') as async_factory, \
+                        patch('openai.DefaultHttpxClient') as sync_transport, \
+                        patch('openai.DefaultAsyncHttpxClient') as async_transport:
+                    factory = async_factory if streamed else sync_factory
+                    transport = async_transport if streamed else sync_transport
+                    sdk = factory.return_value
+                    request = httpx.Request('POST', 'https://invalid.test/' + secret,
+                                            headers={'Authorization': 'Bearer ' + secret})
+                    error = (APITimeoutError(request=request) if issubclass(cause_type, httpx.TimeoutException)
+                             else APIConnectionError(request=request))
+                    cause = cause_type(secret, request=request)
+                    error.__cause__ = cause
+                    tls_cause = ssl.SSLError(secret) if events[-1] == 'connection.start_tls.failed' else None
+                    if tls_cause is not None:
+                        cause.__cause__ = tls_cause
+
+                    def observations():
+                        # A fresh request hook on redirect must not reset sent.
+                        for event in (*events, secret):
+                            yield SimpleNamespace(extensions={}), event
+
+                    def fail(**kwargs):
+                        for traced, event in observations():
+                            transport.call_args.kwargs['event_hooks']['request'][0](traced)
+                            traced.extensions['trace'](event, {'request': request, 'secret': secret})
+                        raise error
+
+                    async def fail_async(**kwargs):
+                        for traced, event in observations():
+                            await transport.call_args.kwargs['event_hooks']['request'][0](traced)
+                            await traced.extensions['trace'](event, {'request': request, 'secret': secret})
+                        raise error
+
+                    create = sdk.responses.create if mode == 'responses' else sdk.chat.completions.create
+                    if streamed:
+                        sdk.chat.completions.create = create = AsyncMock(side_effect=fail_async)
+                        sdk.close = AsyncMock()
+                    else:
+                        create.side_effect = fail
+                    ledger = BudgetLedger({'llm_requests': 1, 'total_tokens': 100})
+                    client = LLMClient(LLMSettings(api_key='fixture', api_mode=mode, stream=streamed,
+                        request_timeout_sec=1, max_output_tokens=10, retry_attempts=1,
+                        connect_retry_attempts=2 if sent else 1), budget_ledger=ledger)
+                    with patch('simple_ar.integrations.llm.time.sleep') as backoff:
+                        with self.assertRaises(LLMError) as caught:
+                            client.ask('system', 'user')
+
+                    phase = 'possibly_dispatched' if sent else 'not_dispatched'
+                    self.assertIs(caught.exception.__cause__, error)
+                    self.assertIs(error.__cause__, cause)
+                    self.assertEqual(error._simple_ar_transport_event, events[-1])
+                    self.assertIs(error._simple_ar_request_started, sent)
+                    self.assertEqual(_transport_failure_phase(error), phase)
+                    summary = _provider_failure_summary(error)
+                    self.assertIn(cause_type.__name__, summary)
+                    if tls_cause is not None:
+                        self.assertIs(cause.__cause__, tls_cause)
+                        self.assertIn(cause_type.__name__ + '>SSLError', summary)
+                    self.assertIn('transport event=' + events[-1], summary)
+                    self.assertIn('transport phase=' + phase, summary)
+                    for diagnostic in (summary, str(caught.exception), ledger.entries[0].reason):
+                        self.assertNotIn(secret, diagnostic)
+                        self.assertNotIn('invalid.test', diagnostic)
+                    entry, = ledger.entries
+                    self.assertEqual(entry.status, 'unknown' if sent else 'settled')
+                    self.assertEqual(entry.actual, {'llm_requests': 1} if sent else
+                                     {'llm_requests': 1, 'total_tokens': 0})
+                    self.assertEqual(ledger.unknown_dimensions(), ('total_tokens',) if sent else ())
+                    if not sent:
+                        self.assertEqual(entry.actual_source, 'transport_pre_dispatch')
+                    else:
+                        self.assertIn(cause_type.__name__, entry.reason)
+                        self.assertIn(events[-1], entry.reason)
+                    factory.assert_called_once()
+                    self.assertEqual(factory.call_args.kwargs['max_retries'], 0)
+                    self.assertIs(factory.call_args.kwargs['http_client'], transport.return_value)
+                    transport.assert_called_once()
+                    self.assertEqual(set(transport.call_args.kwargs), {'http2', 'event_hooks'})
+                    self.assertIs(transport.call_args.kwargs['http2'], False)
+                    create.assert_called_once()
+                    sdk.close.assert_called_once()
+                    if streamed:
+                        create.assert_awaited_once()
+                        sdk.close.assert_awaited_once()
+                    (sync_factory if streamed else async_factory).assert_not_called()
+                    (sync_transport if streamed else async_transport).assert_not_called()
+                    backoff.assert_not_called()
+
     def test_sdk_stream_loop_preflight_and_synchronous_paths_unchanged(self):
         ledger = BudgetLedger({"llm_requests": 1})
         client = LLMClient(LLMSettings(api_key="fixture", api_mode="chat", stream=True,
@@ -526,7 +635,8 @@ class LLMParsingTests(unittest.TestCase):
             # Neither synchronous non-streamed API is routed through asyncio.run.
             for mode in ("chat", "responses"):
                 _call_openai_sdk(mode, {"api_key": "fixture", "model": "fixture", "timeout": 1})
-        with patch("openai.AsyncOpenAI") as async_factory, patch("openai.OpenAI") as sync_factory:
+        with patch("openai.AsyncOpenAI") as async_factory, patch("openai.OpenAI") as sync_factory, \
+                patch("openai.DefaultHttpxClient"):
             asyncio.run(inside_loop())
         self.assertEqual(ledger.entries, ())
         async_factory.assert_not_called()
@@ -1361,6 +1471,28 @@ class LLMParsingTests(unittest.TestCase):
         self.assertEqual(ledger.entries[0].attempt_id, "implement-1")
         self.assertEqual(ledger.remaining("llm_requests"), 0)
 
+    def test_task_output_limit_survives_named_professional_routes_without_rebinding(self):
+        from simple_ar.integrations.model_profiles import ModelCatalog, ModelProfile
+        profile = ModelProfile(api='openai_chat', base_url='https://provider.invalid/v1',
+            capabilities=['text', 'code'], model='gpt-6.1-sol', api_key_env='TASK_CAP_TEST_KEY',
+            reasoning_effort='medium', max_output_tokens=900)
+        catalog = ModelCatalog(profiles={'task': profile, 'writer': profile},
+            routes={'default': 'task', 'code': 'writer', 'writing': 'writer'})
+        with patch.dict(os.environ, {'TASK_CAP_TEST_KEY': 'test-key'}):
+            source = LLMClient(LLMSettings(**profile.text_settings()), model_catalog=catalog, profile_name='task')
+            binding = source.connection_binding()
+            operational = source.with_output_limit(321)
+            for purpose in ('code', 'writing'):
+                routed = LLMClient.for_task(client=operational, purpose=purpose)
+                self.assertEqual(routed._profile_name, 'writer')
+                self.assertEqual(routed.effective_output_limit(), 321)
+                self.assertEqual(routed.effective_output_limit(123), 123)  # Section/call cap keeps precedence.
+                self.assertEqual(routed.with_budget(BudgetLedger({'llm_requests': 0})).effective_output_limit(), 321)
+                self.assertEqual(routed._settings.max_output_tokens, 900)
+            self.assertEqual(operational.connection_binding(), binding)
+            self.assertEqual(source.connection_binding(), binding)
+            self.assertEqual(source.effective_output_limit(), 900)
+
     def test_budget_exhaustion_prevents_provider_call(self) -> None:
         ledger = BudgetLedger({"llm_requests": 0, "total_tokens": 100})
         client = LLMClient(
@@ -1627,6 +1759,39 @@ class LLMParsingTests(unittest.TestCase):
                 if stop is None:
                     self.assertEqual(ledger.entries[1].actual["total_tokens"], 5)
 
+    def test_connect_retry_ceiling_does_not_replay_dispatched_or_unknown_failures(self) -> None:
+        import httpx
+
+        response = {"choices": [{"message": {"content": "ok"}}],
+                    "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}}
+        for failure, pre_dispatch in ((httpx.ConnectTimeout("TLS handshake"), True),
+                                      (httpx.ReadTimeout("read interrupted"), False),
+                                      (TimeoutError("unclassified timeout"), False)):
+            with self.subTest(failure=type(failure).__name__):
+                ledger = BudgetLedger({"llm_requests": 3, "total_tokens": 200})
+                client = LLMClient(LLMSettings(api_key="test-key", api_mode="chat",
+                    stream=True, max_output_tokens=10, retry_attempts=1,
+                    connect_retry_attempts=3), budget_ledger=ledger)
+                with patch("simple_ar.integrations.llm._call_openai_sdk",
+                           side_effect=[failure, response]) as provider, \
+                        patch("simple_ar.integrations.llm.time.sleep"):
+                    if pre_dispatch:
+                        self.assertEqual(client.ask("system", "user"), "ok")
+                    else:
+                        with self.assertRaises(LLMError):
+                            client.ask("system", "user")
+                self.assertEqual(provider.call_count, 2 if pre_dispatch else 1)
+                self.assertEqual(ledger.entries[0].status, "settled" if pre_dispatch else "unknown")
+                self.assertEqual(ledger.entries[0].actual,
+                                 {"llm_requests": 1, "total_tokens": 0} if pre_dispatch
+                                 else {"llm_requests": 1})
+                if pre_dispatch:
+                    self.assertEqual(ledger.entries[0].actual_source, "transport_pre_dispatch")
+                    self.assertEqual(ledger.entries[1].actual["total_tokens"], 5)
+                    self.assertEqual(ledger.unknown_dimensions(), ())
+                else:
+                    self.assertEqual(ledger.unknown_dimensions(), ("total_tokens",))
+
     def test_gateway_http2_failure_before_stream_iteration_is_uncertain_and_retryable(self) -> None:
         ledger = BudgetLedger({"llm_requests": 3, "total_tokens": 200})
         client = LLMClient(
@@ -1700,7 +1865,7 @@ class LLMParsingTests(unittest.TestCase):
                 with self.subTest(timeout=value, mode=mode, streamed=streamed), \
                         patch("openai.OpenAI") as sync_factory, \
                         patch("openai.AsyncOpenAI") as async_factory, \
-                        patch("openai.DefaultAsyncHttpxClient"):
+                        patch("openai.DefaultAsyncHttpxClient"), patch("openai.DefaultHttpxClient"):
                     factory = async_factory if streamed else sync_factory
                     sdk = factory.return_value
                     create = sdk.responses.create if mode == "responses" else sdk.chat.completions.create
