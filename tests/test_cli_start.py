@@ -31,9 +31,10 @@ class StartTests(unittest.TestCase):
             paper.write_text('# Conditions\nA single run cannot establish robustness.\n', encoding='utf-8')
             for name, command in (('no-command', []), ('declared-command', ['--cwd', str(base),
                     '--primary-metric', 'score', '--command', sys.executable, '-c', "print('score: 3')"])):
-                main(['research-session', '--topic', 'Collect conditions before choosing an experiment',
-                    '--local-document', str(paper), '--outputs', 'experiments',
-                    '--output-root', str(base / 'runs' / name), *command])
+                with self.assertRaisesRegex(SystemExit, "status 'paused'"):
+                    main(['research-session', '--topic', 'Collect conditions before choosing an experiment',
+                        '--local-document', str(paper), '--outputs', 'experiments',
+                        '--output-root', str(base / 'runs' / name), *command])
             roots = [path.parent for path in (base / 'runs').rglob('actions.json')]
             self.assertEqual(len(roots), 2)
             for root in roots:

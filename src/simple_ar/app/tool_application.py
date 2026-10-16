@@ -1846,7 +1846,8 @@ class ToolApplication:
         retry. The ordinary action journal still owns execution and delivery.
         """
         config = self.state['config']
-        if (config['model'] is not None or 'conditions' not in (config.get('execution_contract') or {})
+        if (config['model'] is not None or config.get('report_requirement')
+                or 'conditions' not in (config.get('execution_contract') or {})
                 or self.session.manifest.status != 'paused' or self.state['pending'] is not None
                 or not self.state['turns'] or self.state['turns'][-1]['remaining']):
             return []

@@ -482,16 +482,26 @@ def _run_created_research(app, *, request: str, root: Path, outputs: tuple,
         if result.get('status') == 'ok' and result.get('artifacts'):
             deferred = bool('experiments' in outputs or saved.get('report_requirement')
                 or saved['research_policy']['require_design'])
-            completion = ({'tool_name': 'ask_user', 'arguments': {'question':
-                'Materials are retained, but the requested design, execution or authored report is not complete. '
-                'Continue this task with an authorized model and execution contract/approval as needed.'}}
-                if deferred else {'tool_name': 'deliver_result', 'arguments': {
-                'summary': request, 'artifacts': result['artifacts'],
-                'unresolved': result.get('data', {}).get('unresolved', [])}})
-            status = app.run(actions=[completion], progress=print_line)
+            contract = saved.get('execution_contract')
+            if contract is not None:
+                from simple_ar.tools.scientific import measurement_conditions
+                app.request_execution_confirmation()
+                actions = [{'tool_name': 'measure_experiment', 'arguments': {**row['execution'],
+                    **({'condition_id': row['id']} if 'conditions' in contract else {}),
+                    **({'delivery': {'summary': request, 'artifacts': []}}
+                        if 'conditions' not in contract and not saved.get('report_requirement') else {})}}
+                    for row in measurement_conditions(contract) if not row.get('reuse_ref')]
+                status = app.run(actions=actions, progress=print_line)
+            else:
+                completion = ({'tool_name': 'ask_user', 'arguments': {'question':
+                    'Materials are retained, but the requested design, execution or authored report is not complete. '
+                    'Continue this task with an authorized model and execution contract/approval as needed.'}}
+                    if deferred else {'tool_name': 'deliver_result', 'arguments': {
+                    'summary': request, 'artifacts': result['artifacts'],
+                    'unresolved': result.get('data', {}).get('unresolved', [])}})
+                status = app.run(actions=[completion], progress=print_line)
     _render_native_result(app, status)
-    _ensure_research_cli_success(status['status'], operation='Research task', root=root,
-        accepted={'completed', 'paused'} if deferred else None)
+    _ensure_research_cli_success(status['status'], operation='Research task', root=root)
 
 
 def resume_structured_task(args: argparse.Namespace) -> None:

@@ -405,8 +405,9 @@ class ResearchConfigTests(unittest.TestCase):
                     self.assertEqual(path.read_bytes(), original)
 
     def test_config_pair_protocol_real_processes_and_completed_resume(self):
+        import hashlib
         from simple_ar.cli.main import main
-        from simple_ar.app.research_application import load_session
+        from simple_ar.app.tool_application import ToolApplication
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "paper.md").write_text("# Replay learning\nMemory stores previous examples.", encoding="utf-8")
@@ -432,31 +433,77 @@ class ResearchConfigTests(unittest.TestCase):
             with redirect_stdout(io.StringIO()), self.assertRaisesRegex(SystemExit, "paused"):
                 main(argv)
             session = next((root / "out").iterdir())
-            pending = load_session(session).view()
-            self.assertEqual(pending.work_plan["interaction"]["mode"], "checkpoints")
-            gate = pending.work_plan["interaction"]["decision"]
-            self.assertEqual(gate["stage"], "execution_protocol")
+            app = ToolApplication.load(session)
+            self.assertEqual(app.session.manifest.status, "paused")
+            self.assertEqual(app.sources.policy.interaction, "checkpoints")
+            gate = app.sources.pending_decision()
+            self.assertEqual(gate["proposal_kind"], "caller_execution_protocol")
+            self.assertEqual(len(app.state["config"]["execution_contract"]["conditions"]), 4)
+            self.assertTrue(any((attempt / "research_summary.md").is_file()
+                                for attempt in (session / "attempts").iterdir()))
             self.assertFalse((root / "calls.txt").exists())
+            resume = ["start", "--resume-task", str(session), "--yes"]
             with redirect_stdout(io.StringIO()):
-                main(argv + ["--session-root", str(session), "--decision-id", gate["id"],
+                main(resume + ["--decision-id", gate["decision_id"],
                              "--decision-response", "accept"])
-            app = load_session(session)
-            self.assertEqual(app.view().status, "completed")
+            self.assertFalse((root / "calls.txt").exists())
+            self.assertFalse(ToolApplication.load(session).ledger.entries)
+            tokens = set()
+            for index in range(4):
+                app = ToolApplication.load(session)
+                self.assertEqual(app.session.manifest.status, "paused")
+                call = app.state["pending"]["call"]
+                self.assertEqual(call["function"]["name"], "measure_experiment")
+                token = app.approval_token(call)
+                self.assertNotIn(token, tokens)
+                tokens.add(token)
+                with redirect_stdout(io.StringIO()):
+                    main(resume + ["--approve-execution", token])
+                self.assertEqual(len((root / "calls.txt").read_text().splitlines()), index + 1)
+            app = ToolApplication.load(session)
+            self.assertEqual(app.session.manifest.status, "completed")
             calls = (root / "calls.txt").read_text().splitlines()
             self.assertCountEqual(calls, ["baseline 0", "baseline 1", "candidate 0", "candidate 1"])
             results = [json.loads(p.read_text()) for p in session.glob("attempts/**/results.json")]
             measured = [r for r in results if "measurement" in r]
             self.assertEqual(len(measured), 4)
+            self.assertEqual(len({r["measurement"]["measurement_id"] for r in measured}), 4)
             self.assertTrue(all(r["measurement"]["asset_integrity"]["status"] == "observed_unchanged" for r in measured))
-            attempts = app.view().attempts
+            self.assertEqual(sum(entry.actual.get("process_invocations", 0) for entry in app.ledger.entries), 4)
+            observations = [app.session.store.read_json(item["result"])
+                            for turn in app.state["turns"] for item in turn["tools"]]
+            locators = [item["data"]["result_ref"] for item in observations
+                        if item.get("tool_name") == "measure_experiment" and item["status"] == "ok"]
+            self.assertEqual(len(locators), 4)
+            analysis_records = [item["result"] for turn in app.state["turns"] for item in turn["tools"]
+                                if app.session.store.read_json(item["result"]).get("tool_name") == "analyze_measurements"]
+            self.assertEqual(len(analysis_records), 1)
+            self.assertEqual(app.scientific.evidence_requirement(locators, analysis_records), [])
+            evidence = app.scientific.report_evidence(locators, [], analysis_records=analysis_records)
+            self.assertEqual(len(evidence["measurement_refs"]), 4)
+            self.assertEqual(set(evidence["measurement_refs"]), {
+                app.workspace.resolve(locator).relative_to(session).as_posix() for locator in locators})
+            self.assertFalse(evidence.get("measurement_sources"))  # All four outcomes are original.
+            hashes = {ref: hashlib.sha256((session / ref).read_bytes()).hexdigest()
+                      for ref in evidence["measurement_refs"]}
+            for ref, digest in hashes.items():
+                self.assertEqual(evidence["evidence_sha256"][ref], digest)
+            attempts = app.session.list_attempts()
+            ledger = app.ledger.to_dict()
             with redirect_stdout(io.StringIO()):
-                main(argv + ["--session-root", str(session)])
-            self.assertEqual(load_session(session).view().attempts, attempts)
+                main(resume)
+            app = ToolApplication.load(session)
+            self.assertEqual(app.session.manifest.status, "completed")
+            self.assertEqual(app.session.list_attempts(), attempts)
+            self.assertEqual(app.ledger.to_dict(), ledger)
+            self.assertEqual({ref: hashlib.sha256((session / ref).read_bytes()).hexdigest()
+                              for ref in hashes}, hashes)
             self.assertEqual((root / "calls.txt").read_text().splitlines(), calls)
 
     def test_resume_attaches_execution_without_research_replay_or_budget_reset(self):
         from simple_ar.cli.main import main
-        from simple_ar.app.research_application import load_session
+        from simple_ar.app.research_application import ResearchApplication, ResearchApplicationServices, load_session
+        from simple_ar.research.workflow_contracts import ResearchBrief
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "paper.md").write_text("# Replay learning\nMemory stores previous examples for classification.", encoding="utf-8")
@@ -465,9 +512,26 @@ class ResearchConfigTests(unittest.TestCase):
             path.write_text('[task]\ngoal="Replay learning"\noutputs=["experiments"]\noutput_root="out"\n'
                             '[model]\nname=""\n[research]\nproviders=["local_files"]\n[assets]\npapers=["paper.md"]\n'
                             '[budget]\ntotal_tokens=123456\nprocess_invocations=2\nprocess_wall_seconds=60\n', encoding="utf-8")
-            with redirect_stdout(io.StringIO()), self.assertRaisesRegex(SystemExit, "paused"):
-                main(["research-session", "--config", str(path)])
-            session = next((root / "out").iterdir())
+            argv = ["research-session", "--config", str(path)]
+            args = build_parser(research_defaults=research_defaults(argv)).parse_args(argv)
+            session = root / "out" / "historical-attach"
+            # This resume contract belongs to sessions created by the historical owner.
+            app = ResearchApplication.create(ResearchBrief(
+                request_text=args.topic, objective=args.topic, intents=("research", "experiment"),
+                requested_outputs=tuple(args.outputs), asset_requests=tuple({
+                    "locator": paper, "kind": "file", "role": "paper", "mutability": "read_only",
+                    "allowed_uses": ["read", "reference"]} for paper in args.local_document)),
+                root=session, services=ResearchApplicationServices(
+                    max_results=args.max_results, max_chunks=args.max_chunks, idea_limit=args.idea_limit,
+                    input_base_dir=root, max_attempts=20,
+                    budget_limits={name: getattr(args, name) for name in (
+                        "llm_requests", "total_tokens", "process_invocations", "process_wall_seconds")},
+                    config={"research_sources": args.providers,
+                        "research_max_documents": args.max_results,
+                        "research_max_iterations": args.max_research_iterations,
+                        "interaction": "checkpoints",
+                        "report": {**report_settings(args), "mode": "experiment", "template": args.report_template}}))
+            self.assertEqual(app.advance(max_actions=20).status, "paused")
             before = load_session(session).view()
             original_inputs = {
                 key: (session / before.state_refs[key].path).read_bytes()
@@ -636,9 +700,18 @@ class ResearchConfigTests(unittest.TestCase):
             output = io.StringIO()
             with redirect_stdout(output), self.assertRaisesRegex(SystemExit, "status 'paused'"):
                 main(["research-session", "--config", str(path)])
-            self.assertIn("Implementation: preparation required", output.getvalue())
-            self.assertIn("Next action: none", output.getvalue())
-            self.assertIn("Provide execution settings", output.getvalue())
+            deferred_session, = (candidate.parent for candidate in (root / "out").glob("*/budget_ledger.json")
+                                 if candidate != ledger_path)
+            deferred = ToolApplication.load(deferred_session)
+            self.assertEqual(deferred.session.manifest.status, "paused")
+            self.assertTrue(deferred.sources.policy.require_design)
+            self.assertIsNone(deferred.state["config"].get("execution_contract"))
+            self.assertTrue(any((attempt / "research_summary.md").is_file()
+                                for attempt in (deferred_session / "attempts").iterdir()))
+            self.assertEqual(session_materials(deferred_session), {})
+            self.assertEqual(deferred.ledger.limits["total_tokens"], 123456)
+            self.assertFalse(deferred.ledger.entries)
+            self.assertIn("not complete", output.getvalue())
 
     def test_file_paths_and_explicit_cli_overrides(self):
         with tempfile.TemporaryDirectory() as directory:
