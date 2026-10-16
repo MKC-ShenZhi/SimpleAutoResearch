@@ -549,18 +549,14 @@ def _create_declared_execution(args: argparse.Namespace, *, execution: dict, req
     from simple_ar.research.workflow_contracts import ResearchBrief
     config = {**(research_config or {}), 'execution': execution,
         'interaction': getattr(args, 'interaction', None) or (research_config or {}).get('interaction') or 'checkpoints',
-        'require_design': research_work, 'execution_confirmation': confirm_protocol,
+        'require_design': (research_config or {}).get('require_design', research_work and 'experiments' in outputs),
+        'execution_confirmation': confirm_protocol,
         'report': report_config or {}, 'report_writing_method': writing_method,
         'max_output_tokens': getattr(args, 'max_output_tokens', None) if args.model else None}
     if research_work:
         config.update(queries=list(args.queries or ()),
             providers=list(args.providers or ('openalex', 'semantic_scholar', 'arxiv')))
-    # Only explicitly supplied bounds are authorities. Computed legacy execution
-    # estimates are replaced by the common owner, including environment steps.
     budgets = {**limits}
-    for name in ('process_invocations', 'process_wall_seconds'):
-        if getattr(args, name, None) is None and budgets.get(name) != 0:
-            budgets.pop(name, None)
     for name, default in (('llm_requests', 30), ('total_tokens', 600000)):
         if budgets.get(name) is None:
             budgets[name] = default if args.model else 0
@@ -584,134 +580,56 @@ def _print_execution_confirmation(app, root: Path) -> None:
         f'--decision-id {decision["decision_id"]} --decision-response accept')
 
 
-def migrate_exact_code_creation(args: argparse.Namespace, *, execution: dict,
-                                request: str, outputs: tuple, sources: tuple,
-                                limits: dict, root: Path, report_config: dict | None = None,
-                                writing_method: str | None = None,
-                                research_config: dict | None = None) -> bool:
-    """Create through the Python owner; execution and display stay in the CLI."""
-    from simple_ar.app.research_intake import UnsupportedExecutionCreation
+def create_declared_research(args: argparse.Namespace, *, execution: dict,
+                             request: str, outputs: tuple, limits: dict, root: Path,
+                             sources: tuple = (), report_config: dict | None = None,
+                             writing_method: str | None = None,
+                             research_config: dict | None = None) -> bool:
+    """Create every declared CLI task through the common domain owner.
+
+    Merged CLI fields have already been validated. Domain admission either
+    preserves the declared contract or raises before creation; it never sends
+    a different request to a second application.
+    """
     from simple_ar.cli.research_config import FIELDS
     from simple_ar.cli.main import _render_native_result, _ensure_research_cli_success
-    if not isinstance(execution.get('code_task'), dict) or 'run_dir' in execution['code_task']:
-        return False
-    research_fields = {destination for destination, _ in FIELDS['research'].values()}
-    research_work = 'experiments' in outputs and _fixed_execution_research(
-        args, sources, outputs, research_config, research_fields)
-    supported = {'config', 'topic', 'task_kind', 'outputs', 'command_argv', 'cwd', 'timeout_sec', 'label',
-        'primary_metric', 'metric', 'metric_direction', 'code_task_config', 'local_document', 'material', 'data_path',
-        'model', 'max_output_tokens', 'output_root', 'with_report', 'no_report',
-        'llm_requests', 'total_tokens', 'process_invocations', 'process_wall_seconds'}
-    supported.update(destination for destination, _ in FIELDS['report'].values())
-    if research_work:
-        supported.update(research_fields | {'selected_idea_id', 'feasibility_review_model'})
-    if (research_config or {}).get('research_materials_only') is True:
-        supported.add('research_materials_only')
+    from simple_ar.tools.scientific import measurement_conditions
+
     scientific = 'experiments' in outputs
-    if scientific:
-        supported.add('interaction')
-    confirm_protocol = (scientific and not research_work
-        and 'interaction' in set(getattr(args, '_explicit_resume_destinations', ()))
-        and getattr(args, 'interaction', None) in {'assisted', 'checkpoints'})
-    if set(getattr(args, '_explicit_resume_destinations', ())) - supported:
-        return False
-    if research_work and (not args.model or research_config is None):
-        return False
-    if getattr(args, 'task_kind', None) == 'reproduction' and 'experiments' in outputs:
-        # Preserve this explicit shortcut's historical single-command promise.
-        # The public domain compiler supports comparisons independently of labels.
-        if 'pairs' in execution or execution.get('baseline_policy') == 'run' or 'baseline' in execution:
-            return False
+    research_fields = {destination for destination, _ in FIELDS['research'].values()}
+    research_work = _fixed_execution_research(args, sources, outputs, research_config, research_fields)
+    if scientific and execution.get('code_task') is not None and args.task_kind == 'reproduction':
         from simple_ar.app.research_execution import code_task_validation
         code_task_validation(execution, required=True)
-    try:
-        app = _create_declared_execution(args, execution=execution, request=request,
-            outputs=outputs, sources=sources, limits=limits, root=root, research_config=research_config,
-            report_config=report_config, writing_method=writing_method, research_work=research_work,
-            confirm_protocol=confirm_protocol)
-    except UnsupportedExecutionCreation:
-        return False
-    print_line(f'Code/measurement creation uses the common Python owner. Task session: {root}')
-    print_line(f'Resume: simple-ar start --resume-task "{root}"')
-    if confirm_protocol:
-        _print_execution_confirmation(app, root)
-    status = app.run(progress=print_line)
-    _render_native_result(app, status)
-    _ensure_research_cli_success(status['status'], operation='Code task', root=root)
-    return True
-
-
-def migrate_measurement_creation(args: argparse.Namespace, *, execution: dict,
-                                request: str, outputs: tuple, root: Path, limits: dict,
-                                sources: tuple = (), report_config: dict | None = None,
-                                writing_method: str | None = None,
-                                research_config: dict | None = None) -> bool:
-    """Create through intake; retain the literal caller's one-use approval."""
-    flat_fields = {'command', 'cwd', 'timeout_sec', 'label', 'result_schema', 'protocol', 'environment'}
-    from simple_ar.cli.research_config import FIELDS
-    research_fields = {destination for destination, _ in FIELDS['research'].values()}
-    explicit = set(getattr(args, '_explicit_resume_destinations', ()))
-    research_work = _fixed_execution_research(args, sources, outputs, research_config, research_fields)
-    if research_work and research_config is None:
-        return False
-    if ('experiments' not in outputs
-            or set(outputs) - {'experiments', 'report', 'summary'}
-            or set(execution) - (flat_fields | {'baseline', 'pairs', 'seeds', 'seed_count', 'seed_flag', 'baseline_policy', 'baseline_ref'})):
-        return False
-    supported = {'config', 'topic', 'task_kind', 'outputs', 'command_argv', 'cwd', 'timeout_sec',
-        'label', 'primary_metric', 'metric', 'metric_direction', 'output_root', 'data_path',
-        'process_invocations', 'process_wall_seconds', 'total_tokens', 'llm_requests', 'no_report', 'model'}
-    if args.model:
-        supported.add('max_output_tokens')
-    if 'report' in outputs:
-        from simple_ar.cli.research_config import FIELDS
-        supported.update(destination for destination, _ in FIELDS['report'].values())
-        supported.update({'with_report', 'local_document', 'material'})
-        if not args.model and not research_work:
-            raise ValueError('A requested authored report requires a model; use --no-report for caller-directed measurement')
-    supported.add('interaction')
-    if research_work:
-        supported.update(research_fields | {'local_document', 'material', 'selected_idea_id', 'feasibility_review_model'})
-    unsupported = set(getattr(args, '_explicit_resume_destinations', ())) - supported
-    if unsupported:
-        if research_work or args.task_kind != 'measurement':
-            return False  # Preserve other explicitly requested research/interaction work.
-        raise ValueError('Fixed measurement creation cannot reinterpret these explicit controls: '
-                         + ', '.join(sorted(unsupported)))
-    from simple_ar.app.research_intake import UnsupportedExecutionCreation
-    from simple_ar.tools.scientific import measurement_conditions
-    from simple_ar.cli.main import _render_native_result, _ensure_research_cli_success
-    confirm_protocol = (not research_work and 'interaction' in explicit
+    confirm = (scientific and not research_work
+        and 'interaction' in set(getattr(args, '_explicit_resume_destinations', ()))
         and getattr(args, 'interaction', None) in {'assisted', 'checkpoints'})
-    try:
-        app = _create_declared_execution(args, execution=execution, request=request,
-            outputs=outputs, sources=sources, limits=limits, root=root, research_config=research_config,
-            report_config=report_config, writing_method=writing_method,
-            research_work=research_work, confirm_protocol=confirm_protocol)
-    except UnsupportedExecutionCreation:
-        return False
-    if research_work:
+    app = _create_declared_execution(args, execution=execution, request=request,
+        outputs=outputs, sources=sources, limits=limits, root=root,
+        research_config=research_config, report_config=report_config,
+        writing_method=writing_method, research_work=research_work, confirm_protocol=confirm)
+    if confirm:
+        _print_execution_confirmation(app, root)
+    if execution.get('code_task') is not None or research_work:
         _run_created_research(app, request=request, root=root, outputs=outputs, question=args.topic)
         return True
+
+    # Only this caller's initial literal conditions carry one-use execution
+    # intent. A model proposal, retry or later identical command still needs
+    # separate approval. This is not an OS sandbox.
     contract = app.state['config']['execution_contract']
-    conditions = [row for row in measurement_conditions(contract) if 'reuse_ref' not in row] if contract else []
-    grouped = contract is not None and 'conditions' in contract
+    conditions = [row for row in measurement_conditions(contract) if not row.get('reuse_ref')]
+    grouped = 'conditions' in contract
     actions = [{'tool_name': 'measure_experiment', 'arguments':
         {**row['execution'], 'condition_id': row['id']} if grouped else
         row['execution'] if args.model else {**row['execution'], 'delivery': {'summary': request, 'artifacts': []}}}
         for row in conditions]
-    if confirm_protocol:
-        _print_execution_confirmation(app, root)
-    print_line(('Research-led execution' if contract is None else 'Fixed measurement') + ' uses the common task owner, original cwd/argv and '
-               + ('declared environment preparation. ' if execution.get('environment') is not None else 'inherited environment. ')
-               + ('Research requires an accepted design matching the declared execution; execution proposals require approval. '
-                  if research_work else ('Accept this bound protocol, then approve the actual process separately. '
-                  if confirm_protocol else 'Each literal caller condition authorizes one initial execution through the common approval gate; '
-                  if grouped else 'The caller-supplied command authorizes this one initial execution through the common approval gate; '))
-               + 'later proposals require approval. Model interpretation, when selected, uses this same task and ledger. '
-               'This is not an OS sandbox.')
+    print_line('Declared measurement uses the common task owner and original cwd/argv. '
+        + ('Accept the bound protocol, then approve each process separately.' if confirm else
+           'Each initial literal condition carries one-use caller intent; later proposals require approval.'))
     print_line(f'Task session: {root}\nResume: simple-ar start --resume-task "{root}" --approve-execution TOKEN')
     remaining = {f'caller-0-{index}': row['arguments'] for index, row in enumerate(actions)}
+
     def approve(call: dict, token: str) -> bool:
         print_line(f"Execution proposal: {call['function']['arguments']}\nApproval token: {token}")
         arguments = json.loads(call['function']['arguments'])
@@ -730,10 +648,10 @@ def migrate_measurement_creation(args: argparse.Namespace, *, execution: dict,
                            f"Shared process limits: {json.dumps(binding['limits'], sort_keys=True)}")
             else:
                 print_line('Reuse verified shared environment: ' + json.dumps(binding['shared_environment'], sort_keys=True))
-        del remaining[call['id']]  # Once per literal initial caller proposal, never a retry/model proposal.
+        del remaining[call['id']]
         return True
-    status = app.run(progress=print_line) if research_work else app.run(actions=actions,
-        approve=None if confirm_protocol else approve, progress=print_line)
+
+    status = app.run(actions=actions, approve=None if confirm else approve, progress=print_line)
     if grouped and not args.model:
         completion = app.measurement_completion_actions()
         if completion:

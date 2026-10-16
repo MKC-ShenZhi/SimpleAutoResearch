@@ -26,6 +26,31 @@ TEST_ROOT = Path(__file__).resolve().parents[1] / ".tmp_tests"
 
 
 class CliTests(unittest.TestCase):
+    def test_new_declared_execution_calls_unified_entry_without_legacy_creation(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch('simple_ar.cli.start.create_declared_research', return_value=True) as create, \
+                patch('simple_ar.app.research_application.create_session') as legacy, \
+                contextlib.redirect_stdout(io.StringIO()):
+            root = Path(directory).resolve()
+            argv = ['research-session', '--task-kind', 'measurement', '--topic', 'Literal measurement',
+                '--outputs', 'experiments', '--cwd', str(root), '--timeout-sec', '5',
+                '--primary-metric', 'score', '--output-root', str(root / 'runs'),
+                '--command', sys.executable, '-c', "print('score: 3')"]
+            main(argv)
+            create.assert_called_once()
+            options = create.call_args.kwargs
+            self.assertEqual(options['execution']['command'], [sys.executable, '-c', "print('score: 3')"])
+            self.assertEqual(options['request'], 'Literal measurement')
+            self.assertEqual(tuple(options['outputs']), ('experiments',))
+            self.assertEqual(options['limits'], {'llm_requests': None, 'total_tokens': None,
+                'process_invocations': None, 'process_wall_seconds': None})
+            create.reset_mock()
+            create.side_effect = ValueError('Invalid declared execution')
+            with self.assertRaisesRegex(SystemExit, 'Invalid declared execution'):
+                main(argv)
+            create.assert_called_once()
+            legacy.assert_not_called()
+
     def test_fixed_measurement_creation_uses_common_approval_and_original_execution(self):
         from simple_ar.app.tool_application import ToolApplication
         with tempfile.TemporaryDirectory() as temporary:
@@ -340,7 +365,7 @@ code = "daily"
                 if 'experiments' not in outputs:
                     self.assertEqual({k: routed["limits"][k] for k in (
                         "process_invocations", "process_wall_seconds")},
-                        {"process_invocations": 0, "process_wall_seconds": 0})
+                        {"process_invocations": None, "process_wall_seconds": None})
                 source = next(row for row in routed["sources"] if row["role"] == role)
                 self.assertEqual(source["mutability"], "read_only")
                 self.assertEqual(source["allowed_uses"], ["read"] if role == "dataset" else ["read", "reference"])
@@ -1392,6 +1417,7 @@ code = "daily"
 
     def test_research_session_cli_builds_code_task_request_from_config(self) -> None:
         from simple_ar.app.tool_application import ToolApplication
+        from simple_ar.code_task.runtime.config import CodeTaskConfigError
         from simple_ar.tools.scientific import measurement_conditions
         app = MagicMock()
         app.run.return_value = {'status': 'completed'}
@@ -1465,7 +1491,7 @@ code = "daily"
                         patch('sys.stdin.isatty', return_value=False), \
                         patch('simple_ar.app.research_application.create_session') as old, \
                         contextlib.redirect_stdout(io.StringIO()):
-                    with self.assertRaisesRegex(SystemExit, 'Code task ended with status'):
+                    with self.assertRaisesRegex(SystemExit, 'ended with status'):
                         main(['research-session', '--config', str(public), '--topic', 'fixture research',
                               '--model', 'fixture-model', '--no-report', '--output-root', str(root / 'sessions')])
                 old.assert_not_called()
@@ -1566,7 +1592,7 @@ code = "daily"
                 if 'experiments' in options:
                     self.assertEqual([row['source'] for row in routed['execution_contract']['conditions']],
                         ['implementation'])  # Generated candidate, without a suffix-based source heuristic.
-            from simple_ar.cli.start import migrate_exact_code_creation
+            from simple_ar.cli.start import create_declared_research
             config.write_text(original_config.replace('mode = "sparse_copy"', 'mode = "copy"')
                 + '\n[edit_scope]\nallowed_patterns=["adapter.py"]\n', encoding='utf-8')
             reproduction = root / "reproduction.toml"
@@ -1681,21 +1707,19 @@ code = "daily"
                 # Verify this consumer invokes the shared validation gate; its
                 # type/timeout/independence matrix lives in TaskPlanTests.
                 with self.assertRaisesRegex(ValueError, 'validation_command'):
-                    migrate_exact_code_creation(declared, execution={**prepared,
+                    create_declared_research(declared, execution={**prepared,
                         'code_task': {**prepared['code_task'], 'validation_command': None}}, **arguments)
                 with self.assertRaises(ValueError):
-                    migrate_exact_code_creation(declared, execution={**prepared,
+                    create_declared_research(declared, execution={**prepared,
                         'code_task': {**prepared['code_task'], 'validation_command': prepared['command']}}, **arguments)
                 with self.assertRaisesRegex(ValueError, 'cwd must match'):
-                    migrate_exact_code_creation(declared, execution={**prepared, 'cwd': str(root.resolve())}, **arguments)
+                    create_declared_research(declared, execution={**prepared, 'cwd': str(root.resolve())}, **arguments)
                 with self.assertRaisesRegex(ValueError, 'existing absolute directory'):
-                    migrate_exact_code_creation(declared, execution={**prepared, 'cwd': str(root / 'missing')}, **arguments)
-                for extra in ({'pairs': []}, {'baseline_policy': 'run'}):
-                    self.assertFalse(migrate_exact_code_creation(declared, execution={**prepared, **extra}, **arguments))
+                    create_declared_research(declared, execution={**prepared, 'cwd': str(root / 'missing')}, **arguments)
                 with self.assertRaisesRegex(ValueError, 'baseline_policy'):
-                    migrate_exact_code_creation(declared, execution={**prepared, 'baseline_policy': 'paired'}, **arguments)
+                    create_declared_research(declared, execution={**prepared, 'baseline_policy': 'paired'}, **arguments)
                 with self.assertRaises(ValueError):
-                    migrate_exact_code_creation(declared, execution={**prepared,
+                    create_declared_research(declared, execution={**prepared,
                         'environment': {'mode': 'current'}}, **arguments)
                 initial = {**prepared['code_task'], 'workspace_mode': 'copy',
                     'allowed_patterns': ['adapter.py'], 'initial_files': ['adapter.py']}
@@ -1704,7 +1728,7 @@ code = "daily"
                         {'allowed_patterns': ['adapter.txt'], 'initial_files': ['adapter.txt']},
                         {'allowed_patterns': ['tests/test_adapter.py'], 'initial_files': ['tests/test_adapter.py']}):
                     with self.subTest(initial_files=changes), self.assertRaises(ValueError):
-                        migrate_exact_code_creation(declared, execution={**prepared,
+                        create_declared_research(declared, execution={**prepared,
                             'code_task': {**initial, **changes}}, **arguments)
                 ordinary = build_parser().parse_args(['research-session', '--task-kind', 'auto',
                     '--topic', 'Check published conditions', '--model', 'fixture-model'])
@@ -1712,9 +1736,10 @@ code = "daily"
                     '--topic', 'Topic/paper names do not grant model execution'])
                 no_model.model = None
                 with self.assertRaisesRegex(ValueError, 'requires a model'):
-                    migrate_exact_code_creation(no_model, execution=prepared, **arguments)
-                self.assertFalse(migrate_exact_code_creation(ordinary,
-                    execution={**prepared, 'baseline_policy': 'reuse'}, **arguments))
+                    create_declared_research(no_model, execution=prepared, **arguments)
+                with self.assertRaises(ValueError):
+                    create_declared_research(ordinary,
+                        execution={**prepared, 'baseline_policy': 'reuse'}, **arguments)
                 for mode, source in (('empty', None), ('empty', str(project)),
                         ('copy', None), ('sparse_copy', str(root / 'missing'))):
                     with self.subTest(baseline_without_source=(mode, source)):
@@ -1722,20 +1747,17 @@ code = "daily"
                             'baseline': {'command': prepared['command']},
                             'code_task': {**prepared['code_task'], 'kind': 'greenfield',
                                 'workspace_mode': mode, 'code_root': source}}
-                        if mode == 'empty':
-                            self.assertFalse(migrate_exact_code_creation(ordinary, execution=declaration, **arguments))
-                        else:
-                            with self.assertRaises((ValueError, RuntimeError)):
-                                migrate_exact_code_creation(ordinary, execution=declaration, **arguments)
+                        with self.assertRaises((ValueError, CodeTaskConfigError)):
+                            create_declared_research(ordinary, execution=declaration, **arguments)
                 create.assert_not_called()
                 with contextlib.redirect_stdout(io.StringIO()):
-                    self.assertTrue(migrate_exact_code_creation(ordinary, execution={**prepared,
+                    self.assertTrue(create_declared_research(ordinary, execution={**prepared,
                         'command': ['python', 'benchmark.py'], 'baseline_policy': 'skip'}, **arguments))
                 self.assertEqual([row['source'] for row in create.call_args.kwargs['execution_contract']['conditions']],
                     ['implementation'])
                 create.reset_mock()
                 with contextlib.redirect_stdout(io.StringIO()):
-                    self.assertTrue(migrate_exact_code_creation(ordinary, execution={**prepared,
+                    self.assertTrue(create_declared_research(ordinary, execution={**prepared,
                         'command': ['python', 'benchmark.py'], 'baseline_policy': 'run',
                         'baseline': {'command': ['python', 'benchmark.py']},
                         'code_task': {**prepared['code_task'], 'kind': 'greenfield', 'workspace_mode': 'copy'}}, **arguments))
@@ -1749,7 +1771,7 @@ code = "daily"
                 data = project / 'observations.tsv'
                 data.write_text('value\n1\n')
                 with contextlib.redirect_stdout(io.StringIO()):
-                    self.assertTrue(migrate_exact_code_creation(declared, execution={**prepared,
+                    self.assertTrue(create_declared_research(declared, execution={**prepared,
                         'code_task': {**prepared['code_task'], 'workspace_mode': 'copy'}},
                         **{**arguments, 'sources': ({'role': 'dataset', 'locator': str(data)},)}))
                 self.assertEqual(create.call_args.kwargs['code_task']['preparation']['data_inputs'], ['observations.tsv'])
@@ -1757,7 +1779,7 @@ code = "daily"
                 empty = {**prepared, 'cwd': str(root.resolve()), 'code_task': {**prepared['code_task'],
                     'kind': 'greenfield', 'workspace_mode': 'empty', 'code_root': None}}
                 with contextlib.redirect_stdout(io.StringIO()):
-                    self.assertTrue(migrate_exact_code_creation(declared, execution=empty, **arguments))
+                    self.assertTrue(create_declared_research(declared, execution=empty, **arguments))
                 create.assert_called_once()
                 self.assertEqual(list(create.call_args.kwargs['sources'].values()), [])
                 self.assertEqual(create.call_args.kwargs['code_task']['project_path'], '')

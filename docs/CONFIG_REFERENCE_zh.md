@@ -59,7 +59,7 @@ app = create_research_task(ResearchBrief(request_text="测量所提供的程序�
 
 需要研究且未声明比较控制时，创建保留开放设计，不默认补 `baseline_policy="skip"`。接受后的设计进入同一科学所有者；精确代码任务分别绑定未改源码基线和已实现候选，不能扩大编辑范围、替换环境，或给空项目虚构源码基线。没有模型或命令时，结构化实验请求可先保存材料，暂停等待[明确补齐条件](CLI_REFERENCE_zh.md)；收集材料不等于实验或报告完成。首次绑定模型须在原账本明确追加正数请求和token额度。
 
-已初始化 `run_dir` 采用及带产生来源血缘的基线保留真实所有者；不支持的控制须明确拒绝，不能降为仅候选工作或导入裸结果。旧应用 API 仍承接其已有合同及历史继续。
+所有结构化 CLI 新任务使用共同创建所有者；不支持的声明在创建前报错，不回退另一应用。`create_session`/`ResearchApplication.create` 是显式兼容 API，保留原 `view`/`advance` 及历史运行合同，不再作为新 CLI 任务的后端。旧运行和基线产生来源血缘不能用目录副本或裸结果替代。
 
 可信 Python 集成可通过 services 注入文本客户端、独立审阅客户端和 `SearchProviderRegistry`。客户端须实现 `with_budget` 及 `ask_json` 或 `chat_turn`，绑定任务实际账本、会话与 attempt。继续服务工作前，用 `ToolApplication.load(path, services=services)` 恢复依赖。持久化只保留类型/模型身份和 provider 名称，不保存密钥或可执行对象；缺失依赖不会回退环境客户端或内置检索器。自定义实现由调用方信任，不是安全沙箱，也不独立验证实现身份。需跨 CLI/重启使用时，优先命名连接；`model="env"` 表示配置的默认模型，不是名为 env 的服务商模型。
 
@@ -199,11 +199,11 @@ papers = ["paper.md"]
 | --- | --- |
 | survey | 只读文献，除明确代码交付兼容合同外不执行 |
 | bug_fix | 已有项目 CodeTask；输出 bug_fix，可加 report；不跑基线 |
-| measurement | 明确命令、experiments及可选report（须模型）、有限进程额度；固定配对可共享一次可核环境准备；不发现/设计/改码或复用历史基线 |
+| measurement | 明确命令、experiments及可选summary/report（写作须模型）；无CodeTask；可在同一任务使用来源/设计及已核外部基线 |
 | reproduction | 下述固定协议，experiments 可加 report |
 | writing | 本地材料/论文，仅 report，不执行 |
 | data_analysis | 已有表，data_analysis 可加 report，不研究/CodeTask/进程执行 |
-| auto | 已接受计划选择有界步骤，不自动寻找仓库或安装 |
+| auto | 声明合同与共同动作循环，按需选择能力，不另建固定流程；安装须独立授权 |
 
 明确 outputs 不能与 `--with-report`/`--no-report` 合用。可行性审查是模型判断，不是执行证明。
 
@@ -541,7 +541,7 @@ Greenfield 设置 kind="greenfield"。没有脚手架时省略 code_root，并�
 
 通过 `execution.code_task_config` 或 `--code-task-config` 引用同一文件。CodeTask 负责编辑和验证，研究应用负责测量和报告。复现 adapter 是明确允许同时声明独立正式命令的例外。
 
-新建精确 CodeTask 请求的代码、可选环境准备、声明的基线/候选条件及报告/反馈共享原生任务，包括已支持的 copy/sparse 源码脚手架及必需新 Python 文件。环境只准备一次，条件测量与反馈复用；默认进程额度包含准备步骤，显式限制不改。任务 venv 不得静默替换明确选择的外部解释器。已声明测量的 auto/autonomous 任务还可调查材料并形成接受后的设计：实施直接消费原设计，批准绑定设计、接受意见和来源记录；证据变化会使旧实施批准失效。独立源码/环境准备可先于设计接受，接受设计不授予执行权限。CodeTask 基线复用、分阶段/checkpoint 新建及历史继续保留独特合同。工作区、编辑范围、独立验证和执行批准不丢；运行命令不等于批准执行。原生任务用 `simple-ar start --resume-task SESSION` 继续。原生工具需要 Chat 连接。Worktree 批准暂不能绑定 checkout 过滤、attributes、子模块或换行转换；需要这些语义时保留专家协议，或由用户明确选 copy。
+精确代码、准备、比较及报告/反馈共用原生任务。环境只准备一次；默认进程额度包含准备和修复，显式限制包括零始终优先。来源、简报及代码产出可组合，不必虚构科学设计；确需设计时，实施消费已接受原件，批准绑定当前源码与证据，接受设计不授予进程权限。原生任务沿simple-ar start --resume-task SESSION继续，需要Chat连接。显式旧运行采用API保留原合同，新CLI任务不回退这些API。Worktree批准尚不能绑定checkout过滤、attributes、子模块或换行转换，需要时明确选copy或保留专家协议。
 
 要求 report 时，写作直接消费已接受的实施证据及真实修订关系，由原写作模块执行保存的整稿/分节、adaptive 规划、审阅及有界修订要求；必需标题顺序和引文上限仍是硬约束。完成交付同时要求已验证代码和当前规范稿，反馈后也不能拿旧稿充数。任务 max_output_tokens 在专业路由后保留，不修改命名连接；明确的逐次上限（包括 max_section_tokens）优先。缺少报告修订或仍有必需解决的意见时保持 partial，不当作完成。
 

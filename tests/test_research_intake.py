@@ -337,6 +337,25 @@ class ResearchIntakeTests(unittest.TestCase):
             self.assertEqual(reviewer.calls, [])
             self.assertEqual(execution, original)
             self.assertEqual((project / 'check.py').read_text(), 'pass\n')
+            paper = base / 'method.md'
+            paper.write_text('A supplied method description, not verified implementation evidence.', encoding='utf-8')
+            for outputs in (('code_task', 'summary'), ('code_task', 'experiments')):
+                combined = create_research_task(ResearchBrief(request_text='Use the supplied method and implement it.',
+                    requested_outputs=outputs, asset_requests=({'locator': str(paper), 'role': 'paper'},)),
+                    root=base / '-'.join(outputs), services=services)
+                self.assertEqual(combined.state['config']['code_task']['project_path'], 'source0')
+                self.assertEqual(combined.sources.policy.materials, ('source1',))
+                self.assertFalse(combined.sources.policy.require_design)  # Explicit caller choice remains authoritative.
+                self.assertEqual(combined.sources.policy.require_summary, 'summary' in outputs)
+                self.assertEqual(combined.state['config'].get('execution_contract') is not None,
+                    'experiments' in outputs)
+                self.assertEqual(combined.session.list_attempts(), ())
+            with self.assertRaisesRegex(ValueError, 'execution.code_task'):
+                create_research_task(ResearchBrief(request_text='Do not claim code work from a bare command.',
+                    requested_outputs=('code_task', 'experiments')), root=base / 'invalid-code',
+                    services=replace(services, config={'execution': {key: value for key, value in execution.items()
+                        if key != 'code_task'}, 'require_design': False}))
+            self.assertFalse((base / 'invalid-code').exists())
 
     def test_public_fixed_conditions_environment_and_confirmation_only_create(self):
         import sys

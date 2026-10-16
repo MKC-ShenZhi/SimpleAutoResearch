@@ -311,19 +311,19 @@ simple-ar research-session --config research.toml --session-root SESSION --model
 
 没有CodeTask的`measurement`新建，支持通过共同任务执行平直单命令或明确的baseline-run比较（pairs，或带声明seed_flag的紧凑种子配置）。每条字面条件只授权初始一次，保留原cwd、argv和继承环境；明确的任务venv配置另绑定实际解释器。协议只有seeds、没有argv绑定时仍是内部批处理，不增加进程。完整声明不能被静默缩减或换配；完成交付要求实际条件及对应确定性分析，缺测、失败或条件不可比须明确保留。
 
-普通 CodeTask benchmark 即使 validator 与正式 argv 相同也可迁共同 owner，但仍须独立物理调用和记账，校验结果不算测量；严格 reproduction 仍要求不同命令。声明条件可附带必需新 Python 文件和一次 current/venv 准备，不必更换任务类别；精确范围及来源检查保留。默认预算含准备步骤，显式限制不改；venv 的 Python 别名交准备 owner 选择真实解释器。greenfield `copy`/`sparse_copy` 有真实 source 项目时可测源码 baseline，条件显式标记 `source="preparation"`、`before_implementation=true`：先 prepare，完成全部声明基线，再调用 `implement(prepared_result)` 并传实际成功基线事实。失败或缺测阻止生成。empty/无 source 的 baseline 请求保留准确旧 owner 或拒绝。
+普通 CodeTask benchmark 即使 validator 与正式 argv 相同也可迁共同 owner，但仍须独立物理调用和记账，校验结果不算测量；严格 reproduction 仍要求不同命令。声明条件可附带必需新 Python 文件和一次 current/venv 准备，不必更换任务类别；精确范围及来源检查保留。默认预算含准备步骤，显式限制不改；venv 的 Python 别名交准备 owner 选择真实解释器。greenfield `copy`/`sparse_copy` 有真实 source 项目时可测源码 baseline，条件显式标记 `source="preparation"`、`before_implementation=true`：先 prepare，完成全部声明基线，再调用 `implement(prepared_result)` 并传实际成功基线事实。失败或缺测阻止生成。empty/无source项目不能虚构未改源码基线，须提供真实源码或已核外部测量证据。
 
 精确argv明确选中的外部已有文件沿单文件只读来源传递，并在批准时绑定hash，也支持`--option=FILE`。不会挂载其父目录或推断目录授权，数据/材料目录须显式提供。域摘要缺失时，只在产物和候选核验后复用完整已存观察，不重跑模型或校验器。
 
-无模型时本地完成比较与交付，安全恢复后也能继续；指定`--model`须有原生任务Chat工具调用配置及有限正数请求/token预算，同一任务和账本继续解释，后续执行仍须批准，不静默改协议。按打印的`start --resume-task`恢复，中断和未知进程不重放。显式候选集合、CodeTask准备、外部基线引用复用（含CodeTask消费）及已支持的auto/autonomous研究与执行组合共享共同任务；带产生来源血缘的基线导入、分阶段/checkpoint新建及不支持的组合保留原owner，不静默转换。
+有模型时，解释和后续工具共用原任务/账本，需要Chat连接及有限请求/token额度。无模型可完成调用方已声明测量和确定性分析，但缺少模型、设计或报告的工作仍待续。沿打印的start --resume-task恢复，未知操作不重放。代码准备、声明比较、研究与写作共用创建所有者；不支持的新声明明确报错，历史会话保留真实原owner及记录。
 
 测量加写作可用`--task-kind measurement --outputs experiments report --model SELECTOR`及既有报告选项。不要求先修改代码：Writer消费真实测量和对应确定性分析；参考材料沿local-document/material输入。反馈要求新的规范写作回执，原结果、稿件与账本保留，不重跑测量。缺分析或旧稿不能算完整报告交付。
 
 测量可带`execution.environment`：当前环境检查，或任务venv、声明的依赖/项目安装及短检查。冻结多条件共享一个真实attempt的准备回执，要求相同cwd/profile及兼容解释器，后续条件不重复安装。准备前核全部条件与准备的有限额度，显式限制包括零始终优先；来源或准备变化、中断与未核清进程均阻断复用。检查指标不是正式测量。安装可能执行构建代码、使用网络，并非OS沙箱；不能替换CodeTask自有环境。
 
-`auto`请求若明确选择autonomous交互、只要experiments且没有另外的文献/研究工作，也复用这条精确能力路径。checkpoint结构化任务仍保持原决定合同，不静默改成自动批准。
+结构化新任务不因任务名或交互模式不同而改走另一创建路径；材料、简报、代码和实验按声明合同组合。读取来源不等于必须另做科学设计，协议接受与进程批准仍分开。不支持的声明明确报错，不再新建旧控制器任务；已有会话继续使用其原恢复所有者。
 
-无效模型计划最多接受一次修正。提案和错误保存在 `attempts/plan-*/task_plan_proposals.json`；没有有效计划时，下游工作暂停。CodeTask 使用配置的项目、工作区、基准和编辑范围。经审阅的大改动需要 `execute.allow_large_edits=true`。
+历史结构化会话保留有界计划纠正及 `attempts/plan-*/task_plan_proposals.json`，新任务使用共同动作记录。CodeTask 保留项目、工作区、基准及编辑范围；经审阅的大改动需要 `execute.allow_large_edits=true`。默认进程额度由实际执行所有者计算，含准备及修复复验，显式限制包括零始终优先。
 
 结构化修复省略进程限制时，会为校验及配置的修复和复测预留容量；显式限制始终优先，包括零。
 
@@ -376,7 +376,7 @@ Rich 会显示决定，不等待 stdin。修改交付还需要报告设置。答
 
 使用 `--task-kind reproduction`、本地来源和固定协议进行复现。measurement 则原样运行一个已有命令，仅做实验。二者都不代表能自动发现任意论文环境，也不保证科学成功。
 
-新建 measurement 未提供模型、CodeTask、环境准备或配对条件时，使用共同任务所有者。用户明确提交的命令只授权初次这一次执行，cwd、argv和继承环境保持；随后记录确定性解释并交付实际产物，不创建研究计划或调用模型。恢复使用打印的 `start --resume-task` 命令，不自动批准重测或重试。不能承接的额外显式控制在创建前拒绝；已有结构化会话和更复杂科学协议仍按原所有者处理。
+所有measurement新建均进入共同任务；固定条件、来源、环境准备和报告按各自合同承接。纯调用方字面命令只携带初次执行意图，确认协议或研究要求不自动授予进程权限；重测及重试仍需批准。恢复沿打印的 `start --resume-task`，未完成工作不作为成功退出。不支持的新声明在创建前报错，不回退旧调度；已有会话保留原恢复所有者。
 
 独立校验、适配器创建、解释器和指标选择器由配置声明，见[执行与报告](CONFIG_REFERENCE_zh.md#执行与报告)。
 

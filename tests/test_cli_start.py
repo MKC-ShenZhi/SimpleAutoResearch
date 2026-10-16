@@ -420,43 +420,12 @@ class StartTests(unittest.TestCase):
                 create.assert_not_called()
                 legacy.assert_not_called()
             self.assertFalse((root / "runs").exists())
-            # Compatibility is selected by explicit controls, including values
-            # equal to parser defaults, rather than a task-name allowlist.
-            from simple_ar.cli.main import _explicit_session_option_destinations
             from simple_ar.cli.start import migrate_new_start
-            controls = (["--allow", "src/**"], ["--validate", "python check.py"],
-                        ["--template", "material_report"], ["--sources", "materials"], ["--fulltext"],
-                        ["--web-extract-backend", "direct"], ["--max-cited-sources", "3"],
-                        ["--interaction", "checkpoints"], ["--environment", "current"],
-                        ["--hypothesis", "Claim"], ["--dataset", "Conditions"],
-                        ["--expected-outcome", "Criterion"], ["--metric", "score"],
-                        ["--output-files", "{}"], ["--metric-sources", "{}"],
-                        ["--cwd", str(root)], ["--timeout-sec", "300"],
-                        ["--requirements", "requirements.txt"], ["--install-project"],
-                        ["--check-argv", '["python", "check.py"]'], ["--command", "python", "run.py"])
-            # Each explicit control owns one routing check. Ordinary preferences
-            # already cover every kind; exact code controls have their own route.
-            for flags in controls:
-                argv = ["start", "--kind", "survey", "--goal", "Keep exact controls", *flags]
-                parser = build_parser()
-                args = parser.parse_args(argv)
-                args._explicit_start_destinations = _explicit_session_option_destinations(parser, argv, set(), command="start")
-                before = vars(args).copy()
-                with self.subTest(controls=flags):
-                    self.assertFalse(migrate_new_start(args))
-                    self.assertEqual(vars(args), before)
             for flags in (["--allow", "src/**"], ["--validate", "python check.py"]):
                 args = build_parser().parse_args(["start", "--kind", "bug_fix", "--goal", "Keep exact controls", *flags])
                 with self.subTest(incomplete_code=flags), self.assertRaisesRegex(
                         ValueError, 'requires --project, --allow and --validate'):
                     migrate_new_start(args)
-            for flags in (["--chat"], ["--resume-setup", str(root)],
-                          ["--from-session", str(root), "--reuse", "report"],
-                          ["--data-file", str(data), "--value-column", "x"],
-                          ["--data-file", str(data), "--x-column", "x"],
-                          ["--data-file", str(data), "--paired-baseline", "x"]):
-                args = build_parser().parse_args(["start", "--kind", "data_analysis", *flags])
-                self.assertFalse(migrate_new_start(args))
 
     def test_saved_delivery_reuse_keeps_draft_evidence_and_old_session(self):
         from simple_ar.core.capabilities import CapabilityRegistry
@@ -1314,7 +1283,94 @@ class StartTests(unittest.TestCase):
             run.assert_called_once()
             self.assertEqual(run.call_args.args[0].task_kind, "survey")
             self.assertEqual(run.call_args.args[0].outputs, ["report"])
-        from simple_ar.cli.start import migrate_measurement_creation
+
+    def test_literal_creation_preserves_limits_and_requires_completion(self):
+        from simple_ar.cli.start import create_declared_research
+        with tempfile.TemporaryDirectory() as directory, \
+                patch('simple_ar.app.tool_application.ToolApplication.create') as create, \
+                patch('simple_ar.app.research_application.create_session') as legacy, \
+                patch('simple_ar.cli.main._render_native_result'), patch('simple_ar.cli.start.print_line'):
+            root = Path(directory).resolve()
+            args = build_parser().parse_args(['research-session', '--task-kind', 'measurement',
+                '--topic', 'Run the exact command'])
+            args.model = None
+            execution = {'command': [sys.executable, '-c', "print('score: 3')"],
+                'cwd': str(root), 'timeout_sec': 5, 'result_schema': {'primary_metric': 'score'}}
+            app = self._capture_creation(create)
+            for bounds, status in (((None, None), 'completed'), ((2, 10), 'completed'),
+                    ((0, 0), 'completed'), ((0, 0), 'paused'), ((0, 0), 'partial'), ((0, 0), 'failed')):
+                limits = dict(zip(('process_invocations', 'process_wall_seconds'), bounds))
+                with self.subTest(bounds=bounds, status=status):
+                    app.run.reset_mock()
+                    app.run.return_value = {'status': status}
+                    arguments = dict(execution=execution, request=args.topic,
+                        outputs=('experiments',), limits=limits, root=root)
+                    if status == 'completed':
+                        self.assertTrue(create_declared_research(args, **arguments))
+                    else:
+                        with self.assertRaisesRegex(SystemExit, f"status '{status}'"):
+                            create_declared_research(args, **arguments)
+                    options = create.call_args.kwargs
+                    self.assertEqual(options['process_limits'], {
+                        'process_invocations': 1 if bounds[0] is None else bounds[0],
+                        'process_wall_seconds': 5 if bounds[1] is None else bounds[1]})
+                    self.assertIsNone(options['model'])
+                    self.assertIsNone(options['report_requirement'])
+                    self.assertTrue(callable(app.run.call_args.kwargs['approve']))
+                    self.assertEqual(len(app.run.call_args.kwargs['actions']), 1)
+            legacy.assert_not_called()
+
+    def test_code_outputs_compose_with_sources_summary_and_fixed_experiments(self):
+        from simple_ar.cli.start import create_declared_research
+        with tempfile.TemporaryDirectory() as directory, \
+                patch('simple_ar.app.tool_application.ToolApplication.create') as create, \
+                patch('simple_ar.app.research_application.create_session') as legacy, \
+                patch('simple_ar.cli.main._render_native_result'), patch('simple_ar.cli.start.print_line'):
+            root = Path(directory).resolve()
+            project = root / 'project'
+            project.mkdir()
+            paper = root / 'notes.md'
+            paper.write_text('Supplied adapter requirements', encoding='utf-8')
+            args = build_parser().parse_args(['research-session', '--model', 'fixture',
+                '--topic', 'Implement the declared adapter', '--query', 'adapter requirements'])
+            args._explicit_resume_destinations = {'model', 'queries'}
+            execution = {'command': ['python', 'measure.py'], 'cwd': str(project), 'timeout_sec': 5,
+                'result_schema': {'primary_metric': 'score'}, 'baseline_policy': 'skip',
+                'code_task': {'code_root': str(project), 'validation_command': ['python', 'check.py'],
+                    'validation_timeout_sec': 7}}
+            app = self._capture_creation(create)
+            app.run.return_value = {'status': 'completed'}
+            for outputs in (('code_task',), ('code_task', 'summary'), ('experiments', 'code_task')):
+                with self.subTest(outputs=outputs):
+                    app.run.reset_mock()
+                    self.assertTrue(create_declared_research(args, execution=execution, request=args.topic,
+                        outputs=outputs, root=root / '-'.join(outputs),
+                        sources=({'locator': str(paper), 'role': 'material'},),
+                        research_config={'require_design': False, 'research_materials_only': True},
+                        limits={'process_invocations': 0, 'process_wall_seconds': 0}))
+                    options = create.call_args.kwargs
+                    self.assertFalse(options['research_policy']['require_design'])
+                    self.assertEqual(options['research_policy']['require_summary'], 'summary' in outputs)
+                    self.assertEqual(options['research_policy']['materials'], ['source1'])
+                    self.assertEqual(options['research_policy']['queries'], ['adapter requirements'])
+                    self.assertEqual(options['code_task']['validation_command'], ['python', 'check.py'])
+                    self.assertEqual(options['execution_contract'] is not None, 'experiments' in outputs)
+                    self.assertEqual(options['process_limits'], {'process_invocations': 0, 'process_wall_seconds': 0})
+                    app.run.assert_called_once()
+                    self.assertNotIn('approve', app.run.call_args.kwargs)
+            create.reset_mock()
+            with self.assertRaisesRegex(ValueError, 'execution.code_task'):
+                create_declared_research(args, execution={key: value for key, value in execution.items()
+                    if key != 'code_task'}, request=args.topic, outputs=('experiments', 'code_task'),
+                    root=root / 'invalid', limits={})
+            create.assert_not_called()
+            legacy.assert_not_called()
+            self.assertEqual(paper.read_text(encoding='utf-8'), 'Supplied adapter requirements')
+            self.assertEqual(list(project.iterdir()), [])
+
+    def test_declared_measurement_rejects_invalid_inputs_before_creation(self):
+        from simple_ar.cli.start import create_declared_research
+        from simple_ar.app.research_intake import UnsupportedExecutionCreation
         with tempfile.TemporaryDirectory() as directory, \
                 patch('simple_ar.app.tool_application.ToolApplication.create') as create, \
                 patch('simple_ar.cli.main._render_native_result'), patch('simple_ar.cli.start.print_line') as print_line:
@@ -1328,27 +1384,29 @@ class StartTests(unittest.TestCase):
                     *(['--model', model] if model else [])])
                 args._explicit_resume_destinations = {'task_kind', 'model'}
                 with self.assertRaisesRegex(ValueError, 'explicit interpreters'):
-                    migrate_measurement_creation(args, execution={**execution, 'environment': {'mode': 'venv'}},
+                    create_declared_research(args, execution={**execution, 'environment': {'mode': 'venv'}},
                         request='Do not replace the selected interpreter', outputs=('experiments',), root=root, limits=limits)
                 with self.assertRaisesRegex(ValueError, 'baseline_ref requires baseline_policy=reuse'):
-                    migrate_measurement_creation(args, execution={**execution, 'baseline_ref': 'historical.json'},
+                    create_declared_research(args, execution={**execution, 'baseline_ref': 'historical.json'},
                         request='Reject an unrequested baseline', outputs=('experiments',), root=root, limits=limits)
-                self.assertFalse(migrate_measurement_creation(args, execution={**execution, 'baseline_policy': 'reuse'},
-                    request='Keep historical reuse with its owner', outputs=('experiments',), root=root, limits=limits))
-                self.assertFalse(migrate_measurement_creation(args, execution=execution,
-                    request='Keep explicit outputs', outputs=('report',), root=root, limits=limits))
-                if model is None:
-                    with self.assertRaisesRegex(ValueError, 'authored report requires a model'):
-                        migrate_measurement_creation(args, execution=execution,
-                            request='Do not fabricate a report', outputs=('experiments', 'report'), root=root, limits=limits)
-                create.assert_not_called()
-                if model:
-                    for key, value in (('llm_requests', 0), ('total_tokens', 0), ('total_tokens', -1)):
-                        with self.assertRaisesRegex(ValueError, 'finite positive'):
-                            migrate_measurement_creation(args, execution=execution, request='Bounded creation',
-                                outputs=('experiments',), root=root, limits={**limits, key: value})
+                with self.assertRaises(UnsupportedExecutionCreation):
+                    create_declared_research(args, execution={**execution, 'baseline_policy': 'reuse'},
+                        request='Keep historical reuse with its owner', outputs=('experiments',), root=root, limits=limits)
+                with self.assertRaises(UnsupportedExecutionCreation):
+                    create_declared_research(args, execution=execution,
+                        request='Keep explicit outputs', outputs=('report',), root=root, limits=limits)
                 create.assert_not_called()
 
+    def test_literal_conditions_approve_once_and_share_environment_budget(self):
+        from simple_ar.cli.start import create_declared_research
+        with tempfile.TemporaryDirectory() as directory, \
+                patch('simple_ar.app.tool_application.ToolApplication.create') as create, \
+                patch('simple_ar.cli.main._render_native_result'), patch('simple_ar.cli.start.print_line') as print_line:
+            root = Path(directory).resolve()
+            execution = {'command': [sys.executable, '-c', "print('score: 3')"], 'cwd': str(root),
+                'timeout_sec': 5, 'result_schema': {'primary_metric': 'score'}}
+            limits = {'llm_requests': 3, 'total_tokens': 24000,
+                'process_invocations': None, 'process_wall_seconds': None}
             args = build_parser().parse_args(['research-session', '--topic', 'Measure declared conditions', '--task-kind', 'measurement'])
             args.model = None
             args._explicit_resume_destinations = {'task_kind'}
@@ -1376,15 +1434,15 @@ class StartTests(unittest.TestCase):
                     self.assertFalse(approve(call, 'never-retry'))
                 return {'status': 'completed'}
             app.run.side_effect = run_batch
-            self.assertTrue(migrate_measurement_creation(args, execution=grouped, request='Prepare once for all roles',
+            self.assertTrue(create_declared_research(args, execution=grouped, request='Prepare once for all roles',
                 outputs=('experiments',), root=root, limits=limits))
             options = create.call_args.kwargs
             self.assertIsNone(options['code_task'])
             self.assertEqual(options['process_limits'], {'process_invocations': 5, 'process_wall_seconds': 25})
             self.assertEqual(len(options['execution_contract']['conditions']), 4)
-            args.process_invocations, args.process_wall_seconds = 2, 10
-            migrate_measurement_creation(args, execution=grouped, request='Keep explicit limits',
-                outputs=('experiments',), root=root, limits=limits)
+            create_declared_research(args, execution=grouped, request='Keep explicit limits',
+                outputs=('experiments',), root=root, limits={**limits,
+                    'process_invocations': 2, 'process_wall_seconds': 10})
             self.assertEqual(create.call_args.kwargs['process_limits'],
                 {'process_invocations': 2, 'process_wall_seconds': 10})
             create.reset_mock()
@@ -1392,16 +1450,28 @@ class StartTests(unittest.TestCase):
             other = root / 'other'
             other.mkdir()
             with self.assertRaisesRegex(ValueError, 'same declared cwd'):
-                migrate_measurement_creation(args, execution={**grouped, 'baseline': {
+                create_declared_research(args, execution={**grouped, 'baseline': {
                     'command': execution['command'], 'cwd': str(other)}}, request='Invalid shared cwd',
                     outputs=('experiments',), root=root, limits=limits)
             create.assert_not_called()
             with self.assertRaises(ValueError):
-                migrate_measurement_creation(args, execution={**grouped, 'baseline': {
+                create_declared_research(args, execution={**grouped, 'baseline': {
                     'command': execution['command'], 'environment': {'mode': 'venv'}}},
                     request='No per-condition environment replacement', outputs=('experiments',), root=root, limits=limits)
             create.assert_not_called()
 
+    def test_fixed_research_preserves_sources_policy_and_separate_process_approval(self):
+        from simple_ar.cli.start import create_declared_research
+        from simple_ar.app.research_intake import UnsupportedExecutionCreation
+        with tempfile.TemporaryDirectory() as directory, \
+                patch('simple_ar.app.tool_application.ToolApplication.create') as create, \
+                patch('simple_ar.cli.main._render_native_result'), patch('simple_ar.cli.start.print_line') as print_line:
+            root = Path(directory).resolve()
+            execution = {'command': [sys.executable, '-c', "print('score: 3')"], 'cwd': str(root),
+                'timeout_sec': 5, 'result_schema': {'primary_metric': 'score'}}
+            limits = {'llm_requests': 3, 'total_tokens': 24000,
+                'process_invocations': None, 'process_wall_seconds': None}
+            app = self._capture_creation(create)
             # Fixed research keeps one owner, but investigation/design must
             # precede separately approved execution of the declared comparison.
             from simple_ar.tools.sources import SourcePolicy
@@ -1459,9 +1529,11 @@ class StartTests(unittest.TestCase):
                         {'queries', 'providers', 'process_invocations', 'process_wall_seconds'}
                         if explicit_budget else set())
                     with self.assertRaisesRegex(SystemExit, "status 'paused'"):
-                        migrate_measurement_creation(research_args, execution=declared_execution,
+                        create_declared_research(research_args, execution=declared_execution,
                             request='Investigate before measuring; commands require separate approval',
-                            outputs=('experiments', 'summary'), root=root, limits=limits, sources=selected_sources,
+                            outputs=('experiments', 'summary'), root=root, limits={**limits,
+                                'process_invocations': 2 if explicit_budget else None,
+                                'process_wall_seconds': 10 if explicit_budget else None}, sources=selected_sources,
                             research_config={**research, 'interaction': interaction,
                                              'research_materials_only': materials_only})
                     create.assert_called_once()
@@ -1502,28 +1574,27 @@ class StartTests(unittest.TestCase):
                     legacy.assert_not_called()
                     self.assertEqual({path: path.read_bytes() for path in originals}, originals)
             create.reset_mock()
-            # Open comparison design no longer creates a second controller or
-            # invents a skip policy. Historical unreferenced reuse still needs
-            # its original owner rather than a copied baseline result.
+            # Open comparison design keeps one owner without inventing skip.
             research_args.model, research_args.interaction = 'fixture', 'checkpoints'
             with self.assertRaisesRegex(SystemExit, "status 'paused'"):
-                migrate_measurement_creation(research_args, execution=execution,
+                create_declared_research(research_args, execution=execution,
                     request='Design the missing comparison', outputs=('experiments',), root=root,
                     limits=limits, sources=sources, research_config=research)
             create.assert_called_once()
             self.assertIsNone(create.call_args.kwargs['execution_contract'])
             self.assertNotIn('baseline_policy', create.call_args.kwargs['research_policy']['execution_boundary'])
             create.reset_mock()
-            self.assertFalse(migrate_measurement_creation(research_args,
-                execution={**research_execution, 'baseline_policy': 'reuse'},
-                request='Keep the producing owner', outputs=('experiments',), root=root,
-                limits=limits, sources=sources, research_config=research))
+            with self.assertRaises(UnsupportedExecutionCreation):
+                create_declared_research(research_args,
+                    execution={**research_execution, 'baseline_policy': 'reuse'},
+                    request='Keep the producing owner', outputs=('experiments',), root=root,
+                    limits=limits, sources=sources, research_config=research)
             create.assert_not_called()
             self.assertEqual(json.dumps([research_execution, research, limits, sources], sort_keys=True), frozen_inputs)
 
-    def test_fixed_measurement_research_is_selected_by_obligations_and_keeps_fallbacks(self):
+    def test_fixed_measurement_research_is_selected_by_obligations(self):
         from copy import deepcopy
-        from simple_ar.cli.start import migrate_measurement_creation
+        from simple_ar.cli.start import create_declared_research
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             args = build_parser().parse_args(['research-session', '--task-kind', 'measurement',
@@ -1544,7 +1615,7 @@ class StartTests(unittest.TestCase):
                         patch('simple_ar.cli.start.print_line') as progress, patch('subprocess.run') as process:
                     app = self._capture_creation(create)
                     app.run.return_value = {'status': 'completed'}
-                    self.assertTrue(migrate_measurement_creation(args, execution=execution,
+                    self.assertTrue(create_declared_research(args, execution=execution,
                         request='Honor the declared research obligation', outputs=outputs, root=root,
                         limits=limits, research_config=research))
                     policy = create.call_args.kwargs['research_policy']
@@ -1557,17 +1628,10 @@ class StartTests(unittest.TestCase):
                     app.measurement_completion_actions.assert_not_called()
                     process.assert_not_called()
                 self.assertEqual((vars(args), execution, limits, research), original)
-            with patch('simple_ar.app.tool_application.ToolApplication.create') as create:
-                # Unknown explicit controls cannot be silently dropped from research.
-                args._explicit_resume_destinations.add('report_figures')
-                self.assertFalse(migrate_measurement_creation(args, execution=execution,
-                    request='Retain unmapped controls', outputs=('experiments',), root=root,
-                    limits=limits, research_config=research))
-                create.assert_not_called()
 
     def test_measurement_reuse_maps_read_only_sources_and_only_authorizes_initial_candidates(self):
         from copy import deepcopy
-        from simple_ar.cli.start import migrate_measurement_creation
+        from simple_ar.cli.start import create_declared_research
         from simple_ar.tools.scientific import freeze_measurement_set
 
         with tempfile.TemporaryDirectory() as directory:
@@ -1614,7 +1678,7 @@ class StartTests(unittest.TestCase):
                         app.state = {'turns': [{'origin': 'caller'}], 'pending': None}
                         app.run.return_value = {'status': 'completed'}
                         app.measurement_completion_actions.return_value = []
-                        self.assertTrue(migrate_measurement_creation(args, execution=execution,
+                        self.assertTrue(create_declared_research(args, execution=execution,
                             request='Reuse evidence', outputs=('experiments',), root=root,
                             limits=limits, sources=sources))
                         self.assertEqual(freeze.call_args.args[0]['baseline_ref'],
@@ -1654,8 +1718,9 @@ class StartTests(unittest.TestCase):
     def test_research_code_creation_retains_domain_contracts_in_one_task(self):
         from copy import deepcopy
         from simple_ar.app.research_intake import create_research_task
+        from simple_ar.app.research_intake import UnsupportedExecutionCreation
         from simple_ar.app.research_application import ResearchApplicationServices
-        from simple_ar.cli.start import migrate_exact_code_creation
+        from simple_ar.cli.start import create_declared_research
         from simple_ar.research.workflow_contracts import ResearchBrief
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -1688,7 +1753,7 @@ class StartTests(unittest.TestCase):
                         patch('simple_ar.cli.main._run_native_start') as old_runner:
                     app = self._capture_creation(create)
                     app.run.return_value = {'status': 'completed'}
-                    self.assertTrue(migrate_exact_code_creation(args, execution=execution, request=args.topic,
+                    self.assertTrue(create_declared_research(args, execution=execution, request=args.topic,
                         outputs=('experiments', 'summary', 'report'), sources=sources, limits=limits, root=root / kind,
                         research_config=research))
                     cli = create.call_args.kwargs
@@ -1731,7 +1796,7 @@ class StartTests(unittest.TestCase):
             with patch('simple_ar.app.tool_application.ToolApplication.create') as create:
                 app = self._capture_creation(create)
                 app.run.return_value = {'status': 'completed'}
-                self.assertTrue(migrate_exact_code_creation(args,
+                self.assertTrue(create_declared_research(args,
                     execution={key: value for key, value in execution.items() if key != 'baseline_policy'},
                     request=args.topic, outputs=('experiments',), sources=sources, limits=limits,
                     root=root / 'open-design', research_config=research))
@@ -1743,20 +1808,17 @@ class StartTests(unittest.TestCase):
                         {**execution, 'code_task': {'run_dir': str(root / 'saved-run')}},
                         {**execution, 'baseline_policy': 'reuse'},
                         {**execution, 'unmapped_execution_control': True}):
-                    self.assertFalse(migrate_exact_code_creation(args, execution=declaration, request=args.topic,
-                        outputs=('experiments',), sources=sources, limits=limits, root=root / 'fallback',
-                        research_config=research))
-                args._explicit_resume_destinations.add('unmapped_control')
-                self.assertFalse(migrate_exact_code_creation(args, execution=execution, request=args.topic,
-                    outputs=('experiments',), sources=sources, limits=limits, root=root / 'fallback',
-                    research_config=research))
+                    with self.subTest(declaration=declaration), self.assertRaises(UnsupportedExecutionCreation):
+                        create_declared_research(args, execution=declaration, request=args.topic,
+                            outputs=('experiments',), sources=sources, limits=limits, root=root / 'rejected',
+                            research_config=research)
+                    create.assert_not_called()
                 create.assert_not_called()
-            args._explicit_resume_destinations.remove('unmapped_control')
             self.assertEqual((vars(args), execution, sources, research, limits), original)
             self.assertEqual({path: path.read_bytes() for path in originals}, originals)
 
     def test_fixed_code_protocol_confirmation_is_owned_by_public_creation(self):
-        from simple_ar.cli.start import migrate_exact_code_creation
+        from simple_ar.cli.start import create_declared_research
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             project = root / 'project'
@@ -1774,7 +1836,7 @@ class StartTests(unittest.TestCase):
                         patch('simple_ar.cli.main._render_native_result'), patch('simple_ar.cli.start.print_line'):
                     app = self._capture_creation(create)
                     app.run.return_value = {'status': 'completed'}
-                    self.assertTrue(migrate_exact_code_creation(args, execution=execution, request=args.topic,
+                    self.assertTrue(create_declared_research(args, execution=execution, request=args.topic,
                         outputs=('experiments',), sources=(), limits={}, root=root / interaction))
                     options = create.call_args.kwargs
                     self.assertTrue(options['research_policy']['require_design'])
@@ -1784,18 +1846,11 @@ class StartTests(unittest.TestCase):
                     app.request_execution_confirmation.assert_called_once_with()
                     app.run.assert_called_once()
                     self.assertNotIn('approve', app.run.call_args.kwargs)
-                    create.reset_mock()
-                    self.assertFalse(migrate_exact_code_creation(args, execution=execution, request=args.topic,
-                        outputs=('code_task',), sources=(), limits={}, root=root / 'code-only'))
-                    create.assert_not_called()
             args.task_kind = 'reproduction'
             args._explicit_resume_destinations = {'model'}
             with patch('simple_ar.app.tool_application.ToolApplication.create') as create:
-                for declared in ({**execution, 'baseline_policy': 'run'}, {**execution, 'pairs': []}):
-                    self.assertFalse(migrate_exact_code_creation(args, execution=declared, request=args.topic,
-                        outputs=('experiments',), sources=(), limits={}, root=root / 'unsupported'))
                 with self.assertRaisesRegex(ValueError, 'user-confirmed fixed protocol'):
-                    migrate_exact_code_creation(args, execution=execution, request=args.topic,
+                    create_declared_research(args, execution=execution, request=args.topic,
                         outputs=('experiments',), sources=(), limits={}, root=root / 'unconfirmed')
                 create.assert_not_called()
 
@@ -1832,7 +1887,7 @@ class StartTests(unittest.TestCase):
             self.assertNotIn("total_tokens", values)
             self.assertFalse(values["research_allow_pdf_download"])
             self.assertFalse((config.parent / "code_task.toml").exists())
-            with patch('simple_ar.cli.start.migrate_exact_code_creation') as migrate:
+            with patch('simple_ar.cli.start.create_declared_research') as migrate:
                 adapter = self.prepare("--kind", "reproduction", "--goal", "Export author results without changing the method",
                     "--document", str(paper), "--hypothesis", "Published claim", "--dataset", "Fixed data",
                     "--expected-outcome", "Measure coverage", "--metric", "coverage", "--project", directory,

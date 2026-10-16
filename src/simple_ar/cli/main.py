@@ -395,7 +395,6 @@ def _print_research_session(args: argparse.Namespace) -> None:
     from simple_ar.app.research_application import (
         ResearchApplicationError,
         ResearchApplicationServices,
-        create_session,
     )
     from simple_ar.app.research_intake import ResearchInputError
     from simple_ar.app.session_roots import new_research_session_root
@@ -660,36 +659,8 @@ def _print_research_session(args: argparse.Namespace) -> None:
             "allowed_uses": ["read", "isolated_edit", "validate"],
         })
     assets = tuple(asset_requests)
-    display = ResearchConsole()
-    validation_runs = 1 + execute_options.repair_rounds if task_kind == "bug_fix" and code_task_spec is not None else 1
-    process_count = validation_runs if task_kind == 'bug_fix' else 8 if execution is not None else 0
-    process_wall = (max(30, timeout_sec) * validation_runs if task_kind == 'bug_fix'
-        else max(60, timeout_sec * 8) if execution is not None else 0)
-    if (resume_root is None and execution is not None and execution.get('environment') is not None
-            and code_task_spec is None and not execution.get('pairs')):
-        from simple_ar.research.project_environment import project_environment_plan
-        plan = project_environment_plan(execution['environment'], Path(execution['cwd']),
-            Path('__attempt__') / 'environment', list(execution['command']))
-        process_count = max(process_count, len(plan['steps']) + 1)
-        process_wall = max(process_wall, len(plan['steps']) * plan['profile']['timeout_sec'] + timeout_sec)
-    services = ResearchApplicationServices(
-        llm_client=llm_client,
-        feasibility_llm_client=feasibility_client,
-        max_results=args.max_results,
-        max_chunks=args.max_chunks,
-        idea_limit=args.idea_limit,
-        cache_dir=Path(args.cache_dir).resolve() if args.cache_dir else None,
-        input_base_dir=Path.cwd(),
-        config=config,
-        budget_limits={
-            "llm_requests": args.llm_requests,
-            "total_tokens": args.total_tokens,
-            "process_invocations": args.process_invocations if getattr(args, "process_invocations", None) is not None else process_count,
-            "process_wall_seconds": args.process_wall_seconds if getattr(args, "process_wall_seconds", None) is not None else process_wall,
-        },
-        max_attempts=32 if code_task_spec is not None else 20,
-        message_callback=display.message,
-    )
+    limits = {name: getattr(args, name, None) for name in (
+        'llm_requests', 'total_tokens', 'process_invocations', 'process_wall_seconds')}
     intents = (
         ("bug_fix",) if task_kind == "bug_fix"
         else ("survey",) if task_kind == "survey"
@@ -729,28 +700,42 @@ def _print_research_session(args: argparse.Namespace) -> None:
                 from simple_ar.cli.start import migrate_structured_creation
                 migrate_structured_creation(args, request=brief.request_text,
                     outputs=brief.requested_outputs, sources=brief.asset_requests,
-                    limits=services.budget_limits, root=session_root, research_config=config,
+                    limits=limits, root=session_root, research_config=config,
                     report_config=report_config, writing_method=writing_method,
                     data_analysis=data_analysis, review_model=review_model or None)
                 return
-            if execution is not None:
-                from simple_ar.cli.start import migrate_exact_code_creation, migrate_measurement_creation
-                if migrate_measurement_creation(args, execution=execution, request=brief.request_text,
-                        outputs=brief.requested_outputs, root=session_root, limits=services.budget_limits,
-                        sources=brief.asset_requests, report_config=report_config, writing_method=writing_method,
-                        research_config=config):
-                    return
-                if migrate_exact_code_creation(args, execution=execution, request=brief.request_text,
-                        outputs=brief.requested_outputs, sources=brief.asset_requests,
-                        limits=services.budget_limits, root=session_root,
-                        report_config=report_config, writing_method=writing_method, research_config=config):
-                    return
-            if report_requested:
-                _print_report_writing_plan(writing_method, report_config)
-            app = create_session(brief, root=session_root, services=services)
+            from simple_ar.cli.start import create_declared_research
+            create_declared_research(args, execution=execution, request=brief.request_text,
+                outputs=brief.requested_outputs, sources=brief.asset_requests,
+                limits=limits, root=session_root,
+                report_config=report_config, writing_method=writing_method, research_config=config)
+            return
         else:
             from simple_ar.app.research_application import load_session
             from dataclasses import replace
+            display = ResearchConsole()
+            validation_runs = 1 + execute_options.repair_rounds if task_kind == "bug_fix" and code_task_spec is not None else 1
+            process_count = validation_runs if task_kind == 'bug_fix' else 8 if execution is not None else 0
+            process_wall = (max(30, timeout_sec) * validation_runs if task_kind == 'bug_fix'
+                else max(60, timeout_sec * 8) if execution is not None else 0)
+            services = ResearchApplicationServices(
+                llm_client=llm_client,
+                feasibility_llm_client=feasibility_client,
+                max_results=args.max_results,
+                max_chunks=args.max_chunks,
+                idea_limit=args.idea_limit,
+                cache_dir=Path(args.cache_dir).resolve() if args.cache_dir else None,
+                input_base_dir=Path.cwd(),
+                config=config,
+                budget_limits={
+                    "llm_requests": args.llm_requests,
+                    "total_tokens": args.total_tokens,
+                    "process_invocations": args.process_invocations if getattr(args, "process_invocations", None) is not None else process_count,
+                    "process_wall_seconds": args.process_wall_seconds if getattr(args, "process_wall_seconds", None) is not None else process_wall,
+                },
+                max_attempts=32 if code_task_spec is not None else 20,
+                message_callback=display.message,
+            )
             app = load_session(session_root, services=replace(services, config={}))
             saved_review_model = str(app.services.config.get("feasibility_review_model") or "")
             if saved_review_model and app.services.feasibility_llm_client is None:

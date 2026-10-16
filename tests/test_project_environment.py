@@ -381,15 +381,6 @@ class ProjectEnvironmentTests(unittest.TestCase):
             for changes in ({'command': [sys.executable, 'run.py']}, {'code_task': {}}, {'dataset': 'x.csv'}, {'pairs': [{}]}):
                 with self.subTest(changes=changes), self.assertRaises(ValueError):
                     run_preparation_capability(context=self.context(root), request=self.request(root, **changes))
-            from simple_ar.cli.start import migrate_measurement_creation
-            args = build_parser().parse_args(['research-session', '--topic', 'Explicit environment', '--task-kind', 'measurement'])
-            execution = self.request(root).execution
-            with patch('simple_ar.app.tool_application.ToolApplication.create') as create:
-                # CodeTask still owns its own preparation. Frozen no-code
-                # comparisons are exercised through the shared scientific owner.
-                self.assertFalse(migrate_measurement_creation(args, execution={**execution, 'code_task': {}},
-                    request='Retain CodeTask preparation owner', outputs=('experiments',), root=root, limits={}))
-                create.assert_not_called()
 
     def test_guided_option_serializes_same_profile_and_counts_preparation_invocations(self):
         with tempfile.TemporaryDirectory() as folder:

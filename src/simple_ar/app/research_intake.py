@@ -81,18 +81,19 @@ def create_research_task(brief: ResearchBrief, *, root: str | Path, services: An
         raise ValueError('Use explicit native execution contracts for these outputs: '
             + ', '.join(sorted(set(outputs) - supported)))
     execution = config.get('execution')
-    if execution is None and {'bug_fix', 'code_task'} & set(outputs):
+    if execution is not None and not isinstance(execution, Mapping):
+        raise ValueError('execution must be an object containing the declared domain contract')
+    if {'bug_fix', 'code_task'} & set(outputs) and (execution is None or not execution.get('code_task')):
         raise ValueError('Code deliverables require an explicit execution.code_task contract')
-    research_work = bool({'summary', 'research_summary'} & set(outputs) or policy_values.get('require_summary')
-        or policy_values.get('materials') or policy_values.get('source_workspace')) or (
-        bool(policy_values.get('require_design')) if 'require_design' in policy_values else
-        bool({'summary', 'research_summary'} & set(outputs) or materials
-            or set(policy_values) - {'interaction'})) if execution is not None else True
+    research_work = (execution is None or bool({'summary', 'research_summary'} & set(outputs)
+        or materials or any(policy_values.get(name) for name in (
+            'require_summary', 'require_design', 'materials', 'source_workspace', 'queries', 'providers', 'allow_network'))))
+    design_required = bool(policy_values.get('require_design', research_work and 'experiments' in outputs))
     confirm_execution = config.get('execution_confirmation', False)
-    if type(confirm_execution) is not bool or confirm_execution and (execution is None or research_work):
+    if type(confirm_execution) is not bool or confirm_execution and (execution is None or design_required):
         raise ValueError('execution_confirmation requires a caller-directed fixed execution')
     projection = (project_execution_creation(execution, request=brief.request_text, outputs=tuple(outputs),
-        sources=tuple(asset.to_dict() for asset in assets), input_base_dir=base, require_design=research_work)
+        sources=tuple(asset.to_dict() for asset in assets), input_base_dir=base, require_design=design_required)
         if execution is not None else None)
     if projection is not None:
         policy_values = _remap_policy_mounts(policy_values, mounts, projection['sources'])
@@ -108,8 +109,7 @@ def create_research_task(brief: ResearchBrief, *, root: str | Path, services: An
         'cache_dir': str(settings.cache_dir.resolve()) if settings.cache_dir else None,
         'providers': providers, **policy_values,
         'materials': policy_values.get('materials', materials), 'allow_network': not local_only,
-        'require_design': bool(confirm_execution or research_work and 'experiments' in outputs
-            or policy_values.get('require_design')),
+        'require_design': bool(confirm_execution or design_required),
         'require_summary': bool(policy_values.get('require_summary') or {'summary', 'research_summary'} & set(outputs))})
     report = (freeze_report_requirement(dict(config.get('report') or {}),
         method=config.get('report_writing_method')) if {'report', 'paper', 'full_paper'} & set(outputs) else None)
@@ -130,8 +130,8 @@ def create_research_task(brief: ResearchBrief, *, root: str | Path, services: An
     selected_model = model if model else 'runtime' if client is not None else None
     if projection is not None and projection['code_task'] is not None and selected_model is None:
         raise ValueError('Code preparation requires a model')
-    if confirm_execution:
-        policy = SourcePolicy(require_design=True, allow_network=False, interaction=policy.interaction)
+    if confirm_execution and not research_work:
+        policy = policy.model_copy(update={'allow_network': False})
     if projection is not None and research_work:
         boundary = projection['execution_boundary']
         project_alias = (projection['code_task'] or {}).get('project_path')
@@ -355,8 +355,7 @@ def project_execution_creation(execution: Mapping[str, Any], *, request: str, ou
     if task is not None and (not isinstance(task, dict) or 'run_dir' in task):
         raise UnsupportedExecutionCreation('Initialized CodeTask adoption requires its saved owner')
     scientific = 'experiments' in outputs
-    if set(outputs) - ({'experiments', 'report', 'summary', 'research_summary'} if scientific
-                      else {'bug_fix', 'code_task', 'report'}):
+    if set(outputs) - {'experiments', 'report', 'summary', 'research_summary', 'bug_fix', 'code_task'}:
         raise UnsupportedExecutionCreation('Unsupported execution outputs')
     if not scientific and task is None:
         raise UnsupportedExecutionCreation('Execution needs a measurement or explicit code deliverable')
