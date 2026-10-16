@@ -101,7 +101,7 @@ Supply uses the same validation as native creation. It can add `sources`, `execu
 
 Source paths resolve from the supply file; execution cwd must be an existing absolute directory and argv remains literal. Changed protocols need fresh acceptance when confirmation is required; actual execution always needs its own exact approval. First model binding requires both positive request and token allowances; resource continuation alone cannot grant model access.
 
-The same ID and terms are idempotent, including recovery after a grant was recorded but the config commit was interrupted. An interrupted supply blocks work until that supply is completed. In-flight/unknown operations must first be reconciled. Supply is separate from feedback, retry, resource flags and command approval; it is not yet the compatibility adapter for changing an old structured research protocol.
+The same ID and terms are idempotent, including recovery after a grant was recorded but the config commit was interrupted. An interrupted supply blocks work until that supply is completed. In-flight/unknown operations must first be reconciled. Supply is separate from feedback, retry, resource flags and command approval; it does not modify saved legacy ResearchApplication protocols.
 
 ~~~bash
 simple-ar status SESSION
@@ -126,7 +126,7 @@ For that closed failure only, add `--model profile:NAME` or `route:NAME` to reco
 
 ### Structured compatibility selection
 
-Most explicit protocol controls select the existing structured owner, even if an explicitly supplied value equals a parser default. Source/retrieval policies, report templates/limits, reproduction commands/metrics/environment, table physical limits and interaction settings retain exact semantics and cannot mix with native access/budget controls. Figure/scripted requests with incompatible strict controls fail before creation. Creation preferences cannot change a resumed native task.
+Most explicit protocol controls select structured input adaptation, even if an explicitly supplied value equals a parser default; new tasks still use the common task owner. Source/retrieval policies, report templates/limits, reproduction commands/metrics/environment, table physical limits and interaction settings retain exact semantics and cannot mix with native access/budget controls. Figure/scripted requests with incompatible strict controls fail before creation. Creation preferences cannot change a resumed native task.
 
 New `--kind bug_fix` with `--project`, `--allow` and `--validate` together uses the native session and the exact CodeTask owner. The work, original source, validator and environment require explicit approval; generic workspace writes/processes are unavailable under this frozen contract. Feedback may reference a validated candidate for a separately approved revision. Additional unmapped protocol controls are rejected, not ignored. Registered legacy project reuse retains its original editing/budget policy.
 
@@ -144,7 +144,7 @@ New `--kind bug_fix` with `--project`, `--allow` and `--validate` together uses 
 | `--environment current\|venv`, `--requirements PATH`, `--install-project` | Explicit dependency preparation; repeatable requirements |
 | `--check-argv JSON` | Independent short premeasurement check; no inferred command or scientific metrics |
 | `--command ARGV...` | Formal command, last option |
-| `--interaction assisted\|checkpoints\|autonomous` | Structured participation policy |
+| `--interaction assisted\|checkpoints\|autonomous` | Protocol/design confirmation policy for new tasks; legacy milestones follow the saved owner |
 | `--with-report` | Data/repair report from saved results; requires model |
 | `--asset-max-mb N` | Chat project/data download capacity; default 20 MiB, ZIP expansion 4×; not download permission |
 
@@ -250,9 +250,9 @@ simple-ar research-session --config research.toml
 simple-ar research-session --config research.toml --session-root SESSION --model env
 ~~~
 
-This is the exact structured interface. Explicit CLI overrides research TOML; omitted model on a direct new command is deterministic, while file config defaults env. Model failures remain failures. New retrieval/summary, supplied-material writing and exact-table tasks use the common action owner with frozen domain settings. Tables can run without a model; authored reports require one. Completing an open experiment goal needs a model or a prepared command, and process proposals still need separate approval. No-model requests awaiting execution settings retain the original continuation owner for now. Saved historical recipes retain their original owner.
+This is the exact structured interface. Explicit CLI overrides research TOML; omitted model on a direct new command is deterministic, while file config defaults env. Model failures remain failures. All new tasks use the common action owner, combining materials, summary, code and experiments within their declared contracts. Reading sources does not itself require a scientific design. Unsupported declarations fail before creation, without an old-controller fallback. Tables can run without a model; authored reports require one. A no-model experiment request can retain materials and pause with requested work incomplete. Continue that same task with the printed `start --resume-task SESSION` and [explicit supply](#native-recovery) for missing contracts or model authorization; collection is not experiment/report completion. Saved historical sessions retain their original owner.
 
-Research design replies use `start --resume-task SESSION --decision-id ID --decision-response accept|reject|revise`; add `--decision-guidance TEXT` for revise. The ID binds actual design/protocol bytes. Confirmation does not run or authorize a process. New-task interaction policy governs design confirmation, not a replay of the old stage-by-stage milestones. Resume keeps frozen contracts; use ordinary native feedback for text changes, not creation flags. Intact table results can be reused for report feedback without recomputation.
+Research design replies use `start --resume-task SESSION --decision-id ID --decision-response accept|reject|revise`; add `--decision-guidance TEXT` for revise. The ID binds actual design/protocol bytes. Confirmation does not run or authorize a process. Resume keeps frozen contracts; use ordinary native feedback for text changes, not creation flags. Intact table results can be reused for report feedback without recomputation. See [interaction policies](#interaction-policies-and-pending-decisions) for new and legacy confirmation scope.
 
 | Option group | Options / defaults |
 | --- | --- |
@@ -271,9 +271,9 @@ Data options are shared with the table above. Full-text permissions, page extrac
 
 Historical structured sessions retain their bounded plan correction and attempts/plan-*/task_plan_proposals.json records. New tasks use the common action journal instead. CodeTask retains its configured project/workspace/benchmark/scope; reviewed large edits require execute.allow_large_edits=true. The actual execution owner computes omitted process limits, including preparation and repair/retests; explicit limits, including zero, win.
 
-Resume preserves history and reuses measurements only with matching command/schema/protocol/preparation/protected assets. Explicit goal/outputs/local-paper/execution revisions replan dependent work; task-kind changes need a new session. Incompatible search/ingestion changes fail. Omitted report settings stay saved; report changes rebuild report outputs only.
+For saved legacy sessions owned by ResearchApplication, resume preserves history and reuses measurements only with matching command/schema/protocol/preparation/protected assets. Explicit goal/outputs/local-paper/execution revisions replan dependent work; task-kind changes need a new session. Incompatible search/ingestion changes fail. Omitted report settings stay saved; report changes rebuild report outputs only.
 
-Recover-interrupted confirms the old worker has stopped and closes a running attempt lacking result within the same ledger. Apply input revisions separately. Persisted API failures use ordinary resume. Reanalyze is separate from revisions/authorizations: it reconsiders saved measurements and may lead to authorized future experiments, without requesting a report. Pending follow-ups must continue first.
+For those legacy sessions, recover-interrupted confirms the old worker has stopped and closes a running attempt lacking result within the same ledger. Apply input revisions separately. Persisted API failures use ordinary resume. Reanalyze is separate from revisions/authorizations: it reconsiders saved measurements and may lead to authorized future experiments, without requesting a report. Pending follow-ups must continue first. New common tasks use [native recovery](#native-recovery).
 
 ### Report controls
 
@@ -295,9 +295,11 @@ Sections default to section drafting/review, no document review, auto outline, l
 
 #### Interaction policies and pending decisions
 
-Assisted confirms protocol/delivery and research choices; checkpoints confirms first protocol, material direction and delivery changes while permitting bounded same-protocol supplements; autonomous selects valid options within saved limits. Missing facts/assets/permissions block all modes.
+For new common tasks, `interaction` controls protocol/design confirmation only. `assisted` and `checkpoints` wait for a reply to a generated design; `autonomous` accepts a valid generated design within the saved contract. It does not add stage or delivery milestones or grant process permission. Missing facts, assets or permissions still block the affected work.
 
-Fixed-measurement creation also accepts an explicit `--interaction checkpoints` or `assisted`. The common task freezes the caller's actual protocol and prints its decision ID. Resume with the printed `start --resume-task ... --decision-id ... --decision-response accept`, then separately approve the pending process with its exact token. Acceptance retains the queued commands; it does not run them or fabricate a research design. Identical caller replies after delivery are idempotent. Existing research-design decisions retain their original bound confirmation rules; not all historical structured creators have migrated.
+Fixed-measurement creation requests protocol confirmation when `--interaction checkpoints` or `assisted` is explicitly supplied. The common task freezes the caller's actual protocol and prints its decision ID. Resume with the printed `start --resume-task ... --decision-id ... --decision-response accept`, then separately approve the pending process with its exact token. Acceptance retains the queued commands; it does not run them or fabricate a research design. Identical caller replies after delivery are idempotent.
+
+Saved legacy sessions continuing under ResearchApplication retain their milestone policy: `assisted` confirms protocol, delivery and supplementary/revision research choices; `checkpoints` confirms the first protocol, candidate revisions and delivery changes while permitting bounded same-protocol supplements; `autonomous` selects valid options within saved limits. The following legacy reply examples and delivery/mode-change rules apply to those sessions:
 
 ~~~bash
 simple-ar research-session --session-root SESSION --model env --decision-id ID --decision-response accept
@@ -306,7 +308,7 @@ simple-ar research-session --session-root SESSION --model env --decision-id ID -
 
 Rich displays decisions but does not wait for stdin. Delivery revise also needs report setting. Answers and proposals persist separately; exact replay restores saved interrupted revisions, changed terms/inputs refuse old decisions. Mode changes must be separate from reanalyze/report-only refresh, except a delivery answer may include report/mode changes.
 
-New remaining allowance needs stable ID/reason; prior usage/unknown charges/counters remain. Same ID/terms are idempotent and cannot replenish spent capacity. Attempt/no-progress additions raise caps. Authorization alone does not reopen completed work; authorize before report refresh (normally writer/assembly/audit: three attempts, failures extra). Report-only needs no process expansion. Do not edit ledger/manifest.
+Legacy continuation allowances need stable ID/reason; prior usage/unknown charges/counters remain. Same ID/terms are idempotent and cannot replenish spent capacity. Attempt/no-progress additions raise caps. Authorization alone does not reopen completed work; authorize before report refresh (normally writer/assembly/audit: three attempts, failures extra). Report-only needs no process expansion. Do not edit ledger/manifest.
 
 ### Prepared reproduction
 
@@ -320,17 +322,15 @@ Ordinary CodeTask benchmarks also use the common owner when validator and formal
 
 Exact argv's existing external file operands are retained as individual read-only inputs and hash-bound during approval, including `--option=FILE`. This does not mount their parent directories or infer directory access; supply data/material directories explicitly. Restoring a missing domain summary reuses an intact saved observation after artifact/candidate checks, without rerunning the model or validator.
 
-With a model, interpretation and follow-up tools share this task and ledger and require a Chat profile with finite request/token allowances. Without one, declared measurements and deterministic analysis can run through caller actions, while missing model/design/report work remains pending. Resume using the printed start --resume-task command; unknown operations are never replayed. Code preparation, declared comparisons, research and writing use the same creation owner. Unsupported fresh declarations fail explicitly; historical sessions retain their actual original owner and records.
+With a model, interpretation and follow-up tools share this task and ledger and require a Chat profile with finite request/token allowances. Without one, declared measurements and deterministic analysis can run through caller actions, while missing model/design/report work remains pending. Resume using the printed start --resume-task command; unknown operations are never replayed.
 
 For measurement plus writing, use `--task-kind measurement --outputs experiments report --model SELECTOR` and the usual report controls. No code modification is required: the writer consumes actual measurements and their matching deterministic analysis. Include supplied references as local documents/materials. Feedback needs a new canonical composition and preserves the original results, manuscript and ledger without rerunning measurements. Missing analysis or a stale manuscript cannot count as completed report delivery.
 
 A measurement may include `execution.environment`: a current-environment check or task venv, declared requirements/project installation and short check. For a frozen multi-condition set, one actual attempt owns preparation; all conditions must share the declared cwd/profile and compatible interpreter. Later conditions reuse its verified receipt, not another installation. The full set plus preparation must fit the finite process allowance before setup; explicit limits, including zero, take precedence. Changed sources/preparation, interrupted or unaccounted processes block reuse. Setup metrics are not formal measurements. Installation may run build code/network and is not an OS sandbox; a CodeTask-owned environment cannot be replaced here.
 
-New structured tasks share one creation path regardless of task label or interaction mode. Materials, summary, code and experiments can be combined within their declared contracts; reading sources does not itself require a new scientific design. Protocol acceptance and process approval remain separate. Unsupported declarations fail explicitly instead of creating an old-controller task. Existing sessions retain their original recovery owner.
-
 ### `simple-ar research-report`
 
-`simple-ar research-report --session-root SESSION --model SELECTOR [--refresh]` adds a missing report to a ready analysis handoff. Report controls above apply. Omitted options retain saved settings. Existing completed reports are idempotent; refresh creates new report/audit attempts from saved evidence without rerunning measurements/analysis. Exhausted attempt/no-progress caps require explicit session authorization. Disabled reviewer does not disable audit. Legacy sessions remain read-only; invalid current sessions do not fall back to another executor.
+For saved ResearchApplication sessions, `simple-ar research-report --session-root SESSION --model SELECTOR [--refresh]` adds a missing report to a ready analysis handoff. Report controls above apply. Omitted options retain saved settings. Existing completed reports are idempotent; refresh creates new report/audit attempts from saved evidence without rerunning measurements/analysis. Exhausted attempt/no-progress caps require explicit session authorization. Disabled reviewer does not disable audit. Legacy v1 records remain read-only; invalid sessions do not fall back to another executor. New common tasks request writing through [native feedback or supply](#native-recovery) and continue under the same owner.
 
 ### `simple-ar report-export`
 
@@ -826,11 +826,11 @@ History_archive indexes omitted accepted turns/failure counts, not missing evide
 
 `simple-ar research-session-continue --session-root SESSION [--parent-attempt-id ID] [--model SELECTOR] [--cwd PATH] [--timeout-sec N] [--label TEXT] [--primary-metric NAME] [--metric NAME ...] [--metric-direction NAME=DIRECTION ...] --command ARGV...`
 
-Canonical v2 permits one corrected simple explicit experiment after failed/timed_out technical candidate; scientific negative results are evidence. Cwd defaults ., timeout 300, label research-session-recovery. Latest candidate/schema retained unless explicitly overridden. Parent attempt/literature remain; deterministic analysis reruns. Paired/prepared-data/CodeTask failures use their own bounded paths. V1 execution is retired.
+This compatibility command uses the saved ResearchApplication owner (canonical v2), permitting one corrected simple explicit experiment after a failed/timed_out technical candidate; scientific negative results are evidence. Cwd defaults ., timeout 300, label research-session-recovery. Latest candidate/schema retained unless explicitly overridden. Parent attempt/literature remain; deterministic analysis reruns. Paired/prepared-data/CodeTask failures use their own bounded paths. V1 execution is retired; new common tasks use native recovery.
 
 ### `simple-ar research-session-migrate`
 
-`simple-ar research-session-migrate --source-root OLD --destination-root NEW [--artifact NAME ...] [--requested-output NAME ...] [--max-artifact-bytes N]` creates a successor without changing v1. Default import cap 2 MiB; only explicitly named small files copied. Destination must be empty/outside old root. Parent/imported/skipped counts and unknown_not_imported historical budget are recorded, never guessed.
+`simple-ar research-session-migrate --source-root OLD --destination-root NEW [--artifact NAME ...] [--requested-output NAME ...] [--max-artifact-bytes N]` creates a common-tool successor without changing v1. Default import cap 2 MiB; only explicitly named small files copied. Destination must be empty/outside old root. Parent/imported/skipped counts and unknown_not_imported historical budget are recorded, never guessed.
 
 ### Retired `simple-ar research-experiment`
 

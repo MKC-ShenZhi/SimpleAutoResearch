@@ -178,7 +178,7 @@ materials_only = true
 papers = ["paper.md"]
 ```
 
-Run `simple-ar research-session --config research.toml`. See [the survey example](../examples/survey/README.md). Unknown research sections/fields/types fail. Omitted API caps mean no framework cap for that dimension, not free calls or unlimited retries. Saved usage/limits remain on resume.
+Run `simple-ar research-session --config research.toml`. See [the survey example](../examples/survey/README.md). Unknown research sections/fields/types fail. Model-backed common creation defaults to finite task allowances of 30 requests and 600000 tokens; without a model, omitted model allowances are zero. Saved usage/limits remain on resume; legacy sessions retain their original budget contract.
 
 ### Task, model and budget
 
@@ -191,7 +191,7 @@ Run `simple-ar research-session --config research.toml`. See [the survey example
 | `model.name` | File default `env`; empty string: deterministic |
 | `model.feasibility_review_model` | Optional same-provider feasibility reviewer; shared budget, saved choice cannot change |
 | `model.max_output_tokens` | Optional positive output cap |
-| `budget.total_tokens`, `budget.llm_requests` | Optional positive API caps |
+| `budget.total_tokens`, `budget.llm_requests` | Model-backed common creation: positive integer caps, default 600000 tokens / 30 requests |
 | `budget.process_invocations`, `budget.process_wall_seconds` | Nonnegative; task-derived defaults; declare finite intended execution limits |
 
 The following kind restrictions apply to structured `research-session`, not to the tool combinations available to ordinary `start` tasks.
@@ -220,7 +220,8 @@ Explicit outputs cannot combine with `--with-report`/`--no-report`. Feasibility 
 | `research.use_fulltext`, `research.allow_pdf_download`, `research.keep_raw_pdf`, `research.materials_only` | `false`. Materials-only disables search, not model reading; writing always local |
 | `research.max_fulltext_documents`, `research.max_pdf_mb` | Optional positive remote caps; guided full-text search: 6 documents, 20 MiB each |
 | `research.web_extract_backend` | `direct` or `tavily_basic` |
-| `research.max_iterations`, `research.interaction` | `1` follow-up round; `0` stops after first analysis. New CLI `checkpoints`; `assisted`/`autonomous` also supported |
+| `research.max_iterations` | Default `1`; bounds additional source collections in new common tasks. Legacy scientific follow-ups retain their saved contract |
+| `research.interaction` | CLI default `checkpoints`; also `assisted`/`autonomous`. New tasks use protocol/design confirmation; legacy stage/delivery policies remain with their saved owner. See [interaction policies](CLI_REFERENCE.md#interaction-policies-and-pending-decisions) |
 | `assets.papers`, `assets.materials`, `assets.data` | Bibliographic sources; writing drafts/notes/results/packages; execution inputs. Project data copied into isolated preparation, external data stays; no argv substitution or split verification |
 
 Local PDFs parse even when remote full text is disabled. Remote PDFs need download/cache-retention permissions. Provenance records total/extracted/empty pages and truncation; extraction is not OCR or full understanding. Basic parser enforces ceilings; unstructured rejects ceilings it cannot enforce. Legacy coverage is not reconstructed.
@@ -241,7 +242,7 @@ Fields below are under `[execution]`.
 | `baseline` | Optional table declaring the control `command` and overrides; otherwise uses the main command |
 | `baseline_policy`, `baseline_ref` | run/skip/reuse; fixed measurements can reference passed same-condition canonical result files, with a path list in condition order for paired runs |
 | `protocol` | contract_id/hypothesis, dataset_refs, split_spec, metric_specs, comparison_conditions, protected_assets; reproduction also dataset/expected_outcome |
-| `initial_files` | With explicit CodeTask preparation: exact allowed, absent, unprotected Python paths, not limited to reproduction. Supported native tasks pass these as required creations to CodeTask, not initializer stubs. Historical and unmigrated contracts retain their owner. |
+| `initial_files` | With explicit CodeTask preparation: exact allowed, absent, unprotected Python paths, not limited to reproduction. New tasks pass these as required creations to CodeTask, not initializer stubs. Saved legacy contracts retain their original semantics. |
 
 Omit command and CodeTask for literature-only work.
 
@@ -256,7 +257,7 @@ For fixed measurements with `reuse`, `baseline_ref` paths are relative to the co
 
 Preparation/checks share process budgets/logs; failure stops measurement. Checks emit no measurement metrics. Prepared venv resolves bare Python aliases; conflicting explicit executables in source-owned measurements are rejected, never silently replaced. Installation can run build code/network; workspace is not an OS sandbox. Completed recovery does not reinstall.
 
-Migrated exact tasks may prepare an unchanged source, measure a baseline, implement a separate candidate and reuse that preparation during feedback. Frozen conditions record their source independently of baseline/candidate roles. Explicit `skip` requires only declared candidate runs and produces descriptive results, not a fabricated baseline comparison. Fixed measurements and CodeTask can reuse external canonical baselines as described above; producing-source imports and unsupported structured combinations retain their original controller.
+Exact tasks may prepare an unchanged source, measure a baseline, implement a separate candidate and reuse that preparation during feedback. Frozen conditions record their source independently of baseline/candidate roles. Explicit `skip` requires only declared candidate runs and produces descriptive results, not a fabricated baseline comparison. External baseline reuse must preserve the lineage described above; unsupported new declarations fail before creation rather than selecting another controller.
 
 Ordinary benchmarks may use identical validator and formal argv: validation and measurement require separate physical calls and ledger records, and validator results never count as measurements. Strict reproduction still requires a distinct validation command. Greenfield `copy`/`sparse_copy` with a real source project may include source baselines; those frozen conditions carry `source="preparation"` and `before_implementation=true`. Prepare first, complete every declared baseline, then call `implement(prepared_result)` with the actual successful baseline facts. Missing/failed baselines cannot authorize generation. Empty/source-less projects cannot invent an unchanged-source baseline; use real source or verified external measurement evidence. Every project measurement cwd must still match the original source root, and edit scope and path projection remain unchanged.
 
@@ -371,7 +372,9 @@ Pearson requires line/scatter x/y and computes per group/y from jointly present 
 
 ### Continue a research session after preparing execution
 
-Use `research-session --config research.toml --session-root SESSION`. Omitted goal/outputs stay; explicit goal/output/local-paper/execution revisions rebuild dependent plans, retaining history. Reuse measurements only with matching command/schema/protocol/preparation/protected assets. New task kind or incompatible search/ingestion needs new session; report-only changes rebuild only report, research-report adds missing report.
+New common tasks continue with the printed `start --resume-task SESSION`: use feedback for text changes and [explicit supply](CLI_REFERENCE.md#native-recovery) for missing or explicitly replaced native contracts. The legacy plan/reanalysis/report-refresh rules below apply to saved ResearchApplication sessions, not to new tasks merely because they used research TOML.
+
+For those legacy sessions, use `research-session --config research.toml --session-root SESSION`. Omitted goal/outputs stay; explicit goal/output/local-paper/execution revisions rebuild dependent plans, retaining history. Reuse measurements only with matching command/schema/protocol/preparation/protected assets. New task kind or incompatible search/ingestion needs new session; report-only changes rebuild only report, research-report adds missing report.
 
 Continuation decision_id/decision_response/decision_guidance answer pending choices; responses accept/reject/revise, delivery revisions also need report settings. Exact replay restores interrupted saved revisions without repeating work; different terms/changed inputs invalidate old decisions. Interaction changes cannot mix with reanalysis/report-only refresh, except delivery answers may include mode/report settings. See [CLI reference](CLI_REFERENCE.md).
 
@@ -386,7 +389,7 @@ additional_no_progress = 1
 remaining = { total_tokens = 50000, llm_requests = 8 }
 ```
 
-Only with --session-root. New remaining amounts apply to subsequent calls on configured ledger dimensions; history/unknown charges persist. Attempt/no-progress additions increase caps, not reset counters. Stable ID/reason required; same ID/terms complete interrupted authorization idempotently, never replenish spent capacity. Changed terms need new ID. Do not edit ledger/manifest.
+This `[continuation]` table applies to legacy sessions with `--session-root`. New common tasks use the [native allowance controls](CLI_REFERENCE.md#native-recovery). New remaining amounts apply to subsequent calls on configured ledger dimensions; history/unknown charges persist. Attempt/no-progress additions increase caps, not reset counters. Stable ID/reason required; same ID/terms complete interrupted authorization idempotently, never replenish spent capacity. Changed terms need new ID. Do not edit ledger/manifest.
 
 Authorization alone leaves completed sessions completed and runs nothing. Authorize then refresh report (normally writer/assembly/audit: three attempts, failed retries extra). Report-only needs no process expansion. Declare process dimensions at creation if later execution is intended.
 

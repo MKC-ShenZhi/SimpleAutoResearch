@@ -44,30 +44,29 @@ uv run simple-ar-checks --list
 
 ## 理解两类入口
 
-技术 greenfield 可以从空工作区或挂载的源码脚手架（`copy`/`sparse_copy`）出发，复用同一原生准备和反馈所有者。结构化科学任务仍保留测量协议；规划和派发共用 `task_plan.action_binding`，但身份映射不授予权限，也不把验证器通过当作科学测量。已有动作和账本保留原语义。
+技术 greenfield 可以从空工作区或挂载的源码脚手架（`copy`/`sparse_copy`）出发，复用同一原生准备和反馈所有者。测量协议归科学领域；legacy 规划和派发共用 `task_plan.action_binding`。身份映射不授予权限，也不把验证器通过当作科学测量。已有动作和账本保留原语义。
 
-当前实现有两类实际消费者，不应把它们混称为一套已完成迁移的流程：
+CLI 新任务与显式兼容消费者具有不同的应用边界：
 
 ```text
-普通目标 / 已迁移精确请求
+普通目标 / 所有结构化 CLI 新任务 / create_research_task
   → ToolApplication → CommonToolGateway → 专业工具
 
-剩余科学协议 / 已保存结构化会话
+已保存的 legacy 结构化会话 / 显式 create_session 或 ResearchApplication.create
   → ResearchApplication → 类型化能力
 
 共享：SessionController、产物记录、预算与执行基础
 ```
 
-普通入口根据目标和观察选择行动；任务名称不是执行权限。
-结构化表格、材料报告及调研简报输入现投射为共同所有者的冻结专业合同；部分研究/执行混合合同与历史结构化续接仍由ResearchApplication承接。它不是原生任务失败后的静默回退。
+共同行动循环根据目标和观察选择行动，结构化输入向其投射冻结领域合同。任务名称不是执行权限。不支持的新声明在创建前报错，不回退 ResearchApplication。已有会话按保存的所有者恢复；显式兼容 API 保留原返回类型和续接合同。
 
-`ToolApplication.supply(supply_id=..., reason=..., changes=..., resource_allowances=...)`是调用方补齐原生任务缺失合同的操作，不是模型工具或新运行时。与创建共用前置校验，原actions日志保存先前配置、补齐中断意图和最终参数；原账本按稳定ID只授权一次。补齐中断期间阻止执行，不改旧观察和消耗。新增测量义务后报告证据由材料升级为实测，旧材料报告不能冒充满足。已有冻结合同替换及历史续接仍用原协议。
+`ToolApplication.supply(supply_id=..., reason=..., changes=..., resource_allowances=...)`是调用方补齐原生任务缺失合同的操作，不是模型工具或新运行时。与创建共用前置校验，原actions日志保存先前配置、补齐中断意图和最终参数；原账本按稳定ID只授权一次。补齐中断期间阻止执行，不改旧观察和消耗。新增测量义务后报告证据由材料升级为实测，旧材料报告不能冒充满足。显式替换原生合同遵循[补齐合同](CLI_REFERENCE_zh.md#原生任务恢复)；legacy 续接保留其保存的协议。
 
 `request_execution_confirmation()`经同一个source协议所有者冻结已声明科学合同；调用方提案在`inputs/caller-protocols`，不是虚构attempt或生成设计。声明前须经创建或supply保存确认义务（`research_policy.require_design=true`）；接受不授予进程权限，也不取消原命令队列。实际设计与调用方协议共享原件/响应核验，但真实设计仍必须保留原设计及来源记录。协议回复和实际进程审批是不同授权。
 
 原生测量可显式选择已完成的实施回执，而非全局当前候选。实施所有者核实际准备、独立验证器及共享进程账目；科学执行用该候选解释器/环境并保留真实来源引用。原文件字节受约束，新增源码或依赖声明需要验证。物理验证器事实核查归CodeTask，与中断恢复共享，不在消费者分别实现。正式测量与验证是两个独立物理调用，普通benchmark可以使用同一argv；严格复现保留不同检查器合同。
 
-调用方冻结的单命令和显式多条件测量不论是否带模型，都复用共同所有者，原cwd/argv/环境合同不变；每个字面初始条件只授权caller执行一次，模型后续提案不自动获批。相容条件可共享经回执核对的环境准备。这不是可写源挂载或OS沙箱。固定测量与CodeTask共用外部基线冻结快照，实施审批绑定已核实观察，不虚构准备血缘或新进程账目；研究驱动的CodeTask经既有专业交接直接消费已接受设计，不由协调层摘要代替，科学条件的源码角色仍归冻结执行合同。带产生来源的基线导入、分阶段/实质合同修订及剩余公开创建仍待迁移。
+调用方冻结的单命令和显式多条件测量不论是否带模型，都复用共同所有者，原cwd/argv/环境合同不变；每个字面初始条件只授权caller执行一次，模型后续提案不自动获批。相容条件可共享经回执核对的环境准备。这不是可写源挂载或OS沙箱。固定测量与CodeTask共用外部基线冻结快照，实施审批绑定已核实观察，不虚构准备血缘或新进程账目；研究驱动的CodeTask经既有专业交接直接消费已接受设计，不由协调层摘要代替，科学条件的源码角色仍归冻结执行合同。
 
 精确CodeTask与平直正式测量合同可以共存。准备保存两种声明，原生审批绑定科学合同；来源所有者核实际独立validator后才允许测量。项目argv投射归CodeTask环境所有者，执行与来源核查共用，不在CLI重写。独立验证不要求科学产物已经存在，整项目/API门保留，正式测量另核runtime schema。Greenfield规划读取正式入口/指标，不能把validator当实验。报告只接收所选代码血缘的实际测量；缺测义务跨报告反馈保留，无关旧候选的产物不成为当前报告依赖。成果复用读取已交付正式argv模板，不复用已完成进程的物理输出目录或额度。
 
@@ -77,12 +76,11 @@ uv run simple-ar-checks --list
 
 - [CLI 分发](../src/simple_ar/cli/main.py)与[start 输入适配](../src/simple_ar/cli/start.py)。
 - [原生任务应用](../src/simple_ar/app/tool_application.py)与[公共工具入口](../src/simple_ar/tools/gateway.py)。
-- [结构化研究应用](../src/simple_ar/app/research_application.py)与[任务计划](../src/simple_ar/research/task_plan.py)。
+- [共同研究创建](../src/simple_ar/app/research_intake.py)、[兼容研究应用](../src/simple_ar/app/research_application.py)与[legacy 任务计划](../src/simple_ar/research/task_plan.py)。
 - [会话控制](../src/simple_ar/core/session.py)、[产物](../src/simple_ar/core/artifacts.py)和[预算](../src/simple_ar/core/budget.py)。
 
 旧八阶段执行器已退出，`run`、`resume`、`research-code-task`、
-`research-experiment` 不再启动旧流程。`research-brief` 仅是 `research-session` 的简报兼容名称，不另建应用。其 CLI 消费者退出后移除了 `app.research_brief` 专用会话请求/结果包装；库集成使用已有 research 能力注册表及 `research.brief` 类型结果，自定义 provider 可由结构化应用 services 传入。历史应用加载和继续不变。
-历史读取与可继续执行的结构化会话必须区别对待。
+`research-experiment` 不再启动旧流程。`research-brief` 仅是 `research-session` 的简报兼容名称，新任务使用共同创建。其 CLI 消费者不再使用已移除的 `app.research_brief` 专用会话请求/结果包装。库集成可通过 `create_research_task` 和 `ResearchApplicationServices` 注入自定义 provider，或直接调用类型化研究能力。须区分只读 legacy v1 记录与仍可继续执行的已保存 ResearchApplication 会话。
 
 ## 改动应该放在哪里
 

@@ -177,7 +177,7 @@ materials_only = true
 papers = ["paper.md"]
 ~~~
 
-使用 `simple-ar research-session --config research.toml`，见[调研示例](../examples/survey/README.md)。未知研究分区/字段/类型报错。省略 API 上限表示该维度不设框架上限，不表示免费或无限重试；恢复保留用量和限额。
+使用 `simple-ar research-session --config research.toml`，见[调研示例](../examples/survey/README.md)。未知研究分区/字段/类型报错。带模型的共同创建默认保存有限任务额度：30 次请求、600000 token；无模型时，省略的模型额度为零。恢复保留用量和限额，legacy 会话保留原预算合同。
 
 ### 任务、模型与预算
 
@@ -190,7 +190,7 @@ papers = ["paper.md"]
 | `model.name` | 文件默认 env，空字符串选择确定性处理 |
 | `model.feasibility_review_model` | 可选同提供方独立可行性审查，共享预算，保存后不可改 |
 | `model.max_output_tokens` | 可选正整数输出上限 |
-| `budget.total_tokens`、`budget.llm_requests` | 可选正整数 API 上限 |
+| `budget.total_tokens`、`budget.llm_requests` | 带模型的共同创建使用正整数上限，默认 600000 token／30 次请求 |
 | `budget.process_invocations`、`budget.process_wall_seconds` | 非负，默认按任务推导；应声明有限的拟执行额度 |
 
 以下限制适用于结构化 `research-session`，不代表普通 `start` 的工具组合范围。
@@ -219,7 +219,8 @@ papers = ["paper.md"]
 | `research.use_fulltext`、`research.allow_pdf_download`、`research.keep_raw_pdf`、`research.materials_only` | false；仅材料关闭搜索，不禁模型阅读；写作始终本地 |
 | `research.max_fulltext_documents`、`research.max_pdf_mb` | 可选正上限，引导全文搜索为6份/每份20 MiB |
 | `research.web_extract_backend` | direct 或 tavily_basic |
-| `research.max_iterations`、`research.interaction` | 1轮后续；0首轮分析后停。新 CLI checkpoints，可选 assisted/autonomous |
+| `research.max_iterations` | 默认1；限制新共同任务的来源收集追加轮次。legacy 科学续接保留保存的合同 |
+| `research.interaction` | CLI 默认 checkpoints，可选 assisted/autonomous。新任务用于协议/设计确认；legacy 阶段/交付政策仍归保存的所有者。见[参与策略](CLI_REFERENCE_zh.md#参与策略与待处理决定) |
 | `assets.papers`、`assets.materials`、`assets.data` | 书目来源；写作草稿/笔记/结果/包；执行输入。项目内数据复制进隔离准备，外部原地保留，不改 argv 或核划分 |
 
 本地 PDF 不受远程全文关闭影响；远程 PDF 需要下载/保留许可。出处记录总页/提取页/空页/截断，提取不等于 OCR 或理解。基础 parser 执行页数上限；unstructured 无法执行时拒绝，旧覆盖不补造。
@@ -242,7 +243,7 @@ papers = ["paper.md"]
 | `baseline` | 可选表，声明控制条件的 `command` 及覆盖字段；未单独声明时沿用主命令 |
 | `baseline_policy`、`baseline_ref` | run/skip/reuse；固定测量可引用已通过的同条件 canonical 结果文件，配对条件可提供按条件顺序排列的路径列表 |
 | `protocol` | contract_id/hypothesis、dataset_refs、split_spec、metric_specs、comparison_conditions、protected_assets；复现还需 dataset/expected_outcome |
-| `initial_files` | 须显式 CodeTask 准备；明确允许、尚不存在、不受保护的 Python 路径，不限复现任务。已支持的原生任务交由 CodeTask 直接创建，不先写占位实现；历史及未迁移合同仍由原所有者执行。 |
+| `initial_files` | 须显式 CodeTask 准备；明确允许、尚不存在、不受保护的 Python 路径，不限复现任务。新任务交由 CodeTask 直接创建，不先写占位实现；已保存 legacy 合同保留原语义。 |
 
 仅文献任务省略 command 和 CodeTask。
 
@@ -257,9 +258,9 @@ papers = ["paper.md"]
 
 准备与检查共享进程预算/日志，失败不进入测量，检查输出不作为测量。任务 venv 解析裸 Python 别名；来源绑定测量中的显式执行器若与该 venv 冲突，会在启动前拒绝，不静默替换。安装可能运行构建代码/联网；工作区不是 OS 沙箱，完成恢复不重装。
 
-已迁移的精确任务可先准备未改源码、测基线，再实施独立候选，反馈时复用原准备。冻结条件的来源与 baseline/candidate 比较角色分开。明确 `skip` 只要求声明的候选运行，交付描述性结果，不虚构基线对照。固定测量与 CodeTask 可按上述 `baseline_ref` 复用外部 canonical 基线；带产生来源血缘的导入及未支持的结构化组合仍由原控制器负责。
+精确任务可先准备未改源码、测基线，再实施独立候选，反馈时复用原准备。冻结条件的来源与 baseline/candidate 比较角色分开。明确 `skip` 只要求声明的候选运行，交付描述性结果，不虚构基线对照。外部基线复用须保留上述血缘；不支持的新声明在创建前报错，不转入另一控制器。
 
-普通 benchmark 允许 validator 与正式测量使用相同 argv，但必须分别进行真实物理调用并独立记账，validator 结果不能充当测量。严格 reproduction 仍要求不同的校验命令。greenfield 的 `copy`/`sparse_copy` 若有真实 source 项目，可承接源码基线；这些冻结条件显式携带 `source="preparation"`、`before_implementation=true`。高层须先 prepare，完成全部声明的 baseline，再调用 `implement(prepared_result)` 并传入实际成功基线事实；失败或缺测不能授权生成。empty 或无 source 的 greenfield baseline 保留准确的原 owner 或拒绝，不虚构源码。项目测量 cwd 仍须匹配原 source root，可写范围与源码路径投射规则不变。
+普通 benchmark 允许 validator 与正式测量使用相同 argv，但必须分别进行真实物理调用并独立记账，validator 结果不能充当测量。严格 reproduction 仍要求不同的校验命令。greenfield 的 `copy`/`sparse_copy` 若有真实 source 项目，可承接源码基线；这些冻结条件显式携带 `source="preparation"`、`before_implementation=true`。高层须先 prepare，完成全部声明的 baseline，再调用 `implement(prepared_result)` 并传入实际成功基线事实；失败或缺测不能授权生成。empty 或无 source 项目不能虚构未改源码基线，须使用真实源码或已核外部测量证据。项目测量 cwd 仍须匹配原 source root，可写范围与源码路径投射规则不变。
 
 ~~~toml
 [execution.output_files]
@@ -392,7 +393,9 @@ Pearson 相关只用于 `line` 或 `scatter` 的 x/y 坐标，每组、每列使
 
 ## 研究会话补齐条件与续接
 
-使用 `research-session --config research.toml --session-root SESSION` 续接。省略的目标和输出沿用原值；显式修改目标、论文或执行条件时，只重建相关计划并保留历史。测量复用要求命令、结果格式、协议、准备条件和保护资产一致。
+新共同任务沿打印的 `start --resume-task SESSION` 继续：文字修改使用反馈，补齐或显式替换原生合同使用[明确补齐条件](CLI_REFERENCE_zh.md#原生任务恢复)。以下旧计划、重分析和报告刷新规则适用于已保存 ResearchApplication 会话，不因新任务使用研究 TOML 就适用。
+
+这些 legacy 会话使用 `research-session --config research.toml --session-root SESSION` 续接。省略的目标和输出沿用原值；显式修改目标、论文或执行条件时，只重建相关计划并保留历史。测量复用要求命令、结果格式、协议、准备条件和保护资产一致。
 
 改变任务类型，或采用不兼容的搜索、提取设置，需要新会话。仅修改报告设置不会重跑测量；`research-report` 可为已有会话补写报告。
 
@@ -411,7 +414,7 @@ additional_no_progress = 1
 remaining = { total_tokens = 50000, llm_requests = 8 }
 ~~~
 
-该配置仅与 `--session-root` 一起使用。`remaining` 设置后续可用额度，历史费用和未知费用仍保留。`additional_attempts` 与 `additional_no_progress` 增加对应上限，不清零计数。
+该 `[continuation]` 表用于带 `--session-root` 的 legacy 会话；新共同任务使用[原生续额参数](CLI_REFERENCE_zh.md#原生任务恢复)。`remaining` 设置后续可用额度，历史费用和未知费用仍保留。`additional_attempts` 与 `additional_no_progress` 增加对应上限，不清零计数。
 
 必须提供稳定的授权 ID 和原因。相同 ID 与条款只用于补完中断的授权，不会补回已经消耗的额度；改变条款需使用新 ID。不要直接修改账本。
 

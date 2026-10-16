@@ -45,31 +45,28 @@ Runtime outputs belong in ignored directories such as `runs/`, not source.
 
 ## Understand the two entry paths
 
-Technical greenfield tasks may start from an empty workspace or a mounted scaffold (`copy`/`sparse_copy`) through the same native preparation and feedback owner. Structured scientific tasks still own their measurement protocol: planning and dispatch share `task_plan.action_binding`, but this identity mapping never grants permissions or substitutes a validator for a scientific measurement. Saved actions and ledgers retain their original meaning.
+Technical greenfield tasks may start from an empty workspace or a mounted scaffold (`copy`/`sparse_copy`) through the same native preparation and feedback owner. Scientific domains own measurement protocols; legacy planning and dispatch share `task_plan.action_binding`. This identity mapping never grants permissions or substitutes a validator for a scientific measurement. Saved actions and ledgers retain their original meaning.
 
-Both paths have real consumers today; do not describe their migration as already complete:
+New CLI tasks and explicit compatibility consumers have different application boundaries:
 
 ```text
-Ordinary goal / migrated exact requests
+Ordinary goals / all new structured CLI tasks / create_research_task
   → ToolApplication → CommonToolGateway → professional tools
 
-Remaining scientific protocols / saved structured sessions
+Saved legacy structured sessions / explicit create_session or ResearchApplication.create
   → ResearchApplication → typed capabilities
 
 Shared: SessionController, artifact records, budgets and execution primitives
 ```
 
-The ordinary entry chooses actions from goals and observations. Task names do not grant permissions.
-`ToolApplication.supply(supply_id=..., reason=..., changes=..., resource_allowances=...)` is a caller-only operation to fill missing native contracts, not a model tool or a new runtime. Creation and supply share preflight; the existing actions journal records prior config, pending supply and final terms. The ledger grants the same stable ID once. Work is blocked during an interrupted supply; completed observations and old charges are never rewritten. Adding measurement obligations upgrades report evidence from materials to execution; an old materials report cannot satisfy them. Existing frozen-contract replacement and historical continuation still use their original protocols.
+The common action loop chooses actions from goals and observations; structured inputs project frozen domain contracts into it. Task names do not grant permissions. Unsupported new declarations fail before creation, without falling back to ResearchApplication. Saved sessions resume under their recorded owner; explicit compatibility APIs retain their original return types and continuation contracts.
+`ToolApplication.supply(supply_id=..., reason=..., changes=..., resource_allowances=...)` is a caller-only operation to fill missing native contracts, not a model tool or a new runtime. Creation and supply share preflight; the existing actions journal records prior config, pending supply and final terms. The ledger grants the same stable ID once. Work is blocked during an interrupted supply; completed observations and old charges are never rewritten. Adding measurement obligations upgrades report evidence from materials to execution; an old materials report cannot satisfy them. Explicit native contract replacement uses the [supply contract](CLI_REFERENCE.md#native-recovery); legacy continuation retains its saved protocol.
 
 `request_execution_confirmation()` freezes an already declared scientific contract through the same source protocol owner. Caller proposals live under `inputs/caller-protocols`, not fake attempts or generated designs. Save the confirmation obligation (`research_policy.require_design=true`) through creation or supply first; accepting it neither grants process access nor cancels its queued commands. Protocol/response verification is shared with actual research designs, which still require their original design and source records. Existing user response and process approval are distinct authorities.
-Structured inputs for tables, material reports and research summaries now project frozen
-domain contracts into the common owner. Some mixed research/execution contracts and saved
-structured sessions still use ResearchApplication; it is not a silent fallback for failed native tasks.
 
 Native measurement can select a completed implementation receipt rather than a global active candidate. The implementation owner verifies its actual preparation, independent validator and shared process accounting; scientific execution uses that candidate's interpreter/environment and retains its producing references. Original sources remain pinned, and added source/dependency files require validation. Physical validator verification belongs to CodeTask and is shared with interruption recovery, not copied into each consumer. Formal measurement is a separate physical invocation from validation, even when an ordinary benchmark uses the same argv. Strict reproduction retains its distinct-checker contract.
 
-Caller-frozen single-command and declared multi-condition measurements use the same owner with or without a model. Their exact cwd/argv/environment policy is not a writable workspace mount or an OS sandbox. Each literal initial caller condition authorizes one execution; model follow-up is not preapproved. Compatible conditions share receipt-verified environment preparation. Fixed measurements and CodeTask share frozen external baseline snapshots; implementation binds verified observations without invented preparation ancestry or new process accounting. Research-led CodeTask implementation consumes the accepted original design through its existing professional handoff, not a coordinator summary; scientific source roles remain owned by the frozen execution contract. Producing-source baseline imports, staged/revised contracts and remaining public creators still need migration.
+Caller-frozen single-command and declared multi-condition measurements use the same owner with or without a model. Their exact cwd/argv/environment policy is not a writable workspace mount or an OS sandbox. Each literal initial caller condition authorizes one execution; model follow-up is not preapproved. Compatible conditions share receipt-verified environment preparation. Fixed measurements and CodeTask share frozen external baseline snapshots; implementation binds verified observations without invented preparation ancestry or new process accounting. Research-led CodeTask implementation consumes the accepted original design through its existing professional handoff, not a coordinator summary; scientific source roles remain owned by the frozen execution contract.
 
 Exact CodeTask and a flat formal measurement contract can coexist. Preparation stores both declarations; native approval binds the scientific contract, and the common source owner verifies the actual independent validator before measurement. Project argv relocation belongs to CodeTask's environment owner and is shared by execution and provenance, not reimplemented in the CLI. Independent validation does not require already-produced scientific artifacts; whole-project/API checks remain, and the separate formal measurement owns its runtime result schema. Greenfield planning consumes the declared formal entrypoint/metrics rather than mistaking the validator for the experiment. Report projection consumes receipt-verified measurements for the accepted code lineage. Frozen measurement obligations survive report-only feedback; unrelated old candidate output bytes are not a report dependency. Reuse reads the delivered formal argv template, never a completed invocation's physical output directory or old allowance.
 
@@ -79,13 +76,12 @@ Start reading here:
 
 - [CLI dispatch](../src/simple_ar/cli/main.py) and [start input adaptation](../src/simple_ar/cli/start.py).
 - [Native task application](../src/simple_ar/app/tool_application.py) and [tool gateway](../src/simple_ar/tools/gateway.py).
-- [Structured research application](../src/simple_ar/app/research_application.py) and [task planning](../src/simple_ar/research/task_plan.py).
+- [Common research creation](../src/simple_ar/app/research_intake.py), [compatibility research application](../src/simple_ar/app/research_application.py) and [legacy task planning](../src/simple_ar/research/task_plan.py).
 - [Session control](../src/simple_ar/core/session.py), [artifacts](../src/simple_ar/core/artifacts.py) and [budgets](../src/simple_ar/core/budget.py).
 
 The old eight-stage executor has been retired. `run`, `resume`, `research-code-task`
 and `research-experiment` no longer launch it.
-`research-brief` is a summary-only compatibility spelling of `research-session`, not another application. Its CLI consumer no longer uses the removed `app.research_brief` session request/result wrapper; library integrations should use the existing research capability registry and typed `research.brief` results, or the structured application's services for custom providers. Historical application loading/continuation is unchanged.
-Distinguish historical read-only access from structured sessions that can still continue execution.
+`research-brief` is a summary-only compatibility spelling of `research-session`; new tasks use common creation. Its CLI consumer no longer uses the removed `app.research_brief` session request/result wrapper. Library integrations can use `create_research_task` with `ResearchApplicationServices` for custom providers, or invoke typed research capabilities directly. Distinguish read-only legacy v1 records from saved ResearchApplication sessions that can still continue execution.
 
 ## Place changes with their owner
 

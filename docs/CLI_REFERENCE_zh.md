@@ -76,8 +76,6 @@ simple-ar start --kind data_analysis --scripted --data-file measurements.csv --g
 
 ### 原生任务恢复
 
-固定测量新建也支持显式 `--interaction checkpoints` 或 `assisted`：共同任务冻结调用方实际协议并打印 decision ID。先按打印的 `start --resume-task ... --decision-id ... --decision-response accept` 接受协议，再用精确 token 单独批准待执行进程。接受保留原命令队列，不执行命令、不伪造研究设计；交付后重放相同调用方回复幂等。真实研究设计仍按原绑定规则确认，不表示所有历史结构化创建都已迁移。
-
 无模型的调用方原生任务需要补齐条件时，使用补齐文件，不要借模型重试绕过授权：
 
 ```toml
@@ -105,7 +103,7 @@ simple-ar start --resume-task SESSION
 
 来源路径相对补齐文件解析；执行 cwd 必须是已存在的绝对目录，argv 不做 shell 展开。需要协议确认的任务在条件变化后须重新确认，实际执行仍需独立精确批准。首次绑定模型必须显式给出正数请求/token 额度；仅续额不会取得模型权限。
 
-相同 ID 与参数重放幂等，也覆盖“已记额度、未完成配置提交”的中断恢复。补齐中断后须完成原补齐操作才能继续；在途/未知操作须先核对。补齐与反馈、重试、独立续额参数及命令审批分开，不是修改旧结构化研究协议的兼容适配器。
+相同 ID 与参数重放幂等，也覆盖“已记额度、未完成配置提交”的中断恢复。补齐中断后须完成原补齐操作才能继续；在途/未知操作须先核对。补齐与反馈、重试、独立续额参数及命令审批分开，不修改已保存的 legacy ResearchApplication 协议。
 
 ~~~bash
 simple-ar status SESSION
@@ -140,7 +138,7 @@ simple-ar start --resume-task SESSION --authorize-remaining llm_requests=10 --au
 
 ### 结构化兼容入口
 
-大部分显式协议控制参数会选择已有的结构化执行入口，即使显式值恰好等于解析器默认值。来源策略、检索边界、报告模板、复现命令、指标、环境、表格物理限制和参与策略仍保留精确语义，不能与原生访问或预算参数混用。
+大部分显式协议控制参数会选择结构化输入适配，即使显式值恰好等于解析器默认值；新任务仍使用共同任务所有者。来源策略、检索边界、报告模板、复现命令、指标、环境、表格物理限制和参与策略仍保留精确语义，不能与原生访问或预算参数混用。
 
 新建 `--kind bug_fix` 同时提供 `--project`、`--allow`、`--validate` 时，使用原生会话和精确 CodeTask 所有者。执行前批准工作、原源码、验证器及环境；冻结合同下不能另用普通工作区写入或进程绕开范围。反馈可引用已验证候选，重新批准后修订。不能承接的额外协议参数会明确拒绝，不会忽略；已登记的旧项目复用保留原编辑及预算策略。
 
@@ -160,7 +158,7 @@ simple-ar start --resume-task SESSION --authorize-remaining llm_requests=10 --au
 | `--environment current\|venv`、`--requirements PATH`、`--install-project` | 显式准备依赖，可重复提供 requirements。 |
 | `--check-argv JSON` | 测量前的独立短检查；不推断命令或科学指标。 |
 | `--command ARGV...` | 正式命令，必须是最后一个选项。 |
-| `--interaction assisted\|checkpoints\|autonomous` | 结构化参与策略。 |
+| `--interaction assisted\|checkpoints\|autonomous` | 新任务的协议/设计确认策略；legacy 里程碑按保存的所有者执行。 |
 | `--with-report` | 从保存的数据或修复结果写报告，需要模型。 |
 | `--asset-max-mb N` | chat 项目或数据下载容量，默认 20 MiB；ZIP 展开容量为四倍，不等于下载授权。 |
 
@@ -290,9 +288,9 @@ simple-ar research-session --config research.toml
 simple-ar research-session --config research.toml --session-root SESSION --model env
 ~~~
 
-这是精确的结构化接口。显式 CLI 覆盖研究 TOML；直接新建省略模型时为确定性模式，配置文件默认 `env`。模型失败仍是失败。新检索/简报、材料写作和精确表格任务进入共同主干并保存领域合同。表格可不调用模型，成文报告需要模型。完成开放实验需要模型或已准备的命令；执行提案仍须单独批准。无模型且等待补执行条件的请求暂保留原续接所有者。历史recipe保留原所有者。
+这是精确的结构化接口。显式 CLI 覆盖研究 TOML；直接新建省略模型时为确定性模式，配置文件默认 `env`。模型失败仍是失败。所有新任务使用共同行动所有者，材料、简报、代码和实验按声明合同组合。读取来源本身不要求科学设计。不支持的声明在创建前报错，不回退旧控制器。表格可不调用模型，成文报告需要模型。无模型的实验请求可先保存材料，保留尚未完成的请求后暂停。沿打印的 `start --resume-task SESSION` 继续同一任务，并通过[明确补齐条件](#原生任务恢复)添加缺失合同或模型授权；收集材料不等于实验或报告完成。已有历史会话保留原所有者。
 
-设计回复使用 `start --resume-task SESSION --decision-id ID --decision-response accept|reject|revise`，revise可附 `--decision-guidance TEXT`。ID绑定实际设计/协议字节；确认不会运行或授权进程。新任务的参与策略控制设计确认，不再复制旧逐阶段里程碑。恢复保留冻结合同；文字修改使用普通原生反馈，不重复传新建参数。报告反馈可复用未变的表格结果，无需重算。
+设计回复使用 `start --resume-task SESSION --decision-id ID --decision-response accept|reject|revise`，revise可附 `--decision-guidance TEXT`。ID绑定实际设计/协议字节；确认不会运行或授权进程。恢复保留冻结合同；文字修改使用普通原生反馈，不重复传新建参数。报告反馈可复用未变的表格结果，无需重算。新旧确认范围见[参与策略](#参与策略与待处理决定)。
 
 | 参数组 | 选项和默认值 |
 | --- | --- |
@@ -315,13 +313,11 @@ simple-ar research-session --config research.toml --session-root SESSION --model
 
 精确argv明确选中的外部已有文件沿单文件只读来源传递，并在批准时绑定hash，也支持`--option=FILE`。不会挂载其父目录或推断目录授权，数据/材料目录须显式提供。域摘要缺失时，只在产物和候选核验后复用完整已存观察，不重跑模型或校验器。
 
-有模型时，解释和后续工具共用原任务/账本，需要Chat连接及有限请求/token额度。无模型可完成调用方已声明测量和确定性分析，但缺少模型、设计或报告的工作仍待续。沿打印的start --resume-task恢复，未知操作不重放。代码准备、声明比较、研究与写作共用创建所有者；不支持的新声明明确报错，历史会话保留真实原owner及记录。
+有模型时，解释和后续工具共用原任务/账本，需要Chat连接及有限请求/token额度。无模型可完成调用方已声明测量和确定性分析，但缺少模型、设计或报告的工作仍待续。沿打印的start --resume-task恢复，未知操作不重放。
 
 测量加写作可用`--task-kind measurement --outputs experiments report --model SELECTOR`及既有报告选项。不要求先修改代码：Writer消费真实测量和对应确定性分析；参考材料沿local-document/material输入。反馈要求新的规范写作回执，原结果、稿件与账本保留，不重跑测量。缺分析或旧稿不能算完整报告交付。
 
 测量可带`execution.environment`：当前环境检查，或任务venv、声明的依赖/项目安装及短检查。冻结多条件共享一个真实attempt的准备回执，要求相同cwd/profile及兼容解释器，后续条件不重复安装。准备前核全部条件与准备的有限额度，显式限制包括零始终优先；来源或准备变化、中断与未核清进程均阻断复用。检查指标不是正式测量。安装可能执行构建代码、使用网络，并非OS沙箱；不能替换CodeTask自有环境。
-
-结构化新任务不因任务名或交互模式不同而改走另一创建路径；材料、简报、代码和实验按声明合同组合。读取来源不等于必须另做科学设计，协议接受与进程批准仍分开。不支持的声明明确报错，不再新建旧控制器任务；已有会话继续使用其原恢复所有者。
 
 历史结构化会话保留有界计划纠正及 `attempts/plan-*/task_plan_proposals.json`，新任务使用共同动作记录。CodeTask 保留项目、工作区、基准及编辑范围；经审阅的大改动需要 `execute.allow_large_edits=true`。默认进程额度由实际执行所有者计算，含准备及修复复验，显式限制包括零始终优先。
 
@@ -329,11 +325,11 @@ simple-ar research-session --config research.toml --session-root SESSION --model
 
 #### 恢复与重分析
 
-恢复保留历史。只有命令、schema、协议、准备状态和保护资产一致时，才复用测量。显式修改目标、输出、本地论文或执行设置，会重新规划相关工作。改变 task-kind 需要新会话。不兼容的搜索或摄取修改会失败。
+对于由 ResearchApplication 承接的已保存 legacy 会话，恢复保留历史。只有命令、schema、协议、准备状态和保护资产一致时，才复用测量。显式修改目标、输出、本地论文或执行设置，会重新规划相关工作。改变 task-kind 需要新会话。不兼容的搜索或摄取修改会失败。
 
 省略报告参数会保留原设置；改变报告设置只重建报告输出。`--recover-interrupted` 确认旧 worker 已停止，并在同一账本内关闭仍为 running 且没有结果的尝试。输入修改必须另行提交。已经保存的 API 失败用普通恢复处理。
 
-`--reanalyze` 必须与输入修改和授权分开。它重新考虑保存的测量，可能引出已授权的后续实验，但不请求报告。已有待续接工作必须先完成。
+这些 legacy 会话的 `--reanalyze` 必须与输入修改和授权分开。它重新考虑保存的测量，可能引出已授权的后续实验，但不请求报告。已有待续接工作必须先完成。新共同任务使用[原生任务恢复](#原生任务恢复)。
 
 ### 报告控制参数
 
@@ -357,7 +353,11 @@ article 默认进行确定性组装和审计；明确的整稿独立检查及有
 
 #### 参与策略与待处理决定
 
-assisted 会确认协议、交付和研究选择。checkpoints 会确认首个协议、材料方向和交付变化，同时允许有界的同协议补充。autonomous 在保存的边界内选择有效选项。所有模式都会因缺事实、资产或权限而停止。
+新共同任务的 `interaction` 只控制协议/设计确认：`assisted` 和 `checkpoints` 等待对生成设计的回复，`autonomous` 在保存合同内接受有效生成设计。它不增加阶段或交付里程碑，也不授予进程权限。缺事实、资产或权限仍会阻止相关工作。
+
+固定测量新建在显式提供 `--interaction checkpoints` 或 `assisted` 时要求协议确认。共同任务冻结调用方实际协议并打印 decision ID。先按打印的 `start --resume-task ... --decision-id ... --decision-response accept` 接受协议，再用精确 token 单独批准待执行进程。接受保留原命令队列，不执行命令、不伪造研究设计；交付后重放相同调用方回复幂等。
+
+仍由 ResearchApplication 续接的已保存 legacy 会话保留里程碑策略：`assisted` 确认协议、交付及补充/修订研究选择；`checkpoints` 确认首个协议、候选修订及交付变化，同时允许有界的同协议补充；`autonomous` 在保存边界内选择有效选项。下列旧会话回复示例及交付/模式修改规则仅适用于这些会话：
 
 ~~~bash
 simple-ar research-session --session-root SESSION --model env --decision-id ID --decision-response accept
@@ -368,7 +368,7 @@ Rich 会显示决定，不等待 stdin。修改交付还需要报告设置。答
 
 模式修改须与重分析或单独报告刷新分开，但交付答案可以同时修改报告或模式。
 
-新剩余额度必须有稳定 ID 和原因，既有使用、未知消耗和计数器保留。同一 ID 和条款具有幂等性，不补回已消耗容量。尝试次数和无进展次数增量会提高对应上限。
+legacy 续接额度必须有稳定 ID 和原因，既有使用、未知消耗和计数器保留。同一 ID 和条款具有幂等性，不补回已消耗容量。尝试次数和无进展次数增量会提高对应上限。
 
 单独授权不重开已完成工作。报告刷新前先授权；通常写作、组装和审计需要三次尝试，失败另计。只改报告不需要增加进程容量。不要手改账本或 manifest。
 
@@ -382,11 +382,11 @@ Rich 会显示决定，不等待 stdin。修改交付还需要报告设置。答
 
 ### `simple-ar research-report`
 
-`simple-ar research-report --session-root SESSION --model SELECTOR [--refresh]` 为已准备好的分析交付补写报告。报告控制见上表；省略参数保留保存的设置。
+对于已保存 ResearchApplication 会话，`simple-ar research-report --session-root SESSION --model SELECTOR [--refresh]` 为已准备好的分析交付补写报告。报告控制见上表；省略参数保留保存的设置。
 
 已完成报告会幂等返回。refresh 基于保存证据创建新的报告和审计尝试，不重新测量或分析。尝试或无进展上限耗尽时，必须显式授权 session。禁用 reviewer 不会禁用 audit。
 
-旧会话保持只读。当前会话无效时，不会回退到另一个执行器。
+legacy v1 记录保持只读；会话无效时不会回退到另一个执行器。新共同任务通过[原生反馈或补齐条件](#原生任务恢复)请求写作，并由同一所有者继续。
 
 ### `simple-ar report-export`
 
@@ -1041,9 +1041,9 @@ simple-ar research-session-continue --session-root SESSION --parent-attempt-id I
 
 `--session-root` 和末尾命令必填，其他示例选项可省略，`--metric` 和 `--metric-direction` 可重复。
 
-canonical v2 只允许在技术候选 failed 或 timed_out 后，补交一次修正的简单显式实验。科学上的负结果仍是证据。cwd 默认 `.`，超时默认 300 秒，label 默认 `research-session-recovery`。
+此兼容命令使用保存的 ResearchApplication 所有者（canonical v2），只允许在技术候选 failed 或 timed_out 后，补交一次修正的简单显式实验。科学上的负结果仍是证据。cwd 默认 `.`，超时默认 300 秒，label 默认 `research-session-recovery`。
 
-未显式覆盖时，保留最近候选和 schema。父尝试及文献保留，确定性分析重新运行。配对、已准备数据或 CodeTask 的失败使用各自有界路径。v1 执行已退出。
+未显式覆盖时，保留最近候选和 schema。父尝试及文献保留，确定性分析重新运行。配对、已准备数据或 CodeTask 的失败使用各自有界路径。v1 执行已退出；新共同任务使用原生恢复。
 
 ### `simple-ar research-session-migrate`
 
@@ -1053,7 +1053,7 @@ simple-ar research-session-migrate --source-root OLD --destination-root NEW --ar
 
 `--source-root` 和 `--destination-root` 必填。`--artifact` 和 `--requested-output` 可重复且可省略，`--max-artifact-bytes` 默认 2 MiB。
 
-命令创建后继会话，不改变 v1。只复制显式命名的小文件。目标必须为空且位于旧根目录之外。记录父会话、导入及跳过数量，历史预算记为 `unknown_not_imported`，不猜测。
+命令创建共同工具后继会话，不改变 v1。只复制显式命名的小文件。目标必须为空且位于旧根目录之外。记录父会话、导入及跳过数量，历史预算记为 `unknown_not_imported`，不猜测。
 
 ### 已退出的 `simple-ar research-experiment`
 
