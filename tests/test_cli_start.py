@@ -1593,6 +1593,41 @@ class StartTests(unittest.TestCase):
                         request=args.topic, outputs=('experiments',), sources=sources, limits=limits,
                         root=root / interaction, research_config=research))
                     run.assert_not_called()
+            # Explicit old baselines use the same mounted evidence projection
+            # in CodeTask, not a second legacy creation or a prepared-source run.
+            args.interaction = 'autonomous'
+            args.config = str(root / 'task.toml')
+            baseline_file = root / 'baseline.json'
+            baseline_file.write_text('{}', encoding='utf-8')  # Domain tests own canonical validation.
+            for code_kind in ('existing_project', 'greenfield'):
+                declared = {**execution, 'baseline_policy': 'reuse', 'baseline_ref': 'baseline.json',
+                    'command': ['python', 'measure.py'],
+                    'baseline': {'command': ['python', 'old_measure.py']},
+                    'code_task': {**task, 'kind': code_kind,
+                        **({'code_root': None, 'workspace_mode': 'empty'} if code_kind == 'greenfield' else {})}}
+                if code_kind == 'greenfield':
+                    declared['cwd'] = str(root)
+                    declared.pop('baseline')
+                snapshot = deepcopy(declared)
+                with self.subTest(reuse_code_kind=code_kind), \
+                        patch('simple_ar.cli.main._run_native_start') as run, \
+                        patch('simple_ar.cli.start.print_line'):
+                    self.assertTrue(migrate_exact_code_creation(args, execution=declared,
+                        request='Implement using a retained baseline', outputs=('experiments',),
+                        sources=sources, limits=limits, root=root / code_kind, research_config=research))
+                native = run.call_args.args[0]
+                baseline, candidate = native._execution_contract['conditions']
+                self.assertEqual(native.source[-1], baseline_file)
+                self.assertEqual(baseline['reuse_ref'], f'source{len(native.source)-1}')
+                self.assertEqual(baseline['source'], 'declared')
+                self.assertNotIn('before_implementation', baseline)
+                self.assertEqual(baseline['execution']['command'],
+                    ['python', 'measure.py' if code_kind == 'greenfield' else 'old_measure.py'])
+                self.assertEqual(candidate['execution']['command'], [sys.executable, 'measure.py'])
+                self.assertEqual(candidate['source'], 'implementation')
+                self.assertEqual(native._process_limits, {'process_invocations': 3, 'process_wall_seconds': 15})
+                self.assertFalse(native.approve_execution)
+                self.assertEqual(declared, snapshot)
             self.assertEqual((project / 'check.py').read_text(), 'pass\n')
             self.assertEqual(paper.read_text(), 'Source method and conditions')
 

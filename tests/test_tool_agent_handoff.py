@@ -1998,6 +1998,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     "assert Path('data.txt').read_text() == 'heldout data\\n'\n"
                     "with Path('calls.txt').open('a') as f: f.write(' '.join(sys.argv[1:])+'\\n')\n"
                     "print('score:', float(sys.argv[1]))\n", encoding='utf-8')
+                (project / 'candidate.py').write_text('VALUE = 1\n', encoding='utf-8')
                 execution = {'command': [sys.executable, 'evaluate.py', '3'], 'cwd': str(project),
                     'timeout_sec': 5, 'baseline': {'command': [sys.executable, 'evaluate.py', '1']},
                     'baseline_policy': 'run',
@@ -2097,6 +2098,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 self.assertEqual(old.ledger.to_dict(), old_ledger)
                 self.assertEqual({path: path.read_bytes() for path in old_bytes}, old_bytes)
 
+                self._assert_code_task_consumes_reused_baselines(root, project, old, reused, paths)
+
                 # Failed/forged/lineage-bearing facts and changed protected files
                 # are rejected by the same validator used before task creation.
                 canonical = json.loads(paths[0].read_bytes())
@@ -2147,6 +2150,149 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     alias = str(app.workspace.resolve(locators[0]))
                     with self.assertRaisesRegex(ValueError, 'physical measurement'):
                         reader._analysis_inputs(MeasurementAnalysisRequest(result_refs=[locators[0]], baseline_ref=alias))
+
+    def _assert_code_task_consumes_reused_baselines(self, root, project, old, reused, paths):
+        """Consume the CPU scenario's real controls through the scoped code owner."""
+        from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
+        from simple_ar.code_task.runtime.state import code_task_paths, implementation_file_hashes
+        from simple_ar.code_task.execution.runner import run_code_task_benchmark
+        from simple_ar.tools.scientific import ScientificToolGateway
+        import shlex
+
+        scoped = json.loads(json.dumps(reused))
+        for row in scoped['conditions']:
+            row['source'] = 'declared' if row.get('reuse_ref') else 'implementation'
+        contract = {'project_path': 'project', 'goal': 'Improve the candidate using retained baseline observations',
+            'allowed_patterns': ['candidate.py'], 'validation_command': ['python', '-c',
+                'from candidate import VALUE; assert VALUE == 2'], 'timeout_sec': 5,
+            'preparation': {'kind': 'existing_project', 'workspace_mode': 'copy'}}
+        preflight = Mock()
+        preflight._settings = SimpleNamespace(api_mode='chat')
+        preflight.connection_binding.return_value = {'profile': 'fixture',
+            'settings': {'model': 'fixture', 'api_mode': 'chat'}}
+        preflight.ask_json.side_effect = AssertionError('No model generation in connection preflight')
+        preflight.chat.side_effect = AssertionError('No network calls in connection preflight')
+        # Override the enclosing no-client guard only for this inert connection
+        # preflight. It remains active for the real evidence and CPU paths.
+        with patch('simple_ar.app.tool_application.LLMClient.from_env', return_value=preflight) as connection:
+            app = ToolApplication.create(root / 'code-reuse', contract['goal'], model='fixture',
+                sources={'project': project, 'prior': old.session.store.root}, allow_execution=True,
+                max_turns=1, max_tokens=20000, max_attempts=8, code_task=contract, execution_contract=scoped,
+                process_limits={'process_invocations': 8, 'process_wall_seconds': 60})
+            connection.assert_called_once_with('fixture')
+        preflight.ask_json.assert_not_called()
+        preflight.chat.assert_not_called()
+        owner, science = app.implementation, app.scientific
+        imported = [row for row in science.execution_contract['conditions'] if row.get('reuse_ref')]
+        before = app.ledger.to_dict()
+        inputs = science.implementation_inputs([], None, required=False)
+        self.assertEqual(science.implementation_inputs([], None), inputs)
+        # No preparation ancestry, process approval, or generated identity is
+        # needed for an imported observation, even through absolute aliases.
+        self.assertEqual(science.implementation_inputs(
+            [str(app.workspace.resolve(row['reuse_ref'])) for row in imported], None, required=False), inputs)
+        self.assertEqual(len(inputs['observations']), len(paths))
+        self.assertEqual(inputs['evidence_sha256'], {row['reuse_ref']: row['reuse_sha256'] for row in imported})
+        for observed, row, original in zip(inputs['observations'], imported, paths):
+            canonical = json.loads(original.read_bytes())
+            self.assertEqual(observed['condition_id'], row['id'])
+            self.assertEqual(observed['metrics'], canonical['metrics'])
+            self.assertEqual(observed['measurement'], canonical['measurement'])
+            self.assertEqual(observed['measurement_source']['measurement_id'], canonical['measurement']['measurement_id'])
+            self.assertEqual(observed['measurement_source']['origin'], 'reused')
+            self.assertNotIn('preparation', observed)
+            projected = science._measurement_request(row['reuse_ref'])
+            self.assertNotIn('execution_approval', projected)
+            self.assertNotIn('implementation_approval', projected)
+            with self.assertRaisesRegex(ValueError, 'cannot execute'):
+                science.approval_binding({**row['execution'], 'condition_id': row['id']}, identity='no-rerun')
+        self.assertEqual(app.ledger.to_dict(), before)
+        preparation_binding = owner.approval_binding({}, identity='preparation-only', for_preparation=True)
+        self.assertNotIn('measurement_inputs', preparation_binding)
+        approval = {'token': 'retained-controls', 'binding': owner.approval_binding({}, identity='consume')}
+        self.assertEqual(approval['binding']['measurement_inputs'], inputs)
+
+        unbound = json.loads(json.dumps(science.execution_contract))
+        del unbound['conditions'][0]['reuse_sha256']
+        reader = ScientificToolGateway(app.session.store.root, app.workspace, app.ledger,
+            app.session.manifest.session_id, implementation=owner, execution_contract=unbound)
+        with self.assertRaisesRegex(ValueError, 'digest'):
+            reader.implementation_inputs([], None, required=False)
+        historical = ScientificToolGateway(app.session.store.root, app.workspace, app.ledger,
+            app.session.manifest.session_id)
+        self.assertEqual(historical.implementation_inputs(['records/old/missing.json'], None, required=False),
+            {'observations': [], 'evidence_sha256': {}})
+
+        # Imports cannot satisfy a separately required physical preparation slot.
+        guarded = json.loads(json.dumps(science.execution_contract))
+        physical = next(row for row in guarded['conditions'] if row['role'] == 'candidate')
+        physical.update(source='preparation', before_implementation=True)
+        reader = ScientificToolGateway(app.session.store.root, app.workspace, app.ledger,
+            app.session.manifest.session_id, implementation=owner, execution_contract=guarded)
+        with self.assertRaisesRegex(ValueError, 'registered preparation ancestor'):
+            reader.implementation_inputs([], None)
+        with self.assertRaisesRegex(ValueError, 'required prepared-source measurements'):
+            reader.implementation_inputs([], {'record': 'records/missing/execution.json', 'sha256': '0' * 64})
+
+        context = CapabilityContext(ArtifactStore(app.session.store.root / 'attempts/consume'), AttemptManifest('consume'))
+        def generate(*, context, request):
+            # Generation is substituted; evidence transport and the independent
+            # CPU validator are real. This asserts no model output quality.
+            task_text = context.store.read_json('inputs/brief.json')['request_text']
+            recorded = task_text.split('Recorded prior measurement evidence (not scientific proof or permission to change conditions):\n', 1)[1]
+            observations, _ = json.JSONDecoder().raw_decode(recorded)
+            self.assertEqual(observations, inputs['observations'])
+            self.assertIn(recorded.split('\n\nCaller-frozen', 1)[0], context.store.read_text('inputs/task.md'))
+            candidate = code_task_paths(request.run_dir).workspace_dir
+            (candidate / 'candidate.py').write_text('VALUE = 2\n', encoding='utf-8')
+            validation = run_code_task_benchmark(request.run_dir, command=shlex.join(request.validation_command),
+                skip_validation=True, timeout_sec=5, budget_ledger=app.ledger,
+                session_id=app.session.manifest.session_id, attempt_id='consume')
+            self.assertEqual(validation.status, 'passed')
+            report = context.store.write_text('code_task/validation.json', validation.report_path.read_text(encoding='utf-8'))
+            context.store.write_json('implementation.json', {'schema_version': 'research_implementation.v1',
+                'status': 'validated', 'next_action': 'inspect', 'native_binding': approval,
+                'validation': {'command': list(request.validation_command), 'status': validation.status,
+                    'timeout_sec': 5, 'returncode': validation.returncode, 'timed_out': validation.timed_out},
+                'artifact_refs': {'validation_report': report.to_dict()},
+                'artifact_hashes': {report.path: hashlib.sha256(context.store.resolve(report).read_bytes()).hexdigest()},
+                'implementation_file_hashes': implementation_file_hashes(request.run_dir),
+                'workspace_dir': str(candidate), 'code_task_run_dir': str(request.run_dir)})
+
+        snapshot = app.workspace.resolve(imported[0]['reuse_ref'])
+        content = snapshot.read_bytes()
+        with patch.object(owner, '_client', return_value=Mock()) as client, patch(
+                'simple_ar.research.implementation.run_implementation_capability', side_effect=generate) as generation:
+            try:
+                snapshot.write_bytes(content + b'\n')
+                for read in (lambda: science._measurement_request(imported[0]['reuse_ref']),
+                        lambda: science._measurement_input(imported[0]['reuse_ref']),
+                        lambda: owner.execute(context, {}, approval=approval)):
+                    with self.assertRaisesRegex(ValueError, 'digest'):
+                        read()
+                generation.assert_not_called()
+                client.assert_not_called()
+                self.assertEqual(app.ledger.to_dict(), before)
+            finally:
+                snapshot.write_bytes(content)
+            result = owner.execute(context, {}, approval=approval)
+            self.assertEqual(result.status, 'ok', result.error)
+            generation.assert_called_once()
+            owner.check_delivery(result.data, [result.data['project_path']])
+            saved = app.ledger.to_dict()
+            restored = ToolApplication.load(root / 'code-reuse')
+            self.assertEqual(restored.implementation.execute(context, {}, approval=approval), result)
+            generation.assert_called_once()
+            self.assertEqual(app.ledger.to_dict(), saved)
+            try:
+                snapshot.write_bytes(content + b'\n')
+                with self.assertRaisesRegex(ValueError, 'digest'):
+                    restored.implementation.execute(context, {}, approval=approval)
+                generation.assert_called_once()
+                self.assertEqual(restored.ledger.to_dict(), saved)
+            finally:
+                snapshot.write_bytes(content)
+        self.assertEqual((project / 'candidate.py').read_text(encoding='utf-8'), 'VALUE = 1\n')
 
     def test_shared_condition_environment_reuses_venv_and_blocks_changed_or_unfinished_preparation(self):
         from simple_ar.tools.scientific import freeze_measurement_set
@@ -7056,11 +7202,19 @@ class ScientificToolTests(unittest.TestCase):
                     for row in reused['conditions']], run['conditions'])
                 self.assertEqual(measurement_contract(reused), reused)
                 for change in ({'reuse_ref': ''}, {'reuse_ref': False}, {'role': 'candidate'},
-                        {'source': 'preparation'}, {'reuse_sha256': 'bad'}):
+                        {'source': 'preparation'}, {'source': 'implementation'},
+                        {'source': 'declared', 'before_implementation': True}, {'reuse_sha256': 'bad'}):
                     invalid = json.loads(json.dumps(reused))
                     invalid['conditions'][0].update(change)
                     with self.subTest(change=change), self.assertRaises(ValueError):
                         measurement_contract(invalid)
+                incompatible_environment = json.loads(json.dumps(reused))
+                for row in incompatible_environment['conditions']:
+                    row['execution']['environment'] = {'mode': 'current', 'timeout_sec': 5,
+                        'check_command': ['python', '-c', 'import math']}
+                    row['source'] = 'declared' if row['role'] == 'baseline' else 'implementation'
+                with self.assertRaisesRegex(ValueError, 'Shared environment'):
+                    measurement_contract(incompatible_environment)
             for refs in ([], ['only-one'], ['first', 'second', 'third'], ['first', '']):
                 with self.subTest(refs=refs), self.assertRaises(ValueError):
                     freeze_measurement_set({**flat, 'baseline_policy': 'reuse', 'baseline_ref': refs,

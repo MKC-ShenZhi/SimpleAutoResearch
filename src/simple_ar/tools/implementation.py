@@ -366,11 +366,13 @@ class ImplementationToolGateway:
             from simple_ar.research.project_environment import project_environment_process_env
             for process in binding['process_environments'].values():
                 process['environment'] = project_environment_process_env(self.exact.environment, process['environment'])
-        if predecessor and any(row.get('before_implementation') for row in (self.measurement or {}).get('conditions', [])):
+        conditions = (self.measurement or {}).get('conditions', [])
+        prior_required = any(row.get('before_implementation') for row in conditions)
+        if not for_preparation and (predecessor and prior_required or any(row.get('reuse_ref') for row in conditions)):
             if self.measurement_inputs is None:
                 raise ValueError('Required prior measurements have no scientific evidence owner')
             binding['measurement_inputs'] = self.measurement_inputs(self._preparation_origin(
-                {'binding': binding}, identity=identity), True)
+                {'binding': binding}, identity=identity), prior_required)
         if not for_preparation and self.research_inputs is not None:
             research = self.research_inputs()
             if research:
@@ -839,7 +841,7 @@ class ImplementationToolGateway:
             inputs = (self.measurement_inputs(self._preparation_origin(approval, identity=identity), False)
                 if conditions and self.measurement_inputs and (work.prior_result or work.prepared_result) else {})
             completed = {row['condition_id'] for row in inputs.get('observations', [])}
-            conditions = [row for row in conditions if row['id'] not in completed]
+            conditions = [row for row in conditions if row['id'] not in completed and not row.get('reuse_ref')]
             for key, required in (('process_invocations', steps + 1 + len(conditions)),
                     ('process_wall_seconds', (steps * plan['profile']['timeout_sec'] if plan else 0)
                         + contract.timeout_sec + sum(row['execution']['timeout_sec'] for row in conditions))):

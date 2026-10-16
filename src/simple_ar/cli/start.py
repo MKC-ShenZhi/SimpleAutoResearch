@@ -423,6 +423,24 @@ def native_creation_options(args: argparse.Namespace) -> dict:
         max_output_tokens=getattr(args, '_task_output_limit', None))
 
 
+def _mount_baseline_references(execution: dict, mounts: list[Path], config: str | Path | None) -> dict:
+    """Use the same read-only caller reference binding for code and fixed runs."""
+    values = execution.get('baseline_ref')
+    if execution.get('baseline_policy') != 'reuse' or values is None:
+        return execution
+    from simple_ar.tools.scientific import _reject_links
+    base = Path(config).resolve().parent if config else Path.cwd()
+    refs = []
+    for value in values if isinstance(values, (list, tuple)) else [values]:
+        named = (base / value).absolute() if not Path(value).is_absolute() else Path(value).absolute()
+        _reject_links(named)
+        path = named.resolve()
+        if path not in [item.resolve() for item in mounts]:
+            mounts.append(path)
+        refs.append(f'source{[item.resolve() for item in mounts].index(path)}')
+    return {**execution, 'baseline_ref': refs if isinstance(values, (list, tuple)) else refs[0]}
+
+
 def _configure_research(native: argparse.Namespace, args: argparse.Namespace, *,
                         sources: tuple, research_config: dict, outputs: tuple,
                         require_design: bool, review_model: str | None = None,
@@ -549,9 +567,10 @@ def migrate_exact_code_creation(args: argparse.Namespace, *, execution: dict,
     from simple_ar.research.task_plan import implementation_only
     reproduction = getattr(args, 'task_kind', None) == 'reproduction'
     flat_fields = {'command', 'cwd', 'timeout_sec', 'label', 'result_schema', 'protocol'}
-    controls = {'baseline', 'baseline_policy', 'pairs', 'seeds', 'seed_count', 'seed_flag'}
+    controls = {'baseline', 'baseline_policy', 'baseline_ref', 'pairs', 'seeds', 'seed_count', 'seed_flag'}
     if (not isinstance(execution.get('code_task'), dict)
-            or execution.get('baseline_policy', 'skip') not in {'run', 'skip', 'none'}):
+            or execution.get('baseline_policy', 'skip') not in {'run', 'skip', 'none', 'reuse'}
+            or execution.get('baseline_policy') == 'reuse' and execution.get('baseline_ref') is None):
         return False
     from simple_ar.cli.parser import build_parser
     native = build_parser().parse_args(['start'])
@@ -559,6 +578,9 @@ def migrate_exact_code_creation(args: argparse.Namespace, *, execution: dict,
         'llm_requests': native.max_turns if limits.get('llm_requests') is None else limits['llm_requests'],
         'total_tokens': native.max_tokens if limits.get('total_tokens') is None else limits['total_tokens']}
     task = execution['code_task']
+    project = Path(task['code_root']).resolve() if task['code_root'] else None
+    mounts = list(dict.fromkeys([*([project] if project is not None else []),
+                                *(Path(row['locator']).resolve() for row in sources)]))
     scientific = 'experiments' in outputs and not set(outputs) - {'experiments', 'report'}
     from simple_ar.cli.research_config import FIELDS
     research_fields = {destination for destination, _ in FIELDS['research'].values()}
@@ -603,6 +625,7 @@ def migrate_exact_code_creation(args: argparse.Namespace, *, execution: dict,
         else:
             declaration = {key: value for key, value in execution.items() if key in flat_fields | controls}
             declaration['baseline_policy'] = normalize_execution_config(execution)['baseline_policy']
+            declaration = _mount_baseline_references(declaration, mounts, getattr(args, 'config', None))
             # Materialize the existing CodeTask interpreter policy, not a new
             # argv rule. freeze receives measurement fields only.
             from simple_ar.code_task.execution.environment import resolve_code_task_command
@@ -610,24 +633,32 @@ def migrate_exact_code_creation(args: argparse.Namespace, *, execution: dict,
             reused = (_source_venv_python(Path(task['code_root'])) if task.get('code_root')
                 and task['workspace_reuse_source_venv'] and not task['python_executable'] else None)
             commands = [(declaration, 'command')]
+            reuse = declaration['baseline_policy'] == 'reuse'
+            if reuse and not declaration.get('pairs'):
+                # A missing baseline command means the original caller argv,
+                # not the candidate's newly resolved CodeTask interpreter.
+                declaration['baseline'] = {'command': list(declaration['command']), **declaration.get('baseline', {})}
             if 'baseline' in declaration:
                 declaration['baseline'] = dict(declaration['baseline'])
-                commands.append((declaration['baseline'], 'command'))
+                if not reuse:
+                    commands.append((declaration['baseline'], 'command'))
             if 'pairs' in declaration:
                 declaration['pairs'] = [dict(pair) for pair in declaration['pairs']]
             commands.extend((pair, key) for pair in declaration.get('pairs', [])
-                for key in ('baseline_command', 'candidate_command'))
+                for key in (('candidate_command',) if reuse else ('baseline_command', 'candidate_command')))
             for row, key in commands:
                 row[key] = (list(row[key]) if (execution.get('environment') or {}).get('mode') == 'venv' else
                     resolve_code_task_command(row[key], env_mode='external' if reused else task['env_mode'],
                         python_executable=str(reused) if reused else task['python_executable']))
             formal = freeze_measurement_set(declaration)
-            if task['kind'] == 'greenfield' and any(row['role'] == 'baseline' for row in formal['conditions']):
+            if task['kind'] == 'greenfield' and any(row['role'] == 'baseline' and not row.get('reuse_ref')
+                    for row in formal['conditions']):
                 if (task['workspace_mode'] not in {'copy', 'sparse_copy'}
                         or not task.get('code_root') or not Path(task['code_root']).is_dir()):
                     return False  # A source baseline requires a real copied source project.
             for row in formal['conditions']:
-                row['source'] = 'preparation' if row['role'] == 'baseline' else 'implementation'
+                row['source'] = ('declared' if row.get('reuse_ref') else
+                    'preparation' if row['role'] == 'baseline' else 'implementation')
                 if row['source'] == 'preparation':
                     row['before_implementation'] = True
             formal = measurement_contract(formal)
@@ -640,18 +671,15 @@ def migrate_exact_code_creation(args: argparse.Namespace, *, execution: dict,
         return False
     from simple_ar.tools.implementation import ExactCodeTask
     from simple_ar.cli.main import _run_native_start
-    project = Path(task['code_root']).resolve() if task['code_root'] else None
     if scientific:
         from simple_ar.experiment.execution.measurement import representative_measurement_execution
         selected = representative_measurement_execution(formal)
-        conditions = formal.get('conditions', [{'execution': selected}])
+        conditions = [row for row in formal.get('conditions', [{'execution': selected}]) if not row.get('reuse_ref')]
         if project is not None and (not project.is_dir() or any(
                 Path(row['execution']['cwd']).resolve() != project for row in conditions)):
             raise ValueError('Reproduction measurement cwd must match the original code_root')
         if project is None and (task['kind'] != 'greenfield' or task['workspace_mode'] != 'empty'):
             raise ValueError('Source-less reproduction requires empty greenfield preparation')
-    mounts = list(dict.fromkeys([*([project] if project is not None else []),
-                                *(Path(row['locator']).resolve() for row in sources)]))
     # Exact argv explicitly names these file inputs. Mount only those files,
     # never their parent directories or arbitrary directory-valued arguments.
     # The implementation owner binds their bytes as protected external inputs.
@@ -822,20 +850,9 @@ def migrate_measurement_creation(args: argparse.Namespace, *, execution: dict,
     from simple_ar.cli.main import _render_native_result, _ensure_research_cli_success
     mounts = [Path(row['locator']) for row in sources]
     if execution.get('baseline_policy') == 'reuse':
-        values = execution.get('baseline_ref')
-        if values is None:
+        if execution.get('baseline_ref') is None:
             return False  # Historical same-session reuse remains with its saved owner.
-        base = Path(args.config).resolve().parent if getattr(args, 'config', None) else Path.cwd()
-        refs = []
-        for value in values if isinstance(values, (list, tuple)) else [values]:
-            named = (base / value).absolute() if not Path(value).is_absolute() else Path(value).absolute()
-            from simple_ar.tools.scientific import _reject_links
-            _reject_links(named)
-            path = named.resolve()
-            if path not in [item.resolve() for item in mounts]:
-                mounts.append(path)
-            refs.append(f'source{[item.resolve() for item in mounts].index(path)}')
-        execution = {**execution, 'baseline_ref': refs if isinstance(values, (list, tuple)) else refs[0]}
+        execution = _mount_baseline_references(execution, mounts, getattr(args, 'config', None))
     contract = freeze_measurement_set(execution) if extended else measurement_contract(execution)
     conditions = measurement_conditions(contract)
     grouped = 'conditions' in contract

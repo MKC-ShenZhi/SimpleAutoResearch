@@ -761,17 +761,24 @@ class ScientificToolGateway:
 
     def implementation_inputs(self, locators: list[str], origin: dict[str, str] | None,
                               *, required: bool = True) -> dict[str, Any]:
-        """Prove explicit pre-implementation conditions on the unchanged source."""
-        conditions = {row['id'] for row in measurement_conditions(self.execution_contract)
+        """Collect frozen imports and prove required unchanged prepared-source facts."""
+        rows = measurement_conditions(self.execution_contract) if self.execution_contract is not None else []
+        conditions = {row['id'] for row in rows
             if (row.get('before_implementation') if required else row.get('source') == 'preparation')}
+        reused = {row['id']: row['reuse_ref'] for row in rows if row.get('reuse_ref')}
         selected, problems = {}, {}
-        if origin is None:
-            if required:
-                raise ValueError('Required prior measurements need a registered preparation ancestor')
-            return {'observations': [], 'evidence_sha256': {}}
-        for locator in dict.fromkeys(locators):
+        if origin is None and required and (conditions or not reused):
+            raise ValueError('Required prior measurements need a registered preparation ancestor')
+        for locator in dict.fromkeys([*(locators if origin is not None else []), *reused.values()]):
             request = self._measurement_request(locator)
             parsed = MeasurementRequest.model_validate(request['arguments'])
+            if request.get('origin') == 'reused':
+                self._condition(parsed, allow_reused=True)
+                ref, receipt = self._measurement_input(locator)
+                selected.setdefault(parsed.condition_id, (ref, receipt))
+                continue
+            if origin is None:
+                continue
             if parsed.condition_id not in conditions:
                 continue
             self._condition(parsed)
@@ -795,7 +802,9 @@ class ScientificToolGateway:
         for identity, (ref, receipt) in selected.items():
             canonical = ArtifactStore(self.root).read_json(ref)
             observations.append({'condition_id': identity, 'result_ref': ref.to_dict(), **{
-                key: canonical[key] for key in ('status', 'metrics', 'experiment_contract', 'measurement', 'output_evidence') if key in canonical}})
+                key: canonical[key] for key in ('status', 'metrics', 'experiment_contract', 'measurement', 'output_evidence') if key in canonical},
+                **({'measurement_source': receipt['result']['data']['measurement_source']}
+                    if receipt.get('origin') == 'reused' else {})})
             hashes.update(receipt['hashes'])
         return {'observations': observations, 'evidence_sha256': hashes}
 
@@ -921,11 +930,10 @@ class ScientificToolGateway:
             canonical = json.loads(raw)
             validate_reused_baseline(canonical, row['execution'])
             physical = canonical['measurement']['measurement_id']
-            if self.implementation is not None and self.implementation.exact is not None:
-                raise ValueError('Reused baseline cannot bypass scoped producing-source lineage')
+            parsed = MeasurementRequest.model_validate({**row['execution'], 'condition_id': row['id']})
+            self._condition(parsed, allow_reused=True)
             process = (canonical.get('execution') or {}).get('process') or {}
-            return {'origin': 'reused', 'arguments': MeasurementRequest.model_validate({
-                    **row['execution'], 'condition_id': row['id']}).model_dump(),
+            return {'origin': 'reused', 'arguments': parsed.model_dump(),
                 'hashes': {self.workspace.locator(str(path)): digest},
                 'measurement_source': {'origin': 'reused', 'condition_id': row['id'],
                     'result_ref': self.workspace.locator(str(path)), 'sha256': digest,

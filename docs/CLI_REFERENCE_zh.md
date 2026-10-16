@@ -313,7 +313,7 @@ simple-ar research-session --config research.toml --session-root SESSION --model
 
 精确argv明确选中的外部已有文件沿单文件只读来源传递，并在批准时绑定hash，也支持`--option=FILE`。不会挂载其父目录或推断目录授权，数据/材料目录须显式提供。域摘要缺失时，只在产物和候选核验后复用完整已存观察，不重跑模型或校验器。
 
-无模型时本地完成比较与交付，安全恢复后也能继续；指定`--model`须有原生任务Chat工具调用配置及有限正数请求/token预算，同一任务和账本继续解释，后续执行仍须批准，不静默改协议。按打印的`start --resume-task`恢复，中断和未知进程不重放。显式候选集合、CodeTask准备、固定测量引用基线复用及已支持的auto/autonomous研究与执行组合共享共同任务；分阶段/checkpoint新建、CodeTask基线reuse及不支持的组合保留原owner，不静默转换。
+无模型时本地完成比较与交付，安全恢复后也能继续；指定`--model`须有原生任务Chat工具调用配置及有限正数请求/token预算，同一任务和账本继续解释，后续执行仍须批准，不静默改协议。按打印的`start --resume-task`恢复，中断和未知进程不重放。显式候选集合、CodeTask准备、外部基线引用复用（含CodeTask消费）及已支持的auto/autonomous研究与执行组合共享共同任务；带产生来源血缘的基线导入、分阶段/checkpoint新建及不支持的组合保留原owner，不静默转换。
 
 测量加写作可用`--task-kind measurement --outputs experiments report --model SELECTOR`及既有报告选项。不要求先修改代码：Writer消费真实测量和对应确定性分析；参考材料沿local-document/material输入。反馈要求新的规范写作回执，原结果、稿件与账本保留，不重跑测量。缺分析或旧稿不能算完整报告交付。
 
