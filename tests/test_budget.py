@@ -14,6 +14,53 @@ from simple_ar.core.budget import (
 
 
 class BudgetLedgerTests(unittest.TestCase):
+    def test_response_accounting_boundary_requires_unchanged_complete_unknown_records(self) -> None:
+        from types import SimpleNamespace
+        from simple_ar.code_task.generation.agent_step import (
+            response_accounting_known, response_accounting_snapshot,
+        )
+
+        ledger = BudgetLedger({'tokens': 100})
+        ledger.reserve('old', {'tokens': 10}, logical_call_id='original-call')
+        entry = ledger.mark_unknown('old', reason='lost response', retain_reservation=True)
+        client = SimpleNamespace(_budget_ledger=ledger)
+        before = response_accounting_snapshot(client)
+        original = entry.to_dict()
+        self.assertFalse(response_accounting_known(client))
+        self.assertTrue(response_accounting_known(client, before))
+        self.assertEqual(ledger.remaining('tokens'), 90)
+        # All fields matter, even when usage dimensions are fully accounted.
+        for field, value in original.items():
+            with self.subTest(field=field):
+                replacement = ({'tokens': 1} if isinstance(value, dict) else
+                               'settled' if field == 'status' else 'changed')
+                setattr(entry, field, replacement)
+                self.assertFalse(response_accounting_known(client, before))
+                setattr(entry, field, value)
+        self.assertTrue(response_accounting_known(client, before))
+        ledger.reserve('current', {'tokens': 10})
+        self.assertFalse(response_accounting_known(client, before))
+        pending_before = response_accounting_snapshot(client)
+        self.assertFalse(response_accounting_known(client, pending_before))
+        ledger.settle('current', {'tokens': 2})
+        self.assertTrue(response_accounting_known(client, before))
+        # A formerly settled entry must not become an ignorable unknown.
+        settled_before = response_accounting_snapshot(client)
+        ledger.entries[-1].status = 'unknown'
+        self.assertFalse(response_accounting_known(client, settled_before))
+        ledger.entries[-1].status = 'settled'
+        ledger.reserve('new', {'tokens': 1})
+        ledger.mark_unknown('new', reason='current uncertainty', known_actual={'tokens': 1})
+        self.assertFalse(response_accounting_known(client, before))
+        self.assertEqual(entry.to_dict(), original)
+        client._budget_ledger = BudgetLedger()
+        self.assertFalse(response_accounting_known(client, before))
+        for fake in (SimpleNamespace(), SimpleNamespace(_budget_ledger=object())):
+            self.assertIsNone(response_accounting_snapshot(fake))
+            self.assertTrue(response_accounting_known(fake))
+        client._budget_ledger = None
+        self.assertFalse(response_accounting_known(client, before))
+
     def test_temporary_floors_preserve_accounting_and_guard_each_reservation(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "budget.json"

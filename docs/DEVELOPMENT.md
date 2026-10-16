@@ -123,6 +123,8 @@ Code patches and generated repair actions use the shared atomic file writer. Fil
 
 CodeTask also owns completed-proposal correction and authorized technical verification/repair. Research callers supply approval, protocol-asset guards and the shared ledger, then retain the returned evidence; they do not run another repair loop. Proposal-only public execution still waits for approval. Failed restoration, changed protected assets or insufficient verification allowance stop further automatic work; scientific measurement remains a separate responsibility.
 
+Completed-response corrections capture a call-local accounting boundary. An unchanged historical `unknown` remains charged and preserved, but does not by itself forbid correcting a later fully received response. Pending reservations, new uncertainty, changed historical records and ledger replacement still block correction. Fallback checks cover the whole planning/generation unit. The original client owns every physical retry/reservation and output limit; this boundary neither adds capacity nor replays transport failures, and exact source-span/candidate validation remains unchanged.
+
 The report projection owns measurement-to-text evidence joins. Applications select accepted records; comparisons must reference those measurements, and implementation history stops at the measured revision. Later patches and superseded measurements remain history, not evidence for the current result. Source retrieval uses canonical document chunks and in-memory ranking; the retired persistent-index API fails explicitly without modifying historical stores.
 
 See [capability contracts](../src/simple_ar/core/capabilities.py),

@@ -11,7 +11,7 @@ from typing import Any, Callable, Mapping
 from simple_ar.integrations.llm import LLMClient, LLMError, LLMResponseError
 from simple_ar.code_task.generation.agent_step import (
     run_completed_response_corrections, run_json_agent_step,
-    response_accounting_known, write_agent_step_artifact,
+    response_accounting_known, response_accounting_snapshot, write_agent_step_artifact,
 )
 from simple_ar.code_task.generation.common import scalar_list, text as clean_text
 from simple_ar.code_task.generation.task_contract import contract_prompt_view
@@ -57,6 +57,9 @@ def build_architecture_plan(
         message_callback=message_callback, planner_selector=planner_selector,
     )
     if client is not None:
+        # Fallback must account for the entire planning unit, including retries.
+        accounting_before = response_accounting_snapshot(client)
+
         def operation(attempt: int, error: LLMError | None) -> dict[str, Any]:
             prompt = greenfield_architecture_prompt(
                 contract=contract, result_schema=result_schema,
@@ -74,7 +77,7 @@ def build_architecture_plan(
             return normalize_architecture_plan(raw, contract=contract, resource_plan=resource_plan)
 
         def on_failure(exc: LLMError, attempt: int, correct: bool) -> None:
-            if isinstance(exc, LLMResponseError) and response_accounting_known(client):
+            if isinstance(exc, LLMResponseError) and response_accounting_known(client, accounting_before):
                 action = "correcting the completed response" if correct else "no retries left"
                 _emit(message_callback, "Greenfield architecture planning failed "
                       f"(attempt {attempt}/{retry_attempts}); {action}. {exc}")
@@ -88,7 +91,7 @@ def build_architecture_plan(
                 write_json(planning_dir / "final_plan.json", plan)
             return plan, "compact"
         except LLMResponseError as exc:
-            if not response_accounting_known(client):
+            if not response_accounting_known(client, accounting_before):
                 raise
             last_error = exc
     if client is not None and not allow_fallback:

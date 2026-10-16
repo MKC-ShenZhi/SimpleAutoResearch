@@ -27,7 +27,7 @@ from simple_ar.code_task.memory import task_memory_context
 from simple_ar.code_task.analysis.interfaces import render_source_snippets, snippet_api_contract
 from simple_ar.integrations.llm import LLMClient, LLMError, LLMResponseError
 from simple_ar.code_task.generation.agent_step import (
-    response_accounting_known, retry_suffix, run_completed_response_corrections,
+    response_accounting_known, response_accounting_snapshot, retry_suffix, run_completed_response_corrections,
 )
 from simple_ar.integrations.usage import record_usage
 
@@ -248,6 +248,9 @@ def _generate_plan_data(
                 meta_dir, usage, stage=usage_stage, message_callback=message_callback),
         )
 
+        # Keep fallback conservative across every correction in this plan unit.
+        accounting_before = response_accounting_snapshot(client)
+
         def operation(attempt: int, last_error: LLMError | None) -> dict[str, Any]:
             suffix = f" (attempt {attempt}/{llm_retry_attempts})" if llm_retry_attempts > 1 else ""
             _emit(message_callback, f"Calling LLM for code-task {plan_name} planning{suffix}.")
@@ -257,7 +260,7 @@ def _generate_plan_data(
             if isinstance(exc, LLMResponseError):
                 write_json(meta_dir / "planning_steps" / f"{plan_name}-plan-response-{attempt:03d}.json",
                     {"error": str(exc), "raw_response": exc.raw_response})
-                if response_accounting_known(client):
+                if response_accounting_known(client, accounting_before):
                     _emit(message_callback, f"LLM {plan_name} planning attempt {attempt} failed: {exc}")
 
         try:
@@ -266,7 +269,7 @@ def _generate_plan_data(
                 on_failure=on_failure,
             ), "llm"
         except LLMResponseError as exc:
-            if not allow_llm_fallback or not response_accounting_known(client):
+            if not allow_llm_fallback or not response_accounting_known(client, accounting_before):
                 raise
             _emit(message_callback, f"Using offline fallback after LLM {plan_name} planning failed. {exc}")
 

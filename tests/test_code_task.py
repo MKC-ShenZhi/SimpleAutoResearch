@@ -4828,23 +4828,27 @@ protected_patterns = ["pyproject.toml"]
                     for allow in (False, True):
                         with self.subTest(consumer=generate.__name__, error=str(error), fallback=allow):
                             client = Mock()
-                            client.ask_json.side_effect = ([LLMResponseError('invalid JSON', raw_response='{broken'), error]
-                                if status == 'correction' else error)
                             ledger = BudgetLedger({'llm_requests': 10, 'image_requests': 3})
                             client._budget_ledger = ledger
                             if status in ('unknown', 'reserved'):
                                 ledger.reserve('image', {'image_requests': 1})
+                                self.assertEqual(ledger.unknown_dimensions(), ())
+                            ledger_after = []
+                            def fail(*_args, **_kwargs):
                                 if status == 'unknown':
                                     ledger.mark_unknown('image', reason='dispatch unknown',
                                         known_actual={'image_requests': 1})
-                                self.assertEqual(ledger.unknown_dimensions(), ())
-                            before = ledger.to_dict()
+                                ledger_after.append(ledger.to_dict())
+                                if status == 'correction' and client.ask_json.call_count == 1:
+                                    raise LLMResponseError('invalid JSON', raw_response='{broken')
+                                raise error
+                            client.ask_json.side_effect = fail
                             with patch.object(LLMClient, 'for_task', return_value=client), self.assertRaises(type(error)) as caught:
                                 generate(run_dir, llm_client=client, llm_retry_attempts=3,
                                     allow_llm_fallback=allow, force=True)
                             self.assertIs(caught.exception, error)
                             self.assertEqual(client.ask_json.call_count, 2 if status == 'correction' else 1)
-                            self.assertEqual(ledger.to_dict(), before)
+                            self.assertEqual(ledger.to_dict(), ledger_after[-1])
                             self.assertEqual({path: path.read_bytes() for path in retained}, retained)
                             manifest = read_json(run_dir / 'manifest.json')
                             self.assertEqual(manifest['plan'], approved['plan'])

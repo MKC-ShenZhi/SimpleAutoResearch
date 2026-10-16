@@ -13,7 +13,10 @@ from simple_ar.core.artifacts import write_json, write_text, replace_exact_spans
 from simple_ar.integrations.llm import LLMClient, LLMError, LLMResponseError
 from simple_ar.core.budget import BudgetLedger
 from simple_ar.code_task.analysis.interfaces import dependency_context, order_file_specs, public_api
-from simple_ar.code_task.generation.agent_step import run_json_agent_step, write_agent_step_artifact, response_accounting_known
+from simple_ar.code_task.generation.agent_step import (
+    run_json_agent_step, write_agent_step_artifact, response_accounting_known,
+    response_accounting_snapshot,
+)
 from simple_ar.code_task.generation.common import generation_candidate, mapping_list, safe_relative_path, string_list
 from simple_ar.code_task.generation.file_specs import is_model_generated_file, is_runtime_placeholder
 from simple_ar.code_task.generation.implementation_memory import record_generated_file, record_generation_batch
@@ -160,6 +163,7 @@ def _generate_implementation_contents(
     for attempt in range(1, retry_attempts + 1):
         response = {}
         response_received = False
+        accounting_before = response_accounting_snapshot(client)
         try:
             response = run_json_agent_step(client=client, system=system,
                 prompt=prompt + ('\nValidation feedback: ' + feedback if feedback else ''),
@@ -183,7 +187,7 @@ def _generate_implementation_contents(
             if artifact_dir is not None and isinstance(exc, (ValueError, SyntaxError)):
                 write_agent_step_artifact(artifact_dir, stage=label if legacy else 'implementation',
                     attempt_index=attempt, value={'response': response, 'validation_error': str(exc)})
-            if not response_accounting_known(client):
+            if not response_accounting_known(client, accounting_before):
                 raise
             if not legacy:
                 # A complete parsed response can need structural correction;
@@ -277,6 +281,8 @@ def write_generated_project(
                     "max_generated_lines_remaining": max_generated_lines - total_lines,
                 }
                 prompt = json.dumps(context, ensure_ascii=False, default=str)
+                # Fallback covers the complete batch, including every correction.
+                accounting_before = response_accounting_snapshot(client)
                 try:
                     contents, response, modes = _generate_implementation_contents(
                         client=client, system=IMPLEMENTATION_SYSTEM + (
@@ -293,7 +299,7 @@ def write_generated_project(
                         message_callback=message_callback)
                     summary = str(response.get("summary", ""))[:500]
                 except LLMResponseError:
-                    if not allow_fallback or not response_accounting_known(client):
+                    if not allow_fallback or not response_accounting_known(client, accounting_before):
                         raise
                     _emit(message_callback, f"Explicit fallback enabled: using offline templates for {batch_id}.")
             elif not allow_fallback:

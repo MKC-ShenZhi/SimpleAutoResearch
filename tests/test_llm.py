@@ -1588,6 +1588,129 @@ class LLMParsingTests(unittest.TestCase):
         self.assertEqual(ledger.remaining("total_tokens"),
                          95 - ledger.entries[0].reserved["total_tokens"])
 
+    def test_completed_corrections_scope_sdk_accounting_to_each_operation(self) -> None:
+        from simple_ar.code_task.generation.agent_step import run_json_agent_step
+        from simple_ar.code_task.generation.architecture import build_architecture_plan
+        from simple_ar.code_task.generation.writer import _generate_implementation_contents, write_implementation_unit
+        from simple_ar.code_task.editing.planning import _generate_plan_data
+
+        # The shared step owns the uncertainty matrix; each consumer proves its
+        # boundary placement, not a duplicate copy of every SDK fault scenario.
+        cases_by_owner = {
+            'step': ('correct', 'reserved', 'new_reserved', 'new_unknown', 'changed_history',
+                'settled_to_unknown', 'transport_retry', 'budget', 'floor', 'unbounded_budget'),
+            'architecture': ('correct', 'fallback', 'new_unknown'),
+            'planning': ('correct', 'fallback', 'new_unknown'),
+            'writer': ('correct', 'syntax', 'new_unknown', 'transport_retry', 'budget', 'floor'),
+            'legacy_writer': ('correct', 'new_unknown'),
+        }
+        for owner, cases in cases_by_owner.items():
+            for case in cases:
+                with self.subTest(owner=owner, case=case), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    project = root / 'project'
+                    project.mkdir()
+                    original_bytes = b'VALUE = 1\n'
+                    (project / 'main.py').write_bytes(original_bytes)
+                    ledger = BudgetLedger({'llm_requests': 2 if case == 'budget' else 6,
+                                           'total_tokens': 1000000})
+                    ledger.reserve('old', {'llm_requests': 1, 'total_tokens': 100})
+                    old = ledger.mark_unknown('old', reason='earlier failed transport',
+                        known_actual={'llm_requests': 1}, retain_reservation=case != 'unbounded_budget')
+                    old_record = old.to_dict()
+                    if case == 'reserved':
+                        ledger.reserve('pending', {'other': 1})
+                    if case == 'settled_to_unknown':
+                        ledger.reserve('settled', {'other': 1})
+                        ledger.settle('settled', {'other': 1})
+                    client = LLMClient(LLMSettings(api_key='test-key', api_mode='chat',
+                        max_output_tokens=100, retry_attempts=2 if case == 'transport_retry' else 1,
+                        retry_base_delay_sec=0), budget_ledger=ledger)
+                    good = ({'ok': True} if owner in ('step', 'planning') else
+                            {'files': [{'path': 'main.py', 'content': "print('ok')\n"}], 'unresolved': []})
+                    if owner == 'writer':
+                        good = {'files': [{'path': 'main.py', 'replacements': [
+                            {'old_text': 'VALUE = 1', 'new_text': 'VALUE = 2'}]}], 'unresolved': []}
+                    bad = ({'files': [{'path': 'main.py', 'replacements': [
+                        {'old_text': 'missing original', 'new_text': 'VALUE = 2'}]}], 'unresolved': []}
+                        if owner == 'writer' else {'files': []})
+                    if case == 'syntax':
+                        bad = {'files': [{'path': 'main.py', 'replacements': [
+                            {'old_text': 'VALUE = 1', 'new_text': 'def broken(:'}]}], 'unresolved': []}
+                    calls = []
+
+                    def provider(*_args):
+                        calls.append(True)
+                        if case == 'transport_retry' and len(calls) == 1:
+                            raise TimeoutError('response lost within this operation')
+                        if len(calls) == 1:
+                            if case in ('new_reserved', 'new_unknown'):
+                                ledger.reserve('during-call', {'other': 1})
+                                if case == 'new_unknown':
+                                    ledger.mark_unknown('during-call', reason='new uncertainty',
+                                                        known_actual={'other': 1})
+                            elif case == 'changed_history':
+                                old.reason = 'history changed during call'
+                            elif case == 'settled_to_unknown':
+                                ledger.entries[1].status = 'unknown'
+                        rejected = len(calls) == 1 or case in ('fallback', 'transport_retry')
+                        # Decode errors and complete parsed structural failures
+                        # must both reach the same accounting boundary.
+                        content = ('not a JSON response' if owner in ('step', 'planning')
+                                   else json.dumps(bad)) if rejected else json.dumps(good)
+                        return {'choices': [{'message': {'content': content}}],
+                                'usage': {'prompt_tokens': 2, 'completion_tokens': 3, 'total_tokens': 5}}
+
+                    def invoke():
+                        if owner == 'step':
+                            return run_json_agent_step(client=client, system='s', prompt='p',
+                                label='test', stage='test', attempt_index=1, retry_attempts=2,
+                                max_output_tokens=100)
+                        if owner == 'architecture':
+                            return build_architecture_plan(contract={}, result_schema={}, resource_plan={},
+                                domain_profile={}, client=client, retry_attempts=2, allow_fallback=True)
+                        if owner == 'writer':
+                            return write_implementation_unit(project_dir=project, goal='Change the value',
+                                files=[{'path': 'main.py'}], source_windows=[], client=client,
+                                artifact_dir=root / 'steps', retry_attempts=2,
+                                original_files={'main.py': {'text': original_bytes.decode()}})
+                        if owner == 'legacy_writer':
+                            return _generate_implementation_contents(client=client, system='s', prompt='p',
+                                planned=['main.py'], retry_attempts=2, legacy=True)
+                        with patch.object(LLMClient, 'for_task', return_value=client):
+                            return _generate_plan_data(Path(tmp), inputs={
+                                'task_text': 'goal', 'index': {}, 'benchmark_command': '',
+                                'run_context': {}, 'allowed_patterns': [], 'protected_patterns': []}, selected_files=[],
+                                ask=lambda selected, **kw: selected.ask_json('s', 'p'),
+                                offline=lambda **kw: {'offline': True}, plan_name='test', usage_stage='test',
+                                model=None, use_llm=True, llm_client=client, llm_retry_attempts=2,
+                                allow_llm_fallback=True, message_callback=None)
+
+                    # The snapshot never bypasses the original request floor.
+                    with ledger.protect_remaining({'llm_requests': 4 if case == 'floor' else 0}), patch(
+                            'simple_ar.integrations.llm._call_openai_sdk', side_effect=provider) as sdk:
+                        if case in ('correct', 'fallback'):
+                            result = invoke()
+                            if case == 'fallback':
+                                self.assertEqual(result[1], 'fallback' if owner == 'architecture' else 'offline')
+                            elif owner == 'writer':
+                                self.assertEqual((project / 'main.py').read_bytes(), b'VALUE = 2\n')
+                        else:
+                            with self.assertRaises((LLMError, ValueError, SyntaxError)):
+                                invoke()
+                            self.assertEqual((project / 'main.py').read_bytes(), original_bytes)
+                    expected_calls = (0 if case == 'unbounded_budget' else
+                        2 if case in ('correct', 'fallback', 'transport_retry') else 1)
+                    self.assertEqual(sdk.call_count, expected_calls)
+                    if case != 'changed_history':
+                        self.assertEqual(old.to_dict(), old_record)
+                    self.assertEqual(old.status, 'unknown')
+                    physical = [entry for entry in ledger.entries
+                                if entry.reservation_id != 'old' and 'llm_requests' in entry.reserved]
+                    self.assertEqual([entry.status for entry in physical],
+                        ['unknown', 'settled'] if case == 'transport_retry' else
+                        ['settled'] * sdk.call_count)
+
     def test_authentication_failure_releases_preflight_reservation(self) -> None:
         ledger = BudgetLedger({"llm_requests": 2, "total_tokens": 100})
         client = LLMClient(

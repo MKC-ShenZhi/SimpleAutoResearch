@@ -322,7 +322,11 @@ class CodeTaskInterfaceTests(unittest.TestCase):
             def __init__(self, valid_on_retry):
                 self.calls = 0
                 self.valid_on_retry = valid_on_retry
-                self._budget_ledger = BudgetLedger({'llm_requests': 3, 'total_tokens': 300})
+                self._budget_ledger = BudgetLedger({'llm_requests': 4, 'total_tokens': 400})
+                self._budget_ledger.reserve('older-call', {'llm_requests': 1, 'total_tokens': 100})
+                self.old_unknown = self._budget_ledger.mark_unknown('older-call',
+                    reason='earlier transport failed', known_actual={'llm_requests': 1},
+                    retain_reservation=True).to_dict()
 
             def ask_json(self, _system, prompt, **kwargs):
                 self.calls += 1
@@ -362,25 +366,30 @@ class CodeTaskInterfaceTests(unittest.TestCase):
             artifacts = generate_project(**options, client=fallback, allow_fallback=True)
             self.assertEqual(fallback.calls, 3)
             self.assertTrue(all(row["mode"] == "fallback" for row in artifacts["generated_files"]))
+            for retained_client in (client, failed, fallback):
+                self.assertEqual(retained_client._budget_ledger.entries[0].to_dict(), retained_client.old_unknown)
             before = project_bytes(project)
             for status in ('unknown', 'unknown_accounted', 'reserved'):
                 with self.subTest(status=status):
                     uncertain = Mock()
-                    uncertain.ask_json.return_value = {'files': []}
                     ledger = BudgetLedger({'llm_requests': 3, 'total_tokens': 300, 'image_requests': 3})
                     uncertain._budget_ledger = ledger
                     amounts = {'image_requests': 1} if status != 'unknown' else {'llm_requests': 1, 'total_tokens': 100}
                     ledger.reserve('prior', amounts)
-                    if status != 'reserved':
-                        ledger.mark_unknown('prior', reason='dispatch unknown',
-                            known_actual=amounts if status == 'unknown_accounted' else None)
                     if status != 'unknown':
                         self.assertEqual(ledger.unknown_dimensions(), ())
-                    ledger_before = ledger.to_dict()
+                    ledger_after = []
+                    def incomplete(*_args, **_kwargs):
+                        if status != 'reserved':
+                            ledger.mark_unknown('prior', reason='dispatch unknown',
+                                known_actual=amounts if status == 'unknown_accounted' else None)
+                        ledger_after.append(ledger.to_dict())
+                        return {'files': []}
+                    uncertain.ask_json.side_effect = incomplete
                     with self.assertRaises(ValueError):
                         generate_project(**options, memory=memory, client=uncertain, allow_fallback=True)
                     self.assertEqual(uncertain.ask_json.call_count, 1)
-                    self.assertEqual(ledger.to_dict(), ledger_before)
+                    self.assertEqual(ledger.to_dict(), ledger_after[0])
                     self.assertEqual(memory, {"retained": ["original"]})
                     self.assertEqual(project_bytes(project), before)
 
@@ -410,22 +419,26 @@ class CodeTaskInterfaceTests(unittest.TestCase):
                     with self.subTest(owner=owner, error=type(error).__name__, status=unknown):
                         ledger = BudgetLedger({'llm_requests': 10, 'total_tokens': 1000})
                         ledger.reserve('prior', {'llm_requests': 1, 'total_tokens': 100})
-                        # A completed response may coexist with a prior unknown charge.
+                        # These uncertainties arise within the operation boundary.
                         if unknown in ('unknown_accounted', 'reserved'):
                             ledger.settle('prior', {'llm_requests': 1, 'total_tokens': 25})
                             ledger.reserve('image', {'image_requests': 1})
-                            if unknown == 'unknown_accounted':
-                                ledger.mark_unknown('image', reason='dispatch unknown', known_actual={'image_requests': 1})
                             self.assertEqual(ledger.unknown_dimensions(), ())
-                        elif unknown:
-                            ledger.mark_unknown('prior', reason='retained uncertain charge')
-                        else:
+                        elif not unknown:
                             ledger.settle('prior', {'llm_requests': 1, 'total_tokens': 25})
-                        before = ledger.to_dict()
                         client = Mock()
                         client._budget_ledger = ledger
-                        client.ask_json.side_effect = ([LLMResponseError('invalid JSON', raw_response='{broken'), error]
-                            if correction else error)
+                        ledger_after = []
+                        def fail(*_args, **_kwargs):
+                            if unknown == 'unknown_accounted':
+                                ledger.mark_unknown('image', reason='dispatch unknown', known_actual={'image_requests': 1})
+                            elif unknown and unknown != 'reserved':
+                                ledger.mark_unknown('prior', reason='retained uncertain charge')
+                            ledger_after.append(ledger.to_dict())
+                            if correction and client.ask_json.call_count == 1:
+                                raise LLMResponseError('invalid JSON', raw_response='{broken')
+                            raise error
+                        client.ask_json.side_effect = fail
                         memory = {'retained': True}
                         with self.assertRaises(type(error)) as caught:
                             if owner == 'step':
@@ -447,7 +460,7 @@ class CodeTaskInterfaceTests(unittest.TestCase):
                                     artifact_dir=root / owner)
                         self.assertIs(caught.exception, error)
                         self.assertEqual(client.ask_json.call_count, 2 if correction else 1)
-                        self.assertEqual(ledger.to_dict(), before)
+                        self.assertEqual(ledger.to_dict(), ledger_after[-1])
                         self.assertEqual(memory, {'retained': True})
                         self.assertEqual((project / 'main.py').read_bytes(), original)
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -24,11 +25,12 @@ def run_completed_response_corrections(
     retry_attempts = max(1, int(retry_attempts or 1))
     last_error: LLMError | None = None
     for attempt in range(1, retry_attempts + 1):
+        accounting_before = response_accounting_snapshot(client)
         try:
             return operation(attempt, last_error)
         except LLMError as exc:
             correct = (isinstance(exc, LLMResponseError) and attempt < retry_attempts
-                       and response_accounting_known(client))
+                       and response_accounting_known(client, accounting_before))
             on_failure(exc, attempt, correct)
             if not correct:
                 raise
@@ -157,15 +159,45 @@ def retry_suffix(error: LLMError | None, attempt: int) -> str:
     )
 
 
-def response_accounting_known(client: LLMClient) -> bool:
-    """Do not correct or replace a response with unreconciled ledger operations.
+@dataclass(frozen=True)
+class ResponseAccountingSnapshot:
+    """Call-local evidence; never grants or releases budget capacity."""
 
-    Fully accounted dimensions do not establish that dispatch completed:
-    unknown and pending reserved entries remain authoritative uncertainty.
+    ledger: BudgetLedger
+    unknown_records: tuple[dict[str, Any], ...]
+
+
+def response_accounting_snapshot(client: LLMClient) -> ResponseAccountingSnapshot | None:
+    """Capture complete independent records before an operation/model call."""
+    budget = getattr(client, '_budget_ledger', None)
+    if not isinstance(budget, BudgetLedger):
+        return None
+    return ResponseAccountingSnapshot(budget, tuple(
+        entry.to_dict() for entry in budget.entries if entry.status == 'unknown'))
+
+
+def response_accounting_known(
+    client: LLMClient, before: ResponseAccountingSnapshot | None = None,
+) -> bool:
+    """Allow only unchanged unknown history explicitly captured before the call.
+
+    Without a snapshot retain the conservative whole-ledger check. Reserved
+    entries (including older in-flight work) always block. Every prior unknown
+    must still exist with its entire record unchanged, even if now settled.
+    This is response-correction eligibility, not budget admission.
     """
     budget = getattr(client, '_budget_ledger', None)
-    return not isinstance(budget, BudgetLedger) or all(
-        entry.status in ('settled', 'released') for entry in budget.entries)
+    if not isinstance(budget, BudgetLedger):
+        return before is None
+    if before is not None and before.ledger is not budget:
+        return False
+    entries = {entry.reservation_id: entry.to_dict() for entry in budget.entries}
+    retained = {row['reservation_id']: row for row in before.unknown_records} if before else {}
+    if any(entries.get(key) != row for key, row in retained.items()):
+        return False
+    return all(row['status'] in ('settled', 'released') or (
+        row['status'] == 'unknown' and retained.get(key) == row)
+        for key, row in entries.items())
 
 
 def _emit(callback: MessageCallback | None, message: str) -> None:
