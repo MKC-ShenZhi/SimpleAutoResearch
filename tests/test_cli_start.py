@@ -850,6 +850,92 @@ class StartTests(unittest.TestCase):
             self.assertEqual(len(configs), 1)
             self.assertEqual(tomllib.loads(configs[0].read_text())["task"]["goal"], "task")
 
+    def test_technical_start_executes_shared_arguments_without_reading_export(self):
+        from simple_ar.cli.main import main
+        from simple_ar.cli.research_config import validate_session_arguments
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paper = root / "paper.md"
+            paper.write_text("Published claim", encoding="utf-8")
+            data = root / "values.csv"
+            data.write_text("score\n1\n2\n", encoding="utf-8")
+            cases = [
+                ["--kind", "survey", "--sources", "search", "--fulltext", "--max-cited-sources", "3"],
+                ["--kind", "data_analysis", "--data-file", str(data), "--value-column", "score",
+                 "--observation-unit", "run"],
+                ["--kind", "reproduction", "--document", str(paper), "--hypothesis", "Claim",
+                 "--dataset", "Fixed data", "--expected-outcome", "Compare score", "--metric", "score",
+                 "--project", directory, "--allow", "adapter.py", "--validate", "python check.py",
+                 "--environment", "venv", "--timeout-sec", "12", "--command", "python", "adapter.py"],
+            ]
+            for number, flags in enumerate(cases):
+                output = root / str(number)
+                with self.subTest(flags=flags), patch("sys.stdin.isatty", return_value=False), \
+                        patch("simple_ar.cli.main._print_research_session") as run, \
+                        patch("simple_ar.cli.research_config.research_defaults", return_value={}) as load, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    main(["start", "--goal", "Preserve the confirmed contract", "--yes",
+                          "--output-root", str(output), *flags])
+                run.assert_called_once()
+                self.assertEqual(load.call_count, 1)
+                self.assertEqual(load.call_args.args[0][0], "start")
+                prepared = run.call_args.args[0]
+                self.assertEqual(prepared.command, "research-session")
+                validate_session_arguments(prepared)
+                exported = research_defaults(["research-session", "--config", str(prepared.config)])
+                for destination, value in exported.items():
+                    actual = getattr(prepared, destination)
+                    self.assertEqual(str(actual) if isinstance(actual, Path) else actual, value, destination)
+                self.assertEqual(prepared._explicit_resume_destinations,
+                                 (set(exported) - {"execution_details"}) | {"config"})
+
+    def test_technical_setup_confirmation_uses_edits_and_preserves_save_only(self):
+        from simple_ar.cli.main import main
+        with tempfile.TemporaryDirectory() as directory:
+            for mode in ("decline", "prepare", "accept", "edit", "invalid"):
+                output = Path(directory) / mode
+                def confirm(prompt):
+                    self.assertIn("Start now", prompt)
+                    config, = output.glob("*/research.toml")
+                    if mode == "edit":
+                        config.write_text('[task]\ngoal="Edited goal"\nkind="survey"\n'
+                            'outputs=["summary"]\noutput_root="edited sessions"\n'
+                            '[model]\nname=""\n[research]\ninteraction="autonomous"\n', encoding="utf-8")
+                    elif mode == "invalid":
+                        config.write_text('[task]\ngoal="Edited goal"\noutput_root=3\n', encoding="utf-8")
+                    return "n" if mode == "decline" else "y"
+                with self.subTest(mode=mode), patch("sys.stdin.isatty", return_value=mode != "prepare"), \
+                        patch("builtins.input", side_effect=confirm) as approval, \
+                        patch("simple_ar.cli.main._print_research_session") as run, \
+                        patch("simple_ar.cli.research_config.research_defaults", wraps=research_defaults) as load, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    argv = ["start", "--kind", "survey", "--sources", "search", "--fulltext", "--goal", "Keep inputs",
+                            "--output-root", str(output), *(["--prepare-only"] if mode == "prepare" else [])]
+                    if mode == "invalid":
+                        with self.assertRaisesRegex(SystemExit, "Invalid type for task.output_root"):
+                            main(argv)
+                    else:
+                        main(argv)
+                self.assertEqual(len(list(output.glob("*/research.toml"))), 1)
+                self.assertEqual(approval.call_count, 0 if mode == "prepare" else 1)
+                self.assertEqual(load.call_count, 2 if mode in {"edit", "invalid"} else 1)
+                if mode in {"decline", "prepare", "invalid"}:
+                    run.assert_not_called()
+                    continue
+                run.assert_called_once()
+                args = run.call_args.args[0]
+                if mode == "edit":
+                    self.assertEqual(args.topic, "Edited goal")
+                    self.assertEqual(args.model, "")
+                    self.assertEqual(args.outputs, ["summary"])
+                    self.assertEqual(args.output_root, str((args.config.parent / "edited sessions").resolve()))
+                    self.assertEqual(args.interaction, "autonomous")
+                    self.assertNotIn("report_draft_scope", args._explicit_resume_destinations)
+                    self.assertFalse(getattr(args, "research_allow_pdf_download", False))
+                else:
+                    self.assertEqual(args.topic, "Keep inputs")
+                    self.assertTrue(args.research_allow_pdf_download)
+
     def test_interactive_native_decline_creates_no_task_or_legacy_configuration(self):
         from simple_ar.cli.main import main
         with tempfile.TemporaryDirectory() as directory:

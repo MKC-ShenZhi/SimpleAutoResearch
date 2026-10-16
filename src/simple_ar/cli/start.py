@@ -1,12 +1,13 @@
 """Input adapters for native tasks and explicit structured compatibility.
 
 This module adapts inputs without inferring execution authority or owning task
-state. Native creation delegates to main; structured compatibility writes TOML
-for the existing research-session command.
+state. Native creation delegates to main; structured setup exports editable
+TOML and supplies the same arguments directly to the shared session entry.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -853,7 +854,7 @@ def _inline_value(value) -> str:
     """Serialize validated selectors (tables, lists and ordinary scalars)."""
     if isinstance(value, dict):
         return "{" + ", ".join(f"{_quote(key)} = {_inline_value(item)}" for key, item in value.items()) + "}"
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return "[" + ", ".join(_inline_value(item) for item in value) + "]"
     return json.dumps(value, ensure_ascii=False, allow_nan=False)
 
@@ -865,15 +866,58 @@ def _command(arguments: list[str]) -> str:
     return shlex.join(arguments)
 
 
-def _literature_rows(args: argparse.Namespace, sources: str, documents: list[Path]) -> list[str]:
-    return [f"materials_only = {'true' if sources == 'materials' else 'false'}",
-            f"use_fulltext = {'true' if args.fulltext else 'false'}",
-            f"allow_pdf_download = {'true' if args.fulltext else 'false'}",
-            f"keep_raw_pdf = {'true' if args.fulltext else 'false'}",
-            *([f"web_extract_backend = {_quote(args.web_extract_backend)}"]
-              if getattr(args, "web_extract_backend", None) else []),
-            *(["max_fulltext_documents = 6", "max_pdf_mb = 20"] if args.fulltext else []),
-            "", "[assets]", f"papers = {_array([str(path) for path in documents])}"]
+def _export_start_config(options: dict, config: Path) -> None:
+    """Export declared options only; execution never reads this projection back."""
+    from simple_ar.cli.research_config import FIELDS
+    rows = []
+    for section, fields in FIELDS.items():
+        values = {name: options[destination] for name, (destination, _) in fields.items()
+                  if destination in options}
+        if section == "task":
+            values["output_root"] = "sessions"
+        if section == "execution":
+            values.update(options.get("execution_details", {}))
+            if "code_task_config" in values:
+                values["code_task_config"] = "code_task.toml"
+        if values:
+            rows.extend(["", f"[{section}]", *[f"{name} = {_inline_value(value)}"
+                                               for name, value in values.items()]])
+    config.write_text("\n".join(rows).lstrip() + "\n", encoding="utf-8")
+
+
+def _start_session_arguments(options: dict, config: Path, *, explicit: set[str] | None = None) -> argparse.Namespace:
+    """Project generated values with the config owner's types and path rules.
+
+    These are constructed start values, not arbitrary configuration sections.
+    Choice/value semantics come from start's input owners and the shared
+    validate_session_arguments call in _print_research_session. Edited files
+    must first pass research_defaults, including its full declaration checks.
+    """
+    from simple_ar.cli.parser import build_parser
+    from simple_ar.cli.research_config import FIELDS, PATHS
+    values = dict(options)
+    unknown = set(values) - {destination for fields in FIELDS.values() for destination, _ in fields.values()} - {"execution_details"}
+    if unknown:
+        raise ValueError(f"Unknown generated configuration fields: {sorted(unknown)}")
+    for fields in FIELDS.values():
+        for destination, expected in fields.values():
+            if destination not in values:
+                continue
+            value = values[destination]
+            if type(value) is not expected or (expected is list and any(type(item) is not str for item in value)):
+                raise ValueError(f"Invalid generated configuration type: {destination}")
+            if destination in PATHS:
+                def resolve(item):
+                    target = Path(item).expanduser()
+                    return str(target if target.is_absolute() else (config.resolve().parent / target).resolve())
+                values[destination] = [resolve(item) for item in value] if expected is list else resolve(value)
+    if "execution_details" in values:
+        from simple_ar.app.research_execution import validate_execution_declaration
+        validate_execution_declaration(values["execution_details"])
+    result = build_parser(research_defaults=values).parse_args(["research-session"])
+    result.config = config
+    result._explicit_resume_destinations = (set(options) - {"execution_details"} if explicit is None else explicit) | {"config"}
+    return result
 
 
 def _code_task_files(goal: str, project: Path | None, validation: str, allowed: list[str],
@@ -908,7 +952,7 @@ def _code_task_files(goal: str, project: Path | None, validation: str, allowed: 
     }
 
 
-def _reproduction_rows(args: argparse.Namespace, *, interactive: bool) -> list[str]:
+def _reproduction_options(args: argparse.Namespace, *, interactive: bool) -> dict:
     from simple_ar.experiment.execution.outputs import metric_sources, output_files
     attachments = output_files({"output_files": args.output_files})
     selectors = metric_sources({"output_files": attachments, "metric_sources": args.metric_sources})
@@ -939,7 +983,7 @@ def _reproduction_rows(args: argparse.Namespace, *, interactive: bool) -> list[s
     timeout = args.timeout_sec if args.timeout_sec is not None else 300
     if timeout < 1:
         raise ValueError("--timeout-sec must be positive.")
-    environment_rows = []
+    environment = {}
     setup_steps = 0
     if getattr(args, "check_argv", None) is not None and not args.check_argv:
         raise ValueError("--check-argv must name a nonempty check command; omit it to skip the check.")
@@ -954,14 +998,9 @@ def _reproduction_rows(args: argparse.Namespace, *, interactive: bool) -> list[s
                                        project=cwd, directory=Path('__attempt__') / 'environment', command=argv)
         profile = plan['profile']
         setup_steps = len(plan['steps'])
-        environment_rows = ["", "[execution.environment]", f'mode = "{args.environment}"',
-                            f"requirements = {_array(profile['requirements'])}",
-                            f"install_project = {'true' if profile['install_project'] else 'false'}", f"timeout_sec = {timeout}"]
+        environment = profile
         if profile.get("check_command"):
-            environment_rows.append(f"check_command = {_array(profile['check_command'])}")
             print_line(f"Preparation check: {_command(profile['check_command'])}; failure or timeout stops measurement. Check outputs are not scientific results.")
-        if args.environment == "venv":
-            environment_rows.append(f"python_executable = {_quote(profile['python_executable'])}")
         print_line(f"Preparation: {args.environment}; requirements {profile['requirements']}; install project: {profile['install_project']}. {setup_steps} invocations, each <= {timeout}s. Venv installation may run build code/network; current mode does not install. Not an OS sandbox.")
     print_line("\n".join(f"{key}: {value}" for key, value in protocol.items()))
     print_line(f"Execution: {_command(argv)}\nDirectory: {cwd}\nOne invocation; timeout: {timeout}s; metrics: {', '.join(metrics)}")
@@ -986,17 +1025,14 @@ def _reproduction_rows(args: argparse.Namespace, *, interactive: bool) -> list[s
             args._generated_script = True
             print_line("Authorized new adapter creation uses the bounded script edit policy; author files remain read-only.")
     invocations = (3 if adaptation else 1) + setup_steps
-    return ["", "[execution]", f"command = {_array(argv)}", f"cwd = {_quote(str(cwd))}",
-            *(['code_task_config = "code_task.toml"'] if adaptation else []),
-            *([f"initial_files = {_array(initial_files)}"] if initial_files else []),
-            f"timeout_sec = {timeout}", 'baseline_policy = "skip"', f"primary_metric = {_quote(metrics[0])}",
-            f"metrics = {_array(metrics)}",
-            *(["output_files = {" + ", ".join(f"{_quote(name)} = {_quote(path)}" for name, path in attachments.items()) + "}"] if attachments else []),
-            *(["metric_sources = " + _inline_value(selectors)] if selectors else []),
-            *environment_rows, "", "[execution.protocol]",
-            *[f"{key} = {_quote(value)}" for key, value in protocol.items()],
-            f"metrics = {_array(metrics)}", "", "[budget]", f"process_invocations = {invocations}",
-            f"process_wall_seconds = {timeout * invocations}"]
+    return {"command_argv": argv, "cwd": str(cwd), "timeout_sec": timeout,
+            "primary_metric": metrics[0], "metric": metrics,
+            "execution_details": {"baseline_policy": "skip", "protocol": {**protocol, "metrics": metrics},
+                **({"initial_files": initial_files} if initial_files else {}),
+                **({"output_files": attachments} if attachments else {}),
+                **({"metric_sources": selectors} if selectors else {}),
+                **({"environment": environment} if environment else {})},
+            "process_invocations": invocations, "process_wall_seconds": timeout * invocations}
 
 
 def _session_project(session) -> tuple[Path, dict, dict] | None:
@@ -1238,8 +1274,12 @@ def reuse_session_materials(args: argparse.Namespace) -> None:
     args.reuse = []
 
 
-def prepare_start(args: argparse.Namespace) -> Path | None:
-    """Adapt public start inputs once, retaining exact structured protocols."""
+def prepare_start(args: argparse.Namespace, *, for_execution: bool = False) -> Path | argparse.Namespace | None:
+    """Prepare/export inputs; return shared session arguments only after approval.
+
+    Path-returning callers retain the configuration-export interface. The CLI
+    requests arguments for direct execution, without loading the exported TOML.
+    """
     interactive = sys.stdin.isatty()
     migrated = migrate_new_start(args)
     native_destinations = getattr(args, "_native_start_destinations", None)
@@ -1364,7 +1404,7 @@ def prepare_start(args: argparse.Namespace) -> Path | None:
     validation = None
     allowed = list(args.allow)
     sources = args.sources
-    reproduction_rows: list[str] = []
+    reproduction_options = {}
     from simple_ar.report.templates import BUILTIN_TEMPLATE_NAMES, MATERIAL_REPORT_TEMPLATE
     writing_template = args.template or MATERIAL_REPORT_TEMPLATE
     if kind == "writing":
@@ -1426,7 +1466,7 @@ def prepare_start(args: argparse.Namespace) -> Path | None:
                 if args.cwd and args.cwd.expanduser().resolve() != project:
                     raise ValueError("Reproduction code preparation must measure in its isolated project; --cwd must match --project.")
                 validation = args.validate
-            reproduction_rows = _reproduction_rows(args, interactive=interactive)
+            reproduction_options = _reproduction_options(args, interactive=interactive)
     else:
         if sources not in {None, "materials", "search"}:
             raise ValueError("Source scope must be materials or search.")
@@ -1519,14 +1559,19 @@ def prepare_start(args: argparse.Namespace) -> Path | None:
     if args.with_report:
         outputs[kind].append("report")
     model = "" if kind == "data_analysis" and not args.with_report else args.model
-    rows = ["[task]", f"goal = {_quote(goal)}", f"kind = {_quote('auto' if kind == 'code' else kind)}",
-            f"outputs = {_array(outputs[kind])}",
-            'output_root = "sessions"', "", "[model]", f"name = {_quote(model)}", "",
-            "[research]", f"interaction = {_quote(args.interaction)}"]
+    options = {"topic": goal, "task_kind": "auto" if kind == "code" else kind,
+               "outputs": outputs[kind], "output_root": str((root / "sessions").resolve()),
+               "model": model, "interaction": args.interaction, **reproduction_options}
     if kind in {"survey", "reproduction", "writing"} or (kind == "data_analysis" and args.with_report) or (kind in {"bug_fix", "code"} and (sources or documents)):
-        rows.extend(_literature_rows(args, sources, documents))
+        options.update(research_materials_only=sources == "materials", research_use_fulltext=args.fulltext,
+                       research_allow_pdf_download=args.fulltext, research_keep_raw_pdf=args.fulltext,
+                       local_document=[str(path) for path in documents])
+        if getattr(args, "web_extract_backend", None):
+            options["research_web_extract_backend"] = args.web_extract_backend
+        if args.fulltext:
+            options.update(research_max_fulltext_documents=6, research_max_pdf_mb=20)
         if data_paths:
-            rows.append(f"data = {_array([str(path) for path in dict.fromkeys(data_paths)])}")
+            options["data_path"] = [str(path) for path in dict.fromkeys(data_paths)]
         if kind == "reproduction" and (args.project or args.cwd):
             from simple_ar.research.preparation import inspect_project_preparation, project_preparation_markdown
             from simple_ar.core.artifacts import write_json
@@ -1535,32 +1580,32 @@ def prepare_start(args: argparse.Namespace) -> Path | None:
             write_json(root / "preparation.json", facts)
             (root / "preparation.md").write_text(project_preparation_markdown(facts), encoding="utf-8")
         if kind in {"writing", "data_analysis", "survey", "reproduction"}:
-            rows.append(f"materials = {_array([str(path) for path in materials])}")
+            options["material"] = [str(path) for path in materials]
     if kind in {"survey", "reproduction", "writing"} or args.with_report:
-        rows.extend(["", "[report]", "document_review = true"])
+        options["report_document_review"] = True
         if kind in {"survey", "reproduction", "data_analysis"} or (kind == "writing" and writing_template in {
             MATERIAL_REPORT_TEMPLATE, "analysis_report", "source_review",
         }):
             # Keep the established entry default until automatic granularity has
             # a real same-material comparison; auto remains an explicit choice.
-            rows.extend(['draft_scope = "document"', 'review_scope = "document"'])
+            options.update(report_draft_scope="document", report_review_scope="document")
         if args.max_cited_sources is not None:
-            rows.append(f"max_cited_sources = {args.max_cited_sources}")
+            options["report_max_cited_sources"] = args.max_cited_sources
         if kind == "reproduction":
-            rows.append('template = "reproduction"')
+            options["report_template"] = "reproduction"
         elif kind in {"writing", "data_analysis", "bug_fix", "code"}:
-            rows.append(f"template = {_quote(writing_template)}")
+            options["report_template"] = writing_template
         # New built-in tasks share evidence planning; custom templates and
         # existing TOML/checkpoints retain their author's structure.
         if kind in {"survey", "reproduction"} or writing_template in {"auto", *BUILTIN_TEMPLATE_NAMES}:
-            rows.append('outline_strategy = "adaptive"')
-        rows.extend(reproduction_rows)
+            options["report_outline_strategy"] = "adaptive"
     if kind == "data_analysis":
-        rows.extend(["", "[analysis]", *[f"{key} = {_array(list(value)) if isinstance(value, tuple) else str(value) if type(value) is int else _quote(value)}"
-                                             for key, value in analysis.items()]])
+        from simple_ar.cli.research_config import FIELDS
+        options.update({FIELDS["analysis"][key][0]: list(value) if isinstance(value, tuple) else value
+                        for key, value in analysis.items()})
     if project or kind == "code":
         if data_paths and kind in {"bug_fix", "code"}:
-            rows.extend(["", "[assets]", f"data = {_array([str(path) for path in dict.fromkeys(data_paths)])}"])
+            options["data_path"] = [str(path) for path in dict.fromkeys(data_paths)]
         implementation_goal = getattr(args, "_code_task_text", goal)
         if getattr(args, "_analysis_project", False):
             from simple_ar.result_analysis.script_project import SCRIPT_RESULT_REQUIREMENTS
@@ -1580,12 +1625,10 @@ def prepare_start(args: argparse.Namespace) -> Path | None:
                                          edit_policy=getattr(args, "_reuse_edit_policy", None),
                                          timeout_sec=args.timeout_sec or 300).items():
             (root / name).write_text(text, encoding="utf-8")
-        if kind in {"bug_fix", "code"}:
-            rows.extend(["", "[execution]", 'code_task_config = "code_task.toml"'])
-    config.write_text("\n".join(rows) + "\n", encoding="utf-8")
-    # Validate through the existing parser, not an independent wizard schema.
-    from simple_ar.cli.research_config import research_defaults
-    research_defaults(["research-session", "--config", str(config)])
+        options["code_task_config"] = str((root / "code_task.toml").resolve())
+    session_args = _start_session_arguments(options, config)
+    _export_start_config(options, config)
+    exported_digest = hashlib.sha256(config.read_bytes()).digest()
     if hasattr(args, "_setup_state"):
         from simple_ar.core.artifacts import write_json
         state = {**args._setup_state, "status": "configured", "configuration": str(config)}
@@ -1602,4 +1645,9 @@ def prepare_start(args: argparse.Namespace) -> Path | None:
         if input("Start now / 现在执行? [y/N]: ").strip().lower() not in {"y", "yes"}:
             print_line("Saved without execution. Edit the files or use the printed run command later.")
             return None
-    return config
+    if for_execution and hashlib.sha256(config.read_bytes()).digest() != exported_digest:
+        from simple_ar.cli.research_config import research_defaults
+        explicit: set[str] = set()
+        edited = research_defaults(["research-session", "--config", str(config)], explicit_destinations=explicit)
+        session_args = _start_session_arguments(edited, config, explicit=explicit)
+    return session_args if for_execution else config

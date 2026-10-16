@@ -231,13 +231,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         from simple_ar.cli.start import prepare_start
         from simple_ar.core.locking import SessionLockError
         try:
-            config_path = prepare_start(args)
+            prepared = prepare_start(args, for_execution=True)
         except LLMError as exc:
             raise SystemExit(f"Setup model call failed; the printed setup draft is retained: {exc}") from exc
         except (OSError, ValueError, EOFError, KeyboardInterrupt, SessionLockError) as exc:
             raise SystemExit(f"Task setup stopped: {exc}") from exc
-        if config_path is not None and not args.prepare_only:
-            main(["research-session", "--config", str(config_path)])
+        if isinstance(prepared, argparse.Namespace):
+            _print_research_session(prepared)
         return
     if args.command == "research-session":
         args._explicit_resume_destinations = _explicit_session_option_destinations(
