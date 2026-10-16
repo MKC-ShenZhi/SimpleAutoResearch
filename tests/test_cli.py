@@ -310,6 +310,7 @@ code = "daily"
             table.write_text("group,value\na,2\na,4\n", encoding="utf-8")
             cases = (
                 (["--no-report"], ("summary",), "paper", None),
+                (["--outputs", "experiments"], ("experiments",), "paper", None),
                 (["--model", "fixture"], ("report",), "paper", None),
                 (["--task-kind", "survey", "--outputs", "summary", "--model", "fixture"],
                  ("summary",), "paper", None),
@@ -336,9 +337,10 @@ code = "daily"
                 self.assertEqual(tuple(routed["outputs"]), outputs)
                 self.assertEqual(routed["root"].parent, root / "runs")
                 self.assertNotIn("execution", routed["research_config"])
-                self.assertEqual({k: routed["limits"][k] for k in (
-                    "process_invocations", "process_wall_seconds")},
-                    {"process_invocations": 0, "process_wall_seconds": 0})
+                if 'experiments' not in outputs:
+                    self.assertEqual({k: routed["limits"][k] for k in (
+                        "process_invocations", "process_wall_seconds")},
+                        {"process_invocations": 0, "process_wall_seconds": 0})
                 source = next(row for row in routed["sources"] if row["role"] == role)
                 self.assertEqual(source["mutability"], "read_only")
                 self.assertEqual(source["allowed_uses"], ["read"] if role == "dataset" else ["read", "reference"])

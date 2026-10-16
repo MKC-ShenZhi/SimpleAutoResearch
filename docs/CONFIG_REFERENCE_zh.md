@@ -55,7 +55,11 @@ app = create_research_task(ResearchBrief(request_text="测量所提供的程序�
     requested_outputs=("experiments",)), root=Path("runs/measurement"), services=services)
 ```
 
-执行仍须单独批准实际提案。`execution_confirmation=True` 另要求接受调用方冻结协议，不是进程权限。CodeTask 的 `allowed_patterns` 未填或为空时保留原默认源码范围及强制保护，并非“禁止编辑”；要缩小范围请给明确 glob。开放比较设计、已初始化 `run_dir` 采用及带产生来源血缘的基线须保留真实所有者；不支持的控制在创建前拒绝，不能静默降为仅候选测量。旧应用 API 仍承接其已有合同及历史继续。
+执行仍须单独批准实际提案。`execution_confirmation=True` 另要求接受调用方冻结协议，不是进程权限。CodeTask 的 `allowed_patterns` 未填或为空时保留原默认源码范围及强制保护，并非“禁止编辑”；要缩小范围请给明确 glob。
+
+需要研究且未声明比较控制时，创建保留开放设计，不默认补 `baseline_policy="skip"`。接受后的设计进入同一科学所有者；精确代码任务分别绑定未改源码基线和已实现候选，不能扩大编辑范围、替换环境，或给空项目虚构源码基线。没有模型或命令时，结构化实验请求可先保存材料，暂停等待[明确补齐条件](CLI_REFERENCE_zh.md)；收集材料不等于实验或报告完成。首次绑定模型须在原账本明确追加正数请求和token额度。
+
+已初始化 `run_dir` 采用及带产生来源血缘的基线保留真实所有者；不支持的控制须明确拒绝，不能降为仅候选工作或导入裸结果。旧应用 API 仍承接其已有合同及历史继续。
 
 可信 Python 集成可通过 services 注入文本客户端、独立审阅客户端和 `SearchProviderRegistry`。客户端须实现 `with_budget` 及 `ask_json` 或 `chat_turn`，绑定任务实际账本、会话与 attempt。继续服务工作前，用 `ToolApplication.load(path, services=services)` 恢复依赖。持久化只保留类型/模型身份和 provider 名称，不保存密钥或可执行对象；缺失依赖不会回退环境客户端或内置检索器。自定义实现由调用方信任，不是安全沙箱，也不独立验证实现身份。需跨 CLI/重启使用时，优先命名连接；`model="env"` 表示配置的默认模型，不是名为 env 的服务商模型。
 

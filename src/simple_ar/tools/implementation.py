@@ -215,6 +215,7 @@ class ImplementationToolGateway:
                  measurement_inputs: Callable[[dict[str, str] | None, bool], dict[str, Any]] | None = None,
                  research_inputs: Callable[[], dict[str, Any]] | None = None,
                  measurement: dict[str, Any] | None = None,
+                 measurement_supplier: Callable[[], dict[str, Any] | None] | None = None,
                  exact: dict[str, Any] | None = None) -> None:
         self.root, self.workspace, self.ledger = root, workspace, ledger
         self.model, self.session_id = model, session_id
@@ -224,6 +225,12 @@ class ImplementationToolGateway:
         self.measurement_inputs = measurement_inputs
         self.research_inputs = research_inputs
         self.exact = ExactCodeTask.model_validate(exact) if exact is not None else None
+        if measurement_supplier is not None and self.exact is None:
+            raise ValueError('A producing measurement supplier requires the exact implementation owner')
+        self._measurement_supplier = measurement_supplier
+        self._declared_measurement = self._validate_measurement(measurement)
+
+    def _validate_measurement(self, measurement: dict[str, Any] | None) -> dict[str, Any] | None:
         if measurement is not None:
             if self.exact is None:
                 raise ValueError('A producing measurement contract requires the exact implementation owner')
@@ -232,7 +239,15 @@ class ImplementationToolGateway:
             from simple_ar.tools.scientific import measurement_conditions
             if any(row['execution'].get('environment') is not None for row in measurement_conditions(measurement)):
                 raise ValueError('Scoped measurement inherits its implementation preparation; do not request a second environment owner')
-        self.measurement = measurement
+        return measurement
+
+    @property
+    def measurement(self) -> dict[str, Any] | None:
+        # The scientific owner projects accepted source authority. Do not cache
+        # a second mutable copy that can outlive a revision or bound acceptance.
+        if self._declared_measurement is not None:
+            return self._declared_measurement
+        return self._validate_measurement(self._measurement_supplier()) if self._measurement_supplier else None
 
     def _formal_execution(self) -> dict[str, Any]:
         from simple_ar.experiment.execution.measurement import representative_measurement_execution
@@ -476,7 +491,7 @@ class ImplementationToolGateway:
             raise ValueError('Source is not an actual registered output')
         return registered[0]
 
-    def _check_preparation(self, record: Path) -> tuple[dict[str, Any], Path]:
+    def _check_preparation(self, record: Path, *, allow_pre_design: bool = False) -> tuple[dict[str, Any], Path]:
         """Verify an unedited preparation, not an implementation or a directory hint."""
         from simple_ar.code_task.runtime.state import code_task_paths, load_code_task_manifest, retained_implementation_inventory, native_preparation_processes
         store = ArtifactStore(record.parent)
@@ -484,12 +499,16 @@ class ImplementationToolGateway:
         run = self.workspace.workspace / 'code_tasks' / record.parent.name
         manifest = load_code_task_manifest(run)
         approval = manifest['code_task']['native_binding']
+        measurement = self.measurement
+        pre_design = (allow_pre_design and self._measurement_supplier is not None
+            and self._declared_measurement is None and measurement is not None
+            and 'measurement_contract' not in approval['binding'])
         candidate = code_task_paths(run).workspace_dir.resolve()
         task = payload.get('execution', {}).get('code_task', {})
         if (payload.get('schema_version') != 'prepared_execution.v1'
                 or payload.get('native_binding') != approval or not approval.get('token')
                 or approval['binding']['contract'] != self.exact.model_dump()
-                or approval['binding'].get('measurement_contract') != self.measurement
+                or not pre_design and approval['binding'].get('measurement_contract') != measurement
                 or Path(payload['workspace']).resolve() != candidate
                 or Path(payload['execution']['cwd']).resolve() != candidate
                 or Path(task['run_dir']).resolve() != run.resolve()
@@ -519,7 +538,9 @@ class ImplementationToolGateway:
                 or record.parent.name == identity):
             raise ValueError('Prepared source must be a different registered preparation in this task')
         self._registered_ref(record, kind='prepared_execution')
-        payload, candidate = self._check_preparation(record)
+        # Consume the unchanged, registered preparation under a NEW approval.
+        # This does not replay/reapprove its old physical work or revise receipts.
+        payload, candidate = self._check_preparation(record, allow_pre_design=True)
         observed = ToolResult.model_validate(ArtifactStore(record.parent).read_json('native_result.json'))
         if (observed.tool_name != 'prepare_code_task' or observed.status != 'ok'
                 or observed.data != self._prepared_result(record, payload, candidate).data):

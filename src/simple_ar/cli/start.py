@@ -433,7 +433,6 @@ def migrate_structured_creation(args: argparse.Namespace, *, request: str, outpu
     from simple_ar.app.research_application import ResearchApplicationServices
     from simple_ar.app.research_intake import create_research_task
     from simple_ar.research.workflow_contracts import ResearchBrief
-    from simple_ar.cli.main import _render_native_result, _ensure_research_cli_success
     model = args.model if data_analysis is None or 'report' in outputs else None
     # CLI defaults remain CLI defaults. The common intake owns normalization,
     # source aliases, report/table contracts and admission for all consumers.
@@ -458,25 +457,41 @@ def migrate_structured_creation(args: argparse.Namespace, *, request: str, outpu
         max_no_progress=6)
     app = create_research_task(ResearchBrief(request_text=request, objective=args.topic,
         requested_outputs=outputs, asset_requests=sources), root=root, services=services, model=model)
+    _run_created_research(app, request=request, root=root, outputs=outputs,
+        question=args.topic, data_analysis=data_analysis)
+
+
+def _run_created_research(app, *, request: str, root: Path, outputs: tuple,
+                          question: str, data_analysis: dict | None = None) -> None:
+    """Run or collect for the same task without inventing completion of later work."""
+    from simple_ar.cli.main import _render_native_result, _ensure_research_cli_success
     saved = app.state['config']
     print_line(f'Structured inputs use the common task owner. Task session: {root}')
     print_line(f'Resume: simple-ar start --resume-task "{root}"')
+    deferred = False
     if saved['model']:
         status = app.run(progress=print_line)
     else:
         action = ({'tool_name': 'analyze_table', 'arguments': saved['table_analysis']} if data_analysis is not None else
             {'tool_name': 'research_collect' if saved['allow_network'] else 'research', 'arguments': {
-                'operation': 'summary', 'question': args.topic,
+                'operation': 'summary', 'question': question,
                 'materials': saved['research_policy']['materials'], 'use_llm': False}})
         status = app.run(actions=[action], progress=print_line)
         turn = app.state['turns'][-1]
         result = app.session.store.read_json(turn['tools'][-1]['result']) if turn['tools'] else {}
         if result.get('status') == 'ok' and result.get('artifacts'):
-            status = app.run(actions=[{'tool_name': 'deliver_result', 'arguments': {
+            deferred = bool('experiments' in outputs or saved.get('report_requirement')
+                or saved['research_policy']['require_design'])
+            completion = ({'tool_name': 'ask_user', 'arguments': {'question':
+                'Materials are retained, but the requested design, execution or authored report is not complete. '
+                'Continue this task with an authorized model and execution contract/approval as needed.'}}
+                if deferred else {'tool_name': 'deliver_result', 'arguments': {
                 'summary': request, 'artifacts': result['artifacts'],
-                'unresolved': result.get('data', {}).get('unresolved', [])}}], progress=print_line)
+                'unresolved': result.get('data', {}).get('unresolved', [])}})
+            status = app.run(actions=[completion], progress=print_line)
     _render_native_result(app, status)
-    _ensure_research_cli_success(status['status'], operation='Research task', root=root)
+    _ensure_research_cli_success(status['status'], operation='Research task', root=root,
+        accepted={'completed', 'paused'} if deferred else None)
 
 
 def resume_structured_task(args: argparse.Namespace) -> None:
@@ -627,10 +642,7 @@ def migrate_measurement_creation(args: argparse.Namespace, *, execution: dict,
     research_fields = {destination for destination, _ in FIELDS['research'].values()}
     explicit = set(getattr(args, '_explicit_resume_destinations', ()))
     research_work = _fixed_execution_research(args, sources, outputs, research_config, research_fields)
-    if research_work and (not args.model or research_config is None
-            or not {'baseline_policy', 'baseline', 'pairs'}.intersection(execution)):
-        # An omitted comparison policy permits design to propose new conditions.
-        # Such a request is not a fixed measurement contract.
+    if research_work and research_config is None:
         return False
     if ('experiments' not in outputs
             or set(outputs) - {'experiments', 'report', 'summary'}
@@ -645,7 +657,7 @@ def migrate_measurement_creation(args: argparse.Namespace, *, execution: dict,
         from simple_ar.cli.research_config import FIELDS
         supported.update(destination for destination, _ in FIELDS['report'].values())
         supported.update({'with_report', 'local_document', 'material'})
-        if not args.model:
+        if not args.model and not research_work:
             raise ValueError('A requested authored report requires a model; use --no-report for caller-directed measurement')
     supported.add('interaction')
     if research_work:
@@ -668,16 +680,19 @@ def migrate_measurement_creation(args: argparse.Namespace, *, execution: dict,
             research_work=research_work, confirm_protocol=confirm_protocol)
     except UnsupportedExecutionCreation:
         return False
+    if research_work:
+        _run_created_research(app, request=request, root=root, outputs=outputs, question=args.topic)
+        return True
     contract = app.state['config']['execution_contract']
-    conditions = [row for row in measurement_conditions(contract) if 'reuse_ref' not in row]
-    grouped = 'conditions' in contract
+    conditions = [row for row in measurement_conditions(contract) if 'reuse_ref' not in row] if contract else []
+    grouped = contract is not None and 'conditions' in contract
     actions = [{'tool_name': 'measure_experiment', 'arguments':
         {**row['execution'], 'condition_id': row['id']} if grouped else
         row['execution'] if args.model else {**row['execution'], 'delivery': {'summary': request, 'artifacts': []}}}
         for row in conditions]
     if confirm_protocol:
         _print_execution_confirmation(app, root)
-    print_line('Fixed measurement uses the common task owner, original cwd/argv and '
+    print_line(('Research-led execution' if contract is None else 'Fixed measurement') + ' uses the common task owner, original cwd/argv and '
                + ('declared environment preparation. ' if execution.get('environment') is not None else 'inherited environment. ')
                + ('Research requires an accepted design matching the declared execution; execution proposals require approval. '
                   if research_work else ('Accept this bound protocol, then approve the actual process separately. '

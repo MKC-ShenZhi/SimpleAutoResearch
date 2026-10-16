@@ -63,6 +63,70 @@ def _reply(name, arguments):
 
 
 class ResearchIntakeTests(unittest.TestCase):
+    def test_deferred_experiment_retains_materials_then_supplies_execution_in_same_task(self):
+        import sys
+        from simple_ar.tools.scientific import measurement_contract
+        with TemporaryDirectory() as directory, patch.object(LLMClient, 'from_env',
+                side_effect=AssertionError('Collection and caller measurements need no model')):
+            base = Path(directory).resolve()
+            notes = base / 'notes.md'
+            notes.write_text('# Conditions\nOne observation does not establish stability.\n', encoding='utf-8')
+            original_notes = notes.read_bytes()
+            brief = ResearchBrief(request_text='Collect these conditions, then measure the result.',
+                requested_outputs=('experiments',),
+                asset_requests=({'locator': str(notes), 'role': 'paper'},))
+            app = create_research_task(brief, root=base / 'task', services=ResearchApplicationServices(
+                max_attempts=30, config={'research_materials_only': True},
+                budget_limits={'process_invocations': 1, 'process_wall_seconds': 5}))
+            identity = app.session.manifest.session_id
+            self.assertIsNone(app.state['config']['model'])
+            self.assertIsNone(app.state['config'].get('execution_contract'))
+            self.assertTrue(app.sources.policy.require_design)
+            app.run(actions=[{'tool_name': 'research', 'arguments': {'operation': 'summary',
+                'question': brief.request_text, 'materials': ['source0'], 'use_llm': False}}], progress=lambda _: None)
+            collected = app.session.store.read_json(app.state['turns'][-1]['tools'][0]['result'])
+            self.assertEqual(collected['status'], 'ok', collected.get('error'))
+            retained = {path: app.workspace.resolve(path).read_bytes() for path in collected['artifacts']}
+            self.assertTrue(app.sources.delivery_issues([]))
+            original_ledger = app.ledger.to_dict()
+            contract = measurement_contract({'command': [sys.executable, '-c', "print('score: 3')"],
+                'cwd': str(base), 'timeout_sec': 5, 'result_schema': {'primary_metric': 'score'}})
+            app = ToolApplication.load(base / 'task')
+            app.supply(supply_id='prepared-command', reason='Caller supplied the missing measurement',
+                changes={'execution_contract': contract})
+            self.assertEqual(app.session.manifest.session_id, identity)
+            self.assertEqual(app.ledger.to_dict(), original_ledger)
+            self.assertEqual({path: app.workspace.resolve(path).read_bytes() for path in retained}, retained)
+            decision = app.request_execution_confirmation()
+            app.run(decision={'decision_id': decision['decision_id'], 'decision_response': 'accept'},
+                progress=lambda _: None)
+            app.run(actions=[{'tool_name': 'measure_experiment', 'arguments': contract}], progress=lambda _: None)
+            self.assertFalse(app.ledger.entries)
+            token = app.approval_token(app.state['pending']['call'])
+            app.run(approved_execution=token, progress=lambda _: None)
+            measured = app.session.store.read_json(app.state['turns'][-1]['tools'][0]['result'])
+            self.assertEqual(measured['status'], 'ok', measured.get('error'))
+            self.assertEqual(measured['data']['metrics']['score'], 3)
+            self.assertEqual(sum(row.actual.get('process_invocations', 0) for row in app.ledger.entries), 1)
+            self.assertEqual(notes.read_bytes(), original_notes)
+
+    def test_open_execution_does_not_freeze_omitted_comparison_as_skip(self):
+        import sys
+        with TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            execution = {'command': [sys.executable, '-c', "print('score: 3')"], 'cwd': str(base),
+                'timeout_sec': 5, 'result_schema': {'primary_metric': 'score'}}
+            app = create_research_task(ResearchBrief(request_text='Investigate a justified comparison.',
+                requested_outputs=('experiments',)), root=base / 'task',
+                services=ResearchApplicationServices(config={'execution': execution,
+                    'require_design': True, 'research_materials_only': True}, max_attempts=9))
+            self.assertIsNone(app.scientific.execution_contract)
+            self.assertNotIn('baseline_policy', app.sources.policy.execution_boundary)
+            self.assertEqual(app.sources.policy.execution_boundary['command'], execution['command'])
+            self.assertEqual(app.ledger.remaining('process_invocations'), 9)
+            self.assertTrue(app.scientific.execution_issues())
+            self.assertEqual(app.session.list_attempts(), ())
+
     def test_json_client_resumes_one_native_task_delivers_and_terminal_load_is_idle(self) -> None:
         content = "# Assessment\nCalibration error 0.12 alone cannot establish robustness.\n"
         client = _JSONClient([
@@ -361,7 +425,6 @@ class ResearchIntakeTests(unittest.TestCase):
                 ({**execution, 'code_task': {'run_dir': str(base / 'historical')}}, False),
                 ({**execution, 'baseline_policy': 'reuse'}, False),
                 ({**execution, 'unmapped_control': True}, False),
-                (execution, True),
             ]
             with patch.object(ToolApplication, 'create') as create:
                 for declared, design in cases:

@@ -725,7 +725,7 @@ def _print_research_session(args: argparse.Namespace) -> None:
         raise SystemExit("Continuation allowances require --session-root.")
     try:
         if resume_root is None:
-            if execution is None and (not experiment_requested or llm_client is not None):
+            if execution is None:
                 from simple_ar.cli.start import migrate_structured_creation
                 migrate_structured_creation(args, request=brief.request_text,
                     outputs=brief.requested_outputs, sources=brief.asset_requests,

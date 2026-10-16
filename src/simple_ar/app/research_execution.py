@@ -15,6 +15,53 @@ from simple_ar.code_task.execution.environment import resolve_code_task_command
 from simple_ar.result_analysis.metrics import normalize_direction
 
 
+class UnsupportedExecutionCreation(ValueError):
+    """An explicit declaration still requires a different execution owner."""
+
+
+def compile_scoped_measurement(execution: dict, task: dict, declaration: dict) -> tuple[dict, dict]:
+    """Bind this schema's unchanged-source baseline and implemented candidate.
+
+    Used for both caller-fixed declarations and accepted research designs. This
+    source meaning belongs to the scoped declaration, not arbitrary native
+    condition roles. Preparation, measurement and code approval remain separate.
+    """
+    from simple_ar.tools.scientific import freeze_measurement_set, measurement_contract
+    from simple_ar.code_task.workspace.modes import _source_venv_python
+    declaration = {**{name: value for name, value in declaration.items() if name != 'environment'},
+        'baseline_policy': normalize_execution_config(declaration)['baseline_policy']}
+    reused = (_source_venv_python(Path(task['code_root'])) if task.get('code_root')
+        and task.get('workspace_reuse_source_venv') and not task.get('python_executable') else None)
+    commands = [(declaration, 'command')]
+    reuse = declaration['baseline_policy'] == 'reuse'
+    if reuse and not declaration.get('pairs'):
+        declaration['baseline'] = {'command': list(declaration['command']), **declaration.get('baseline', {})}
+    if 'baseline' in declaration:
+        declaration['baseline'] = dict(declaration['baseline'])
+        if not reuse:
+            declaration['baseline'].setdefault('command', list(declaration['command']))
+            commands.append((declaration['baseline'], 'command'))
+    if 'pairs' in declaration:
+        declaration['pairs'] = [dict(pair) for pair in declaration['pairs']]
+    commands.extend((pair, key) for pair in declaration.get('pairs', [])
+        for key in (('candidate_command',) if reuse else ('baseline_command', 'candidate_command')))
+    for row, key in commands:
+        row[key] = (list(row[key]) if (execution.get('environment') or {}).get('mode') == 'venv' else
+            resolve_code_task_command(row[key], env_mode='external' if reused else task.get('env_mode', 'current'),
+                python_executable=str(reused) if reused else task.get('python_executable')))
+    formal = freeze_measurement_set(declaration)
+    if task.get('kind') == 'greenfield' and any(row['role'] == 'baseline' and not row.get('reuse_ref')
+            for row in formal['conditions']):
+        if task.get('workspace_mode') not in {'copy', 'sparse_copy'} or not task.get('code_root'):
+            raise UnsupportedExecutionCreation('A source baseline requires a real copied source project')
+    for row in formal['conditions']:
+        row['source'] = ('declared' if row.get('reuse_ref') else
+            'preparation' if row['role'] == 'baseline' else 'implementation')
+        if row['source'] == 'preparation':
+            row['before_implementation'] = True
+    return measurement_contract(formal), declaration
+
+
 def code_task_execution_options(init: CodeTaskInitOptions, execute: CodeTaskExecuteOptions) -> dict[str, Any]:
     """Translate canonical options to the shared preparation/implementation contract."""
     return {

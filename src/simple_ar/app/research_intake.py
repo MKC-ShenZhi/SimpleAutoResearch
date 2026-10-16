@@ -9,6 +9,7 @@ import tomllib
 from typing import Any
 
 from simple_ar.core.artifacts import write_json, write_text
+from simple_ar.app.research_execution import UnsupportedExecutionCreation, compile_scoped_measurement
 from simple_ar.research.workflow_contracts import Diagnostic, ResearchAsset, ResearchBrief
 
 
@@ -127,10 +128,8 @@ def create_research_task(brief: ResearchBrief, *, root: str | Path, services: An
     if model is not None and client is not None:
         raise ValueError('Choose a named model or an injected client, not both')
     selected_model = model if model else 'runtime' if client is not None else None
-    if 'experiments' in outputs and selected_model is None and (projection is None or research_work):
-        raise ValueError('Open-ended experiments require a model or an explicitly prepared execution command')
-    if projection is not None and (projection['code_task'] is not None or report is not None) and selected_model is None:
-        raise ValueError('Code preparation or a requested authored report requires a model')
+    if projection is not None and projection['code_task'] is not None and selected_model is None:
+        raise ValueError('Code preparation requires a model')
     if confirm_execution:
         policy = SourcePolicy(require_design=True, allow_network=False, interaction=policy.interaction)
     if projection is not None and research_work:
@@ -157,6 +156,10 @@ def create_research_task(brief: ResearchBrief, *, root: str | Path, services: An
     process_defaults = (projection['process_limits'] if projection is not None else {
         'process_invocations': execution_runs,
         'process_wall_seconds': execution_runs * policy.execution_boundary.get('timeout_sec', 300)})
+    if projection is not None and projection['execution_contract'] is None and 'experiments' in outputs:
+        process_defaults = {'process_invocations': process_defaults['process_invocations'] + execution_runs,
+            'process_wall_seconds': process_defaults['process_wall_seconds']
+                + execution_runs * policy.execution_boundary.get('timeout_sec', 300)}
     process_limits = {name: limits[name] if limits.get(name) is not None else default + extra
         for name, default, extra in (
             ('process_invocations', process_defaults['process_invocations'], network_runs * 4),
@@ -189,10 +192,6 @@ def create_research_task(brief: ResearchBrief, *, root: str | Path, services: An
     if confirm_execution:
         app.request_execution_confirmation()
     return app
-
-
-class UnsupportedExecutionCreation(ValueError):
-    """The declaration needs its historical or unsupported creation owner."""
 
 
 def _remap_policy_mounts(values: dict, original: dict[str, Path], projected: dict[str, Path]) -> dict:
@@ -240,45 +239,6 @@ def _bind_baseline_references(execution: dict, mounts: list[Path], base: Path) -
     return {**execution, 'baseline_ref': refs if isinstance(values, (list, tuple)) else refs[0]}
 
 
-def _code_measurement_contract(execution: dict, task: dict, declaration: dict) -> tuple[dict, dict]:
-    from simple_ar.app.research_execution import normalize_execution_config
-    from simple_ar.tools.scientific import freeze_measurement_set, measurement_contract
-    from simple_ar.code_task.execution.environment import resolve_code_task_command
-    from simple_ar.code_task.workspace.modes import _source_venv_python
-    declaration = {**{name: value for name, value in declaration.items() if name != 'environment'},
-        'baseline_policy': normalize_execution_config(declaration)['baseline_policy']}
-    reused = (_source_venv_python(Path(task['code_root'])) if task.get('code_root')
-        and task.get('workspace_reuse_source_venv') and not task.get('python_executable') else None)
-    commands = [(declaration, 'command')]
-    reuse = declaration['baseline_policy'] == 'reuse'
-    if reuse and not declaration.get('pairs'):
-        declaration['baseline'] = {'command': list(declaration['command']), **declaration.get('baseline', {})}
-    if 'baseline' in declaration:
-        declaration['baseline'] = dict(declaration['baseline'])
-        if not reuse:
-            declaration['baseline'].setdefault('command', list(declaration['command']))
-            commands.append((declaration['baseline'], 'command'))
-    if 'pairs' in declaration:
-        declaration['pairs'] = [dict(pair) for pair in declaration['pairs']]
-    commands.extend((pair, key) for pair in declaration.get('pairs', [])
-        for key in (('candidate_command',) if reuse else ('baseline_command', 'candidate_command')))
-    for row, key in commands:
-        row[key] = (list(row[key]) if (execution.get('environment') or {}).get('mode') == 'venv' else
-            resolve_code_task_command(row[key], env_mode='external' if reused else task.get('env_mode', 'current'),
-                python_executable=str(reused) if reused else task.get('python_executable')))
-    formal = freeze_measurement_set(declaration)
-    if task.get('kind') == 'greenfield' and any(row['role'] == 'baseline' and not row.get('reuse_ref')
-            for row in formal['conditions']):
-        if task.get('workspace_mode') not in {'copy', 'sparse_copy'} or not task.get('code_root'):
-            raise UnsupportedExecutionCreation('A source baseline requires a real copied source project')
-    for row in formal['conditions']:
-        row['source'] = ('declared' if row.get('reuse_ref') else
-            'preparation' if row['role'] == 'baseline' else 'implementation')
-        if row['source'] == 'preparation':
-            row['before_implementation'] = True
-    return measurement_contract(formal), declaration
-
-
 def _exact_code_contract(execution: dict, task: dict, project: Path | None,
                          mounts: list[Path], sources: tuple, request: str,
                          formal: dict | None) -> dict:
@@ -297,7 +257,7 @@ def _exact_code_contract(execution: dict, task: dict, project: Path | None,
     # Exact argv explicitly names these file inputs. Mount only those files,
     # never their parent directories or arbitrary directory-valued arguments.
     # The implementation owner binds their bytes as protected external inputs.
-    commands = [task.get('validation_command') or execution['command']]
+    commands = [task.get('validation_command') or execution['command'], execution['command']]
     if (execution.get('environment') or {}).get('check_command'):
         commands.append(execution['environment']['check_command'])
     if formal is not None:
@@ -400,8 +360,7 @@ def project_execution_creation(execution: Mapping[str, Any], *, request: str, ou
         raise UnsupportedExecutionCreation('Unsupported execution outputs')
     if not scientific and task is None:
         raise UnsupportedExecutionCreation('Execution needs a measurement or explicit code deliverable')
-    if scientific and require_design and not {'baseline_policy', 'baseline', 'pairs'}.intersection(execution):
-        raise UnsupportedExecutionCreation('Open comparison design requires its design owner; no skip policy was declared')
+    open_design = scientific and require_design and not {'baseline_policy', 'baseline', 'pairs'}.intersection(execution)
     execution['cwd'] = str(_execution_path(execution.get('cwd', '.'), base))
     if 'baseline' in execution and isinstance(execution['baseline'], dict) and 'cwd' in execution['baseline']:
         execution['baseline']['cwd'] = str(_execution_path(execution['baseline']['cwd'], base))
@@ -428,15 +387,27 @@ def project_execution_creation(execution: Mapping[str, Any], *, request: str, ou
     declaration = {key: value for key, value in execution.items() if key != 'code_task'}
     declaration = _bind_baseline_references(declaration, mounts, base)
     contract = None
-    if scientific:
+    if scientific and not open_design:
         extended = set(declaration) - flat
         if not require_design and extended == {'baseline_policy'} and declaration['baseline_policy'] == 'skip':
             declaration = {key: value for key, value in declaration.items() if key in flat}
             extended = set()
         if task is not None:
-            contract, declaration = _code_measurement_contract(execution, task, declaration)
+            contract, declaration = compile_scoped_measurement(execution, task, declaration)
         else:
             contract = freeze_measurement_set(declaration) if extended else measurement_contract(declaration)
+    if open_design and task is not None:
+        from simple_ar.code_task.execution.environment import resolve_code_task_command
+        from simple_ar.code_task.workspace.modes import _source_venv_python
+        reused = (_source_venv_python(project) if project and task.get('workspace_reuse_source_venv')
+            and not task.get('python_executable') else None)
+        declaration['command'] = (list(declaration['command']) if (execution.get('environment') or {}).get('mode') == 'venv'
+            else resolve_code_task_command(declaration['command'], env_mode='external' if reused else task.get('env_mode', 'current'),
+                python_executable=str(reused) if reused else task.get('python_executable')))
+        if project is not None and Path(declaration['cwd']) != project:
+            raise ValueError('Reproduction measurement cwd must match the original code_root')
+    if open_design:
+        measurement_contract({key: value for key, value in declaration.items() if key in flat})
     exact = _exact_code_contract(execution, task, project, mounts, sources, request, contract) if task is not None else None
     conditions = [row for row in measurement_conditions(contract) if not row.get('reuse_ref')] if contract else []
     validators = 1 + (exact.get('preparation') or {}).get('max_repairs', 0) if exact else 0
@@ -446,7 +417,7 @@ def project_execution_creation(execution: Mapping[str, Any], *, request: str, ou
     environment = execution.get('environment')
     if environment is not None:
         from simple_ar.research.project_environment import project_environment_plan
-        command = conditions[0]['execution']['command'] if conditions else exact['validation_command']
+        command = conditions[0]['execution']['command'] if conditions else exact['validation_command'] if exact else declaration['command']
         plan = project_environment_plan(environment, project or Path(execution['cwd']),
             Path('__attempt__') / 'environment', command)
         required['process_invocations'] += len(plan['steps'])

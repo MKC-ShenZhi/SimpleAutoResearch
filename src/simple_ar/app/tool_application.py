@@ -303,7 +303,9 @@ class ToolApplication:
                 observed['data']['result_ref'] for turn in self._evidence_turns('scientific') for item in turn['tools']
                 if (observed := self.session.store.read_json(item['result'])).get('tool_name') == 'measure_experiment'
                 and observed.get('status') == 'ok'], origin, required=required),
-            measurement=config.get('execution_contract') if config.get('code_task') is not None else None)
+            measurement=config.get('execution_contract') if config.get('code_task') is not None else None,
+            measurement_supplier=(lambda: scientific['scientific'].execution_contract)
+                if config.get('code_task') is not None and config.get('scientific_tools', False) else None)
         if config.get('scientific_tools', False):
             from simple_ar.tools.scientific import ScientificToolGateway
             scientific['scientific'] = ScientificToolGateway(controller.store.root, self.workspace,

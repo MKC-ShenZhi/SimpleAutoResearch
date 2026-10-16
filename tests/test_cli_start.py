@@ -18,6 +18,34 @@ from simple_ar.code_task.runtime.config import load_code_task_init_options, load
 
 
 class StartTests(unittest.TestCase):
+    def test_structured_experiment_collects_without_model_and_waits_in_common_task(self):
+        from simple_ar.cli.main import main
+        from simple_ar.app.tool_application import ToolApplication
+        with tempfile.TemporaryDirectory() as directory, patch('simple_ar.integrations.llm.LLMClient.from_env',
+                side_effect=AssertionError('Deferred collection must not resolve model credentials')), \
+                patch('simple_ar.app.research_application.create_session',
+                    side_effect=AssertionError('No fallback creation for deferred experiments')), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            base = Path(directory).resolve()
+            paper = base / 'paper.md'
+            paper.write_text('# Conditions\nA single run cannot establish robustness.\n', encoding='utf-8')
+            for name, command in (('no-command', []), ('declared-command', ['--cwd', str(base),
+                    '--primary-metric', 'score', '--command', sys.executable, '-c', "print('score: 3')"])):
+                main(['research-session', '--topic', 'Collect conditions before choosing an experiment',
+                    '--local-document', str(paper), '--outputs', 'experiments',
+                    '--output-root', str(base / 'runs' / name), *command])
+            roots = [path.parent for path in (base / 'runs').rglob('actions.json')]
+            self.assertEqual(len(roots), 2)
+            for root in roots:
+                app = ToolApplication.load(root)
+                self.assertEqual(app.session.manifest.status, 'paused')
+                self.assertTrue(app.sources.policy.require_design)
+                self.assertIsNone(app.state['config']['model'])
+                self.assertIsNone(app.state['config'].get('execution_contract'))
+                self.assertFalse(app.ledger.entries)
+                self.assertTrue(any((path / 'research_summary.md').exists() for path in (root / 'attempts').iterdir()))
+            self.assertIn('not complete', output.getvalue())
+
     def test_fixed_protocol_confirmation_retains_queue_and_requires_separate_process_approval(self):
         from simple_ar.cli.main import main
         from simple_ar.app.tool_application import ToolApplication
@@ -1473,16 +1501,22 @@ class StartTests(unittest.TestCase):
                     legacy.assert_not_called()
                     self.assertEqual({path: path.read_bytes() for path in originals}, originals)
             create.reset_mock()
-            # Open comparison design and historical/no-model research retain fallback.
-            for model, interaction, declared_execution in (
-                    ('fixture', 'autonomous', execution),
-                    (None, 'autonomous', research_execution),
-                    ('fixture', 'checkpoints', execution),
-                    ('fixture', 'assisted', {**research_execution, 'baseline_policy': 'reuse'})):
-                research_args.model, research_args.interaction = model, interaction
-                self.assertFalse(migrate_measurement_creation(research_args, execution=declared_execution,
-                    request='Keep the original owner', outputs=('experiments',), root=root,
-                    limits=limits, sources=sources, research_config=research))
+            # Open comparison design no longer creates a second controller or
+            # invents a skip policy. Historical unreferenced reuse still needs
+            # its original owner rather than a copied baseline result.
+            research_args.model, research_args.interaction = 'fixture', 'checkpoints'
+            with self.assertRaisesRegex(SystemExit, "status 'paused'"):
+                migrate_measurement_creation(research_args, execution=execution,
+                    request='Design the missing comparison', outputs=('experiments',), root=root,
+                    limits=limits, sources=sources, research_config=research)
+            create.assert_called_once()
+            self.assertIsNone(create.call_args.kwargs['execution_contract'])
+            self.assertNotIn('baseline_policy', create.call_args.kwargs['research_policy']['execution_boundary'])
+            create.reset_mock()
+            self.assertFalse(migrate_measurement_creation(research_args,
+                execution={**research_execution, 'baseline_policy': 'reuse'},
+                request='Keep the producing owner', outputs=('experiments',), root=root,
+                limits=limits, sources=sources, research_config=research))
             create.assert_not_called()
             self.assertEqual(json.dumps([research_execution, research, limits, sources], sort_keys=True), frozen_inputs)
 
@@ -1694,9 +1728,18 @@ class StartTests(unittest.TestCase):
                     self.assertIs(python['services'], services)
             args.task_kind = original[0]['task_kind']
             with patch('simple_ar.app.tool_application.ToolApplication.create') as create:
+                app = self._capture_creation(create)
+                app.run.return_value = {'status': 'completed'}
+                self.assertTrue(migrate_exact_code_creation(args,
+                    execution={key: value for key, value in execution.items() if key != 'baseline_policy'},
+                    request=args.topic, outputs=('experiments',), sources=sources, limits=limits,
+                    root=root / 'open-design', research_config=research))
+                self.assertIsNone(create.call_args.kwargs['execution_contract'])
+                self.assertNotIn('baseline_policy', create.call_args.kwargs['research_policy']['execution_boundary'])
+                self.assertEqual(create.call_args.kwargs['code_task']['allowed_patterns'], ['adapter.py'])
+                create.reset_mock()
                 for declaration in (
                         {**execution, 'code_task': {'run_dir': str(root / 'saved-run')}},
-                        {key: value for key, value in execution.items() if key != 'baseline_policy'},
                         {**execution, 'baseline_policy': 'reuse'},
                         {**execution, 'unmapped_execution_control': True}):
                     self.assertFalse(migrate_exact_code_creation(args, execution=declaration, request=args.topic,

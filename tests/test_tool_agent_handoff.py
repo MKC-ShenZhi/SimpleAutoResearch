@@ -5578,6 +5578,150 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'stale'):
             restored.implementation_evidence()
 
+    def test_open_scoped_design_supplies_measurement_authority_to_code_approval(self) -> None:
+        from dataclasses import replace
+        from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext, CapabilityResult
+        from simple_ar.research.design import _resolve_execution_protocol
+        from simple_ar.tools.implementation import ImplementationToolGateway
+        from simple_ar.tools.scientific import ScientificToolGateway
+        from simple_ar.tools.sources import SourceToolGateway
+
+        root, workspace, original, design_context = self._professional_design_fixture()
+        project = workspace.resolve('source0')
+        (project / 'main.py').write_text('VALUE = 1\n')
+        (project / 'check.py').write_text('assert True\n')
+        task = {'code_root': str(project), 'kind': 'existing_project', 'workspace_mode': 'copy',
+            'env_mode': 'current', 'allowed_patterns': ['main.py'],
+            'validation_command': ['python', 'check.py']}
+        boundary = {**original.policy.execution_boundary, 'code_task': task,
+            'environment': {'mode': 'current', 'timeout_sec': 5}}
+        policy = original.policy.model_copy(update={'execution_boundary': boundary})
+        sources = SourceToolGateway(root, workspace, workspace.ledger, policy=policy)
+        science = ScientificToolGateway(root, workspace, workspace.ledger, 'open-code',
+            research_contract=sources.accepted_execution_contract, research_requirements=sources.execution_issues)
+        owner = ImplementationToolGateway(root, workspace, workspace.ledger, 'fixture', 'open-code',
+            exact={'project_path': 'source0', 'goal': 'Implement the accepted method',
+                'allowed_patterns': ['main.py'], 'validation_command': ['python', 'check.py'], 'timeout_sec': 5},
+            research_inputs=sources.implementation_evidence,
+            measurement_supplier=lambda: science.execution_contract)
+        science.implementation = owner
+        self.assertIsNone(owner.measurement)
+        before = {'token': 'before-acceptance', 'binding': owner.approval_binding(
+            {}, identity='open-code', for_preparation=True)}
+        prep_context = CapabilityContext(ArtifactStore(root / 'attempts/pre-design-prepare'),
+            AttemptManifest('pre-design-prepare', capability='native_tool'))
+        prep_approval = {'token': 'prepare-before-design', 'binding': owner.approval_binding(
+            {}, identity='pre-design-prepare', for_preparation=True)}
+        prepared = owner.prepare(prep_context, {}, approval=prep_approval)
+        prep_context.store.write_json('native_result.json', prepared.model_dump(mode='json'))
+        ref = prep_context.store.ref('execution.json', kind='prepared_execution')
+        prep_context = replace(prep_context, attempt=replace(prep_context.attempt,
+            status='completed', outputs=(ref,)))
+        prep_context.store.write_attempt_manifest(prep_context.attempt)
+        prep_context.store.write_capability_result(CapabilityResult(status='completed', artifacts=(ref,)))
+        ArtifactStore(root).write_json('session_manifest.json', {'session_id': 'open-code',
+            'budget': {'recorded_attempts': ['pre-design-prepare']}})
+        prep_bytes = prep_context.store.resolve('execution.json').read_bytes()
+
+        def proposed_comparison(*args, **kwargs):
+            return {**_resolve_execution_protocol(*args, **kwargs),
+                'baseline_policy': 'run', 'comparison_required': True}
+
+        with patch('simple_ar.research.design._resolve_execution_protocol', side_effect=proposed_comparison):
+            result = sources.execute_tool('research', design_context, {'operation': 'design',
+                'question': 'Test the chosen method', 'synthesis_record': 'source0/synthesis.json'})
+        self.assertEqual(result.status, 'ok', result.error)
+        self.assertIsNone(owner.measurement)
+        with self.assertRaises(ValueError):
+            owner.approval_binding({}, identity='open-code')
+        sources.respond_decision(sources.pending_decision()['decision_id'], 'accept')
+        self.assertEqual(sources.execution_issues(), [])
+        formal = science.execution_contract
+        self.assertEqual(owner.measurement, formal)
+        self.assertEqual([(row['role'], row['source']) for row in formal['conditions']],
+            [('baseline', 'preparation'), ('candidate', 'implementation')])
+        self.assertTrue(formal['conditions'][0]['before_implementation'])
+        self.assertTrue(all('environment' not in row['execution'] for row in formal['conditions']))
+        approval = {'token': 'separate-process-approval', 'binding': owner.approval_binding({}, identity='open-code')}
+        self.assertEqual(approval['binding']['measurement_contract'], formal)
+        self.assertNotEqual(before['binding'], approval['binding'])
+        # Acceptance adds measurement authority; the old physical preparation
+        # remains an unchanged registered source, consumed with a new approval.
+        prepared_locator = prepared.data['record']
+        record, candidate = owner._prior_preparation(prepared_locator, identity='open-code')
+        self.assertEqual(record.read_bytes(), prep_bytes)
+        self.assertEqual(owner.prepared_source(prepared_locator, identity='baseline')['cwd'], str(candidate))
+        with self.assertRaisesRegex(ValueError, 'Approved preparation'):
+            owner.prepare(prep_context, {}, approval=prep_approval)
+        work = {'prepared_result': prepared_locator}
+        with patch.object(owner, 'measurement_inputs', return_value={'observations': ['retained baseline']}):
+            continued = owner.approval_binding(work, identity='open-code')
+        self.assertEqual(continued['measurement_contract'], formal)
+        self.assertEqual(continued['prior_source']['sha256'], hashlib.sha256(prep_bytes).hexdigest())
+        (candidate / 'main.py').write_text('VALUE = 9\n')
+        with self.assertRaises(ValueError):
+            owner._prior_preparation(prepared_locator, identity='open-code')
+        (candidate / 'main.py').write_text('VALUE = 1\n')
+        self.assertEqual(prep_context.store.resolve('execution.json').read_bytes(), prep_bytes)
+        context = CapabilityContext(ArtifactStore(root / 'attempts/open-code'), AttemptManifest('open-code'))
+        with patch('simple_ar.research.preparation.run_preparation_capability') as no_prepare, patch(
+                'simple_ar.research.implementation.run_implementation_capability') as no_implement:
+            with self.assertRaisesRegex(ValueError, 'changed'):
+                owner.execute(context, {}, approval=before)
+            with self.assertRaisesRegex(ValueError, 'prior measurements'):
+                owner.execute(context, {}, approval=approval)
+            no_prepare.assert_not_called()
+            no_implement.assert_not_called()
+        restored = SourceToolGateway(root, workspace, workspace.ledger, policy=policy)
+        science._research_contract = restored.accepted_execution_contract
+        self.assertEqual(owner.measurement, formal)
+        raw = design_context.store.read_json('frozen_protocol.json')
+        for changes in ({'code_task': {**task, 'allowed_patterns': ['**']}},
+                {'environment': {'mode': 'venv'}}, {'cwd': str(workspace.workspace)},
+                {'conditions': formal['conditions']},
+                {'baseline_policy': 'reuse', 'baseline_ref': 'source0/synthesis.json'}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                restored._execution_contract({**raw, **changes})
+        design_context.store.write_json('frozen_protocol.json', {**raw, 'command': ['python', 'other.py']})
+        self.assertIsNone(owner.measurement)
+        with self.assertRaises(ValueError):
+            owner.approval_binding({}, identity='open-code')
+        with self.assertRaisesRegex(ValueError, 'Retained domain result'):
+            owner._check_retained_result(context.store, {'artifact_refs': {}, 'native_binding': approval,
+                'implementation_file_hashes': {}}, workspace.workspace / 'code_tasks/open-code', approval)
+        self.assertEqual(sources.policy.execution_boundary, boundary)
+
+        # A source-less skip design carries only an origin cwd identity; it
+        # grants no access to that unmounted directory before relocation.
+        empty_root, empty_workspace, original, empty_context = self._professional_design_fixture()
+        origin = empty_root / 'unmounted-origin'
+        origin.mkdir()
+        sentinel = origin / 'sentinel.txt'
+        sentinel.write_bytes(b'Unchanged unmounted origin\n')
+        origin_bytes = {path.name: path.read_bytes() for path in origin.iterdir()}
+        empty_task = {'kind': 'greenfield', 'workspace_mode': 'empty', 'env_mode': 'current'}
+        empty_boundary = {**original.policy.execution_boundary, 'cwd': str(origin), 'code_task': empty_task}
+        empty = SourceToolGateway(empty_root, empty_workspace, empty_workspace.ledger,
+            policy=original.policy.model_copy(update={'execution_boundary': empty_boundary}))
+        result = empty.execute_tool('research', empty_context, {'operation': 'design',
+            'question': 'Create the selected method', 'synthesis_record': 'source0/synthesis.json'})
+        self.assertEqual(result.status, 'ok', (result.error, result.data))
+        self.assertNotEqual(result.data.get('domain_status'), 'needs_review', result.data)
+        self.assertEqual(empty_context.store.read_json('research_design.json')['status'], 'ready', result.data)
+        decision = empty.pending_decision()
+        self.assertIsNotNone(decision, result.data)
+        empty.respond_decision(decision['decision_id'], 'accept')
+        skipped = empty.accepted_execution_contract()
+        self.assertEqual([(row['role'], row['source']) for row in skipped['conditions']],
+            [('candidate', 'implementation')])
+        self.assertEqual(skipped['conditions'][0]['execution']['cwd'], str(origin))
+        self.assertEqual({path.name: path.read_bytes() for path in origin.iterdir()}, origin_bytes)
+        with self.assertRaisesRegex(ValueError, 'outside the authorized mounts'):
+            empty_workspace.resolve(str(sentinel))
+        with self.assertRaises(ValueError):
+            empty._execution_contract({**empty_context.store.read_json('frozen_protocol.json'),
+                'baseline_policy': 'run', 'comparison_required': True})
+
     def test_fixed_design_comparison_preserves_conditions_and_source_authority(self) -> None:
         from simple_ar.tools.scientific import ScientificToolGateway, fixed_measurement_issues, freeze_measurement_set
         root, workspace, sources, _ = self._professional_design_fixture(

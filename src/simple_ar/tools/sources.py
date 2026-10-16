@@ -950,14 +950,15 @@ class SourceToolGateway:
             if response['decision_response'] != 'accept':
                 return ['Latest design was not accepted; revise or resolve its bound protocol decision.']
             boundary = self._fixed_execution_boundary()
-            if boundary is not None:
+            if boundary is not None or (self._declared_execution_contract is None
+                    and self.policy.execution_boundary.get('code_task') is not None):
                 # Read this already verified decision directly: accepted_protocol
                 # calls this gate and must not become a recursive acceptance check.
                 protocol = json.loads(self._decision_protocol(path, decision).read_text(encoding='utf-8'))
                 accepted = (protocol if decision.get('proposal_kind') == 'caller_execution_protocol'
                     else self._execution_contract(protocol))
                 from simple_ar.tools.scientific import fixed_measurement_issues
-                return fixed_measurement_issues(boundary, accepted)
+                return fixed_measurement_issues(boundary, accepted) if boundary is not None else []
             return []
         except (OSError, ValueError, KeyError, TypeError) as exc:
             return [str(exc)]
@@ -995,6 +996,77 @@ class SourceToolGateway:
         """Use the scientific owner's existing declaration normalization."""
         from simple_ar.tools.scientific import freeze_measurement_set, measurement_contract, measurement_conditions
         execution = dict(execution)
+        frozen = self.policy.execution_boundary
+        if self._declared_execution_contract is None and frozen.get('code_task') is not None:
+            from simple_ar.app.research_execution import compile_scoped_measurement
+            from copy import deepcopy
+            task = deepcopy(frozen['code_task'])
+            for key in ('code_task', 'environment'):
+                if key in execution and execution[key] != frozen.get(key):
+                    raise ValueError('Scoped design cannot replace caller-frozen task or environment')
+            comparison = execution.pop('comparison_required', False)
+            execution.pop('code_task', None)
+            execution.pop('environment', None)
+            # This branch accepts only the legacy creation schema; native
+            # condition roles cannot implicitly grant producing-source authority.
+            if set(execution) - {'command', 'cwd', 'timeout_sec', 'label', 'result_schema', 'protocol',
+                    'baseline', 'baseline_policy', 'baseline_ref', 'pairs', 'seeds', 'seed_count', 'seed_flag'}:
+                raise ValueError('Scoped design requires the frozen legacy execution schema')
+            source = task.get('code_root') or self.policy.source_workspace
+            if source:
+                project = self.workspace.resolve(str(source)).resolve()
+                if not project.is_dir():
+                    raise ValueError('Scoped source must be a mounted project directory')
+                if self.policy.source_workspace and self.workspace.resolve(self.policy.source_workspace).resolve() != project:
+                    raise ValueError('Scoped code root differs from the mounted source project')
+                accepted_cwd = self.workspace.resolve(str(execution['cwd'])).resolve()
+            else:
+                if task.get('kind') != 'greenfield' or task.get('workspace_mode') != 'empty':
+                    raise ValueError('Source-less scoped measurement requires empty greenfield preparation')
+                # An origin spelling for relocation, not a mount or read grant.
+                project = Path(str(frozen['cwd']))
+                accepted_cwd = Path(str(execution['cwd']))
+                if not project.is_absolute() or not accepted_cwd.is_absolute():
+                    raise ValueError('Source-less origin cwd must be explicitly absolute')
+                project, accepted_cwd = project.absolute(), accepted_cwd.absolute()
+            if accepted_cwd != project:
+                raise ValueError('Scoped measurement cwd must match the frozen source project')
+            execution['cwd'] = str(project)
+            for key in ('command', 'timeout_sec', 'result_schema', 'baseline', 'baseline_policy',
+                    'baseline_ref', 'pairs', 'seeds', 'seed_count', 'seed_flag'):
+                if key in frozen and execution.get(key) != frozen[key]:
+                    raise ValueError('Scoped design differs from a caller-frozen execution field: ' + key)
+            if any((execution.get('protocol') or {}).get(key) != value
+                    for key, value in (frozen.get('protocol') or {}).items()):
+                raise ValueError('Scoped design differs from caller-frozen protocol data')
+            owner_execution = {**execution, 'code_task': task}
+            if frozen.get('environment') is not None:
+                owner_execution['environment'] = deepcopy(frozen['environment'])
+            contract, _ = compile_scoped_measurement(owner_execution, task, execution)
+            if not source and any(row.get('source') == 'preparation'
+                    for row in measurement_conditions(contract)):
+                raise ValueError('A source baseline requires a real frozen source project')
+            reused = [row for row in measurement_conditions(contract) if row.get('reuse_ref')]
+            if reused:
+                # A bare design locator is not imported evidence. Only the
+                # original hash-bound authority can authorize reuse in scope.
+                declared = freeze_measurement_set({key: value for key, value in frozen.items()
+                    if key not in {'code_task', 'environment', 'comparison_required'}})
+                originals = {row['id']: row for row in measurement_conditions(declared)}
+                for row in reused:
+                    original = originals.get(row['id'], {})
+                    digest = original.get('reuse_sha256')
+                    if (not digest or row['reuse_ref'] != original.get('reuse_ref')
+                            or self._digest(self.workspace.resolve(row['reuse_ref'])) != digest):
+                        raise ValueError('Scoped baseline reuse requires original hash-bound measurement evidence')
+                    row['reuse_sha256'] = digest
+            if any(not row.get('reuse_ref') and (self.workspace.resolve(str(row['execution']['cwd'])).resolve()
+                    if source else Path(str(row['execution']['cwd'])).absolute()) != project
+                    for row in measurement_conditions(contract)):
+                raise ValueError('Scoped condition cwd must match the frozen source project')
+            if comparison and {row['role'] for row in measurement_conditions(contract)} != {'baseline', 'candidate'}:
+                raise ValueError('Requested comparison has no explicit executable baseline/condition set')
+            return contract
         # CodeTask owns implementation scope and preparation. Neither is a
         # measurement control or a grant derived from accepting a design.
         if execution.pop('code_task', None) is not None:
