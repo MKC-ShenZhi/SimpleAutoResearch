@@ -112,6 +112,7 @@ def add_start_parser(subparsers: argparse._SubParsersAction) -> None:
     native = parser.add_argument_group("Native task")
     native.add_argument("request", nargs="?", help="Natural-language task using the native action loop; no function selection.")
     native.add_argument("--resume-task", type=Path, help="Resume a native-tool session; never replays unknown operations.")
+    native.add_argument("--supply-task", type=Path, help="With --resume-task, confirm a TOML caller supply of missing contracts or the first model binding. Records without executing; retains old evidence and ledger. Not model retry or replacement of an existing frozen contract.")
     native.add_argument("--retry-model", action="store_true", help="With --resume-task, explicitly continue a terminated failed native model decision using a new attempt and remaining budget. Optionally select --model profile:NAME/route:NAME to record a compatible Chat connection change without clearing history or charges. Cached replies keep their saved connection; tools, in-flight requests and whole tasks are not resubmitted. Use separately from feedback or authorization changes.")
     native.add_argument("--authorize-remaining", action="append", default=None, metavar="DIMENSION=AMOUNT", help="Native resume: explicitly authorize a new remaining resource allowance after confirmation; repeat for multiple dimensions.")
     native.add_argument("--authorization-id", default=None, help="Native resume: stable idempotency key required for explicit continuation allowances.")

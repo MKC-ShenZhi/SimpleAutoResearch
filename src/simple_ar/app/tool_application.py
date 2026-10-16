@@ -416,7 +416,7 @@ class ToolApplication:
             return ToolResult(tool_name=name, status='blocked', error=str(exc))
 
     @classmethod
-    def create(cls, root: Path, goal: str, *, model: str | None, sources: dict[str, Path],
+    def _configuration(cls, root: Path, goal: str, *, model: str | None, sources: dict[str, Path],
                allow_execution: bool = False, allow_network: bool = False, allow_vision: bool = False, max_turns: int = 30,
                max_tokens: int = 600000, max_images: int = 0,
                project_python: Path | None = None, code_task: dict[str, Any] | None = None,
@@ -427,7 +427,9 @@ class ToolApplication:
                max_output_tokens: int | None = None,
                max_attempts: int | None = None,
                source_operations: int | None = None,
-               execution_contract: dict[str, Any] | None = None) -> ToolApplication:
+               execution_contract: dict[str, Any] | None = None,
+               retained: bool = False) -> tuple[dict[str, Any], list, dict[str, Any], int]:
+        """Validate caller contracts before creation or supply; never execute or persist."""
         if (not goal.strip() or max_images < 0 or
                 (model is not None and (not model.strip() or max_turns < 1 or max_tokens < 1))):
             raise ValueError('Goal and positive model resource bounds are required')
@@ -472,17 +474,26 @@ class ToolApplication:
             for row in measurement_conditions(execution_contract):
                 if 'reuse_ref' not in row:
                     continue
-                path = resolve_mounted_path({name: Path(path) for name, path in mounts.items()}, row['reuse_ref'])
+                available = {name: Path(path) for name, path in mounts.items()}
+                if retained:
+                    available['evidence'] = Path(root) / 'evidence'
+                path = resolve_mounted_path(available, row['reuse_ref'])
                 _reject_links(path)
                 if not path.is_file() or path.stat().st_size > 16 * 1024 * 1024:
                     raise ValueError('Reused baseline must be a canonical result file of at most 16 MiB')
                 content = path.read_bytes()
                 canonical = json.loads(content)
                 validate_reused_baseline(canonical, row['execution'])
-                relative = f'evidence/reused-baselines/{len(reused_inputs)}/results.json'
                 digest = hashlib.sha256(content).hexdigest()
                 if row.get('reuse_sha256') is not None and row['reuse_sha256'] != digest:
                     raise ValueError('Reused baseline differs from its declared digest')
+                if retained and path.is_relative_to((Path(root) / 'evidence/reused-baselines').resolve()):
+                    row['reuse_ref'], row['reuse_sha256'] = path.relative_to(Path(root).resolve()).as_posix(), digest
+                    continue
+                index = len(reused_inputs)
+                while retained and (Path(root) / f'evidence/reused-baselines/{index}/results.json').exists():
+                    index += 1
+                relative = f'evidence/reused-baselines/{index}/results.json'
                 destination = Path(root) / relative
                 _reject_links(destination)
                 if destination.exists():
@@ -490,7 +501,17 @@ class ToolApplication:
                 reused_inputs.append((relative, content))
                 row['reuse_ref'], row['reuse_sha256'] = relative, digest
         if research_policy is not None:
-            research_policy = SourcePolicy.model_validate(research_policy).model_dump(mode='json')
+            from simple_ar.tools.workspace import resolve_mounted_path
+            policy = SourcePolicy.model_validate(research_policy)
+            readable = {name: Path(path) for name, path in mounts.items()}
+            if retained:
+                readable['evidence'] = Path(root) / 'evidence'
+            SourceToolGateway.validate_material_paths(
+                [resolve_mounted_path(readable, locator) for locator in policy.materials], policy,
+                excluded_roots=(Path(root) / 'workspace', Path(root) / 'attempts'))
+            if policy.source_workspace and not resolve_mounted_path(readable, policy.source_workspace).is_dir():
+                raise ValueError('Research source_workspace must name an authorized project directory')
+            research_policy = policy.model_dump(mode='json')
         if table_analysis is not None:
             from types import SimpleNamespace
             from simple_ar.tools.analysis import validate_table_analysis_contract
@@ -542,14 +563,7 @@ class ToolApplication:
             _, profile = catalog.select(purpose="image")
             profile.credential()
             profile.resolve_proxy()
-        session = SessionController.create(root, session_id=root.name, topic=goal,
-            registry=CapabilityRegistry(), budget=BudgetState(max_attempts=attempt_limit, max_no_progress=6))
-        session.manifest.transition_recipe = cls.RECIPE
-        from simple_ar.core.artifacts import write_atomically
-        for relative, content in reused_inputs:
-            destination = session.store.resolve(relative)
-            write_atomically(destination, content)
-        session.store.write_json("actions.json", {"config": {"model": model,
+        config = {"model": model,
             "model_connection": client.connection_binding() if client is not None else None,
             "vision_connection": vision_connection,
             "project_python": str(project_python) if project_python else None,
@@ -559,29 +573,51 @@ class ToolApplication:
             "research_policy": research_policy, "table_analysis": table_analysis,
             "feasibility_connection": feasibility_connection,
             "max_images": max_images,
-            "max_turns": max_turns},
-            "requests": [goal], "turns": [], "pending": None})
+            "max_turns": max_turns}
         if code_task is not None:
-            actions = session.store.read_json('actions.json')
-            actions['config']['code_task'] = code_task
-            session.store.write_json('actions.json', actions)
-        if report_requirement is not None or max_output_tokens is not None:
-            actions = session.store.read_json('actions.json')
-            if report_requirement is not None:
-                actions['config']['report_requirement'] = report_requirement
-                actions['config']['report_evidence_contract'] = (
-                    'execution.v1' if code_task is not None or execution_contract is not None else 'materials.v1')
-            if max_output_tokens is not None:
-                actions['config']['max_output_tokens'] = max_output_tokens
-            session.store.write_json('actions.json', actions)
-        BudgetLedger({"llm_requests": max_turns, "total_tokens": max_tokens,
+            config['code_task'] = code_task
+        if report_requirement is not None:
+            config['report_requirement'] = report_requirement
+            config['report_evidence_contract'] = (
+                'execution.v1' if code_task is not None or execution_contract is not None else 'materials.v1')
+        if max_output_tokens is not None:
+            config['max_output_tokens'] = max_output_tokens
+        limits = {"llm_requests": max_turns, "total_tokens": max_tokens,
             # One model turn can contain multiple bounded tool operations.
             # Search backends share process receipts, but must not consume a
             # one-process-per-model-turn allowance before validation starts.
             "process_invocations": max_turns * 10, "process_wall_seconds": max_turns * 300,
             "source_operations": source_operations if source_operations is not None else max_turns * 3,
-            "image_requests": max_images, **(process_limits or {})},
-            storage_path=root / "budget_ledger.json").save()
+            "image_requests": max_images, **(process_limits or {})}
+        return config, reused_inputs, limits, attempt_limit
+
+    @classmethod
+    def create(cls, root: Path, goal: str, *, model: str | None, sources: dict[str, Path],
+               allow_execution: bool = False, allow_network: bool = False, allow_vision: bool = False, max_turns: int = 30,
+               max_tokens: int = 600000, max_images: int = 0,
+               project_python: Path | None = None, code_task: dict[str, Any] | None = None,
+               process_limits: dict[str, int | float] | None = None,
+               report_requirement: dict[str, Any] | None = None,
+               research_policy: dict[str, Any] | None = None,
+               table_analysis: dict[str, Any] | None = None,
+               max_output_tokens: int | None = None,
+               max_attempts: int | None = None,
+               source_operations: int | None = None,
+               execution_contract: dict[str, Any] | None = None) -> ToolApplication:
+        config, reused, limits, attempts = cls._configuration(root, goal, model=model, sources=sources,
+            allow_execution=allow_execution, allow_network=allow_network, allow_vision=allow_vision,
+            max_turns=max_turns, max_tokens=max_tokens, max_images=max_images, project_python=project_python,
+            code_task=code_task, process_limits=process_limits, report_requirement=report_requirement,
+            research_policy=research_policy, table_analysis=table_analysis, max_output_tokens=max_output_tokens,
+            max_attempts=max_attempts, source_operations=source_operations, execution_contract=execution_contract)
+        session = SessionController.create(root, session_id=root.name, topic=goal,
+            registry=CapabilityRegistry(), budget=BudgetState(max_attempts=attempts, max_no_progress=6))
+        session.manifest.transition_recipe = cls.RECIPE
+        from simple_ar.core.artifacts import write_atomically
+        for relative, content in reused:
+            write_atomically(session.store.resolve(relative), content)
+        session.store.write_json('actions.json', {'config': config, 'requests': [goal], 'turns': [], 'pending': None})
+        BudgetLedger(limits, storage_path=root / 'budget_ledger.json').save()
         session.manifest.state_refs["actions"] = session.store.ref("actions.json", kind="native_actions")
         session.manifest.budget_ledger_ref = session.store.ref("budget_ledger.json", kind="budget_ledger")
         session.save()
@@ -594,6 +630,142 @@ class ToolApplication:
     def _save(self) -> None:
         self.session.store.write_json("actions.json", self.state)
         self.session.save()
+
+    def supply(self, *, supply_id: str, reason: str, changes: dict[str, Any],
+               resource_allowances: dict[str, int | float] | None = None) -> dict[str, Any]:
+        """Caller-only completion of missing contracts; not a retry or model tool.
+
+        Existing contracts and source aliases are immutable here. Their feedback
+        or historical revision protocols still own changes to executed work.
+        The single actions journal owns this supply and its previous config;
+        resources use the original idempotent ledger authorization, not a reset.
+        """
+        with self.session.mutation_scope():
+            if (not isinstance(supply_id, str) or not supply_id.strip()
+                    or not isinstance(reason, str) or not reason.strip()
+                    or not isinstance(changes, dict) or not changes):
+                raise ValueError('Supply requires a stable id, reason and explicit missing contracts')
+            supply_id, reason = supply_id.strip(), reason.strip()
+            fields = {'model', 'sources', 'allow_execution', 'allow_network', 'code_task',
+                'execution_contract', 'research_policy', 'table_analysis', 'report_requirement', 'max_output_tokens'}
+            if set(changes) - fields:
+                raise ValueError('Unsupported supply fields: ' + ', '.join(sorted(set(changes) - fields)))
+            supplied = dict(changes)
+            if 'sources' in supplied:
+                if not isinstance(supplied['sources'], dict):
+                    raise ValueError('Supply sources must map aliases to read-only paths')
+                if any(not isinstance(path, (str, Path)) or not str(path).strip()
+                        for path in supplied['sources'].values()):
+                    raise ValueError('Supply sources require nonempty paths, not alias removal')
+                supplied['sources'] = {name: str(Path(path).expanduser().absolute())
+                    for name, path in supplied['sources'].items()}
+            supplied = json.loads(json.dumps(supplied, ensure_ascii=False, allow_nan=False))
+            terms = {'supply_id': supply_id, 'reason': reason, 'changes': supplied,
+                'resource_allowances': dict(resource_allowances or {})}
+            interrupted = self.state.get('pending_supply')
+            if interrupted is not None and any(interrupted[key] != value for key, value in terms.items()):
+                raise ValueError('Finish the retained supply with its original id and terms before supplying different contracts')
+            previous = next((row for row in self.state.get('supplies', []) if row['supply_id'] == supply_id), None)
+            if previous is not None:
+                if any(previous[key] != value for key, value in terms.items()):
+                    raise ValueError('Supply id already exists with different terms')
+                return previous
+            if any(row.status == 'running' for row in self.session.list_attempts()) or any(
+                    row.status in {'reserved', 'unknown'} for row in self.ledger.entries):
+                raise ValueError('Reconcile running, reserved or unknown operations before supplying contracts')
+            pending = self.state['pending']
+            if pending and (pending['kind'] == 'model' or any(
+                    row.attempt_id == pending['attempt'] for row in self.session.list_attempts())):
+                raise ValueError('Reconcile the started operation before supplying contracts')
+            old = json.loads(json.dumps(self.state['config']))
+            for name, value in supplied.items():
+                if name == 'sources':
+                    if any(alias in old['sources'] and old['sources'][alias] != path for alias, path in value.items()):
+                        raise ValueError('Supply cannot replace an existing source alias')
+                elif name in {'allow_execution', 'allow_network'}:
+                    if type(value) is not bool or old.get(name, False) and not value:
+                        raise ValueError('Supply access is an explicit additional grant, not revocation')
+                elif name == 'model' and old.get(name) is not None and old[name] != value:
+                    raise ValueError(f'{name} is already frozen; use its existing feedback/revision contract')
+            candidate = {**old, **supplied,
+                'sources': {**old['sources'], **supplied.get('sources', {})}}
+            allowances = terms['resource_allowances']
+            first_model = old['model'] is None and candidate['model'] is not None
+            if first_model and (type(allowances.get('llm_requests')) is not int or allowances['llm_requests'] < 1
+                    or type(allowances.get('total_tokens')) is not int or allowances['total_tokens'] < 1):
+                raise ValueError('First model binding requires explicit positive llm_requests and total_tokens allowances')
+            config, reused, _, _ = self._configuration(self.session.store.root, self.state['requests'][0],
+                model=candidate['model'], sources={key: Path(value) for key, value in candidate['sources'].items()},
+                allow_execution=candidate['allow_execution'], allow_network=candidate.get('allow_network', False),
+                allow_vision=candidate.get('allow_vision', False), max_images=candidate.get('max_images', 0),
+                max_turns=allowances['llm_requests'] if first_model else max(1, candidate['max_turns']),
+                max_tokens=allowances['total_tokens'] if first_model else max(1, self.ledger.limits['total_tokens']),
+                project_python=Path(candidate['project_python']) if candidate.get('project_python') else None,
+                code_task=candidate.get('code_task'), execution_contract=candidate.get('execution_contract'),
+                research_policy=candidate.get('research_policy'), table_analysis=candidate.get('table_analysis'),
+                report_requirement=candidate.get('report_requirement'), max_output_tokens=candidate.get('max_output_tokens'),
+                max_attempts=self.session.manifest.budget.max_attempts, retained=True)
+            for name in fields - {'model', 'sources', 'allow_execution', 'allow_network'}:
+                if old.get(name) is not None and old[name] != config.get(name):
+                    raise ValueError(f'{name} is already frozen; use its existing feedback/revision contract')
+            for name in ('model_connection', 'vision_connection', 'feasibility_connection'):
+                if old.get(name) is not None:
+                    if not model_connections_compatible(old[name], config.get(name) or {}):
+                        raise ValueError('Supply cannot replace the saved ' + name)
+                    config[name] = old[name]
+            # max_turns remains the initial allowance: the budget authorization
+            # below accounts for newly authorized decisions exactly once.
+            config['max_turns'] = old['max_turns']
+            terms['previous_config'] = old
+            if allowances:
+                self.ledger.validate_remaining(allowances, authorization_id=supply_id, reason=reason)
+                check = BudgetState.from_dict(self.session.manifest.budget.to_dict())
+                check.authorize_additional(supply_id, attempts=allowances.get('llm_requests', 0) * 10,
+                    resource_allowances=allowances, reason=reason)
+            else:
+                check = self.session.manifest.budget
+            if check.exhausted():
+                raise ValueError('Supply cannot reset exhausted task attempts or no-progress limits')
+            # Journal intent before the companion budget files. A crash cannot
+            # expose a new allowance to the old task configuration; run refuses
+            # work until this exact caller supply is completed idempotently.
+            self.state['pending_supply'] = terms
+            self._save()
+            # Persist a grant before its config consumer; the same id recovers a
+            # crash here without replenishing spent resources or authorizing a call.
+            self._authorize_resources(allowances, supply_id if allowances else '', reason if allowances else '',
+                model_binding=config.get('model_connection'), persist=False)
+            from simple_ar.core.artifacts import write_atomically
+            for relative, content in reused:
+                write_atomically(self.session.store.resolve(relative), content)
+            self._cancel_unstarted('Explicit caller supply: ' + supply_id)
+            self.state['config'] = {**old, **config}
+            self.state.pop('pending_supply', None)
+            self.state.setdefault('supplies', []).append(terms)
+            self.state['requests'].append('Caller supplied missing task contracts: ' + reason)
+            if self.session.manifest.status not in {'created', 'running'}:
+                self.session.continue_with_revision(reason)
+            self._save()
+            self._configure_tools()
+            return terms
+
+    def _cancel_unstarted(self, reason: str) -> None:
+        """Close only unstarted tool messages; keep completed observations intact."""
+        pending = self.state['pending']
+        queued = self.state['turns'] and self.state['turns'][-1]['remaining']
+        if (pending and pending['kind'] == 'tool') or (pending is None and queued):
+            if pending and any(attempt.attempt_id == pending['attempt'] for attempt in self.session.list_attempts()):
+                raise ValueError('Reconcile the started tool before changing its task')
+            turn = self.state['turns'][-1]
+            cancellation = pending['attempt'] if pending else (
+                Path(turn['reply']).stem if turn.get('origin') == 'caller' else Path(turn['reply']).parent.name)
+            for index, call in enumerate(turn['remaining']):
+                relative = f'tools/cancelled/{cancellation}-{index}.json'
+                self.session.store.write_json(relative, {'tool_name': call['function']['name'],
+                    'status': 'blocked', 'error': reason, 'data': {'executed': False}})
+                turn['tools'].append({'id': call['id'], 'result': relative})
+            turn['remaining'] = []
+            self.state['pending'] = None
 
     def _submit_actions(self, actions: list[dict[str, Any]]) -> None:
         """Accept caller requests into the existing action journal, not a new scheduler.
@@ -1746,7 +1918,8 @@ class ToolApplication:
         return 'User explicitly authorized additional access: ' + '; '.join(changes) + '. Saved budgets are unchanged; individual process commands still need approval.'
 
     def _authorize_resources(self, allowances: dict[str, int | float],
-                             authorization_id: str, reason: str) -> None:
+                             authorization_id: str, reason: str, *,
+                             model_binding: dict[str, Any] | None = None, persist: bool = True) -> None:
         if not allowances:
             if authorization_id or reason:
                 raise ValueError('Resource authorization requires an explicit remaining allowance')
@@ -1775,7 +1948,7 @@ class ToolApplication:
                 raise ValueError('Reconcile in-flight or unknown operations before authorizing resources')
         if self.state['config']['model'] is not None:
             self._client()  # Resource authorization cannot change model identity.
-        elif set(allowances) & {'llm_requests', 'total_tokens', 'image_requests'}:
+        elif not model_binding and set(allowances) & {'llm_requests', 'total_tokens', 'image_requests'}:
             raise ValueError('Caller-directed tasks cannot acquire model access through resource continuation')
         self.ledger.validate_remaining(allowances, authorization_id=authorization_id, reason=reason)
         self.session.manifest.budget.authorize_additional(authorization_id,
@@ -1790,7 +1963,8 @@ class ToolApplication:
                 # Budget preflight failed before a provider reservation. Preserve
                 # that failed attempt; the next action receives a new identity.
                 self.state['pending'] = None
-        self._save()
+        if persist:
+            self._save()
 
     def _failed_model_attempt(self, pending: dict[str, Any], *, current_only: bool = True) -> AttemptManifest | None:
         """Prove a closed failure; pending/retry callers require the current identity."""
@@ -1941,6 +2115,8 @@ class ToolApplication:
                     observer = None
 
         with self.session.mutation_scope():
+            if self.state.get('pending_supply') is not None:
+                raise ValueError('Complete the retained caller supply before running, revising or authorizing work')
             if decision is not None:
                 if (feedback or actions is not None or retry_model or approved_execution
                         or read_only_sources or allow_execution or allow_network or allow_vision
@@ -1982,26 +2158,7 @@ class ToolApplication:
             if feedback:
                 if self.state["pending"] and self.state["pending"]["kind"] == "model":
                     raise ValueError("Unreconciled model operation; feedback cannot silently replay it")
-                pending = self.state["pending"]
-                queued = self.state['turns'] and self.state['turns'][-1]['remaining']
-                if (pending and pending['kind'] == 'tool') or (pending is None and queued):
-                    if pending and any(attempt.attempt_id == pending['attempt'] for attempt in self.session.list_attempts()):
-                        raise ValueError("Reconcile the started tool before changing its task")
-                    # New user intent replaces unstarted actions, not executed
-                    # facts. Close their native tool-call messages explicitly
-                    # so the next model turn has a valid, truthful history.
-                    turn = self.state["turns"][-1]
-                    cancellation = pending['attempt'] if pending else (
-                        Path(turn['reply']).stem if turn.get('origin') == 'caller'
-                        else Path(turn['reply']).parent.name)
-                    for index, call in enumerate(turn["remaining"]):
-                        relative = f"tools/cancelled/{cancellation}-{index}.json"
-                        self.session.store.write_json(relative, {"tool_name": call["function"]["name"],
-                            "status": "blocked", "error": "Unstarted action cancelled by new user feedback",
-                            "data": {"executed": False}})
-                        turn["tools"].append({"id": call["id"], "result": relative})
-                    turn["remaining"] = []
-                    self.state["pending"] = None
+                self._cancel_unstarted('Unstarted action cancelled by new user feedback')
                 self.state["requests"].append(feedback)
                 if self.session.manifest.status not in {'created', 'running'}:
                     self.session.continue_with_revision(feedback)

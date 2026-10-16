@@ -18,6 +18,35 @@ from simple_ar.code_task.runtime.config import load_code_task_init_options, load
 
 
 class StartTests(unittest.TestCase):
+    def test_native_supply_records_only_after_confirmation_without_running_work(self):
+        from simple_ar.cli.main import main
+        from unittest.mock import MagicMock
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / 'supply.toml'
+            config.write_text('supply_id = "add-execution"\nreason = "Measure retained sources"\n'
+                '[changes]\nallow_execution = true\n[changes.sources]\nextra = "notes.txt"\n', encoding='utf-8')
+            app = MagicMock()
+            app.session.store.root = root / 'task'
+            args = ['start', '--resume-task', str(root / 'task'), '--supply-task', str(config)]
+            with patch('simple_ar.app.tool_application.ToolApplication.load', return_value=app), \
+                    patch('simple_ar.cli.main._render_native_result'), patch('sys.stdin.isatty', return_value=False), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                main(args)
+                main([*args, '--prepare-only', '--yes'])
+                app.supply.assert_not_called()
+                app.run.assert_not_called()
+                main([*args, '--yes'])
+                app.supply.assert_called_once_with(supply_id='add-execution', reason='Measure retained sources',
+                    changes={'allow_execution': True, 'sources': {'extra': str((root / 'notes.txt').resolve())}})
+                app.run.assert_not_called()
+                for extra in (['--allow-execution'], ['--retry-model'], ['--approve-execution', 'old'],
+                        ['--model', 'profile:other']):
+                    with self.subTest(extra=extra), self.assertRaisesRegex(SystemExit, 'separately'):
+                        main([*args, *extra, '--yes'])
+                with self.assertRaisesRegex(SystemExit, '--resume-task'):
+                    main(['start', '--supply-task', str(config), '--yes'])
+
     def test_native_approval_without_saved_task_stops_before_setup(self):
         from simple_ar.cli.main import main
         with patch("sys.stdin.isatty", return_value=False), \

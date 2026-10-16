@@ -1492,6 +1492,320 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 self.assertEqual(app.ledger.limits, ledger['limits'])
                 self.assertEqual((owner.root / 'capability_result.json').read_bytes(), envelope)
 
+    def _supply_fixture(self):
+        root, inputs = self._tool_materials()
+        fake = Mock()
+        fake._settings = SimpleNamespace(api_mode='chat', context_input_tokens=24000)
+        fake.effective_output_limit.return_value = None
+        fake.connection_binding.return_value = {
+            'profile': 'fixture', 'settings': {'model': 'fixture', 'api_mode': 'chat'}}
+        fake.with_output_limit.return_value = fake
+        fake.chat_turn.side_effect = AssertionError('Supply/caller actions must not request model decisions')
+        fake.ask_json.side_effect = AssertionError('No implicit professional model work')
+        self.enterContext(patch('simple_ar.app.tool_application.LLMClient.from_env', return_value=fake))
+        app = ToolApplication.create(root / 'task', 'Collect materials, then measure when authorized',
+            model=None, sources={'source0': inputs}, max_turns=0, max_tokens=0, max_attempts=30,
+            process_limits={'process_invocations': 2, 'process_wall_seconds': 30})
+        return inputs, fake, app
+
+    @staticmethod
+    def _supply_files(app):
+        root = app.session.store.root
+        return {path.relative_to(root).as_posix(): path.read_bytes()
+            for path in root.rglob('*') if path.is_file() and path.name != '.session.lock'}
+
+    @staticmethod
+    def _supply_measurement(cwd: Path | None = None):
+        return {'command': [sys.executable, '-c',
+            "from pathlib import Path; Path('measured.txt').write_text('once'); print('score: 3.5')"],
+            'cwd': str(cwd or Path.cwd()), 'timeout_sec': 10,
+            'result_schema': {'primary_metric': 'score', 'required_metrics': ['score']},
+            'protocol': {'hypothesis': 'Record a CPU observation', 'dataset': 'Deterministic local input',
+                'expected_outcome': 'One score, not evidence of stability'}}
+
+    def test_supply_first_model_binding_retains_materials_approval_and_replay_after_restart(self):
+        from simple_ar.tools.writing import freeze_report_requirement
+
+        inputs, fake, app = self._supply_fixture()
+        def action(name, **arguments):
+            return {'tool_name': name, 'arguments': arguments}
+        stop = action('ask_user', question='Await explicit next caller action')
+        app.run(actions=[action('read_file', path='source0/notes.txt'),
+            action('read_file', path='source0/missing.txt'),
+            action('write_file', path='workspace/materials.md', content='Original materials; no measurement.')],
+            progress=lambda _: None)
+        receipts = self._native_receipts(app, app.state['turns'])
+        self.assertEqual(app.session.store.read_json(app.state['turns'][0]['tools'][0]['result'])['data']['text'],
+            'original source')
+        self.assertNotEqual(app.session.store.read_json(app.state['turns'][0]['tools'][1]['result'])['status'], 'ok')
+        fake.chat_turn.assert_not_called()
+        fake.ask_json.assert_not_called()
+        root, session_id = app.session.store.root, app.session.manifest.session_id
+        ledger_before = app.ledger.to_dict()
+        with app.session.mutation_scope():
+            app._submit_actions([action('write_file', path='workspace/stale.txt', content='Must be cancelled')])
+        app = ToolApplication.load(root)
+        previous_config = json.loads(json.dumps(app.state['config']))
+        requests_before = list(app.state['requests'])
+        request = {'supply_id': 'first-model', 'reason': 'Measure collected materials and require an execution report',
+            'changes': {'model': 'fixture', 'sources': {'extra': inputs}, 'allow_execution': True,
+                'execution_contract': self._supply_measurement(app.workspace.workspace),
+                'report_requirement': freeze_report_requirement({'outline_strategy': 'template'}),
+                'max_output_tokens': 2048},
+            'resource_allowances': {'llm_requests': 2, 'total_tokens': 120000}}
+        attempts_before = app.session.list_attempts()
+        authorize = app._authorize_resources
+        def interrupted_grant(*args, **kwargs):
+            authorize(*args, **kwargs)
+            raise RuntimeError('Worker stopped after grant, before config commit')
+        with patch.object(app, '_authorize_resources', side_effect=interrupted_grant), self.assertRaisesRegex(
+                RuntimeError, 'before config commit'):
+            app.supply(**request)
+        app = ToolApplication.load(root)
+        self.assertIsNone(app.state['config']['model'])
+        self.assertEqual(app.state['pending_supply']['supply_id'], request['supply_id'])
+        granted_budget = app.session.manifest.budget.to_dict()
+        granted_ledger = app.ledger.to_dict()
+        with self.assertRaisesRegex(ValueError, 'retained caller supply'):
+            app.run(actions=[action('read_file', path='source0/notes.txt')], progress=lambda _: None)
+        with self.assertRaisesRegex(ValueError, 'original id and terms'):
+            app.supply(**{**request, 'supply_id': 'different'})
+        app.supply(**request)
+        self.assertEqual(app.session.manifest.budget.to_dict(), granted_budget)
+        self.assertEqual(app.ledger.to_dict(), granted_ledger)
+        self.assertNotIn('pending_supply', app.state)
+        self.assertEqual(app.session.list_attempts(), attempts_before)
+        app = ToolApplication.load(root)
+        self.assertEqual(app.session.manifest.session_id, session_id)
+        self.assertEqual(app.session.manifest.budget_ledger_ref.path, 'budget_ledger.json')
+        self.assertEqual(app.state['config']['model'], 'fixture')
+        self.assertEqual(app.state['config']['max_turns'], 0)
+        self.assertEqual(app.state['config']['model_connection'], fake.connection_binding.return_value)
+        self.assertEqual(app.state['config']['report_evidence_contract'], 'execution.v1')
+        self.assertEqual(set(app.state['config']['sources']), {'source0', 'extra'})
+        self.assertEqual(app.state['config']['sources']['source0'], str(inputs.resolve()))
+        self.assertEqual(app.state['config']['max_output_tokens'], 2048)
+        self.assertIsNone(app.state['pending'])
+        self.assertFalse(any(turn['remaining'] for turn in app.state['turns']))
+        cancelled = [app.session.store.read_json(item['result']) for item in app.state['turns'][-1]['tools']]
+        self.assertEqual(len(cancelled), 1)
+        self.assertEqual(cancelled[0]['status'], 'blocked')
+        self.assertFalse(cancelled[0]['data']['executed'])
+        self.assertFalse((root / 'workspace/stale.txt').exists())
+        self.assertFalse((root / 'workspace/measured.txt').exists())
+        self.assertEqual({path: (root / path).read_bytes() for path in receipts}, receipts)
+        self.assertEqual(app.ledger.to_dict()['entries'][:len(ledger_before['entries'])], ledger_before['entries'])
+        self.assertEqual(app.ledger.remaining('llm_requests'), 2)
+        self.assertEqual(app._request_capacity(), 2)
+        supply, = app.state['supplies']
+        self.assertEqual(supply['supply_id'], 'first-model')
+        self.assertEqual(supply['previous_config'], previous_config)
+        self.assertEqual(app.state['requests'][:-1], requests_before)
+        self.assertEqual(app.session.manifest.budget.continuation_authorizations['first-model']
+            ['resource_allowances'], request['resource_allowances'])
+        self.assertEqual([entry.reservation_id for entry in app.ledger.entries
+            if entry.actual_source == 'user_authorization'], ['first-model'])
+        self.assertNotIn('supply', {spec.name for spec in app.gateway.registry.list_specs()})
+        fake.chat_turn.assert_not_called()
+        fake.ask_json.assert_not_called()
+
+        app.run(actions=[action('measure_experiment', **request['changes']['execution_contract']), stop],
+            progress=lambda _: None)
+        self.assertEqual(app.state['pending']['call']['function']['name'], 'measure_experiment')
+        self.assertFalse((root / 'workspace/measured.txt').exists())
+        token = app.approval_token(app.state['pending']['call'])
+        identity = app.state['pending']['attempt']
+        app = ToolApplication.load(root)
+        app.run(approved_execution=token, progress=lambda _: None)
+        measured = app.session.store.read_json(f'attempts/{identity}/native_result.json')
+        self.assertEqual(measured['status'], 'ok', measured.get('error'))
+        self.assertEqual(measured['data']['metrics']['score'], 3.5)
+        self.assertEqual((root / 'workspace/measured.txt').read_text(), 'once')
+        app.run(actions=[action('analyze_measurements', result_refs=[measured['data']['result_ref']]), stop],
+            progress=lambda _: None)
+        analysis = app.session.store.read_json(app.state['turns'][-1]['tools'][0]['result'])
+        self.assertEqual(analysis['status'], 'ok', analysis.get('error'))
+        self.assertEqual(app._report_inputs()['evidence_contract'], 'execution.v1')
+        with self.assertRaises(ValueError):
+            app._validated_report_delivery(['workspace/materials.md'])
+        self.assertEqual(sum(entry.actual.get('process_invocations', 0) for entry in app.ledger.entries), 1)
+
+        # Spend some of the explicit grant without making a provider call; replay
+        # must recognize the original request, not compare it to merged config.
+        app.ledger.reserve('spent-model-budget', {'llm_requests': 1, 'total_tokens': 100})
+        app.ledger.settle('spent-model-budget', {'llm_requests': 1, 'total_tokens': 100})
+        app = ToolApplication.load(root)
+        before, files = self._native_snapshot(app), self._supply_files(app)
+        app.supply(**request)
+        self._assert_native_snapshot(app, before)
+        self.assertEqual(self._supply_files(app), files)
+        self.assertEqual(app.ledger.remaining('llm_requests'), 1)
+        self.assertEqual(app._request_capacity(), 1)
+        for replacement in ({'reason': 'Different intent'}, {'changes': {**request['changes'], 'allow_network': True}},
+                {'resource_allowances': {'llm_requests': 3, 'total_tokens': 120000}}):
+            with self.subTest(conflict=replacement), self.assertRaises(ValueError):
+                app.supply(**{**request, **replacement})
+            self._assert_native_snapshot(app, before)
+            self.assertEqual(self._supply_files(app), files)
+        with self.assertRaises(ValueError):
+            app.supply(supply_id='replace-output-cap', reason='Frozen output cap cannot change',
+                changes={'max_output_tokens': 4096})
+        self._assert_native_snapshot(app, before)
+        self.assertEqual(self._supply_files(app), files)
+        self.assertEqual({path: (root / path).read_bytes() for path in receipts}, receipts)
+        fake.chat_turn.assert_not_called()
+        fake.ask_json.assert_not_called()
+
+    def test_supply_rejects_invalid_contracts_and_unreconciled_work_without_mutation(self):
+        cases = [
+            ('unknown-key', {'arbitrary_config': True}, None),
+            ('model-no-grant', {'model': 'fixture'}, None),
+            ('model-no-tokens', {'model': 'fixture'}, {'llm_requests': 1}),
+            ('model-no-requests', {'model': 'fixture'}, {'total_tokens': 100}),
+            ('model-zero', {'model': 'fixture'}, {'llm_requests': 0, 'total_tokens': 100}),
+            ('model-bool', {'model': 'fixture'}, {'llm_requests': True, 'total_tokens': 100}),
+            ('model-float', {'model': 'fixture'}, {'llm_requests': 1.5, 'total_tokens': 100}),
+            ('model-zero-tokens', {'model': 'fixture'}, {'llm_requests': 1, 'total_tokens': 0}),
+            ('model-infinite-tokens', {'model': 'fixture'}, {'llm_requests': 1, 'total_tokens': float('inf')}),
+            ('execution-without-access', {'execution_contract': self._supply_measurement()}, None),
+            ('bad-execution', {'allow_execution': True, 'execution_contract': {'command': []}}, None),
+            ('bad-report', {'report_requirement': {'outline': []}}, None),
+            ('bad-code', {'code_task': {'unknown': True}}, None),
+            ('bad-policy', {'research_policy': {'max_papers': -1, 'unknown': True}}, None),
+            ('bad-table', {'table_analysis': {'path': 'source0/missing.csv'}}, None),
+            ('reserved-alias', {'sources': {'workspace': Path('.')}}, None),
+            ('delete-alias', {'sources': {'source0': None}}, None),
+            ('reserved', {'allow_network': True}, None),
+            ('unknown', {'allow_network': True}, None),
+            ('pending-model', {'allow_network': True}, None),
+            ('pending-tool', {'allow_network': True}, None),
+            ('running', {'allow_network': True}, None),
+        ]
+        for case, changes, allowances in cases:
+            with self.subTest(case=case):
+                inputs, fake, app = self._supply_fixture()
+                if case.startswith('bad-'):
+                    changes = {**changes, 'model': 'fixture', 'allow_execution': True}
+                    allowances = {'llm_requests': 1, 'total_tokens': 100}
+                    invalid_root = app.session.store.root / 'invalid-create'
+                    with self.assertRaises(ValueError):
+                        ToolApplication.create(invalid_root, 'Reject the same malformed creation contract',
+                            sources={'source0': inputs}, max_turns=1, max_tokens=100, **changes)
+                    self.assertFalse(invalid_root.exists())
+                app.run(actions=[{'tool_name': 'read_file', 'arguments': {'path': 'source0/notes.txt'}}],
+                    progress=lambda _: None)
+                identity = app.session.list_attempts()[0].attempt_id
+                if case in {'reserved', 'unknown'}:
+                    app.ledger.reserve('unreconciled', {'process_invocations': 1})
+                    if case == 'unknown':
+                        app.ledger.mark_unknown('unreconciled', reason='Process outcome unavailable')
+                if case in {'pending-model', 'pending-tool', 'running'}:
+                    manifest_path = app.session.store.root / 'attempts' / identity / 'attempt_manifest.json'
+                    manifest = read_json(manifest_path)
+                    manifest['status'] = 'running' if case == 'running' else 'failed'
+                    if case == 'pending-model':
+                        manifest['capability'] = 'native_turn'
+                    write_json(manifest_path, manifest)
+                    if case != 'running':
+                        app.state['pending'] = {'kind': 'model' if case == 'pending-model' else 'tool',
+                            'attempt': identity, 'call': self._native_message('read_file',
+                                {'path': 'source0/notes.txt'}, 'started')['tool_calls'][0]}
+                    app._save()
+                before, files = self._native_snapshot(app), self._supply_files(app)
+                with self.assertRaises((ValueError, TypeError)):
+                    app.supply(supply_id='rejected', reason='Invalid or unreconciled supply',
+                        changes=changes, resource_allowances=allowances)
+                self._assert_native_snapshot(app, before)
+                self.assertEqual(self._supply_files(app), files)
+                fake.chat_turn.assert_not_called()
+                fake.ask_json.assert_not_called()
+
+        # Execution-only supplementation needs no model, but resource continuation
+        # alone must still be unable to turn this task into a model-owned task.
+        inputs, fake, app = self._supply_fixture()
+        app.supply(supply_id='execution-only', reason='Allow measurement proposals', changes={
+            'allow_execution': True, 'allow_network': True,
+            'execution_contract': self._supply_measurement(app.workspace.workspace)})
+        self.assertIsNone(app.state['config']['model'])
+        self.assertEqual(app.state['turns'], [])
+        for changes in ({'allow_execution': False}, {'allow_network': False},
+                {'sources': {'source0': inputs.parent}}, {'sources': {'source0': None}},
+                {'execution_contract': {**self._supply_measurement(app.workspace.workspace), 'timeout_sec': 11}}):
+            before, files = self._native_snapshot(app), self._supply_files(app)
+            with self.subTest(frozen=changes), self.assertRaises((ValueError, TypeError)):
+                app.supply(supply_id='conflicting-contract', reason='Cannot rewrite frozen authority', changes=changes)
+            self._assert_native_snapshot(app, before)
+            self.assertEqual(self._supply_files(app), files)
+        files = self._supply_files(app)
+        with self.assertRaises(ValueError):
+            app.run(resource_allowances={'llm_requests': 1, 'total_tokens': 100},
+                authorization_id='not-model-access', authorization_reason='Only supply can bind the first model',
+                progress=lambda _: None)
+        self.assertEqual(self._supply_files(app), files)
+        fake.chat_turn.assert_not_called()
+        fake.ask_json.assert_not_called()
+
+    def test_supply_upgrades_material_report_contract_without_accepting_old_composition(self):
+        from simple_ar.tools.writing import freeze_report_requirement
+
+        requirement = freeze_report_requirement({'outline_strategy': 'template'})
+        _, _, fake, _, app, _ = self._native_fixture(allow_execution=False, report_requirement=requirement)
+        self.enterContext(patch('simple_ar.app.tool_application.LLMClient.for_task', return_value=fake))
+        fake.chat_turn.side_effect = AssertionError('Only explicit caller actions are requested')
+        fake.ask_json.return_value = {'draft_markdown': '\n\n'.join(
+            '## ' + row['heading'] + '\n\nRetained source material; no stability claim.'
+            for row in requirement['outline'])}
+        def action(name, **arguments):
+            return {'tool_name': name, 'arguments': arguments}
+        stop = action('ask_user', question='Await next explicit action')
+        app.run(actions=[action('compose_document', goal='Summarize supplied material', title='Material report',
+            materials=[{'path': 'source0/notes.txt'}]), stop],
+            progress=lambda _: None)
+        old = app.session.store.read_json(app.state['turns'][-1]['tools'][0]['result'])
+        self.assertEqual(old['status'], 'ok', old.get('error'))
+        manuscript = old['data']['editable_markdown']
+        app._validated_report_delivery([manuscript])
+        self.assertEqual(old['data']['report_binding']['evidence_contract'], 'materials.v1')
+        receipts = self._native_receipts(app, app.state['turns'])
+        content = app.workspace.resolve(manuscript).read_bytes()
+        calls = fake.ask_json.call_count
+        app = ToolApplication.load(app.session.store.root)
+        app.supply(supply_id='add-execution', reason='Now require actual measurement and analysis',
+            changes={'allow_execution': True, 'execution_contract': self._supply_measurement(app.workspace.workspace),
+                'report_requirement': requirement, 'model': 'fixture'})
+        self.assertEqual(app.state['config']['report_evidence_contract'], 'execution.v1')
+        self.assertEqual(fake.ask_json.call_count, calls)
+        fake.chat_turn.assert_not_called()
+        for changes in ({'model': 'another-model'}, {'model': None},
+                {'report_requirement': {**requirement, 'outline': []}}):
+            before, files = self._native_snapshot(app), self._supply_files(app)
+            with self.subTest(frozen=changes), self.assertRaises(ValueError):
+                app.supply(supply_id='invalid-replacement', reason='Cannot replace frozen contract', changes=changes)
+            self._assert_native_snapshot(app, before)
+            self.assertEqual(self._supply_files(app), files)
+        with self.assertRaises(ValueError):
+            app._validated_report_delivery([manuscript])
+        app.run(actions=[action('measure_experiment', **app.state['config']['execution_contract']), stop],
+            approve=lambda *_: True, progress=lambda _: None)
+        measured = app.session.store.read_json(app.state['turns'][-1]['tools'][0]['result'])
+        self.assertEqual(measured['status'], 'ok', measured.get('error'))
+        app.run(actions=[action('analyze_measurements', result_refs=[measured['data']['result_ref']]), stop],
+            progress=lambda _: None)
+        with self.assertRaises(ValueError):
+            app._validated_report_delivery([manuscript])
+        app.run(actions=[action('compose_document', goal='Explain actual measurement', title='Execution report',
+            prior_draft=manuscript), stop], progress=lambda _: None)
+        current = app.session.store.read_json(app.state['turns'][-1]['tools'][0]['result'])
+        self.assertEqual(current['status'], 'ok', current.get('error'))
+        self.assertEqual(current['data']['report_binding']['evidence_contract'], 'execution.v1')
+        self.assertEqual(fake.ask_json.call_count, calls + 1)
+        app.run(actions=[action('deliver_result', summary='One measured score with analysis',
+            artifacts=[current['data']['editable_markdown']])], progress=lambda _: None)
+        self.assertEqual(app.session.manifest.status, 'completed', app.session.manifest.status_reason)
+        self.assertEqual(app.workspace.resolve(manuscript).read_bytes(), content)
+        self.assertEqual({path: (app.session.store.root / path).read_bytes() for path in receipts}, receipts)
+        fake.chat_turn.assert_not_called()
+
     def test_caller_science_uses_common_approval_attempts_feedback_and_no_model(self):
         with _temporary_run() as root, patch('simple_ar.app.tool_application.LLMClient.from_env',
                 side_effect=AssertionError('Caller actions must not resolve model credentials')) as client:

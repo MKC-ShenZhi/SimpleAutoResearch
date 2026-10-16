@@ -2540,6 +2540,8 @@ def _run_native_start(args: argparse.Namespace) -> None:
         else:
             decision = None
         continuation = _continuation_parameters(args)
+        if args.supply_task and not args.resume_task:
+            raise ValueError('--supply-task requires --resume-task and its retained task')
         if args.approve_execution and not args.resume_task:
             raise ValueError("--approve-execution requires --resume-task and its saved pending command")
         allowances = continuation["authorize_remaining"]
@@ -2565,6 +2567,41 @@ def _run_native_start(args: argparse.Namespace) -> None:
             if args.max_images or args.project_python:
                 raise ValueError("Resume keeps the saved image allowance and interpreter; it cannot silently change them")
             app = ToolApplication.load(args.resume_task.resolve())
+            if args.supply_task:
+                if (args.request or args.goal or args.retry_model or args.approve_execution or decision
+                        or args.source or args.allow_execution or args.allow_network or args.allow_vision
+                        or allowances or authorization_id or authorization_reason
+                        or 'model' in getattr(args, '_explicit_start_destinations', set())):
+                    raise ValueError('Use --supply-task separately; declare new contracts and resources in its TOML')
+                import tomllib
+                path = args.supply_task.resolve()
+                with path.open('rb') as stream:
+                    supply = tomllib.load(stream)
+                if (set(supply) - {'supply_id', 'reason', 'changes', 'resource_allowances'}
+                        or not {'supply_id', 'reason', 'changes'}.issubset(supply)
+                        or not isinstance(supply['changes'], dict)):
+                    raise ValueError('Supply TOML requires supply_id, reason and [changes]; optional [resource_allowances]')
+                sources = supply['changes'].get('sources', {})
+                if not isinstance(sources, dict) or any(not isinstance(value, str) or not value.strip()
+                        for value in sources.values()):
+                    raise ValueError('Supply [changes.sources] must map aliases to read-only paths')
+                if sources:
+                    supply['changes']['sources'] = {name: str((path.parent / value).resolve())
+                        for name, value in sources.items()}
+                make_console().print(Panel(Text(
+                    f"Supply ID: {supply['supply_id']}\nReason: {supply['reason']}\n"
+                    f"Contract fields: {', '.join(sorted(supply['changes']))}\n"
+                    f"New remaining allowances: {supply.get('resource_allowances', {})}\n"
+                    "Original records and usage remain. This records missing contracts only; "
+                    "no model call or process runs, and commands still require separate approval."),
+                    title='Confirm task supply / 确认补齐任务条件'))
+                if args.prepare_only or (not args.yes and (not interactive or input(
+                        'Record these contracts / 保存这些条件? [y/N]: ').strip().lower() not in {'y', 'yes'})):
+                    return
+                app.supply(**supply)
+                _render_native_result(app, app.session.status_snapshot())
+                print_line(f'Supply saved without execution. Continue: simple-ar start --resume-task "{app.session.store.root}"')
+                return
             feedback = args.request or args.goal or ""
             explicit_model = 'model' in getattr(args, '_explicit_start_destinations', set())
             replacement_model = args.model if args.retry_model and explicit_model else ''

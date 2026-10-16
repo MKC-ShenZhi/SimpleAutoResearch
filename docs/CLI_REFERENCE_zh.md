@@ -53,6 +53,7 @@ simple-ar start --kind writing --material notes.md --prepare-only
 | `--prepare-only` | 只保存或预览，不调用模型或执行进程；新原生任务仍会预检连接和凭据。 |
 | `--yes` | 接受展示的任务、访问和资源摘要，不等于命令审批。 |
 | `--resume-task SESSION` | 恢复保存的原生任务，可同时提供反馈。 |
+| `--supply-task PATH` | 配合原生恢复，确认 TOML 中尚缺的合同；只记录，不执行工作。 |
 | `--approve-execution TOKEN` | 提交当前打印的精确审批 token；必须与原生恢复一起使用。 |
 | `--decision-id ID`、`--decision-response accept\|reject\|revise`、`--decision-guidance TEXT` | 恢复时回复冻结设计；guidance用于revise，不代表执行授权。 |
 | `--retry-model` | 显式重试已关闭的失败模型决策，规则见下文。 |
@@ -74,6 +75,33 @@ simple-ar start --kind data_analysis --scripted --data-file measurements.csv --g
 显式提供的列、单位、配对关系和展示要求会保留在目标中。没有提供的预设默认值不会约束原生任务。`--scripted` 仅适用于 `data_analysis`。
 
 ### 原生任务恢复
+
+无模型的调用方原生任务需要补齐条件时，使用补齐文件，不要借模型重试绕过授权：
+
+```toml
+supply_id = "first-model"
+reason = "基于已保存材料继续工作"
+
+[changes]
+model = "profile:daily"
+allow_execution = true
+
+[resource_allowances]
+llm_requests = 20
+total_tokens = 600000
+process_invocations = 8
+process_wall_seconds = 600
+```
+
+```bash
+simple-ar start --resume-task SESSION --supply-task supply.toml --prepare-only
+simple-ar start --resume-task SESSION --supply-task supply.toml --yes
+simple-ar start --resume-task SESSION
+```
+
+补齐与原生创建共用校验。`changes` 还可补 `sources`、`execution_contract`、`code_task`、`research_policy`、`table_analysis`、`report_requirement` 和 `max_output_tokens`，不能替换已有非空合同或来源别名。来源路径相对补齐文件解析；执行 cwd 必须是已存在的绝对目录，argv 不做 shell 展开。执行提案仍需精确批准。首次绑定模型必须显式给出正数请求/token 额度；仅续额不会取得模型权限。
+
+相同 ID 与参数重放幂等，也覆盖“已记额度、未完成配置提交”的中断恢复。补齐中断后须完成原补齐操作才能继续；在途/未知操作须先核对。补齐与反馈、重试、独立续额参数及命令审批分开，不是修改旧结构化研究协议的兼容适配器。
 
 ~~~bash
 simple-ar status SESSION

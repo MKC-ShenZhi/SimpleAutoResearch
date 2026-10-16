@@ -363,10 +363,18 @@ class SourceToolGateway:
 
     def _material_paths(self, values: list[str]) -> list[Path]:
         paths = [self.workspace.resolve_source_record(value) for value in values]
-        if len(paths) > self.policy.max_documents or len(set(paths)) != len(paths):
+        return self.validate_material_paths(paths, self.policy)
+
+    @staticmethod
+    def validate_material_paths(paths: list[Path], policy: SourcePolicy, *,
+                                excluded_roots: tuple[Path, ...] = ()) -> list[Path]:
+        """Shared read-only preflight for source use and caller configuration."""
+        if len(paths) > policy.max_documents or len(set(paths)) != len(paths):
             raise ValueError('Material selection exceeds document limit or repeats a source')
         for path in paths:
-            if not path.is_file() or path.stat().st_size > self.policy.max_pdf_mb * 1024 * 1024:
+            if any(path.is_relative_to(root.resolve()) for root in excluded_roots):
+                raise ValueError('Generated output or attempt history is not original-source evidence')
+            if not path.is_file() or path.stat().st_size > policy.max_pdf_mb * 1024 * 1024:
                 raise ValueError('Material must be a bounded authorized file')
         return paths
 

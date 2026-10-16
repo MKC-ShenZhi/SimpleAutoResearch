@@ -53,6 +53,7 @@ Bare start asks for a goal. A positional request or ordinary `--goal` enters the
 | `--prepare-only` | Save/preview without calls or execution; new native tasks still preflight connection/credentials |
 | `--yes` | Accept displayed task/access/resource summary, not command approval |
 | `--resume-task SESSION` | Resume saved native state, optionally with feedback |
+| `--supply-task PATH` | With native resume, confirm a TOML supply of missing contracts; records only, no work is executed |
 | `--approve-execution TOKEN` | Exact current printed approval token; requires native resume |
 | `--decision-id ID`, `--decision-response accept\|reject\|revise`, `--decision-guidance TEXT` | Reply to a frozen research design on resume; guidance accompanies revise. Not process approval |
 | `--retry-model` | Explicitly retry a closed failed model decision; see recovery below |
@@ -72,6 +73,33 @@ simple-ar start --kind data_analysis --scripted --data-file measurements.csv --g
 Figure work requests layout/code, PNG, editable SVG and explanation. Scripted analysis requests runnable source, computed results and explanation. Preferences do not restrict tools or plot types, grant permissions, manufacture data or prove completion. Explicit column/unit/pairing/presentation declarations are retained in the goal; unprovided preset defaults do not restrict native work. `--scripted` requires data_analysis.
 
 ### Native recovery
+
+To add missing conditions to a caller-directed native task, use a supply file rather than model retry:
+
+```toml
+supply_id = "first-model"
+reason = "Continue from the retained materials"
+
+[changes]
+model = "profile:daily"
+allow_execution = true
+
+[resource_allowances]
+llm_requests = 20
+total_tokens = 600000
+process_invocations = 8
+process_wall_seconds = 600
+```
+
+```bash
+simple-ar start --resume-task SESSION --supply-task supply.toml --prepare-only
+simple-ar start --resume-task SESSION --supply-task supply.toml --yes
+simple-ar start --resume-task SESSION
+```
+
+Supply uses the same validation as native creation. It can add `sources`, `execution_contract`, `code_task`, `research_policy`, `table_analysis`, `report_requirement` and `max_output_tokens` under `changes`; existing nonempty contracts and source aliases cannot be replaced. Source paths resolve from the supply file; execution cwd must be an existing absolute directory and argv remains literal. Execution proposals still need exact approval. First model binding requires both positive request and token allowances; resource continuation alone cannot grant model access.
+
+The same ID and terms are idempotent, including recovery after a grant was recorded but the config commit was interrupted. An interrupted supply blocks work until that supply is completed. In-flight/unknown operations must first be reconciled. Supply is separate from feedback, retry, resource flags and command approval; it is not yet the compatibility adapter for changing an old structured research protocol.
 
 ~~~bash
 simple-ar status SESSION
