@@ -42,6 +42,8 @@ restored = ToolApplication.load(Path("runs/evidence-note"))
 
 创建只校验输入，不调用模型或进程。不传 `model` 时由调用方提供动作，后续可明确补齐条件；声明报告只是保留交付义务，不授权调用模型。`ResearchApplicationServices` 提供研究设置及有限预算。声明命令或条件集合写入 `services.config["execution"]`；可选 `code_task` 复用原 CodeTask 默认值、编辑边界和独立验证器。路径相对 `input_base_dir`，不是任务输出目录；显式零额度保持为零。来源别名、环境及已核外部基线快照与 CLI 共用编译，不再另设 Python 执行语义。
 
+`create_research_task(..., allow_vision=True)` 可明确授权图像检查；该关键字默认 `False`，只接受布尔值，不从任务文字或材料推导授权。检查仍要求既有所有者校验命名 vision 路由及连接/哈希，并计入 `services.budget_limits` 对应的同一模型请求和 token 账本；注入文本客户端本身不提供 vision 授权。此参数不授权来源联网或图像生成，不改变旧任务权限及 `ToolApplication` 返回类型。
+
 例如，下面只创建调用方测量任务，不执行程序：
 
 ```python

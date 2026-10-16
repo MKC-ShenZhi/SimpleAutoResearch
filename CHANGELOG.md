@@ -6,7 +6,8 @@ User-visible changes, newest first. Entries describe behavior on their date; lat
 
 ## 2026-10-17
 
-- New native tasks reserve a follow-up decision within the existing shared budget, including professional requests and retries. Explicit final-work delivery and historical contracts retain their original gates; exhausted work is not automatically marked complete.
+- New native tasks protect a follow-up opportunity and require an explicit closing action batch when no further decision fits. Invalid closing batches are retained without execution, not marked successful; saved admission policies and ledgers remain unchanged.
+- Public Python task creation accepts explicit `allow_vision=True` inspection authorization, using existing named vision routing and the shared request/token ledger; it does not grant source network access or image generation.
 
 ## 2026-10-16
 

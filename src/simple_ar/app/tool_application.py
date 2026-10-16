@@ -40,6 +40,16 @@ from simple_ar.research.sources import SearchProviderRegistry
 
 _CORE_COORDINATION = {'focus_work', 'load_tools', 'read_history'}
 _FINAL_WORK_TOOLS = {'write_file', 'export_report', 'run_process', 'review_document', 'measure_experiment', 'analyze_measurements'}
+_COMPLETION_POLICIES = {'protected_decision.v1', 'closing_decision.v2'}
+_CLOSING_DECISION = (
+    'This is the last affordable decision under the saved resource contract. '
+    'Return one executable action batch ending with exactly one explicit delivery or question. '
+    'You may finish known work and deliver in that batch, including an approved final process '
+    'with delivery; otherwise disclose incomplete work and deliver only existing usable artifacts '
+    'or ask an indispensable scope/resource question. A plan, ordinary file write or prose '
+    'alone cannot close this request. Do not claim an unexecuted check or old delivery is current. '
+    'A non-closing batch will be retained without executing its proposed operations.'
+)
 
 
 SYSTEM = (
@@ -693,7 +703,7 @@ class ToolApplication:
             **({'runtime_dependencies': dependencies} if dependencies else {}),
             "feasibility_connection": feasibility_connection,
             "max_images": max_images,
-            "completion_policy": "protected_decision.v1",
+            "completion_policy": "closing_decision.v2",
             "max_turns": max_turns}
         if code_task is not None:
             config['code_task'] = code_task
@@ -865,7 +875,9 @@ class ToolApplication:
             config['max_turns'] = old['max_turns']
             # Supply changes the declared work, not a historical controller's
             # spending policy. New tasks already carry the current policy.
-            if 'completion_policy' not in old:
+            if 'completion_policy' in old:
+                config['completion_policy'] = old['completion_policy']
+            else:
                 config.pop('completion_policy', None)
             if old.get('source_snapshots'):
                 config['source_snapshots'] = {name: value for name, value in old['source_snapshots'].items()
@@ -1057,7 +1069,7 @@ class ToolApplication:
                 + (client.effective_output_limit() or 0))
 
     def _completion_floor(self, client: Any, messages: list | None = None) -> dict[str, int]:
-        if client is None or self.state['config'].get('completion_policy') != 'protected_decision.v1':
+        if client is None or self.state['config'].get('completion_policy') not in _COMPLETION_POLICIES:
             return {}
         if messages is None and self.state['turns']:
             # Reuse this decision's recorded reservation estimate instead of
@@ -1079,6 +1091,18 @@ class ToolApplication:
         space = self.session.manifest.budget.max_attempts - self.session.manifest.budget.attempts
         return bool(queued and len(queued) <= space and self._terminal_intent(queued[-1])
             and sum(self._terminal_intent(call) for call in queued) == 1)
+
+    def _closing_decision(self) -> bool:
+        """The saved decision's admission contract, not current-budget inference.
+
+        Old replies have no such obligation. Approval/recovery must retain the
+        contract used to obtain the reply, even if resources later change.
+        """
+        if not self.state['turns']:
+            return False
+        path = str(Path(self.state['turns'][-1]['reply']).with_name('decision_budget.json'))
+        return (self.session.store.exists(path)
+            and self.session.store.read_json(path).get('closing_required') is True)
 
     @staticmethod
     def _history_observation(call: dict, result: dict, record: str) -> dict:
@@ -1129,7 +1153,7 @@ class ToolApplication:
         return table if len(json.dumps(table, ensure_ascii=False)) < len(
             json.dumps(turns, ensure_ascii=False)) else turns
 
-    def _messages(self, *, client: LLMClient | None = None) -> list[dict[str, Any]]:
+    def _messages(self, *, client: LLMClient | None = None, closing: bool = False) -> list[dict[str, Any]]:
         config = self.state["config"]
         blocks = []
         progress = []
@@ -1255,7 +1279,8 @@ class ToolApplication:
         vision_spec = self.gateway.registry.get('inspect_images')
         vision_available, vision_reason = (self.gateway.policy.is_allowed(vision_spec)
             if vision_spec is not None else (False, 'inspect_images is not registered for this task.'))
-        messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": json.dumps({
+        messages = [{"role": "system", "content": SYSTEM + ('\n\n' + _CLOSING_DECISION if closing else '')},
+            {"role": "user", "content": json.dumps({
             "requests": self.state["requests"], "mounts": config["sources"],
             "workspace": str(self.workspace.workspace),
             "authorized_roots": {name: str(path) for name, path in self.workspace.mounts.items()},
@@ -1278,7 +1303,8 @@ class ToolApplication:
                     "includes_current_decision": True,
                     "provider_slots_after_one_attempt": max(0, remaining_requests - 1),
                     "nested_provider_slots_after_decision_and_followup": max(0, remaining_requests - 2),
-                    "protected_followup_requests": int(config.get('completion_policy') == 'protected_decision.v1'),
+                    "followup_policy": config.get('completion_policy', 'none'),
+                    "closing_required": closing,
                     "scope": "Shared physical attempts, not completed actions. Professional selection, writing, review and retries also spend them. Protection is a follow-up opportunity, not guaranteed task completion."},
                 "semantics": {
                     "llm_requests": "Shared physical provider attempts: decisions, professional selection/writing/review, inspect_images and retries.",
@@ -1540,16 +1566,24 @@ class ToolApplication:
         client = self._client(context.attempt.attempt_id)
         messages = self._messages(client=client)
         floor = self._completion_floor(client, messages)
-        if floor:
-            context.store.write_json('decision_budget.json', {
-                'estimated_followup_tokens': floor['total_tokens'],
-                'scope': 'Current serialized decision input plus its output cap; estimate, not provider usage or guaranteed future context capacity.'})
         remaining = self.ledger.remaining('total_tokens')
         # A last affordable decision can deliver/question, but its retry must
         # not steal a future decision while ordinary work is still affordable.
         protect = bool(floor and self._request_capacity() > 1
             and self.session.manifest.budget.max_attempts - self.session.manifest.budget.attempts > 2
             and (remaining is None or remaining >= 2 * floor['total_tokens']))
+        closing = self.state['config'].get('completion_policy') == 'closing_decision.v2' and not protect
+        if closing:
+            # Include the closing contract before context trimming/reservation,
+            # not as an unbudgeted suffix added to a capacity-fitted request.
+            messages = self._messages(client=client, closing=True)
+            floor = self._completion_floor(client, messages)
+        if floor:
+            context.store.write_json('decision_budget.json', {
+                'estimated_followup_tokens': floor['total_tokens'],
+                'closing_required': closing,
+                'scope': 'Estimated follow-up reservation, not provider usage or guaranteed future capacity. '
+                    'closing_required binds this decision reply and survives approval/recovery.'})
         with self.ledger.protect_remaining(floor if protect else {}):
             message = client.chat_turn(messages, tools=self.schemas,
                 label="native-turn", budget_call_id=context.attempt.attempt_id)
@@ -2496,7 +2530,7 @@ class ToolApplication:
 
     def _run(self, approved_execution: str, approve: Any, progress: Callable[[str], None]) -> None:
         caller_takeover = self._caller_takeover()
-        reserve_completion = (self.state['config'].get('completion_policy') == 'protected_decision.v1'
+        reserve_completion = (self.state['config'].get('completion_policy') in _COMPLETION_POLICIES
             and self.state['config']['model'] is not None and not caller_takeover)
         while True:
             if self._commit_terminal(progress):
@@ -2507,6 +2541,13 @@ class ToolApplication:
                 attempt_space = self.session.manifest.budget.max_attempts - self.session.manifest.budget.attempts
                 if turns and turns[-1].get("remaining"):
                     call = turns[-1]["remaining"][0]
+                    if self._closing_decision() and not self._terminal_batch():
+                        reason = ('Final decision requires one fitting explicit delivery/question as the '
+                            'last action; proposed work retained without execution, not marked complete')
+                        self._cancel_unstarted(reason)
+                        self.session.pause(reason)
+                        self._save()
+                        return
                     if (reserve_completion
                             and not self._terminal_intent(call)
                             and not self._terminal_batch()

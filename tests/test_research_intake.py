@@ -242,10 +242,13 @@ class ResearchIntakeTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             catalog = root / "models.toml"
-            catalog.write_text('version = 1\n[routes]\ndefault = "acceptance"\n'
+            catalog.write_text('version = 1\n[routes]\ndefault = "acceptance"\nvision = "visual"\n'
                 '[profiles.acceptance]\napi = "openai_chat"\n'
                 'base_url = "https://acceptance.invalid/v1"\nmodel = "fixture-model"\n'
-                'api_key_env = "ACCEPTANCE_MODEL_KEY"\ncapabilities = ["text"]\n', encoding="utf-8")
+                'api_key_env = "ACCEPTANCE_MODEL_KEY"\ncapabilities = ["text"]\n'
+                '[profiles.visual]\napi = "openai_chat"\n'
+                'base_url = "https://acceptance.invalid/v1"\nmodel = "fixture-vision"\n'
+                'api_key_env = "ACCEPTANCE_MODEL_KEY"\ncapabilities = ["vision"]\n', encoding="utf-8")
             with patch.dict(os.environ, {"SIMPLE_AR_MODELS_CONFIG": str(catalog),
                     "ACCEPTANCE_MODEL_KEY": "fixture-secret-never-persist"}), patch.object(
                     LLMClient, "chat_turn", side_effect=AssertionError("Creation/loading must not call models")) as calls:
@@ -282,6 +285,50 @@ class ResearchIntakeTests(unittest.TestCase):
                     requested_outputs=("assessment",)), root=root / "writing-research", model="env",
                     services=ResearchApplicationServices(config={'research_task_kind': 'writing', 'allow_network': True}))
                 self.assertTrue(writing.state['config']['allow_network'])
+                figure = root / "figure.svg"
+                figure.write_text('<svg xmlns="http://www.w3.org/2000/svg"/>', encoding="utf-8")
+                visual_brief = ResearchBrief(request_text="Inspect the supplied image and explain its evidence.",
+                    requested_outputs=("assessment",),
+                    asset_requests=({'locator': str(figure), 'role': 'material'},))
+                visual_services = ResearchApplicationServices(config={'research_materials_only': True},
+                    budget_limits={'llm_requests': 2, 'total_tokens': 1000,
+                        'process_invocations': 0, 'process_wall_seconds': 0, 'source_operations': 0})
+                for label, options in (('omitted', {}), ('denied', {'allow_vision': False}),
+                        ('authorized', {'allow_vision': True})):
+                    with self.subTest(vision=label), patch.object(ToolApplication, 'create',
+                            wraps=ToolApplication.create) as create:
+                        visual = create_research_task(visual_brief, root=root / label,
+                            model='profile:acceptance', services=visual_services, **options)
+                        create.assert_called_once()
+                        granted = options.get('allow_vision', False)
+                        self.assertIs(create.call_args.kwargs['allow_vision'], granted)
+                        self.assertIsInstance(visual, ToolApplication)
+                        config = visual.state['config']
+                        self.assertIs(config['allow_vision'], granted)
+                        if granted:
+                            self.assertEqual(config['vision_connection']['profile'], 'visual')
+                            self.assertEqual(config['vision_connection']['settings']['model'], 'fixture-vision')
+                        else:
+                            self.assertIsNone(config['vision_connection'])
+                        self.assertFalse(config['allow_network'])
+                        self.assertFalse(config['allow_execution'])
+                        self.assertEqual(config['max_images'], 0)
+                        for resource, limit in visual_services.budget_limits.items():
+                            self.assertEqual(visual.ledger.remaining(resource), limit)
+                        self.assertEqual(visual.session.list_attempts(), ())
+                        self.assertEqual(visual.ledger.entries, ())
+                        restored = ToolApplication.load(root / label)
+                        self.assertIs(restored.state['config']['allow_vision'], granted)
+                        self.assertEqual(restored.state['config']['vision_connection'], config['vision_connection'])
+                for invalid in (None, 0, 1, 'true', 'false', [], {}):
+                    with self.subTest(allow_vision=invalid), patch.object(ToolApplication, 'create') as create, \
+                            patch.object(LLMClient, 'from_env') as connection:
+                        with self.assertRaisesRegex(ValueError, 'allow_vision must be a bool'):
+                            create_research_task(visual_brief, root=root / 'invalid-vision',
+                                model='profile:acceptance', allow_vision=invalid)
+                        create.assert_not_called()
+                        connection.assert_not_called()
+                        self.assertFalse((root / 'invalid-vision').exists())
                 calls.assert_not_called()
 
 

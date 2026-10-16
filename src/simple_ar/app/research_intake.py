@@ -24,6 +24,7 @@ class ResearchInputError(ValueError):
 
 def create_research_task(brief: ResearchBrief, *, root: str | Path, services: Any | None = None,
                          model: str | None = None,
+                         allow_vision: bool = False,
                          snapshot_sources: bool = False,
                          max_snapshot_bytes: int = 16 * 1024 * 1024):
     """Create a common task from public research inputs without running it.
@@ -31,7 +32,12 @@ def create_research_task(brief: ResearchBrief, *, root: str | Path, services: An
     This is an input projection, not another planner or lifecycle. Runtime
     clients/providers stay in memory; the native owner retains their identities,
     user obligations, selected evidence and the one resource ledger.
+    Image inspection requires explicit allow_vision=True; the native owner
+    validates its named vision route and charges the same model budget.
     """
+    if type(allow_vision) is not bool:
+        raise ValueError('allow_vision must be a bool')
+
     from simple_ar.app.research_application import ResearchApplicationServices
     from simple_ar.app.tool_application import ToolApplication
     from simple_ar.tools.sources import SourcePolicy
@@ -167,7 +173,7 @@ def create_research_task(brief: ResearchBrief, *, root: str | Path, services: An
     root = Path(root).expanduser().resolve()
     app = ToolApplication.create(root, (brief.objective or brief.request_text)
         + '\nOriginal user request and declared constraints:\n' + json.dumps(brief.to_dict(), ensure_ascii=False),
-        model=selected_model, sources=mounts,
+        model=selected_model, sources=mounts, allow_vision=allow_vision,
         allow_execution='experiments' in outputs or projection is not None,
         allow_network=policy.allow_network if projection is None or research_work else False, max_turns=(limits.get('llm_requests')
             if limits.get('llm_requests') is not None else 30 if selected_model is not None else 0),

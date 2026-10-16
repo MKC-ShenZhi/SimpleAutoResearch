@@ -42,6 +42,8 @@ restored = ToolApplication.load(Path("runs/evidence-note"))
 
 Creation validates inputs but makes no model or process calls. Omit `model` for caller-directed actions and later explicit supply; a declared report remains an obligation, not permission to invoke a model. `ResearchApplicationServices` supplies research settings and finite budgets. Put a declared command/condition set in `services.config["execution"]`; optional `code_task` uses the existing CodeTask configuration defaults, edit boundaries and independent validator. Paths resolve from `input_base_dir`, not the output task directory. Explicit zero allowances remain zero. Source aliases, environments and verified external baseline snapshots share the same compilation as CLI creation, rather than separate Python execution semantics.
 
+`create_research_task(..., allow_vision=True)` explicitly authorizes image inspection; the keyword defaults to `False` and accepts only a boolean. Request text and materials do not grant it. The existing owner still validates the named vision route and connection, and inspection uses the same request/token ledger supplied through `services.budget_limits`. This grants neither source network access nor image generation and does not change saved task permissions or the return type.
+
 For example, this creates a caller-directed measurement task without running it:
 
 ```python

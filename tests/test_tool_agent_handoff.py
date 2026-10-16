@@ -4259,6 +4259,100 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                         'completed' if mode in ('final_review', 'terminal_batch') else 'partial')
                 self.assertEqual(restored.ledger.to_dict(), before)
 
+    def test_native_last_decision_closes_or_preserves_unexecuted_work(self) -> None:
+        from simple_ar.integrations.llm import LLMClient, LLMSettings
+
+        for mode in ('unclosed', 'misordered', 'process', 'failed_process', 'question', 'v1', 'legacy'):
+            with self.subTest(mode=mode):
+                _, _, _, _, app, _ = self._native_fixture(mount_inputs=False, max_turns=1)
+                if mode in ('v1', 'legacy'):
+                    if mode == 'v1':
+                        app.state['config']['completion_policy'] = 'protected_decision.v1'
+                    else:
+                        app.state['config'].pop('completion_policy')
+                    app._save()
+                    app.supply(supply_id='keep-policy', reason='Explicit access supply, not a controller upgrade',
+                        changes={'allow_execution': True})
+                    self.assertEqual(app.state['config'].get('completion_policy'),
+                        'protected_decision.v1' if mode == 'v1' else None)
+                client = LLMClient(LLMSettings(api_key='fixture', model='fixture', api_mode='chat',
+                    retry_attempts=0, max_output_tokens=512))
+                def bound(attempt_id='', **_):
+                    return client.with_budget(app.ledger,
+                        session_id=app.session.manifest.session_id, attempt_id=attempt_id)
+                delivery = {'summary': 'Actual available result', 'artifacts': ['workspace/result.txt']}
+                if mode == 'question':
+                    message = self._native_message('ask_user', {'question': 'Confirm the reduced scope?'}, 'question')
+                elif mode in ('process', 'failed_process'):
+                    code = ("raise RuntimeError('real failure')" if mode == 'failed_process' else
+                        "from pathlib import Path; Path('result.txt').write_text('Actual result')")
+                    message = self._native_message('write_file', {
+                        'path': 'workspace/finish.py', 'content': code}, 'prepare')
+                    message['tool_calls'] += self._native_message('run_process', {
+                        'argv': ['python', 'finish.py'], 'timeout_sec': 3,
+                        'delivery': delivery}, 'finish')['tool_calls']
+                else:
+                    message = self._native_message('write_file', {
+                        'path': 'workspace/result.txt', 'content': 'Not verified'}, 'ordinary')
+                    if mode == 'misordered':
+                        message['tool_calls'] = self._native_message('deliver_result',
+                            delivery, 'premature')['tool_calls'] + message['tool_calls']
+                seen = []
+                def provider(api_mode, request, **_):
+                    seen.append(request)
+                    closing = any('last affordable decision' in str(row.get('content', ''))
+                        for row in request['messages'])
+                    self.assertEqual(closing, mode not in ('v1', 'legacy'))
+                    context = json.loads(request['messages'][1]['content'])['resources']
+                    self.assertEqual(context['decision_budget']['provider_slots_after_one_attempt'], 0)
+                    self.assertNotIn('protected_followup_requests', context['decision_budget'])
+                    self.assertEqual(context['decision_budget']['closing_required'], closing)
+                    receipt_path = 'attempts/native-turn-0001/decision_budget.json'
+                    if mode != 'legacy':
+                        receipt = app.session.store.read_json(receipt_path)
+                        self.assertEqual(receipt['closing_required'], closing)
+                        self.assertEqual(receipt['estimated_followup_tokens'],
+                            app._decision_tokens(client, request['messages']))
+                    else:
+                        self.assertFalse(app.session.store.exists(receipt_path))
+                    return {'choices': [{'message': message}], 'usage': {
+                        'prompt_tokens': 100, 'completion_tokens': 10, 'total_tokens': 110}}
+                with patch.object(app, '_client', side_effect=bound), patch(
+                        'simple_ar.integrations.llm._call_openai_sdk', side_effect=provider):
+                    status = app.run(progress=lambda _: None)
+                    if mode in ('process', 'failed_process'):
+                        self.assertIn('approval', status['status_reason'])
+                        self.assertEqual(app.ledger.remaining('process_invocations'), app.ledger.limits['process_invocations'])
+                        token = app.approval_token(app.state['pending']['call'])
+                        restored = ToolApplication.load(app.session.store.root)
+                        with patch.object(restored, '_client', side_effect=bound):
+                            status = restored.run(approved_execution=token, progress=lambda _: None)
+                        app = restored
+                self.assertEqual(len(seen), 1)
+                self.assertEqual(app.ledger.remaining('llm_requests'), 0)
+                self.assertEqual(sum(e.status == 'unknown' for e in app.ledger.entries), 0)
+                self.assertIsNone(app.state['pending'])
+                self.assertEqual(app.session.store.exists('delivery.json'), mode == 'process')
+                self.assertEqual((app.workspace.workspace/'result.txt').is_file(), mode in ('process', 'v1', 'legacy'))
+                if mode in ('unclosed', 'misordered'):
+                    self.assertIn('Final decision requires', status['status_reason'])
+                    self.assertEqual(app.state['turns'][-1]['remaining'], [])
+                    self.assertTrue(app.session.store.exists('tools/cancelled/native-turn-0001-0.json'))
+                    self.assertFalse(app.session.list_attempts()[0].status == 'running')
+                if mode == 'process':
+                    self.assertEqual(status['status'], 'completed')
+                    self.assertEqual((app.workspace.workspace/'result.txt').read_text(), 'Actual result')
+                elif mode == 'question':
+                    self.assertEqual(status['status_reason'], 'Confirm the reduced scope?')
+                else:
+                    self.assertEqual(status['status'], 'paused')
+                ledger = app.ledger.to_dict()
+                restored = ToolApplication.load(app.session.store.root)
+                with patch.object(restored, '_client', side_effect=AssertionError('No decision replay')), \
+                        patch.object(restored.gateway, 'call', side_effect=AssertionError('No tool replay')):
+                    restored.run(progress=lambda _: None)
+                self.assertEqual(restored.ledger.to_dict(), ledger)
+
     def test_native_attempt_space_is_reserved_without_faking_a_terminal_result(self) -> None:
         for attempts in (1, 2, 3):
             with self.subTest(attempts=attempts):
