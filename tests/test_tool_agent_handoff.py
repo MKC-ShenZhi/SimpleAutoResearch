@@ -5021,8 +5021,9 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             owner.pending_decision()
         with self.assertRaises(ValueError):
             SourcePolicy.model_validate({'max_chunks': 0})
-        with self.assertRaises(ValueError):
-            SourcePolicy.model_validate({'providers': ['invented']})
+        # Provider identities are validated against the actual injected/default
+        # registry at dispatch, not a product-wide list of provider names.
+        self.assertEqual(SourcePolicy.model_validate({'providers': ['custom']}).providers, ('custom',))
 
     def test_fixed_comparison_design_binds_static_science_and_restored_acceptance(self) -> None:
         from simple_ar.tools.scientific import ScientificToolGateway, freeze_measurement_set, fixed_measurement_issues
@@ -5220,6 +5221,122 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         science._research_contract = lambda: accepted
         accepted['conditions'].pop()
         self.assertIn('fixed scientific', science.execution_issues()[0])
+
+    def test_source_runtime_registry_calls_real_custom_provider(self) -> None:
+        from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
+        from simple_ar.literature.models import Paper
+        from simple_ar.research.sources.base import SearchResponse
+        from simple_ar.research.sources.registry import SearchProviderRegistry
+        from simple_ar.tools.sources import SourcePolicy, SourceToolGateway
+
+        root, inputs, workspace = self._workspace_fixture()
+        calls = []
+        paper = Paper(id='custom-paper', title='Custom evidence', authors=[],
+            abstract='Provider excerpt', url='https://example.org/custom', source='user_catalog')
+
+        class Catalog:
+            source_name = 'user_catalog'
+
+            def search(self, request):
+                calls.append(request)
+                return SearchResponse(source=self.source_name, query=request.query, papers=[paper])
+
+        registry = SearchProviderRegistry({'user_catalog': Catalog})
+        workspace.mounts['records'] = root / 'attempts'
+        policy = SourcePolicy(queries=('methods',), providers=('user_catalog',), cache_enabled=False,
+            require_fulltext=False, allow_pdf_download=False)
+        with patch('simple_ar.tools.sources.default_search_provider_registry',
+                   side_effect=AssertionError('Injected registry must not fall back to builtins')):
+            owner = SourceToolGateway(root, workspace, workspace.ledger, policy=policy, registry=registry)
+            self.assertIs(owner.registry, registry)
+            result = owner.call('search_sources', {'query': 'methods', 'providers': ['user_catalog']},
+                identity='custom-search')
+        self.assertEqual(result.status, 'ok', result.error)
+        self.assertEqual([(call.query, call.max_results) for call in calls], [('methods', 5)])
+        self.assertEqual(result.data['papers'][0]['id'], paper.id)
+        saved = read_json(root / result.data['search_record'])
+        self.assertEqual(saved['responses'][0]['source'], 'user_catalog')
+        self.assertEqual(saved['papers'][0]['abstract'], paper.abstract)
+        self.assertEqual(saved['selected_paper_ids'], [paper.id])
+        context = CapabilityContext(ArtifactStore(root / 'attempts/custom-collection'),
+            AttemptManifest('custom-collection', capability='native_tool'))
+        collected = owner.execute_tool('research_collect', context,
+            {'operation': 'ingest', 'question': 'methods'})
+        self.assertEqual(collected.status, 'ok', collected.error)
+        bundle = context.store.read_json('document_bundle.json')
+        self.assertTrue(bundle['documents'])
+        self.assertIn(paper.abstract, json.dumps(bundle['chunks']))
+        self.assertNotIn('registry', policy.model_dump(mode='json'))
+        # Injection does not grant access to material outside workspace mounts.
+        with self.assertRaises(ValueError):
+            SourceToolGateway(root, workspace, workspace.ledger, registry=registry,
+                policy=SourcePolicy(materials=('unmounted/private.txt',)))
+
+    def test_source_runtime_registry_rejects_before_dispatch_or_task_mutation(self) -> None:
+        from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
+        from simple_ar.research.sources.registry import SearchProviderRegistry
+        from simple_ar.tools.sources import SourcePolicy, SourceToolGateway
+
+        root, inputs, workspace = self._workspace_fixture()
+        policy = SourcePolicy(queries=('methods',), providers=('user_catalog',), cache_enabled=False)
+        # A restart restores the JSON policy, but main supplies an empty registry
+        # when its saved custom runtime dependency is unavailable.
+        restored_policy = SourcePolicy.model_validate_json(policy.model_dump_json())
+        context = CapabilityContext(ArtifactStore(root / 'attempts/missing-provider'),
+            AttemptManifest('missing-provider', capability='native_tool'))
+        before = {path: path.read_bytes() for path in root.rglob('*') if path.is_file()}
+        ledger_before = workspace.ledger.to_dict()
+        for registry, requested, error in (
+                (SearchProviderRegistry(), 'user_catalog', 'Unknown search provider'),
+                (SearchProviderRegistry({'web': Mock()}), 'web', 'exceed source policy')):
+            with self.subTest(provider=requested), patch(
+                    'simple_ar.tools.sources.default_search_provider_registry') as no_default, patch.object(
+                    registry, 'resolve', side_effect=AssertionError('Must reject before resolver')) as no_resolve, patch(
+                    'simple_ar.tools.sources.search_sources') as no_search:
+                owner = SourceToolGateway(root, workspace, workspace.ledger,
+                    policy=restored_policy, registry=registry)
+                self.assertIs(owner.registry, registry)
+                result = owner.call('search_sources', {'query': 'methods', 'providers': [requested]},
+                    identity='missing-search')
+                self.assertEqual(result.status, 'blocked')
+                self.assertIn(error, result.error)
+                collected = owner.execute_tool('research_collect', context,
+                    {'operation': 'ingest', 'question': 'methods'})
+                self.assertEqual(collected.status, 'blocked')
+                self.assertIn('Unknown search provider', collected.error)
+                no_default.assert_not_called()
+                no_resolve.assert_not_called()
+                no_search.assert_not_called()
+            self.assertEqual(workspace.ledger.to_dict(), ledger_before)
+            self.assertEqual({path: path.read_bytes() for path in root.rglob('*') if path.is_file()}, before)
+
+    def test_source_runtime_registry_does_not_grant_network_permission(self) -> None:
+        from simple_ar.research.sources.registry import SearchProviderRegistry
+        from simple_ar.tools.permissions import ToolPermissionPolicy
+        from simple_ar.tools.registry import ToolRegistry
+        from simple_ar.tools.sources import SourcePolicy, SourceToolGateway, source_tool_specs
+
+        root, inputs, workspace = self._workspace_fixture()
+        for provider in ('offline_catalog', 'local_files'):
+            with self.subTest(provider=provider):
+                factory = Mock(side_effect=AssertionError('Permission must precede provider construction'))
+                registry = SearchProviderRegistry({provider: factory})
+                owner = SourceToolGateway(root, workspace, workspace.ledger, registry=registry,
+                    policy=SourcePolicy(providers=(provider,), allow_network=False))
+                arguments = {'query': 'methods', 'providers': [provider]}
+                denied = owner.call('search_sources', arguments, identity='policy-denied')
+                self.assertEqual(denied.status, 'blocked')
+                self.assertIn('denies network', denied.error)
+                owner = SourceToolGateway(root, workspace, workspace.ledger, registry=registry,
+                    policy=SourcePolicy(providers=(provider,), allow_network=True))
+                tools = ToolRegistry()
+                tools.register_many(source_tool_specs())
+                gateway = CommonToolGateway(root, registry=tools, policy=ToolPermissionPolicy.read_only(),
+                    domain_gateways={'sources': owner})
+                denied = _call_tool(gateway, 'search_sources', arguments, identity='permission-denied')
+                self.assertEqual(denied.status, 'blocked')
+                factory.assert_not_called()
+        self.assertEqual(workspace.ledger.entries, ())
 
     def test_source_search_and_local_passages_preserve_original_identity(self) -> None:
         run_dir, inputs, fake, binding, resumed, code = self._native_fixture(allow_network=True)

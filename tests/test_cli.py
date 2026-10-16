@@ -1038,9 +1038,8 @@ code = "daily"
             self.assertIn("Historical budget: unknown_not_imported", stdout.getvalue())
             manifest = ArtifactStore(successor).read_json("session_manifest.json")
             self.assertEqual(manifest["parent_session"], "legacy-cli-session")
-            self.assertTrue(
-                (successor / "compatibility" / "imported" / "01-search.json").is_file()
-            )
+            migration = ArtifactStore(successor).read_json(manifest['state_refs']['legacy_import']['path'])
+            self.assertTrue((successor / migration['imported'][0]['destination_ref']['path']).is_file())
 
     def test_code_task_execute_messages_use_shared_rich_styles(self) -> None:
         self.assertEqual(style_progress_message("LLM usage greenfield-file-main.py: 1 input"), "gold1")

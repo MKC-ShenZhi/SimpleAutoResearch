@@ -27,12 +27,9 @@ from simple_ar.research.contracts import DocumentRecord, SourcePlan
 from simple_ar.research.documents.ingest import DocumentBundle, build_document_bundle
 from simple_ar.research.store.retrieval import rank_source_chunks, source_chunk_views
 from simple_ar.research.preparation_assets import validate_public_url
-from simple_ar.research.sources.capability import SearchRequest, SearchResult, SearchSelectionPolicy, search_sources
-from simple_ar.research.sources.registry import default_search_provider_registry
+from simple_ar.research.sources.capability import SearchRequest, SearchResult, SearchSelectionPolicy, search_sources, select_search_result
+from simple_ar.research.sources.registry import SearchProviderRegistry, default_search_provider_registry
 from simple_ar.tools.specs import CommonToolSpec, ToolResult
-
-
-Provider = Literal['arxiv', 'openalex', 'semantic_scholar', 'web', 'local_files']
 
 
 class SourcePolicy(BaseModel):
@@ -47,11 +44,11 @@ class SourcePolicy(BaseModel):
     """
     model_config = ConfigDict(extra='forbid', strict=True, frozen=True)
     queries: tuple[str, ...] = ()
-    providers: tuple[Provider, ...] = ('arxiv', 'openalex', 'semantic_scholar', 'web')
+    providers: tuple[str, ...] = ('arxiv', 'openalex', 'semantic_scholar', 'web')
     materials: tuple[str, ...] = ()
     max_results: int = Field(default=5, ge=1, le=1000)
     max_documents: int = Field(default=20, ge=1, le=1000)
-    max_chunks: int = Field(default=80, ge=1, le=10000)
+    max_chunks: int | None = Field(default=80, ge=1, le=10000)
     idea_limit: int = Field(default=3, ge=1, le=20)
     cache_enabled: bool = True
     cache_dir: str | None = None
@@ -127,7 +124,7 @@ class _Research(BaseModel):
 class _Search(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     query: str = Field(min_length=1, max_length=2000)
-    providers: list[Provider] = Field(
+    providers: list[str] = Field(
         default_factory=lambda: ["arxiv", "openalex"], min_length=1, max_length=5)
     max_results: int = Field(default=5, ge=1, le=1000)
 
@@ -200,6 +197,7 @@ class SourceToolGateway:
 
     def __init__(self, root: Path, workspace: Any, ledger: BudgetLedger, *,
                  policy: SourcePolicy | dict[str, Any] | None = None,
+                 registry: SearchProviderRegistry | None = None,
                  client_factory: Callable[[str], Any] | None = None,
                  feasibility_client_factory: Callable[[str], Any] | None = None,
                  execution_contract: dict[str, Any] | None = None) -> None:
@@ -212,8 +210,12 @@ class SourceToolGateway:
         self._caller_contract_snapshot = (self._protocol_bytes(execution_contract)
             if execution_contract is not None else None)
         self._caller_policy_snapshot = self._protocol_bytes(self.policy.model_dump(mode='json'))
-        self.registry = default_search_provider_registry(local_documents=[str(path)
-            for path in self._material_paths(list(self.policy.materials))] if self.policy.materials else [])
+        materials = self._material_paths(list(self.policy.materials)) if self.policy.materials else []
+        # Runtime dependencies are never part of the persisted policy/binding.
+        # An explicitly empty registry must stay empty after a dependency is lost.
+        self._builtin_registry = registry is None
+        self.registry = (registry if registry is not None else
+            default_search_provider_registry(local_documents=[str(path) for path in materials]))
 
     context_tools = {'research', 'research_collect'}
 
@@ -243,7 +245,7 @@ class SourceToolGateway:
                         "retained_preview": source_chunk_views(bundle.chunks[:1], max_chars=1200),
                         "scope": "Source identity, retained coverage and a bounded retained-text preview; not full reading. Query passages for consequential claims. Supplied source metadata is not independently verified."})
                 selected = rank_source_chunks(bundle.chunks[:self.policy.max_chunks], request.query,
-                    limit=min(request.limit, self.policy.max_chunks))
+                    limit=min(request.limit, self.policy.max_chunks) if self.policy.max_chunks is not None else request.limit)
                 return ToolResult(tool_name=name, data={
                     **identity,
                     "matches": source_chunk_views(selected, query=request.query, max_chars=request.max_chars),
@@ -312,9 +314,10 @@ class SourceToolGateway:
             providers=tuple(dict.fromkeys(request.providers)), max_results_per_query=request.max_results,
             cache_dir=self._cache_dir(), cache_enabled=self.policy.cache_enabled,
             llm_client=client, problem_markdown=question,
-            research_plan_json=json.dumps(plan.to_handoff_dict()) if plan else '{}'), registry=self.registry,
-            selection_policy=SearchSelectionPolicy(topic=question, questions=plan.questions,
-                query_plan=plan.query_plan, max_documents=self.policy.max_documents) if plan else None)
+            research_plan_json=json.dumps(plan.to_handoff_dict()) if plan else '{}'), registry=self.registry)
+        result = (select_search_result(result, policy=SearchSelectionPolicy(topic=question, questions=plan.questions,
+            query_plan=plan.query_plan, max_documents=self.policy.max_documents)) if plan else
+            replace(result, selected_papers=tuple({paper.id: paper for paper in result.papers}.values())[:self.policy.max_documents]))
         write_json(directory / "search.json", result.to_handoff_dict())
         return {"status": result.status, "search_record": (directory / 'search.json').relative_to(self.root).as_posix(),
             "responses": result.to_dict()["responses"], "diagnostics": list(result.diagnostics),
@@ -351,12 +354,21 @@ class SourceToolGateway:
             cache_dir=self._cache_dir() or directory / 'raw', extraction_dir=directory / 'parsed',
             max_chunks=self.policy.max_chunks)
 
-    def _validate_search(self, request: _Search) -> None:
-        if not self.policy.allow_network and set(request.providers) != {'local_files'}:
+    def _validate_providers(self, providers: list[str] | tuple[str, ...]) -> None:
+        # Source-network authority is independent of a connector's name or IO.
+        if not self.policy.allow_network and not (self._builtin_registry and set(providers) == {'local_files'}):
             raise ValueError('Source policy denies network search')
+        if not set(providers) <= set(self.policy.providers):
+            raise ValueError('Search providers/results exceed source policy')
+        unknown = set(providers) - set(self.registry.names())
+        if unknown:
+            raise ValueError('Unknown search provider: ' + ', '.join(sorted(unknown)))
+
+    def _validate_search(self, request: _Search) -> None:
+        self._validate_providers(request.providers)
         if self.policy.queries and request.query not in self.policy.queries:
             raise ValueError('Query is outside the exact source policy')
-        if not set(request.providers) <= set(self.policy.providers) or request.max_results > self.policy.max_results:
+        if request.max_results > self.policy.max_results:
             raise ValueError('Search providers/results exceed source policy')
 
     @staticmethod
@@ -430,6 +442,10 @@ class SourceToolGateway:
                 if any(self._digest(Path(path)) != digest for path, digest in saved['hashes'].items()):
                     raise ValueError('Research result artifact changed')
                 return ToolResult.model_validate(saved['result'])
+            if network and not paths and not request.document_record:
+                # Reject missing runtime services before writing an attempt or
+                # reserving budget; saved evidence remains available for replay.
+                self._validate_providers(self.policy.providers)
             context.store.write_json('source_request.json', binding, kind='source_request')
             if inventory:
                 context.store.write_json('source_inventory.json', inventory, kind='source_inventory')

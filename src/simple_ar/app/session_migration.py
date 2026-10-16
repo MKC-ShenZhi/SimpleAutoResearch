@@ -1,7 +1,7 @@
 """Small compatibility boundary for creating a canonical successor session.
 
 The importer intentionally does not translate an old session into new stage
-state.  It reads a legacy manifest, creates a fresh ``ResearchApplication``
+state.  It reads a legacy manifest, creates a fresh common-tool
 session, and optionally copies explicitly selected small artifacts as evidence
 of what was carried forward.  The legacy directory is never modified.
 """
@@ -12,17 +12,13 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 import hashlib
 from pathlib import Path
-import re
-import shutil
 from typing import Any
 
 from simple_ar.core import ArtifactRef, ArtifactStore, SessionManifest
 from simple_ar.research.workflow_contracts import ResearchBrief
 
-from .research_application import (
-    ResearchApplication,
-    ResearchApplicationServices,
-)
+from .research_application import ResearchApplicationServices
+from .research_intake import create_research_task
 
 
 _DEFAULT_OUTPUTS = ("research_summary",)
@@ -107,7 +103,7 @@ def import_legacy_session(
 
     Only state references named by ``artifact_names`` are copied.  Copies are
     limited to regular files within the old session and are recorded under
-    ``compatibility/imported`` in the new session.  Unknown or unavailable
+    the common owner's retained evidence inputs. Unknown or unavailable
     state is recorded as skipped rather than represented by a misleading
     canonical reference.
     """
@@ -144,17 +140,21 @@ def import_legacy_session(
         legacy_manifest,
         requested_outputs=requested_outputs,
     )
-    application = ResearchApplication.create(brief, root=destination, services=services)
+    selected_paths = list(dict.fromkeys(path for _, _, path in plans))
+    brief = replace(brief, asset_requests=tuple({'locator': str(path), 'role': 'material',
+        'kind': 'file', 'mutability': 'read_only', 'allowed_uses': ['read', 'reference']}
+        for path in selected_paths))
+    application = create_research_task(brief, root=destination, services=services,
+        snapshot_sources=True, max_snapshot_bytes=max_artifact_bytes)
+    controller = application.session
 
     imported: list[LegacyArtifactMapping] = []
-    for index, (name, source_ref, source_path) in enumerate(plans, start=1):
-        suffix = source_path.suffix.lower()
-        filename = f"{index:02d}-{_safe_name(name)}{suffix}"
-        relative_path = Path("compatibility") / "imported" / filename
-        destination_path = application.controller.store.root / relative_path
-        destination_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source_path, destination_path)
-        destination_ref = application.controller.store.ref(
+    for name, source_ref, source_path in plans:
+        # The common owner copied and bounded these bytes before returning;
+        # this importer records provenance, never a second copy or live mount.
+        destination_path = Path(application.state['config']['sources'][f'source{selected_paths.index(source_path)}'])
+        relative_path = destination_path.relative_to(controller.store.root)
+        destination_ref = controller.store.ref(
             relative_path,
             kind="legacy_import",
             schema=source_ref.schema,
@@ -165,14 +165,14 @@ def import_legacy_session(
                 name=name,
                 source_ref=source_ref,
                 destination_ref=destination_ref,
-                size_bytes=source_path.stat().st_size,
-                sha256=_sha256(source_path),
+                size_bytes=destination_path.stat().st_size,
+                sha256=_sha256(destination_path),
             )
         )
 
     migration_ref: ArtifactRef
-    with application.controller.mutation_scope():
-        migration_ref = application.controller.store.write_json(
+    with controller.mutation_scope():
+        migration_ref = controller.store.write_json(
             "compatibility/session_migration.json",
             {
                 "schema_version": "session_migration.v1",
@@ -180,7 +180,7 @@ def import_legacy_session(
                 "source_manifest_schema": "session_manifest.v1",
                 "source_status": legacy_manifest.status,
                 "parent_session": legacy_manifest.session_id,
-                "destination_session": application.controller.manifest.session_id,
+                "destination_session": controller.manifest.session_id,
                 "imported": [item.to_dict() for item in imported],
                 "skipped": [item.to_dict() for item in skipped],
                 "brief_source": brief_source,
@@ -191,15 +191,15 @@ def import_legacy_session(
             schema="session_migration.v1",
             producer="session_migration",
         )
-        application.controller.manifest.parent_session = legacy_manifest.session_id
-        application.controller.manifest.state_refs["legacy_import"] = migration_ref
-        application.controller.save()
+        controller.manifest.parent_session = legacy_manifest.session_id
+        controller.manifest.state_refs["legacy_import"] = migration_ref
+        controller.save()
 
     return SessionMigrationResult(
         source_root=source,
         destination_root=destination,
         parent_session=legacy_manifest.session_id,
-        destination_session=application.controller.manifest.session_id,
+        destination_session=controller.manifest.session_id,
         migration_ref=migration_ref,
         imported=tuple(imported),
         skipped=tuple(skipped),
@@ -310,11 +310,6 @@ def _successor_brief(
         ),
         "manifest_topic",
     )
-
-
-def _safe_name(value: str) -> str:
-    result = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-._")
-    return result or "artifact"
 
 
 def _sha256(path: Path) -> str:

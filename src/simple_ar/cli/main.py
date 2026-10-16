@@ -1045,6 +1045,7 @@ def _print_research_session_migrate(args: argparse.Namespace) -> None:
     print_line(f"Imported artifacts: {len(result.imported)}")
     print_line(f"Skipped artifacts: {len(result.skipped)}")
     print_line(f"Historical budget: {result.budget_status}")
+    print_line(f'Resume: simple-ar start --resume-task "{result.destination_root}"')
 
 
 def _optional_research_llm_client(

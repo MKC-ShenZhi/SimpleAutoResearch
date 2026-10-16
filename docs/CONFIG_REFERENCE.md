@@ -20,6 +20,32 @@ Ordinary `start`, `--guided` and outcome preferences save a native session, not 
 
 Structured precedence is defaults → TOML → explicit CLI. CLI lists replace file lists. Research paths resolve from the TOML directory; argv stays literal. Protocol protected paths use execution cwd. CodeTask retains separate [loading rules](#loading-rules). Native access/resource changes use explicit continuation controls rather than ordinary overrides.
 
+### Python task creation
+
+Structured research, writing and table inputs can use the same creation owner as the CLI:
+
+```python
+from pathlib import Path
+from simple_ar.app.research_intake import create_research_task
+from simple_ar.app.tool_application import ToolApplication
+from simple_ar.research.workflow_contracts import ResearchBrief
+
+app = create_research_task(
+    ResearchBrief(request_text="Explain the evidence and its limits.",
+        requested_outputs=("summary",),
+        asset_requests=({"locator": "notes.md", "role": "material"},)),
+    root=Path("runs/evidence-note"), model="route:default",
+)
+app.run(progress=print)
+restored = ToolApplication.load(Path("runs/evidence-note"))
+```
+
+Creation validates inputs but makes no model or process calls. Omit `model` for caller-directed actions and later explicit supply; a declared report remains an obligation, not permission to invoke a model. `ResearchApplicationServices` supplies research settings and finite budgets. Unsupported legacy execution/revision controls are rejected before creation, not silently dropped; the old application APIs remain available for their existing contracts and historical continuation.
+
+For trusted Python integrations, services may inject a text client, independent reviewer and `SearchProviderRegistry`. Clients must implement `with_budget` and `ask_json` or `chat_turn`, binding the task's actual ledger, session and attempt. Reload with `ToolApplication.load(path, services=services)` before further service work. Only type/model identities and provider names are retained—not credentials or executable objects. Missing dependencies do not fall back to environment clients or built-in providers. Custom implementations remain caller-trusted, not sandboxed or independently identity-verified. Named connections are preferable for CLI/restart portability; `model="env"` selects the configured default, not a literal provider model called `env`.
+
+`snapshot_sources=True` retains only selected regular files, each bounded by `max_snapshot_bytes` (default 16 MiB); it does not copy a whole directory. Hashes bind retained bytes. Legacy v1 import uses these copies, preserves the parent link and original files, and records `unknown_not_imported` for historical budget rather than importing or resetting it. Continue the new task with `start --resume-task`; the original task still uses its original recovery contract.
+
 ### Named model connections
 
 Load one catalog from an explicit catalog path where offered, `SIMPLE_AR_MODELS_CONFIG`, or `~/.config/simple-ar/models.toml`. Catalogs are not merged. `models --config PATH` inspects that file without activating it for later commands. `start`, `models` and the client load current-directory `.env` without replacing existing environment variables.

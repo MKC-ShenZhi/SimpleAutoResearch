@@ -20,6 +20,32 @@
 
 结构化优先级为默认值 → TOML → 明确 CLI，CLI 列表替换文件列表。研究路径相对 TOML 所在目录解析，命令 argv 保持字面含义；协议保护路径相对执行 cwd。CodeTask 使用独立的[加载规则](#加载规则)。原生追加访问或资源须走明确续接参数。
 
+### Python 创建任务
+
+结构化调研、材料写作和表格输入可与 CLI 共用创建所有者：
+
+```python
+from pathlib import Path
+from simple_ar.app.research_intake import create_research_task
+from simple_ar.app.tool_application import ToolApplication
+from simple_ar.research.workflow_contracts import ResearchBrief
+
+app = create_research_task(
+    ResearchBrief(request_text="解释材料中的证据及其限制。",
+        requested_outputs=("summary",),
+        asset_requests=({"locator": "notes.md", "role": "material"},)),
+    root=Path("runs/evidence-note"), model="route:default",
+)
+app.run(progress=print)
+restored = ToolApplication.load(Path("runs/evidence-note"))
+```
+
+创建只校验输入，不调用模型或进程。不传 `model` 时由调用方提供动作，后续可明确补齐条件；声明报告只是保留交付义务，不授权调用模型。`ResearchApplicationServices` 提供研究设置及有限预算。不支持的旧执行或修订控制在创建前拒绝，不静默丢弃；旧应用 API 仍承接其已有合同及历史继续。
+
+可信 Python 集成可通过 services 注入文本客户端、独立审阅客户端和 `SearchProviderRegistry`。客户端须实现 `with_budget` 及 `ask_json` 或 `chat_turn`，绑定任务实际账本、会话与 attempt。继续服务工作前，用 `ToolApplication.load(path, services=services)` 恢复依赖。持久化只保留类型/模型身份和 provider 名称，不保存密钥或可执行对象；缺失依赖不会回退环境客户端或内置检索器。自定义实现由调用方信任，不是安全沙箱，也不独立验证实现身份。需跨 CLI/重启使用时，优先命名连接；`model="env"` 表示配置的默认模型，不是名为 env 的服务商模型。
+
+`snapshot_sources=True` 只复制明确选中的普通文件，每个受 `max_snapshot_bytes` 限制（默认 16 MiB），不复制整个目录；哈希绑定保留字节。旧 v1 导入共用这些副本，保留父任务关系与原文件，历史预算标为 `unknown_not_imported`，不导入或清零。新任务沿 `start --resume-task` 继续，原任务仍按原合同恢复。
+
 ### 命名模型连接
 
 一次读取一份模型 TOML，不合并多份文件。支持配置路径参数的命令可显式指定文件；否则使用 `SIMPLE_AR_MODELS_CONFIG`，再查找 `~/.config/simple-ar/models.toml`。`models --config PATH` 只检查该文件，不会替后续命令启用它。

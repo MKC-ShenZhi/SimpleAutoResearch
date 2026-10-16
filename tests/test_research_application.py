@@ -1537,7 +1537,7 @@ class ResearchApplicationTests(unittest.TestCase):
             frozen = read_json(code_task_paths(code_run).task_dir / "research_handoff.json")
             implementation_task = (code_task_paths(code_run).task_dir / "task.md").read_text(encoding="utf-8")
             self.assertIn("Implementation-only CodeTask", implementation_task)
-            self.assertIn("outer ResearchApplication owns", implementation_task)
+            self.assertIn("owns literature review, experiment execution, result analysis", implementation_task)
             self.assertNotIn("complete academic Markdown paper", implementation_task)
             if paired:
                 self.assertEqual(len(frozen["consumed"]["paired_baselines"]), 2)

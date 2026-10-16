@@ -485,47 +485,44 @@ def migrate_structured_creation(args: argparse.Namespace, *, request: str, outpu
                                 report_config: dict, writing_method: str | None,
                                 data_analysis: dict | None, review_model: str | None = None) -> None:
     """Project domain contracts into one task; modules own their local work."""
-    from simple_ar.app.tool_application import ToolApplication
+    from simple_ar.app.research_application import ResearchApplicationServices
+    from simple_ar.app.research_intake import create_research_task
+    from simple_ar.research.workflow_contracts import ResearchBrief
     from simple_ar.cli.main import _render_native_result, _ensure_research_cli_success
-    from simple_ar.cli.parser import build_parser
-    from simple_ar.tools.writing import freeze_report_requirement
-    native = build_parser().parse_args(['start'])
-    native.model = args.model if data_analysis is None or 'report' in outputs else None
-    if 'experiments' in outputs and not native.model:
-        raise ValueError('Open-ended experiments require a model or an explicitly prepared execution command')
-    native.source = [Path(row['locator']) for row in sources]
-    native.max_turns = limits.get('llm_requests') if limits.get('llm_requests') is not None else native.max_turns if native.model else 0
-    native.max_tokens = limits.get('total_tokens') if limits.get('total_tokens') is not None else native.max_tokens if native.model else 0
-    material_paths = _configure_research(native, args, sources=sources, research_config=research_config,
-        outputs=outputs, require_design='experiments' in outputs, review_model=review_model,
-        online=data_analysis is None and args.task_kind != 'writing')
-    policy = native._research_policy
-    online = native.allow_network
-    native.allow_execution = 'experiments' in outputs
-    native._report_requirement = freeze_report_requirement(report_config, method=writing_method) if 'report' in outputs else None
-    native._task_output_limit = getattr(args, 'max_output_tokens', None) if native.model else None
-    native._task_attempt_limit = max(30, native.max_turns * 10)
-    source_count = max(1, len(args.queries or ())) * len(policy['providers'])
-    native._process_limits = {name: getattr(args, name, None) if getattr(args, name, None) is not None else default
-        for name, default in (('process_invocations', source_count * 4 if online else 0),
-                              ('process_wall_seconds', source_count * 120 if online else 0))}
-    aliases = {str(path.resolve()): f'source{index}' for index, path in enumerate(native.source)}
-    if data_analysis is not None:
-        source = aliases[str(Path(data_analysis['file']).resolve())]
-        native._table_analysis = {'path': source, 'spec': {key: value for key, value in data_analysis.items() if key != 'file'}}
-    request += '\nRequested deliverables: ' + ', '.join(outputs)
-    if sources:
-        request += '\nSupplied material roles (caller declarations, not verified facts):\n' + json.dumps([
-            {'path': aliases[str(Path(row['locator']).resolve())], 'role': row['role']} for row in sources], ensure_ascii=False)
-    app = ToolApplication.create(root, request, **native_creation_options(native))
+    model = args.model if data_analysis is None or 'report' in outputs else None
+    # CLI defaults remain CLI defaults. The common intake owns normalization,
+    # source aliases, report/table contracts and admission for all consumers.
+    config = dict(research_use_fulltext=False, research_allow_pdf_download=False,
+        research_keep_raw_pdf=False, research_max_pdf_mb=20, research_max_pdf_pages=100,
+        research_read_max_shortlist=args.max_results, research_max_iterations=0,
+        research_max_fulltext_documents=min(research_config.get('research_max_documents', args.max_results), args.max_results),
+        research_materials_only=data_analysis is not None or args.task_kind == 'writing')
+    config.update(research_config)
+    config.update(research_task_kind=args.task_kind, report=report_config,
+        report_writing_method=writing_method, data_analysis=data_analysis,
+        max_output_tokens=getattr(args, 'max_output_tokens', None) if model else None,
+        research_execution_boundary={'timeout_sec': args.timeout_sec if args.timeout_sec is not None else 300})
+    if review_model:
+        config['feasibility_review_model'] = review_model
+    budgets = {**limits, **{name: getattr(args, name, None)
+        for name in ('process_invocations', 'process_wall_seconds')}}
+    services = ResearchApplicationServices(max_results=args.max_results, max_chunks=args.max_chunks,
+        idea_limit=args.idea_limit, cache_dir=Path(args.cache_dir).resolve() if args.cache_dir else None,
+        input_base_dir=Path.cwd(), config=config, budget_limits=budgets,
+        max_attempts=max(30, (limits.get('llm_requests') if limits.get('llm_requests') is not None else 30 if model else 0) * 10),
+        max_no_progress=6)
+    app = create_research_task(ResearchBrief(request_text=request, objective=args.topic,
+        requested_outputs=outputs, asset_requests=sources), root=root, services=services, model=model)
+    saved = app.state['config']
     print_line(f'Structured inputs use the common task owner. Task session: {root}')
     print_line(f'Resume: simple-ar start --resume-task "{root}"')
-    if native.model:
+    if saved['model']:
         status = app.run(progress=print_line)
     else:
-        action = ({'tool_name': 'analyze_table', 'arguments': native._table_analysis} if data_analysis is not None else
-            {'tool_name': 'research_collect' if online else 'research', 'arguments': {
-                'operation': 'summary', 'question': args.topic, 'materials': material_paths, 'use_llm': False}})
+        action = ({'tool_name': 'analyze_table', 'arguments': saved['table_analysis']} if data_analysis is not None else
+            {'tool_name': 'research_collect' if saved['allow_network'] else 'research', 'arguments': {
+                'operation': 'summary', 'question': args.topic,
+                'materials': saved['research_policy']['materials'], 'use_llm': False}})
         status = app.run(actions=[action], progress=print_line)
         turn = app.state['turns'][-1]
         result = app.session.store.read_json(turn['tools'][-1]['result']) if turn['tools'] else {}

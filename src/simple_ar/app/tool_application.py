@@ -11,6 +11,7 @@ import json
 import math
 from pathlib import Path
 from typing import Any, Callable, Literal
+from types import SimpleNamespace
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -34,6 +35,7 @@ from simple_ar.tools.publication import PublicationToolGateway, publication_tool
 from simple_ar.tools.writing import BOUND_REPORT_REVISION, WritingToolGateway, writing_tool_specs
 from simple_ar.tools.implementation import ExactCodeTask, ImplementationToolGateway, implementation_tool_specs
 from simple_ar.tools.analysis import AnalysisToolGateway, analysis_tool_specs
+from simple_ar.research.sources import SearchProviderRegistry
 
 
 _CORE_COORDINATION = {'focus_work', 'load_tools', 'read_history'}
@@ -141,14 +143,85 @@ class _WorkPlan(BaseModel):
         return self
 
 
+class _RuntimeClientPort:
+    """Adapt an explicitly supplied JSON client, not a second decision loop."""
+    def __init__(self, client: Any, binding: dict[str, Any]) -> None:
+        self.client, self.binding = client, binding
+        self.model = binding['model']
+        self._settings = SimpleNamespace(api_mode='chat',
+            context_input_tokens=getattr(client, 'context_input_tokens', 16000))
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.client, name)
+
+    def connection_binding(self) -> dict[str, Any]:
+        return {}
+
+    def effective_output_limit(self) -> int | None:
+        method = getattr(self.client, 'effective_output_limit', None)
+        return method() if callable(method) else None
+
+    def with_output_limit(self, limit: int) -> _RuntimeClientPort:
+        method = getattr(self.client, 'with_output_limit', None)
+        if not callable(method):
+            raise ValueError('Injected client cannot honor an explicit output limit')
+        return _RuntimeClientPort(method(limit), self.binding)
+
+    def chat_turn(self, messages: list, *, tools: list, label: str, budget_call_id: str) -> dict:
+        native = getattr(self.client, 'chat_turn', None)
+        if callable(native):
+            return native(messages, tools=tools, label=label, budget_call_id=budget_call_id)
+        reply = self.client.ask_json('Choose the next action using only the supplied tool contracts. '
+            'Return an assistant message object with role, content and tool_calls; each call must have '
+            'a unique id, type="function", and function {name, arguments}, where arguments is a JSON string. '
+            'Do not claim an operation ran before receiving its tool result.',
+            json.dumps({'messages': messages, 'tools': tools}, ensure_ascii=False),
+            label=label, budget_call_id=budget_call_id)
+        if not isinstance(reply, dict) or reply.get('role', 'assistant') != 'assistant':
+            raise ValueError('Injected JSON client must return an assistant tool-call message')
+        return {'role': 'assistant', 'content': reply.get('content'), 'tool_calls': reply.get('tool_calls', [])}
+
+
+def _runtime_bindings(services: Any | None) -> dict[str, Any]:
+    """Persist identities only; never objects, credentials or registry factories."""
+    bindings = {}
+    for name in ('llm_client', 'feasibility_llm_client'):
+        client = getattr(services, name, None)
+        if client is None:
+            continue
+        if not callable(getattr(client, 'with_budget', None)) or not (
+                callable(getattr(client, 'ask_json', None)) or callable(getattr(client, 'chat_turn', None))):
+            raise ValueError('Injected clients require with_budget and ask_json or chat_turn')
+        model = getattr(client, 'model', type(client).__qualname__)
+        if not isinstance(model, str) or not model.strip():
+            raise ValueError('Injected client model identity must be a nonempty string')
+        if not isinstance(client, LLMClient) and (type(getattr(client, 'context_input_tokens', 16000)) is not int
+                or getattr(client, 'context_input_tokens', 16000) < 1):
+            raise ValueError('Injected client context_input_tokens must be positive')
+        bindings[name] = {'type': type(client).__module__ + '.' + type(client).__qualname__, 'model': model}
+        if isinstance(client, LLMClient):
+            bindings[name]['connection'] = client.connection_binding() or {
+                'settings': {key: getattr(client._settings, key) for key in ('model', 'base_url', 'api_mode')}}
+    registry = getattr(services, 'search_registry', None)
+    if registry is not None:
+        bindings['search_registry'] = list(registry.names())
+    return bindings
+
+
 class ToolApplication:
     RECIPE = "native-tools-v1"
 
-    def __init__(self, controller: SessionController) -> None:
+    def __init__(self, controller: SessionController, *, services: Any | None = None) -> None:
         self.session = controller
+        self.services = services
         if controller.manifest.transition_recipe != self.RECIPE:
             raise ValueError("This is not a native-tool session; use its original resume command")
         self.state = controller.store.read_json("actions.json")
+        declared = self.state['config'].get('runtime_dependencies', {})
+        if services is not None:
+            supplied = _runtime_bindings(services)
+            if any(name not in declared or binding != declared[name] for name, binding in supplied.items()):
+                raise ValueError('Injected runtime dependency differs from the saved task; no silent replacement')
         self.ledger = BudgetLedger.load(controller.store.root / "budget_ledger.json")
         self._configure_tools()
         controller.registry.register("native_turn", self._model)
@@ -157,6 +230,11 @@ class ToolApplication:
     def _configure_tools(self) -> None:
         controller = self.session
         config = self.state["config"]
+        for alias, snapshot in config.get('source_snapshots', {}).items():
+            path = Path(config['sources'][alias])
+            if (not path.is_file() or path.stat().st_size != snapshot['size_bytes']
+                    or hashlib.sha256(path.read_bytes()).hexdigest() != snapshot['sha256']):
+                raise ValueError('Retained source snapshot changed: ' + alias)
         if config.get('tool_contracts', 'full') not in {'full', 'on_demand'}:
             raise ValueError('Unknown saved tool-contract mode; do not silently change historical tasks')
         evidence = controller.store.root / "evidence"
@@ -240,7 +318,11 @@ class ToolApplication:
             execution_contract=config.get('execution_contract'),
             client_factory=(lambda identity: self._client(identity, purpose='task', native=False))
                 if config['model'] is not None else None,
-            feasibility_client_factory=self._feasibility_client)
+            feasibility_client_factory=self._feasibility_client,
+            registry=(getattr(self.services, 'search_registry', None)
+                if getattr(self.services, 'search_registry', None) is not None else
+                SearchProviderRegistry()
+                if 'search_registry' in config.get('runtime_dependencies', {}) else None))
         self.gateway = CommonToolGateway(controller.store.root, registry=registry,
             policy=ToolPermissionPolicy(allowed_permissions=permissions, max_risk_level="high",
                 blocked_tools=blocked),
@@ -428,6 +510,9 @@ class ToolApplication:
                max_attempts: int | None = None,
                source_operations: int | None = None,
                execution_contract: dict[str, Any] | None = None,
+               services: Any | None = None,
+               snapshot_sources: bool = False,
+               max_snapshot_bytes: int = 16 * 1024 * 1024,
                retained: bool = False) -> tuple[dict[str, Any], list, dict[str, Any], int]:
         """Validate caller contracts before creation or supply; never execute or persist."""
         if (not goal.strip() or max_images < 0 or
@@ -438,7 +523,7 @@ class ToolApplication:
         if type(max_turns) is not int or type(max_tokens) is not int or max_turns < 0 or max_tokens < 0:
             raise ValueError('Finite nonnegative model resource allowances are required')
         if model is None and (allow_vision or max_images
-                or code_task is not None or report_requirement is not None or max_output_tokens is not None):
+                or code_task is not None or max_output_tokens is not None):
             raise ValueError('A caller-directed task cannot authorize a model-owned contract')
         attempt_limit = max_attempts if max_attempts is not None else max_turns * 10
         if type(attempt_limit) is not int or attempt_limit < 1:
@@ -455,6 +540,9 @@ class ToolApplication:
                 or ('process_invocations' in process_limits and type(process_limits['process_invocations']) is not int)):
             raise ValueError('Process limits require finite nonnegative counts/wall seconds; zero is not omission')
         mounts = {}
+        snapshots = []
+        if type(snapshot_sources) is not bool or type(max_snapshot_bytes) is not int or max_snapshot_bytes < 1:
+            raise ValueError('Source snapshots require a boolean choice and positive byte bound')
         if project_python is not None:
             project_python = project_python.expanduser().absolute()
             if not project_python.is_file():
@@ -464,6 +552,14 @@ class ToolApplication:
                 raise ValueError("Invalid or reserved source alias")
             path = resolve_source_mount(path)
             mounts[name] = str(path)
+            if snapshot_sources:
+                if not path.is_file() or path.stat().st_size > max_snapshot_bytes:
+                    raise ValueError('Snapshot sources must be explicitly selected bounded regular files')
+                with path.open('rb') as stream:
+                    content = stream.read(max_snapshot_bytes + 1)
+                if len(content) > max_snapshot_bytes:
+                    raise ValueError('Snapshot source grew beyond its declared bound')
+                snapshots.append((name, path, content))
         # A reused result is retained user evidence, not a new physical run.
         # Validate every declared slot before creating the session, then bind
         # the original bytes into the existing read-only evidence mount.
@@ -542,13 +638,29 @@ class ToolApplication:
             from simple_ar.tools.writing import validate_report_requirement
             report_requirement = validate_report_requirement(report_requirement)
         # Preflight connection/protocol before creating a session or making a call.
-        client = LLMClient.from_env(model) if model is not None else None
+        dependencies = _runtime_bindings(services)
+        client = getattr(services, 'llm_client', None)
+        if client is not None and model is None:
+            raise ValueError('An injected model still requires explicit model resource authorization')
+        if client is None:
+            client = LLMClient.from_env(None if model == 'env' else model) if model is not None else None
+        if 'llm_client' in dependencies and allow_vision:
+            raise ValueError('Injected text clients do not authorize a named vision route')
+        if research_policy is not None and getattr(services, 'search_registry', None) is not None:
+            if missing := set(research_policy['providers']) - set(services.search_registry.names()):
+                raise ValueError('Injected registry lacks declared providers: ' + ', '.join(sorted(missing)))
         if max_output_tokens is not None:
-            client.with_output_limit(max_output_tokens)  # Validate before session mutation.
-        if client is not None and client._settings.api_mode != "chat":
+            limiter = getattr(client, 'with_output_limit', None)
+            if not callable(limiter):
+                raise ValueError('Injected client cannot honor an explicit output limit')
+            limiter(max_output_tokens)  # Validate before session mutation.
+        named_client = client is not None and ('llm_client' not in dependencies or isinstance(client, LLMClient))
+        if named_client and client._settings.api_mode != "chat":
             raise ValueError("Native tools currently require a named Chat connection; no protocol fallback")
         feasibility_connection = None
         if research_policy and research_policy.get('feasibility_connection'):
+            if 'feasibility_llm_client' in dependencies:
+                raise ValueError('Choose a named feasibility connection or an injected reviewer, not both')
             if client is None:
                 raise ValueError('Independent feasibility review requires model authorization')
             feasibility_connection = LLMClient.from_env(research_policy['feasibility_connection']).connection_binding()
@@ -564,13 +676,14 @@ class ToolApplication:
             profile.credential()
             profile.resolve_proxy()
         config = {"model": model,
-            "model_connection": client.connection_binding() if client is not None else None,
+            "model_connection": client.connection_binding() if named_client else None,
             "vision_connection": vision_connection,
             "project_python": str(project_python) if project_python else None,
             "sources": mounts, "allow_execution": allow_execution, "allow_network": allow_network,
             "allow_vision": allow_vision, "scientific_tools": True, "scientific_lineage": True,
             "execution_contract": execution_contract,
             "research_policy": research_policy, "table_analysis": table_analysis,
+            **({'runtime_dependencies': dependencies} if dependencies else {}),
             "feasibility_connection": feasibility_connection,
             "max_images": max_images,
             "max_turns": max_turns}
@@ -580,6 +693,16 @@ class ToolApplication:
             config['report_requirement'] = report_requirement
             config['report_evidence_contract'] = (
                 'execution.v1' if code_task is not None or execution_contract is not None else 'materials.v1')
+        if snapshots:
+            config['source_snapshots'] = {}
+            for name, original, content in snapshots:
+                relative = f'evidence/inputs/{name}/{original.name}'
+                if (Path(root) / relative).exists():
+                    raise ValueError('Retained source destination already exists')
+                reused_inputs.append((relative, content))
+                config['sources'][name] = str(Path(root).resolve() / relative)
+                config['source_snapshots'][name] = {'original_path': str(original),
+                    'sha256': hashlib.sha256(content).hexdigest(), 'size_bytes': len(content)}
         if max_output_tokens is not None:
             config['max_output_tokens'] = max_output_tokens
         limits = {"llm_requests": max_turns, "total_tokens": max_tokens,
@@ -603,13 +726,16 @@ class ToolApplication:
                max_output_tokens: int | None = None,
                max_attempts: int | None = None,
                source_operations: int | None = None,
-               execution_contract: dict[str, Any] | None = None) -> ToolApplication:
+               execution_contract: dict[str, Any] | None = None,
+               services: Any | None = None, snapshot_sources: bool = False,
+               max_snapshot_bytes: int = 16 * 1024 * 1024) -> ToolApplication:
         config, reused, limits, attempts = cls._configuration(root, goal, model=model, sources=sources,
             allow_execution=allow_execution, allow_network=allow_network, allow_vision=allow_vision,
             max_turns=max_turns, max_tokens=max_tokens, max_images=max_images, project_python=project_python,
             code_task=code_task, process_limits=process_limits, report_requirement=report_requirement,
             research_policy=research_policy, table_analysis=table_analysis, max_output_tokens=max_output_tokens,
-            max_attempts=max_attempts, source_operations=source_operations, execution_contract=execution_contract)
+            max_attempts=max_attempts, source_operations=source_operations, execution_contract=execution_contract,
+            services=services, snapshot_sources=snapshot_sources, max_snapshot_bytes=max_snapshot_bytes)
         session = SessionController.create(root, session_id=root.name, topic=goal,
             registry=CapabilityRegistry(), budget=BudgetState(max_attempts=attempts, max_no_progress=6))
         session.manifest.transition_recipe = cls.RECIPE
@@ -621,11 +747,11 @@ class ToolApplication:
         session.manifest.state_refs["actions"] = session.store.ref("actions.json", kind="native_actions")
         session.manifest.budget_ledger_ref = session.store.ref("budget_ledger.json", kind="budget_ledger")
         session.save()
-        return cls(session)
+        return cls(session, services=services)
 
     @classmethod
-    def load(cls, root: Path) -> ToolApplication:
-        return cls(SessionController.load(root, registry=CapabilityRegistry()))
+    def load(cls, root: Path, *, services: Any | None = None) -> ToolApplication:
+        return cls(SessionController.load(root, registry=CapabilityRegistry()), services=services)
 
     def _save(self) -> None:
         self.session.store.write_json("actions.json", self.state)
@@ -678,6 +804,8 @@ class ToolApplication:
                     row.attempt_id == pending['attempt'] for row in self.session.list_attempts())):
                 raise ValueError('Reconcile the started operation before supplying contracts')
             old = json.loads(json.dumps(self.state['config']))
+            if _runtime_bindings(self.services) != old.get('runtime_dependencies', {}):
+                raise ValueError('Restore unchanged runtime dependencies before supplying new contracts')
             for name, value in supplied.items():
                 if name == 'sources':
                     if any(alias in old['sources'] and old['sources'][alias] != path for alias, path in value.items()):
@@ -704,7 +832,7 @@ class ToolApplication:
                 code_task=candidate.get('code_task'), execution_contract=candidate.get('execution_contract'),
                 research_policy=candidate.get('research_policy'), table_analysis=candidate.get('table_analysis'),
                 report_requirement=candidate.get('report_requirement'), max_output_tokens=candidate.get('max_output_tokens'),
-                max_attempts=self.session.manifest.budget.max_attempts, retained=True)
+                max_attempts=self.session.manifest.budget.max_attempts, retained=True, services=self.services)
             for name in fields - {'model', 'sources', 'allow_execution', 'allow_network'}:
                 if old.get(name) is not None and old[name] != config.get(name):
                     raise ValueError(f'{name} is already frozen; use its existing feedback/revision contract')
@@ -716,6 +844,8 @@ class ToolApplication:
             # max_turns remains the initial allowance: the budget authorization
             # below accounts for newly authorized decisions exactly once.
             config['max_turns'] = old['max_turns']
+            if old.get('source_snapshots'):
+                config['source_snapshots'] = old['source_snapshots']
             terms['previous_config'] = old
             if allowances:
                 self.ledger.validate_remaining(allowances, authorization_id=supply_id, reason=reason)
@@ -1259,7 +1389,14 @@ class ToolApplication:
                 native: bool = True) -> LLMClient:
         if self.state['config']['model'] is None:
             raise ValueError('This caller-directed task has no model connection or model authorization')
-        client = LLMClient.from_env(self.state["config"]["model"], budget_ledger=self.ledger,
+        if 'llm_client' in self.state['config'].get('runtime_dependencies', {}):
+            client = self._runtime_client('llm_client', attempt_id)
+            limit = self.state['config'].get('max_output_tokens')
+            if isinstance(client, LLMClient):
+                client = self._text_client(client, purpose or self._work_focus()['purpose'], native=native)
+            return client.with_output_limit(limit) if limit is not None else client
+        selector = self.state['config']['model']
+        client = LLMClient.from_env(None if selector == 'env' else selector, budget_ledger=self.ledger,
             budget_session_id=self.session.manifest.session_id, budget_attempt_id=attempt_id)
         saved = self.state["config"].get("model_connection")
         binding = client.connection_binding()
@@ -1278,7 +1415,21 @@ class ToolApplication:
         limit = self.state['config'].get('max_output_tokens')
         return client.with_output_limit(limit) if limit is not None else client
 
+    def _runtime_client(self, name: str, attempt_id: str) -> Any:
+        expected = self.state['config']['runtime_dependencies'][name]
+        if _runtime_bindings(self.services).get(name) != expected:
+            raise ValueError('Restore the saved injected ' + name + ' before model work; no environment fallback')
+        client = getattr(self.services, name).with_budget(self.ledger,
+            session_id=self.session.manifest.session_id, attempt_id=attempt_id)
+        if (getattr(client, '_budget_ledger', None) is not self.ledger
+                or getattr(client, '_budget_session_id', None) != self.session.manifest.session_id
+                or getattr(client, '_budget_attempt_id', None) != attempt_id):
+            raise ValueError('Injected client must bind the actual parent ledger/session/attempt')
+        return client if isinstance(client, LLMClient) else _RuntimeClientPort(client, expected)
+
     def _feasibility_client(self, attempt_id: str) -> LLMClient | None:
+        if 'feasibility_llm_client' in self.state['config'].get('runtime_dependencies', {}):
+            return self._runtime_client('feasibility_llm_client', attempt_id)
         policy = self.state['config'].get('research_policy') or {}
         selector = policy.get('feasibility_connection')
         if not selector:
@@ -2008,6 +2159,8 @@ class ToolApplication:
 
     def _retry_model(self, model_selector: str = "") -> None:
         """Authorize one new decision, retaining failed attempts and all charges."""
+        if 'llm_client' in self.state['config'].get('runtime_dependencies', {}):
+            raise ValueError('Injected clients do not support named-connection retries; restore their original service and reconcile the failed operation')
         pending = self.state['pending']
         if not pending or pending['kind'] != 'model' or any(turn['remaining'] for turn in self.state['turns']):
             raise ValueError('--retry-model requires a pending native model decision, not a tool or new task')
@@ -2205,14 +2358,14 @@ class ToolApplication:
             if resource_allowances and self.session.manifest.status in {'paused', 'blocked', 'failed'}:
                 self.session.continue_with_revision('Explicit resource continuation: ' + authorization_id)
             try:
-                if (self.state['config']['model'] is not None
-                        and not (self._caller_takeover()
-                            and (self.state['pending'] is None or self.state['pending']['kind'] == 'tool'))):
-                    self._client()  # Reject changed identity before starting an attempt or side effect.
                 if self._commit_terminal(progress):
                     return self.session.status_snapshot()
                 if self.session.manifest.status in {'completed', 'partial'} and not feedback:
                     return self.session.status_snapshot()
+                if (self.state['config']['model'] is not None
+                        and not (self._caller_takeover()
+                            and (self.state['pending'] is None or self.state['pending']['kind'] == 'tool'))):
+                    self._client()  # Reject changed identity before starting an attempt or side effect.
                 if self.session.manifest.status == "paused" and not feedback:
                     pending = self.state['pending']
                     if pending is None:

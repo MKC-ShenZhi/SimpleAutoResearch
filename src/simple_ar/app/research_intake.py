@@ -20,6 +20,122 @@ class ResearchInputError(ValueError):
         super().__init__(message)
 
 
+def create_research_task(brief: ResearchBrief, *, root: str | Path, services: Any | None = None,
+                         model: str | None = None,
+                         snapshot_sources: bool = False,
+                         max_snapshot_bytes: int = 16 * 1024 * 1024):
+    """Create a common task from public research inputs without running it.
+
+    This is an input projection, not another planner or lifecycle. Runtime
+    clients/providers stay in memory; the native owner retains their identities,
+    user obligations, selected evidence and the one resource ledger.
+    """
+    from simple_ar.app.research_application import ResearchApplicationServices
+    from simple_ar.app.tool_application import ToolApplication
+    from simple_ar.tools.sources import SourcePolicy
+    from simple_ar.tools.writing import freeze_report_requirement
+
+    settings = services or ResearchApplicationServices()
+    config = dict(settings.config)
+    aliases = {'research_sources': 'providers', 'research_use_fulltext': 'require_fulltext',
+        'research_selected_idea_id': 'selected_idea_id', 'feasibility_review_model': 'feasibility_connection'}
+    policy_values, unhandled = {}, []
+    auxiliary = {'research_task_kind', 'research_materials_only', 'report', 'report_writing_method',
+        'data_analysis', 'max_output_tokens'}
+    for name, value in config.items():
+        target = aliases.get(name, name.removeprefix('research_'))
+        if name not in auxiliary and target in SourcePolicy.model_fields:
+            policy_values[target] = value
+        elif name not in auxiliary:
+            unhandled.append(name)
+    if unhandled or settings.extraction_dir is not None:
+        raise ValueError('These legacy creation controls need their explicit execution/revision owner: '
+            + ', '.join(sorted([*unhandled, *(['extraction_dir'] if settings.extraction_dir is not None else [])])))
+    source = Path(brief.source_path) if brief.source_path else None
+    base = settings.input_base_dir or (source.parent if source and source.suffix else source) or Path.cwd()
+    assets = normalize_assets(brief, input_base_dir=base)
+    diagnostics = validate_brief(brief, assets)
+    if any(item.severity == 'error' for item in diagnostics):
+        raise ResearchInputError(item for item in diagnostics if item.severity == 'error')
+    mounts, materials = {}, []
+    for index, asset in enumerate(assets):
+        if _is_remote_locator(asset.locator):
+            continue  # Explicit URLs remain in the original request; acquisition needs network permission.
+        alias = f'source{index}'
+        mounts[alias] = Path(asset.locator)
+        if asset.role not in {'dataset', 'code'} and mounts[alias].is_file():
+            materials.append(alias)
+    providers = (list(settings.search_registry.names()) if settings.search_registry is not None
+        else ['openalex', 'semantic_scholar', 'arxiv'])
+    local_only = (config.get('research_materials_only') is True
+        or policy_values.get('allow_network') is False
+        or bool(materials) and config.get('research_materials_only') is not False
+            and policy_values.get('allow_network') is not True)
+    outputs = brief.requested_outputs or ('research_summary',)
+    supported = {'summary', 'research_summary', 'report', 'paper', 'full_paper', 'assessment',
+        'idea_assessment', 'idea_comparison', 'design', 'research_design', 'data_analysis', 'experiments'}
+    if set(outputs) - supported:
+        raise ValueError('Use explicit native execution contracts for these outputs: '
+            + ', '.join(sorted(set(outputs) - supported)))
+    policy = SourcePolicy.model_validate({'max_results': settings.max_results,
+        'max_documents': settings.max_results, 'max_chunks': settings.max_chunks,
+        'idea_limit': settings.idea_limit, 'max_fulltext_documents': min(settings.max_results, 1),
+        'cache_dir': str(settings.cache_dir.resolve()) if settings.cache_dir else None,
+        'providers': providers, **policy_values,
+        'materials': policy_values.get('materials', materials), 'allow_network': not local_only,
+        'require_design': bool(policy_values.get('require_design') or 'experiments' in outputs),
+        'require_summary': bool(policy_values.get('require_summary') or {'summary', 'research_summary'} & set(outputs))})
+    report = (freeze_report_requirement(dict(config.get('report') or {}),
+        method=config.get('report_writing_method')) if {'report', 'paper', 'full_paper'} & set(outputs) else None)
+    table = config.get('data_analysis')
+    if table is not None:
+        path = (Path(base) / table['file']).resolve()
+        alias = next((name for name, item in mounts.items() if item.resolve() == path), None)
+        if alias is None:
+            alias = f'source{len(assets)}'
+            mounts[alias] = path
+        table = {'path': alias, 'spec': {name: value for name, value in table.items() if name != 'file'}}
+    client = settings.llm_client
+    if model is not None and client is not None:
+        raise ValueError('Choose a named model or an injected client, not both')
+    selected_model = model if model else 'runtime' if client is not None else None
+    if 'experiments' in outputs and selected_model is None:
+        raise ValueError('Open-ended experiments require a model or an explicitly prepared execution command')
+    limits = settings.budget_limits
+    unsupported_limits = {name for name, value in limits.items() if value is not None and name not in {
+        'llm_requests', 'total_tokens', 'process_invocations', 'process_wall_seconds', 'source_operations'}}
+    if unsupported_limits:
+        raise ValueError('Unsupported creation resource controls: ' + ', '.join(sorted(unsupported_limits)))
+    source_count = max(1, len(policy.queries)) * len(policy.providers)
+    execution_runs = settings.max_attempts if 'experiments' in outputs else 0
+    root = Path(root).expanduser().resolve()
+    app = ToolApplication.create(root, (brief.objective or brief.request_text)
+        + '\nOriginal user request and declared constraints:\n' + json.dumps(brief.to_dict(), ensure_ascii=False),
+        model=selected_model, sources=mounts,
+        allow_execution='experiments' in outputs, allow_network=policy.allow_network, max_turns=(limits.get('llm_requests')
+            if limits.get('llm_requests') is not None else 30 if selected_model is not None else 0),
+        max_tokens=(limits.get('total_tokens') if limits.get('total_tokens') is not None
+            else 600000 if selected_model is not None else 0),
+        max_attempts=settings.max_attempts, report_requirement=report,
+        max_output_tokens=config.get('max_output_tokens'), table_analysis=table,
+        research_policy=policy.model_dump(mode='json'),
+        process_limits={name: limits[name] if limits.get(name) is not None else default
+            for name, default in (('process_invocations', execution_runs + (source_count * 4 if policy.allow_network else 0)),
+                ('process_wall_seconds', execution_runs * policy.execution_boundary.get('timeout_sec', 300)
+                    + (source_count * 120 if policy.allow_network else 0)))},
+        source_operations=limits.get('source_operations') if limits.get('source_operations') is not None
+            else source_count * (1 + policy.max_iterations) + policy.max_documents * 3,
+        services=settings, snapshot_sources=snapshot_sources, max_snapshot_bytes=max_snapshot_bytes)
+    with app.session.mutation_scope():
+        app.session.manifest.budget.max_no_progress = settings.max_no_progress
+        app.session.manifest.state_refs['brief'] = app.session.store.write_json('inputs/research_brief.json',
+            brief.to_dict(), kind='research_input', schema=brief.schema_version, producer='research_intake')
+        app.session.manifest.state_refs['assets'] = app.session.store.write_json('inputs/research_assets.json',
+            {'assets': [asset.to_dict() for asset in assets]}, kind='research_assets', producer='research_intake')
+        app.session.save()
+    return app
+
+
 def parse_research_input(
     request_text: str | Path,
     *,
@@ -505,6 +621,7 @@ _KNOWN_SUFFIXES = {
 
 __all__ = [
     "ResearchInputError",
+    "create_research_task",
     "normalize_assets",
     "parse_research_input",
     "validate_brief",
