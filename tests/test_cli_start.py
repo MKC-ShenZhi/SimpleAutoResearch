@@ -1195,7 +1195,7 @@ class StartTests(unittest.TestCase):
         from simple_ar.cli.start import migrate_measurement_creation
         with tempfile.TemporaryDirectory() as directory, \
                 patch('simple_ar.app.tool_application.ToolApplication.create') as create, \
-                patch('simple_ar.cli.main._render_native_result'), patch('simple_ar.cli.start.print_line'):
+                patch('simple_ar.cli.main._render_native_result'), patch('simple_ar.cli.start.print_line') as print_line:
             root = Path(directory).resolve()
             execution = {'command': [sys.executable, '-c', "print('score: 3')"], 'cwd': str(root),
                 'timeout_sec': 5, 'result_schema': {'primary_metric': 'score'}}
@@ -1282,6 +1282,107 @@ class StartTests(unittest.TestCase):
                     'command': execution['command'], 'environment': {'mode': 'venv'}}},
                     request='No per-condition environment replacement', outputs=('experiments',), root=root, limits=limits)
             create.assert_not_called()
+
+            # Autonomous research keeps one owner, but investigation/design must
+            # precede separately approved execution of the declared comparison.
+            from simple_ar.tools.sources import SourcePolicy
+            paper, notes, data = (root / name for name in ('paper.md', 'notes.md', 'data.csv'))
+            for path, content in ((paper, 'Published claim'), (notes, 'Unverified notes'),
+                                  (data, 'score\n3\n')):
+                path.write_text(content, encoding='utf-8')
+            originals = {path: path.read_bytes() for path in (paper, notes, data)}
+            sources = tuple({'locator': str(path), 'role': role} for path, role in
+                            ((paper, 'paper'), (notes, 'material'), (data, 'dataset')))
+            research_execution = {**execution, 'baseline_policy': 'skip',
+                'label': 'Declared comparison',
+                'protocol': {'hypothesis': 'Published claim', 'dataset': 'Supplied data',
+                             'expected_outcome': 'Compare score to three'},
+                'environment': {'mode': 'current', 'timeout_sec': 5,
+                                'check_command': [sys.executable, '-c', 'pass']},
+                'result_schema': {'primary_metric': 'score', 'required_metrics': ['score'],
+                                  'output_files': {'scores': 'scores.json'},
+                                  'metric_sources': {'score': {'output': 'scores', 'path': ['score']}}}}
+            research = {'interaction': 'autonomous', 'research_max_documents': 7,
+                'research_use_fulltext': True, 'research_allow_pdf_download': True,
+                'research_keep_raw_pdf': True, 'research_max_fulltext_documents': 2,
+                'research_max_pdf_mb': 9, 'research_max_pdf_pages': 31,
+                'research_read_max_shortlist': 4, 'research_web_extract_backend': 'tavily_basic',
+                'research_max_iterations': 3, 'research_selected_idea_id': 'idea-2',
+                'feasibility_review_model': 'profile:review'}
+            research_args = build_parser().parse_args(['research-session', '--topic', 'Investigate before measuring',
+                '--task-kind', 'auto', '--interaction', 'autonomous', '--model', 'fixture',
+                '--query', 'first exact query', '--query', 'second exact query',
+                '--provider', 'openalex', '--provider', 'arxiv', '--max-results', '6',
+                '--max-chunks', '19', '--idea-limit', '2', '--cache-dir', str(root / 'cache'),
+                '--max-output-tokens', '1700'])
+            research_args._explicit_resume_destinations = {'task_kind', 'interaction', 'model'}
+            frozen_inputs = json.dumps([research_execution, research, limits, sources], sort_keys=True)
+            app.run.side_effect = None
+            app.run.return_value = {'status': 'paused', 'status_reason': 'Design and execution need approval'}
+            for materials_only, explicit_budget in ((False, False), (False, True), (True, False)):
+                with self.subTest(materials_only=materials_only, explicit_budget=explicit_budget), \
+                        patch('subprocess.run') as process, \
+                        patch('simple_ar.cli.start.new_research_session_root') as legacy:
+                    create.reset_mock()
+                    research_args.process_invocations = 2 if explicit_budget else None
+                    research_args.process_wall_seconds = 10 if explicit_budget else None
+                    # Also exercise explicit research controls without non-dataset material.
+                    selected_sources = sources if not explicit_budget else sources[2:]
+                    research_args._explicit_resume_destinations = {'task_kind', 'interaction', 'model'} | (
+                        {'queries', 'providers', 'process_invocations', 'process_wall_seconds'}
+                        if explicit_budget else set())
+                    with self.assertRaisesRegex(SystemExit, "status 'paused'"):
+                        migrate_measurement_creation(research_args, execution=research_execution,
+                            request='Investigate before measuring; commands require separate approval',
+                            outputs=('experiments',), root=root, limits=limits, sources=selected_sources,
+                            research_config={**research, 'research_materials_only': materials_only})
+                    create.assert_called_once()
+                    self.assertEqual(create.call_args.args[0], root)
+                    options = create.call_args.kwargs
+                    self.assertEqual(options['sources'], {f'source{i}': Path(row['locator'])
+                        for i, row in enumerate(selected_sources)})
+                    expected_policy = SourcePolicy(queries=('first exact query', 'second exact query'),
+                        providers=('openalex', 'arxiv'), materials=() if explicit_budget else ('source0', 'source1'),
+                        max_results=6, max_documents=7, max_chunks=19, idea_limit=2,
+                        cache_dir=str(root / 'cache'), require_fulltext=True, allow_pdf_download=True,
+                        keep_raw_pdf=True, max_fulltext_documents=2, max_pdf_mb=9, max_pdf_pages=31,
+                        read_max_shortlist=4, web_extract_backend='tavily_basic',
+                        allow_network=not materials_only, feasibility_connection='profile:review',
+                        require_design=True, max_iterations=3, interaction='autonomous',
+                        selected_idea_id='idea-2', execution_boundary=research_execution,
+                        execution_schema=research_execution['result_schema']).model_dump(mode='json')
+                    self.assertEqual(options['research_policy'], expected_policy)
+                    self.assertEqual(options['allow_network'], not materials_only)
+                    self.assertTrue(options['allow_execution'])  # Proposals still require separate approval.
+                    self.assertIsNone(options['code_task'])
+                    self.assertEqual((options['max_turns'], options['max_tokens']), (3, 24000))
+                    self.assertEqual(options['max_output_tokens'], 1700)
+                    self.assertEqual(options['source_operations'], 4 + 7 * 3)
+                    # Two exact queries x two providers reserve search work only by default.
+                    self.assertEqual(options['process_limits'], {
+                        'process_invocations': 2 if explicit_budget or materials_only else 2 + 4 * 4,
+                        'process_wall_seconds': 10 if explicit_budget or materials_only else 10 + 4 * 120})
+                    app.run.assert_called_once_with(progress=print_line)
+                    app.measurement_completion_actions.assert_not_called()
+                    self.assertEqual(app.scientific.mock_calls, [])
+                    process.assert_not_called()
+                    legacy.assert_not_called()
+                    self.assertEqual({path: path.read_bytes() for path in originals}, originals)
+            create.reset_mock()
+            # Missing comparison semantics and non-autonomous/no-model research
+            # remain with the original owner; reuse never migrates.
+            for model, interaction, declared_execution in (
+                    ('fixture', 'autonomous', execution),
+                    (None, 'autonomous', research_execution),
+                    ('fixture', 'checkpoints', research_execution),
+                    ('fixture', 'assisted', research_execution),
+                    ('fixture', 'autonomous', {**research_execution, 'baseline_policy': 'reuse'})):
+                research_args.model, research_args.interaction = model, interaction
+                self.assertFalse(migrate_measurement_creation(research_args, execution=declared_execution,
+                    request='Keep the original owner', outputs=('experiments',), root=root,
+                    limits=limits, sources=sources, research_config=research))
+            create.assert_not_called()
+            self.assertEqual(json.dumps([research_execution, research, limits, sources], sort_keys=True), frozen_inputs)
 
     def test_prepared_reproduction_uses_existing_config_and_preserves_argv(self):
         with tempfile.TemporaryDirectory() as directory:

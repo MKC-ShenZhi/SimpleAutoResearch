@@ -422,32 +422,15 @@ def native_creation_options(args: argparse.Namespace) -> dict:
         max_output_tokens=getattr(args, '_task_output_limit', None))
 
 
-def migrate_structured_creation(args: argparse.Namespace, *, request: str, outputs: tuple,
-                                sources: tuple, limits: dict, root: Path, research_config: dict,
-                                report_config: dict, writing_method: str | None,
-                                data_analysis: dict | None, review_model: str | None = None) -> None:
-    """Project precise domain contracts into the existing common task owner.
-
-    There is no stage scheduler here. Model tasks choose tools; a no-model
-    caller requests one existing deterministic capability and delivers its
-    actual result. Historical recipes continue through their saved owner.
-    """
-    from simple_ar.app.tool_application import ToolApplication
-    from simple_ar.cli.main import _render_native_result, _ensure_research_cli_success
-    from simple_ar.cli.parser import build_parser
+def _configure_research(native: argparse.Namespace, args: argparse.Namespace, *,
+                        sources: tuple, research_config: dict, outputs: tuple,
+                        require_design: bool, review_model: str | None = None,
+                        online: bool = True) -> list[str]:
+    """Bind source work independently of the requested execution capability."""
     from simple_ar.tools.sources import SourcePolicy
-    from simple_ar.tools.writing import freeze_report_requirement
-    native = build_parser().parse_args(['start'])
-    native.model = args.model if data_analysis is None or 'report' in outputs else None
-    if 'experiments' in outputs and not native.model:
-        raise ValueError('Open-ended experiments require a model or an explicitly prepared execution command')
-    native.source = [Path(row['locator']) for row in sources]
     aliases = {str(path.resolve()): f'source{index}' for index, path in enumerate(native.source)}
     material_paths = [aliases[str(Path(row['locator']).resolve())] for row in sources if row['role'] != 'dataset']
-    online = data_analysis is None and args.task_kind != 'writing' and not research_config.get('research_materials_only', False)
-    native.allow_network = online
-    native.max_turns = limits.get('llm_requests') if limits.get('llm_requests') is not None else native.max_turns if native.model else 0
-    native.max_tokens = limits.get('total_tokens') if limits.get('total_tokens') is not None else native.max_tokens if native.model else 0
+    native.allow_network = online and not research_config.get('research_materials_only', False)
     policy = dict(queries=list(args.queries or ()),
         providers=list(args.providers or ('openalex', 'semantic_scholar', 'arxiv')),
         materials=material_paths, max_results=args.max_results,
@@ -464,23 +447,49 @@ def migrate_structured_creation(args: argparse.Namespace, *, request: str, outpu
         read_max_shortlist=research_config.get('research_read_max_shortlist', args.max_results),
         web_extract_backend=research_config.get('research_web_extract_backend', 'direct'),
         feasibility_connection=review_model or '',
-        require_design='experiments' in outputs,
+        require_design=require_design,
         execution_boundary={'timeout_sec': args.timeout_sec if args.timeout_sec is not None else 300},
         max_iterations=research_config.get('research_max_iterations', 0),
         interaction=research_config.get('interaction', 'checkpoints'),
         require_summary='summary' in outputs,
         selected_idea_id=research_config.get('research_selected_idea_id'))
     native._research_policy = SourcePolicy.model_validate(policy).model_dump(mode='json')
+    # Search processes are network work, not permission to execute project code.
+    source_count = max(1, len(args.queries or ())) * len(policy['providers'])
+    native._source_operations = source_count + policy['max_documents'] * 3
+    return material_paths
+
+
+def migrate_structured_creation(args: argparse.Namespace, *, request: str, outputs: tuple,
+                                sources: tuple, limits: dict, root: Path, research_config: dict,
+                                report_config: dict, writing_method: str | None,
+                                data_analysis: dict | None, review_model: str | None = None) -> None:
+    """Project domain contracts into one task; modules own their local work."""
+    from simple_ar.app.tool_application import ToolApplication
+    from simple_ar.cli.main import _render_native_result, _ensure_research_cli_success
+    from simple_ar.cli.parser import build_parser
+    from simple_ar.tools.writing import freeze_report_requirement
+    native = build_parser().parse_args(['start'])
+    native.model = args.model if data_analysis is None or 'report' in outputs else None
+    if 'experiments' in outputs and not native.model:
+        raise ValueError('Open-ended experiments require a model or an explicitly prepared execution command')
+    native.source = [Path(row['locator']) for row in sources]
+    native.max_turns = limits.get('llm_requests') if limits.get('llm_requests') is not None else native.max_turns if native.model else 0
+    native.max_tokens = limits.get('total_tokens') if limits.get('total_tokens') is not None else native.max_tokens if native.model else 0
+    material_paths = _configure_research(native, args, sources=sources, research_config=research_config,
+        outputs=outputs, require_design='experiments' in outputs, review_model=review_model,
+        online=data_analysis is None and args.task_kind != 'writing')
+    policy = native._research_policy
+    online = native.allow_network
     native.allow_execution = 'experiments' in outputs
     native._report_requirement = freeze_report_requirement(report_config, method=writing_method) if 'report' in outputs else None
     native._task_output_limit = getattr(args, 'max_output_tokens', None) if native.model else None
     native._task_attempt_limit = max(30, native.max_turns * 10)
-    # Search processes are network work, not permission to execute project code.
     source_count = max(1, len(args.queries or ())) * len(policy['providers'])
-    native._source_operations = source_count + policy['max_documents'] * 3
     native._process_limits = {name: getattr(args, name, None) if getattr(args, name, None) is not None else default
         for name, default in (('process_invocations', source_count * 4 if online else 0),
                               ('process_wall_seconds', source_count * 120 if online else 0))}
+    aliases = {str(path.resolve()): f'source{index}' for index, path in enumerate(native.source)}
     if data_analysis is not None:
         source = aliases[str(Path(data_analysis['file']).resolve())]
         native._table_analysis = {'path': source, 'spec': {key: value for key, value in data_analysis.items() if key != 'file'}}
@@ -730,11 +739,21 @@ def migrate_exact_code_creation(args: argparse.Namespace, *, execution: dict,
 def migrate_measurement_creation(args: argparse.Namespace, *, execution: dict,
                                 request: str, outputs: tuple, root: Path, limits: dict,
                                 sources: tuple = (), report_config: dict | None = None,
-                                writing_method: str | None = None) -> bool:
+                                writing_method: str | None = None,
+                                research_config: dict | None = None) -> bool:
     """Adapt an explicit fixed execution, without another plan or resume owner."""
     flat_fields = {'command', 'cwd', 'timeout_sec', 'label', 'result_schema', 'protocol', 'environment'}
-    autonomous = (args.task_kind == 'auto' and getattr(args, 'interaction', None) == 'autonomous'
-        and all(row['role'] == 'dataset' for row in sources))
+    from simple_ar.cli.research_config import FIELDS
+    research_fields = {destination for destination, _ in FIELDS['research'].values()}
+    explicit = set(getattr(args, '_explicit_resume_destinations', ()))
+    autonomous = args.task_kind == 'auto' and getattr(args, 'interaction', None) == 'autonomous'
+    research_work = autonomous and (any(row['role'] != 'dataset' for row in sources)
+        or bool(explicit & (research_fields - {'interaction'})))
+    if research_work and (not args.model or research_config is None
+            or not {'baseline_policy', 'baseline', 'pairs'}.intersection(execution)):
+        # An omitted comparison policy permits design to propose new conditions.
+        # Such a request is not a fixed measurement contract.
+        return False
     if (args.task_kind != 'measurement' and not autonomous or 'experiments' not in outputs
             or set(outputs) - {'experiments', 'report'}
             or set(execution) - (flat_fields | {'baseline', 'pairs', 'seeds', 'seed_count', 'seed_flag', 'baseline_policy'})
@@ -744,7 +763,7 @@ def migrate_measurement_creation(args: argparse.Namespace, *, execution: dict,
     from simple_ar.app.research_execution import normalize_execution_config
     if extended:
         policy = normalize_execution_config(execution)['baseline_policy']
-        if policy == 'skip' and extended == {'baseline_policy'}:
+        if not research_work and policy == 'skip' and extended == {'baseline_policy'}:
             execution = {key: value for key, value in execution.items() if key in flat_fields}
             extended = set()
     supported = {'config', 'topic', 'task_kind', 'outputs', 'command_argv', 'cwd', 'timeout_sec',
@@ -760,6 +779,8 @@ def migrate_measurement_creation(args: argparse.Namespace, *, execution: dict,
             raise ValueError('A requested authored report requires a model; use --no-report for caller-directed measurement')
     if autonomous:
         supported.add('interaction')
+    if research_work:
+        supported.update(research_fields | {'local_document', 'material', 'selected_idea_id', 'feasibility_review_model'})
     unsupported = set(getattr(args, '_explicit_resume_destinations', ())) - supported
     if unsupported:
         if autonomous:
@@ -789,6 +810,12 @@ def migrate_measurement_creation(args: argparse.Namespace, *, execution: dict,
     native._task_output_limit = getattr(args, 'max_output_tokens', None)
     native._task_attempt_limit = max(20, len(conditions) + int(grouped) + native.max_turns * 10)
     native._execution_contract = contract
+    if research_work:
+        _configure_research(native, args, sources=sources, research_config=research_config,
+            outputs=outputs, require_design=True,
+            review_model=research_config.get('feasibility_review_model'))
+        native._research_policy.update(execution_boundary=execution,
+            execution_schema=execution.get('result_schema', {}))
     if 'report' in outputs:
         from simple_ar.tools.writing import freeze_report_requirement
         native._report_requirement = freeze_report_requirement(report_config or {}, method=writing_method)
@@ -796,6 +823,11 @@ def migrate_measurement_creation(args: argparse.Namespace, *, execution: dict,
             request += '\n\nSupplied read-only material roles (not verified evidence):\n' + json.dumps(
                 [{'path': row['locator'], 'role': row['role']} for row in sources], ensure_ascii=False)
     native._process_limits = {name: limits[name] for name in ('process_invocations', 'process_wall_seconds')}
+    if research_work and native.allow_network:
+        source_count = max(1, len(args.queries or ())) * len(native._research_policy['providers'])
+        for name, extra in (('process_invocations', source_count * 4), ('process_wall_seconds', source_count * 120)):
+            if getattr(args, name, None) is None:
+                native._process_limits[name] += extra
     if grouped and execution.get('environment') is not None:
         from simple_ar.research.project_environment import project_environment_plan
         first = conditions[0]['execution']
@@ -810,8 +842,9 @@ def migrate_measurement_creation(args: argparse.Namespace, *, execution: dict,
     app = ToolApplication.create(root, request, **native_creation_options(native))
     print_line('Fixed measurement uses the common task owner, original cwd/argv and '
                + ('declared environment preparation. ' if execution.get('environment') is not None else 'inherited environment. ')
-               + ('Each literal caller condition authorizes one initial execution through the common approval gate; '
-                  if grouped else 'The caller-supplied command authorizes this one initial execution through the common approval gate; ')
+               + ('Research requires an accepted design matching the declared execution; execution proposals require approval. '
+                  if research_work else ('Each literal caller condition authorizes one initial execution through the common approval gate; '
+                  if grouped else 'The caller-supplied command authorizes this one initial execution through the common approval gate; '))
                + 'later proposals require approval. Model interpretation, when selected, uses this same task and ledger. '
                'This is not an OS sandbox.')
     print_line(f'Task session: {root}\nResume: simple-ar start --resume-task "{root}" --approve-execution TOKEN')
@@ -836,7 +869,7 @@ def migrate_measurement_creation(args: argparse.Namespace, *, execution: dict,
                 print_line('Reuse verified shared environment: ' + json.dumps(binding['shared_environment'], sort_keys=True))
         del remaining[call['id']]  # Once per literal initial caller proposal, never a retry/model proposal.
         return True
-    status = app.run(actions=actions, approve=approve, progress=print_line)
+    status = app.run(progress=print_line) if research_work else app.run(actions=actions, approve=approve, progress=print_line)
     if grouped and not args.model:
         completion = app.measurement_completion_actions()
         if completion:

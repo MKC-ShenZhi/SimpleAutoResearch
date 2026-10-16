@@ -640,9 +640,11 @@ class SourceToolGateway:
                 base.setdefault('protocol', design['contract'])
                 protocol_data = merge_execution_protocol(base, design['execution_protocol'])
                 protocol_data['comparison_required'] = design['execution_protocol'].get('comparison_required', False)
-                if any(not protocol_data.get(key) for key in ('command', 'cwd', 'timeout_sec', 'result_schema')):
+                try:
+                    self._execution_contract(protocol_data)
+                except (ValueError, KeyError, TypeError) as exc:
                     design.update(status='needs_review', diagnostics=[*design['diagnostics'],
-                        'Executable entry, authorized cwd, timeout or result schema is missing; clarify before freezing.'])
+                        f'Execution protocol is not ready: {exc}'])
                     context.store.write_json('research_design.json', design)
                     return self._professional_result(request.operation, artifacts, outcomes, network=network,
                         domain_status='needs_review', diagnostics=design['diagnostics'])
@@ -749,6 +751,14 @@ class SourceToolGateway:
             if (any(response.get(key) != value for key, value in decision.items())
                     or response.get('decision_response') != 'accept'):
                 return ['Latest design was not accepted; revise or resolve its bound protocol decision.']
+            boundary = self._fixed_execution_boundary()
+            if boundary is not None:
+                # Read this already verified decision directly: accepted_protocol
+                # calls this gate and must not become a recursive acceptance check.
+                accepted = self._execution_contract(json.loads(
+                    (latest / 'frozen_protocol.json').read_text(encoding='utf-8')))
+                from simple_ar.tools.scientific import fixed_measurement_issues
+                return fixed_measurement_issues(boundary, accepted)
             return []
         except (OSError, ValueError, KeyError, TypeError) as exc:
             return [str(exc)]
@@ -763,23 +773,40 @@ class SourceToolGateway:
         return {**decision, 'execution_protocol': json.loads(
             (path.parent / 'frozen_protocol.json').read_text(encoding='utf-8'))}
 
+    def _fixed_execution_boundary(self) -> dict[str, Any] | None:
+        boundary = self.policy.execution_boundary
+        return boundary if (self.policy.require_design
+            and {'command', 'cwd', 'timeout_sec', 'result_schema'}.issubset(boundary)
+            and any(key in boundary for key in ('baseline_policy', 'baseline', 'pairs'))) else None
+
+    @staticmethod
+    def _execution_contract(execution: dict[str, Any]) -> dict[str, Any]:
+        """Use the scientific owner's existing declaration normalization."""
+        from simple_ar.tools.scientific import freeze_measurement_set, measurement_contract, measurement_conditions
+        execution = dict(execution)
+        comparison = execution.pop('comparison_required', False)
+        if any(key in execution for key in ('baseline', 'pairs', 'seeds', 'seed_count', 'baseline_policy')):
+            contract = freeze_measurement_set(execution)
+        else:
+            contract = measurement_contract(execution)
+        if comparison and {row['role'] for row in measurement_conditions(contract)} != {'baseline', 'candidate'}:
+            raise ValueError('Requested comparison has no explicit executable baseline/condition set')
+        return contract
+
     def accepted_execution_contract(self) -> dict[str, Any] | None:
         """Project the accepted execution through the existing scientific owner.
 
         Condition matching, physical evidence and analysis coverage belong to
         ScientificToolGateway, including when this projection is unavailable.
         """
-        from simple_ar.tools.scientific import freeze_measurement_set, measurement_contract
         accepted = self.accepted_protocol()
         if accepted is None:
             return None
-        execution = dict(accepted['execution_protocol'])
-        comparison = execution.pop('comparison_required', False)
-        if comparison and not any(key in execution for key in ('baseline', 'pairs', 'seeds', 'seed_count')):
-            raise ValueError('Requested comparison has no explicit executable baseline/condition set')
-        if any(key in execution for key in ('baseline', 'pairs', 'seeds', 'seed_count', 'baseline_policy')):
-            return freeze_measurement_set(execution)
-        return measurement_contract(execution)
+        # Acceptance checked physical fields and explicitly declared metadata.
+        # Extra design prose remains source evidence, not a replacement for the
+        # caller's frozen measurement/approval contract (including absent protocol).
+        boundary = self._fixed_execution_boundary()
+        return self._execution_contract(boundary if boundary is not None else accepted['execution_protocol'])
 
     def delivery_issues(self, observations: list[dict[str, Any]]) -> list[str]:
         issues = self.execution_issues()

@@ -737,7 +737,8 @@ def _print_research_session(args: argparse.Namespace) -> None:
                 from simple_ar.cli.start import migrate_exact_code_creation, migrate_measurement_creation
                 if migrate_measurement_creation(args, execution=execution, request=brief.request_text,
                         outputs=brief.requested_outputs, root=session_root, limits=services.budget_limits,
-                        sources=brief.asset_requests, report_config=report_config, writing_method=writing_method):
+                        sources=brief.asset_requests, report_config=report_config, writing_method=writing_method,
+                        research_config=config):
                     return
                 if migrate_exact_code_creation(args, execution=execution, request=brief.request_text,
                         outputs=brief.requested_outputs, sources=brief.asset_requests,

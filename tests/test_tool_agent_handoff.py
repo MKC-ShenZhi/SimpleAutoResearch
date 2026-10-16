@@ -4178,7 +4178,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertFalse(owner.can_reconcile('research', context.attempt.attempt_id))
         self.assertTrue(owner.delivery_issues([]))
 
-    def test_professional_design_confirmation_binds_protocol_and_rejects_replay(self) -> None:
+    def _professional_design_fixture(self, **execution):
         from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
         from simple_ar.research.contracts import IdeaCandidate, ResearchExperimentContract
         from simple_ar.research.synthesis import SynthesisResult
@@ -4194,10 +4194,15 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         owner = SourceToolGateway(root, workspace, workspace.ledger, policy=SourcePolicy(
             require_design=True, selected_idea_id='chosen', execution_boundary={
                 'command': ['python', 'measure.py'], 'cwd': str(inputs), 'timeout_sec': 3,
-                'result_schema': {'required_metrics': ['score']}}))
-        self.assertTrue(owner.execution_issues())
+                'result_schema': {'required_metrics': ['score']}, **execution}))
         context = CapabilityContext(ArtifactStore(root / 'attempts' / 'research-design'),
             AttemptManifest('research-design', capability='native_tool'))
+        return root, workspace, owner, context
+
+    def test_professional_design_confirmation_binds_protocol_and_rejects_replay(self) -> None:
+        from simple_ar.tools.sources import SourcePolicy
+        root, workspace, owner, context = self._professional_design_fixture()
+        self.assertTrue(owner.execution_issues())
         result = owner.execute_tool('research', context, {'operation': 'design', 'question': 'Test the chosen method',
             'synthesis_record': 'source0/synthesis.json'})
         self.assertEqual(result.status, 'ok', result.error)
@@ -4209,6 +4214,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         owner.respond_decision(decision['decision_id'], 'accept', None)
         self.assertIsNone(owner.pending_decision())
         self.assertEqual(owner.execution_issues(), [])
+        self.assertEqual(owner.accepted_execution_contract(),
+            owner._execution_contract(context.store.read_json('frozen_protocol.json')))
         with self.assertRaisesRegex(ValueError, 'already answered'):
             owner.respond_decision(decision['decision_id'], 'accept')
         context.store.write_json('frozen_protocol.json', {'command': ['different']})
@@ -4219,6 +4226,64 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             SourcePolicy.model_validate({'max_chunks': 0})
         with self.assertRaises(ValueError):
             SourcePolicy.model_validate({'providers': ['invented']})
+
+    def test_fixed_comparison_design_binds_static_science_and_restored_acceptance(self) -> None:
+        from simple_ar.tools.scientific import ScientificToolGateway, freeze_measurement_set, fixed_measurement_issues
+        from simple_ar.tools.sources import SourceToolGateway
+        for policy in ('skip', 'run'):
+            with self.subTest(policy=policy):
+                root, workspace, owner, context = self._professional_design_fixture(baseline_policy=policy)
+                declared = freeze_measurement_set(owner.policy.execution_boundary)
+
+                def science(source, contract=declared):
+                    return ScientificToolGateway(root, workspace, workspace.ledger, 'fixed-design',
+                        execution_contract=contract, research_contract=source.accepted_execution_contract,
+                        research_requirements=source.execution_issues)
+
+                unrestricted = SourceToolGateway(root, workspace, workspace.ledger,
+                    policy=owner.policy.model_copy(update={'require_design': False}))
+                self.assertEqual(science(unrestricted).execution_issues(), [])
+                self.assertIn('no accepted', science(owner).execution_issues()[0])
+                arguments = {'operation': 'design', 'question': 'Test the chosen method',
+                    'synthesis_record': 'source0/synthesis.json'}
+                result = owner.execute_tool('research', context, arguments)
+                self.assertEqual(result.status, 'ok', result.error)
+                self.assertIn('bound acceptance', science(owner).execution_issues()[0])
+                owner.respond_decision(owner.pending_decision()['decision_id'], 'accept')
+                self.assertEqual(science(owner).execution_issues(), [])
+                self.assertEqual(owner.accepted_execution_contract(), declared)
+                # Design metadata is retained, but must not replace absent caller protocol.
+                self.assertIsNotNone(context.store.read_json('frozen_protocol.json')['protocol'])
+                if policy == 'skip':
+                    with self.assertRaisesRegex(ValueError, 'Requested comparison'):
+                        owner._execution_contract({**owner.policy.execution_boundary, 'comparison_required': True})
+                else:
+                    # A baseline-only declaration must not constrain candidate metadata.
+                    boundary = {**owner.policy.execution_boundary,
+                        'baseline': {'command': ['python', 'measure.py'], 'protocol': {'hypothesis': 'Baseline'}}}
+                    accepted = freeze_measurement_set(boundary)
+                    accepted['conditions'][1]['execution']['protocol'] = {'hypothesis': 'Candidate evidence'}
+                    self.assertEqual(fixed_measurement_issues(boundary, accepted), [])
+                    accepted['conditions'][0]['execution']['protocol']['hypothesis'] = 'Different baseline'
+                    self.assertIn('explicit fixed', fixed_measurement_issues(boundary, accepted)[0])
+                for field, value in (('command', ['python', 'different.py']),
+                        ('result_schema', {'required_metrics': ['different_metric']})):
+                    with self.subTest(field=field):
+                        changed = json.loads(json.dumps(declared))
+                        changed['conditions'][0]['execution'][field] = value
+                        self.assertIn('fixed scientific', science(owner, changed).execution_issues()[0])
+                        boundary = {**owner.policy.execution_boundary, field: value}
+                        different = SourceToolGateway(root, workspace, workspace.ledger,
+                            policy=owner.policy.model_copy(update={'execution_boundary': boundary}))
+                        self.assertIn('fixed physical', different.execution_issues()[0])
+                restored = SourceToolGateway(root, workspace, workspace.ledger, policy=owner.policy)
+                before = {path: path.read_bytes() for path in context.store.root.iterdir() if path.is_file()}
+                with patch('simple_ar.tools.sources.run_research_design_capability',
+                        side_effect=AssertionError('Saved acceptance must not regenerate design')):
+                    self.assertEqual(restored.execute_tool('research', context, arguments), result)
+                    self.assertEqual(science(restored).execution_issues(), [])
+                    self.assertEqual(restored.accepted_execution_contract(), declared)
+                self.assertEqual({path: path.read_bytes() for path in before}, before)
 
     def test_source_search_and_local_passages_preserve_original_identity(self) -> None:
         run_dir, inputs, fake, binding, resumed, code = self._native_fixture(allow_network=True)

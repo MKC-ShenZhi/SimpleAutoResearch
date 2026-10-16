@@ -202,6 +202,28 @@ def freeze_measurement_set(execution: dict[str, Any]) -> dict[str, Any]:
     return measurement_contract({'conditions': rows})
 
 
+def fixed_measurement_issues(declaration: dict[str, Any], accepted: dict[str, Any]) -> list[str]:
+    """Match physical slots and caller-explicit protocol fields, not added design prose."""
+    declared = (freeze_measurement_set(declaration) if any(key in declaration for key in
+        ('baseline', 'pairs', 'seeds', 'seed_count', 'baseline_policy')) else measurement_contract(declaration))
+    expected, actual = measurement_conditions(declared), measurement_conditions(accepted)
+    if len(expected) != len(actual):
+        return ['Accepted design differs from the fixed execution condition set.']
+    for index, (left, right) in enumerate(zip(expected, actual)):
+        if ({key: value for key, value in left.items() if key != 'execution'}
+                != {key: value for key, value in right.items() if key != 'execution'}
+                or {key: value for key, value in left['execution'].items() if key != 'protocol'}
+                != {key: value for key, value in right['execution'].items() if key != 'protocol'}):
+            return ['Accepted design differs from the fixed physical execution contract.']
+        explicit = (declaration['conditions'][index]['execution'] if 'conditions' in declaration else
+            declaration.get('baseline', {}) if left['role'] == 'baseline' else declaration)
+        protocol = explicit.get('protocol', declaration.get('protocol')) or {}
+        if any((left['execution'].get('protocol') or {}).get(key)
+                != (right['execution'].get('protocol') or {}).get(key) for key in protocol):
+            return ['Accepted design differs from an explicit fixed execution protocol field.']
+    return []
+
+
 def _hash(path: Path) -> str:
     with path.open('rb') as stream:
         return hashlib.file_digest(stream, 'sha256').hexdigest()
@@ -234,7 +256,17 @@ class ScientificToolGateway:
         self._research_requirements = research_requirements
 
     def execution_issues(self) -> list[str]:
-        return self._research_requirements() if self._research_requirements is not None else []
+        issues = self._research_requirements() if self._research_requirements is not None else []
+        if issues:
+            return issues
+        if self._declared_execution_contract is not None and self._research_contract is not None:
+            try:
+                accepted = self._research_contract()
+                if accepted is not None and accepted != self._declared_execution_contract:
+                    return ['Accepted research design differs from the fixed scientific execution contract.']
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                return [str(exc)]
+        return []
 
     @property
     def execution_contract(self) -> dict[str, Any] | None:
