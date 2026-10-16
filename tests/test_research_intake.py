@@ -63,6 +63,52 @@ def _reply(name, arguments):
 
 
 class ResearchIntakeTests(unittest.TestCase):
+    def test_native_default_attempts_do_not_inherit_legacy_stage_units(self):
+        from simple_ar.app.research_application import create_session, load_session
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            note = root / 'note.md'
+            note.write_text('A supplied observation, not a verified conclusion.', encoding='utf-8')
+            brief = ResearchBrief(request_text='Assess the supplied observation.',
+                requested_outputs=('assessment',), asset_requests=({'locator': str(note)},))
+            client = _JSONClient()
+            services = ResearchApplicationServices(llm_client=client,
+                config={'research_materials_only': True})
+            self.assertIsNone(services.max_attempts)
+            app = create_research_task(brief, root=root / 'native', services=services)
+            self.assertEqual(app.session.manifest.budget.max_attempts, 300)
+            actions = [{'tool_name': 'write_file', 'arguments': {
+                'path': f'workspace/note-{index}.md', 'content': 'Observed evidence only.'}}
+                for index in range(17)]
+            actions.append({'tool_name': 'ask_user', 'arguments': {
+                'question': 'Which scientific interpretation should the next comparison address?'}})
+            app.run(actions=actions, progress=lambda _: None)
+            self.assertTrue((root / 'native/workspace/note-16.md').is_file())
+            self.assertEqual(len(app.session.list_attempts()), 18)
+            self.assertEqual(client.calls, [])
+            self.assertEqual(app.ledger.entries, ())
+            for name, options, expected in (
+                    ('bounded-model', replace(services, budget_limits={'llm_requests': 4, 'total_tokens': 100000}), 40),
+                    ('explicit', replace(services, max_attempts=7), 7),
+                    ('caller', replace(services, llm_client=None), 16)):
+                with self.subTest(creation=name):
+                    created = create_research_task(brief, root=root / name, services=options)
+                    self.assertEqual(created.session.manifest.budget.max_attempts, expected)
+                    restored = ToolApplication.load(root / name, services=replace(options, max_attempts=999))
+                    self.assertEqual(restored.session.manifest.budget.max_attempts, expected)
+            experiments = create_research_task(replace(brief, requested_outputs=('experiments',)),
+                root=root / 'experiments', services=services)
+            self.assertEqual(experiments.session.manifest.budget.max_attempts, 300)
+            self.assertEqual(experiments.ledger.remaining('process_invocations'), 16)
+            legacy = create_session(brief, root=root / 'legacy', services=replace(services, llm_client=None))
+            self.assertEqual(legacy.services.max_attempts, 16)
+            restored = load_session(root / 'legacy', services=ResearchApplicationServices(max_attempts=999))
+            self.assertEqual(restored.services.max_attempts, 16)
+            self.assertEqual(restored.controller.manifest.budget.max_attempts, 16)
+            for invalid in (0, -1, True, 1.5, '16'):
+                with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                    ResearchApplicationServices(max_attempts=invalid)
+
     def test_deferred_experiment_retains_materials_then_supplies_execution_in_same_task(self):
         import sys
         from simple_ar.tools.scientific import measurement_contract

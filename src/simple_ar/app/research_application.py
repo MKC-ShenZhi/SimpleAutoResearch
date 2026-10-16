@@ -111,7 +111,8 @@ class ResearchApplicationServices:
     budget_limits: Mapping[str, int | float | None] = field(
         default_factory=lambda: {"llm_requests": None, "total_tokens": None}
     )
-    max_attempts: int = 16
+    # None leaves new native-task sizing to its owner; legacy stages resolve 16.
+    max_attempts: int | None = None
     max_no_progress: int = 3
     message_callback: Callable[[str], None] | None = field(default=None, repr=False, compare=False)
 
@@ -120,7 +121,8 @@ class ResearchApplicationServices:
             raise ValueError("Research application numeric settings must be positive.")
         if self.max_chunks is not None and self.max_chunks < 1:
             raise ValueError("max_chunks must be positive when provided.")
-        if self.max_attempts < 1 or self.max_no_progress < 1:
+        if (self.max_attempts is not None and (
+                type(self.max_attempts) is not int or self.max_attempts < 1)) or self.max_no_progress < 1:
             raise ValueError("Research application budgets must be positive.")
         for name in ("cache_dir", "extraction_dir", "input_base_dir"):
             value = getattr(self, name)
@@ -223,6 +225,8 @@ class ResearchApplication:
         services: ResearchApplicationServices | None = None,
     ) -> "ResearchApplication":
         settings = services or ResearchApplicationServices()
+        if settings.max_attempts is None:
+            settings = replace(settings, max_attempts=16)
         assets = _normalize_assets(brief, settings)
         diagnostics = validate_brief(brief, assets)
         _raise_on_errors(diagnostics)
@@ -286,6 +290,7 @@ class ResearchApplication:
         config.update(settings.config)
         settings = replace(
             settings,
+            max_attempts=controller.manifest.budget.max_attempts,
             max_results=runtime["max_results"],
             max_chunks=runtime["max_chunks"],
             idea_limit=runtime["idea_limit"],

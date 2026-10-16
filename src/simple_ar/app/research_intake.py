@@ -157,7 +157,8 @@ def create_research_task(brief: ResearchBrief, *, root: str | Path, services: An
     if unsupported_limits:
         raise ValueError('Unsupported creation resource controls: ' + ', '.join(sorted(unsupported_limits)))
     source_count = max(1, len(policy.queries)) * len(policy.providers)
-    execution_runs = settings.max_attempts if 'experiments' in outputs else 0
+    # Preserve the old bounded process allowance independently of native attempts.
+    execution_runs = (settings.max_attempts if settings.max_attempts is not None else 16) if 'experiments' in outputs else 0
     network_runs = source_count if policy.allow_network and (projection is None or research_work) else 0
     process_defaults = (projection['process_limits'] if projection is not None else {
         'process_invocations': execution_runs,
@@ -171,6 +172,10 @@ def create_research_task(brief: ResearchBrief, *, root: str | Path, services: An
             ('process_invocations', process_defaults['process_invocations'], network_runs * 4),
             ('process_wall_seconds', process_defaults['process_wall_seconds'], network_runs * 120))}
     root = Path(root).expanduser().resolve()
+    # Caller-directed work has no model-turn budget from which to size attempts.
+    attempt_limit = settings.max_attempts
+    if selected_model is None and attempt_limit is None:
+        attempt_limit = 16
     app = ToolApplication.create(root, (brief.objective or brief.request_text)
         + '\nOriginal user request and declared constraints:\n' + json.dumps(brief.to_dict(), ensure_ascii=False),
         model=selected_model, sources=mounts, allow_vision=allow_vision,
@@ -179,7 +184,7 @@ def create_research_task(brief: ResearchBrief, *, root: str | Path, services: An
             if limits.get('llm_requests') is not None else 30 if selected_model is not None else 0),
         max_tokens=(limits.get('total_tokens') if limits.get('total_tokens') is not None
             else 600000 if selected_model is not None else 0),
-        max_attempts=settings.max_attempts, report_requirement=report,
+        max_attempts=attempt_limit, report_requirement=report,
         max_output_tokens=config.get('max_output_tokens'), table_analysis=table,
         research_policy=policy.model_dump(mode='json') if projection is None or research_work or confirm_execution else None,
         code_task=projection['code_task'] if projection else None,

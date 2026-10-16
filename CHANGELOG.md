@@ -9,6 +9,7 @@ User-visible changes, newest first. Entries describe behavior on their date; lat
 - New native tasks protect a follow-up opportunity and require an explicit closing action batch when no further decision fits. Invalid closing batches are retained without execution, not marked successful; saved admission policies and ledgers remain unchanged.
 - Public Python task creation accepts explicit `allow_vision=True` inspection authorization, using existing named vision routing and the shared request/token ledger; it does not grant source network access or image generation.
 - Completed-response corrections now distinguish unchanged historical unknown charges from uncertainty introduced by the current operation. Original charges, shared limits, transport-stop rules and exact source checks remain intact.
+- Public Python creation no longer applies the legacy 16-stage default to individual native operations. Explicit and saved attempt limits remain unchanged, without increasing process allowances.
 
 ## 2026-10-16
 
