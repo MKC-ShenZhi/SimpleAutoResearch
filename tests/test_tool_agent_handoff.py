@@ -4682,6 +4682,174 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             AttemptManifest('research-design', capability='native_tool'))
         return root, workspace, owner, context
 
+    def test_caller_protocol_confirmation_preserves_fixed_owner_and_terminal_replay(self) -> None:
+        from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
+        from simple_ar.tools.scientific import ScientificToolGateway, measurement_contract
+        from simple_ar.tools.sources import SourcePolicy, SourceToolGateway, source_tool_specs
+
+        for response in ('accept', 'reject', 'revise'):
+            with self.subTest(response=response):
+                root, inputs, workspace = self._workspace_fixture()
+                flat = measurement_contract({'command': ['python', 'measure.py'],
+                    'cwd': str(inputs), 'timeout_sec': 3, 'result_schema': {'required_metrics': ['score']}})
+                fixed = {'conditions': [{'id': 'baseline', 'role': 'baseline', 'seed': None,
+                    'source': 'preparation', 'before_implementation': True, 'execution': flat},
+                    {'id': 'candidate', 'role': 'candidate', 'seed': None,
+                     'source': 'implementation', 'execution': flat}]}
+                science = ScientificToolGateway(root, workspace, workspace.ledger, 'caller-contract',
+                    execution_contract=fixed)
+                factory = Mock(side_effect=AssertionError('Caller declaration must not call a model'))
+                policy = SourcePolicy(require_design=True, allow_network=False)
+                owner = SourceToolGateway(root, workspace, workspace.ledger, policy=policy,
+                    execution_contract=science.execution_contract, client_factory=factory,
+                    feasibility_client_factory=factory)
+                science._research_contract = owner.accepted_execution_contract
+                science._research_requirements = owner.execution_issues
+                ledger_before = workspace.ledger.to_dict()
+                with patch('simple_ar.tools.sources.run_research_design_capability') as no_design:
+                    decision = owner.declare_execution_protocol()
+                    self.assertEqual(decision['proposal_kind'], 'caller_execution_protocol')
+                    self.assertEqual(decision['provenance'], 'caller-provided-not-research-design')
+                    self.assertNotIn('design_record', decision)
+                    self.assertEqual(owner.pending_decision(), decision)
+                    directory = Path(decision['protocol_record']).parent
+                    self.assertEqual(directory.parent, root / 'inputs/caller-protocols')
+                    self.assertEqual(json.loads(Path(decision['protocol_record']).read_bytes()), fixed)
+                    before = {path: path.read_bytes() for path in directory.iterdir()}
+                    self.assertEqual(owner.declare_execution_protocol(), decision)
+                    self.assertEqual({path: path.read_bytes() for path in before}, before)
+                    self.assertTrue(science.execution_issues())
+                    with self.assertRaisesRegex(ValueError, 'mismatched'):
+                        owner.respond_decision('wrong-id', response)
+                    receipt = owner.respond_decision(decision['decision_id'], response, 'Keep caller scope')
+                    self.assertEqual({key: receipt[key] for key in decision}, decision)
+                    terminal = {path: path.read_bytes() for path in directory.iterdir()}
+                    self.assertEqual(owner.respond_decision(decision['decision_id'], response,
+                        'Keep caller scope'), receipt)
+                    self.assertEqual(owner.declare_execution_protocol(), decision)
+                    for changed_response, guidance in ((response, 'Changed guidance'),
+                            ('revise' if response == 'accept' else 'accept', 'Keep caller scope')):
+                        with self.assertRaisesRegex(ValueError, 'already answered'):
+                            owner.respond_decision(decision['decision_id'], changed_response, guidance)
+                    restored = SourceToolGateway(root, workspace, workspace.ledger, policy=policy,
+                        execution_contract=science.execution_contract)
+                    self.assertIsNone(restored.pending_decision())
+                    self.assertEqual(restored.declare_execution_protocol(), decision)
+                    if response == 'accept':
+                        self.assertEqual(science.execution_issues(), [])
+                        self.assertIs(restored.accepted_execution_contract(), science.execution_contract)
+                        self.assertEqual(restored.implementation_evidence(), {})
+                        for key, value in (('source', 'declared'), ('before_implementation', False)):
+                            row = science.execution_contract['conditions'][0]
+                            previous = row[key]
+                            row[key] = value
+                            self.assertTrue(restored.execution_issues())
+                            self.assertIsNone(restored.accepted_execution_contract())
+                            row[key] = previous
+                    else:
+                        self.assertTrue(science.execution_issues())
+                        self.assertIsNone(restored.accepted_execution_contract())
+                    self.assertEqual({path: path.read_bytes() for path in terminal}, terminal)
+                    no_design.assert_not_called()
+                factory.assert_not_called()
+                self.assertFalse((root / 'attempts').exists())
+                self.assertFalse((root / 'tools/processes').exists())
+                self.assertEqual(workspace.ledger.to_dict(), ledger_before)
+                self.assertNotIn('declare_execution_protocol', {spec.name for spec in source_tool_specs()})
+                if response == 'accept':
+                    # A real subsequent scientific invocation still needs separate process authority.
+                    workspace.mounts['records'] = root / 'attempts'
+                    context = CapabilityContext(ArtifactStore(root / 'attempts/unapproved-measurement'),
+                        AttemptManifest('unapproved-measurement', capability='native_tool'))
+                    with patch('simple_ar.tools.scientific.run_experiment_capability') as no_measure:
+                        result = science.execute_tool('measure_experiment', context, flat)
+                        self.assertEqual(result.status, 'blocked')
+                        self.assertIn('execution approval', result.error)
+                        no_measure.assert_not_called()
+                    self.assertEqual(workspace.ledger.to_dict(), ledger_before)
+
+    def test_caller_protocol_tampering_partial_recovery_and_real_design_cannot_downgrade(self) -> None:
+        from simple_ar.tools.scientific import measurement_contract
+        from simple_ar.tools.sources import SourcePolicy, SourceToolGateway
+
+        root, inputs, workspace = self._workspace_fixture()
+        policy = SourcePolicy(require_design=True)
+        with self.assertRaisesRegex(ValueError, 'scientific owner'):
+            SourceToolGateway(root, workspace, workspace.ledger, policy=policy).declare_execution_protocol()
+        fixed = measurement_contract({'command': ['python', 'measure.py'], 'cwd': str(inputs),
+            'timeout_sec': 3, 'result_schema': {'required_metrics': ['score']}})
+        owner = SourceToolGateway(root, workspace, workspace.ledger, policy=policy, execution_contract=fixed)
+        decision = owner.declare_execution_protocol()
+        owner.respond_decision(decision['decision_id'], 'accept')
+        directory = Path(decision['protocol_record']).parent
+        original = {path: path.read_bytes() for path in directory.iterdir()}
+        mutations = {
+            'frozen_protocol.json': original[directory / 'frozen_protocol.json'] + b'\n',
+            'protocol_response.json': json.dumps({**read_json(directory / 'protocol_response.json'),
+                'decision_id': 'wrong-id'}).encode(),
+            'protocol_decision.json': json.dumps({**decision, 'proposal_kind': 'research_design'}).encode(),
+        }
+        for name, content in mutations.items():
+            with self.subTest(tampered=name):
+                path = directory / name
+                path.write_bytes(content)
+                self.assertTrue(owner.execution_issues())
+                self.assertIsNone(owner.accepted_execution_contract())
+                with self.assertRaises(ValueError):
+                    owner.declare_execution_protocol()
+                self.assertEqual(path.read_bytes(), content)
+                path.write_bytes(original[path])
+        changed_contract = {**fixed, 'timeout_sec': 4}
+        for contract, changed_policy in ((changed_contract, policy),
+                (fixed, policy.model_copy(update={'allow_network': False}))):
+            restored = SourceToolGateway(root, workspace, workspace.ledger,
+                policy=changed_policy, execution_contract=contract)
+            self.assertTrue(restored.execution_issues())
+            with self.assertRaises(ValueError):
+                restored.declare_execution_protocol()
+        # Mutating the owner's live reference cannot expand an already frozen declaration.
+        fixed['timeout_sec'] = 4
+        self.assertTrue(owner.execution_issues())
+        fixed['timeout_sec'] = 3
+        (directory / 'caller_request.json').unlink()
+        retained = {path: path.read_bytes() for path in directory.iterdir()}
+        with self.assertRaises((OSError, ValueError)):
+            owner.declare_execution_protocol()
+        self.assertEqual({path: path.read_bytes() for path in directory.iterdir()}, retained)
+        (directory / 'caller_request.json').write_bytes(original[directory / 'caller_request.json'])
+        self.assertEqual(owner.execution_issues(), [])
+
+        root, workspace, design_owner, context = self._professional_design_fixture()
+        result = design_owner.execute_tool('research', context, {'operation': 'design',
+            'question': 'Test the chosen method', 'synthesis_record': 'source0/synthesis.json'})
+        self.assertEqual(result.status, 'ok', result.error)
+        real_decision = design_owner.pending_decision()
+        design_owner.respond_decision(real_decision['decision_id'], 'accept')
+        evidence = design_owner.implementation_evidence()
+        self.assertEqual(len(evidence['hashes']), 6)
+        self.assertEqual(workspace.resolve(evidence['design_ref']), context.store.resolve('research_design.json'))
+        restored = SourceToolGateway(root, workspace, workspace.ledger, policy=design_owner.policy)
+        self.assertEqual(restored.implementation_evidence(), evidence)
+        with self.assertRaisesRegex(ValueError, 'already answered'):
+            restored.respond_decision(real_decision['decision_id'], 'accept')
+        before = {path: path.read_bytes() for path in context.store.root.iterdir() if path.is_file()}
+        with self.assertRaisesRegex(ValueError, 'existing design protocol'):
+            restored.declare_execution_protocol()
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+        decision_path = context.store.resolve('protocol_decision.json')
+        for changes in ({}, {'proposal_kind': 'caller_execution_protocol'}):
+            broken = {key: value for key, value in real_decision.items() if key != 'design_sha256'}
+            write_json(decision_path, {**broken, **changes})
+            self.assertTrue(restored.execution_issues())
+            self.assertIsNone(restored.accepted_execution_contract())
+            with self.assertRaises((ValueError, KeyError)):
+                restored.implementation_evidence()
+        decision_path.write_bytes(before[decision_path])
+        self.assertEqual(restored.implementation_evidence(), evidence)
+        source = workspace.resolve('source0/synthesis.json')
+        source.write_text('{}')
+        self.assertTrue(restored.execution_issues())
+
     def test_professional_design_confirmation_binds_protocol_and_rejects_replay(self) -> None:
         from simple_ar.tools.sources import SourcePolicy
         root, workspace, owner, context = self._professional_design_fixture()

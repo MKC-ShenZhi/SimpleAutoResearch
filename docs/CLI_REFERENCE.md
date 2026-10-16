@@ -295,6 +295,8 @@ Sections default to section drafting/review, no document review, auto outline, l
 
 Assisted confirms protocol/delivery and research choices; checkpoints confirms first protocol, material direction and delivery changes while permitting bounded same-protocol supplements; autonomous selects valid options within saved limits. Missing facts/assets/permissions block all modes.
 
+Fixed-measurement creation also accepts an explicit `--interaction checkpoints` or `assisted`. The common task freezes the caller's actual protocol and prints its decision ID. Resume with the printed `start --resume-task ... --decision-id ... --decision-response accept`, then separately approve the pending process with its exact token. Acceptance retains the queued commands; it does not run them or fabricate a research design. Identical caller replies after delivery are idempotent. Existing research-design decisions retain their original bound confirmation rules; not all historical structured creators have migrated.
+
 ~~~bash
 simple-ar research-session --session-root SESSION --model env --decision-id ID --decision-response accept
 simple-ar research-session --session-root SESSION --model env --decision-id ID --decision-response revise --decision-guidance "Revised direction"

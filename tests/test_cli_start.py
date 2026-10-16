@@ -18,6 +18,51 @@ from simple_ar.code_task.runtime.config import load_code_task_init_options, load
 
 
 class StartTests(unittest.TestCase):
+    def test_fixed_protocol_confirmation_retains_queue_and_requires_separate_process_approval(self):
+        from simple_ar.cli.main import main
+        from simple_ar.app.tool_application import ToolApplication
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / 'measure.py').write_text('from pathlib import Path\n'
+                'p=Path("calls.txt")\np.write_text(p.read_text()+"x" if p.exists() else "x")\nprint("score: 3")\n')
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(SystemExit, "status 'paused'"):
+                main(['research-session', '--topic', 'Review a literal measurement', '--task-kind', 'measurement',
+                    '--outputs', 'experiments',
+                    '--interaction', 'checkpoints', '--model', '', '--output-root', str(root / 'out'),
+                    '--cwd', str(root), '--primary-metric', 'score', '--timeout-sec', '5',
+                    '--process-invocations', '1', '--process-wall-seconds', '10',
+                    '--command', sys.executable, 'measure.py'])
+            session, = (root / 'out').iterdir()
+            app = ToolApplication.load(session)
+            self.assertEqual(app.session.manifest.transition_recipe, ToolApplication.RECIPE)
+            proposal = app.sources.pending_decision()
+            self.assertEqual(proposal['proposal_kind'], 'caller_execution_protocol')
+            self.assertFalse(app.session.list_attempts())
+            self.assertFalse((root / 'calls.txt').exists())
+            queue = json.loads(json.dumps(app.state['turns'][-1]['remaining']))
+            requests = list(app.state['requests'])
+            reply = {'decision_id': proposal['decision_id'], 'decision_response': 'accept'}
+            app = ToolApplication.load(session)
+            status = app.run(decision=reply, progress=lambda _: None)
+            self.assertEqual(status['status'], 'paused')
+            self.assertEqual(app.state['turns'][-1]['remaining'], queue)
+            self.assertEqual(app.state['requests'], requests)
+            self.assertFalse((root / 'calls.txt').exists())
+            self.assertFalse(app.ledger.entries)
+            token = app.approval_token(app.state['pending']['call'])
+            app = ToolApplication.load(session)
+            self.assertEqual(app.run(approved_execution=token, progress=lambda _: None)['status'], 'completed')
+            self.assertEqual((root / 'calls.txt').read_text(), 'x')
+            self.assertEqual(sum(row.actual.get('process_invocations', 0) for row in app.ledger.entries), 1)
+            before = {p.relative_to(session): p.read_bytes() for p in session.rglob('*')
+                if p.is_file() and p.name != '.session.lock'}
+            app = ToolApplication.load(session)
+            self.assertEqual(app.run(decision=reply, progress=lambda _: None)['status'], 'completed')
+            self.assertEqual(app.request_execution_confirmation(), proposal)
+            self.assertEqual({p.relative_to(session): p.read_bytes() for p in session.rglob('*')
+                if p.is_file() and p.name != '.session.lock'}, before)
+            self.assertEqual((root / 'calls.txt').read_text(), 'x')
+
     def test_native_supply_records_only_after_confirmation_without_running_work(self):
         from simple_ar.cli.main import main
         from unittest.mock import MagicMock
@@ -1249,11 +1294,6 @@ class StartTests(unittest.TestCase):
                         migrate_measurement_creation(args, execution=execution,
                             request='Do not fabricate a report', outputs=('experiments', 'report'), root=root, limits=limits)
                 create.assert_not_called()
-                args._explicit_resume_destinations.add('interaction')
-                with self.assertRaisesRegex(ValueError, 'explicit controls'):
-                    migrate_measurement_creation(args, execution=execution, request='Preserve explicit controls',
-                        outputs=('experiments',), root=root, limits=limits)
-                args._explicit_resume_destinations.remove('interaction')
                 if model:
                     for key, value in (('llm_requests', 0), ('total_tokens', 0), ('total_tokens', -1)):
                         with self.assertRaisesRegex(ValueError, 'finite positive'):

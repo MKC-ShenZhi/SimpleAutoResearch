@@ -767,6 +767,30 @@ class ToolApplication:
             turn['remaining'] = []
             self.state['pending'] = None
 
+    def request_execution_confirmation(self) -> dict[str, Any]:
+        """Caller asks to review its declared protocol before process approval.
+
+        The source owner keeps the same frozen protocol/response records used
+        for professional designs. This is input confirmation, not an attempt,
+        a measurement, an execution grant or an additional task controller.
+        """
+        with self.session.mutation_scope():
+            if self.state.get('pending_supply') is not None:
+                raise ValueError('Complete the retained caller supply before confirming execution')
+            if not self.sources.policy.require_design:
+                raise ValueError('Save research_policy.require_design before declaring a caller protocol confirmation')
+            if any(row.status == 'running' for row in self.session.list_attempts()) or any(
+                    row.status in {'reserved', 'unknown'} for row in self.ledger.entries):
+                raise ValueError('Reconcile running or unknown work before proposing a protocol')
+            pending = self.state['pending']
+            if pending and (pending['kind'] == 'model' or any(
+                    row.attempt_id == pending['attempt'] for row in self.session.list_attempts())):
+                raise ValueError('Reconcile the started operation before proposing a protocol')
+            decision = self.sources.declare_execution_protocol()
+            if self.sources.pending_decision() is not None:
+                self.session.pause('Declared execution protocol awaits an explicit bound decision')
+            return decision
+
     def _submit_actions(self, actions: list[dict[str, Any]]) -> None:
         """Accept caller requests into the existing action journal, not a new scheduler.
 
@@ -2128,8 +2152,21 @@ class ToolApplication:
                     raise ValueError('Reconcile the started operation before recording a design decision')
                 if decision.get('decision_guidance') and decision.get('decision_response') != 'revise':
                     raise ValueError('Design guidance requires a revise response, not implicit conditional acceptance')
+                awaiting = self.sources.pending_decision()
                 response = self.sources.respond_decision(**decision)
-                feedback = 'Caller design decision (not process authorization): ' + json.dumps(response, ensure_ascii=False)
+                if response.get('proposal_kind') == 'caller_execution_protocol':
+                    if awaiting is None and not self.state['pending'] and not any(
+                            row['remaining'] for row in self.state['turns']):
+                        return self.session.status_snapshot()
+                    if response['decision_response'] == 'accept':
+                        # Acknowledging the same caller contract is not a new
+                        # goal: preserve its queued, as-yet unapproved commands.
+                        if self.session.manifest.status not in {'created', 'running'}:
+                            self.session.continue_with_revision('Accepted caller execution protocol')
+                    else:
+                        feedback = 'Caller protocol decision (not process authorization): ' + json.dumps(response, ensure_ascii=False)
+                else:
+                    feedback = 'Caller design decision (not process authorization): ' + json.dumps(response, ensure_ascii=False)
             if (actions is not None and self.state['pending']
                     and self.state['pending']['kind'] == 'model'
                     and (feedback or approved_execution or read_only_sources or allow_execution
@@ -2204,6 +2241,10 @@ class ToolApplication:
                     pending = {"kind": "tool", "call": call,
                         "attempt": self.session.allocate_attempt_id("native-tool")}
                 else:
+                    if decision := self.sources.pending_decision():
+                        self.session.pause('Protocol requires an explicit bound user decision')
+                        progress('Pending protocol decision: ' + json.dumps(decision, ensure_ascii=False))
+                        return
                     if (self.state['config']['model'] is None
                             or caller_takeover):
                         self.session.pause('Caller actions consumed; submit explicit next work or delivery. No model decision was requested.')
@@ -2233,6 +2274,13 @@ class ToolApplication:
                 continue
             call = pending["call"]
             name = call["function"]["name"]
+            spec = self.gateway.registry.get(name)
+            if (spec is not None and spec.permission_level == 'execution'
+                    and (decision := self.sources.pending_decision())
+                    and (decision.get('proposal_kind') == 'caller_execution_protocol' or name != 'prepare_code_task')):
+                self.session.pause('Protocol requires an explicit bound user decision before process approval')
+                progress('Pending protocol decision: ' + json.dumps(decision, ensure_ascii=False))
+                return
             if (self.state["config"]["allow_execution"]
                     and (spec := self.gateway.registry.get(name)) is not None and spec.permission_level == 'execution'
                     and self.gateway.policy.is_allowed(spec)[0]

@@ -76,6 +76,8 @@ simple-ar start --kind data_analysis --scripted --data-file measurements.csv --g
 
 ### 原生任务恢复
 
+固定测量新建也支持显式 `--interaction checkpoints` 或 `assisted`：共同任务冻结调用方实际协议并打印 decision ID。先按打印的 `start --resume-task ... --decision-id ... --decision-response accept` 接受协议，再用精确 token 单独批准待执行进程。接受保留原命令队列，不执行命令、不伪造研究设计；交付后重放相同调用方回复幂等。真实研究设计仍按原绑定规则确认，不表示所有历史结构化创建都已迁移。
+
 无模型的调用方原生任务需要补齐条件时，使用补齐文件，不要借模型重试绕过授权：
 
 ```toml

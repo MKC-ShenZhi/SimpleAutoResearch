@@ -61,6 +61,8 @@ Shared: SessionController, artifact records, budgets and execution primitives
 
 The ordinary entry chooses actions from goals and observations. Task names do not grant permissions.
 `ToolApplication.supply(supply_id=..., reason=..., changes=..., resource_allowances=...)` is a caller-only operation to fill missing native contracts, not a model tool or a new runtime. Creation and supply share preflight; the existing actions journal records prior config, pending supply and final terms. The ledger grants the same stable ID once. Work is blocked during an interrupted supply; completed observations and old charges are never rewritten. Adding measurement obligations upgrades report evidence from materials to execution; an old materials report cannot satisfy them. Existing frozen-contract replacement and historical continuation still use their original protocols.
+
+`request_execution_confirmation()` freezes an already declared scientific contract through the same source protocol owner. Caller proposals live under `inputs/caller-protocols`, not fake attempts or generated designs. Save the confirmation obligation (`research_policy.require_design=true`) through creation or supply first; accepting it neither grants process access nor cancels its queued commands. Protocol/response verification is shared with actual research designs, which still require their original design and source records. Existing user response and process approval are distinct authorities.
 Structured inputs for tables, material reports and research summaries now project frozen
 domain contracts into the common owner. Some mixed research/execution contracts and saved
 structured sessions still use ResearchApplication; it is not a silent fallback for failed native tasks.

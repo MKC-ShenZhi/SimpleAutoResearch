@@ -800,8 +800,7 @@ def migrate_measurement_creation(args: argparse.Namespace, *, execution: dict,
         supported.update({'with_report', 'local_document', 'material'})
         if not args.model:
             raise ValueError('A requested authored report requires a model; use --no-report for caller-directed measurement')
-    if autonomous:
-        supported.add('interaction')
+    supported.add('interaction')
     if research_work:
         supported.update(research_fields | {'local_document', 'material', 'selected_idea_id', 'feasibility_review_model'})
     unsupported = set(getattr(args, '_explicit_resume_destinations', ())) - supported
@@ -878,11 +877,25 @@ def migrate_measurement_creation(args: argparse.Namespace, *, execution: dict,
         for name, minimum in required.items():
             if getattr(args, name, None) is None:
                 native._process_limits[name] = max(native._process_limits[name], minimum)
+    confirm_protocol = (not research_work and 'interaction' in explicit
+        and getattr(args, 'interaction', None) in {'assisted', 'checkpoints'})
+    if confirm_protocol:
+        from simple_ar.tools.sources import SourcePolicy
+        # Persist the confirmation obligation before creating its input record:
+        # a crash between creation and declaration cannot bypass this gate.
+        native._research_policy = SourcePolicy(max_results=20, require_design=True,
+            interaction=args.interaction).model_dump(mode='json')
     app = ToolApplication.create(root, request, **native_creation_options(native))
+    if confirm_protocol:
+        decision = app.request_execution_confirmation()
+        print_line('Pending protocol decision: ' + json.dumps(decision, ensure_ascii=False))
+        print_line(f'Confirm protocol: simple-ar start --resume-task "{root}" '
+            f'--decision-id {decision["decision_id"]} --decision-response accept')
     print_line('Fixed measurement uses the common task owner, original cwd/argv and '
                + ('declared environment preparation. ' if execution.get('environment') is not None else 'inherited environment. ')
                + ('Research requires an accepted design matching the declared execution; execution proposals require approval. '
-                  if research_work else ('Each literal caller condition authorizes one initial execution through the common approval gate; '
+                  if research_work else ('Accept this bound protocol, then approve the actual process separately. '
+                  if confirm_protocol else 'Each literal caller condition authorizes one initial execution through the common approval gate; '
                   if grouped else 'The caller-supplied command authorizes this one initial execution through the common approval gate; '))
                + 'later proposals require approval. Model interpretation, when selected, uses this same task and ledger. '
                'This is not an OS sandbox.')
@@ -908,7 +921,8 @@ def migrate_measurement_creation(args: argparse.Namespace, *, execution: dict,
                 print_line('Reuse verified shared environment: ' + json.dumps(binding['shared_environment'], sort_keys=True))
         del remaining[call['id']]  # Once per literal initial caller proposal, never a retry/model proposal.
         return True
-    status = app.run(progress=print_line) if research_work else app.run(actions=actions, approve=approve, progress=print_line)
+    status = app.run(progress=print_line) if research_work else app.run(actions=actions,
+        approve=None if confirm_protocol else approve, progress=print_line)
     if grouped and not args.model:
         completion = app.measurement_completion_actions()
         if completion:

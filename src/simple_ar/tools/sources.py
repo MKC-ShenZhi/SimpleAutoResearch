@@ -209,6 +209,9 @@ class SourceToolGateway:
         self.client_factory, self.feasibility_client_factory = client_factory, feasibility_client_factory
         # Runtime reference to the scientific owner's fixed authority, not source policy.
         self._declared_execution_contract = execution_contract
+        self._caller_contract_snapshot = (self._protocol_bytes(execution_contract)
+            if execution_contract is not None else None)
+        self._caller_policy_snapshot = self._protocol_bytes(self.policy.model_dump(mode='json'))
         self.registry = default_search_provider_registry(local_documents=[str(path)
             for path in self._material_paths(list(self.policy.materials))] if self.policy.materials else [])
 
@@ -687,22 +690,128 @@ class SourceToolGateway:
             'operation': operation, 'artifact_refs': refs, 'outcomes': outcomes, **extra,
             'qualification': 'Partial statuses and domain diagnostics remain authoritative; no research quality certification.'})
 
+    @staticmethod
+    def _protocol_bytes(value: Any) -> bytes:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True,
+            separators=(',', ':'), allow_nan=False).encode('utf-8')
+
+    def _design_requests(self) -> list[Path]:
+        return [path for path in (self.root / 'attempts').glob('*/source_request.json')
+            if json.loads(path.read_text(encoding='utf-8'))['request']['operation'] == 'design']
+
+    def _caller_protocol_files(self) -> tuple[Path, dict[str, bytes], dict[str, Any]]:
+        if self._caller_contract_snapshot is None or self._declared_execution_contract is None:
+            raise ValueError('Caller protocol requires the scientific owner fixed execution contract')
+        if (self._protocol_bytes(self._declared_execution_contract) != self._caller_contract_snapshot
+                or self._protocol_bytes(self.policy.model_dump(mode='json')) != self._caller_policy_snapshot):
+            raise ValueError('Caller execution contract or original policy changed')
+        binding = {'proposal_kind': 'caller_execution_protocol',
+            'provenance': 'caller-provided-not-research-design',
+            'execution_contract': json.loads(self._caller_contract_snapshot),
+            'policy': json.loads(self._caller_policy_snapshot)}
+        request_bytes = self._protocol_bytes(binding)
+        identity = hashlib.sha256(request_bytes).hexdigest()
+        directory = self.root / 'inputs' / 'caller-protocols' / identity
+        if any(path.is_symlink() or path.is_junction()
+                for path in (directory, directory.parent, directory.parent.parent)):
+            raise ValueError('Caller protocol must remain in the actual session inputs directory')
+        decision = {'proposal_kind': binding['proposal_kind'], 'provenance': binding['provenance'],
+            'decision_id': identity + ':' + hashlib.sha256(self._caller_contract_snapshot).hexdigest(),
+            'protocol_record': str((directory / 'frozen_protocol.json').resolve()),
+            'protocol_sha256': hashlib.sha256(self._caller_contract_snapshot).hexdigest(),
+            'request_record': str((directory / 'caller_request.json').resolve()),
+            'request_sha256': identity}
+        return directory, {'caller_request.json': request_bytes,
+            'frozen_protocol.json': self._caller_contract_snapshot,
+            'protocol_decision.json': self._protocol_bytes(decision)}, decision
+
+    def declare_execution_protocol(self) -> dict[str, Any]:
+        """Freeze the caller's scientific contract for semantic confirmation only.
+
+        No design, attempt, model call, measurement or process approval is created.
+        An interrupted or changed declaration is retained and cannot be repaired
+        by replaying this method. Terminal responses are never overwritten.
+        """
+        if self._design_requests():
+            raise ValueError('Existing research design request; confirm its existing design protocol')
+        directory, files, decision = self._caller_protocol_files()
+        # Validate all retained declarations before creating another one.
+        self._decisions()
+        directory.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            directory.mkdir()
+        except FileExistsError:
+            # _decisions also rejects incomplete directories and different bytes.
+            self._decisions()
+            return decision
+        for name, content in files.items():
+            with (directory / name).open('xb') as stream:
+                stream.write(content)
+        self._decisions()
+        return decision
+
+    def _decision_protocol(self, path: Path, decision: dict[str, Any]) -> Path:
+        target = (Path(decision['protocol_record'])
+            if path.parent.parent == self.root / 'inputs' / 'caller-protocols'
+            else self.workspace.resolve(decision['protocol_record']))
+        if target.resolve() != (path.parent / 'frozen_protocol.json').resolve():
+            raise ValueError('Protocol record path differs from its actual decision')
+        return target
+
     def _decisions(self) -> list[tuple[Path, dict[str, Any]]]:
+        """One recovery/tamper check for both actual designs and caller protocols.
+
+        Origin follows the storage namespace, never the absence of design fields.
+        All consumers use these actual paths and the same bound response checks.
+        """
         rows = []
-        for path in sorted((self.root / 'attempts').glob('*/protocol_decision.json'), key=lambda item: item.stat().st_mtime_ns):
+        paths = list((self.root / 'attempts').glob('*/protocol_decision.json'))
+        caller_root = self.root / 'inputs' / 'caller-protocols'
+        if any(path.is_symlink() or path.is_junction() for path in (caller_root, caller_root.parent)):
+            raise ValueError('Caller protocol must remain in the actual session inputs directory')
+        if caller_root.exists():
+            for directory in caller_root.iterdir():
+                if not directory.is_dir() or directory.is_symlink() or directory.is_junction():
+                    raise ValueError('Invalid retained caller protocol directory')
+                paths.append(directory / 'protocol_decision.json')
+        for path in sorted(paths, key=lambda item: item.stat().st_mtime_ns):
             decision = json.loads(path.read_text(encoding='utf-8'))
-            # A decision cannot outlive successful durable professional output.
-            receipt = json.loads((path.parent / 'source_result.json').read_text(encoding='utf-8'))
-            binding = json.loads((path.parent / 'source_request.json').read_text(encoding='utf-8'))
-            if any(self._digest(Path(item)) != digest for item, digest in binding['inputs'].items()):
-                raise ValueError('Design source inputs changed; protocol decision is stale')
-            for name, key in (('research_design.json', 'design_sha256'), ('frozen_protocol.json', 'protocol_sha256')):
-                target = path.parent / name
-                if (self._digest(target) != decision[key]
-                        or receipt['hashes'].get(str(target)) != decision[key]):
-                    raise ValueError('Frozen design/protocol changed; decision is stale')
-            if decision['decision_id'] != path.parent.name + ':' + decision['protocol_sha256']:
-                raise ValueError('Protocol decision identity mismatch')
+            protocol = self._decision_protocol(path, decision)
+            if path.parent.parent == caller_root:
+                directory, files, expected = self._caller_protocol_files()
+                if directory != path.parent or decision != expected:
+                    raise ValueError('Caller protocol differs from the fixed scientific contract or policy')
+                if any(item.is_symlink() or not item.is_file() for item in directory.iterdir()):
+                    raise ValueError('Caller protocol artifacts must be original regular files')
+                if any((directory / name).read_bytes() != content for name, content in files.items()):
+                    raise ValueError('Caller protocol bytes changed; decision is stale')
+                if {item.name for item in directory.iterdir()} - {*files, 'protocol_response.json'}:
+                    raise ValueError('Unexpected retained caller protocol artifacts')
+            else:
+                # A design cannot become a caller protocol by losing design_sha256.
+                if decision.get('proposal_kind', 'research_design') != 'research_design':
+                    raise ValueError('Design decision origin changed')
+                receipt = json.loads((path.parent / 'source_result.json').read_text(encoding='utf-8'))
+                binding = json.loads((path.parent / 'source_request.json').read_text(encoding='utf-8'))
+                if binding['request']['operation'] != 'design':
+                    raise ValueError('Protocol decision has no actual design request')
+                if any(self._digest(Path(item)) != digest for item, digest in binding['inputs'].items()):
+                    raise ValueError('Design source inputs changed; protocol decision is stale')
+                design = self.workspace.resolve(decision['design_record'])
+                if design.resolve() != (path.parent / 'research_design.json').resolve():
+                    raise ValueError('Design record path differs from its actual decision')
+                for target, key in ((design, 'design_sha256'), (protocol, 'protocol_sha256')):
+                    if (self._digest(target) != decision[key]
+                            or receipt['hashes'].get(str(target)) != decision[key]):
+                        raise ValueError('Frozen design/protocol changed; decision is stale')
+                if decision['decision_id'] != path.parent.name + ':' + decision['protocol_sha256']:
+                    raise ValueError('Protocol decision identity mismatch')
+            response_path = path.parent / 'protocol_response.json'
+            if response_path.exists():
+                response = json.loads(response_path.read_text(encoding='utf-8'))
+                if (any(response.get(key) != value for key, value in decision.items())
+                        or response.get('decision_response') not in {'accept', 'reject', 'revise'}):
+                    raise ValueError('Protocol response identity changed; decision is stale')
             rows.append((path, decision))
         return rows
 
@@ -717,11 +826,24 @@ class SourceToolGateway:
         """Caller-only exact reply; no tool or natural language can self-approve."""
         if decision_response not in {'accept', 'reject', 'revise'}:
             raise ValueError('Protocol response must be accept, reject or revise')
-        pending = self.pending_decision()
-        if pending is None or pending['decision_id'] != decision_id:
+        decisions = self._decisions()
+        for path, decision in decisions:
+            response_path = path.parent / 'protocol_response.json'
+            if (decision['decision_id'] == decision_id
+                    and decision.get('proposal_kind') == 'caller_execution_protocol'
+                    and response_path.exists()):
+                receipt = json.loads(response_path.read_text(encoding='utf-8'))
+                if (receipt['decision_response'] == decision_response
+                        and receipt.get('decision_guidance') == (decision_guidance or '')):
+                    return receipt
+                raise ValueError('Caller protocol already answered with different response or guidance')
+        pending = next(((path, decision) for path, decision in decisions
+            if not (path.parent / 'protocol_response.json').exists()), None)
+        if pending is None or pending[1]['decision_id'] != decision_id:
             raise ValueError('Protocol decision is stale, already answered or mismatched')
-        path = self.root / 'attempts' / decision_id.split(':', 1)[0] / 'protocol_response.json'
-        receipt = {**pending, 'decision_response': decision_response,
+        decision_path, decision = pending
+        path = decision_path.parent / 'protocol_response.json'
+        receipt = {**decision, 'decision_response': decision_response,
             'decision_guidance': decision_guidance or '', 'authority': 'explicit caller response'}
         # Exclusive creation rejects duplicate replies without changing the old receipt.
         with path.open('x', encoding='utf-8') as stream:
@@ -745,44 +867,49 @@ class SourceToolGateway:
     def execution_issues(self) -> list[str]:
         """Semantic protocol acceptance is independent of process permission."""
         try:
-            requests = list((self.root / 'attempts').glob('*/source_request.json'))
-            designs = [path for path in requests
-                if json.loads(path.read_text(encoding='utf-8'))['request']['operation'] == 'design']
-            if not self.policy.require_design and not designs:
+            designs = self._design_requests()
+            decisions = self._decisions()
+            if not self.policy.require_design and not designs and not decisions:
                 return []
-            if not designs:
+            if not designs and not decisions:
                 return ['Requested design has no accepted frozen protocol.']
-            latest = max(designs, key=lambda path: path.stat().st_mtime_ns).parent
-            decisions = {path.parent: decision for path, decision in self._decisions()}
-            decision = decisions.get(latest)
-            response_path = latest / 'protocol_response.json'
-            if decision is None or not response_path.exists():
+            selected = self._execution_decision(decisions, designs)
+            if selected is None or not (selected[0].parent / 'protocol_response.json').exists():
                 return ['Design awaits a ready frozen protocol and its bound acceptance.']
-            response = json.loads(response_path.read_text(encoding='utf-8'))
-            if (any(response.get(key) != value for key, value in decision.items())
-                    or response.get('decision_response') != 'accept'):
+            path, decision = selected
+            response = json.loads((path.parent / 'protocol_response.json').read_text(encoding='utf-8'))
+            if response['decision_response'] != 'accept':
                 return ['Latest design was not accepted; revise or resolve its bound protocol decision.']
             boundary = self._fixed_execution_boundary()
             if boundary is not None:
                 # Read this already verified decision directly: accepted_protocol
                 # calls this gate and must not become a recursive acceptance check.
-                accepted = self._execution_contract(json.loads(
-                    (latest / 'frozen_protocol.json').read_text(encoding='utf-8')))
+                protocol = json.loads(self._decision_protocol(path, decision).read_text(encoding='utf-8'))
+                accepted = (protocol if decision.get('proposal_kind') == 'caller_execution_protocol'
+                    else self._execution_contract(protocol))
                 from simple_ar.tools.scientific import fixed_measurement_issues
                 return fixed_measurement_issues(boundary, accepted)
             return []
         except (OSError, ValueError, KeyError, TypeError) as exc:
             return [str(exc)]
 
+    @staticmethod
+    def _execution_decision(decisions: list[tuple[Path, dict[str, Any]]],
+                            designs: list[Path]) -> tuple[Path, dict[str, Any]] | None:
+        if designs:
+            latest = max(designs, key=lambda path: path.stat().st_mtime_ns).parent
+            return next((row for row in decisions if row[0].parent == latest), None)
+        return decisions[-1] if decisions else None
+
     def accepted_protocol(self) -> dict[str, Any] | None:
         if self.execution_issues():
             return None
-        decisions = self._decisions()
-        if not decisions:
+        selected = self._execution_decision(self._decisions(), self._design_requests())
+        if selected is None:
             return None
-        path, decision = decisions[-1]
+        path, decision = selected
         return {**decision, 'execution_protocol': json.loads(
-            (path.parent / 'frozen_protocol.json').read_text(encoding='utf-8'))}
+            self._decision_protocol(path, decision).read_text(encoding='utf-8'))}
 
     def _fixed_execution_boundary(self) -> dict[str, Any] | None:
         if self._declared_execution_contract is not None:
@@ -835,9 +962,9 @@ class SourceToolGateway:
         if issues := self.execution_issues():
             raise ValueError('; '.join(issues))
         accepted = self.accepted_protocol()
-        if accepted is None:
+        if accepted is None or accepted.get('proposal_kind') == 'caller_execution_protocol':
             return {}
-        directory = self.root / 'attempts' / accepted['decision_id'].split(':', 1)[0]
+        directory = self.workspace.resolve(accepted['design_record']).parent
         names = ('research_design.json', 'frozen_protocol.json', 'protocol_decision.json',
             'protocol_response.json', 'source_request.json', 'source_result.json')
         hashes = {self.workspace.locator(str(directory / name)): self._digest(directory / name)
