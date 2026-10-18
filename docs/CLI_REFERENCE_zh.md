@@ -400,9 +400,19 @@ simple-ar report-export --report-dir REPORT_ATTEMPT --output NEW_DIR --title "�
 
 必须提供 `--report-dir` 和 `--output`；`--title TEXT` 和 `--compile` 可选。输入需要 `report_body.md`，有引用时还需要书目。Pandoc 转换已有文本，不调用模型或实验。
 
+可用 `--citation-style numeric|template` 显式选择引用呈现。`numeric` 在模板设置完成后配置 natbib，使用方括号数字（包括叙述式和省略作者的引用），使无作者条目显示数字而非来源 ID；已加载 natbib 时不会重复传包选项造成冲突。源码和产物中的 citekey、BibTeX 条目保持原样，不推测作者或年份。`template` 保留所供模板的引用默认值；内置 ACM 仍使用 `acmnumeric`。省略选项保留历史渲染和 manifest 形状，只有显式选择才会在 `export.json` 增加 `citation_style`。
+
+使用 `--latex-template layout/article.latex` 指定相对 `--report-dir` 的可信 Pandoc LaTeX 模板，重复 `--template-asset local.bst` 显式列出模板旁的扁平伴随文件。`--tex-engine pdflatex|xelatex` 可选，默认 pdflatex；该参数与 `--template-asset` 均要求 `--latex-template`。沿用现有有界模板契约：`$body$` 位于 `\begin{document}` 之后，导言区包含 `$for(header-includes)$$header-includes$$endfor$`。文档类、正文布局和字面指定的书目样式仍由模板控制。`$biblio-style$` 默认 plainnat，显式 numeric 时改用 **plainurl**（TeX Live/MiKTeX 的 **urlbst** 包），避免把缺作者记录的内部 key 印入书目，同时保留 URL/DOI 出处；不静默回退到会丢失出处的 plain。模板字面指定的自定义样式仍控制其参考文献格式。数字引用要求模板加载 natbib；缺少的 TeX 依赖应在编译前安装，导出器不会自行下载。可信 TeX 并非沙箱，不提供模板发现或新运行时。例如：
+
+~~~bash
+simple-ar report-export --report-dir REPORT_ATTEMPT --output NEW_DIR --latex-template layout/article.latex --citation-style numeric --compile
+~~~
+
+原生 `export_report` 工具在现有 `template` 配置之外接受相同的可选 `citation_style: "numeric" | "template" | null`。工具可根据普通出版目标显式选择样式，用户无需输入哈希。省略或 null 不进入序列化请求与输入绑定，保留历史请求哈希和恢复语义。显式选择经现有审批、保存请求和导出 manifest 绑定；修改样式需要新的导出标识或输出目录，冻结恢复不会给旧产物换样式或重新编译。
+
 本地图形和登记的矢量版本会复制；SVG 转 TeX 需要 rsvg-convert。远程图像不会获取。外部证据链接会转为标签，目标记录在 `export.json`，不会自动复制数据集。
 
-输出是可移动的单栏 acmart 项目，包含 `main.tex`、`body.tex`、`source.md`、书目、图形、`export.json`，以及保存字面代码的 `code/block-*.txt`。请保留整个目录。
+默认输出是可移动的单栏 acmart 项目；提供模板时保留其文档类和正文布局。两者均包含 `main.tex`、`body.tex`、`source.md`、书目、图形、`export.json`，以及保存字面代码的 `code/block-*.txt`。请保留整个目录。
 
 登记图注会绑定到导出，只去掉紧邻的完全相同图注；没有 manifest 时保留已有图注。图形使用 htbp，不强制固定位置。
 

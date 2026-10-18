@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -46,6 +47,7 @@ class ReportExportTests(unittest.TestCase):
         from simple_ar.core.budget import BudgetLedger, BudgetUnknownError
         from simple_ar.tools.workspace import WorkspaceToolGateway
         from simple_ar.tools.publication import ExportRequest, PublicationToolGateway, export_input_binding
+        from simple_ar.app.tool_application import ToolApplication
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -53,13 +55,17 @@ class ReportExportTests(unittest.TestCase):
                 storage_path=root / 'budget.json')
             workspace = WorkspaceToolGateway(root, {}, ledger)
             source = workspace.workspace / 'draft.md'
-            source.write_text('# Résumé α\n\nBody [@p1].\n', encoding='utf-8')
-            (source.parent / 'references.bib').write_text('@misc{p1, title={Evidence}}', encoding='utf-8')
+            original_markdown = '# Résumé α\n\nBody [@material-a1b2; @p2]. Narrative @material-a1b2; [-@p2].\n'
+            source.write_text(original_markdown, encoding='utf-8')
+            original_bib = ('@misc{material-a1b2, key={material-a1b2}, title={Evidence}, url={https://example.org/evidence}}\n'
+                '@article{p2, author={Doe, Jane}, year={2024}, title={Authored evidence}, doi={10.1234/example}}\n')
+            (source.parent / 'references.bib').write_text(original_bib, encoding='utf-8')
             bundle = source.parent / 'layout'
             bundle.mkdir()
             template = bundle / 'article.latex'
             template.write_text('\\documentclass{article}\n'
-                '$for(header-includes)$\n$header-includes$\n$endfor$\n\\usepackage{natbib}\n'
+                '\\usepackage[authoryear,round]{natbib}\n'
+                '$for(header-includes)$\n$header-includes$\n$endfor$\n'
                 '\\title{$title$}\n\\begin{document}\n\\maketitle\n$abstract$\n$body$\n'
                 '\\bibliographystyle{local}\n\\bibliography{references}\n\\end{document}\n', encoding='utf-8')
             companion = bundle / 'local.bst'
@@ -73,6 +79,21 @@ class ReportExportTests(unittest.TestCase):
             self.assertNotIn('template', export_input_binding(source, ExportRequest(markdown=arguments['markdown'])))
             self.assertNotIn('checks', ExportRequest(markdown=arguments['markdown']).model_dump())
             self.assertNotIn('checks', approved)
+            historical_request = {'markdown': arguments['markdown'], 'title': '', 'compile_pdf': False,
+                'template': arguments['template']}
+            self.assertEqual(approved, {**historical_request, 'inputs': approved['inputs'], 'image_binding_version': 1})
+            self.assertNotIn('citation_style', request.model_dump())
+            self.assertEqual(ExportRequest.model_validate({**arguments, 'citation_style': None}).model_dump(),
+                request.model_dump())
+            schema = ExportRequest.model_json_schema()
+            self.assertIn({'enum': ['numeric', 'template'], 'type': 'string'},
+                schema['properties']['citation_style']['anyOf'])
+            # Exercise the actual native approval consumer, using the old
+            # serialized input shape as the expected pre-feature hash.
+            app = SimpleNamespace(workspace=workspace, gateway=SimpleNamespace(session_owner=lambda name: None))
+            call = {'function': {'name': 'export_report', 'arguments': json.dumps(arguments)}}
+            old_token = hashlib.sha256(json.dumps({'call': call, 'inputs': approved}, sort_keys=True).encode()).hexdigest()
+            self.assertEqual(ToolApplication.approval_token(app, call), old_token)
             gateway = PublicationToolGateway(root, workspace, ledger)
             standalone = []
             failure = False
@@ -94,15 +115,22 @@ class ReportExportTests(unittest.TestCase):
                     self.assertIn('UTF-8', spec.argv)
                     text = 'Visible résumé 张三' if check_mode == 'hit' else 'Visible résumé only'
                 elif '--to=json' in spec.argv:
-                    text = json.dumps(_ast())
+                    document = _ast(citation='material-a1b2')
+                    document['blocks'].append({'t': 'Para', 'c': [
+                        {'t': 'Cite', 'c': [[{'citationId': 'material-a1b2', 'citationMode': {'t': 'AuthorInText'}}], []]},
+                        {'t': 'Cite', 'c': [[{'citationId': 'p2', 'citationMode': {'t': 'SuppressAuthor'}}], []]}]})
+                    text = json.dumps(document)
                 else:
                     document = json.loads(Path(spec.argv[-1]).read_text(encoding='utf-8'))
                     if '--standalone' in spec.argv:
                         standalone.append(document)
                         self.assertIn('--template=template.latex', spec.argv)
                         text = _standalone_fixture(document, spec.cwd)
+                    elif '--to=markdown' in spec.argv:
+                        text = original_markdown
                     else:
-                        text = 'Converted résumé α'
+                        self.assertNotIn('citation_style', document['meta'])
+                        text = r'Converted résumé α \citep{material-a1b2,p2} \citet{material-a1b2} \citeyearpar{p2}'
                 (spec.output_dir / 'stdout.log').write_text(text, encoding='utf-8')
                 return SimpleNamespace(returncode=int(failure and '--standalone' in spec.argv), stop_reason=None,
                     record={'streams': {'stdout': {'log_bytes_discarded': 0}}})
@@ -123,8 +151,50 @@ class ReportExportTests(unittest.TestCase):
                 self.assertIn('\\usepackage{fvextra,seqsplit,etoolbox}', renderer_preamble)
                 self.assertNotIn('untrusted', renderer_preamble)
                 self.assertNotIn('DeclareUnicodeCharacter', renderer_preamble)
+                self.assertNotIn('citation_style', result.data['manifest'])
+                self.assertNotIn('NAT@sort', renderer_preamble)
+                self.assertEqual(standalone[0]['meta']['biblio-style']['c'], 'plainnat')
                 count = processes.call_count
                 self.assertEqual(gateway.call('export_report', arguments, identity='template').data, result.data)
+                for style in ('numeric', 'template'):
+                    styled = {**arguments, 'citation_style': style}
+                    styled_request = ExportRequest.model_validate(styled)
+                    self.assertEqual(export_input_binding(source, styled_request), {**approved, 'citation_style': style})
+                    styled_call = {'function': {'name': 'export_report', 'arguments': json.dumps(styled)}}
+                    self.assertNotEqual(ToolApplication.approval_token(app, styled_call), old_token)
+                    self.assertIn('inputs changed', gateway.call('export_report', styled, identity='template').error)
+                    self.assertEqual(processes.call_count, count)
+                    identity = 'style-' + style
+                    styled_result = gateway.call('export_report', styled, identity=identity)
+                    self.assertEqual(styled_result.status, 'ok', styled_result.error)
+                    project = workspace.workspace / 'publications' / identity
+                    main = (project / 'main.tex').read_text(encoding='utf-8')
+                    self.assertEqual(styled_result.data['manifest']['citation_style'], style)
+                    saved_path = root / 'tools/publications' / identity / 'request.json'
+                    self.assertEqual(json.loads(saved_path.read_text())['citation_style'], style)
+                    self.assertIn('\\documentclass{article}', main)
+                    self.assertIn('\\bibliographystyle{local}', main)
+                    self.assertIn('\\usepackage[authoryear,round]{natbib}', main)
+                    self.assertNotIn('\\usepackage[numbers', main)
+                    self.assertEqual(main.count('\\usepackage[authoryear,round]{natbib}'), 1)
+                    if style == 'numeric':
+                        self.assertIn('\\AtEndPreamble{\\@ifpackageloaded{natbib}', main)
+                        self.assertIn('\\setcitestyle{numbers,square,comma}', main)
+                        self.assertIn('\\let\\citet\\citep\\let\\citeyearpar\\citep', main)
+                    else:
+                        self.assertNotIn('NAT@sort', main)
+                    self.assertIn(r'\citep{material-a1b2,p2}', (project / 'body.tex').read_text(encoding='utf-8'))
+                    self.assertEqual((project / 'references.bib').read_text(encoding='utf-8'), original_bib)
+                    self.assertEqual((project / 'source.md').read_text(encoding='utf-8'), original_markdown)
+                    count = processes.call_count
+                    frozen = {path: path.read_bytes() for path in (saved_path, project / 'export.json', project / 'main.tex')}
+                    restored = PublicationToolGateway(root, workspace, ledger)
+                    self.assertEqual(restored.call('export_report', styled, identity=identity).data, styled_result.data)
+                    for changed_style in (None, 'template' if style == 'numeric' else 'numeric'):
+                        self.assertIn('inputs changed', restored.call('export_report',
+                            {**arguments, 'citation_style': changed_style}, identity=identity).error)
+                    self.assertEqual(processes.call_count, count)
+                    self.assertEqual({path: path.read_bytes() for path in frozen}, frozen)
                 for path in (template, companion):
                     original = path.read_bytes()
                     path.write_bytes(original + b'\n% changed')
@@ -137,11 +207,16 @@ class ReportExportTests(unittest.TestCase):
                 (exported / 'local.bst').write_text('% changed after export', encoding='utf-8')
                 self.assertIn('project files changed', gateway.call('export_report', arguments, identity='template').error)
                 failure = True
-                failed = gateway.call('export_report', arguments, identity='failed-template')
+                failed_arguments = {**arguments, 'citation_style': 'numeric'}
+                failed = gateway.call('export_report', failed_arguments, identity='failed-template')
                 self.assertEqual(failed.status, 'error')
                 self.assertEqual(failed.data['manifest']['status'], 'failed')
+                self.assertEqual(failed.data['manifest']['citation_style'], 'numeric')
                 count = processes.call_count
-                self.assertEqual(gateway.call('export_report', arguments, identity='failed-template').status, 'error')
+                failed_manifest = (workspace.workspace / 'publications/failed-template/export.json').read_bytes()
+                self.assertEqual(PublicationToolGateway(root, workspace, ledger).call(
+                    'export_report', failed_arguments, identity='failed-template').data, failed.data)
+                self.assertEqual((workspace.workspace / 'publications/failed-template/export.json').read_bytes(), failed_manifest)
                 self.assertEqual(processes.call_count, count)
                 self.assertTrue((root / 'tools/processes/failed-template-render-1/stdout.log').is_file())
                 failure = False
@@ -200,11 +275,18 @@ class ReportExportTests(unittest.TestCase):
                 retroactive = gateway.call('export_report', checked, identity='template')
                 self.assertIn('inputs changed', retroactive.error)
                 self.assertEqual(processes.call_count, count)
-            self.assertEqual(source.read_text(encoding='utf-8'), '# Résumé α\n\nBody [@p1].\n')
+            self.assertEqual(source.read_text(encoding='utf-8'), original_markdown)
+            self.assertEqual((source.parent / 'references.bib').read_text(encoding='utf-8'), original_bib)
 
     def test_template_scope_partials_missing_companions_and_engine_fail_before_processes(self):
         from simple_ar.report.export import publication_template_inputs
         from simple_ar.tools.publication import ExportRequest, export_input_binding
+
+        for style in ('author-year', '', True, 1, ['numeric']):
+            with self.subTest(citation_style=style), self.assertRaises(ValueError):
+                ExportRequest(markdown='workspace/draft.md', citation_style=style)
+        with self.assertRaisesRegex(ReportExportError, 'citation_style must be'):
+            export_acm_report(Path('unused'), Path('unused-output'), citation_style='author-year')
 
         for checks in ({}, {'max_pages': 0}, {'max_pages': True}, {'max_pages': 1.5},
                 {'forbidden_identifiers': []}, {'forbidden_identifiers': [' ']},
@@ -495,8 +577,10 @@ class ReportExportTests(unittest.TestCase):
     def test_supplied_templates_preserve_body_without_inferred_abstract_roles(self):
         # Template variables are presentation, not proof that authored text
         # will be rendered. Do not move a section out of the body by its name.
-        for heading, abstract_slot in (('Abstract', False), ('Summary', True), ('Executive summary', False)):
-            with self.subTest(heading=heading, abstract_slot=abstract_slot), tempfile.TemporaryDirectory() as tmp:
+        for heading, abstract_slot, style in (
+                ('Abstract', False, None), ('Summary', True, None), ('Executive summary', False, None),
+                ('Abstract', True, 'numeric'), ('Executive summary', False, 'template')):
+            with self.subTest(heading=heading, abstract_slot=abstract_slot, citation_style=style), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 source = self._source(root)
                 document = _ast()
@@ -506,7 +590,8 @@ class ReportExportTests(unittest.TestCase):
                     {'t': 'Para', 'c': [{'t': 'Str', 'c': 'Nested discussion is still body content.'}]}])
                 template = source / 'layout.latex'
                 template.write_text('\\documentclass{article}\n'
-                    '$for(header-includes)$\n$header-includes$\n$endfor$\n\\begin{document}\n'
+                    '$for(header-includes)$\n$header-includes$\n$endfor$\n'
+                    '\\usepackage[authoryear]{natbib}\n\\begin{document}\n'
                     + ('$if(abstract)$$abstract$$endif$\n' if abstract_slot else '')
                     + '$body$\n\\end{document}\n', encoding='utf-8')
                 converted = []
@@ -519,8 +604,17 @@ class ReportExportTests(unittest.TestCase):
                             else json.dumps(current['blocks']))
                 with patch('simple_ar.report.export.shutil.which', return_value='pandoc'), \
                         patch('simple_ar.report.export._run', side_effect=convert):
-                    result = export_acm_report(source, root / 'export', template={'path': template.name})
+                    result = export_acm_report(source, root / 'export', template={'path': template.name},
+                        **({'citation_style': style} if style is not None else {}))
                 self.assertEqual(result['status'], 'exported')
+                if style is None:
+                    self.assertNotIn('citation_style', result)
+                else:
+                    self.assertEqual(result['citation_style'], style)
+                main = (root / 'export/main.tex').read_text(encoding='utf-8')
+                self.assertEqual('\\setcitestyle{numbers,square,comma}' in main, style == 'numeric')
+                self.assertEqual(converted[-1]['meta']['biblio-style']['c'], 'plainurl' if style == 'numeric' else 'plainnat')
+                self.assertEqual((root / 'export/template.latex').read_bytes(), template.read_bytes())
                 self.assertEqual(converted[1]['blocks'][0]['c'][2], [{'t': 'Str', 'c': heading}])
                 self.assertIn('A bounded finding.', (root / 'export/body.tex').read_text())
                 self.assertIn('Nested discussion is still body content.', (root / 'export/body.tex').read_text())
@@ -549,6 +643,7 @@ class ReportExportTests(unittest.TestCase):
             self.assertNotIn('template', result)
             self.assertNotIn('compliance', result)
             self.assertNotIn('checks', result)
+            self.assertNotIn('citation_style', result)
             self.assertTrue(all(document["meta"] == {} for document in calls[:-1]))
             self.assertEqual(set(calls[-1]['meta']), {'title', 'abstract', 'header-includes', 'bibliography', 'biblio-style'})
             body_headers = [block["c"][0] for block in calls[1]["blocks"] if block["t"] == "Header"]
@@ -559,6 +654,8 @@ class ReportExportTests(unittest.TestCase):
             main = (root / "acm/main.tex").read_text()
             self.assertLess(main.index("\\begin{abstract}"), main.index("\\maketitle"))
             self.assertIn("\\authorsaddresses{}", main)
+            self.assertIn('\\citestyle{acmnumeric}', main)
+            self.assertNotIn('NAT@sort', main)
             self.assertIn("\\microtypesetup{expansion=false}", main)
             self.assertIn("\\RenewDocumentCommand{\\bibitem}{o m}", main)
             self.assertIn("\\saroriginalbibitem[{#1}]{#2}", main)
@@ -569,6 +666,20 @@ class ReportExportTests(unittest.TestCase):
             self.assertIn("\\setkeys{Gin}{width=\\sarmaxwidth,height=\\sarmaxheight,keepaspectratio}", main)
             self.assertNotIn("\\setkeys{Gin}{width=\\linewidth,keepaspectratio}", main)
             self.assertTrue((root / "acm/export.json").is_file())
+            with patch('simple_ar.report.export.shutil.which', return_value='pandoc'), \
+                    patch('simple_ar.report.export._run', side_effect=convert):
+                for style in ('template', 'numeric'):
+                    explicit = root / ('acm-' + style)
+                    receipt = export_acm_report(source, explicit, citation_style=style)
+                    self.assertEqual(receipt['citation_style'], style)
+                    explicit_main = (explicit / 'main.tex').read_text()
+                    self.assertIn('\\citestyle{acmnumeric}', explicit_main)
+                    if style == 'template':
+                        self.assertEqual(explicit_main, main)
+                    else:
+                        self.assertIn('\\setcitestyle{numbers,square,comma}', explicit_main)
+                    self.assertEqual((explicit / 'body.tex').read_bytes(), (root / 'acm/body.tex').read_bytes())
+                    self.assertEqual((explicit / 'references.bib').read_bytes(), (source / 'references.bib').read_bytes())
             # The native consumer uses the same exporter with a shared process
             # owner; it does not require a special report filename or a model.
             from types import SimpleNamespace

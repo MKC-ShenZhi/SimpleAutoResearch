@@ -355,6 +355,7 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
                       runner: Callable | None = None, validate_asset: Callable[[Path], str | None] | None = None,
                       caption_owner: Literal['manifest', 'markdown'] = 'manifest',
                       template: dict[str, Any] | None = None,
+                      citation_style: Literal['numeric', 'template'] | None = None,
                       checks: dict[str, Any] | None = None) -> dict[str, Any]:
     """Compatibility entry point for the shared Pandoc publication converter.
 
@@ -362,8 +363,13 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
     model is called and no upstream evidence or session state is changed.
     Managed report consumers keep manifest captions by default; direct canonical
     workspace publication explicitly selects Markdown ownership.
+    Omitted citation_style retains historical rendering and manifest shape;
+    'template' explicitly preserves layout defaults, 'numeric' selects bracketed
+    natbib display and a numeric default bibliography style. Records/keys stay intact.
     """
     root, output = report_dir.resolve(), output_dir.resolve()
+    if citation_style is not None and citation_style not in {'numeric', 'template'}:
+        raise ReportExportError('citation_style must be numeric or template')
     template_files = publication_template_inputs(root, template) if template is not None else {}
     if caption_owner not in {'manifest', 'markdown'}:
         raise ReportExportError('Unknown figure caption owner')
@@ -458,6 +464,8 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
                                "compiled": False, "quality_checked": False,
                                "figure_caption_owner": caption_owner,
                                "bound_figure_captions": bound_captions}
+    if citation_style is not None:
+        manifest['citation_style'] = citation_style
     if render_preview:
         manifest['pdf_preview'] = {'rendered': False, 'visual_reviewed': False,
             'max_pages': 12, 'dpi': 120, 'max_dimension_px': 1600, 'pages': []}
@@ -601,6 +609,21 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
             "\\def\\sarmaxheight{\\ifdim\\Gin@nat@height>0.8\\textheight0.8\\textheight\\else\\Gin@nat@height\\fi}\n"
             "\\makeatother\n"
             "\\setkeys{Gin}{width=\\sarmaxwidth,height=\\sarmaxheight,keepaspectratio}\n")
+        if citation_style == 'numeric' and citations:
+            # Templates/classes may already load natbib (even before this
+            # header hook). Configure after preamble setup but before the aux
+            # file is read: AtBeginDocument is too late for author-year templates
+            # with a numeric bibliography on the second TeX pass.
+            # Pandoc emits citet/citeyearpar for narrative/suppress-author
+            # citations: numeric presentation must not expose an authorless
+            # record's key as an author or year through those commands either.
+            preamble += ("\\makeatletter\n"
+                "\\AtEndPreamble{\\@ifpackageloaded{natbib}{%\n"
+                "  \\setcitestyle{numbers,square,comma}%\n"
+                "  \\let\\citet\\citep\\let\\citeyearpar\\citep\n"
+                "}{\\PackageError{simple-ar}{citation_style=numeric requires natbib}%\n"
+                "  {Load natbib in the trusted publication template.}}}\n"
+                "\\makeatother\n")
         if not template_files or template.get('engine', 'pdflatex') == 'pdflatex':
             preamble += _scientific_unicode_preamble(heading, body_tex, abstract_tex, bibliography, source)
         def meta_tex(value: str) -> dict:
@@ -611,7 +634,12 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
             metadata['abstract'] = meta_tex(abstract_tex)
         if citations:
             metadata['bibliography'] = {'t': 'MetaString', 'c': 'references.bib'}
-            metadata['biblio-style'] = {'t': 'MetaString', 'c': 'plainnat' if template_files else 'ACM-Reference-Format'}
+            # plainnat prints an authorless entry's key in the bibliography.
+            # plainurl supplies numeric labels while retaining URL/DOI fields;
+            # plain would lose reader-facing locators. Do not rewrite records.
+            # A template with its own literal bibliography style still owns it.
+            default_bst = ('plainurl' if citation_style == 'numeric' else 'plainnat') if template_files else 'ACM-Reference-Format'
+            metadata['biblio-style'] = {'t': 'MetaString', 'c': default_bst}
         main = run([pandoc, '--from=json', '--to=latex', '--natbib', '--no-highlight', '--wrap=none',
             '--standalone', '--template=template.latex'], cwd=output,
             text=json.dumps({**ast, 'meta': metadata,
@@ -658,6 +686,16 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
                 'Missing authors/dates remain missing. External evidence paths are listed in export.json, not copied.\n'
                 f"Rebuild here: {template.get('engine', 'pdflatex')} -no-shell-escape -halt-on-error main.tex; "
                 'bibtex main (if cited); repeat the TeX command twice.\n')
+        if citation_style is not None:
+            readme += ('Explicit citation_style: ' + citation_style + '.\n'
+                + ('Natbib citations use bracketed numbers, including narrative and suppress-author citations. '
+                   'The template must load natbib. '
+                   + ('Default biblio-style is plainurl (TeX urlbst package, retaining URL/DOI); an explicit template style remains authoritative. '
+                      if template_files else 'Built-in ACM retains ACM-Reference-Format. ')
+                   +
+                   'Class, body, bibliography records and exact citation keys are preserved; no author/year fields are inferred.\n'
+                   if citation_style == 'numeric' else
+                   'Template citation defaults are preserved (built-in ACM remains acmnumeric).\n'))
         (output / 'README.txt').write_text(readme, encoding='utf-8')
         manifest["status"] = "exported"
         if compile_pdf:

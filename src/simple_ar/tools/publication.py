@@ -49,6 +49,9 @@ class ExportRequest(BaseModel):
     markdown: str = Field(description="Workspace Markdown file; local figures and references.bib use its directory.")
     title: str = Field(default="", max_length=500)
     compile_pdf: bool = True
+    citation_style: Literal['numeric', 'template'] | None = Field(default=None,
+        exclude_if=lambda value: value is None,
+        description='Optional publication presentation choice. Select numeric for readable bracketed numbers, including narrative citations and authorless sources; supplied templates must load natbib and the default bibliography style becomes plainurl (TeX urlbst package, retaining URL/DOI; a literal template style still owns its choice). Select template to explicitly honor template citation defaults (built-in ACM stays numeric). May be chosen from the ordinary publication goal; no hashes or source metadata edits needed. Omit/null preserves historical rendering, request bindings and manifest shape. Exact citekeys, BibTeX records and template class/body remain unchanged.')
     checks: PublicationChecks | None = Field(default=None, exclude_if=lambda value: value is None,
         description='Optional finite rules explicitly supplied by the user. Requires compile_pdf=true and installed Poppler tools. Missing tools, bounded-output failure or rule failure retain diagnostics and prevent final delivery. No automatic edits or recompile; absence of literals never certifies anonymity.')
     template: PublicationTemplate | None = Field(default=None,
@@ -224,6 +227,7 @@ class PublicationToolGateway:
                     manifest = export_acm_report(source.parent, output, title=request.title or None,
                         body_name=source.name, compile_pdf=request.compile_pdf, render_preview=request.render_preview, runner=render,
                         validate_asset=validate_asset, caption_owner='markdown',
+                        **({'citation_style': request.citation_style} if request.citation_style is not None else {}),
                         **({'checks': request.checks.model_dump(exclude_none=True)} if request.checks is not None else {}),
                         **({'template': request.template.model_dump()} if request.template is not None else {}))
                 except ReportExportError:

@@ -40,13 +40,20 @@ def build_parser(
     preparation_parser.add_argument("--output", type=Path, required=True, help="New directory for editable preparation notes and facts.")
 
     export_parser = subparsers.add_parser(
-        "report-export", help="Export an assembled report as an editable ACM acmart manuscript."
+        "report-export", help="Export an assembled report as an editable publication (ACM by default)."
     )
     export_parser.add_argument("--report-dir", type=Path, required=True,
                                help="Directory containing report_body.md and references.bib.")
     export_parser.add_argument("--output", type=Path, required=True, help="New export directory.")
     export_parser.add_argument("--title", help="Optional reader-facing document title.")
-    export_parser.add_argument("--compile", action="store_true", help="Also compile with installed pdflatex/bibtex; retain source and logs on failure.")
+    export_parser.add_argument("--citation-style", choices=("numeric", "template"), default=None,
+                               help="Explicit numeric natbib display override, or preserve template citation defaults. Omit for historical behavior; no source keys or bibliography fields are changed.")
+    export_parser.add_argument("--latex-template", help="Trusted Pandoc LaTeX template path relative to --report-dir; requires body and preamble header-includes hooks. Omit for ACM.")
+    export_parser.add_argument("--template-asset", action="append", default=[],
+                               help="Explicit flat companion filename beside --latex-template; repeat as needed.")
+    export_parser.add_argument("--tex-engine", choices=("pdflatex", "xelatex"), default=None,
+                               help="Installed engine for --latex-template; default pdflatex. BibTeX only.")
+    export_parser.add_argument("--compile", action="store_true", help="Also compile with installed TeX/BibTeX; retain source and logs on failure.")
 
 
 
