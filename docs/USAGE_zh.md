@@ -15,11 +15,11 @@
 ### 安装
 
 执行主机需要 Python 3.12+、Git、uv 和 ripgrep（`rg`）。
-使用文档所列预览分支；远端已发布文件可能与本地未发布改动不同。
+使用 main 分支。
 在终端执行：
 
 ```bash
-git clone --branch feat/v2.9-task-driven-research https://github.com/Wchanging/SimpleAutoResearch.git
+git clone --branch main https://github.com/Wchanging/SimpleAutoResearch.git
 cd SimpleAutoResearch
 uv sync
 uv run simple-ar start --help

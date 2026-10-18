@@ -64,10 +64,10 @@ Named TOML profiles configure model connections and purpose routes. Text, code, 
 
 ## Quick start
 
-Install Python 3.12+, Git, [uv](https://docs.astral.sh/uv/) and ripgrep (`rg`) on the execution machine. The documented preview branch is:
+Install Python 3.12+, Git, [uv](https://docs.astral.sh/uv/) and ripgrep (`rg`) on the execution machine. Clone the main branch:
 
 ```bash
-git clone --branch feat/v2.9-task-driven-research https://github.com/Wchanging/SimpleAutoResearch.git
+git clone --branch main https://github.com/Wchanging/SimpleAutoResearch.git
 cd SimpleAutoResearch
 uv sync
 ```

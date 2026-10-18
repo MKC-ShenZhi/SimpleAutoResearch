@@ -64,10 +64,10 @@
 
 ## 快速开始
 
-执行机器需要 Python 3.12+、Git、[uv](https://docs.astral.sh/uv/) 和 ripgrep（`rg`）。文档使用以下预览分支：
+执行机器需要 Python 3.12+、Git、[uv](https://docs.astral.sh/uv/) 和 ripgrep（`rg`）。克隆 main 分支：
 
 ```bash
-git clone --branch feat/v2.9-task-driven-research https://github.com/Wchanging/SimpleAutoResearch.git
+git clone --branch main https://github.com/Wchanging/SimpleAutoResearch.git
 cd SimpleAutoResearch
 uv sync
 ```

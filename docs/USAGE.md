@@ -18,11 +18,10 @@ evidence limits before relying on it.
 ### Installation
 
 You need Python 3.12+, Git, uv, and ripgrep (`rg`) on the execution host.
-Use the documented preview branch; its published files can differ from local
-unpublished changes. From a terminal:
+Use the main branch. From a terminal:
 
 ```bash
-git clone --branch feat/v2.9-task-driven-research https://github.com/Wchanging/SimpleAutoResearch.git
+git clone --branch main https://github.com/Wchanging/SimpleAutoResearch.git
 cd SimpleAutoResearch
 uv sync
 uv run simple-ar start --help
