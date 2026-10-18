@@ -111,7 +111,13 @@ def add_start_parser(subparsers: argparse._SubParsersAction) -> None:
     parser = subparsers.add_parser("start", help="Start a native goal-driven task; structured protocols retain explicit compatibility.")
     native = parser.add_argument_group("Native task")
     native.add_argument("request", nargs="?", help="Natural-language task using the native action loop; no function selection.")
-    native.add_argument("--resume-task", type=Path, help="Resume a native-tool session; never replays unknown operations.")
+    native.add_argument("--resume-task", type=Path, help="Resume a native task directory, or an exact displayed name with --tasks-in; never replays unknown operations.")
+    native.add_argument("--tasks-in", type=Path, help="Read-only native task listing in PATH and its immediate children (at most 256 entries); no recursive search.")
+    native.add_argument("--select-task", action="store_true", help="With --tasks-in, interactively select an existing native task; blank cancels.")
+    native.add_argument("--task-config", type=Path, help="Create a native task from an editable TOML configuration; explicit CLI values override it.")
+    native.add_argument("--write-task-config", type=Path, help="Export editable native task TOML and exit without creating a task.")
+    native.add_argument("--max-processes", type=int, default=None, help="Native creation: cumulative process invocation cap; zero disables processes.")
+    native.add_argument("--max-process-seconds", type=float, default=None, help="Native creation: cumulative process wall-time cap in seconds.")
     native.add_argument("--supply-task", type=Path, help="With --resume-task, confirm caller TOML contracts or first model binding. replace_existing=true explicitly revises saved contracts without resetting evidence or ledger. Records without execution; not a model retry or model replacement.")
     native.add_argument("--retry-model", action="store_true", help="With --resume-task, explicitly continue a terminated failed native model decision using a new attempt and remaining budget. Optionally select --model profile:NAME/route:NAME to record a compatible Chat connection change without clearing history or charges. Cached replies keep their saved connection; tools, in-flight requests and whole tasks are not resubmitted. Use separately from feedback or authorization changes.")
     native.add_argument("--authorize-remaining", action="append", default=None, metavar="DIMENSION=AMOUNT", help="Native resume: explicitly authorize a new remaining resource allowance after confirmation; repeat for multiple dimensions.")
@@ -408,12 +414,13 @@ def _quote(value: str) -> str:
 
 def native_creation_options(args: argparse.Namespace) -> dict:
     """One projection of native creation access, frozen contracts and budgets."""
+    from simple_ar.cli.task_options import native_process_limits
     return dict(model=args.model or None,
         sources={f'source{index}': path for index, path in enumerate(args.source)},
         allow_execution=args.allow_execution, allow_network=args.allow_network, allow_vision=args.allow_vision,
         max_turns=args.max_turns, max_tokens=args.max_tokens, max_images=args.max_images,
         project_python=args.project_python, code_task=getattr(args, '_code_task', None),
-        process_limits=getattr(args, '_process_limits', None),
+        process_limits=native_process_limits(args),
         execution_contract=getattr(args, '_execution_contract', None),
         report_requirement=getattr(args, '_report_requirement', None),
         research_policy=getattr(args, '_research_policy', None),

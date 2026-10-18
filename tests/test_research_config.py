@@ -12,6 +12,47 @@ from simple_ar.cli.research_config import FIELDS, report_settings, research_defa
 
 
 class ReportDocumentArgumentsTests(unittest.TestCase):
+    def test_native_task_config_export_edit_create_and_explicit_override(self):
+        from simple_ar.cli.main import main
+        from simple_ar.app.tool_application import ToolApplication
+        from simple_ar.cli.task_options import apply_task_config, native_process_limits
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / 'task.toml'
+            materials = root / 'materials'
+            materials.mkdir()
+            (materials / 'notes.md').write_text('Saved measurements, not new experiments.', encoding='utf-8')
+            with patch('simple_ar.integrations.llm.LLMClient.from_env', side_effect=AssertionError('No external calls')), \
+                    patch('sys.stdin.isatty', return_value=False), redirect_stdout(io.StringIO()):
+                main(['start', 'Inspect results and explain limitations', '--source', str(materials),
+                      '--max-processes', '0', '--max-process-seconds', '12',
+                      '--write-task-config', str(config)])
+                self.assertTrue(config.is_file())
+                with self.assertRaises(SystemExit):
+                    main(['start', '--write-task-config', str(config)])
+            # Relative inputs resolve against the configuration, CLI budget overrides it.
+            config.write_text('[task]\nrequest="Inspect nested materials"\nsource=["materials"]\n'
+                'max_turns=4\nmax_tokens=500\nmax_processes=0\nmax_process_seconds=12\n', encoding='utf-8')
+            args = build_parser().parse_args(['start', '--task-config', str(config), '--max-tokens', '900'])
+            args._explicit_start_destinations = {'task_config', 'max_tokens'}
+            apply_task_config(args)
+            self.assertEqual(args.max_tokens, 900)
+            self.assertEqual(args.source, [materials.resolve()])
+            app = ToolApplication.create(root / 'session', args.request, model=None,
+                sources={'source0': args.source[0]}, max_turns=args.max_turns, max_tokens=args.max_tokens,
+                process_limits=native_process_limits(args))
+            loaded = ToolApplication.load(app.session.store.root)
+            self.assertEqual(loaded.ledger.limits['process_invocations'], 0)
+            self.assertEqual(loaded.ledger.limits['process_wall_seconds'], 12)
+            self.assertEqual(loaded.state['config']['sources']['source0'], str(materials.resolve()))
+            self.assertFalse(loaded.ledger.entries)
+            for bad in ('max_turns=true', 'max_process_seconds=inf', 'api_key="not-a-task-setting"'):
+                config.write_text('[task]\n' + bad + '\n', encoding='utf-8')
+                args = build_parser().parse_args(['start', '--task-config', str(config)])
+                args._explicit_start_destinations = {'task_config'}
+                with self.assertRaises(ValueError):
+                    apply_task_config(args)
+
     def test_public_cli_article_and_sections_control_contract(self):
         from simple_ar.cli.research_config import report_writing_method
 

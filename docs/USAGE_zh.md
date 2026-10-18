@@ -180,6 +180,34 @@ uv run simple-ar start --resume-task "SESSION"
 见[恢复条件](CLI_REFERENCE_zh.md#原生任务入口实验性)。
 追加额度与更多恢复选项见 CLI 参考。
 
+## 配置一次，围绕成果继续
+
+可以先生成带关键注释的原生任务配置，编辑后启动。生成配置不需要模型凭据，也不创建任务：
+
+```bash
+uv run simple-ar start "检查这些实验结果，解释稳定性与开销，按需要制作主图和结果说明" --source ./my-results --model profile:daily --max-processes 16 --max-process-seconds 600 --write-task-config task.toml
+uv run simple-ar start --task-config task.toml
+```
+
+配置中的相对材料路径以配置文件所在目录为准，材料必须能由执行机器读取。
+显式命令行值覆盖文件中的同名设置。确认摘要后输入 `y` 开始；模型和工具按目标选择工作。
+`max_processes` 和 `max_process_seconds` 是进入实际账本的累计进程次数和累计墙钟秒数，
+包括搜索后端；不是单命令超时。零次数禁止进程，允许提案仍需批准具体命令。
+自然语言中的资源建议不自动成为硬限制，请核对摘要与这些显式设置。
+
+查找已有任务和反馈时，无需先寻找内部 JSON：
+
+```bash
+uv run simple-ar start --tasks-in runs/assistant
+uv run simple-ar start --tasks-in runs/assistant --select-task
+uv run simple-ar start --tasks-in runs/assistant --resume-task EXACT_DIRECTORY_NAME "保留测量结果，调整主图并更新说明"
+```
+
+列表只读所给目录及其直接子目录，最多检查256项，不建立额外任务索引。交互选择需要终端；脚本使用列表中的精确目录名。
+显示的 `partial` 保留未完成项；记录状态不代表成果质量已认证。
+反馈沿原任务、材料和账本继续；再次用配置文件启动则会创建新任务。
+继续时不能用创建参数悄悄重设进程额度，额外资源仍使用显式续额授权。
+
 ## 选择任务与最小输入
 
 [六项工作流配方](WORKFLOWS_zh.md)覆盖调研、代码、数据、写作、复现和导出。

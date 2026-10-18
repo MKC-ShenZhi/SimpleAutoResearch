@@ -190,6 +190,35 @@ separately from feedback or new authorization. It retains failed charges and
 uses remaining budget; see the [recovery conditions](CLI_REFERENCE.md#native-task-entry-experimental).
 See the CLI reference for additional allowances and recovery options.
 
+## Configure once and continue from the result
+
+Export an annotated native task configuration, review it, then start. Exporting needs no model credentials and creates no task:
+
+```bash
+uv run simple-ar start "Inspect these results, compare stability and cost, and make a main figure and explanation as needed" --source ./my-results --model profile:daily --max-processes 16 --max-process-seconds 600 --write-task-config task.toml
+uv run simple-ar start --task-config task.toml
+```
+
+Relative material paths use the configuration's directory. Files must be readable on the execution machine.
+Explicit CLI values override the corresponding file settings. Review the summary and enter `y` to start.
+`max_processes` and `max_process_seconds` enter the actual ledger as cumulative invocation and wall-time caps, including search backends, rather than per-command timeouts.
+Zero invocations disables processes; proposing commands still requires individual approval.
+Natural-language resource suggestions do not automatically become hard limits: check the summary and explicit settings.
+
+Find and continue existing tasks without locating internal JSON:
+
+```bash
+uv run simple-ar start --tasks-in runs/assistant
+uv run simple-ar start --tasks-in runs/assistant --select-task
+uv run simple-ar start --tasks-in runs/assistant --resume-task EXACT_DIRECTORY_NAME "Keep the measurements, revise the main figure and explanation"
+```
+
+Discovery reads the supplied directory and direct children only, at most 256 entries, without another task index.
+Interactive selection requires a terminal; scripts use an exact listed directory name.
+Recorded status does not certify quality; `partial` retains unresolved work.
+Feedback continues the same task and ledger; starting from a configuration again creates a new task.
+Creation flags cannot reset saved process limits on resume; additional resources require explicit continuation authorization.
+
 ## Choose a task and its smallest input
 
 Use the [six workflow recipes](WORKFLOWS.md) for research, code, data, writing,

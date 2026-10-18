@@ -18,6 +18,117 @@ from simple_ar.code_task.runtime.config import load_code_task_init_options, load
 
 
 class StartTests(unittest.TestCase):
+    def test_project_tasks_main_listing_selection_feedback_and_read_only_boundaries(self):
+        from simple_ar.app.tool_application import ToolApplication
+        from simple_ar.cli.main import main
+        from simple_ar.cli.project_tasks import ProjectTask, handle_project_tasks
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch('simple_ar.integrations.llm.LLMClient.from_env',
+                    side_effect=AssertionError('Discovery/selection must not resolve a model')), \
+                patch('sys.stdin.isatty', return_value=False), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            root = Path(temporary).resolve()
+            app = ToolApplication.create(root / 'a-task', 'Explain [saved] results', model=None, sources={})
+            app.session.manifest.status = 'partial'
+            app.session.save()
+            ToolApplication.create(root / 'b-task', 'A second goal', model=None, sources={})
+            ToolApplication.create(root / 'nested' / 'hidden', 'Never scanned recursively', model=None, sources={})
+            for name, content in (('broken', '{'), ('oversized', ' ' * (256 * 1024 + 1))):
+                (root / name).mkdir()
+                (root / name / 'session_manifest.json').write_text(content, encoding='utf-8')
+            legacy = root / 'legacy'
+            legacy.mkdir()
+            payload = app.session.manifest.to_dict()
+            payload['transition_recipe'] = 'research-v1'
+            (legacy / 'session_manifest.json').write_text(json.dumps(payload), encoding='utf-8')
+            snapshot = {p.relative_to(root): p.read_bytes() for p in root.rglob('*') if p.is_file()}
+            with patch.object(ToolApplication, 'load', side_effect=AssertionError('Listing must not load')), \
+                    patch.object(ToolApplication, 'create', side_effect=AssertionError('Listing must not create')):
+                main(['start', '--tasks-in', str(root)])
+                for extra in (['ignored request'], ['--goal', 'ignored goal'], ['--allow-network'],
+                              ['--source', str(root)], ['--max-processes', '0'], ['--max-tokens', '100']):
+                    with self.subTest(extra=extra), self.assertRaisesRegex(SystemExit, 'read-only'):
+                        main(['start', '--tasks-in', str(root), *extra])
+                for selector in ('../a-task', str(app.session.store.root), 'hidden', 'broken', 'legacy'):
+                    with self.subTest(selector=selector), self.assertRaisesRegex(SystemExit, 'exact listed'):
+                        main(['start', '--tasks-in', str(root), '--resume-task', selector])
+                with patch('simple_ar.cli.project_tasks.MAX_ENTRIES', 2), self.assertRaisesRegex(SystemExit, 'narrower'):
+                    main(['start', '--tasks-in', str(root)])
+                with self.assertRaisesRegex(SystemExit, 'terminal'):
+                    main(['start', '--tasks-in', str(root), '--select-task'])
+                with patch('sys.stdin.isatty', return_value=True), patch('builtins.input', return_value=''):
+                    main(['start', '--tasks-in', str(root), '--select-task'])
+            self.assertEqual(snapshot, {p.relative_to(root): p.read_bytes() for p in root.rglob('*') if p.is_file()})
+            text = output.getvalue()
+            self.assertIn('status=partial', text)
+            self.assertIn('Explain [saved] results', text)
+            self.assertIn('partial retains unresolved work', text)
+            self.assertIn(ProjectTask(app.session.store.root, '', '').resume_command, text)
+            self.assertNotIn('Never scanned recursively', text)
+            args = build_parser().parse_args(['start', '--tasks-in', str(root), '--select-task'])
+            args._explicit_start_destinations = {'tasks_in', 'select_task'}
+            with patch('builtins.input', return_value='2'):
+                self.assertFalse(handle_project_tasks(args, interactive=True))
+            self.assertEqual(args.resume_task, root / 'b-task')
+            self.assertEqual(args._explicit_start_destinations, {'resume_task'})
+            direct = build_parser().parse_args(['start', '--tasks-in', str(root / 'a-task'), '--resume-task', '.'])
+            self.assertFalse(handle_project_tasks(direct, interactive=False))
+            self.assertEqual(direct.resume_task, root / 'a-task')
+            # Inject deterministic actions at the existing native run boundary;
+            # real resume, feedback, file delivery and state persistence still run.
+            run = ToolApplication.run
+            def revise(task, **options):
+                self.assertEqual(options['feedback'], 'Explain the limitation')
+                return run(task, **options, actions=[
+                    {'tool_name': 'write_file', 'arguments': {'path': 'workspace/revision.md',
+                        'content': 'One saved observation cannot establish robustness.'}},
+                    {'tool_name': 'deliver_result', 'arguments': {'summary': 'Revised explanation',
+                        'artifacts': ['workspace/revision.md']}}])
+            with patch.object(ToolApplication, 'run', autospec=True, side_effect=revise), \
+                    patch.object(ToolApplication, 'create', side_effect=AssertionError('Resume must not create')):
+                main(['start', '--tasks-in', str(root), '--resume-task', 'a-task', 'Explain the limitation'])
+            resumed = ToolApplication.load(root / 'a-task')
+            self.assertEqual(resumed.session.manifest.status, 'completed')
+            self.assertIn('Explain the limitation', resumed.state['requests'])
+            self.assertIn('cannot establish robustness', (root / 'a-task/workspace/revision.md').read_text())
+            self.assertEqual((root / 'a-task/budget_ledger.json').read_bytes(), snapshot[Path('a-task/budget_ledger.json')])
+            self.assertEqual((root / 'b-task/session_manifest.json').read_bytes(), snapshot[Path('b-task/session_manifest.json')])
+
+    def test_project_tasks_links_and_native_process_cap_projection(self):
+        from simple_ar.app.tool_application import ToolApplication
+        from simple_ar.cli.project_tasks import discover_project_tasks
+        from simple_ar.cli.start import native_creation_options
+        args = build_parser().parse_args(['start', '--task-config', 'task.toml',
+            '--write-task-config', 'export.toml', '--max-processes', '2', '--max-process-seconds', '3.5'])
+        self.assertEqual(args.task_config, Path('task.toml'))
+        self.assertEqual(args.write_task_config, Path('export.toml'))
+        self.assertTrue({'task_config', 'write_task_config', 'max_processes', 'max_process_seconds'}
+                        <= args._native_start_destinations)
+        args._process_limits = {'process_invocations': 2}
+        self.assertEqual(native_creation_options(args)['process_limits'],
+                         {'process_invocations': 2, 'process_wall_seconds': 3.5})
+        args._process_limits['process_invocations'] = 1
+        with self.assertRaisesRegex(ValueError, 'Conflicting'):
+            native_creation_options(args)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            outside = ToolApplication.create(root / 'outside', 'Outside goal', model=None, sources={})
+            project = root / 'project'
+            project.mkdir()
+            try:
+                (project / 'linked-task').symlink_to(outside.session.store.root, target_is_directory=True)
+                (root / 'linked-parent').symlink_to(root, target_is_directory=True)
+                (project / 'linked-manifest').mkdir()
+                (project / 'linked-manifest/session_manifest.json').symlink_to(
+                    outside.session.store.root / 'session_manifest.json')
+            except (OSError, NotImplementedError):
+                return  # Windows without link privileges; other boundaries above still run.
+            tasks, skipped = discover_project_tasks(project)
+            self.assertEqual(tasks, [])
+            self.assertEqual(skipped, 2)
+            with self.assertRaisesRegex(ValueError, 'ancestors'):
+                discover_project_tasks(root / 'linked-parent' / 'project')
+
     def test_structured_experiment_collects_without_model_and_waits_in_common_task(self):
         from simple_ar.cli.main import main
         from simple_ar.app.tool_application import ToolApplication

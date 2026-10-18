@@ -53,6 +53,9 @@ simple-ar start --kind writing --material notes.md --prepare-only
 | `--prepare-only` | 只保存或预览，不调用模型或执行进程；新原生任务仍会预检连接和凭据。 |
 | `--yes` | 接受展示的任务、访问和资源摘要，不等于命令审批。 |
 | `--resume-task SESSION` | 恢复保存的原生任务，可同时提供反馈。 |
+| `--tasks-in PATH`、`--select-task` | 只读列出目录及直接子目录中的原生任务；可交互选择，或配合 `--resume-task 精确目录名` 继续。 |
+| `--write-task-config PATH`、`--task-config PATH` | 导出带注释的原生创建配置并退出；编辑后加载，显式命令行值优先。配置不能用于重设已有任务。 |
+| `--max-processes N`、`--max-process-seconds N` | 新原生任务累计进程次数和墙钟秒数上限，包含搜索后端；零值有效。恢复沿原账本，续额另行授权。 |
 | `--supply-task PATH` | 配合原生恢复，确认 TOML 中尚缺的合同；只记录，不执行工作。 |
 | `--approve-execution TOKEN` | 提交当前打印的精确审批 token；必须与原生恢复一起使用。 |
 | `--decision-id ID`、`--decision-response accept\|reject\|revise`、`--decision-guidance TEXT` | 恢复时回复冻结设计；guidance用于revise，不代表执行授权。 |

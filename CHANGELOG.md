@@ -4,6 +4,11 @@
 
 User-visible changes, newest first. Entries describe behavior on their date; later entries may change or retire it. See [usage](docs/USAGE.md), [CLI](docs/CLI_REFERENCE.md), and [configuration](docs/CONFIG_REFERENCE.md) for current instructions.
 
+## Unreleased — V2.10
+
+- List and select existing native tasks by directory/name without a second registry; continue feedback through the saved task owner.
+- Export annotated native task TOML for review, with explicit CLI overrides and effective cumulative process limits. Resume commands use the actual session path.
+
 ## 2026-10-18 — V2.9 release preparation
 
 - Publish a real saved-result figure replay example, source/data and before/after images; no API or training is needed for replay.

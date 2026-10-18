@@ -53,6 +53,9 @@ Bare start asks for a goal. A positional request or ordinary `--goal` enters the
 | `--prepare-only` | Save/preview without calls or execution; new native tasks still preflight connection/credentials |
 | `--yes` | Accept displayed task/access/resource summary, not command approval |
 | `--resume-task SESSION` | Resume saved native state, optionally with feedback |
+| `--tasks-in PATH`, `--select-task` | Read-only native task listing in a directory and direct children; select interactively or use `--resume-task EXACT_NAME` |
+| `--write-task-config PATH`, `--task-config PATH` | Export annotated native creation TOML and exit; load after review, with explicit CLI values taking precedence; not a saved-task reset |
+| `--max-processes N`, `--max-process-seconds N` | Cumulative native creation process count/wall-second caps, including search backends; zero is respected; resume keeps its ledger |
 | `--supply-task PATH` | With native resume, confirm a TOML supply of missing contracts; records only, no work is executed |
 | `--approve-execution TOKEN` | Exact current printed approval token; requires native resume |
 | `--decision-id ID`, `--decision-response accept\|reject\|revise`, `--decision-guidance TEXT` | Reply to a frozen research design on resume; guidance accompanies revise. Not process approval |

@@ -222,7 +222,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 print_line(delivery["summary"])
                 for limitation in delivery.get("unresolved", []):
                     print_line(f"Unresolved: {limitation}")
-            print_line(f"Continue: simple-ar start --resume-task '{args.session}' 'Your changes'")
+            from simple_ar.cli.task_options import resume_command
+            print_line(f"Continue: {resume_command(args.session)} 'Your changes'")
             return
         print_line("Continue: simple-ar start --kind writing --from-session SESSION --reuse NAME --goal 'Your changes'")
         return
@@ -231,6 +232,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         from simple_ar.cli.start import prepare_start
         from simple_ar.core.locking import SessionLockError
         try:
+            from simple_ar.cli.project_tasks import handle_project_tasks
+            if handle_project_tasks(args, interactive=sys.stdin.isatty()):
+                return
+            from simple_ar.cli.task_options import apply_task_config, write_task_config
+            apply_task_config(args)
+            if write_task_config(args):
+                return
             prepared = prepare_start(args, for_execution=True)
         except LLMError as exc:
             raise SystemExit(f"Setup model call failed; the printed setup draft is retained: {exc}") from exc
@@ -2550,6 +2558,8 @@ def _run_native_start(args: argparse.Namespace) -> None:
             if args.approve_execution:
                 raise ValueError("Confirm resource authorization separately from --approve-execution")
         if args.resume_task:
+            if getattr(args, 'max_processes', None) is not None or getattr(args, 'max_process_seconds', None) is not None:
+                raise ValueError('Resume retains saved process limits; use explicit --authorize-remaining for resource changes')
             if args.max_images or args.project_python:
                 raise ValueError("Resume keeps the saved image allowance and interpreter; it cannot silently change them")
             app = ToolApplication.load(args.resume_task.resolve())
@@ -2651,8 +2661,13 @@ def _run_native_start(args: argparse.Namespace) -> None:
                 raise ValueError("Provide a task request or --goal; use --source PATH for read-only materials")
             args.source = [resolve_source_mount(path) for path in args.source]
             select_start_model(args, interactive=interactive)
+            creation_options = native_creation_options(args)
+            process_limits = creation_options['process_limits'] or {}
             make_console().print(Panel(f"Goal: {args.request}\nRead-only sources: {args.source}\n"
                 f"Model: {args.model}\nAllowance: {args.max_turns} requests / {args.max_tokens} tokens\n"
+                f"Process allowance: {process_limits.get('process_invocations', args.max_turns * 10)} invocations / "
+                f"{process_limits.get('process_wall_seconds', args.max_turns * 300)} wall seconds\n"
+                f"Task settings: {getattr(args, '_task_config_source', 'command line / defaults')}; explicit CLI values take precedence\n"
                 f"Public source access: {args.allow_network}\n"
                 f"Rendered-image inspection: {args.allow_vision} (named vision route)\n"
                 f"Image submissions: {args.max_images} (named image route)\n"
@@ -2662,12 +2677,14 @@ def _run_native_start(args: argparse.Namespace) -> None:
                 if not interactive or input("Start / 开始? [y/N]: ").strip().lower() not in {"y", "yes"}:
                     return
             root = getattr(args, '_native_root', None) or new_research_session_root(args.output_root, args.request)
-            app = ToolApplication.create(root, args.request, **native_creation_options(args))
+            app = ToolApplication.create(root, args.request, **creation_options)
             feedback = ""
         print_line(f"Task session: {app.session.store.root}")
         print_line(f"Saved process allowance (including search backends): {app.ledger.limits.get('process_invocations')}; "
                    f"wall seconds: {app.ledger.limits.get('process_wall_seconds')}. Resume does not reset it.")
-        print_line("Resume: simple-ar start --resume-task SESSION [--approve-execution TOKEN]; append a request for feedback.")
+        from simple_ar.cli.task_options import resume_command
+        print_line(f'Resume: {resume_command(app.session.store.root)}')
+        print_line('Append a request for feedback, or --approve-execution TOKEN for the exact pending command.')
         if args.prepare_only:
             return
 
