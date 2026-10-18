@@ -17,6 +17,7 @@ from simple_ar.integrations.llm import LLMClient
 from simple_ar.tools.specs import CommonToolSpec, ToolResult
 from simple_ar.tools.workspace import FileWindow
 from simple_ar.code_task.generation.selection import select_implementation_files, bind_implementation_originals
+from simple_ar.tools.implementation_run import ExecuteImplementationRequest
 
 
 class ImplementationFile(BaseModel):
@@ -175,25 +176,46 @@ def implementation_tool_specs(*, exact: bool = False) -> list[CommonToolSpec]:
             description='Implement the frozen scoped code task using its approved isolated-workspace preparation, CodeTask investigation, edit/protected-file gates, independent review and declared validator. Uses this task budget and attempt. Optional instruction/prior_result support feedback on the existing candidate; no arguments change scope, preparation or validator. Requires explicit approval of the displayed work and current source/environment identity. Only the saved technical-repair ceiling is authorized (one for legacy contracts); no scientific measurement. Installation is allowed only by an explicitly frozen environment preparation contract; it shares this attempt and process budget. Inspect the retained result before delivery. Interrupted work without a complete domain result is never replayed automatically.')]
     return [CommonToolSpec(name='prepare_implementation', domain='implementation',
         permission_level='write_patch', risk_level='medium', input_schema=ImplementationRequest.model_json_schema(),
-        description='Prepare a coherent code candidate from a goal without coordinator-selected files or supplied code. Optional material_roots are read-only evidence: the owner investigates actual file windows using the shared material reader before selecting code files. An optional existing project_path supplies editable source context; omit it for new code. Or supply explicit files/source_windows for investigated work. New files use full content; existing files use exact replacements against hash-bound complete originals. A complete response-contract rejection may receive one correction using the same remaining allowance; rejected proposals are retained. Transport, unknown-use and syntax failures are not replayed here. Saves selection, coverage omissions, source bindings and unresolved gaps. Repeating an identity returns only an unchanged completed result. Historical execution observations are evidence, not unresolved-failure declarations. No installs, execution, copying or transfer. Original sources remain unchanged; candidates require separate review and verification.')]
+        description='Prepare coherent code from a goal and optional read-only material_roots, without coordinator-selected files or code. The owner investigates actual windows, selects files and generates a candidate; project_path optionally supplies editable originals. When the goal needs a run, the same generation can propose one execution_plan; execute_implementation uses its registered result after explicit approval, without hand-copied commands/digests. Existing files require exact replacements. One complete response-contract correction shares the original budget; transport, unknown-use and syntax failures are not replayed. Original sources stay unchanged. Candidate preparation is not execution or scientific/visual verification.'),
+        CommonToolSpec(name='execute_implementation', domain='implementation',
+            permission_level='execution', risk_level='high', input_schema=ExecuteImplementationRequest.model_json_schema(),
+            description='Execute one registered prepare_implementation execution_plan through the existing approved process owner, interpreter and shared physical ledger. Takes its prepared_result, not hand-written commands or hashes. Pins all generated files, consumed input identities, exact command/environment and expected fresh outputs. Saves real errors for later professional repair, without retries, installation or a second workflow. Source/output changes invalidate success; interrupted unbound outputs are not adopted. Optional delivery finishes after this run succeeds, not after another coordinator decision. Physical execution does not certify scientific correctness or visual quality.')]
 
 
 class ImplementationToolGateway:
+    def delivery_preflight(self, observations: list[dict[str, Any]], arguments: dict[str, Any]) -> list[str]:
+        # Admission to this owner's final operation is not its success gate.
+        # Actual execution/version issues are checked again at terminal commit.
+        return []
+
+    def delivery_issues(self, observations: list[dict[str, Any]]) -> list[str]:
+        if self.exact is not None:
+            return []
+        from simple_ar.tools.implementation_run import delivery_issues
+        return delivery_issues(self, observations)
+
     @property
     def context_tools(self) -> set[str]:
-        return {'prepare_code_task', 'implement_code_task'} if self.exact is not None else set()
+        return {'prepare_code_task', 'implement_code_task'} if self.exact is not None else {'execute_implementation'}
 
     def execute_tool(self, name: str, context: Any, arguments: dict[str, Any],
                      *, approval: dict[str, Any] | None = None) -> ToolResult:
         if name not in self.context_tools:
             raise ValueError('Operation is not bound to this implementation owner')
+        if name == 'execute_implementation':
+            from simple_ar.tools.implementation_run import execute_prepared
+            return execute_prepared(self, context, arguments, approval=approval or {})
         return (self.prepare(context, arguments, approval=approval or {}) if name == 'prepare_code_task'
             else self.execute(context, arguments, approval=approval or {}))
 
     def has_started(self, identity: str) -> bool:
-        return bool(self.exact and (self.workspace.workspace / 'code_tasks' / identity).exists())
+        return ((self.workspace.workspace / 'code_tasks' / identity).exists() if self.exact
+            else self.workspace.has_started(identity))
 
     def can_reconcile(self, name: str, identity: str) -> bool:
+        if name == 'execute_implementation' and self.exact is None:
+            return ((self.root / 'attempts' / identity / 'candidate_execution.json').is_file()
+                or self.workspace.can_reconcile('run_process', identity))
         if self.exact:
             if name == 'prepare_code_task':
                 try:
@@ -260,7 +282,8 @@ class ImplementationToolGateway:
     def approval_binding(self, arguments: dict[str, Any], *, identity: str,
                          for_preparation: bool = False) -> dict[str, Any]:
         if self.exact is None:
-            raise ValueError('Exact implementation requires the saved contract')
+            from simple_ar.tools.implementation_run import execution_binding
+            return execution_binding(self, arguments, identity=identity)
         work = ExactCodeWork.model_validate(arguments)
         project = self.workspace.resolve(self.exact.project_path) if self.exact.project_path else None
         if project is not None:
@@ -478,17 +501,18 @@ class ImplementationToolGateway:
         self._check_retained_result(store, payload, run, binding)
         return record, code_task_paths(run).workspace_dir
 
-    def _registered_ref(self, record: Path, *, kind: str) -> Any:
-        store = ArtifactStore(record.parent)
+    def _registered_ref(self, record: Path, *, kind: str, store_root: Path | None = None) -> Any:
+        store = ArtifactStore(store_root or record.parent)
+        relative = record.relative_to(store.root).as_posix()
         attempt = store.read_attempt_manifest()
         capability = store.read_capability_result()
         session = ArtifactStore(self.root).read_json('session_manifest.json')
-        if (attempt.attempt_id != record.parent.name or attempt.capability != 'native_tool'
+        if (attempt.attempt_id != store.root.name or attempt.capability != 'native_tool'
                 or attempt.status != 'completed' or capability.status != 'completed'
                 or session['session_id'] != self.session_id
                 or attempt.attempt_id not in session['budget']['recorded_attempts']):
             raise ValueError('Source is not a completed native_tool attempt in this task')
-        registered = [ref for ref in attempt.outputs if ref.path == record.name
+        registered = [ref for ref in attempt.outputs if ref.path == relative
                       and ref.kind == kind and ref.status == 'available' and ref in capability.artifacts]
         if len(registered) != 1:
             raise ValueError('Source is not an actual registered output')
@@ -1153,6 +1177,11 @@ class ImplementationToolGateway:
                         'coverage': selection['coverage']} if selection else {})},
                 'artifacts': [f"{prefix}/{row['path']}" for row in result['files']],
                 'summary': 'Candidate saved. Original sources unchanged; execution and scientific correctness remain unverified.'}
+            if result.get('execution_plan') is not None:
+                data['data']['prepared_result'] = f'records/{identity}/implementation/result.json'
+                data['metadata'] = {'capability_artifacts': [ArtifactStore(owner.root.parent).ref(
+                    'implementation/result.json', kind='prepared_implementation',
+                    schema='prepared_implementation.v1').to_dict()]}
             owner.write_json('result.json', data)
             return ToolResult(tool_name=name, **data)
         except Exception as exc:

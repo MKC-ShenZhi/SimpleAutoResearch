@@ -21,6 +21,7 @@ from simple_ar.code_task.generation.common import generation_candidate, mapping_
 from simple_ar.code_task.generation.file_specs import is_model_generated_file, is_runtime_placeholder
 from simple_ar.code_task.generation.implementation_memory import record_generated_file, record_generation_batch
 from simple_ar.code_task.generation.scaffold import fallback_file_content
+from simple_ar.code_task.generation.run_plan import ImplementationRunPlan
 from simple_ar.code_task.generation.task_contract import contract_prompt_view
 
 
@@ -44,6 +45,16 @@ IMPLEMENTATION_SYSTEM = (
     'Keep checks, measurement and rendering distinguishable; rendering reuses saved measurements. '
     'Use portable paths and deterministic seeds where applicable. Do not fabricate measurements, '
     'state execution happened, silently change scientific conditions, or conceal missing source coverage. '
+    'When actual execution is needed for the goal, optionally include execution_plan in this same JSON: '
+    '{argv: [nonempty strings, at most 40], outputs: [1-24 distinct literal candidate-relative file paths], '
+    'timeout_sec: positive integer at most 300 (default 120)}. Propose one coherent command; the same '
+    'script may render, check behavior, and generate captions or a report. Its cwd is fixed to the '
+    'candidate root. Outputs must not overlap each other or any planned file, including ancestor or '
+    'descendant conflicts; no absolute, traversal, glob, backslash, colon or private/runtime paths. '
+    'For Python use the supplied task interpreter and explicit portable input/output paths; do not '
+    'hardcode plotting layouts. A plan is a proposal only: do not automatically run commands, install '
+    'dependencies, access the network or claim independent scientific verification. Omit the plan '
+    'when execution is unnecessary; do not add prerequisites, scaffolding or copied assets. '
     'The calling task will review and execute separately; runnable candidate is not verified success.'
 )
 
@@ -70,11 +81,15 @@ def write_implementation_unit(
             or len(set(planned)) != len(planned)):
         raise ValueError('Implementation requires distinct safe relative output paths')
     system = IMPLEMENTATION_SYSTEM
+    ledger = getattr(client, '_budget_ledger', None)
+    execution_resources = ({name: ledger.remaining(name) for name in
+        ('process_invocations', 'process_wall_seconds')} if isinstance(ledger, BudgetLedger) else None)
     prompt = json.dumps({'goal': goal, 'planned_files': files,
         'source_windows': source_windows, 'original_files': original_files,
         'execution_observations': execution_observations or [],
         'execution': {'performed': False, 'candidate_root': str(project_dir),
             'task_python': task_python,
+            'remaining_process_resources': execution_resources,
             'path_semantics': 'Planned files are relative to candidate_root. Source locators are observed input locations, not portable runtime defaults. Accept input/output paths explicitly; resolve project assets relative to the generated project, not the caller working directory.',
             'environment_scope': 'The interpreter path does not establish available packages. Use supplied dependency observations or disclose gaps; do not assume libraries are installed or install them.'}}, ensure_ascii=False)
     # Per-file/source-window bounds already constrain material acquisition.
@@ -86,6 +101,8 @@ def write_implementation_unit(
         client=client, system=system, prompt=prompt, planned=planned,
         original_files=original_files, artifact_dir=artifact_dir, retry_attempts=retry_attempts)
     unresolved = response.get('unresolved', [])
+    execution_plan = (ImplementationRunPlan.model_validate(response['execution_plan']).model_dump()
+        if 'execution_plan' in response else None)
     generated = []
     with generation_candidate(project_dir) as candidate:
         for path, content in contents.items():
@@ -94,9 +111,12 @@ def write_implementation_unit(
             target.write_bytes(content.encode('utf-8'))
             generated.append({'path': path, 'sha256': hashlib.sha256(content.encode()).hexdigest(),
                 'line_count': len(content.splitlines())})
-    return {'project_dir': str(project_dir), 'files': generated,
+    result = {'project_dir': str(project_dir), 'files': generated,
         'summary': str(response.get('summary', '')), 'unresolved': unresolved,
         'verification': 'Python syntax checked only; no imports, commands or scientific validation.'}
+    if execution_plan is not None:
+        result['execution_plan'] = execution_plan
+    return result
 
 
 def _decode_implementation_response(
@@ -145,6 +165,9 @@ def _decode_implementation_response(
     unresolved = response.get('unresolved', [])
     if not isinstance(unresolved, list) or any(not isinstance(item, str) for item in unresolved):
         raise ValueError('Unresolved gaps must be a list of strings')
+    if not legacy and 'execution_plan' in response:
+        plan = ImplementationRunPlan.model_validate(response['execution_plan'])
+        plan.validate_planned_paths(planned)
 
     return contents, modes
 
@@ -160,6 +183,8 @@ def _generate_implementation_contents(
     """Bound completed format corrections; provider retries belong to LLMClient."""
     feedback = ''
     response: dict[str, Any] = {}
+    if not legacy:
+        retry_attempts = min(retry_attempts, 2)
     for attempt in range(1, retry_attempts + 1):
         response = {}
         response_received = False

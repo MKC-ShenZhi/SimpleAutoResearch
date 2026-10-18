@@ -88,13 +88,17 @@ class CommonToolGateway:
         except (OSError, ValueError, KeyError, TypeError):
             return False
 
-    def delivery_issues(self, observations: list[dict[str, Any]]) -> list[str]:
+    def delivery_issues(self, observations: list[dict[str, Any]], *, proposed: ToolCall | None = None) -> list[str]:
         """Domains judge their accepted evidence; the gateway does not reinterpret it."""
         issues = []
         for owner in self._domain_gateways.values():
             check = getattr(owner, 'delivery_issues', None)
             if check is not None:
-                issues.extend(check(observations))
+                preflight = getattr(owner, 'delivery_preflight', None)
+                if proposed is not None and self.session_owner(proposed.tool_name) is owner and preflight:
+                    issues.extend(preflight(observations, proposed.arguments))
+                else:
+                    issues.extend(check(observations))
         return issues
 
     def call(self, call: ToolCall | str, arguments: dict[str, Any] | None = None,

@@ -39,7 +39,7 @@ from simple_ar.research.sources import SearchProviderRegistry
 
 
 _CORE_COORDINATION = {'focus_work', 'load_tools', 'read_history'}
-_FINAL_WORK_TOOLS = {'write_file', 'export_report', 'run_process', 'review_document', 'measure_experiment', 'analyze_measurements'}
+_FINAL_WORK_TOOLS = {'write_file', 'export_report', 'run_process', 'execute_implementation', 'review_document', 'measure_experiment', 'analyze_measurements'}
 _COMPLETION_POLICIES = {'protected_decision.v1', 'closing_decision.v2'}
 _CLOSING_DECISION = (
     'This is the last affordable decision under the saved resource contract. '
@@ -1232,7 +1232,8 @@ class ToolApplication:
                                     'record': 'records/' + item['result'].removeprefix('attempts/'),
                                     'operation': name, 'turn': len(blocks)}
                 outcomes.append(self._history_observation(call, result, item['result']))
-                if call['function']['name'] == 'run_process' and 'returncode' in data:
+                if ((execution_spec := self.gateway.registry.get(call['function']['name'])) is not None
+                        and execution_spec.permission_level == 'execution' and 'returncode' in data):
                     latest_execution = {'observation': outcomes[-1], 'data': data,
                         'result': result, 'turn': len(blocks),
                         'path': str(self.session.store.root / item['result'])}
@@ -1382,7 +1383,7 @@ class ToolApplication:
                     context['history_archive']['tool_failures'] += int(
                         observation.get('status') != 'ok' or bool(observation.get('error')))
                     context['history_archive']['nonzero_executions'] += int(
-                        observation['tool'] == 'run_process' and observation['observed'].get('returncode', 0) != 0)
+                        observation['observed'].get('returncode', 0) != 0)
             context['execution_observations'] = [{**execution['observation'],
                 'observed': execution['data']} for execution in executions
                 if not any(index >= cutoff for index in execution['blocks'])]
@@ -1498,7 +1499,7 @@ class ToolApplication:
                 context['history_archive']['tool_failures'] -= int(
                     observation.get('status') != 'ok' or bool(observation.get('error')))
                 context['history_archive']['nonzero_executions'] -= int(
-                    observation['tool'] == 'run_process' and observation['observed'].get('returncode', 0) != 0)
+                    observation['observed'].get('returncode', 0) != 0)
         input_cost()
         return prefix + [message for block in selected for message in block] + feedback
 
@@ -2056,7 +2057,10 @@ class ToolApplication:
                     arguments = {}
                 observations.append({**self.session.store.read_json(item['result']),
                     'arguments': arguments, 'record': item['result'], 'current_request': current_request})
-        failed = self.gateway.delivery_issues(observations)
+        proposed = (ToolCall(tool_name=call['function']['name'],
+            arguments=json.loads(call['function']['arguments']))
+            if not any(item['id'] == call['id'] for item in turn['tools']) else None)
+        failed = self.gateway.delivery_issues(observations, proposed=proposed)
         for item in turn['tools']:
             observed = self.session.store.read_json(item['result'])
             data = observed.get('data') or {}

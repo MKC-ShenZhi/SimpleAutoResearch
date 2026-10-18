@@ -94,6 +94,134 @@ class _ImplementationAssertions:
 
 
 class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
+    def test_prepared_unit_executes_approved_plan_and_pins_delivery_version(self) -> None:
+        from simple_ar.core.capabilities import ArtifactStore
+        _, _, fake, _, app, _ = self._native_fixture(process_limits={
+            'process_invocations': 2, 'process_wall_seconds': 10})
+        fake.chat_turn.side_effect = AssertionError('Caller actions must not request coordinator decisions')
+        app.implementation.client_factory = lambda _: fake
+        code = "from pathlib import Path\nPath('result.txt').write_text(str(sum(range(7))))\n"
+        external = app.workspace.workspace / 'caller-runner.py'
+        external.write_text(code)
+        fake.ask_json.return_value = {'summary': 'Compute saved result', 'unresolved': ['Optional CSV input remains unsupported'],
+            'files': [{'path': 'calculate.py', 'content': code}],
+            'execution_plan': {'argv': ['python', str(external)], 'outputs': ['result.txt'], 'timeout_sec': 3}}
+        stop = {'tool_name': 'ask_user', 'arguments': {'question': 'Await next explicit action'}}
+        app.run(actions=[{'tool_name': 'prepare_implementation', 'arguments': {
+            'goal': 'Compute the integer sum and save its result',
+            'files': [{'path': 'calculate.py', 'purpose': 'Compute actual result'}]}}, stop], progress=lambda _: None)
+        prepared = app.session.store.read_json(app.state['turns'][-1]['tools'][0]['result'])
+        self.assertEqual(prepared['status'], 'ok', prepared.get('error'))
+        locator = prepared['data']['prepared_result']
+        candidate = Path(prepared['data']['project_dir'])
+        self.assertFalse((candidate / 'result.txt').exists())
+        run = {'tool_name': 'execute_implementation', 'arguments': {'prepared_result': locator,
+            'delivery': {'summary': 'Actual saved sum; no scientific certification',
+                'artifacts': [str(candidate / 'result.txt'), str(candidate / 'calculate.py')]}}}
+        app.run(actions=[run], progress=lambda _: None)
+        pending = app.state['pending']
+        self.assertEqual(pending['call']['function']['name'], 'execute_implementation')
+        token = app.approval_token(pending['call'])
+        identity = pending['attempt']
+        external.write_text(code + '# external entry changed\n')
+        self.assertNotEqual(app.approval_token(pending['call']), token)
+        external.write_text(code)
+        # No capability context or borrowed directory can authorize a run.
+        rejected = app.gateway.call('execute_implementation', run['arguments'])
+        self.assertEqual(rejected.status, 'blocked')
+        self.assertFalse((candidate / 'result.txt').exists())
+        # A changed helper/source is caught even when absent from argv.
+        (candidate / 'calculate.py').write_text(code + '# changed\n')
+        with self.assertRaises(ValueError):
+            app.approval_token(pending['call'])
+        (candidate / 'calculate.py').write_text(code)
+        app = ToolApplication.load(app.session.store.root)
+        status = app.run(approved_execution=token, progress=lambda _: None)
+        self.assertEqual(status['status'], 'partial', status)
+        observed = app.session.store.read_json(f'attempts/{identity}/native_result.json')
+        self.assertEqual(observed['status'], 'ok', observed.get('error'))
+        self.assertEqual(observed['data']['returncode'], 0)
+        self.assertEqual(observed['data']['status'], 'run_succeeded')
+        self.assertEqual(observed['data']['delivery']['unresolved'], ['Optional CSV input remains unsupported'])
+        self.assertEqual((candidate / 'result.txt').read_text(), '21')
+        self.assertIn('no independent', observed['data']['verification'])
+        ledger = app.ledger.to_dict()
+        store = ArtifactStore(app.session.store.root / 'attempts' / identity)
+        saved = store.read_json('candidate_execution.json')
+        from simple_ar.tools.implementation_run import execute_prepared
+        context = SimpleNamespace(attempt=store.read_attempt_manifest(), store=store)
+        with patch.object(app.workspace, 'call', side_effect=AssertionError('No physical replay')):
+            recovered = execute_prepared(app.implementation, context, run['arguments'], approval=saved['approval'])
+        self.assertEqual(recovered.data, observed['data'])
+        self.assertEqual(app.ledger.to_dict(), ledger)
+        with _changed_record(store.root / 'candidate_execution.json', None), \
+                patch('simple_ar.tools.workspace.run_process', side_effect=AssertionError('No physical replay')):
+            interrupted = execute_prepared(app.implementation, context, run['arguments'], approval=saved['approval'])
+            self.assertEqual(interrupted.status, 'blocked')
+            self.assertEqual(interrupted.data['status'], 'unbound_outputs_after_interruption')
+            self.assertNotIn('delivery', interrupted.data)
+            self.assertEqual(app.ledger.to_dict(), ledger)
+        # Later delivery cannot certify this old output against new source.
+        external.write_text(code + '# new unexecuted entry\n')
+        issues = app.implementation.delivery_issues([{**observed, 'current_request': True}])
+        self.assertTrue(issues)
+        fake.chat_turn.assert_not_called()
+        self.assertEqual(fake.ask_json.call_count, 1)
+
+    def test_prepared_execution_failure_supplies_real_diagnosis_and_feedback_version(self) -> None:
+        _, _, fake, _, app, _ = self._native_fixture(process_limits={
+            'process_invocations': 3, 'process_wall_seconds': 10})
+        fake.chat_turn.side_effect = AssertionError('No coordinator decisions')
+        app.implementation.client_factory = lambda _: fake
+        stop = {'tool_name': 'ask_user', 'arguments': {'question': 'Await explicit continuation'}}
+        helper = 'def compute():\n    return 6*7\n'
+        bad = "from helper import compute\nraise ValueError('observed fixture failure')\n"
+        plan = {'argv': ['python', 'worker.py'], 'outputs': ['answer.txt'], 'timeout_sec': 3}
+        fake.ask_json.return_value = {'summary': 'First candidate', 'unresolved': [],
+            'files': [{'path': 'worker.py', 'content': bad}, {'path': 'helper.py', 'content': helper}],
+            'execution_plan': plan}
+        app.run(actions=[{'tool_name': 'prepare_implementation', 'arguments': {'goal': 'Save a computed answer',
+            'files': [{'path': 'worker.py', 'purpose': 'Run computation'},
+                {'path': 'helper.py', 'purpose': 'Required direct runtime dependency'}]}}, stop], progress=lambda _: None)
+        first = app.session.store.read_json(app.state['turns'][-1]['tools'][0]['result'])
+        app.run(actions=[{'tool_name': 'execute_implementation',
+            'arguments': {'prepared_result': first['data']['prepared_result']}}, stop],
+            approve=lambda *_: True, progress=lambda _: None)
+        failed = app.session.store.read_json(app.state['turns'][-1]['tools'][0]['result'])
+        self.assertEqual(failed['status'], 'blocked', failed.get('error'))
+        self.assertNotEqual(failed['data']['returncode'], 0)
+        self.assertIn('observed fixture failure', failed['data']['stderr'])
+        old_ledger = app.ledger.to_dict()
+        good = "from pathlib import Path\nfrom helper import compute\nPath('answer.txt').write_text(str(compute()))\n"
+        fake.ask_json.side_effect = [
+            {'files': [{'path': 'worker.py', 'purpose': 'Repair actual failing implementation'},
+                {'path': 'helper.py', 'purpose': 'Preserve necessary runtime dependency'}]},
+            {'summary': 'Repair candidate', 'unresolved': [],
+                'files': [{'path': 'worker.py', 'replacements': [{'old_text': bad, 'new_text': good}]},
+                    {'path': 'helper.py', 'replacements': []}],
+                'execution_plan': plan}]
+        app.run(actions=[{'tool_name': 'prepare_implementation', 'arguments': {
+            'goal': 'Repair using actual process error, preserve the first candidate',
+            'project_path': first['data']['project_dir']}}, stop], progress=lambda _: None)
+        second = app.session.store.read_json(app.state['turns'][-1]['tools'][0]['result'])
+        self.assertEqual(second['status'], 'ok', second.get('error'))
+        prompt = json.loads(fake.ask_json.call_args.args[1])
+        self.assertIn('observed fixture failure', json.dumps(prompt['execution_observations']))
+        self.assertEqual((Path(first['data']['project_dir']) / 'worker.py').read_text(), bad)
+        self.assertEqual((Path(second['data']['project_dir']) / 'helper.py').read_text(), helper)
+        output = str(Path(second['data']['project_dir']) / 'answer.txt')
+        app.run(actions=[{'tool_name': 'execute_implementation', 'arguments': {
+            'prepared_result': second['data']['prepared_result'],
+            'delivery': {'summary': 'Repaired result', 'artifacts': [output]}}}],
+            approve=lambda *_: True, progress=lambda _: None)
+        latest = app.session.store.read_json(app.state['turns'][-1]['tools'][-1]['result'])
+        self.assertEqual(latest['status'], 'ok', latest.get('error'))
+        self.assertEqual(app.session.manifest.status, 'completed')
+        self.assertEqual(Path(output).read_text(), '42')
+        self.assertEqual(app.ledger.to_dict()['entries'][:len(old_ledger['entries'])], old_ledger['entries'])
+        self.assertEqual(failed['data']['status'], 'process_failed')
+        fake.chat_turn.assert_not_called()
+
     def test_default_registry_exports_real_read_only_schemas(self) -> None:
         registry = default_tool_registry()
 
@@ -8863,6 +8991,126 @@ class AgentHandoffTests(unittest.TestCase):
 
 
 class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
+    def test_writer_optional_execution_plan_is_returned_without_execution(self) -> None:
+        from simple_ar.code_task.generation.writer import write_implementation_unit
+
+        candidate = self.run_dir / 'writer-plan'
+        content = "raise RuntimeError('Generation must not execute this script')\n"
+        proposal = {'summary': 'Prepared script', 'unresolved': [],
+            'files': [{'path': 'compose.py', 'content': content}]}
+        plan = {'argv': [sys.executable, 'compose.py', '--output', 'result/report.txt'],
+            'outputs': ['result/report.txt']}
+        for include_plan in (False, True):
+            with self.subTest(include_plan=include_plan):
+                self.fake.ask_json.return_value = {
+                    **proposal, **({'execution_plan': plan} if include_plan else {})}
+                with patch('simple_ar.core.process.run_process',
+                        side_effect=AssertionError('Writer cannot execute')) as process:
+                    result = write_implementation_unit(project_dir=candidate,
+                        goal='Prepare a report from explicit inputs.', files=[{'path': 'compose.py'}],
+                        source_windows=[], client=self.fake, artifact_dir=self.run_dir / 'writer-artifacts',
+                        task_python=sys.executable)
+                expected = {'project_dir': str(candidate), 'files': [{'path': 'compose.py',
+                    'sha256': hashlib.sha256(content.encode()).hexdigest(),
+                    'line_count': len(content.splitlines())}], 'summary': proposal['summary'],
+                    'unresolved': [],
+                    'verification': 'Python syntax checked only; no imports, commands or scientific validation.'}
+                if include_plan:
+                    expected['execution_plan'] = {**plan, 'timeout_sec': 120}
+                self.assertEqual(result, expected)
+                self.assertEqual((candidate / 'compose.py').read_bytes(), content.encode())
+                self.assertFalse((candidate / 'result').exists())
+                process.assert_not_called()
+                prompt = json.loads(self.fake.ask_json.call_args.args[1])
+                self.assertEqual(prompt['execution']['task_python'], sys.executable)
+
+    def test_writer_rejects_execution_output_conflicts_before_publication(self) -> None:
+        from simple_ar.code_task.generation.writer import write_implementation_unit
+
+        candidate = self.run_dir / 'writer-rejected-plan'
+        candidate.mkdir()
+        original = b'Existing candidate stays intact.\n'
+        (candidate / 'keep.txt').write_bytes(original)
+        for output in ('../escape.txt', '.codex/state.json', 'out/*.txt',
+                'src/compose.py', 'src', 'src/compose.py/result.txt', 'SRC/COMPOSE.PY'):
+            with self.subTest(output=output):
+                self.fake.ask_json.reset_mock()
+                self.fake.ask_json.return_value = {'summary': 'Rejected plan', 'unresolved': [],
+                    'files': [{'path': 'src/compose.py', 'content': 'value = 1\n'}],
+                    'execution_plan': {'argv': ['python', 'src/compose.py'], 'outputs': [output]}}
+                with self.assertRaises(ValueError):
+                    write_implementation_unit(project_dir=candidate, goal='Prepare an output.',
+                        files=[{'path': 'src/compose.py'}], source_windows=[], client=self.fake,
+                        artifact_dir=self.run_dir / 'writer-rejected-artifacts', retry_attempts=1)
+                self.assertEqual(self.fake.ask_json.call_count, 1)
+                self.assertEqual({path.name for path in candidate.iterdir()}, {'keep.txt'})
+                self.assertEqual((candidate / 'keep.txt').read_bytes(), original)
+
+    def test_execution_plan_strict_types_and_bounds(self) -> None:
+        from pydantic import ValidationError
+        from simple_ar.code_task.generation.run_plan import ImplementationRunPlan
+
+        valid = {'argv': ['python', 'compose.py'], 'outputs': ['report.txt']}
+        invalid = [
+            {'argv': []}, {'argv': ['python'] * 41}, {'argv': ['']}, {'argv': ['  ']},
+            {'argv': ['python', 1]}, {'argv': ('python',)}, {'argv': 'python compose.py'},
+            {'outputs': []}, {'outputs': [f'{index}.txt' for index in range(25)]},
+            {'outputs': [1]}, {'outputs': ['report.txt', 'REPORT.txt']},
+            {'outputs': ['result', 'result/report.txt']}, {'outputs': ['out\\report.txt']},
+            {'outputs': ['/report.txt']}, {'outputs': ['out/.ENV.local']},
+            {'timeout_sec': True}, {'timeout_sec': '120'}, {'timeout_sec': 1.5},
+            {'timeout_sec': 0}, {'timeout_sec': 301}, {'cwd': '.'},
+        ]
+        for change in invalid:
+            with self.subTest(change=change), self.assertRaises(ValidationError):
+                ImplementationRunPlan.model_validate({**valid, **change})
+        plan = ImplementationRunPlan.model_validate({'argv': ['python'] * 40,
+            'outputs': [f'{index}.txt' for index in range(24)], 'timeout_sec': 300})
+        self.assertEqual(plan.timeout_sec, 300)
+        self.assertEqual(ImplementationRunPlan.model_validate(valid).timeout_sec, 120)
+
+    def test_execution_plan_correction_is_bounded_and_legacy_ignores_it(self) -> None:
+        from simple_ar.code_task.generation.writer import (
+            _decode_implementation_response, write_implementation_unit)
+
+        proposal = {'summary': 'Prepared script', 'unresolved': [],
+            'files': [{'path': 'compose.py', 'content': 'value = 1\n'}]}
+        invalid = {**proposal, 'execution_plan': {'argv': ['python'], 'outputs': ['compose.py']}}
+        valid = {**proposal, 'execution_plan': {
+            'argv': ['python', 'compose.py'], 'outputs': ['report.txt']}}
+        for corrected in (True, False):
+            with self.subTest(corrected=corrected):
+                candidate = self.run_dir / f'writer-correction-{corrected}'
+                ledger = BudgetLedger({'llm_requests': 3})
+                fake = Mock(_budget_ledger=ledger)
+                replies = [invalid, valid if corrected else invalid]
+
+                def respond(*args, **kwargs):
+                    self.assertFalse(candidate.exists())
+                    index = fake.ask_json.call_count - 1
+                    key = f'plan-request-{index}'
+                    ledger.reserve(key, {'llm_requests': 1})
+                    ledger.settle(key, {'llm_requests': 1})
+                    return replies[index]
+
+                fake.ask_json.side_effect = respond
+                arguments = dict(project_dir=candidate, goal='Prepare a report.',
+                    files=[{'path': 'compose.py'}], source_windows=[], client=fake,
+                    artifact_dir=self.run_dir / f'writer-correction-artifacts-{corrected}', retry_attempts=5)
+                if corrected:
+                    result = write_implementation_unit(**arguments)
+                    self.assertEqual(result['execution_plan'], {**valid['execution_plan'], 'timeout_sec': 120})
+                else:
+                    with self.assertRaises(ValueError):
+                        write_implementation_unit(**arguments)
+                    self.assertFalse(candidate.exists())
+                self.assertEqual(fake.ask_json.call_count, 2)
+        with patch('simple_ar.code_task.generation.writer.ImplementationRunPlan.model_validate',
+                side_effect=AssertionError('Legacy cannot adopt execution plans')):
+            contents, _ = _decode_implementation_response(invalid, planned=['compose.py'],
+                original_files={}, legacy=True, artifact_dir=None, attempt=1)
+        self.assertEqual(set(contents), {'compose.py'})
+
     def setUp(self) -> None:
         from simple_ar.tools.implementation import ImplementationToolGateway
 
