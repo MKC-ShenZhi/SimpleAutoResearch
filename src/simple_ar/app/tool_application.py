@@ -1159,6 +1159,7 @@ class ToolApplication:
         progress = []
         latest_execution = latest_failure = None
         text_windows: dict[tuple[str, int, int], dict[str, Any]] = {}
+        source_observations = []
         request_count = 1
         for turn in self.state["turns"]:
             count = turn.get("request_count", 1)
@@ -1184,6 +1185,9 @@ class ToolApplication:
                 data = result.get('data') or {}
                 name = call['function']['name']
                 if result.get('status') == 'ok':
+                    if name == 'find_source_passages':
+                        source_observations.append({'data': data, 'turn': len(blocks),
+                            'record': 'records/' + item['result'].removeprefix('attempts/')})
                     # Derive exact text observations from existing receipts,
                     # not another memory or a model-authored summary. Processes
                     # may change files; validate candidates once at selection,
@@ -1387,13 +1391,16 @@ class ToolApplication:
             'A later successful probe does not resolve a failure; these are execution facts '
             'rather than claims about the current project.')
         context['retained_text_windows'] = []
+        context['retained_source_passages'] = []
         context['text_window_scope'] = (
             'Exact historical file text, not summaries or verified claims. Windows are '
             'revalidated against current authorized paths and matching full digests, including '
             'after execution. Changes and symlink redirection invalidate them; validation is '
             'a snapshot, not a guarantee against later changes. Original receipts remain '
             'readable. Windows share actual serialized capacity with native turns/contracts; '
-            'omission is not evidence of absence.')
+            'omission is not evidence of absence. Retained source passages are exact observed '
+            'chunk windows bound to the unchanged original source-record bytes, not a summary, '
+            'complete reading or verified support. Both collections share the same input capacity.')
         current_digests: dict[str, str | None] = {}
 
         def input_cost() -> int:
@@ -1450,11 +1457,15 @@ class ToolApplication:
                 except (ValueError, KeyError, OSError, RuntimeError):
                     pass
             if current_digests[location] == window['sha256']:
-                candidates.append(observation)
-        retained = context['retained_text_windows']
+                candidates.append({**observation, '_observed_turn': window['turn']})
+        for window in self.sources.retained_passages(source_observations, before_turn=cutoff):
+            candidates.append({key: value for key, value in window.items() if key != 'turn'}
+                              | {'_observed_turn': window['turn']})
         # Supplement omitted conversation with exact, current-version originals;
         # do not duplicate native observations already retained above.
-        for observation in candidates:
+        for candidate in sorted(candidates, key=lambda value: value['_observed_turn'], reverse=True):
+            observation = {key: value for key, value in candidate.items() if key != '_observed_turn'}
+            retained = context['retained_source_passages' if 'passage' in observation else 'retained_text_windows']
             retained.append(observation)
             if input_cost() > capacity:
                 retained.pop()

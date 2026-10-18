@@ -5132,11 +5132,60 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         # Force eviction of the source observations even when fewer tool
         # contracts leave more room; the assertions exercise retained windows.
         text_turns = [source_view, workspace_view, workspace_view, padding_view, second_padding]
+        # Retrieved originals must survive eviction just like observed file
+        # text, with their actual source version, offsets and receipt intact.
+        from simple_ar.research.contracts import DocumentRecord, TextChunk
+        from simple_ar.research.documents.ingest import DocumentBundle
+        original = resumed.session.store.root / 'evidence' / 'retained-original.json'
+        original_text = 'Observed method evidence and a conditional limitation, not a summary.'
+        bundle = DocumentBundle([DocumentRecord(document_id='observed', title='Retained original',
+            source='fixture', url='https://example.org/original', extraction_status='parsed')], {}, {}, [],
+            [TextChunk(chunk_id='observed-span', document_id='observed', text=original_text, page=3)])
+        write_json(original, bundle.to_handoff_dict())
+        raw_original = original.read_bytes()
+        lookup = {'document_record': 'evidence/retained-original.json', 'query': 'method evidence'}
+        acquired = _call_tool(resumed.gateway, 'find_source_passages', lookup, identity='retained-source-lookup')
+        self.assertEqual(acquired.status, 'ok', acquired.error)
+        source_turn = self._record_native_turn(resumed, 'find_source_passages', lookup,
+            acquired.data, 'retained-source')
+        duplicate_turn = self._record_native_turn(resumed, 'find_source_passages', lookup,
+            acquired.data, 'retained-source-duplicate')
+        text_turns[3:3] = [source_turn, duplicate_turn]
         resumed.state['turns'] = text_turns + [saved_turns[-1]]
-        windows = json.loads(resumed._messages()[1]['content'])['retained_text_windows']
+        context = json.loads(resumed._messages()[1]['content'])
+        windows = context['retained_text_windows']
         self.assertEqual([v['text'] for v in windows].count('1'), 1)
         self.assertTrue(any(v['text'] == source_text for v in windows))
         self.assertTrue(all(v['record'].startswith('records/') for v in windows))
+        passages = context['retained_source_passages']
+        self.assertEqual(len(passages), 1)
+        self.assertEqual(passages[0]['passage'], acquired.data['matches'][0])
+        self.assertEqual(passages[0]['path'], str(original))
+        self.assertEqual(passages[0]['sha256'], hashlib.sha256(raw_original).hexdigest())
+        self.assertEqual(passages[0]['documents'], acquired.data['documents'])
+        self.assertTrue(passages[0]['record'].startswith('records/'))
+        # A later short excerpt cannot erase an earlier observed limitation
+        # outside its span merely because both windows overlap.
+        partial = {**acquired.data['matches'][0], 'text': original_text[10:25],
+            'character_start': 10, 'character_end': 25, 'truncated': True}
+        partial_turn = self._record_native_turn(resumed, 'find_source_passages', lookup,
+            {**acquired.data, 'matches': [partial]}, 'retained-partial-source')
+        text_turns.insert(-2, partial_turn)
+        resumed.state['turns'] = text_turns + [saved_turns[-1]]
+        self.assertEqual({row['passage']['text'] for row in
+            json.loads(resumed._messages()[1]['content'])['retained_source_passages']},
+            {original_text, original_text[10:25]})
+        with patch.object(resumed.workspace, 'resolve_source_record', side_effect=ValueError('Authorization changed')):
+            self.assertEqual(json.loads(resumed._messages()[1]['content'])['retained_source_passages'], [])
+        original.write_bytes(raw_original + b'\n')
+        self.assertEqual(json.loads(resumed._messages()[1]['content'])['retained_source_passages'], [])
+        original.write_bytes(raw_original)
+        legacy_data = {k: v for k, v in acquired.data.items() if k not in {'document_path', 'document_sha256'}}
+        legacy_turn = self._record_native_turn(resumed, 'find_source_passages', lookup,
+            legacy_data, 'legacy-unpinned-source')
+        resumed.state['turns'] = [legacy_turn, padding_view, second_padding, saved_turns[-1]]
+        self.assertEqual(json.loads(resumed._messages()[1]['content'])['retained_source_passages'], [])
+        resumed.state['turns'] = text_turns + [saved_turns[-1]]
         long_thinking = self._record_native_turn(resumed, 'list_directory',
             {'path': 'workspace'}, {'entries': []}, 'indivisible-thinking')
         reply = resumed.session.store.read_json(long_thinking['reply'])
@@ -5146,10 +5195,11 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             with self.subTest(allowance=allowance), patch.object(resumed, 'ledger',
                     BudgetLedger({'total_tokens': allowance, 'llm_requests': 30})):
                 before = resumed.ledger.to_dict()
-                resumed.state['turns'] = [source_view, long_thinking]
+                resumed.state['turns'] = [source_view, source_turn, long_thinking]
                 messages = resumed._messages()
                 context = json.loads(messages[1]['content'])
                 self.assertEqual(context['retained_text_windows'], [])
+                self.assertEqual(context['retained_source_passages'], [])
                 self.assertTrue(context['resources']['context_exceeds_input_target'])
                 self.assertEqual(next(m for m in messages if m['role'] == 'assistant')
                     ['reasoning_content'], reply['reasoning_content'])
@@ -5178,6 +5228,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             projected = json.loads(loaded._messages()[1]['content'])
             self.assertEqual(projected['retained_text_windows'],
                 json.loads(resumed._messages()[1]['content'])['retained_text_windows'])
+            self.assertEqual(projected['retained_source_passages'],
+                json.loads(resumed._messages()[1]['content'])['retained_source_passages'])
             self.assertEqual([v['text'] for v in projected['retained_text_windows']
                 if v['path'] == workspace_path], ['1'])
             self.assertEqual(loaded.ledger.limits, original_limits)
@@ -6204,11 +6256,39 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 factory.assert_not_called()
         self.assertEqual(workspace.ledger.entries, ())
 
+        # Backend selection grants neither frozen policy nor gateway authority.
+        arguments = {'url': 'https://example.org/method', 'web_extract_backend': 'tavily_basic'}
+        for policy, error in ((SourcePolicy(), 'caller-frozen'), ({}, 'caller-frozen'),
+                ({'web_extract_backend': 'tavily_basic', 'allow_network': False}, 'denies network'),
+                ({'web_extract_backend': 'tavily_basic', 'providers': ['openalex']}, 'web provider'),
+                ({'web_extract_backend': 'tavily_basic'}, 'TAVILY_API_KEY'),
+                (None, 'TAVILY_API_KEY')):
+            owner = SourceToolGateway(root, workspace, workspace.ledger, policy=policy)
+            with self.subTest(policy=policy), patch.dict(os.environ, {'TAVILY_API_KEY': '  '}), patch(
+                    'simple_ar.tools.sources.build_document_bundle') as no_bundle:
+                denied = owner.call('acquire_source', arguments, identity='backend-denied')
+                self.assertEqual(denied.status, 'blocked')
+                self.assertIn(error, denied.error)
+                no_bundle.assert_not_called()
+            self.assertEqual(workspace.ledger.entries, ())
+            self.assertFalse((root / 'evidence/backend-denied').exists())
+        owner = SourceToolGateway(root, workspace, workspace.ledger)
+        tools = ToolRegistry()
+        tools.register_many(source_tool_specs())
+        gateway = CommonToolGateway(root, registry=tools, policy=ToolPermissionPolicy.read_only(),
+            domain_gateways={'sources': owner})
+        with patch('simple_ar.research.connectors.web.WebConnector') as no_connector:
+            self.assertEqual(_call_tool(gateway, 'acquire_source', arguments,
+                identity='backend-permission-denied').status, 'blocked')
+            no_connector.assert_not_called()
+        self.assertEqual(workspace.ledger.entries, ())
+
     def test_source_search_and_local_passages_preserve_original_identity(self) -> None:
         run_dir, inputs, fake, binding, resumed, code = self._native_fixture(allow_network=True)
         from simple_ar.research.sources.capability import SearchResult
         from simple_ar.research.sources.base import SearchResponse
         from simple_ar.literature.models import Paper
+        from simple_ar.tools.sources import SourcePolicy, SourceToolGateway
         paper = Paper(id="fixture-paper", title="A method", authors=[], abstract="Provider excerpt",
             url="https://example.org/method", source="web")
         search = SearchResult(status="completed", papers=(paper,), responses=(
@@ -6226,22 +6306,115 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             "path": found.data["search_record"], "content": "replace evidence"}, identity="deny-edit").status, "blocked")
         self.assertEqual(_call_tool(resumed.gateway, "acquire_source",
             {"url": "file:///private"}, identity="bad-url").status, "blocked")
+        # Exercise the original bundle/fulltext owner; only external transports
+        # are substituted. These scenarios specify routing, not service quality.
+        provenance = {'provider': 'tavily', 'depth': 'basic',
+            'source_url': paper.url, 'request_id': 'fixture-extract', 'usage': {'credits': 1}}
+        with patch.dict(os.environ, {'TAVILY_API_KEY': 'fixture'}), patch(
+                'simple_ar.research.preparation_assets.public_document_response',
+                side_effect=RuntimeError('ConnectError')) as direct, patch(
+                'simple_ar.research.connectors.web.WebConnector.extract_page',
+                return_value=('Original page evidence.\n' * 20, provenance)) as extract:
+            for index, policy in enumerate((None, SourcePolicy(), {'web_extract_backend': 'tavily_basic'})):
+                owner = SourceToolGateway(resumed.session.store.root, resumed.workspace, resumed.ledger, policy=policy)
+                snapshot = owner.policy.model_dump(mode='json')
+                frozen_bytes = owner._caller_policy_snapshot
+                resumed.gateway._domain_gateways['sources'] = owner
+                selectors = (None, 'direct', 'tavily_basic') if policy is None else (
+                    None, owner.policy.web_extract_backend)
+                for turn, selector in enumerate(selectors):
+                    arguments = {'url': paper.url}
+                    if selector is not None:
+                        arguments['web_extract_backend'] = selector
+                    backend = selector or owner.policy.web_extract_backend
+                    identity = f'backend-{index}-{turn}'
+                    acquired = _call_tool(resumed.gateway, 'acquire_source', arguments, identity=identity)
+                    self.assertEqual(acquired.status, 'ok', acquired.error)
+                    manifest = acquired.data['acquisition']
+                    self.assertEqual(manifest['budget']['web_extract_backend'], backend)
+                    self.assertEqual(manifest['fetch_attempt_count'], 1)
+                    hint = manifest['documents'][0]['hints'][0]
+                    if backend == 'direct':
+                        self.assertEqual((hint['status'], hint['reason']), ('fetch_failed', 'ConnectError'))
+                    else:
+                        self.assertEqual(hint['acquisition']['provider'], 'tavily')
+                        self.assertEqual(hint['acquisition']['usage'], {'credits': 1})
+                        self.assertGreater(acquired.data['text_bytes'], 0)
+                        # Even an explicit direct selector cannot unpin Tavily.
+                        if policy is not None:
+                            before = resumed.ledger.to_dict()
+                            rejected = _call_tool(resumed.gateway, 'acquire_source', {
+                                'url': paper.url, 'web_extract_backend': 'direct'}, identity=f'{identity}-mismatch')
+                            self.assertEqual(rejected.status, 'blocked')
+                            self.assertIn('caller-frozen', rejected.error)
+                            self.assertEqual(resumed.ledger.to_dict(), before)
+                    canonical = read_json(resumed.workspace.resolve(acquired.data['document_record']))
+                    compact = owner.history_identity('acquire_source', acquired.data)
+                    expected = {key: hint[key] for key in ('url', 'status', 'reason')}
+                    if backend == 'tavily_basic':
+                        expected['provider'] = 'tavily'
+                    self.assertEqual(compact['acquisition'], {
+                        'web_extract_backend': backend, 'hints': [expected]})
+                    self.assertEqual(canonical['fulltext_manifest'], manifest)
+                    entry = next(row for row in resumed.ledger.entries if row.reservation_id == f'source:{identity}')
+                    self.assertEqual(entry.actual, {'source_operations': 1})
+                    self.assertIn(acquired.data['document_record'], entry.reason)
+                    self.assertIn(f'web_extract_backend={backend}', entry.reason)
+                self.assertEqual(owner.policy.model_dump(mode='json'), snapshot)
+                self.assertEqual(owner._caller_policy_snapshot, frozen_bytes)
+            self.assertEqual(direct.call_count, 4)
+            self.assertEqual(extract.call_count, 3)
+        resumed.gateway._domain_gateways['sources'] = resumed.sources
         bundle = self._original_document()
         reference = found.data["search_record"].replace("search.json", "document.json")
         write_json(resumed.workspace.resolve(reference), bundle.to_handoff_dict())
+        source_path = resumed.workspace.resolve_source_record(reference)
+        source_bytes = source_path.read_bytes()
         resumed.gateway.policy.allowed_permissions.discard("network")
         matched = _call_tool(resumed.gateway, "find_source_passages",
             {"document_record": reference, "query": "cancellation"}, identity="local-lookup")
         self.assertEqual(matched.status, "ok")
+        self.assertEqual(matched.data['document_sha256'], hashlib.sha256(source_bytes).hexdigest())
+        self.assertEqual(matched.data['document_path'], str(source_path))
         self.assertEqual(matched.data["matches"][0]["chunk_id"], "original-span")
         self.assertEqual(matched.data["matches"][0]["line_start"], 10)
         self.assertEqual(matched.data['documents'][0]['title'], 'Original method documentation')
         self.assertEqual(matched.data['documents'][0]['url'], 'https://example.org/original')
         identity_view = _call_tool(resumed.gateway, 'find_source_passages',
             {'document_record': reference}, identity='local-identity')
-        for field in ('documents', 'documents_truncated', 'retained_chunks', 'retained_sections'):
+        for field in ('documents', 'documents_truncated', 'retained_chunks', 'retained_sections',
+                'document_path', 'document_sha256'):
             self.assertEqual(matched.data[field], identity_view.data[field])
+        # A valid JSON whitespace change still changes the observed original
+        # bytes. Neither that race nor lost authorization can yield a receipt.
+        def change_source(*args, **kwargs):
+            source_path.write_bytes(source_bytes + b'\n')
+            return []
+        try:
+            with patch('simple_ar.tools.sources.rank_source_chunks', side_effect=change_source):
+                changed = _call_tool(resumed.gateway, 'find_source_passages',
+                    {'document_record': reference, 'query': 'cancellation'}, identity='changed-source')
+            self.assertEqual(changed.status, 'blocked')
+            self.assertIn('changed during passage selection', changed.error)
+            self.assertEqual(changed.data, {})
+        finally:
+            source_path.write_bytes(source_bytes)
+        with patch.object(resumed.workspace, 'resolve_source_record',
+                side_effect=[source_path, ValueError('Source authorization revoked')]):
+            revoked = _call_tool(resumed.gateway, 'find_source_passages',
+                {'document_record': reference}, identity='revoked-source')
+        self.assertEqual(revoked.status, 'blocked')
+        self.assertIn('authorization revoked', revoked.error)
+        self.assertEqual(revoked.data, {})
         write_json(inputs / "retained-document.json", bundle.to_handoff_dict())
+        redirected_path = (inputs / 'retained-document.json').resolve()
+        self.assertEqual(redirected_path.read_bytes(), source_bytes)
+        with patch.object(resumed.workspace, 'resolve_source_record',
+                side_effect=[source_path, redirected_path]):
+            redirected = _call_tool(resumed.gateway, 'find_source_passages',
+                {'document_record': reference}, identity='redirected-source')
+        self.assertEqual(redirected.status, 'blocked')
+        self.assertIn('changed during passage selection', redirected.error)
         inventory = resumed.workspace.call("list_directory", {
             "path": "source0", "recursive": True, "file_glob": "retained-*.json"}, identity="inventory")
         self.assertEqual(inventory.data["entries"][0]["path"], "source0/retained-document.json")

@@ -971,6 +971,12 @@ simple-ar clean --shared-cache
 
 `--allow-network` 单独授权 arXiv、OpenAlex、Semantic Scholar 和可选 Tavily 的检索及原始来源获取。证据保持只读。每次获取目前限一个文档、三次 fetch 尝试、8 MiB 和 60 页 PDF。
 
+原生 `acquire_source` 支持可选 `web_extract_backend: direct|tavily_basic`。省略或传 null 保持当前后端，通常为 direct。未提供来源策略时，显式选择仅作用于本次获取；提供策略（包括空 dict）时，必须匹配冻结后端。显式选择 Tavily 需要策略 providers 包含 `web`、来源网络许可、共同 gateway 网络授权及 `TAVILY_API_KEY`；拒绝发生在来源预算预留之前。省略参数保留已有冻结策略行为。不自动回退或重试，PDF 路由仍归已有全文所有者。原始参数保留选择值，manifest 保留实际 provider 用量/积分，来源账本引用该原始凭据。压缩后的来源历史保留有界的实际 fetch URL、状态、原因、provider 及所选后端，不替代规范记录。后端可用性和成功获取仍需实际服务证据。
+
+新的 `find_source_passages` 凭据包含 `document_path`（授权解析后的实际路径）和 `document_sha256`（原始 JSON 字节的 SHA256）。查询匹配和身份预览使用该字节内容；选择完成后再次检查授权、解析路径和字节是否一致。历史凭据保持原样，不依据当前文件补造旧 hash。
+
+原生会话裁剪旧对话块时，已绑定的原文段落可与已观察文件文本共享同一序列化输入预算。来源 owner 复查授权原路径和字节；变化、丢失或无旧 hash 的来源不被冒认成当前有效原文。局部重叠不会静默抹掉先前读过的条件。保留的是准确历史观察，不是摘要、穷尽覆盖或科学验证；放不下的窗口仍有原回执可查。该机制不保证调用次数减少或任务必然交付。
+
 `source_operations` 统计 provider 或适配器操作，不等于 HTTP 次数或服务积分。问答检索是本地操作，保留 offset 和截断信息。首次可省略 `find_source_passages` 的 query，以检查来源身份和覆盖。
 
 保留的原始 `document_bundle.v1` 记录可以作为只读输入，不需要网络。所有权解析不允许把 workspace 生成的文档或尝试历史当成原始证据。

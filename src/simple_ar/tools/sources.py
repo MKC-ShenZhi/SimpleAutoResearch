@@ -134,6 +134,8 @@ class _Acquire(BaseModel):
     search_record: str = Field(default="", description="Saved evidence/.../search.json returned by search_sources.")
     paper_id: str = Field(default="", description="Exact ID in that saved search record, not a guessed citation.")
     url: str = Field(default="", description="Alternatively, an explicit public HTTPS document URL; no credentials.")
+    web_extract_backend: Literal['direct', 'tavily_basic'] | None = Field(default=None,
+        description="Omit to retain the current backend. Explicit selection must match any caller-supplied source policy; Tavily requires web provider authority and its credential. No automatic fallback.")
 
 
 class _Passages(BaseModel):
@@ -192,8 +194,86 @@ class SourceToolGateway:
         """
         if name != 'acquire_source':
             return {}
-        return {key: data[key] for key in ('document_record', 'documents', 'text_bytes')
-                if key in data}
+        identity = {key: data[key] for key in ('document_record', 'documents', 'text_bytes')
+                    if key in data}
+        manifest = data.get('acquisition')
+        if isinstance(manifest, dict):
+            acquisition: dict[str, Any] = {}
+            budget = manifest.get('budget')
+            if isinstance(budget, dict) and isinstance(budget.get('web_extract_backend'), str):
+                acquisition['web_extract_backend'] = budget['web_extract_backend'][:64]
+            hints = []
+            for document in manifest.get('documents', [])[:20]:
+                if not isinstance(document, dict):
+                    continue
+                for hint in document.get('hints', [])[:8]:
+                    if not isinstance(hint, dict) or len(hints) >= 8:
+                        continue
+                    observed = {key: hint[key][:limit] for key, limit in
+                        (('url', 2048), ('status', 64), ('reason', 300)) if isinstance(hint.get(key), str)}
+                    provenance = hint.get('acquisition')
+                    if isinstance(provenance, dict) and isinstance(provenance.get('provider'), str):
+                        observed['provider'] = provenance['provider'][:64]
+                    if observed:
+                        hints.append(observed)
+            if hints:
+                acquisition['hints'] = hints
+            if acquisition:
+                identity['acquisition'] = acquisition
+        return identity
+
+    def retained_passages(self, observations: list[dict[str, Any]], *, before_turn: int) -> list[dict[str, Any]]:
+        """Revalidate exact observed originals; no summaries, state or model call.
+
+        The caller owns the journal and serialized context capacity. This owner
+        keeps source admission, source versions and chunk-window interpretation.
+        Old unpinned receipts remain readable, never blessed with a current hash.
+        """
+        windows = {}
+        for observation in observations:
+            data = observation['data']
+            location, digest = data.get('document_path'), data.get('document_sha256')
+            if (not isinstance(location, str) or not Path(location).is_absolute()
+                    or not isinstance(digest, str) or not re.fullmatch(r'[a-f0-9]{64}', digest)):
+                continue
+            windows = {key: value for key, value in windows.items()
+                       if key[0] != location or value['sha256'] == digest}
+            for passage in data.get('matches', data.get('retained_preview', [])):
+                start, end, text = passage.get('character_start'), passage.get('character_end'), passage.get('text')
+                if (not isinstance(text, str) or not text or type(start) is not int
+                        or type(end) is not int or not 0 <= start <= end
+                        or end - start != len(text) or not passage.get('chunk_id')):
+                    continue
+                key = (location, passage['chunk_id'], start, end)
+                windows[key] = {'path': location, 'sha256': digest,
+                    'document_record': data['document_record'], 'documents': data.get('documents', []),
+                    'passage': passage, 'turn': observation['turn'], 'record': observation['record']}
+        digests, retained = {}, []
+        for window in sorted(windows.values(), key=lambda value: value['turn'], reverse=True):
+            if window['turn'] >= before_turn:
+                continue
+            location = window['path']
+            if location not in digests:
+                digests[location] = None
+                try:
+                    path = self.workspace.resolve_source_record(location)
+                    if path == Path(location) and path.is_file() and path.stat().st_size <= 64 * 1024 * 1024:
+                        with path.open('rb') as handle:
+                            digest = hashlib.file_digest(handle, 'sha256').hexdigest()
+                        if self.workspace.resolve_source_record(location) == path:
+                            digests[location] = digest
+                except (ValueError, KeyError, OSError, RuntimeError):
+                    pass
+            if digests[location] != window['sha256']:
+                continue
+            passage = window['passage']
+            if any(prior['path'] == location and prior['sha256'] == window['sha256']
+                    and prior['passage']['chunk_id'] == passage['chunk_id']
+                    and prior['passage']['character_start'] <= passage['character_start']
+                    and passage['character_end'] <= prior['passage']['character_end'] for prior in retained):
+                continue
+            retained.append(window)
+        return retained
 
     def __init__(self, root: Path, workspace: Any, ledger: BudgetLedger, *,
                  policy: SourcePolicy | dict[str, Any] | None = None,
@@ -206,6 +286,9 @@ class SourceToolGateway:
             raise ValueError('Source authority revision must be a nonnegative integer')
         self.authority_revision = authority_revision
         self.root, self.workspace, self.ledger = root, workspace, ledger
+        # Preserve the original config distinction across gateway reconstruction;
+        # never add it to SourcePolicy or historical policy snapshots.
+        self._policy_supplied = policy is not None
         self.policy = (SourcePolicy(max_results=20) if policy is None
             else SourcePolicy.model_validate(policy)).model_copy(deep=True)
         self.client_factory, self.feasibility_client_factory = client_factory, feasibility_client_factory
@@ -234,9 +317,12 @@ class SourceToolGateway:
             if name == "find_source_passages":
                 request = _Passages.model_validate(arguments)
                 path = self.workspace.resolve_source_record(request.document_record)
-                bundle = DocumentBundle.from_handoff_dict(json.loads(path.read_text()))
+                raw = path.read_bytes()
+                bundle = DocumentBundle.from_handoff_dict(json.loads(raw))
                 identity = {
                     "document_record": request.document_record,
+                    "document_path": str(path),
+                    "document_sha256": hashlib.sha256(raw).hexdigest(),
                     "documents": [{"id": record.document_id, "title": record.title,
                         "url": record.url, "status": record.extraction_status}
                         for record in bundle.records[:20]],
@@ -244,17 +330,22 @@ class SourceToolGateway:
                     "retained_chunks": len(bundle.chunks), "retained_sections": len(bundle.sections),
                 }
                 if not request.query.strip():
-                    return ToolResult(tool_name=name, data={
+                    data = {
                         **identity,
                         "retained_preview": source_chunk_views(bundle.chunks[:1], max_chars=1200),
-                        "scope": "Source identity, retained coverage and a bounded retained-text preview; not full reading. Query passages for consequential claims. Supplied source metadata is not independently verified."})
-                selected = rank_source_chunks(bundle.chunks[:self.policy.max_chunks], request.query,
-                    limit=min(request.limit, self.policy.max_chunks) if self.policy.max_chunks is not None else request.limit)
-                return ToolResult(tool_name=name, data={
-                    **identity,
-                    "matches": source_chunk_views(selected, query=request.query, max_chars=request.max_chars),
-                    "selected_chunks": len(selected),
-                    "scope": "Lexical lookup in retained text; not full reading or proof of absence"})
+                        "scope": "Source identity, retained coverage and a bounded retained-text preview; not full reading. Query passages for consequential claims. Supplied source metadata is not independently verified."}
+                else:
+                    selected = rank_source_chunks(bundle.chunks[:self.policy.max_chunks], request.query,
+                        limit=min(request.limit, self.policy.max_chunks) if self.policy.max_chunks is not None else request.limit)
+                    data = {
+                        **identity,
+                        "matches": source_chunk_views(selected, query=request.query, max_chars=request.max_chars),
+                        "selected_chunks": len(selected),
+                        "scope": "Lexical lookup in retained text; not full reading or proof of absence"}
+                current = self.workspace.resolve_source_record(request.document_record)
+                if current != path or current.read_bytes() != raw:
+                    raise ValueError('Source record changed during passage selection')
+                return ToolResult(tool_name=name, data=data)
             request = (_Search if name == "search_sources" else _Acquire).model_validate(arguments)
             directory = self.root / "evidence" / identity
             if name == "search_sources":
@@ -262,8 +353,18 @@ class SourceToolGateway:
                 operation = lambda: self._search(request, directory)
                 count = len(set(request.providers))
             else:
+                backend = request.web_extract_backend
+                if (backend is not None and self._policy_supplied
+                        and backend != self.policy.web_extract_backend):
+                    raise ValueError('Acquisition backend differs from caller-frozen source policy')
                 if not self.policy.allow_network:
                     raise ValueError('Source policy denies network acquisition')
+                if backend == 'tavily_basic':
+                    if 'web' not in self.policy.providers:
+                        raise ValueError('Tavily extraction requires the web provider in source policy')
+                    from simple_ar.research.connectors.web import WebConnector
+                    if not WebConnector()._api_key:
+                        raise ValueError('Tavily page extraction requires TAVILY_API_KEY')
                 papers = []
                 records = []
                 if request.search_record:
@@ -285,7 +386,7 @@ class SourceToolGateway:
                     records = [DocumentRecord(document_id=identity, title=request.url,
                         source="supporting_material", url=request.url,
                         metadata={"parent_document_id": "explicit_task_source"})]
-                operation = lambda: self._acquire(papers, records, directory)
+                operation = lambda: self._acquire(papers, records, directory, web_extract_backend=backend)
                 count = 1
             # Counts adapter/provider operations, not physical HTTP requests or
             # vendor credits. Existing acquisition owns redirect/byte limits.
@@ -305,7 +406,12 @@ class SourceToolGateway:
             except BaseException:
                 self.ledger.mark_unknown(reservation, reason="Source operation interrupted; inspect saved records before replay")
                 raise
-            self.ledger.settle(reservation, {"source_operations": count}, actual_source="adapter")
+            # Bind provider/credit provenance to the original manifest, without
+            # equating adapter operations with vendor credits or HTTP requests.
+            reason = (f"Acquisition provenance: {data['document_record']}; "
+                f"web_extract_backend={data['acquisition']['budget']['web_extract_backend']}"
+                if name == 'acquire_source' else '')
+            self.ledger.settle(reservation, {"source_operations": count}, actual_source="adapter", reason=reason)
             return ToolResult(tool_name=name, data=data)
         except (ValueError, KeyError, OSError, BudgetError) as exc:
             return ToolResult(tool_name=name, status="blocked", error=str(exc))
@@ -329,8 +435,9 @@ class SourceToolGateway:
                        for paper in {paper.id: paper for paper in result.papers}.values()],
             "scope": "Provider metadata/excerpts; acquire originals for consequential claims"}
 
-    def _acquire(self, papers: list, records: list, directory: Path) -> dict[str, Any]:
-        bundle = self._bundle(papers, records, directory, network=True)
+    def _acquire(self, papers: list, records: list, directory: Path, *,
+                 web_extract_backend: str | None = None) -> dict[str, Any]:
+        bundle = self._bundle(papers, records, directory, network=True, web_extract_backend=web_extract_backend)
         write_json(directory / "document.json", bundle.to_handoff_dict())
         # Raw extraction and canonical provenance stay outside writable output.
         # Model text windows are served by the same mounted file reader.
@@ -350,8 +457,11 @@ class SourceToolGateway:
         return Path(self.policy.cache_dir) if self.policy.cache_dir else self.root / 'source_cache'
 
     def _bundle(self, papers: list, records: list, directory: Path, *, network: bool,
-                local_documents: list[str] | None = None) -> DocumentBundle:
+                local_documents: list[str] | None = None,
+                web_extract_backend: str | None = None) -> DocumentBundle:
         plan = self.policy.source_plan(local_documents=local_documents)
+        if web_extract_backend is not None:
+            plan = replace(plan, budget={**plan.budget, 'web_extract_backend': web_extract_backend})
         if not network:
             plan = replace(plan, require_fulltext=False)
         return build_document_bundle(papers=papers, supporting_records=records, source_plan=plan,
