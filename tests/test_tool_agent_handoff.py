@@ -4770,6 +4770,39 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 self.assertEqual(app.session.manifest.to_dict(), manifest)
                 provider.assert_not_called()
 
+    def test_switch_retains_bounded_unknown_charges_of_an_accepted_logical_call(self):
+        # One provider attempt can fail, then its SDK retry completes under the
+        # same logical identity. Fees remain unknown even though work is closed.
+        with self._model_rebinding_fixture(outcome='ongoing') as (app, provider, resolve):
+            identity = Path(app.state['turns'][-1]['reply']).parent.name
+            app.ledger.reserve('prior-physical-attempt', {'llm_requests': 1, 'total_tokens': 8192},
+                purpose='native-turn', session_id=app.session.manifest.session_id,
+                attempt_id=identity, logical_call_id=identity)
+            app.ledger.mark_unknown('prior-physical-attempt', reason='Closed transport without usage',
+                known_actual={'llm_requests': 1}, retain_reservation=True)
+            before = self._native_snapshot(app)
+            # The old retry path is not broadened to completed operations.
+            with self.assertRaises(ValueError):
+                app._replacement_text_client('profile:new')
+            self._assert_native_snapshot(app, before)
+            envelope_path = app.session.store.root / f'attempts/{identity}/capability_result.json'
+            envelope = json.loads(envelope_path.read_text())
+            for broken in ({**envelope, 'status': 'failed'}, {**envelope, 'artifacts': []}):
+                with _changed_record(envelope_path, broken), self.assertRaises(ValueError):
+                    app.switch_model('profile:new', switch_id='new-service', reason='Continue with a new service')
+                self._assert_native_snapshot(app, before)
+            accepted = app.state['turns']
+            app.state['turns'] = []
+            with self.assertRaises(ValueError):
+                app.switch_model('profile:new', switch_id='new-service', reason='Continue with a new service')
+            app.state['turns'] = accepted
+            self._assert_native_snapshot(app, before)
+            app.switch_model('profile:new', switch_id='new-service', reason='Continue with a new service')
+            self.assertEqual(app.ledger.to_dict(), before['ledger'])
+            self.assertEqual(self._native_receipts(app, app.state['turns']), before['receipts'])
+            self.assertEqual(app.state['config']['model'], 'profile:new')
+            provider.assert_not_called()
+
     def test_native_model_rebinding_commits_routes_identity_and_preserves_history_on_resume(self):
         for purpose, selector in (('task', 'profile:new'), ('code', 'route:default'),
                                   ('writing', 'profile:new')):

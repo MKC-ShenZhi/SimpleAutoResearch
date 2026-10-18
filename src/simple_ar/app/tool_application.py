@@ -2305,7 +2305,26 @@ class ToolApplication:
             return None
         return attempt
 
-    def _replacement_text_client(self, model_selector: str, *, attempt_id: str = "") -> tuple[LLMClient, dict[str, Any]]:
+    def _accepted_model_attempt(self, identity: str) -> AttemptManifest | None:
+        """Prove a locally closed model operation whose reply entered history.
+
+        A completed logical call can retain unknown physical charges from an
+        earlier transport failure. Accepting its reply does not settle them.
+        """
+        attempt = next((row for row in self.session.list_attempts() if row.attempt_id == identity), None)
+        if (attempt is None or attempt.capability != 'native_turn' or attempt.status != 'completed'
+                or f'attempts/{identity}/native_result.json' not in {row['reply'] for row in self.state['turns']}):
+            return None
+        store = ArtifactStore(self.session.store.root / 'attempts' / identity)
+        if not store.exists('capability_result.json') or not store.exists('native_result.json'):
+            return None
+        result = store.read_capability_result('capability_result.json')
+        if result.status != 'completed' or [ref.path for ref in result.artifacts] != ['native_result.json']:
+            return None
+        return attempt
+
+    def _replacement_text_client(self, model_selector: str, *, attempt_id: str = "",
+                                 allow_completed_unknown: bool = False) -> tuple[LLMClient, dict[str, Any]]:
         """Resolve an explicit binding without sending work or altering accounting."""
         if not model_selector.startswith(('profile:', 'route:')):
             raise ValueError('Explicit model continuation requires a named profile:NAME or route:NAME')
@@ -2316,16 +2335,17 @@ class ToolApplication:
             raise ValueError('Replacement must be a named Chat connection; no protocol conversion')
         client = self._text_client(parent, self._work_focus()['purpose'])
         attempts = self.session.list_attempts()
-        # Only the existing retry contract's closed, bounded native decision
-        # failures may remain unknown. Their original reservations stay held.
+        # Retry keeps its original failure-only contract. Explicit switching
+        # also admits accepted, locally closed calls; all charges stay held.
         for entry in self.ledger.entries:
             if entry.status == 'unknown' and (
                     entry.purpose != 'native-turn' or entry.actual_source != 'reservation_bound'
                     or type(entry.reserved.get('total_tokens')) is not int
                     or entry.reserved['total_tokens'] <= 0
-                    or not any(row.attempt_id == entry.attempt_id and row.status == 'failed'
-                               and row.capability == 'native_turn' for row in attempts)
-                    or self.session.store.exists(f'attempts/{entry.attempt_id}/native_result.json')):
+                    or not ((any(row.attempt_id == entry.attempt_id and row.status == 'failed'
+                                 and row.capability == 'native_turn' for row in attempts)
+                             and not self.session.store.exists(f'attempts/{entry.attempt_id}/native_result.json'))
+                            or allow_completed_unknown and self._accepted_model_attempt(entry.attempt_id) is not None)):
                 raise ValueError('Unconfirmed operation must be reconciled before changing models')
         if client._settings.thinking_mode == 'enabled' and any(
                 'reasoning_content' not in self.session.store.read_json(turn['reply'])
@@ -2370,13 +2390,13 @@ class ToolApplication:
                         and self.session.store.exists(f'attempts/{row.attempt_id}/native_result.json')
                         and f'attempts/{row.attempt_id}/native_result.json' not in accepted for row in attempts)):
                 raise ValueError('Reconcile pending, running, reserved or cached operations before changing models')
-            _, replacement = self._replacement_text_client(model_selector)
+            _, replacement = self._replacement_text_client(model_selector, allow_completed_unknown=True)
             for entry in self.ledger.entries:
                 if entry.status == 'unknown' and (
                         entry.session_id != self.session.manifest.session_id
                         or entry.logical_call_id != entry.attempt_id
-                        or self._failed_model_attempt({'kind': 'model', 'attempt': entry.attempt_id},
-                            current_only=False) is None
+                        or (self._failed_model_attempt({'kind': 'model', 'attempt': entry.attempt_id},
+                            current_only=False) is None and self._accepted_model_attempt(entry.attempt_id) is None)
                         or set(entry.reserved) != {'llm_requests', 'total_tokens'}
                         or entry.reserved['llm_requests'] != 1 or entry.actual.get('llm_requests') != 1
                         or any(key not in entry.reserved or type(value) not in {int, float}
