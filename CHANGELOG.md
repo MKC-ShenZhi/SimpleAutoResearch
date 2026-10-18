@@ -6,6 +6,7 @@ User-visible changes, newest first. Entries describe behavior on their date; lat
 
 ## Unreleased — V2.10
 
+- Named text connections can explicitly set `connect_timeout_sec` separately from generation waiting. Omission preserves the old 20-second connection cap and historical bindings; retries, shared budgets and certificate verification are unchanged.
 - New code units choose editable sources during generation. Registered candidate feedback reuses actual source/material versions directly, preserves omitted originals, and can add necessary text sources or correct only the execution plan without another filename-planning call. Unfamiliar projects and historical selections retain investigation. Execution uses the original approval/process/ledger; binary outputs are rendered, not invented text. No scientific/visual certification is implied.
 - Code and writing share bounded material investigation and original task/inspection feedback in frozen requests. Match observed byte spans, full digests and reviewed versions, including relocated copies; do not upgrade historical unbound checks or changed files into verification. Preserve legacy calls and reject changed inputs before dispatch. Candidate generation is not scientific/visual verification.
 - New native tasks load professional tool contracts on demand alongside core workspace tools, using the original registry and permissions. Saved eager-contract tasks retain their presentation policy through recovery and supply; professional outcome and efficiency gains remain to be validated.

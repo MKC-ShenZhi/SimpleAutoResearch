@@ -25,6 +25,9 @@ stream = true
 # Optional: install simple-autoresearch[http2] and test your server's route.
 # http2 = true
 request_timeout_sec = 600
+# Optional TCP/TLS connection wait, separate from the generation timeout.
+# Omit to retain the historical 20-second cap. Does not authorize retries.
+# connect_timeout_sec = 60
 retry_attempts = 3
 # Native action-loop input working set, including schemas and reasoning history.
 # Default is 24000. Set after checking provider input+output limits and task cost.

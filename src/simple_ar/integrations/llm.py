@@ -114,6 +114,10 @@ class LLMSettings:
             failures. Includes the first request.
         connect_retry_attempts: Optional larger attempt ceiling only for typed
             failures known to precede dispatch. Does not replay uncertain usage.
+        connect_timeout_sec: Optional finite positive SDK connection timeout.
+            Defaults to the legacy 20-second cap for finite request timeouts;
+            explicit values are capped by a finite positive request timeout.
+            Named profiles only; no environment override or provider parameter.
         native_response_corrections: Strict integer 0 (default) or 1. Authorize
             one settled length-response correction in native Chat only, within
             the existing ledger and transport retry limits. Not a network retry.
@@ -180,6 +184,7 @@ class LLMSettings:
     http2: bool = False
     proxy_env: str = ""  # Environment reference only; resolved URLs are call-local.
     native_response_corrections: int = 0
+    connect_timeout_sec: float | None = None
 
 
 @dataclass(frozen=True)
@@ -283,6 +288,11 @@ class LLMClient:
             raise LLMError("native_response_corrections=1 requires explicit chat API mode")
         if settings.proxy_env and settings.transport_backend != "openai":
             raise LLMError("proxy_env is supported by the OpenAI SDK transport only")
+        if settings.connect_timeout_sec is not None:
+            if not _finite_timeout(settings.connect_timeout_sec):
+                raise LLMError("connect_timeout_sec must be a finite positive number")
+            if settings.transport_backend != "openai":
+                raise LLMError("connect_timeout_sec is supported by the OpenAI SDK transport only")
         if not settings.api_key:
             raise LLMError("OPENAI_API_KEY is not configured")
         if settings.http2 and settings.transport_backend != "openai":
@@ -707,6 +717,7 @@ class LLMClient:
             "api_key_env": catalog.profiles[self._profile_name].api_key_env,
             "settings": {key: value for key, value in vars(self._settings).items()
                            if key not in {"api_key", "proxy_env"} and not (key == "http2" and value is False)
+                           and not (key == "connect_timeout_sec" and value is None)
                            and not (key == 'native_response_corrections' and value == 0)},
             "code_route": {"profile": code_name, "connection": code.model_dump(
                 mode="json", exclude={"proxy_env"} | ({"http2"} if not code.http2 else set()))} if code else None,
@@ -864,6 +875,8 @@ class LLMClient:
                         mode_request,
                         http2=self._settings.http2,
                         **({"proxy": proxy} if proxy else {}),
+                        **({"connect_timeout_sec": self._settings.connect_timeout_sec}
+                           if self._settings.connect_timeout_sec is not None else {}),
                     )
                     if mode_request.get("stream") is True:
                         response = _collect_chat_stream(response)
@@ -1947,17 +1960,22 @@ def _api_attempt_order(api_mode: str) -> list[str]:
 
 
 def _call_provider(backend: str, api_mode: str, request: dict[str, Any], *, http2: bool = False,
-                   proxy: str | None = None) -> object:
+                   proxy: str | None = None, connect_timeout_sec: float | None = None) -> object:
     if backend == "litellm":
+        if connect_timeout_sec is not None:
+            raise LLMError("connect_timeout_sec is supported by the OpenAI SDK transport only")
         if proxy:
             raise LLMError("proxy is supported by the OpenAI SDK transport only")
         return _call_litellm(api_mode, request)
     if backend == "openai":
-        if proxy:
-            return _call_openai_sdk(api_mode, request, http2=http2, proxy=proxy)
+        options: dict[str, Any] = {}
         if http2:
-            return _call_openai_sdk(api_mode, request, http2=True)
-        return _call_openai_sdk(api_mode, request)
+            options["http2"] = True
+        if proxy:
+            options.update(http2=http2, proxy=proxy)
+        if connect_timeout_sec is not None:
+            options["connect_timeout_sec"] = connect_timeout_sec
+        return _call_openai_sdk(api_mode, request, **options)
     raise ValueError(f"Unsupported LLM transport backend: {backend}")
 
 
@@ -2022,14 +2040,21 @@ class _SDKTransportObservation:
         error._simple_ar_request_started = self.request_started
 
 
-def _sdk_timeout(value: object) -> object:
-    # A long generation deadline must not become a long TCP/TLS deadline.
-    # Leave read/write/pool and explicit non-finite values unchanged; use the
-    # normal client so certificate and environment/explicit proxy rules survive.
-    if not _finite_timeout(value):
+def _sdk_timeout(value: object, connect_timeout_sec: float | None = None) -> object:
+    # Keep legacy non-finite/absent timeout semantics unless explicitly tuned.
+    if connect_timeout_sec is None and not _finite_timeout(value):
         return value
     import httpx
-    return httpx.Timeout(value, connect=min(float(value), _SDK_CONNECT_TIMEOUT_SEC))
+    connect = _SDK_CONNECT_TIMEOUT_SEC if connect_timeout_sec is None else connect_timeout_sec
+    if _finite_timeout(value):
+        connect = min(float(value), connect)
+    if value is None:
+        # Absent request timeout previously left the SDK defaults in charge.
+        # An explicit connect retune changes only that phase of its defaults.
+        from openai import DEFAULT_TIMEOUT
+        return httpx.Timeout(connect=connect, read=DEFAULT_TIMEOUT.read,
+                             write=DEFAULT_TIMEOUT.write, pool=DEFAULT_TIMEOUT.pool)
+    return httpx.Timeout(value, connect=connect)
 
 
 def _require_no_running_loop() -> None:
@@ -2151,14 +2176,15 @@ def _quiet_proxy_transport(proxy: str | None):
 
 
 def _call_openai_sdk(api_mode: str, request: dict[str, Any], *, http2: bool = False,
-                     proxy: str | None = None) -> object:
+                     proxy: str | None = None, connect_timeout_sec: float | None = None) -> object:
     # SDK DEBUG can expose inline pixels and credentials; retain them in memory.
     with _quiet_proxy_transport(proxy or ("vision" if _has_image_input(request) else None)):
-        return _call_openai_sdk_request(api_mode, request, http2=http2, proxy=proxy)
+        return _call_openai_sdk_request(api_mode, request, http2=http2, proxy=proxy,
+                                        connect_timeout_sec=connect_timeout_sec)
 
 
 def _call_openai_sdk_request(api_mode: str, request: dict[str, Any], *, http2: bool,
-                             proxy: str | None) -> object:
+                             proxy: str | None, connect_timeout_sec: float | None = None) -> object:
     from openai import OpenAI, DefaultHttpxClient
 
     payload = dict(request)
@@ -2174,8 +2200,8 @@ def _call_openai_sdk_request(api_mode: str, request: dict[str, Any], *, http2: b
         # while the CLI only reports a single outer attempt.
         "max_retries": 0,
     }
-    if timeout is not None:
-        client_kwargs["timeout"] = _sdk_timeout(timeout)
+    if timeout is not None or connect_timeout_sec is not None:
+        client_kwargs["timeout"] = _sdk_timeout(timeout, connect_timeout_sec)
     if base_url:
         client_kwargs["base_url"] = str(base_url)
     if api_mode == "chat" and payload.get("stream") and _finite_timeout(timeout):

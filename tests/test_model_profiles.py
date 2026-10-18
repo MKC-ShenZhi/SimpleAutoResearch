@@ -405,6 +405,9 @@ class ModelProfileTests(unittest.TestCase):
         return store
 
     def test_routed_requests_use_whole_connection_and_preserve_usage(self):
+        self.path.write_text(CATALOG.replace('api_key_env = "WRITER_KEY"',
+            'api_key_env = "WRITER_KEY"\nconnect_timeout_sec = 45.0').replace(
+            'api_key_env = "CODER_KEY"', 'api_key_env = "CODER_KEY"\nconnect_timeout_sec = 60.0'), encoding="utf-8")
         parent_usage, task_usage = [], []
         parent = LLMClient.from_env(usage_callback=parent_usage.append)
         task = LLMClient.for_task(client=parent, model=parent.model, usage_callback=task_usage.append)
@@ -418,6 +421,8 @@ class ModelProfileTests(unittest.TestCase):
             ("writer-model", "https://writer.example/v1", "writer-secret"),
             ("coder-model", "https://coder.example/v1", "coder-secret")])
         self.assertTrue(requests[0]["stream"])
+        self.assertEqual([call.kwargs["connect_timeout_sec"] for call in send.call_args_list], [45.0, 60.0])
+        self.assertTrue(all("connect_timeout_sec" not in request for request in requests))
         self.assertEqual(len(parent_usage), 2)
         self.assertEqual(len(task_usage), 1)
         self.assertEqual(task_usage[0].model, "coder-model")
@@ -452,6 +457,15 @@ class ModelProfileTests(unittest.TestCase):
         for selector in ["profile:missing", "different-raw-model", "profile:artist"]:
             with self.subTest(selector=selector), self.assertRaises(LLMError):
                 LLMClient.from_env(model=selector)
+        for api in ("openai_chat", "openai_responses"):
+            with self.subTest(api=api):
+                self.path.write_text(CATALOG.replace('api = "openai_chat"', f'api = "{api}"', 1)
+                    .replace('stream = true', 'stream = false\nconnect_timeout_sec = 45'), encoding="utf-8")
+                configured = LLMClient.from_env()
+                self.assertEqual(configured._settings.connect_timeout_sec, 45.0)
+                self.assertEqual(configured._settings.api_mode, "chat" if api == "openai_chat" else "responses")
+                self.assertEqual(configured.connection_binding()["settings"]["connect_timeout_sec"], 45.0)
+        self.path.write_text(CATALOG, encoding="utf-8")
         del os.environ["CODER_KEY"]
         with self.assertRaisesRegex(LLMError, "CODER_KEY"):
             LLMClient.from_env(purpose="code")
@@ -464,6 +478,10 @@ class ModelProfileTests(unittest.TestCase):
         binding = client.connection_binding()
         self.assertNotIn("http2", binding["settings"])
         self.assertNotIn("http2", binding["code_route"]["connection"])
+        self.assertNotIn("connect_timeout_sec", binding["settings"])
+        self.assertNotIn("connect_timeout_sec", binding["code_route"]["connection"])
+        self.assertNotIn("connect_timeout_sec", load_model_catalog().profiles["writer"].model_dump())
+        self.assertNotIn("connect_timeout_sec", load_model_catalog().profiles["writer"].text_settings())
         self.assertNotIn("writer-secret", json.dumps(binding))
         self.assertNotIn("writer-secret", repr(client._settings))
         self.path.write_text(CATALOG.replace('api_key_env = "WRITER_KEY"',
@@ -478,10 +496,13 @@ class ModelProfileTests(unittest.TestCase):
         self._write_catalog("image-model", "new-image-model")
         self.assertEqual(LLMClient.from_env().connection_binding(), binding)
         self._write_catalog('retry_attempts = 1',
-            'retry_attempts = 3\nconnect_retry_attempts = 4\nrequest_timeout_sec = 1200.0\nmax_output_tokens = 16384\ncontext_input_tokens = 64000')
+            'retry_attempts = 3\nconnect_retry_attempts = 4\nrequest_timeout_sec = 1200.0\nconnect_timeout_sec = 45.0\nmax_output_tokens = 16384\ncontext_input_tokens = 64000')
         tuned = LLMClient.from_env().connection_binding()
         self.assertNotEqual(tuned, binding)
         self.assertTrue(model_connections_compatible(binding, tuned))
+        self.assertTrue(model_connections_compatible(tuned, binding))
+        self.assertEqual(tuned["settings"]["connect_timeout_sec"], 45.0)
+        self.assertEqual(tuned["code_route"]["connection"]["connect_timeout_sec"], 45.0)
         self.assertEqual(LLMClient.from_env()._settings.context_input_tokens, 64000)
         self.assertEqual(LLMClient.from_env()._settings.connect_retry_attempts, 4)
         self.assertNotIn('context_input_tokens', LLMClient.from_env()._build_request('system', 'user'))
@@ -500,6 +521,21 @@ class ModelProfileTests(unittest.TestCase):
         self.assertFalse(model_connections_compatible(binding, routed))
         self._write_catalog('code = "coder"', 'code = "coder"\nwriting = "coder"')
         self.assertFalse(model_connections_compatible(routed, LLMClient.from_env().connection_binding()))
+        writing_binding = LLMClient.from_env().connection_binding()
+        self.assertNotIn("connect_timeout_sec", writing_binding["writing_route"]["connection"])
+        # Isolate a connection-only retune across parent, code and writing routes.
+        self.path.write_text(CATALOG.replace('code = "coder"', 'code = "coder"\nwriting = "coder"')
+            .replace('retry_attempts = 1', 'retry_attempts = 1\nconnect_timeout_sec = 90.0'), encoding="utf-8")
+        retuned = LLMClient.from_env()
+        retuned_binding = retuned.connection_binding()
+        self.assertEqual(retuned_binding["writing_route"]["connection"]["connect_timeout_sec"], 90.0)
+        self.assertNotEqual(writing_binding, retuned_binding)
+        self.assertTrue(model_connections_compatible(writing_binding, retuned_binding))
+        self.assertTrue(model_connections_compatible(retuned_binding, writing_binding))
+        self.assertEqual(LLMClient.for_task(client=retuned, purpose="writing")._settings.connect_timeout_sec, 90.0)
+        self.path.write_text(self.path.read_text(encoding="utf-8").replace(
+            "https://writer.example/v1", "https://other.example/v1"), encoding="utf-8")
+        self.assertFalse(model_connections_compatible(retuned_binding, LLMClient.from_env().connection_binding()))
 
     def test_native_response_corrections_are_strict_chat_only_and_pinned(self):
         binding = LLMClient.from_env().connection_binding()
@@ -515,6 +551,11 @@ class ModelProfileTests(unittest.TestCase):
             client = LLMClient.from_env()
             self.assertFalse(model_connections_compatible(old, client.connection_binding()))
             self.assertFalse(model_connections_compatible(binding, client.connection_binding()))
+            retuned = json.loads(json.dumps(client.connection_binding()))
+            retuned['settings']['connect_timeout_sec'] = 90.0
+            retuned['code_route']['connection']['connect_timeout_sec'] = 90.0
+            self.assertFalse(model_connections_compatible(old, retuned))
+            self.assertFalse(model_connections_compatible(retuned, old))
             if reference == 'WRITER_KEY':
                 self.assertEqual(client._settings.native_response_corrections, 1)
                 self.assertNotIn('native_response_corrections', client._build_request('system', 'user'))
@@ -572,10 +613,15 @@ class ModelProfileTests(unittest.TestCase):
             ('retry_attempts = 1', 'connect_retry_attempts = 0'),
             ('retry_attempts = 1', 'connect_retry_attempts = true'),
             ('api = "openai_images"', 'api = "openai_images"\nconnect_retry_attempts = 2'),
+            ('api = "openai_images"', 'api = "openai_images"\nconnect_timeout_sec = 45.0'),
+            ('api = "openai_images"', 'api = "cctq_images_async"\nconnect_timeout_sec = 45.0'),
             ('retry_attempts = 1', 'context_input_tokens = 0'),
             ('retry_attempts = 1', 'context_input_tokens = true'),
             ('api_key_env = "WRITER_KEY"', 'api_key_env = "WRITER_KEY"\nproxy_env = "http://accidental-secret@proxy"'),
             ('api = "openai_chat"', 'api = "openai_responses"'),
+        ] + [
+            ('retry_attempts = 1', f'connect_timeout_sec = {value}')
+            for value in ('0', '-1', 'true', 'false', '"45"', 'inf', '-inf', 'nan')
         ] + [
             ('api_key_env = "WRITER_KEY"',
              'api_key_env = "WRITER_KEY"\nthinking_mode = "disabled"\n'
@@ -612,8 +658,10 @@ class ModelProfileTests(unittest.TestCase):
 
     def test_no_catalog_keeps_legacy_env(self):
         del os.environ["SIMPLE_AR_MODELS_CONFIG"]
+        os.environ["SIMPLE_AR_LLM_CONNECT_TIMEOUT_SEC"] = "45"
         legacy = LLMClient.from_env()
         self.assertEqual(legacy.model, "legacy-model")
+        self.assertIsNone(legacy._settings.connect_timeout_sec)
         self.assertEqual(legacy.connection_binding(), {})
         with self.assertRaises(LLMError):
             LLMClient.from_env(model="profile:writer")

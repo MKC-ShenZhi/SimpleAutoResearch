@@ -322,7 +322,7 @@ class LLMParsingTests(unittest.TestCase):
                 ledger = BudgetLedger({"llm_requests": 3, "total_tokens": 100})
                 client = LLMClient(LLMSettings(api_key="fixture", api_mode="auto", stream=True,
                     request_timeout_sec=0.03, max_output_tokens=10, retry_attempts=1,
-                    http2=True), budget_ledger=ledger)
+                    http2=True, connect_timeout_sec=45), budget_ledger=ledger)
                 with self.assertRaises(LLMDeadlineError) as caught:
                     client.ask_json("system", "user")
                 self.assertNotIn("looks_complete", str(caught.exception))
@@ -345,6 +345,8 @@ class LLMParsingTests(unittest.TestCase):
                 sdk.chat.completions.create.assert_awaited_once()
                 sdk.close.assert_awaited_once()
                 self.assertEqual(factory.call_args.kwargs["max_retries"], 0)
+                self.assertEqual(factory.call_args.kwargs["timeout"].connect, 0.03)
+                self.assertNotIn("connect_timeout_sec", sdk.chat.completions.create.call_args.kwargs)
                 transport.assert_called_once()
                 self.assertEqual(transport.call_args.kwargs['http2'], True)
                 self.assertEqual(set(transport.call_args.kwargs), {'http2', 'event_hooks'})
@@ -2177,14 +2179,16 @@ class LLMParsingTests(unittest.TestCase):
 
         response = {"choices": [{"message": {"content": "ok"}}],
                     "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5}}
-        for failure, pre_dispatch in ((httpx.ConnectTimeout("TLS handshake"), True),
-                                      (httpx.ReadTimeout("read interrupted"), False),
-                                      (TimeoutError("unclassified timeout"), False)):
-            with self.subTest(failure=type(failure).__name__):
+        for connect, failure, pre_dispatch in (
+                (connect, failure, pre_dispatch) for connect in (None, 45.0)
+                for failure, pre_dispatch in ((httpx.ConnectTimeout("TLS handshake"), True),
+                                             (httpx.ReadTimeout("read interrupted"), False),
+                                             (TimeoutError("unclassified timeout"), False))):
+            with self.subTest(connect=connect, failure=type(failure).__name__):
                 ledger = BudgetLedger({"llm_requests": 3, "total_tokens": 200})
                 client = LLMClient(LLMSettings(api_key="test-key", api_mode="chat",
                     stream=True, max_output_tokens=10, retry_attempts=1,
-                    connect_retry_attempts=3), budget_ledger=ledger)
+                    connect_retry_attempts=3, connect_timeout_sec=connect), budget_ledger=ledger)
                 with patch("simple_ar.integrations.llm._call_openai_sdk",
                            side_effect=[failure, response]) as provider, \
                         patch("simple_ar.integrations.llm.time.sleep"):
@@ -2262,6 +2266,8 @@ class LLMParsingTests(unittest.TestCase):
 
     def test_openai_sdk_backend_passes_explicit_timeout_only(self) -> None:
         import httpx
+        import math
+        from openai import DEFAULT_TIMEOUT
 
         async def chunks():
             yield {"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}
@@ -2273,47 +2279,84 @@ class LLMParsingTests(unittest.TestCase):
             def __aiter__(self):
                 return chunks()
 
-        for value, connect in ((123, 20.0), (0.5, 0.5)):
+        class SyncStream:
+            def __init__(self):
+                self.close = Mock()
+
+            def __iter__(self):
+                return iter([{"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}])
+
+        for value, configured, connect in (
+                (123, None, 20.0), (0.5, None, 0.5),
+                (123, 45.0, 45.0), (0.5, 45.0, 0.5), (123, 2.0, 2.0),
+                (None, None, None), (None, 45.0, 45.0),
+                (float("inf"), None, None), (float("inf"), 45.0, 45.0),
+                (float("nan"), None, None), (float("nan"), 45.0, 45.0)):
             for mode, streamed in (("chat", False), ("responses", False), ("chat", True)):
-                with self.subTest(timeout=value, mode=mode, streamed=streamed), \
+                async_stream = streamed and value is not None and math.isfinite(value)
+                with self.subTest(timeout=value, configured=configured, mode=mode, streamed=streamed), \
                         patch("openai.OpenAI") as sync_factory, \
                         patch("openai.AsyncOpenAI") as async_factory, \
                         patch("openai.DefaultAsyncHttpxClient"), patch("openai.DefaultHttpxClient"):
-                    factory = async_factory if streamed else sync_factory
+                    factory = async_factory if async_stream else sync_factory
                     sdk = factory.return_value
                     create = sdk.responses.create if mode == "responses" else sdk.chat.completions.create
-                    if streamed:
+                    if async_stream:
                         stream = Stream()
                         sdk.chat.completions.create = create = AsyncMock(return_value=stream)
                         sdk.close = AsyncMock()
+                    elif streamed:
+                        stream = SyncStream()
+                        create.return_value = stream
                     else:
                         create.return_value = {"output_text": "ok"} if mode == "responses" else {
                             "choices": [{"message": {"content": "ok"}}]}
-                    request = {"model": "fixture", "api_key": "test-key", "timeout": value,
-                               "input" if mode == "responses" else "messages": [
-                                   {"role": "user", "content": "hello"}]}
-                    if streamed:
-                        request["stream"] = True
-
-                    result = _call_openai_sdk(mode, request)
+                    client = LLMClient(LLMSettings(model="fixture", api_key="test-key", api_mode=mode,
+                        stream=streamed, request_timeout_sec=value, connect_timeout_sec=configured,
+                        retry_attempts=1))
+                    self.assertNotIn("connect_timeout_sec", client._build_request("system", "hello"))
+                    result = client.ask("system", "hello")
 
                     self.assertIn("ok", str(result))
                     factory.assert_called_once()
-                    (sync_factory if streamed else async_factory).assert_not_called()
-                    timeout = factory.call_args.kwargs["timeout"]
-                    self.assertIsInstance(timeout, httpx.Timeout)
-                    self.assertEqual(timeout.connect, connect)
-                    self.assertEqual((timeout.read, timeout.write, timeout.pool), (value,) * 3)
+                    (sync_factory if async_stream else async_factory).assert_not_called()
+                    if value is None and configured is None:
+                        self.assertNotIn("timeout", factory.call_args.kwargs)
+                    else:
+                        timeout = factory.call_args.kwargs["timeout"]
+                        if connect is None:
+                            self.assertTrue(math.isnan(timeout) if math.isnan(value) else timeout == value)
+                        else:
+                            self.assertIsInstance(timeout, httpx.Timeout)
+                            self.assertEqual(timeout.connect, connect)
+                            expected = DEFAULT_TIMEOUT if value is None else httpx.Timeout(value)
+                            for phase in ("read", "write", "pool"):
+                                actual, original = getattr(timeout, phase), getattr(expected, phase)
+                                if original is not None and math.isnan(original):
+                                    self.assertTrue(math.isnan(actual))
+                                else:
+                                    self.assertEqual(actual, original)
                     self.assertEqual(factory.call_args.kwargs["max_retries"], 0)
                     create.assert_called_once()
                     self.assertNotIn("timeout", create.call_args.kwargs)
-                    self.assertEqual(request["timeout"], value)
-                    if streamed:
+                    self.assertNotIn("connect_timeout_sec", create.call_args.kwargs)
+                    if async_stream:
                         create.assert_awaited_once()
                         stream.close.assert_awaited_once()
                         sdk.close.assert_awaited_once()
                     else:
                         sdk.close.assert_called_once()
+                        if streamed:
+                            stream.close.assert_called_once()
+
+        with patch("openai.OpenAI") as factory:
+            for value in (0, -1, True, False, "45", float("inf"), float("nan")):
+                with self.subTest(invalid_connect=value), self.assertRaisesRegex(LLMError, "connect_timeout_sec"):
+                    LLMClient(LLMSettings(api_key="fixture", connect_timeout_sec=value))
+            for backend in ("litellm", "unsupported"):
+                with self.subTest(backend=backend), self.assertRaisesRegex(LLMError, "SDK transport only"):
+                    LLMClient(LLMSettings(api_key="fixture", transport_backend=backend, connect_timeout_sec=45))
+            factory.assert_not_called()
 
     def test_installed_sdk_connect_cap_and_slow_stream_on_loopback(self) -> None:
         from contextlib import contextmanager
@@ -2382,7 +2425,6 @@ class LLMParsingTests(unittest.TestCase):
 
         for stall_tls in (True, False):
             with self.subTest(stall_tls=stall_tls), loopback(stall_tls) as (url, accepted), \
-                    patch("simple_ar.integrations.llm._SDK_CONNECT_TIMEOUT_SEC", 0.05), \
                     patch("openai.AsyncOpenAI", wraps=AsyncOpenAI) as factory, \
                     patch("openai.DefaultAsyncHttpxClient", side_effect=lambda **kwargs:
                           DefaultAsyncHttpxClient(trust_env=False, **kwargs)):
@@ -2392,12 +2434,12 @@ class LLMParsingTests(unittest.TestCase):
                 started = time.monotonic()
                 if stall_tls:
                     with self.assertRaises(APITimeoutError) as caught:
-                        _call_openai_sdk("chat", request)
+                        _call_openai_sdk("chat", request, connect_timeout_sec=0.05)
                     self.assertIsInstance(caught.exception.__cause__, httpx.ConnectTimeout)
                     self.assertEqual(_transport_failure_phase(caught.exception), "not_dispatched")
                     self.assertLess(time.monotonic() - started, request["timeout"])
                 else:
-                    self.assertIn("ok", str(_call_openai_sdk("chat", request)))
+                    self.assertIn("ok", str(_call_openai_sdk("chat", request, connect_timeout_sec=0.05)))
                     self.assertGreater(time.monotonic() - started, 0.05)
                 factory.assert_called_once()
                 self.assertEqual(factory.call_args.kwargs["max_retries"], 0)

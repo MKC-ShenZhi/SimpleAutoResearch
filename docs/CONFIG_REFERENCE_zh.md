@@ -111,6 +111,7 @@ writing = "daily"
 | `proxy_env` | 默认空，引用保存 HTTP(S) 代理 URL 的变量；不接受用户信息/query/fragment，实际地址不持久化 |
 | `stream`、`http2` | false、false；仅 Chat 支持流式；Responses profile 必须使用 `stream=false`，结构化任务也不例外 |
 | `request_timeout_sec` | 180，正数秒 |
+| `connect_timeout_sec` | 未设置时保留历史 TCP/TLS 建连上限 20 秒。可设有限正秒数，生效值不超过有限正的请求超时；仅文本 SDK 连接支持，不是生成总时限，也不增加重试次数。 |
 | `max_output_tokens` | 未设，显式正整数输出上限 |
 | `context_input_tokens` | 24000，正整数原生输入工作集目标，不代表提供方上下文容量 |
 | `retry_attempts` | 3，至少 1，包含首次物理请求 |
@@ -136,7 +137,7 @@ writing = "daily"
 
 HTTP/2 需要执行主机安装 `simple-autoresearch[http2]`，源码用 `uv sync --extra http2`。图像缺支持时在预留/提交前失败，完整旧图片仍可离线恢复。profile 代理只影响本连接，缺失或无效在付费前失败；未配置时沿标准客户端环境路由。
 
-有限时限的 SDK Chat 流式同时约束提交和消费，之后最多两秒清理。建连最多 `min(20, timeout)` 秒，读取/写入/连接池保持配置时限。SDK 内部重试关闭。缺完成标记保留未知用量；有输出上限的文本可沿同 API 在次数内重试，保留失败预留。无上限/视觉请求及额度不足时停止。非流式、Responses、LiteLLM 保持各自运输时限。已有 asyncio 循环中使用 `await asyncio.to_thread(client.ask, ...)`。
+有限时限的 SDK Chat 流式同时约束提交和消费，之后最多两秒清理。建连最多 `min(connect_timeout_sec, request_timeout_sec)` 秒；未设置建连项仍保留历史 20 秒上限，读取/写入/连接池保持配置时限。SDK 内部重试关闭。缺完成标记保留未知用量；有输出上限的文本可沿同 API 在次数内重试，保留失败预留。无上限/视觉请求及额度不足时停止。可选建连项也作用于同步 SDK Chat/Responses；LiteLLM 和 Images profile 不支持。已有 asyncio 循环中使用 `await asyncio.to_thread(client.ask, ...)`。
 
 推理档位和上限依提供方而异，推理可能同时占输出和后续输入。达到长度上限且只有思考、无最终回答不算完成；延长时限不能解决立即过载。诊断保留异常类型、可取得的 HTTP 状态与白名单错误码/类型；SDK Chat 失败还保留已观察到的最后一个安全 TCP/TLS/HTTP 事件，不记录请求头或 trace 内容。发送前建连失败不同于响应中断后的未知用量，之后一次 TLS 成功也不证明 API 稳定。不设输出上限时最终回答可能超过按输入估计的剩余额度，任务额度不是提供方严格费用上限。
 
