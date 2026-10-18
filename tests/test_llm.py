@@ -1385,6 +1385,88 @@ class LLMParsingTests(unittest.TestCase):
             with self.assertRaisesRegex(LLMResponseError, "Increase the per-call output token cap"):
                 client.ask("system", "user")
 
+    def test_response_error_correction_metadata_is_backward_compatible(self) -> None:
+        error = LLMResponseError('invalid JSON', raw_response='broken')
+        self.assertEqual(error.args, ('invalid JSON',))
+        self.assertEqual(str(error), 'invalid JSON')
+        self.assertEqual(error.raw_response, 'broken')
+        self.assertIs(error.correction_allowed, True)
+        self.assertIsNone(error.finish_reason)
+
+    def test_completed_corrections_reject_empty_output_but_correct_invalid_json(self) -> None:
+        from simple_ar.code_task.generation.agent_step import run_completed_response_corrections
+
+        private_reasoning = 'PRIVATE reasoning must never appear in public errors'
+        cases = (
+            ('reasoning_only', '', private_reasoning, 'length'),
+            ('empty', '', '', 'stop'),
+            ('invalid_json', 'not JSON', '', 'stop'),
+        )
+        for streamed in (False, True):
+            for case, content, reasoning, finish_reason in cases:
+                with self.subTest(streamed=streamed, case=case):
+                    ledger = BudgetLedger({'llm_requests': 4, 'total_tokens': 100000})
+                    ledger.reserve('old', {'llm_requests': 1, 'total_tokens': 100})
+                    old = ledger.mark_unknown('old', reason='earlier transport uncertainty',
+                        known_actual={'llm_requests': 1}, retain_reservation=True)
+                    old_record = old.to_dict()
+                    observed, failures = [], []
+                    client = LLMClient(LLMSettings(api_key='test-key', api_mode='chat',
+                        stream=streamed, retry_attempts=1, json_response_format='off'),
+                        budget_ledger=ledger, usage_callback=observed.append)
+                    usage = {'prompt_tokens': 2, 'completion_tokens': 3, 'total_tokens': 5}
+
+                    def response(text, thought, reason):
+                        message = {'content': text, 'reasoning_content': thought}
+                        if streamed:
+                            return iter([
+                                {'choices': [{'delta': message, 'finish_reason': reason}]},
+                                {'choices': [], 'usage': usage},
+                            ])
+                        return {'choices': [{'message': message, 'finish_reason': reason}],
+                                'usage': usage}
+
+                    def operation(attempt, last_error):
+                        return client.ask_json('system', 'user', label=f'correction-{attempt}',
+                                               max_output_tokens=16384)
+
+                    def invoke():
+                        return run_completed_response_corrections(client=client,
+                            operation=operation, retry_attempts=3,
+                            on_failure=lambda error, attempt, correct:
+                                failures.append((error, attempt, correct)))
+
+                    with patch('simple_ar.integrations.llm._call_openai_sdk', side_effect=[
+                            response(content, reasoning, finish_reason),
+                            response('{"ok": true}', '', 'stop')]) as sdk:
+                        if case == 'invalid_json':
+                            self.assertEqual(invoke(), {'ok': True})
+                        else:
+                            with self.assertRaises(LLMResponseError) as failure:
+                                invoke()
+                            self.assertIs(failure.exception, failures[0][0])
+                    error, attempt, correct = failures[0]
+                    self.assertEqual(len(failures), 1)
+                    self.assertEqual(attempt, 1)
+                    self.assertIs(correct, case == 'invalid_json')
+                    self.assertIs(error.correction_allowed, case == 'invalid_json')
+                    self.assertEqual(error.finish_reason, None if correct else finish_reason)
+                    self.assertEqual(error.raw_response, content if correct else '')
+                    self.assertNotIn(private_reasoning, str(error))
+                    self.assertNotIn(private_reasoning, repr(error))
+                    expected_calls = 2 if correct else 1
+                    self.assertEqual(sdk.call_count, expected_calls)
+                    self.assertEqual(len(observed), expected_calls)
+                    self.assertEqual([row.label for row in observed],
+                                     [f'correction-{i}' for i in range(1, expected_calls + 1)])
+                    self.assertEqual([row.total_tokens for row in observed], [5] * expected_calls)
+                    physical = [entry for entry in ledger.entries if entry.reservation_id != 'old']
+                    self.assertEqual(len(physical), expected_calls)
+                    self.assertEqual([entry.status for entry in physical], ['settled'] * expected_calls)
+                    self.assertEqual([entry.actual['total_tokens'] for entry in physical],
+                                     [5] * expected_calls)
+                    self.assertEqual(old.to_dict(), old_record)
+
     def test_ask_retries_transient_connection_error(self) -> None:
         usage: list[object] = []
         client = LLMClient(

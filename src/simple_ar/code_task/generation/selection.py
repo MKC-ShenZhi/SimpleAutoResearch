@@ -27,14 +27,7 @@ def implementation_selection_context(goal: str, project: Path | None,
     owner: ArtifactStore, project_binding: dict[str, Any],
     windows: list[dict[str, Any]], *, resolve_source: Callable[[str], Path]) -> tuple[dict[str, Any], dict[str, Any]]:
     if project is None:
-        # Absence of an input project is not an empty or inspected project.
-        # Do not scan the workspace or create an input shell to select files.
-        coverage = {'project_path': None,
-            'inventory_scope': 'No existing project supplied; no project inventory or source inspection performed.'}
-        context = {'goal': goal, 'project_path': None,
-            'source_context': [], 'source_windows': windows, 'coverage': coverage,
-            'selection_schema': _Selection.model_json_schema()}
-        return context, {'coverage': coverage, 'source_context': [], 'declared_project': {}}
+        raise ValueError('New code units choose their source files during generation; project selection requires existing source')
 
     from simple_ar.code_task.review_pipeline import build_review_index, compact_review_index
     from simple_ar.code_task.analysis.source_context import requested_source_context
@@ -132,8 +125,7 @@ def select_implementation_files(*, goal: str, request_binding: dict[str, Any],
         response = client.ask_json(
             'Select the necessary related existing and new files to implement the goal. '
             'Return only {files: [{path, purpose}]} with 1-12 distinct project-relative paths. '
-            'When project_path is null, choose new files from the goal and supplied material; '
-            'no existing project was supplied or inspected. No entry filename is mandatory. '
+            'No entry filename is mandatory. '
             'Choose actual implementation owners, callers, configuration, documentation and checks as needed. '
             'Select files needed for this coherent candidate, not everything worth inspecting. '
             'Include unchanged direct runtime dependencies only when the standalone candidate needs them; '

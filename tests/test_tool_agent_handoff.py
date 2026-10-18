@@ -108,8 +108,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             'execution_plan': {'argv': ['python', str(external)], 'outputs': ['result.txt'], 'timeout_sec': 3}}
         stop = {'tool_name': 'ask_user', 'arguments': {'question': 'Await next explicit action'}}
         app.run(actions=[{'tool_name': 'prepare_implementation', 'arguments': {
-            'goal': 'Compute the integer sum and save its result',
-            'files': [{'path': 'calculate.py', 'purpose': 'Compute actual result'}]}}, stop], progress=lambda _: None)
+            'goal': 'Compute the integer sum and save its result'}}, stop], progress=lambda _: None)
         prepared = app.session.store.read_json(app.state['turns'][-1]['tools'][0]['result'])
         self.assertEqual(prepared['status'], 'ok', prepared.get('error'))
         locator = prepared['data']['prepared_result']
@@ -8991,6 +8990,58 @@ class AgentHandoffTests(unittest.TestCase):
 
 
 class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
+    def test_direct_creation_rejects_binary_or_private_sources_without_replaying_empty_output(self) -> None:
+        from simple_ar.integrations.llm import LLMResponseError
+
+        for name, path in [('binary', 'figure.png'), ('private', '.env'), ('escape', '../outside.py')]:
+            with self.subTest(proposal=name):
+                self.fake.ask_json.reset_mock()
+                self.fake.ask_json.side_effect = None
+                self.fake.ask_json.return_value = {'summary': 'Invalid source', 'unresolved': [],
+                    'files': [{'path': path, 'content': 'not a rendered image or authorized source'}]}
+                identity = 'direct-denied-' + name
+                rejected = self._prepare_candidate(self.implementation, self.fake,
+                    {'goal': 'Create a useful code unit'}, identity, calls=2, status='error')
+                self.assertFalse((self.workspace.workspace / 'implementations' / identity).exists())
+                self.assertNotIn('PRIVATE', rejected.error)
+        self.fake.ask_json.reset_mock()
+        self.fake.ask_json.side_effect = LLMResponseError('No final output; finish_reason=length',
+            correction_allowed=False, finish_reason='length')
+        arguments = {'goal': 'Create from a goal without a preliminary filename plan'}
+        identity = 'direct-empty-final'
+        rejected = self._prepare_candidate(self.implementation, self.fake, arguments,
+            identity, calls=1, status='error')
+        self.assertIn('No final output', rejected.error)
+        with patch.object(self.implementation, '_client', side_effect=AssertionError('No blind replay')):
+            self._prepare_candidate(self.implementation, self.fake, arguments, identity, calls=1, status='error')
+
+    def test_saved_greenfield_selection_keeps_its_legacy_receipt(self) -> None:
+        from simple_ar.core.capabilities import ArtifactStore
+        from simple_ar.tools.implementation import ImplementationRequest
+
+        arguments = {'goal': 'Create a retained utility description'}
+        identity = 'legacy-greenfield-selection'
+        owner = ArtifactStore(self.run_dir / 'attempts' / identity / 'implementation')
+        initial = {'request': ImplementationRequest.model_validate(arguments).model_dump(),
+            'source_windows': [], 'execution_observations': []}
+        files = [{'path': 'README.md', 'purpose': 'Describe the utility'}]
+        coverage = {'project_path': None,
+            'inventory_scope': 'No existing project supplied; no project inventory or source inspection performed.'}
+        selection = {'input': initial, 'files': files, 'coverage': coverage,
+            'source_context': [], 'declared_project': {}}
+        owner.write_json('selection-input.json', initial)
+        owner.write_json('selection-response.json', {'files': files})
+        owner.write_json('selection.json', selection)
+        self.fake.ask_json.return_value = {'summary': 'Retained utility', 'unresolved': [], 'files': [self.note]}
+        result = self._prepare_candidate(self.implementation, self.fake, arguments, identity, calls=1)
+        saved = read_json(Path(result.data['source_binding']))
+        self.assertNotIn('generation_method', saved)
+        self.assertEqual(saved['selection'], selection)
+        self.assertEqual(owner.read_json('selection-input.json'), initial)
+        with patch.object(self.implementation, '_client', side_effect=AssertionError('No repeat model work')):
+            repeated = self._prepare_candidate(self.implementation, self.fake, arguments, identity, calls=1)
+        self.assertEqual(repeated.data, result.data)
+
     def test_writer_optional_execution_plan_is_returned_without_execution(self) -> None:
         from simple_ar.code_task.generation.writer import write_implementation_unit
 
@@ -9153,22 +9204,21 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
             'offset_bytes': len(prefix), 'max_bytes': len(tail)}]
         goal = 'Implement the iterable utility using the supplied observations.'
         arguments = {'goal': goal, 'material_roots': [str(materials)]}
-        selection = {'files': [{'path': 'utility.py', 'purpose': 'Public iterable utility'},
-            {'path': 'README.md', 'purpose': 'Document supplied evidence and limits'}]}
         generated = {'summary': 'Prepared utility', 'unresolved': [], 'files': [
             {'path': 'utility.py', 'content': 'def materialize(values):\n    return list(values)\n'},
             self.note]}
         self.fake.ask_json.side_effect = [
             {'read_windows': [*windows, {'path': str(distractor)}]},
-            {'materials': windows}, selection, generated]
+            {'materials': windows}, generated]
         identity = 'implementation-material-windows'
         with patch.object(self.workspace, 'call', wraps=self.workspace.call) as reads:
             result = self._prepare_candidate(self.implementation, self.fake, arguments,
-                identity, calls=4)
+                identity, calls=3)
         prompts = [json.loads(call.args[1]) for call in self.fake.ask_json.call_args_list]
         self.assertEqual(prompts[0]['goal'], goal)
         self.assertEqual(prompts[0]['observations'], [])
         self.assertEqual([prompt['decisions_remaining'] for prompt in prompts[:2]], [6, 5])
+        self.assertIsNone(prompts[2]['planned_files'])
         owner = self.run_dir / 'attempts' / identity / 'implementation'
         material_owner = owner / 'material-selection'
         self.assertEqual(read_json(material_owner / 'selection-response.json'), {'materials': windows})
@@ -9204,17 +9254,19 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
         self.assertNotIn('ENVIRONMENT_MATERIAL_SENTINEL', str(self.fake.ask_json.call_args_list))
         self.assertNotIn('linked-evidence.txt', str(prompts[:2]))
         binding = read_json(Path(result.data['source_binding']))
+        self.assertEqual(binding['generation_method'], 'direct_creation.v1')
+        self.assertFalse((owner / 'selection-input.json').exists())
         for observation in observations[:2]:
             self.assertIn(observation['data']['sha256'], json.dumps(binding))
         retained = {path: path.read_bytes() for path in owner.rglob('*.json')}
         accounted = self.ledger.to_dict()
         with patch.object(self.implementation, '_client', side_effect=AssertionError('No replay model')) as client:
-            replay = self._prepare_candidate(self.implementation, self.fake, arguments, identity, calls=4)
+            replay = self._prepare_candidate(self.implementation, self.fake, arguments, identity, calls=3)
             self.assertEqual(replay.data, result.data)
             # Same size, outside the chosen window: full source identity still changes.
             table.write_bytes(prefix.replace(b'item', b'kind') + tail)
             rejected = self._prepare_candidate(self.implementation, self.fake, arguments,
-                identity, calls=4, status='error')
+                identity, calls=3, status='error')
             self.assertIn('changed', rejected.error.lower())
             client.assert_not_called()
         self.assertEqual({path: path.read_bytes() for path in retained}, retained)

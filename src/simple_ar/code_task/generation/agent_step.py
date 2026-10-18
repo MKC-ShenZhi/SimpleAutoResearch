@@ -29,7 +29,8 @@ def run_completed_response_corrections(
         try:
             return operation(attempt, last_error)
         except LLMError as exc:
-            correct = (isinstance(exc, LLMResponseError) and attempt < retry_attempts
+            correct = (isinstance(exc, LLMResponseError) and exc.correction_allowed
+                       and attempt < retry_attempts
                        and response_accounting_known(client, accounting_before))
             on_failure(exc, attempt, correct)
             if not correct:

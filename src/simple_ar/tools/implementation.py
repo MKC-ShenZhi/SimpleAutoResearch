@@ -1095,7 +1095,10 @@ class ImplementationToolGateway:
                     owner=ArtifactStore(owner.root / 'material-selection'), identity=identity,
                     client_factory=lambda: self._client(identity))
                 windows.extend(material_selection['windows'])
-            if not request.files:
+            direct_creation = (not request.files and project is None
+                and not owner.exists('selection-input.json')
+                and (not owner.exists('request.json') or saved_binding.get('generation_method') == 'direct_creation.v1'))
+            if not request.files and not direct_creation:
                 selection, client = select_implementation_files(goal=request.goal,
                     request_binding=request.model_dump(), project=project, owner=owner, windows=windows,
                     bind_inventory=lambda: self.workspace.bind_inventory(project, identity=identity),
@@ -1110,7 +1113,7 @@ class ImplementationToolGateway:
                     'coverage': selection['coverage'],
                     'snapshots': [row for row in selection['source_context']
                         if row['path'] not in {item.path for item in request.files if item.source_path}]})
-            else:
+            elif request.files:
                 # Selection already validates its destinations and source locators.
                 # Explicit files need the same checks before reads or dispatch.
                 paths = set()
@@ -1132,6 +1135,7 @@ class ImplementationToolGateway:
             request_data['files'] = [row.model_dump(exclude={'source_path', 'source_sha256'}
                 if not row.source_path else set()) for row in request.files]
             binding = {'request': request_data, 'source_windows': windows,
+                **({'generation_method': 'direct_creation.v1'} if direct_creation else {}),
                 **({'original_files': originals} if originals else {}),
                 **({'selection': selection} if selection else {}),
                 **({'material_selection': material_selection} if material_selection else {})}
@@ -1158,9 +1162,10 @@ class ImplementationToolGateway:
             owner.write_json('request.json', binding)
             client = client or self._client(identity)
             result = write_implementation_unit(project_dir=output, goal=request.goal,
-                files=[row.model_dump() for row in request.files], source_windows=windows,
+                files=None if direct_creation else [row.model_dump() for row in request.files], source_windows=windows,
                 client=client, artifact_dir=owner.root, original_files=originals,
-                task_python=str(self.workspace.python), execution_observations=observations)
+                task_python=str(self.workspace.python), execution_observations=observations,
+                validate_destination=lambda path: self.workspace.resolve(f'{prefix}/{path}', write=True))
             if material_selection:
                 current, _ = implementation_materials(workspace=self.workspace,
                     roots=request.material_roots, goal=request.goal,

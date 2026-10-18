@@ -56,12 +56,15 @@ class LLMImageInputError(LLMError):
 
 
 class LLMResponseError(LLMError):
-    """A completed response cannot satisfy the requested output format."""
+    """A completed response is unusable, with explicit correction eligibility."""
 
-    def __init__(self, message: str, *, raw_response: str = "") -> None:
+    def __init__(self, message: str, *, raw_response: str = "",
+                 correction_allowed: bool = True, finish_reason: str | None = None) -> None:
         super().__init__(message)
         # Content is for task-local diagnostics, never part of error/log text.
         self.raw_response = raw_response
+        self.correction_allowed = correction_allowed
+        self.finish_reason = finish_reason
 
 
 class LLMStreamError(LLMError):
@@ -427,7 +430,8 @@ class LLMClient:
             budget_call_id=budget_call_id, image_count=len(image_urls))
         output = _content_from_response(response).strip()
         if not output:
-            raise LLMResponseError(_empty_response_message(response))
+            raise LLMResponseError(_empty_response_message(response),
+                correction_allowed=False, finish_reason=_finish_reason_from_response(response) or None)
         return output
 
     def chat_turn(
