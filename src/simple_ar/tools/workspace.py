@@ -27,7 +27,7 @@ _FULL_DIGEST_MAX_BYTES = 64 * 1024 * 1024
 
 class _Path(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    path: str = Field(description="Authorized mount-relative path, e.g. workspace/project or source0/README.md; observed absolute paths within the same roots also work. Mount names are tool locators, not filesystem directories for program code.")
+    path: str = Field(description="Relative paths default to the task workspace, e.g. reports/result.md. Explicit registered mount paths such as workspace/project or source0/README.md and observed absolute paths within those roots also work. Source mounts remain read-only; mount names are tool locators, not filesystem directories for program code.")
 
 
 class _List(_Path):
@@ -66,7 +66,7 @@ class DeliveryRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     summary: str = Field(min_length=1)
     artifacts: list[str] = Field(default_factory=list,
-        description="Existing workspace outputs or retained files in this task's evidence mount. Evidence remains read-only and is referenced, not copied or certified. Directories expand to a snapshot of at most 200 accessible files; private paths, virtual environments, Python bytecode caches and symlinks are excluded by the existing inventory rules. Oversized inventories must be narrowed explicitly; this is not an archive or correctness certificate.")
+        description="Existing workspace outputs (workspace-relative or explicitly mounted paths) or retained files in this task's evidence mount. Evidence remains read-only and is referenced, not copied or certified. Directories expand to a snapshot of at most 200 accessible files; private paths, virtual environments, Python bytecode caches and symlinks are excluded by the existing inventory rules. Oversized inventories must be narrowed explicitly; this is not an archive or correctness certificate.")
     unresolved: list[str] = Field(default_factory=list)
 
 
@@ -170,7 +170,12 @@ def resolve_mounted_path(mounts: dict[str, Path], value: str, *, write: bool = F
     else:
         if "\\" in value or rel.is_absolute():
             raise ValueError("Use an absolute filesystem path or a forward-slash mount alias")
-        alias, *parts = rel.parts
+        parts = rel.parts
+        alias = parts[0] if parts else 'workspace'
+        if alias in mounts:
+            parts = parts[1:]
+        else:
+            alias = 'workspace'  # Never infer a source root or host cwd.
         base = mounts.get(alias)
     if base is None or (write and alias != "workspace"):
         raise ValueError("Path is outside the authorized mounts or writable workspace")

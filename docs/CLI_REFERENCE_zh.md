@@ -971,6 +971,8 @@ simple-ar clean --shared-cache
 
 `--allow-network` 单独授权 arXiv、OpenAlex、Semantic Scholar 和可选 Tavily 的检索及原始来源获取。证据保持只读。每次获取目前限一个文档、三次 fetch 尝试、8 MiB 和 60 页 PDF。
 
+文件工具和交付附件中的无挂载前缀相对路径以任务 workspace 为根。已登记别名（`workspace/…`、`source0/…`、`evidence/…`）保留原所有权，绝对路径仍须位于授权根内；不按裸名称猜来源目录或主机目录。遍历、私有路径、越界链接、只读来源写入和产物版本校验仍生效。最终 `write_file` 的路径及 `delivery.artifacts` 可以采用这两种一致语义的写法；成功保存不等于科学验证。
+
 原生 `acquire_source` 支持可选 `web_extract_backend: direct|tavily_basic`。省略或传 null 保持当前后端，通常为 direct。未提供来源策略时，显式选择仅作用于本次获取；提供策略（包括空 dict）时，必须匹配冻结后端。显式选择 Tavily 需要策略 providers 包含 `web`、来源网络许可、共同 gateway 网络授权及 `TAVILY_API_KEY`；拒绝发生在来源预算预留之前。省略参数保留已有冻结策略行为。不自动回退或重试，PDF 路由仍归已有全文所有者。原始参数保留选择值，manifest 保留实际 provider 用量/积分，来源账本引用该原始凭据。压缩后的来源历史保留有界的实际 fetch URL、状态、原因、provider 及所选后端，不替代规范记录。后端可用性和成功获取仍需实际服务证据。
 
 新的 `find_source_passages` 凭据包含 `document_path`（授权解析后的实际路径）和 `document_sha256`（原始 JSON 字节的 SHA256）。查询匹配和身份预览使用该字节内容；选择完成后再次检查授权、解析路径和字节是否一致。历史凭据保持原样，不依据当前文件补造旧 hash。

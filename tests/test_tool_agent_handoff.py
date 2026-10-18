@@ -702,6 +702,23 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 'artifacts': ['workspace/delivery-project']}}, identity='directory-final')
         self.assertEqual(final_project.status, 'ok')
         self.assertEqual(len(final_project.data['delivery']['artifacts']), 2)
+        for index, (path, artifact) in enumerate((('reports/结果.md', 'reports/结果.md'),
+                ('workspace/mixed.md', 'mixed.md'))):
+            result = standalone.call('write_file', {'path': path, 'content': 'Retained output',
+                'delivery': {'summary': 'Scoped file result', 'artifacts': [artifact]}},
+                identity=f'relative-final-{index}')
+            self.assertEqual(result.status, 'ok', result.error)
+            self.assertEqual(standalone.resolve(path), standalone.resolve(artifact))
+            self.assertEqual(standalone.call('read_file', {'path': artifact},
+                identity=f'relative-read-{index}').data['text'], 'Retained output')
+        self.assertEqual(standalone.resolve('.'), standalone.workspace)
+        original_source = inputs.joinpath('notes.txt').read_bytes()
+        for index, path in enumerate(('../escape.md', '.env', 'source0/notes.txt', str(inputs/'outside.md'))):
+            denied = standalone.call('write_file', {'path': path, 'content': 'Do not write'},
+                identity=f'relative-denied-{index}')
+            self.assertEqual(denied.status, 'blocked')
+        self.assertEqual(inputs.joinpath('notes.txt').read_bytes(), original_source)
+        self.assertFalse(inputs.joinpath('outside.md').exists())
         with patch.object(standalone, '_list_files', return_value={
                 'entries': [], 'has_more': True, 'inventory_truncated': False}):
             self.assertEqual(standalone.call('deliver_result', {'summary': 'Do not truncate',
@@ -4262,7 +4279,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
     def test_native_last_decision_closes_or_preserves_unexecuted_work(self) -> None:
         from simple_ar.integrations.llm import LLMClient, LLMSettings
 
-        for mode in ('unclosed', 'misordered', 'process', 'failed_process', 'question', 'v1', 'legacy'):
+        for mode in ('unclosed', 'misordered', 'process', 'failed_process', 'relative_write', 'question', 'v1', 'legacy'):
             with self.subTest(mode=mode):
                 _, _, _, _, app, _ = self._native_fixture(mount_inputs=False, max_turns=1)
                 if mode in ('v1', 'legacy'):
@@ -4283,6 +4300,9 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 delivery = {'summary': 'Actual available result', 'artifacts': ['workspace/result.txt']}
                 if mode == 'question':
                     message = self._native_message('ask_user', {'question': 'Confirm the reduced scope?'}, 'question')
+                elif mode == 'relative_write':
+                    message = self._native_message('write_file', {'path': 'result.txt',
+                        'content': 'Actual result', 'delivery': {**delivery, 'artifacts': ['result.txt']}}, 'finish')
                 elif mode in ('process', 'failed_process'):
                     code = ("raise RuntimeError('real failure')" if mode == 'failed_process' else
                         "from pathlib import Path; Path('result.txt').write_text('Actual result')")
@@ -4332,14 +4352,14 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 self.assertEqual(app.ledger.remaining('llm_requests'), 0)
                 self.assertEqual(sum(e.status == 'unknown' for e in app.ledger.entries), 0)
                 self.assertIsNone(app.state['pending'])
-                self.assertEqual(app.session.store.exists('delivery.json'), mode == 'process')
-                self.assertEqual((app.workspace.workspace/'result.txt').is_file(), mode in ('process', 'v1', 'legacy'))
+                self.assertEqual(app.session.store.exists('delivery.json'), mode in ('process', 'relative_write'))
+                self.assertEqual((app.workspace.workspace/'result.txt').is_file(), mode in ('process', 'relative_write', 'v1', 'legacy'))
                 if mode in ('unclosed', 'misordered'):
                     self.assertIn('Final decision requires', status['status_reason'])
                     self.assertEqual(app.state['turns'][-1]['remaining'], [])
                     self.assertTrue(app.session.store.exists('tools/cancelled/native-turn-0001-0.json'))
                     self.assertFalse(app.session.list_attempts()[0].status == 'running')
-                if mode == 'process':
+                if mode in ('process', 'relative_write'):
                     self.assertEqual(status['status'], 'completed')
                     self.assertEqual((app.workspace.workspace/'result.txt').read_text(), 'Actual result')
                 elif mode == 'question':
