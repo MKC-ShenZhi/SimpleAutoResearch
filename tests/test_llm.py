@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 import asyncio
 import base64
 import json
@@ -869,6 +870,192 @@ class LLMParsingTests(unittest.TestCase):
         with patch("simple_ar.integrations.llm._call_openai_sdk") as call, self.assertRaises(LLMError):
             wrong_mode.chat_turn(history, tools=tools)
         call.assert_not_called()
+
+    def test_native_length_correction_preserves_history_caps_and_accounting(self):
+        history = [{'role': 'system', 'content': 'existing permissions'},
+            {'role': 'assistant', 'content': None, 'reasoning_content': 'old reasoning',
+             'tool_calls': [{'id': 'old', 'type': 'function', 'function': {
+                 'name': 'read_file', 'arguments': '{"path":"README.md"}'}}]},
+            {'role': 'tool', 'tool_call_id': 'old', 'content': 'old result'}]
+        tools = [{'type': 'function', 'function': {'name': 'read_file',
+            'parameters': {'type': 'object'}}}]
+        partial = {'content': 'PRIVATE PARTIAL', 'reasoning_content': 'PRIVATE THOUGHT',
+            'tool_calls': [{'id': 'cut', 'type': 'function', 'function': {
+                'name': 'read_file', 'arguments': 'PRIVATE ARGUMENT'}}]}
+        complete = {'content': None, 'tool_calls': [{'id': 'good', 'type': 'function',
+            'function': {'name': 'read_file', 'arguments': '{"path":"README.md"}'}}]}
+        for stream in (False, True):
+            for call_id in (None, 'same-logical-call'):
+                with self.subTest(stream=stream, call_id=call_id):
+                    observed = []
+                    ledger = BudgetLedger({'llm_requests': 3, 'total_tokens': 10000})
+                    client = LLMClient(LLMSettings(api_key='test-key', api_mode='chat',
+                        stream=stream, native_response_corrections=1, max_output_tokens=700,
+                        input_price_per_million=1.0, output_price_per_million=2.0),
+                        usage_callback=observed.append, budget_ledger=ledger)
+                    responses = []
+                    for message, reason in ((partial, 'length'), (complete, 'tool_calls')):
+                        usage = {'prompt_tokens': 40, 'completion_tokens': 20, 'total_tokens': 60}
+                        delta = {**message, 'tool_calls': [dict(tool, index=index)
+                            for index, tool in enumerate(message['tool_calls'])]}
+                        responses.append(iter([{'choices': [{'delta': delta, 'finish_reason': reason}],
+                            'usage': usage}]) if stream else {'choices': [
+                                {'message': message, 'finish_reason': reason}], 'usage': usage})
+                    with patch('simple_ar.integrations.llm._call_openai_sdk', side_effect=responses) as send:
+                        result = client.chat_turn(history, tools=tools, max_output_tokens=500,
+                            budget_call_id=call_id)
+                    self.assertEqual(result['tool_calls'], complete['tool_calls'])
+                    self.assertFalse(result.get('content'))
+                    self.assertEqual(result['role'], 'assistant')
+                    self.assertEqual(send.call_count, 2)
+                    first, second = [call.args[1] for call in send.call_args_list]
+                    self.assertEqual(first['messages'], history)
+                    self.assertEqual(second['messages'][:-1], history)
+                    self.assertEqual(second['messages'][-1]['role'], 'system')
+                    self.assertIn('500', second['messages'][-1]['content'])
+                    self.assertNotIn('PRIVATE', json.dumps(second))
+                    self.assertEqual(len(history), 3)
+                    for request in (first, second):
+                        self.assertEqual(request['tools'], tools)
+                        self.assertEqual(request['model'], client.model)
+                        self.assertEqual(request['max_tokens'], 500)
+                    self.assertEqual(len(observed), 2)
+                    self.assertEqual([record.total_tokens for record in observed], [60, 60])
+                    self.assertTrue(all(record.estimated_cost_usd > 0 for record in observed))
+                    self.assertEqual([entry.status for entry in ledger.entries], ['settled', 'settled'])
+                    self.assertEqual(sum(entry.actual['llm_requests'] for entry in ledger.entries), 2)
+                    self.assertEqual(sum(entry.actual['total_tokens'] for entry in ledger.entries), 120)
+                    self.assertEqual(len({entry.logical_call_id for entry in ledger.entries}), 1)
+                    self.assertEqual(len({entry.reservation_id for entry in ledger.entries}), 2)
+                    self.assertIn('finish_reason=length', ledger.entries[0].reason)
+                    self.assertIn('discarded', ledger.entries[0].reason)
+                    self.assertNotIn('PRIVATE', ledger.entries[0].reason)
+                    self.assertEqual(ledger.entries[1].reason, '')
+
+    def test_native_correction_stops_without_further_semantic_attempts(self):
+        def response(reason, content='answer'):
+            return {'choices': [{'message': {'content': content}, 'finish_reason': reason}]}
+
+        for enabled, responses, expected in (
+            (0, [response('length')], 1),
+            (1, [response('length'), response('length')], 2),
+            (1, [response('stop', '')], 1),
+            (1, [response('stop', ' \n ')], 1),
+            (1, [response('content_filter')], 1),
+            (1, [response('unknown')], 1),
+            (1, [response(None)], 1),
+            (1, [response('length'), response('stop', '')], 2),
+            (1, [response('length'), response('stop', ' \n ')], 2),
+            (1, [response('length'), response('content_filter')], 2),
+            (1, [response('length'), response('unknown')], 2),
+            (1, [response('length'), RuntimeError('provider failure')], 2),
+            (1, [response('length'), LLMDeadlineError('uncertain charge')], 2),
+        ):
+            with self.subTest(enabled=enabled, responses=responses):
+                ledger = BudgetLedger({'llm_requests': 5, 'total_tokens': 10000})
+                client = LLMClient(LLMSettings(api_key='test-key', api_mode='chat',
+                    native_response_corrections=enabled, retry_attempts=1), budget_ledger=ledger)
+                with patch('simple_ar.integrations.llm._call_openai_sdk', side_effect=responses) as send:
+                    with self.assertRaises(LLMError):
+                        client.chat_turn([{'role': 'user', 'content': 'inspect'}], tools=[], max_output_tokens=100)
+                self.assertEqual(send.call_count, expected)
+                self.assertEqual(len(ledger.entries), expected)
+                if isinstance(responses[-1], LLMDeadlineError):
+                    self.assertEqual(ledger.entries[-1].status, 'unknown')
+                    self.assertEqual(ledger.entries[-1].actual['llm_requests'], 1)
+
+    def test_native_correction_respects_existing_budget_floor_and_unsettled_attempts(self):
+        truncated = {'choices': [{'message': {'content': 'partial'}, 'finish_reason': 'length'}],
+            'usage': {'prompt_tokens': 5, 'completion_tokens': 5, 'total_tokens': 10}}
+        for case in ('budget', 'floor', 'current_unknown', 'historical_unknown',
+                     'known_connection_failure', 'current_reserved', 'correction_unknown'):
+            with self.subTest(case=case):
+                ledger = BudgetLedger({
+                    'llm_requests': 1 if case == 'budget' else 5, 'total_tokens': 10000})
+                if case == 'historical_unknown':
+                    ledger.reserve('old', {'llm_requests': 1, 'total_tokens': 100}, logical_call_id='same')
+                    ledger.mark_unknown('old', reason='old bounded failure',
+                        known_actual={'llm_requests': 1}, retain_reservation=True)
+                client = LLMClient(LLMSettings(api_key='test-key', api_mode='chat',
+                    native_response_corrections=1, retry_attempts=2), budget_ledger=ledger)
+                complete = {'choices': [{'message': {'content': 'done'}, 'finish_reason': 'stop'}]}
+                if case == 'known_connection_failure':
+                    import httpx
+                    responses = [httpx.ConnectError('connection error before dispatch'), truncated, complete]
+                elif case == 'current_unknown':
+                    responses = [LLMDeadlineError('uncertain charge'), truncated]
+                elif case == 'correction_unknown':
+                    responses = [truncated, LLMDeadlineError('uncertain correction charge'), complete]
+                else:
+                    responses = [truncated, complete]
+                def send_response(*args, **kwargs):
+                    if case == 'current_reserved' and len(ledger.entries) == 1:
+                        ledger.reserve('new-reserved', {'llm_requests': 1}, logical_call_id='same')
+                    item = responses.pop(0)
+                    if isinstance(item, Exception):
+                        raise item
+                    return item
+                scope = ledger.protect_remaining({'llm_requests': 4}) if case == 'floor' else \
+                    nullcontext()
+                with scope, patch('simple_ar.integrations.llm._call_openai_sdk',
+                        side_effect=send_response) as send, patch('simple_ar.integrations.llm.time.sleep'):
+                    if case in ('historical_unknown', 'known_connection_failure'):
+                        self.assertEqual(client.chat_turn([{'role': 'user', 'content': 'inspect'}],
+                            tools=[], max_output_tokens=100, budget_call_id='same')['content'], 'done')
+                    else:
+                        with self.assertRaises(LLMError):
+                            client.chat_turn([{'role': 'user', 'content': 'inspect'}],
+                                tools=[], max_output_tokens=100, budget_call_id='same')
+                expected = 3 if case in ('known_connection_failure', 'correction_unknown') else 2 if case in (
+                    'historical_unknown', 'current_unknown') else 1
+                self.assertEqual(send.call_count, expected)
+                if case in ('historical_unknown', 'current_unknown'):
+                    self.assertEqual(ledger.entries[0].status, 'unknown')
+                if case == 'correction_unknown':
+                    self.assertEqual([entry.status for entry in ledger.entries], ['settled', 'unknown', 'settled'])
+                if case == 'known_connection_failure':
+                    self.assertEqual([entry.status for entry in ledger.entries], ['settled'] * 3)
+                    self.assertEqual(sum(entry.actual['llm_requests'] for entry in ledger.entries), 3)
+                    self.assertEqual({entry.logical_call_id for entry in ledger.entries}, {'same'})
+
+    def test_native_correction_setting_validates_before_transport_and_does_not_change_ask(self):
+        with patch('simple_ar.integrations.llm._call_openai_sdk') as send:
+            for value in (True, False, '1', 1.0, -1, 2, None):
+                with self.subTest(value=value), self.assertRaises(LLMError):
+                    LLMClient(LLMSettings(api_key='test-key', api_mode='chat', native_response_corrections=value))
+            for mode in ('responses', 'auto'):
+                with self.subTest(mode=mode), self.assertRaises(LLMError):
+                    LLMClient(LLMSettings(api_key='test-key', api_mode=mode, native_response_corrections=1))
+            send.assert_not_called()
+            for ledger, cap in ((None, 100), (BudgetLedger({'llm_requests': 2, 'total_tokens': 10000}), None)):
+                client = LLMClient(LLMSettings(api_key='test-key', api_mode='chat', native_response_corrections=1),
+                    budget_ledger=ledger)
+                with self.assertRaisesRegex(LLMError, 'budget ledger and a finite output cap'):
+                    client.chat_turn([{'role': 'user', 'content': 'inspect'}], tools=[], max_output_tokens=cap)
+                if ledger is not None:
+                    self.assertEqual(ledger.entries, ())
+            send.assert_not_called()
+        client = LLMClient(LLMSettings(api_key='test-key', api_mode='chat', native_response_corrections=1))
+        response = {'choices': [{'message': {'content': 'partial'}, 'finish_reason': 'length'}]}
+        with patch('simple_ar.integrations.llm._call_openai_sdk', return_value=response) as send:
+            self.assertEqual(client.ask('system', 'user'), 'partial')
+            send.assert_called_once()
+        response['choices'][0]['message']['content'] = '{"ok":true}'
+        with patch('simple_ar.integrations.llm._call_openai_sdk', return_value=response) as send:
+            self.assertEqual(client.ask_json('system', 'user'), {'ok': True})
+            send.assert_called_once()
+
+    def test_native_correction_requires_successful_settlement(self):
+        ledger = BudgetLedger({'llm_requests': 3, 'total_tokens': 10000})
+        client = LLMClient(LLMSettings(api_key='test-key', api_mode='chat', native_response_corrections=1),
+            budget_ledger=ledger)
+        truncated = {'choices': [{'message': {'content': 'partial'}, 'finish_reason': 'length'}]}
+        with patch('simple_ar.integrations.llm._call_openai_sdk', return_value=truncated) as send, \
+                patch.object(ledger, 'settle', side_effect=BudgetConflictError('settlement failed')):
+            with self.assertRaisesRegex(LLMError, 'Could not settle'):
+                client.chat_turn([{'role': 'user', 'content': 'inspect'}], tools=[], max_output_tokens=100)
+        send.assert_called_once()
+        self.assertEqual(ledger.entries[0].status, 'reserved')
 
     def test_completed_stream_with_final_usage_does_not_wait_for_transport_eof(self):
         observed = []

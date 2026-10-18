@@ -111,6 +111,9 @@ class LLMSettings:
             failures. Includes the first request.
         connect_retry_attempts: Optional larger attempt ceiling only for typed
             failures known to precede dispatch. Does not replay uncertain usage.
+        native_response_corrections: Strict integer 0 (default) or 1. Authorize
+            one settled length-response correction in native Chat only, within
+            the existing ledger and transport retry limits. Not a network retry.
         retry_base_delay_sec: Initial exponential-backoff delay.
         retry_max_delay_sec: Maximum delay between provider retries.
         transport_backend: Provider client backend. ``openai`` uses the OpenAI
@@ -173,6 +176,7 @@ class LLMSettings:
     stream: bool = False
     http2: bool = False
     proxy_env: str = ""  # Environment reference only; resolved URLs are call-local.
+    native_response_corrections: int = 0
 
 
 @dataclass(frozen=True)
@@ -269,6 +273,11 @@ class LLMClient:
         Raises:
             LLMError: If the API key is missing.
         """
+        if (type(settings.native_response_corrections) is not int
+                or settings.native_response_corrections not in (0, 1)):
+            raise LLMError("native_response_corrections must be integer 0 or 1")
+        if settings.native_response_corrections and settings.api_mode != "chat":
+            raise LLMError("native_response_corrections=1 requires explicit chat API mode")
         if settings.proxy_env and settings.transport_backend != "openai":
             raise LLMError("proxy_env is supported by the OpenAI SDK transport only")
         if not settings.api_key:
@@ -451,8 +460,28 @@ class LLMClient:
             raise LLMError("Use the named vision client for visual evidence")
         history = json.dumps(messages, ensure_ascii=False)
         contract = json.dumps(tools, ensure_ascii=False)
+        corrections = self._settings.native_response_corrections
+        if corrections:
+            if self._budget_ledger is None or self.effective_output_limit(max_output_tokens) is None:
+                raise LLMError('Native response correction requires the original budget ledger and a finite output cap')
+            budget_call_id = budget_call_id or label or self._next_budget_call_id()
         response = self._complete_request(request, contract, history, label=label,
-            max_output_tokens=max_output_tokens, budget_call_id=budget_call_id)
+            max_output_tokens=max_output_tokens, budget_call_id=budget_call_id,
+            require_settled_response=bool(corrections))
+        if corrections and _finish_reason_from_response(response) == "length":
+            diagnostic = {"role": "system", "content": (
+                "The previous complete response was truncated (finish_reason=length) "
+                "and was not executed. Output token limit: "
+                f"{self.effective_output_limit(max_output_tokens)}. "
+                "Return a complete, executable operation of appropriate size within "
+                "this limit, following the existing instructions and permissions.")}
+            # Keep native history/tools, but never feed back the partial message,
+            # reasoning or tool arguments. The caller's history is not mutated.
+            request = {**request, "messages": [*messages, diagnostic]}
+            response = self._complete_request(request, contract,
+                json.dumps(request["messages"], ensure_ascii=False), label=label,
+                max_output_tokens=max_output_tokens, budget_call_id=budget_call_id,
+                require_settled_response=True)
         choices = _get_value(response, "choices")
         message = _get_value(choices[0], "message") if isinstance(choices, list) and choices else None
         if not isinstance(message, dict):
@@ -461,7 +490,7 @@ class LLMClient:
         if _finish_reason_from_response(response) == "length":
             # Preserve enough non-content evidence to distinguish reasoning
             # exhaustion from a large answer/tool payload. Never log or adopt
-            # the partial body, or retry a completed, charged response here.
+            # the partial body. Any explicitly authorized correction is exhausted.
             observed = message if isinstance(message, dict) else {}
             usage = _usage_from_response(response)
             argument_chars = sum(len(str(_get_value(_get_value(call, 'function'), 'arguments') or ''))
@@ -474,7 +503,11 @@ class LLMClient:
                 f"output_limit={self.effective_output_limit(max_output_tokens)}")
             raise LLMResponseError("Native Chat turn was truncated (finish_reason=length; "
                                    + counts + "); do not execute partial tool arguments")
+        if corrections and _finish_reason_from_response(response) not in {"stop", "tool_calls"}:
+            raise LLMResponseError("Native Chat turn has an unsupported finish reason")
         if not isinstance(message, dict) or not (message.get("content") or message.get("tool_calls")):
+            raise LLMResponseError(_empty_response_message(response))
+        if corrections and not (message.get("tool_calls") or _text_from_content(message.get("content")).strip()):
             raise LLMResponseError(_empty_response_message(response))
         return {**message, "role": "assistant"}
 
@@ -502,6 +535,7 @@ class LLMClient:
         label: str, max_output_tokens: int | None = None,
         response_format: dict[str, Any] | None = None,
         budget_call_id: str | None = None, image_count: int = 0,
+        require_settled_response: bool = False,
     ) -> object:
         """Shared transport, deadline and accounting for text and native turns."""
         if self._settings.base_url:
@@ -524,6 +558,8 @@ class LLMClient:
         prompt_tokens = (estimate_tokens(system) + estimate_tokens(user)
                          + image_count * ESTIMATED_IMAGE_INPUT_TOKENS)
         logical_call_id = budget_call_id or label or self._next_budget_call_id()
+        prior_reservations = ({entry.reservation_id for entry in self._budget_ledger.entries}
+                              if require_settled_response and self._budget_ledger is not None else set())
         response, provider_attempts, reservation_id = self._request_with_retry(
             request,
             logical_call_id=logical_call_id,
@@ -558,8 +594,18 @@ class LLMClient:
         except Exception as exc:
             self._mark_budget_unknown(reservation_id, reason=f"usage reconciliation failed: {exc}")
             raise
-        self._settle_budget(reservation_id, usage)
+        reason = ('Native response finish_reason=length; discarded without adoption or execution'
+                  if require_settled_response and _finish_reason_from_response(response) == 'length' else '')
+        self._settle_budget(reservation_id, usage, **({'reason': reason} if reason else {}))
         self._notify_usage(usage)
+        if require_settled_response:
+            unsettled = any(entry.reservation_id not in prior_reservations
+                and entry.logical_call_id == logical_call_id
+                and entry.status in {"unknown", "reserved"}
+                for entry in self._budget_ledger.entries)
+            if unsettled:
+                raise LLMResponseError("Native Chat turn has unsettled provider attempts; "
+                                       "response correction/adoption stopped")
         return response
 
     def _image_inputs(self, paths: tuple[Path, ...]) -> tuple[str, ...]:
@@ -647,7 +693,8 @@ class LLMClient:
             "profile": self._profile_name,
             "api_key_env": catalog.profiles[self._profile_name].api_key_env,
             "settings": {key: value for key, value in vars(self._settings).items()
-                         if key not in {"api_key", "proxy_env"} and not (key == "http2" and value is False)},
+                           if key not in {"api_key", "proxy_env"} and not (key == "http2" and value is False)
+                           and not (key == 'native_response_corrections' and value == 0)},
             "code_route": {"profile": code_name, "connection": code.model_dump(
                 mode="json", exclude={"proxy_env"} | ({"http2"} if not code.http2 else set()))} if code else None,
         }
@@ -1179,7 +1226,7 @@ class LLMClient:
             with self._usage_lock:
                 self._usage_callback(record)
 
-    def _settle_budget(self, reservation_id: str | None, usage: LLMUsage) -> None:
+    def _settle_budget(self, reservation_id: str | None, usage: LLMUsage, *, reason: str = '') -> None:
         if self._budget_ledger is None or reservation_id is None:
             return
         try:
@@ -1195,6 +1242,7 @@ class LLMClient:
                     "total_tokens": usage.total_tokens,
                 },
                 actual_source=usage.source,
+                reason=reason,
             )
         except BudgetError as exc:
             raise LLMError(f"Could not settle LLM usage in budget ledger: {exc}") from exc

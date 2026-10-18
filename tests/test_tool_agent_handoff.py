@@ -4201,6 +4201,45 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         fake.chat_turn.assert_not_called()
         fake.ask_json.assert_not_called()
 
+    def test_native_completed_response_correction_adopts_only_complete_work_and_restores(self):
+        from simple_ar.integrations.llm import LLMClient, LLMSettings
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'task'
+            client = LLMClient(LLMSettings(api_key='fixture', model='fixture', api_mode='chat',
+                native_response_corrections=1, max_output_tokens=512, retry_attempts=1))
+            services = SimpleNamespace(llm_client=client)
+            app = ToolApplication.create(root, 'Save and deliver the inspected result', model='fixture',
+                sources={}, services=services, max_turns=3, max_tokens=100000)
+            poison = self._native_message('write_file', {'path': 'poison.txt', 'content': 'never adopt'}, 'cut')
+            complete = self._native_message('write_file', {'path': 'result.txt', 'content': 'complete result',
+                'delivery': {'summary': 'Explicit complete output', 'artifacts': ['result.txt']}}, 'complete')
+            replies = [{'choices': [{'message': message, 'finish_reason': reason}],
+                        'usage': {'prompt_tokens': 100, 'completion_tokens': 20, 'total_tokens': 120}}
+                       for message, reason in ((poison, 'length'), (complete, 'tool_calls'))]
+            with patch('simple_ar.integrations.llm._call_openai_sdk', side_effect=replies) as send:
+                status = app.run(progress=lambda _: None)
+            self.assertEqual(status['status'], 'completed', status['status_reason'])
+            self.assertEqual(send.call_count, 2)
+            self.assertFalse((root / 'workspace/poison.txt').exists())
+            self.assertEqual((root / 'workspace/result.txt').read_text(), 'complete result')
+            self.assertEqual(len(app.state['turns']), 1)
+            self.assertEqual(app.session.store.read_json(app.state['turns'][0]['reply'])['tool_calls'],
+                complete['tool_calls'])
+            self.assertEqual(len(app.ledger.entries), 2)
+            self.assertIn('discarded', app.ledger.entries[0].reason)
+            self.assertEqual(sum(e.actual['total_tokens'] for e in app.ledger.entries), 240)
+            saved = (root / 'actions.json').read_bytes(), app.ledger.to_dict()
+            restored = ToolApplication.load(root, services=services)
+            with patch('simple_ar.integrations.llm._call_openai_sdk', side_effect=AssertionError('No replay')):
+                self.assertEqual(restored.run(progress=lambda _: None)['status'], 'completed')
+            self.assertEqual(((root / 'actions.json').read_bytes(), restored.ledger.to_dict()), saved)
+            strict = LLMClient(LLMSettings(api_key='fixture', model='fixture', api_mode='chat',
+                max_output_tokens=512, retry_attempts=1))
+            with self.assertRaises(ValueError):
+                ToolApplication.load(root, services=SimpleNamespace(llm_client=strict))
+            self.assertEqual((root / 'actions.json').read_bytes(), saved[0])
+
     def test_native_shared_work_preserves_a_real_followup_decision(self) -> None:
         from simple_ar.integrations.llm import LLMClient, LLMSettings
         import httpx

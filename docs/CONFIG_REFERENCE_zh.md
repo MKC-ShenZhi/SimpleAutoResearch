@@ -115,6 +115,7 @@ writing = "daily"
 | `context_input_tokens` | 24000，正整数原生输入工作集目标，不代表提供方上下文容量 |
 | `retry_attempts` | 3，至少 1，包含首次物理请求 |
 | `connect_retry_attempts` | 默认 1；仅对能确认尚未发送请求的连接故障提供更高尝试上限。每次消耗请求预算，不扩大发送后中断或用量未知响应的重试范围 |
+| `native_response_corrections` | 严格整数 `0` 或 `1`，默认 `0`；`1` 明确授权原生 Chat turn 对完整且已结算的截断响应纠正一次。Responses 和 Images profile 不得启用；不新增环境变量或 CLI 询问 |
 | `retry_base_delay_sec`、`retry_max_delay_sec` | 1、12，正数秒 |
 | `reasoning_effort` | 独立于精确 `model` 名称的可选推理参数；空表示不发送。具体支持取决于服务商及模型，与配置别名或Codex subagent设置不是一回事。可配置none、minimal、low、medium、high、xhigh、max、ultra；请求某档位不代表已证明服务商实际执行了它。 |
 | `thinking_mode` | 空、enabled、disabled、auto；Chat 关闭思考时 effort 须为空或 none |
@@ -128,6 +129,10 @@ writing = "daily"
 目录严格检查字段与类型。Images 只接受图像能力，拒绝明确提供的文本流式/token/context/推理/JSON/单价字段。文本连接拒绝图像尺寸、质量和生成能力。能力是声明，不是 API 探测；提供方参数支持需要核实。原生决策和 `focus_work` 要求 Chat，`compose_document` 可通过写作路由使用 Responses。焦点切换不改变工具或共享额度。
 
 新命名研究/原生任务与设置草稿保存非秘密绑定，固定模型、端点、协议、HTTP/2、推理设置及相关代码/写作路由。超时、输出上限、重试/等待和输入工作集可调整；同一变量背后的密钥可轮换。视觉授权单独绑定；无关图像 profile 不使文本任务失效。无绑定旧任务保留旧解析，独立 CodeTask 不追溯补绑定。失败原生决策换连接须走 CLI 明确重试合同。
+
+`native_response_corrections=1` 要求原预算账本与有限输出上限，仅作用于 `chat_turn`：完整 `finish_reason=length` 响应完成结算后，才可纠正一次。半截响应及工具不采用/执行，丢弃原因记入原账本。复用同一客户端、模型、上限、history/tools和逻辑调用ID；内部 system 仅说明截断未执行、上限及既有指令，要求完整适量操作，不含被丢弃的正文、思考或参数。第二次截断、空输出、未知完成原因、内容过滤或错误即停止。普通文本、JSON 和视觉调用不变。
+
+这是一轮语义纠正，不是网络重试，也不表示总共只有两次物理请求：每次完整调用仍走既有传输重试、预留、结算及失败记账，共用原账本。原预算和外层 `protect_remaining` 保留额度继续生效，不续额。若本次完整调用新产生的尝试仍有 unknown/reserved（包括底层重试后成功但早先尝试仍未知），停止纠正或采用；历史已确认有限的 unknown 原样保留，不因此单独禁用纠正。启用可能增加请求和 token 支出，仍可能失败，不保证质量改善。该字段是固定的连接授权，不属于可静默调整的超时项：旧绑定缺字段等价于 `0`，已保存的 `0`／缺省改为 `1` 必须明确变更连接，不能追溯授权历史合同，也不恢复已有失败任务。
 
 HTTP/2 需要执行主机安装 `simple-autoresearch[http2]`，源码用 `uv sync --extra http2`。图像缺支持时在预留/提交前失败，完整旧图片仍可离线恢复。profile 代理只影响本连接，缺失或无效在付费前失败；未配置时沿标准客户端环境路由。
 

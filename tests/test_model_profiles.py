@@ -501,6 +501,41 @@ class ModelProfileTests(unittest.TestCase):
         self._write_catalog('code = "coder"', 'code = "coder"\nwriting = "coder"')
         self.assertFalse(model_connections_compatible(routed, LLMClient.from_env().connection_binding()))
 
+    def test_native_response_corrections_are_strict_chat_only_and_pinned(self):
+        binding = LLMClient.from_env().connection_binding()
+        self.assertNotIn('native_response_corrections', binding['settings'])
+        old = json.loads(json.dumps(binding))
+        old['settings']['native_response_corrections'] = 0
+        old['code_route']['connection']['native_response_corrections'] = 0
+        self.assertTrue(model_connections_compatible(old, binding))
+        self.assertTrue(model_connections_compatible(binding, old))
+        for reference in ('WRITER_KEY', 'CODER_KEY'):
+            self._write_catalog(f'api_key_env = "{reference}"',
+                f'api_key_env = "{reference}"\nnative_response_corrections = 1')
+            client = LLMClient.from_env()
+            self.assertFalse(model_connections_compatible(old, client.connection_binding()))
+            self.assertFalse(model_connections_compatible(binding, client.connection_binding()))
+            if reference == 'WRITER_KEY':
+                self.assertEqual(client._settings.native_response_corrections, 1)
+                self.assertNotIn('native_response_corrections', client._build_request('system', 'user'))
+        for value in ('true', 'false', '"1"', '1.0', '-1', '2'):
+            with self.subTest(value=value):
+                self._write_catalog('retry_attempts = 1', f'native_response_corrections = {value}', 1)
+                with self.assertRaises(ModelConfigError):
+                    load_model_catalog()
+        for api in ('openai_responses', 'openai_images', 'cctq_images_async'):
+            with self.subTest(api=api):
+                original = 'api = "openai_images"' if 'images' in api else 'api = "openai_chat"'
+                replacement = f'api = "{api}"\nnative_response_corrections = 1'
+                self._write_catalog(original, replacement, 1)
+                with self.assertRaises(ModelConfigError):
+                    load_model_catalog()
+        # Responses rejection above must not depend on the separate stream rule.
+        self.path.write_text(CATALOG.replace('api = "openai_chat"', 'api = "openai_responses"', 1)
+            .replace('stream = true', 'stream = false\nnative_response_corrections = 1'), encoding='utf-8')
+        with self.assertRaises(ModelConfigError):
+            load_model_catalog()
+
     def test_catalog_inspection_needs_no_credentials_and_images_are_not_text(self):
         catalog = load_model_catalog()
         self.assertEqual(catalog.select(purpose="image")[0], "artist")

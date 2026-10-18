@@ -21,13 +21,15 @@ def model_connections_compatible(saved: dict, current: dict) -> bool:
     Full settings remain in snapshots; comparison also handles older snapshots
     without rewriting their history. Output caps may change completion length,
     never the identity of the model used for the saved scientific task.
+    Missing correction authorization means strict zero, never an implicit opt-in.
     """
     operational = {"request_timeout_sec", "max_output_tokens", "retry_attempts", "connect_retry_attempts",
                    "retry_base_delay_sec", "retry_max_delay_sec", "context_input_tokens"}
 
     def identity(value):
         if isinstance(value, dict):
-            return {key: identity(item) for key, item in value.items() if key not in operational}
+            return {key: identity(item) for key, item in value.items() if key not in operational
+                    and not (key == "native_response_corrections" and type(item) is int and item == 0)}
         return value
 
     return identity(saved) == identity(current)
@@ -49,6 +51,8 @@ class ModelProfile(BaseModel):
     context_input_tokens: int = Field(default=24000, gt=0)
     retry_attempts: int = Field(default=3, ge=1)
     connect_retry_attempts: int = Field(default=1, ge=1)
+    native_response_corrections: int = Field(default=0, strict=True, ge=0, le=1,
+        exclude_if=lambda value: value == 0)
     retry_base_delay_sec: float = Field(default=1.0, gt=0)
     retry_max_delay_sec: float = Field(default=12.0, gt=0)
     reasoning_effort: Literal["", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"] = ""
@@ -84,6 +88,8 @@ class ModelProfile(BaseModel):
 
     @model_validator(mode="after")
     def compatible(self) -> "ModelProfile":
+        if self.native_response_corrections and self.api != "openai_chat":
+            raise ValueError("native_response_corrections=1 requires an openai_chat profile")
         if (self.api == "openai_chat" and self.thinking_mode == "disabled"
                 and self.reasoning_effort not in {"", "none"}):
             raise ValueError("thinking_mode='disabled' requires reasoning_effort='' or 'none'")

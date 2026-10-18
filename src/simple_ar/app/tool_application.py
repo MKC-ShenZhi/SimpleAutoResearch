@@ -211,7 +211,8 @@ def _runtime_bindings(services: Any | None) -> dict[str, Any]:
         bindings[name] = {'type': type(client).__module__ + '.' + type(client).__qualname__, 'model': model}
         if isinstance(client, LLMClient):
             bindings[name]['connection'] = client.connection_binding() or {
-                'settings': {key: getattr(client._settings, key) for key in ('model', 'base_url', 'api_mode')}}
+                'settings': {key: getattr(client._settings, key) for key in ('model', 'base_url', 'api_mode')}
+                    | ({'native_response_corrections': 1} if client._settings.native_response_corrections else {})}
     registry = getattr(services, 'search_registry', None)
     if registry is not None:
         bindings['search_registry'] = list(registry.names())
