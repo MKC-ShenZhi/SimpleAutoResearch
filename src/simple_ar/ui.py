@@ -78,7 +78,11 @@ class Workspace:
         self.errors: dict[str, str] = {}
 
     def task(self, name: str) -> Path:
-        if name != '.' and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', name):
+        # Discovery exposes native direct-child names, not an ASCII identifier.
+        # Keep '.' for a task rooted at the launch directory and for creation
+        # allow a not-yet-existing child; the native task owner validates state.
+        child = Path(name)
+        if name != '.' and (not name or name == '..' or child.anchor or child.name != name):
             raise ValueError('Use a direct task directory name')
         return bounded(self.tasks / name, self.tasks)
 
@@ -241,13 +245,19 @@ class Workspace:
         else:
             source = self.record(root, 'actions.json')['config']['sources'][mount]
             base = self.read(Path(source))
-        path = bounded(base / relative, base) if base.is_dir() else base
         if base.is_dir():
-            resolve_mounted_path({'view': base}, 'view/' + (relative or '.'))
-        if not base.is_dir() and relative:
-            raise ValueError('File mount has no children')
+            bounded(base / relative, base)
+            path = resolve_mounted_path({'view': base}, 'view/' + (relative or '.'))
+            parts = path.relative_to(base).parts
+        else:
+            if relative:
+                raise ValueError('File mount has no children')
+            path, parts = base, (base.name,)
+        # Shared resolvers own native private/runtime exclusions. These extra
+        # HTTP preview exclusions concern mounted contents (or a file root's
+        # basename), not names of explicitly granted directory ancestors.
         if any(p.startswith('.') or re.search(r'(?i)(credential|secret|^keys?$|^logs?$|\.log$|\.pem$|\.key$|^models\.toml$)', p)
-               for p in path.parts):
+               for p in parts):
             raise ValueError('Private/configuration files cannot be served')
         return path
 

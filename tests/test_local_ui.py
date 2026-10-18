@@ -9,6 +9,7 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+from urllib.parse import quote
 from unittest.mock import patch
 
 from simple_ar.app.tool_application import ToolApplication
@@ -25,15 +26,25 @@ class LocalWorkspaceTests(unittest.TestCase):
     def test_http_owner_feedback_approval_records_and_guards(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary).resolve()
-            project = base / 'materials'
-            project.mkdir()
+            project = base / '.research' / 'secret-study' / '材料'
+            project.mkdir(parents=True)
             (project / 'source.txt').write_text('Observed input', encoding='utf-8')
             (project / '.env').write_text('DO_NOT_EXPOSE', encoding='utf-8')
-            tasks = base / 'tasks'
-            workspace = Workspace(project, [], tasks)
-            root = tasks / 'retained'
+            source_file = project / '观察.txt'
+            source_file.write_text('实测输入 café', encoding='utf-8')
+            (project / '分组').mkdir()
+            (project / '分组' / '输入.txt').write_text('分组输入', encoding='utf-8')
+            for private in ('.hidden', '.ssh/id_rsa', 'credentials/token.txt', 'logs/run.log', 'models.toml'):
+                target = project / private
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text('DO_NOT_EXPOSE', encoding='utf-8')
+            tasks = base / '.research' / 'logs' / 'tasks'
+            workspace = Workspace(project, [source_file], tasks)
+            name = '保留任务 café'
+            root = tasks / name
             app = ToolApplication.create(root, 'Inspect retained evidence', model=None,
-                sources={'source0': project}, allow_execution=True, max_attempts=30,
+                sources={'source0': project, 'source1': source_file, 'source2': project / 'models.toml'},
+                allow_execution=True, max_attempts=30,
                 process_limits={'process_invocations': 1, 'process_wall_seconds': 30})
             app.run(actions=[call('write_file', {'path': 'workspace/report.txt', 'content': 'first report',
                 'delivery': {'summary': 'Initial result', 'artifacts': ['workspace/report.txt']} })],
@@ -50,7 +61,7 @@ class LocalWorkspaceTests(unittest.TestCase):
                     headers['Authorization'] = 'Bearer ' + httpd.session_token
                 if data is not None:
                     headers.update({'Content-Type': 'application/json', 'Origin': origin or httpd.origin})
-                connection.request('POST' if data is not None else 'GET', path,
+                connection.request('POST' if data is not None else 'GET', quote(path, safe='/?=&%'),
                     body=json.dumps(data) if data is not None else None, headers=headers)
                 response = connection.getresponse()
                 result = response.status, response.read()
@@ -58,35 +69,60 @@ class LocalWorkspaceTests(unittest.TestCase):
                 return result
 
             def action(op, **kwargs):
-                status, raw = request('/api/action', {'op': op, 'task': 'retained', **kwargs})
+                status, raw = request('/api/action', {'op': op, 'task': name, **kwargs})
                 self.assertEqual(status, 200, raw)
                 if op in {'feedback', 'resume', 'approve'}:
-                    workspace.workers['retained'][0].join(10)
-                    self.assertFalse(workspace.workers['retained'][0].is_alive())
+                    workspace.workers[name][0].join(10)
+                    self.assertFalse(workspace.workers[name][0].is_alive())
                 return json.loads(raw)
 
             try:
                 self.assertEqual(request('/')[0], 200)
                 self.assertEqual(request('/api/tasks', authenticated=False)[0], 403)
                 self.assertEqual(request('/api/tasks', host='evil.invalid')[0], 403)
-                self.assertEqual(request('/api/action', {'op': 'resume', 'task': 'retained'},
+                self.assertEqual(json.loads(request('/api/tasks')[1]),
+                    [dict(task=name, topic='Inspect retained evidence', status='completed')])
+                self.assertEqual(workspace.task('.'), tasks)
+                for invalid in ('', '..', str(root), name + '/workspace'):
+                    with self.assertRaises(ValueError):
+                        workspace.task(invalid)
+                self.assertEqual(request('/api/action', {'op': 'resume', 'task': name},
                                          origin='http://evil.invalid')[0], 403)
-                status, raw = request('/api/task?task=retained')
+                status, raw = request(f'/api/task?task={name}')
                 self.assertEqual(status, 200)
                 view = json.loads(raw)
                 self.assertEqual(view['manifest']['status'], 'completed')
                 self.assertEqual(view['mode'], 'saved results browser')
-                delivery = json.loads(request('/api/delivery?task=retained')[1])
+                delivery = json.loads(request(f'/api/delivery?task={name}')[1])
                 self.assertTrue(delivery['current'])
                 self.assertTrue(any(f['path'] == 'report.txt' for f in delivery['files']))
                 (root / 'workspace/report.txt').write_text('untracked replacement', encoding='utf-8')
-                self.assertFalse(json.loads(request('/api/delivery?task=retained')[1])['current'])
+                self.assertFalse(json.loads(request(f'/api/delivery?task={name}')[1])['current'])
                 (root / 'workspace/report.txt').write_bytes(initial)
-                self.assertEqual(request('/api/file?task=retained&mount=source0&path=source.txt')[1], b'Observed input')
-                for path in ('.env', '../source.txt', '.ssh/id_rsa', 'keys/private.pem', 'logs/run.log'):
-                    self.assertEqual(request('/api/file?task=retained&mount=source0&path=' + path)[0], 400)
+                self.assertEqual(request(f'/api/file?task={name}&mount=source0&path=source.txt')[1], b'Observed input')
+                rows = json.loads(request(f'/api/files?task={name}&mount=source0')[1])
+                self.assertEqual({row['name'] for row in rows}, {'source.txt', '观察.txt', '分组'})
+                rows = json.loads(request(f'/api/files?task={name}&mount=source0&path=分组')[1])
+                self.assertEqual(rows, [dict(name='输入.txt', path='分组/输入.txt', directory=False)])
+                for mount, relative in (('source0', '观察.txt'), ('source1', '')):
+                    status, raw = request(f'/api/file?task={name}&mount={mount}&path={relative}')
+                    self.assertEqual(status, 200)
+                    self.assertEqual(raw.decode('utf-8'), '实测输入 café')
+                self.assertEqual(request(f'/api/file?task={name}&mount=source0&path=分组/输入.txt')[1].decode('utf-8'),
+                                 '分组输入')
+                self.assertEqual(request(f'/api/file?task={name}&mount=workspace&path=report.txt')[1], initial)
+                self.assertEqual(request(f'/api/file?task={name}&mount=source1&path=child')[0], 400)
+                for path in ('.env', '.hidden', '../source.txt', '.ssh/id_rsa', 'keys/private.pem',
+                             'credentials/token.txt', 'logs/run.log', 'models.toml'):
+                    self.assertEqual(request(f'/api/file?task={name}&mount=source0&path=' + path)[0], 400)
+                # Explicit file mounts still protect their basename; native
+                # source admission continues to reject env/credential roots.
+                for private in ('.env', '.ssh/id_rsa'):
+                    with self.assertRaises(ValueError):
+                        workspace.read(project / private)
+                self.assertEqual(request(f'/api/file?task={name}&mount=source2')[0], 400)
                 self.assertEqual(request('/api/task?task=../materials')[0], 400)
-                self.assertEqual(request('/api/action', {'op': 'run_command', 'task': 'retained',
+                self.assertEqual(request('/api/action', {'op': 'run_command', 'task': name,
                                                         'argv': ['arbitrary']})[0], 400)
                 # This is the actual owner, not a UI-generated completion result.
                 action('feedback', feedback='Explain limitations of the same evidence')
@@ -94,35 +130,35 @@ class LocalWorkspaceTests(unittest.TestCase):
                 self.assertEqual(len(state['requests']), 2)
                 self.assertEqual(state['requests'][-1], 'Explain limitations of the same evidence')
                 self.assertEqual((root / 'workspace/report.txt').read_bytes(), initial)
-                view = json.loads(request('/api/task?task=retained')[1])
+                view = json.loads(request(f'/api/task?task={name}')[1])
                 self.assertEqual(view['manifest']['status'], 'paused')
                 self.assertIsNone(view['plan'])
                 # Keep old delivery on disk: the HTTP view still says paused.
                 self.assertTrue((root / 'delivery.json').exists())
-                self.assertFalse(json.loads(request('/api/delivery?task=retained')[1])['current'])
+                self.assertFalse(json.loads(request(f'/api/delivery?task={name}')[1])['current'])
                 app = ToolApplication.load(root)
                 app.run(actions=[call('run_process', {'argv': ['python', '-c', 'print("approved")'], 'timeout_sec': 5})],
                         progress=lambda _: None)
-                view = json.loads(request('/api/task?task=retained')[1])
+                view = json.loads(request(f'/api/task?task={name}')[1])
                 self.assertIsNotNone(view['approval'])
-                self.assertEqual(request('/api/action', {'op': 'approve', 'task': 'retained', 'token': 'wrong'})[0], 400)
+                self.assertEqual(request('/api/action', {'op': 'approve', 'task': name, 'token': 'wrong'})[0], 400)
                 action('approve', token=view['approval']['token'])
                 ledger = BudgetLedger.load(root / 'budget_ledger.json')
                 self.assertEqual(ledger.remaining('process_invocations'), 0)
-                self.assertEqual(request('/api/action', {'op': 'stop', 'task': 'retained'})[0], 400)
+                self.assertEqual(request('/api/action', {'op': 'stop', 'task': name})[0], 400)
                 # Original ledger remains the source for both unknown and reserved.
                 ledger.reserve('ui-unknown', {'custom_dimension': 3})
                 ledger.mark_unknown('ui-unknown', reason='Receipt unavailable')
                 ledger.reserve('ui-reserved', {'another_dimension': 2})
                 before = (root / 'budget_ledger.json').read_bytes()
-                view = json.loads(request('/api/task?task=retained')[1])
+                view = json.loads(request(f'/api/task?task={name}')[1])
                 self.assertIn('unknown', {e['status'] for e in view['resources']['entries']})
                 self.assertIn('reserved', {e['status'] for e in view['resources']['entries']})
                 self.assertTrue(all({'actual_source', 'reason'} <= set(e) for e in view['resources']['entries']))
                 self.assertEqual((root / 'budget_ledger.json').read_bytes(), before)
                 with patch.dict(os.environ, {'UI_TEST_API_KEY': 'credential-do-not-output'}):
                     (project / 'source.txt').write_text('credential-do-not-output', encoding='utf-8')
-                    self.assertNotIn(b'credential-do-not-output', request('/api/file?task=retained&mount=source0&path=source.txt')[1])
+                    self.assertNotIn(b'credential-do-not-output', request(f'/api/file?task={name}&mount=source0&path=source.txt')[1])
                 outside = base / 'outside'
                 outside.mkdir()
                 try:
@@ -130,7 +166,7 @@ class LocalWorkspaceTests(unittest.TestCase):
                 except OSError:
                     pass  # Windows may prohibit symlink creation for this account.
                 else:
-                    self.assertEqual(request('/api/files?task=retained&mount=source0&path=linked')[0], 400)
+                    self.assertEqual(request(f'/api/files?task={name}&mount=source0&path=linked')[0], 400)
                     with self.assertRaises(ValueError):
                         bounded(project / 'linked' / 'child', project)
                 # Discovery must fail closed even when excess entries are invalid.

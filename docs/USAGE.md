@@ -262,7 +262,8 @@ model catalog. Open the full URL printed by this process. Keep that URL private:
 its fragment grants access to this local session. Do not expose the port publicly.
 For remote hosts, forward the same port through SSH rather than changing its bind address.
 
-The page lists native tasks in the task root and its direct children. Material
+The page lists native tasks in the task root and its direct children, including
+non-ASCII names. Material
 paths refer to the execution host and must fall within the project root or an
 explicit repeatable `--read-root PATH`. Creating a task saves the confirmed
 connection, sources, access and hard caps; **Continue** starts execution.
@@ -274,7 +275,9 @@ an in-flight provider request or process. Keep the launcher alive until it exits
 This is an experimental single-user client, not a sandbox or multi-user service.
 It previews text and raster images; download PDFs and other supported binary files
 to view them. File browsing does not certify scientific quality. Publication
-template adaptation and a fully interactive end-to-end acceptance case remain pending.
+conversion with a trusted user-provided Pandoc template is available through
+[publication export](WORKFLOWS.md); arbitrary publisher-template adaptation and
+a fully interactive end-to-end acceptance case remain pending.
 
 ## Troubleshooting
 
