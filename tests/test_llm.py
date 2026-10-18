@@ -1018,7 +1018,7 @@ class LLMParsingTests(unittest.TestCase):
                     self.assertEqual(sum(entry.actual['llm_requests'] for entry in ledger.entries), 3)
                     self.assertEqual({entry.logical_call_id for entry in ledger.entries}, {'same'})
 
-    def test_native_correction_setting_validates_before_transport_and_does_not_change_ask(self):
+    def test_native_correction_setting_validates_and_never_authorizes_ordinary_correction(self):
         with patch('simple_ar.integrations.llm._call_openai_sdk') as send:
             for value in (True, False, '1', 1.0, -1, 2, None):
                 with self.subTest(value=value), self.assertRaises(LLMError):
@@ -1035,15 +1035,20 @@ class LLMParsingTests(unittest.TestCase):
                 if ledger is not None:
                     self.assertEqual(ledger.entries, ())
             send.assert_not_called()
-        client = LLMClient(LLMSettings(api_key='test-key', api_mode='chat', native_response_corrections=1))
-        response = {'choices': [{'message': {'content': 'partial'}, 'finish_reason': 'length'}]}
-        with patch('simple_ar.integrations.llm._call_openai_sdk', return_value=response) as send:
-            self.assertEqual(client.ask('system', 'user'), 'partial')
-            send.assert_called_once()
-        response['choices'][0]['message']['content'] = '{"ok":true}'
-        with patch('simple_ar.integrations.llm._call_openai_sdk', return_value=response) as send:
-            self.assertEqual(client.ask_json('system', 'user'), {'ok': True})
-            send.assert_called_once()
+        for enabled in (0, 1):
+            client = LLMClient(LLMSettings(api_key='test-key', api_mode='chat', native_response_corrections=enabled))
+            for content, operation in (('partial', client.ask), ('{"ok":true}', client.ask_json)):
+                response = {'choices': [{'message': {'content': content}, 'finish_reason': 'length'}]}
+                with self.subTest(enabled=enabled, content=content), \
+                     patch('simple_ar.integrations.llm._call_openai_sdk', return_value=response) as send:
+                    with self.assertRaises(LLMResponseError) as failure:
+                        operation('system', 'user')
+                    self.assertIs(failure.exception.correction_allowed, False)
+                    send.assert_called_once()
+            response = {'choices': [{'message': {'content': '{"ok":true}'}, 'finish_reason': 'stop'}]}
+            with patch('simple_ar.integrations.llm._call_openai_sdk', return_value=response) as send:
+                self.assertEqual(client.ask_json('system', 'user'), {'ok': True})
+                send.assert_called_once()
 
     def test_native_correction_requires_successful_settlement(self):
         ledger = BudgetLedger({'llm_requests': 3, 'total_tokens': 10000})
