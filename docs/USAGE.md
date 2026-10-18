@@ -267,14 +267,38 @@ non-ASCII names. Material
 paths refer to the execution host and must fall within the project root or an
 explicit repeatable `--read-root PATH`. Creating a task saves the confirmed
 connection, sources, access and hard caps; **Continue** starts execution.
+Creation, exact approval and connection changes use one in-page confirmation
+area. Review the frozen recipients/operation and caps, then confirm or cancel
+to edit. Submission disables the confirmation controls and background form;
+polling does not replace the reviewed request. The server still checks the
+original binding/token/confirmation and budget; a displayed snapshot does not
+grant extra access or reserve resources. A failed submission is not retried
+automatically; inspect the current task before making a new request.
 Saved-result browsing is labelled separately from a worker running in this UI.
+Recent activity shows at most 24 accepted tool receipts, newest first across
+requests, with action/attempt identities, recorded failures and saved file
+locators. Pending actions and queued proposals are labelled separately; they
+are not proof of execution or delivery. A retained pending attempt may already
+have a failed preflight receipt. No local worker means only that this UI is not
+running it; external worker state is unknown. Plans are optional model-authored
+intent, not verified progress; only plans in the recent receipt window appear.
 Feedback and exact command approvals use the original task and ledger.
 **Boundary stop** waits for the current action to return; it does not cancel
 an in-flight provider request or process. Keep the launcher alive until it exits.
 
 This is an experimental single-user client, not a sandbox or multi-user service.
-It previews text and raster images; download PDFs and other supported binary files
-to view them. File browsing does not certify scientific quality. Publication
+Clicking an authorized evidence/material file inspects a declared canonical
+DocumentBundle through the existing source owner: titles, URLs, extraction
+status, retained chunk counts and a bounded text excerpt. This is declared
+provenance, not verification of originality, claims or exhaustive coverage.
+Ordinary JSON remains text; workspace/attempt documents are not promoted to
+original sources. Downloads retain the existing credential redaction. No
+recursive JSON inspection runs during polling. The source owner's recognition
+limit is 8,000,000 bytes; the file preview/download limit remains 16 MiB and
+directory listings remain limited to 256 entries.
+It previews text and raster images; SVG/HTML are text, and PDFs and other
+supported binary files must be downloaded. File browsing does not certify
+scientific quality or turn an unexecuted candidate into a delivery. Publication
 conversion with a trusted user-provided Pandoc template is available through
 [publication export](WORKFLOWS.md); arbitrary publisher-template adaptation and
 a fully interactive end-to-end acceptance case remain pending.

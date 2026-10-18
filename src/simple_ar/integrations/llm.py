@@ -458,10 +458,24 @@ class LLMClient:
         if not isinstance(message, dict):
             dump = getattr(message, "model_dump", None)
             message = dump(exclude_none=True) if callable(dump) else None
+        if _finish_reason_from_response(response) == "length":
+            # Preserve enough non-content evidence to distinguish reasoning
+            # exhaustion from a large answer/tool payload. Never log or adopt
+            # the partial body, or retry a completed, charged response here.
+            observed = message if isinstance(message, dict) else {}
+            usage = _usage_from_response(response)
+            argument_chars = sum(len(str(_get_value(_get_value(call, 'function'), 'arguments') or ''))
+                                 for call in observed.get('tool_calls') or [])
+            counts = (
+                f"content_chars={len(_text_from_content(observed.get('content')))}, "
+                f"reasoning_chars={len(_reasoning_content_from_response(response))}, "
+                f"tool_argument_chars={argument_chars}, "
+                f"completion_tokens={usage[1] if usage else 'unknown'}, "
+                f"output_limit={self.effective_output_limit(max_output_tokens)}")
+            raise LLMResponseError("Native Chat turn was truncated (finish_reason=length; "
+                                   + counts + "); do not execute partial tool arguments")
         if not isinstance(message, dict) or not (message.get("content") or message.get("tool_calls")):
             raise LLMResponseError(_empty_response_message(response))
-        if _finish_reason_from_response(response) == "length":
-            raise LLMResponseError("Native Chat turn was truncated; do not execute partial tool arguments")
         return {**message, "role": "assistant"}
 
     def effective_output_limit(self, max_output_tokens: int | None = None) -> int | None:

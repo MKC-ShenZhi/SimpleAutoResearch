@@ -15,6 +15,8 @@ from unittest.mock import patch
 from simple_ar.app.tool_application import ToolApplication
 from simple_ar.core.budget import BudgetLedger
 from simple_ar.integrations.llm import LLMClient
+from simple_ar.research.documents.ingest import DocumentBundle
+from simple_ar.tools.sources import SourceToolGateway
 from simple_ar.ui import Workspace, bounded, native_arguments, native_creation_options, server
 
 
@@ -44,7 +46,7 @@ class LocalWorkspaceTests(unittest.TestCase):
             root = tasks / name
             app = ToolApplication.create(root, 'Inspect retained evidence', model=None,
                 sources={'source0': project, 'source1': source_file, 'source2': project / 'models.toml'},
-                allow_execution=True, max_attempts=30,
+                allow_execution=True, max_attempts=80,
                 process_limits={'process_invocations': 1, 'process_wall_seconds': 30})
             app.run(actions=[call('write_file', {'path': 'workspace/report.txt', 'content': 'first report',
                 'delivery': {'summary': 'Initial result', 'artifacts': ['workspace/report.txt']} })],
@@ -77,7 +79,14 @@ class LocalWorkspaceTests(unittest.TestCase):
                 return json.loads(raw)
 
             try:
-                self.assertEqual(request('/')[0], 200)
+                status, page = request('/')
+                self.assertEqual(status, 200)
+                self.assertIn(b'id="confirmation"', page)
+                self.assertIn(b'id="confirmationCancel"', page)
+                self.assertIn(b'id="confirmationSubmit"', page)
+                status, script = request('/app.js')
+                self.assertEqual(status, 200)
+                self.assertNotRegex(script.decode('utf-8'), r'\bconfirm\s*\(')
                 self.assertEqual(request('/api/tasks', authenticated=False)[0], 403)
                 self.assertEqual(request('/api/tasks', host='evil.invalid')[0], 403)
                 self.assertEqual(json.loads(request('/api/tasks')[1]),
@@ -93,6 +102,15 @@ class LocalWorkspaceTests(unittest.TestCase):
                 view = json.loads(raw)
                 self.assertEqual(view['manifest']['status'], 'completed')
                 self.assertEqual(view['mode'], 'saved results browser')
+                self.assertFalse(view['worker_live'])
+                self.assertIsNone(view['plan'])
+                self.assertEqual(view['activity_total'], 1)
+                receipt = view['activity'][0]
+                self.assertEqual(receipt['tool'], 'write_file')
+                self.assertEqual(receipt['status'], 'ok')
+                self.assertEqual(receipt['request_count'], 1)
+                self.assertTrue(receipt['attempt'].startswith('native-tool-'))
+                self.assertEqual(json.loads((root / receipt['record']).read_text())['status'], receipt['status'])
                 delivery = json.loads(request(f'/api/delivery?task={name}')[1])
                 self.assertTrue(delivery['current'])
                 self.assertTrue(any(f['path'] == 'report.txt' for f in delivery['files']))
@@ -104,6 +122,36 @@ class LocalWorkspaceTests(unittest.TestCase):
                 self.assertEqual({row['name'] for row in rows}, {'source.txt', '观察.txt', '分组'})
                 rows = json.loads(request(f'/api/files?task={name}&mount=source0&path=分组')[1])
                 self.assertEqual(rows, [dict(name='输入.txt', path='分组/输入.txt', directory=False)])
+                bundle = DocumentBundle.from_rows(documents=[dict(document_id='paper', title='<b>Human title</b>',
+                    source='supporting_material', url='https://example.invalid/paper', extraction_status='parsed')],
+                    chunks=[dict(chunk_id='chunk', document_id='paper', text='retained source ' * 200,
+                        page=3, metadata={'extraction_status': 'parsed'})]).to_handoff_dict()
+                bundle_path = project / 'declared.json'
+                bundle_path.write_text(json.dumps(bundle), encoding='utf-8')
+                (project / 'ordinary.json').write_text('{"title":"ordinary data"}', encoding='utf-8')
+                # Polls/listings do not parse material JSON; explicit inspection
+                # calls the same source owner after the HTTP file guards.
+                with patch.object(SourceToolGateway, 'inventory_source', wraps=SourceToolGateway.inventory_source) as inspect:
+                    request(f'/api/task?task={name}')
+                    request(f'/api/files?task={name}&mount=source0')
+                    inspect.assert_not_called()
+                    status, raw = request(f'/api/source-preview?task={name}&mount=source0&path=declared.json')
+                    self.assertEqual(status, 200)
+                    source = json.loads(raw)
+                    self.assertEqual(source['documents'][0]['title'], '<b>Human title</b>')
+                    self.assertEqual(source['documents'][0]['url'], 'https://example.invalid/paper')
+                    self.assertEqual(source['documents'][0]['status'], 'parsed')
+                    self.assertEqual(source['retained_chunks'], 1)
+                    self.assertTrue(source['retained_preview'][0]['truncated'])
+                    self.assertEqual(source['retained_preview'][0]['page'], 3)
+                    self.assertEqual(request(f'/api/file?task={name}&mount=source0&path=declared.json')[1], bundle_path.read_bytes())
+                    self.assertIsNone(json.loads(request(f'/api/source-preview?task={name}&mount=source0&path=ordinary.json')[1]))
+                    self.assertEqual(request(f'/api/file?task={name}&mount=source0&path=ordinary.json')[1], b'{"title":"ordinary data"}')
+                    (root / 'workspace/declared.json').write_text(json.dumps(bundle), encoding='utf-8')
+                    inspect.reset_mock()
+                    self.assertIsNone(json.loads(request(f'/api/source-preview?task={name}&mount=workspace&path=declared.json')[1]))
+                    inspect.assert_not_called()
+                self.assertEqual(request(f'/api/source-preview?task={name}&mount=source0&path=declared.json', authenticated=False)[0], 403)
                 for mount, relative in (('source0', '观察.txt'), ('source1', '')):
                     status, raw = request(f'/api/file?task={name}&mount={mount}&path={relative}')
                     self.assertEqual(status, 200)
@@ -115,6 +163,7 @@ class LocalWorkspaceTests(unittest.TestCase):
                 for path in ('.env', '.hidden', '../source.txt', '.ssh/id_rsa', 'keys/private.pem',
                              'credentials/token.txt', 'logs/run.log', 'models.toml'):
                     self.assertEqual(request(f'/api/file?task={name}&mount=source0&path=' + path)[0], 400)
+                    self.assertEqual(request(f'/api/source-preview?task={name}&mount=source0&path=' + path)[0], 400)
                 # Explicit file mounts still protect their basename; native
                 # source admission continues to reject env/credential roots.
                 for private in ('.env', '.ssh/id_rsa'):
@@ -133,14 +182,32 @@ class LocalWorkspaceTests(unittest.TestCase):
                 view = json.loads(request(f'/api/task?task={name}')[1])
                 self.assertEqual(view['manifest']['status'], 'paused')
                 self.assertIsNone(view['plan'])
+                self.assertEqual(view['activity'][0]['request_count'], 1)
                 # Keep old delivery on disk: the HTTP view still says paused.
                 self.assertTrue((root / 'delivery.json').exists())
                 self.assertFalse(json.loads(request(f'/api/delivery?task={name}')[1])['current'])
                 app = ToolApplication.load(root)
+                # Bounded recent history includes a real refusal, not model
+                # prose or a synthetic UI status. No plan call is required.
+                app.run(actions=[call('read_file', {'path': 'source0/source.txt'}) for _ in range(25)] +
+                    [call('read_file', {'path': 'source0/../outside.txt'})], progress=lambda _: None)
+                original_state = (root / 'actions.json').read_bytes()
+                view = json.loads(request(f'/api/task?task={name}')[1])
+                self.assertEqual(len(view['activity']), 24)
+                self.assertEqual(view['activity_total'], 27)
+                refusal = view['activity'][0]
+                self.assertEqual(refusal['status'], 'blocked')
+                original = json.loads((root / refusal['record']).read_text())
+                self.assertEqual(refusal['error'], original['error'])
+                self.assertTrue(refusal['error'])
+                self.assertEqual(refusal['request_count'], 2)
+                self.assertEqual((root / 'actions.json').read_bytes(), original_state)
                 app.run(actions=[call('run_process', {'argv': ['python', '-c', 'print("approved")'], 'timeout_sec': 5})],
                         progress=lambda _: None)
                 view = json.loads(request(f'/api/task?task={name}')[1])
                 self.assertIsNotNone(view['approval'])
+                self.assertEqual(view['pending']['attempt'], view['approval']['attempt'])
+                self.assertEqual(view['pending']['call'], view['approval']['call'])
                 self.assertEqual(request('/api/action', {'op': 'approve', 'task': name, 'token': 'wrong'})[0], 400)
                 action('approve', token=view['approval']['token'])
                 ledger = BudgetLedger.load(root / 'budget_ledger.json')
@@ -159,6 +226,8 @@ class LocalWorkspaceTests(unittest.TestCase):
                 with patch.dict(os.environ, {'UI_TEST_API_KEY': 'credential-do-not-output'}):
                     (project / 'source.txt').write_text('credential-do-not-output', encoding='utf-8')
                     self.assertNotIn(b'credential-do-not-output', request(f'/api/file?task={name}&mount=source0&path=source.txt')[1])
+                    bundle_path.write_text(json.dumps(bundle).replace('Human title', 'credential-do-not-output'), encoding='utf-8')
+                    self.assertNotIn(b'credential-do-not-output', request(f'/api/source-preview?task={name}&mount=source0&path=declared.json')[1])
                 outside = base / 'outside'
                 outside.mkdir()
                 try:
@@ -167,6 +236,7 @@ class LocalWorkspaceTests(unittest.TestCase):
                     pass  # Windows may prohibit symlink creation for this account.
                 else:
                     self.assertEqual(request(f'/api/files?task={name}&mount=source0&path=linked')[0], 400)
+                    self.assertEqual(request(f'/api/source-preview?task={name}&mount=source0&path=linked/declared.json')[0], 400)
                     with self.assertRaises(ValueError):
                         bounded(project / 'linked' / 'child', project)
                 # Discovery must fail closed even when excess entries are invalid.
@@ -292,6 +362,7 @@ class LocalWorkspaceTests(unittest.TestCase):
                     self.assertEqual(actual_limits['process_wall_seconds'], 0)
                     switch = dict(op='switch', task=name, model='profile:b', binding_id=b['binding_id'],
                                   confirmed=True, switch_id='ui-switch', reason='Explicit recipient change')
+                    self.assertEqual(request('/api/action', switch | {'confirmed': False})[0], 400)
                     # A changed nested writing recipient invalidates confirmation.
                     catalog.write_text(catalog_text.replace('https://writing.invalid', 'https://new-writing.invalid'), encoding='utf-8')
                     self.assertEqual(request('/api/action', switch)[0], 400)
@@ -305,6 +376,10 @@ class LocalWorkspaceTests(unittest.TestCase):
                     self.assertEqual(calls, [])
                     self.assertEqual(request('/api/action', dict(op='resume', task=name))[0], 200)
                     self.assertTrue(entered.wait(10))
+                    live = request('/api/task?task=' + name)[1]
+                    self.assertTrue(live['worker_live'])
+                    self.assertEqual(live['pending']['kind'], 'model')
+                    self.assertEqual(live['activity'], [])
                     self.assertEqual(request('/api/action', dict(op='stop', task=name))[0], 200)
                     self.assertTrue(request('/api/task?task=' + name)[1]['stop_requested'])
                     release.set()
@@ -312,6 +387,9 @@ class LocalWorkspaceTests(unittest.TestCase):
                     self.assertFalse(workspace.workers[name][0].is_alive())
                     paused = request('/api/task?task=' + name)[1]
                     self.assertEqual(paused['manifest']['status_reason'], 'Caller requested boundary stop')
+                    self.assertFalse(paused['worker_live'])
+                    self.assertEqual(paused['queued_actions'], 1)
+                    self.assertEqual(paused['activity'], [])
                     self.assertFalse((root / 'workspace/result.txt').exists())
                     self.assertEqual(request('/api/action', dict(op='resume', task=name))[0], 200)
                     workspace.workers[name][0].join(10)

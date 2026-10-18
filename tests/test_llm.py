@@ -848,13 +848,23 @@ class LLMParsingTests(unittest.TestCase):
         self.assertEqual(call.call_args.args[1]["messages"], history)
         self.assertEqual(observed[0].total_tokens, 60)
         self.assertEqual(observed[1].source, "estimated")
-        for reason, delta in (("length", {"tool_calls": [
+        for reason, delta in (("length", {"reasoning_content": "private partial thought", "tool_calls": [
             {"index": 0, "id": "cut", "function": {"name": "read_file", "arguments": '{"path":'}}]}),
             ("stop", {"reasoning_content": "no answer"})):
             with patch("simple_ar.integrations.llm._call_openai_sdk", return_value=iter([
                 {"choices": [{"delta": delta, "finish_reason": reason}]}
-            ])), self.assertRaises(LLMResponseError):
+            ])), self.assertRaises(LLMResponseError) as failure:
                 native.chat_turn(history, tools=tools, max_output_tokens=500)
+            if reason == 'length':
+                diagnostic = str(failure.exception)
+                self.assertIn('finish_reason=length', diagnostic)
+                self.assertIn('content_chars=0', diagnostic)
+                self.assertIn('reasoning_chars=23', diagnostic)
+                self.assertIn('tool_argument_chars=8', diagnostic)
+                self.assertIn('output_limit=500', diagnostic)
+                self.assertNotIn('private partial thought', diagnostic)
+                self.assertNotIn('{"path":', diagnostic)
+                self.assertEqual(failure.exception.raw_response, '')
         wrong_mode = LLMClient(LLMSettings(api_key="test-key", api_mode="responses"))
         with patch("simple_ar.integrations.llm._call_openai_sdk") as call, self.assertRaises(LLMError):
             wrong_mode.chat_turn(history, tools=tools)

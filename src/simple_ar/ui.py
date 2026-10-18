@@ -24,6 +24,7 @@ from simple_ar.cli.start import add_start_parser, native_creation_options
 from simple_ar.core.budget import BudgetLedger
 from simple_ar.integrations.llm import LLMClient
 from simple_ar.integrations.model_profiles import load_model_catalog
+from simple_ar.tools.sources import SourceToolGateway
 from simple_ar.tools.workspace import resolve_mounted_path, resolve_source_mount
 
 
@@ -210,16 +211,46 @@ class Workspace:
         approval = None
         if token and pending and pending.get('kind') == 'tool':
             approval = {'token': token[1], 'call': pending['call'], 'attempt': pending['attempt']}
-        plan = None
-        for turn in reversed(state['turns']):
-            for tool in reversed(turn['tools']):
-                result = self.record(root, tool['result'])
-                if (result.get('tool_name') == 'update_work_plan' and result.get('status') == 'ok'
+        # A bounded read of accepted observations, never a saved UI index. Do
+        # not mistake remaining proposals (or model prose) for executed work.
+        plan, activity = None, []
+        recent = islice(((turn, item) for turn in reversed(state['turns'])
+                         for item in reversed(turn['tools'])), 24)
+        for turn, item in recent:
+            ref = item['result']
+            row = dict(record=ref, call_id=item['id'], request_count=turn.get('request_count'),
+                       attempt=Path(ref).parent.name if ref.startswith('attempts/') else None)
+            try:
+                result = self.record(root, ref)
+                # Reuse the action owner's bounded, receipt-derived facts;
+                # no tool registration, application load or journal mutation.
+                try:
+                    reply = self.record(root, turn['reply'])
+                    call = next(c for c in reply.get('tool_calls', []) if c['id'] == item['id'])
+                except (OSError, ValueError, KeyError, TypeError, StopIteration):
+                    # A missing reply must not conceal the saved tool refusal.
+                    call = {'function': {'name': result['tool_name'], 'arguments': '{}'}}
+                    row['action_unavailable'] = True
+                row.update(ToolApplication._history_observation(call, result, ref))
+                row['record'] = ref
+                if (plan is None and result.get('tool_name') == 'update_work_plan'
+                        and result.get('status') == 'ok'
                         and result.get('data', {}).get('request_count') == len(state['requests'])):
-                    plan = result.get('data')
-                    break
-            if plan is not None:
-                break
+                    plan = result['data']
+            except (OSError, ValueError, KeyError, TypeError, StopIteration):
+                row.update(status='unavailable', error='Original action/receipt unavailable; no outcome inferred')
+            activity.append(row)
+        pending_view = dict(pending) if pending else None
+        if pending_view:
+            # A failed preflight can retain a pending identity without any
+            # provider/tool dispatch. Display the original capability receipt.
+            ref = f"attempts/{pending['attempt']}/capability_result.json"
+            try:
+                result = self.record(root, ref)
+                pending_view['receipt'] = {k: result.get(k) for k in ('status', 'diagnostics')}
+                pending_view['receipt']['record'] = ref
+            except (OSError, ValueError, KeyError, TypeError):
+                pending_view['receipt'] = None
         config = state['config']
         with self.lock:
             worker = self.workers.get(name)
@@ -230,7 +261,9 @@ class Workspace:
             worker_live=live, stop_requested=stopping, worker_error=error,
             manifest={k: manifest.get(k) for k in ('session_id', 'topic', 'status', 'status_reason',
                 'current_attempt', 'revision', 'budget', 'updated_at')},
-            requests=state['requests'], plan=plan, pending=pending, approval=approval,
+            requests=state['requests'], plan=plan, pending=pending_view, approval=approval,
+            activity=activity, activity_total=sum(len(t['tools']) for t in state['turns']),
+            queued_actions=sum(len(t.get('remaining', [])) for t in state['turns']),
             model=config.get('model'), access={k: config.get(k) for k in
                 ('allow_network', 'allow_execution', 'allow_vision')},
             sources=list(config.get('sources', {})),
@@ -260,6 +293,20 @@ class Workspace:
                for p in parts):
             raise ValueError('Private/configuration files cannot be served')
         return path
+
+    def source_preview(self, name: str, mount: str, relative: str) -> dict | None:
+        path = self.file(name, mount, relative)
+        if not path.is_file() or path.stat().st_size > 16 * 1024 * 1024:
+            raise ValueError('Preview/download limit is 16 MiB')
+        root = self.task(name)
+        if mount == 'workspace' or any(path.is_relative_to(root / d) for d in ('workspace', 'attempts')):
+            return None
+        # Only an explicitly clicked, currently authorized file is inspected.
+        # The source owner recognizes the declared schema and owns coverage.
+        try:
+            return SourceToolGateway.inventory_source(path)
+        except (ValueError, TypeError, KeyError):
+            return None  # Malformed declarations remain downloadable text.
 
     def mutate(self, data: dict) -> dict:
         op = data['op']
@@ -395,6 +442,8 @@ def server(workspace: Workspace, port: int = 0) -> ThreadingHTTPServer:
                     self.send(200, workspace.snapshot(q['task']))
                 elif url.path == '/api/delivery':
                     self.send(200, workspace.delivery(q['task']))
+                elif url.path == '/api/source-preview':
+                    self.send(200, workspace.source_preview(q['task'], q['mount'], q.get('path', '')))
                 elif url.path == '/api/files':
                     p = workspace.file(q['task'], q['mount'], q.get('path', ''))
                     if p.is_dir():
