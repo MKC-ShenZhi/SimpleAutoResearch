@@ -377,6 +377,14 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
              'size_bytes': len(raw), 'next_offset_bytes': len(raw),
              **({'text': text} if operation == 'read_file' else {})}, identity)
 
+    def _record_parent_material_read(self, app, path, identity, **window):
+        arguments = {'path': str(path), **window}
+        observed = app.workspace.call('read_file', arguments, identity=identity)
+        self.assertEqual(observed.status, 'ok', observed.error)
+        turn = self._record_native_turn(app, 'read_file', arguments, observed.data, identity)
+        app.state['turns'].append(turn)
+        return turn
+
     @staticmethod
     def _native_history_turns(history):
         if isinstance(history, dict):
@@ -580,6 +588,242 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             'figures': [{'path': str(figure), 'caption': 'Supplied comparison diagram.'}],
             'prior_draft': str(prior)}
         return inputs, fake, app, materials, table, figure, request
+
+    def test_parent_read_receipts_seed_writing_and_implementation_without_reinvestigation(self):
+        for professional in ('writing', 'implementation'):
+            with self.subTest(professional=professional):
+                _, fake, app, materials, table, _, writing_request = self._material_root_fixture()
+                extra = materials / 'unread-notes.txt'
+                extra.write_text('UNSELECTED_PARENT_OBSERVATION', encoding='utf-8')
+                for index, path in enumerate((table, extra)):
+                    self._record_parent_material_read(app, path, f'parent-observation-{index}')
+                # Same receipt range may occur repeatedly in the parent journal.
+                self._record_parent_material_read(app, table, 'parent-observation-repeat')
+                app.state['requests'].append('Preserve original group order; disclose descriptive limits.')
+                app._save()
+                refs = app._material_observations([str(materials)])
+                self.assertEqual(len(refs), 3)
+                self.assertNotIn('UNSELECTED_PARENT_OBSERVATION', json.dumps(refs))
+                identity = f'parent-seeded-{professional}'
+                if professional == 'writing':
+                    gateway = app.writing
+                    arguments = writing_request
+                    generated = {'draft_markdown': '## Results\n\nDescriptive yields only; original group order.'}
+                    invoke = lambda: self._compose_document(app, arguments, identity)
+                    owner = app.session.store.root / 'tools/writing' / identity
+                    selection_owner = owner
+                else:
+                    gateway = app.implementation
+                    gateway.client_factory = lambda _: fake
+                    arguments = {'goal': 'Prepare a utility preserving original group order.',
+                        'material_roots': [str(materials)]}
+                    generated = {'summary': 'Prepared utility', 'unresolved': ['Descriptive evidence only'],
+                        'files': [{'path': 'utility.py', 'content': 'def materialize(values):\n    return list(values)\n'}]}
+                    invoke = lambda: self._prepare_candidate(app.gateway, fake, arguments, identity, calls=2)
+                    owner = app.session.store.root / 'attempts' / identity / 'implementation'
+                    selection_owner = owner / 'material-selection'
+                fake.ask_json.side_effect = [{'materials': [str(table)]}, generated]
+                ledger_before = app.ledger.to_dict()
+                with patch.object(gateway, 'material_observations', wraps=app._material_observations) as provider:
+                    result = invoke()
+                    provider.assert_called_once()
+                self.assertEqual(fake.ask_json.call_count, 2)  # One selection, one generation.
+                prompts = [json.loads(call.args[1]) for call in fake.ask_json.call_args_list]
+                self.assertEqual(prompts[0]['decisions_remaining'], 6)
+                self.assertEqual(len(prompts[0]['observations']), 2)
+                self.assertEqual(sum(row['data']['text'] == table.read_text(encoding='utf-8')
+                    for row in prompts[0]['observations']), 1)
+                self.assertEqual(prompts[0]['journal_observation_coverage']['not_admitted_count'], 1)
+                self.assertIn('Preserve original group order', json.dumps(prompts[1]))
+                self.assertNotIn('UNSELECTED_PARENT_OBSERVATION', json.dumps(prompts[1]))
+                self.assertNotIn('journal_observations', prompts[1])
+                if professional == 'writing':
+                    passages = [passage['text'] for handle in prompts[1]['source_handles']
+                        for passage in handle.get('metadata', {}).get('evidence_passages', [])]
+                    self.assertEqual(passages, [table.read_text(encoding='utf-8')])
+                else:
+                    self.assertEqual([row['text'] for row in prompts[1]['source_windows'] if 'text' in row],
+                        [table.read_text(encoding='utf-8')])
+                saved_input = read_json(selection_owner / 'selection-input.json')
+                self.assertNotIn('UNSELECTED_PARENT_OBSERVATION', json.dumps(saved_input))
+                self.assertEqual(read_json(selection_owner / 'selection-observations.json'), prompts[0]['observations'])
+                retained = {path: path.read_bytes() for path in owner.rglob('*.json')}
+                # Later successful reads and feedback cannot reseed a saved attempt.
+                self._record_parent_material_read(app, extra, 'late-parent')
+                app.ledger.reserve('unknown-parent-usage', {'llm_requests': 1, 'total_tokens': 127})
+                app.ledger.mark_unknown('unknown-parent-usage', reason='Preserved unknown usage',
+                    known_actual={'llm_requests': 1}, retain_reservation=True)
+                accounted = app.ledger.to_dict()
+                with patch.object(gateway, 'material_observations', side_effect=AssertionError('No reseeding')), \
+                        patch.object(gateway, 'client_factory', side_effect=AssertionError('No replay model')):
+                    replay = invoke()
+                self.assertEqual(replay.data, result.data)
+                self.assertEqual(fake.ask_json.call_count, 2)
+                self.assertEqual(app.ledger.to_dict(), accounted)
+                self.assertEqual({path: path.read_bytes() for path in retained}, retained)
+                self.assertEqual(ledger_before['limits'], accounted['limits'])
+                # Replay must still reject a changed parent receipt or current
+                # source version, rather than re-certifying it from new reads.
+                parent_record = app.workspace.resolve(refs[0]['record'])
+                parent_receipt = read_json(parent_record)
+                original_table = table.read_bytes()
+                for invalidated in ('receipt', 'current-bytes'):
+                    with self.subTest(replay_invalidated=invalidated):
+                        mutation = (_changed_record(parent_record, {**parent_receipt, 'summary': 'Changed receipt'})
+                            if invalidated == 'receipt' else nullcontext())
+                        if invalidated == 'current-bytes':
+                            table.write_bytes(b'x' * len(original_table))
+                        try:
+                            with mutation, patch.object(gateway, 'material_observations',
+                                    side_effect=AssertionError('No replacement observations')), \
+                                    patch.object(gateway, 'client_factory', side_effect=AssertionError('No repair model')):
+                                if professional == 'writing':
+                                    rejected = self._compose_document(app, arguments, identity, status='error')
+                                else:
+                                    rejected = self._prepare_candidate(app.gateway, fake, arguments,
+                                        identity, calls=2, status='error')
+                            self.assertIn('changed', rejected.error.lower())
+                        finally:
+                            table.write_bytes(original_table)
+                self.assertEqual({path: path.read_bytes() for path in retained}, retained)
+                self.assertEqual(app.ledger.to_dict(), accounted)
+                # An interrupted new selection freezes its own observations;
+                # it does not acquire late reads or retry its failed decision.
+                identity = f'parent-interrupted-{professional}'
+                fake.ask_json.side_effect = RuntimeError('Selection response unavailable; usage unknown')
+                if professional == 'writing':
+                    failed = self._compose_document(app, arguments, identity, status='error')
+                    interrupted_owner = app.session.store.root / 'tools/writing' / identity
+                else:
+                    failed = self._prepare_candidate(app.gateway, fake, arguments, identity, calls=3, status='error')
+                    interrupted_owner = app.session.store.root / 'attempts' / identity / 'implementation/material-selection'
+                self.assertIn('Selection response unavailable', failed.error)
+                frozen = {path: path.read_bytes() for path in interrupted_owner.rglob('*.json')}
+                self.assertIn(interrupted_owner / 'selection-observations.json', frozen)
+                self._record_parent_material_read(app, extra, 'late-after-interruption')
+                with patch.object(gateway, 'material_observations', side_effect=AssertionError('No late seed')), \
+                        patch.object(gateway, 'client_factory', side_effect=AssertionError('No blind replay')):
+                    if professional == 'writing':
+                        rejected = self._compose_document(app, arguments, identity, status='error')
+                    else:
+                        rejected = self._prepare_candidate(app.gateway, fake, arguments, identity, calls=3, status='error')
+                self.assertIn('Interrupted material selection', rejected.error)
+                self.assertEqual({path: path.read_bytes() for path in frozen}, frozen)
+                self.assertEqual(app.ledger.to_dict(), accounted)
+
+    def test_parent_material_seed_requires_current_authorized_complete_successful_receipts(self):
+        from simple_ar.tools.materials import material_inventories, material_observation_seed
+
+        _, inputs, _, _, app, _ = self._native_fixture()
+        current = inputs / 'notes.txt'
+        other = inputs / 'other.txt'
+        other.write_bytes(current.read_bytes())
+        for index, path in enumerate((current, other)):
+            self._record_parent_material_read(app, path, f'seed-valid-{index}')
+        refs = app._material_observations([str(inputs)])
+        inventories = material_inventories(app.workspace, [str(inputs)], identity='seed-validation')
+        # Identical contents at two paths remain two distinct observations.
+        valid = material_observation_seed(workspace=app.workspace, inventories=inventories,
+            provider=lambda _: refs, roots=[str(inputs)], context={})
+        self.assertEqual(len(valid['observations']), 2)
+        reference = refs[0]
+        record = app.workspace.resolve(reference['record'])
+        receipt = read_json(record)
+        for case in ('blocked', 'error', 'unknown', 'no-hash', 'no-range', 'wrong-text', 'changed-receipt',
+                'stale-file', 'outside-inventory', 'revoked', 'source-owner'):
+            with self.subTest(case=case):
+                original = record.read_bytes()
+                subject = app.workspace.resolve(reference['request']['path'])
+                content = subject.read_bytes()
+                supplied = dict(reference)
+                changed = json.loads(json.dumps(receipt))
+                inventory = inventories
+                if case in {'blocked', 'error', 'unknown'}:
+                    changed['status'] = case
+                elif case == 'no-hash':
+                    changed['data']['sha256'] = None
+                elif case == 'no-range':
+                    changed['data'].pop('next_offset_bytes')
+                elif case == 'wrong-text':
+                    changed['data']['text'] = 'NOT OBSERVED'
+                elif case == 'changed-receipt':
+                    changed['summary'] = 'Changed after the parent observation was located'
+                elif case == 'outside-inventory':
+                    inventory = material_inventories(app.workspace, [str(current)], identity='seed-subset')
+                elif case == 'stale-file':
+                    subject.write_bytes(b'x' * len(content))
+                if case not in {'outside-inventory', 'stale-file', 'revoked', 'source-owner'}:
+                    write_json(record, changed)
+                    if case != 'changed-receipt':
+                        supplied['receipt_sha256'] = hashlib.sha256(record.read_bytes()).hexdigest()
+                try:
+                    permission = (patch.object(app.workspace, 'resolve', side_effect=ValueError('Authorization revoked'))
+                        if case == 'revoked' else nullcontext())
+                    with permission:
+                        seed = material_observation_seed(workspace=app.workspace, inventories=inventory,
+                            provider=lambda _: [supplied], roots=[str(inputs)], context={},
+                            excluded_paths={str(subject)} if case == 'source-owner' else None)
+                    self.assertEqual(seed['observations'], [])
+                    self.assertEqual(len(seed['coverage']['not_admitted']), 1)
+                    self.assertFalse(seed['coverage']['not_admitted'][0]['admitted'])
+                    if case in {'blocked', 'error', 'unknown', 'no-hash', 'no-range'}:
+                        self.assertNotIn(reference['record'], [row['record'] for row in app._material_observations([str(inputs)])])
+                finally:
+                    record.write_bytes(original)
+                    subject.write_bytes(content)
+
+    def test_parent_material_seed_capacity_exposes_refusals_without_consuming_extra_decisions(self):
+        from simple_ar.core.capabilities import ArtifactStore
+        from simple_ar.tools.materials import (MaterialSelection, inspect_materials, material_inventories,
+            material_observation_seed, selected_material_windows)
+
+        _, inputs, _, _, app, _ = self._native_fixture()
+        source = inputs / 'capacity.txt'
+        source.write_bytes(b'x' * 120000)
+        windows = [{'path': str(source), 'max_bytes': 64000},
+            {'path': str(source), 'offset_bytes': 64000, 'max_bytes': 30000},
+            {'path': str(source), 'offset_bytes': 94000, 'max_bytes': 16000}]
+        refs = []
+        for index, arguments in enumerate(windows):
+            observed = app.workspace.call('read_file', arguments, identity=f'capacity-parent-{index}')
+            app.state['turns'].append(self._record_native_turn(app, 'read_file', arguments,
+                observed.data, f'capacity-parent-{index}'))
+            refs.append(app._material_observations([str(source)])[0])
+        inventories = material_inventories(app.workspace, [str(source)], identity='seed-capacity')
+        seed = material_observation_seed(workspace=app.workspace, inventories=inventories,
+            provider=lambda _: refs, roots=[str(source)], context={})
+        self.assertEqual(sum(len(row['data']['text']) for row in seed['observations']), 94000)
+        refused = seed['coverage']['not_admitted'][0]
+        self.assertEqual(refused['reason'], 'observation_capacity')
+        self.assertEqual((refused['offset_bytes'], refused['next_offset_bytes']), (94000, 110000))
+        self.assertNotIn('text', refused)
+        owner = ArtifactStore(app.session.store.root / 'tools/seed-capacity')
+        client = Mock()
+        client.ask_json.side_effect = [{'read_windows': [windows[0]]}, {'materials': windows[:2]}]
+        with patch.object(app.workspace, 'call', side_effect=AssertionError('No repeated investigation read')):
+            response = inspect_materials(workspace=app.workspace, context={}, instructions='Select evidence.',
+                inventories=inventories, owner=owner, identity='seed-capacity', client=client,
+                response_model=MaterialSelection, label='seed-capacity', final_fields=('materials',), seed=seed)
+        prompts = [json.loads(call.args[1]) for call in client.ask_json.call_args_list]
+        self.assertEqual([row['decisions_remaining'] for row in prompts], [6, 5])
+        self.assertEqual(prompts[0]['observation_capacity']['remaining_characters'], 2000)
+        self.assertEqual(prompts[1]['read_admission'][0]['status'], 'already_observed')
+        self.assertEqual(client.ask_json.call_count, 2)
+        self.assertEqual(response, {'materials': windows[:2]})
+        with self.assertRaisesRegex(ValueError, 'not inspected'):
+            selected_material_windows(app.workspace, MaterialSelection(materials=[windows[2]]),
+                seed['observations'], identity='seed-capacity-refused')
+        # UTF-8 serialization can bind before the character limit. Refuse only
+        # the overflowing seed, leaving a usable selection rather than failing.
+        unicode_file = inputs / 'unicode.txt'
+        unicode_file.write_bytes(('中' * 21000).encode('utf-8'))
+        self._record_parent_material_read(app, unicode_file, 'unicode-seed', max_bytes=64000)
+        unicode_refs = app._material_observations([str(unicode_file)])
+        unicode_seed = material_observation_seed(workspace=app.workspace,
+            inventories=material_inventories(app.workspace, [str(unicode_file)], identity='unicode-seed'),
+            provider=lambda _: unicode_refs, roots=[str(unicode_file)], context={'inventory': 'x' * 180000})
+        self.assertEqual(unicode_seed['observations'], [])
+        self.assertEqual(unicode_seed['coverage']['not_admitted'][0]['reason'], 'serialized_context_capacity')
 
     def test_common_gateway_dispatches_read_only_and_blocks_execution(self) -> None:
         run_dir, _ = self._tool_materials()
@@ -8092,6 +8336,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             'draft_markdown': '## Summary\n\nSupplied yields.\n\n## Limits\n\nDescriptive observations only.'}]
         result = self._compose_document(app, request, 'writing-root-constraints')
         owner = app.session.store.root / 'tools/writing/writing-root-constraints'
+        self.assertNotIn('journal_observations', read_json(owner / 'selection-input.json'))
         for path in ('selection-input.json', 'request.json'):
             bound = read_json(owner / path)['request']
             self.assertEqual(bound['required_headings'], request['required_headings'])
@@ -8356,6 +8601,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
     def test_composition_preserves_default_and_explicit_material_windows_on_replay(self) -> None:
         _, _, fake, _, resumed, _ = self._native_fixture()
+        resumed.writing.material_observations = Mock(side_effect=AssertionError('Manual windows do not select materials'))
         table = resumed.workspace.workspace / 'observations.csv'
         # Consumer serialization must not turn a default into an explicitly
         # requested line cap. Both new and retained reads keep observed bytes.
@@ -8373,6 +8619,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 replay = _call_tool(resumed.gateway, 'compose_document', request, identity=f'writing-window-{suffix}')
                 self.assertEqual(replay.model_dump(), result.model_dump())
                 self.assertEqual(fake.ask_json.call_count, calls)
+        resumed.writing.material_observations.assert_not_called()
 
     def _visual_fixture(self):
         _, inputs, fake, _, app, _ = self._native_fixture()
@@ -9878,6 +10125,7 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(observations[1]['data']['next_offset_bytes'], len(prefix + tail))
         self.assertFalse(observations[1]['data']['has_more'])
         self.assertTrue((material_owner / 'selection-input.json').is_file())
+        self.assertNotIn('journal_observations', read_json(material_owner / 'selection-input.json'))
         self.assertTrue((material_owner / 'selection-steps/1/observations.json').is_file())
         actual_reads = [call.args[1] for call in reads.call_args_list if call.args[0] == 'read_file']
         self.assertTrue(actual_reads)
@@ -9969,6 +10217,8 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
         from pydantic import ValidationError
         from simple_ar.tools.implementation import ImplementationRequest
 
+        self.implementation.material_observations = Mock(side_effect=AssertionError('Manual files do not select materials'))
+
         arguments = {'goal': 'Prepare a utility description.',
             'files': [{'path': 'README.md', 'purpose': 'Explain utility usage'}]}
         legacy_request = {**arguments, 'source_windows': []}
@@ -9998,6 +10248,7 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
         self.assertIn('contract changed', rejected.error)
         self.assertEqual({path: path.read_bytes() for path in retained}, retained)
         self.assertFalse((Path(prepared.data['source_binding']).parent / 'material-selection').exists())
+        self.implementation.material_observations.assert_not_called()
 
     def test_implementation_material_selection_blocks_unobserved_and_unlisted_windows(self) -> None:
         materials = self.workspace.workspace / 'bounded-materials'

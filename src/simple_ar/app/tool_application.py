@@ -304,12 +304,14 @@ class ToolApplication:
             config['model'], controller.manifest.session_id,
             client_factory=lambda identity: self._client(identity, purpose='writing', native=False),
             work_context=self._work_context,
+            material_observations=self._material_observations,
             report_inputs=self._report_inputs if config.get('report_requirement') else None)
         scientific = {}
         self.implementation = ImplementationToolGateway(controller.store.root, self.workspace, self.ledger,
             config['model'], controller.manifest.session_id,
             client_factory=lambda identity: self._client(identity, purpose='code'),
             work_context=self._work_context,
+            material_observations=self._material_observations,
             execution_observations=self._execution_observations, exact=config.get('code_task'),
             research_inputs=lambda: self.sources.implementation_evidence(),
             candidate_outputs=lambda record: scientific['scientific'].candidate_outputs(record) if scientific else {},
@@ -413,6 +415,42 @@ class ToolApplication:
                     return {**result['data'],
                         'record': 'records/' + item['result'].removeprefix('attempts/')}
         return None
+
+    def _material_observations(self, targets: list[str]) -> list[dict[str, Any]]:
+        """Locate successful parent reads, without transferring bodies or authority.
+
+        The material owner admits these receipts against its actual inventory,
+        current permissions and bytes. Only a new selection calls this provider.
+        """
+        roots = [self.workspace.resolve_material_root(path) for path in targets]
+        retained = []
+        for turn in reversed(self.state['turns']):
+            calls = {call['id']: call for call in
+                self.session.store.read_json(turn['reply']).get('tool_calls', [])}
+            for item in reversed(turn['tools']):
+                call = calls.get(item['id'], {})
+                if call.get('function', {}).get('name') != 'read_file':
+                    continue
+                try:
+                    arguments = json.loads(call['function']['arguments'])
+                    path = self.workspace.resolve(arguments['path'])
+                    if not any(path == root or root.is_dir() and path.is_relative_to(root) for root in roots):
+                        continue
+                    raw = self.session.store.resolve(item['result']).read_bytes()
+                    receipt = json.loads(raw)
+                    data = receipt.get('data') or {}
+                    if (receipt.get('tool_name') != 'read_file' or receipt.get('status') != 'ok'
+                            or receipt.get('error') or not isinstance(data.get('sha256'), str)
+                            or len(data['sha256']) != 64
+                            or type(data.get('next_offset_bytes')) is not int
+                            or type(data.get('size_bytes')) is not int):
+                        continue
+                    retained.append({'request': arguments,
+                        'record': 'records/' + item['result'].removeprefix('attempts/'),
+                        'receipt_sha256': hashlib.sha256(raw).hexdigest()})
+                except (ValueError, TypeError, KeyError, OSError, RuntimeError):
+                    continue
+        return retained
 
     def _work_context(self, targets: list[str]) -> dict[str, Any]:
         """Pass related original feedback, not another coordinator summary.

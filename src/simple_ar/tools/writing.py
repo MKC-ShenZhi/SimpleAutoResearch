@@ -7,7 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -164,6 +164,9 @@ class ComposeRequest(BaseModel):
     figures: list[str | ComposeFigure] = Field(default_factory=list, max_length=12,
         description="Authorized existing PNG/JPEG/SVG/PDF files: legacy path strings, or {path, caption} for an explicit publication caption. Writer places the caption only in the standalone image alt; export owns figure numbering. Contents are not visually or scientifically verified by composition.")
     prior_draft: str = Field(default="", description="Optional mounted Markdown draft for any revision, including review corrections or user feedback. Binds its actual bytes as a prior version, not primary evidence or a new review certificate.")
+    writing_method: Literal['article', 'sections'] | None = Field(default=None,
+        exclude_if=lambda value: value is None,
+        description="Optional composition granularity, not a task type or model selector. article returns one complete draft; sections uses the existing planned section Writer and complete-response checkpoints for longer work. Omitted keeps the original article/frozen-report method. Does not add review, retries or budget; cannot replace a frozen report method.")
     target_words: int = Field(default=0, ge=0, le=20000)
     required_headings: list[str] = Field(default_factory=list, max_length=32,
         description="Optional ordered article-level section titles (case and presentation numbering ignored). Subsections remain free; title and references belong to publication. A missing or reordered heading rejects the retained response, without redrafting.")
@@ -237,12 +240,14 @@ class WritingToolGateway:
     def __init__(self, root: Path, workspace: Any, ledger: Any, model: str, session_id: str,
                  *, client_factory: Callable[[str], Any] | None = None,
                  report_inputs: Callable[[], dict[str, Any]] | None = None,
-                 work_context: Callable[[list[str]], dict] | None = None) -> None:
+                 work_context: Callable[[list[str]], dict] | None = None,
+                 material_observations: Callable[[list[str]], list[dict]] | None = None) -> None:
         self.root, self.workspace, self.ledger = root, workspace, ledger
         self.model, self.session_id = model, session_id
         self.client_factory = client_factory
         self.report_inputs = report_inputs
         self.work_context = work_context
+        self.material_observations = material_observations
 
     def can_reconcile(self, name: str, identity: str) -> bool:
         """Allow dispatch to this owner, without certifying a completed article."""
@@ -367,6 +372,8 @@ class WritingToolGateway:
             inputs['prior_draft'] = {'binding': prior_binding, 'markdown': previous,
                 'evidence_role': 'draft_claims_not_evidence'}
         if retained is not None:
+            if 'journal_observations' in retained:
+                inputs['journal_observations'] = retained['journal_observations']
             if retained != inputs:
                 raise ValueError('Material selection inputs changed; preserve this version and use a new identity')
             if not owner.exists('selection-response.json'):
@@ -390,6 +397,13 @@ class WritingToolGateway:
             prompt = json.dumps(prompt, ensure_ascii=False)
             if len(prompt.encode('utf-8')) > 128000:
                 raise ValueError('Material selection inventory exceeds 128 KB; choose focused roots')
+            from simple_ar.tools.materials import material_observation_seed
+            seed = material_observation_seed(workspace=self.workspace, inventories=inventories,
+                provider=self.material_observations, roots=roots, context=json.loads(prompt),
+                excluded_paths={
+                    str(self.workspace.resolve(row['document_record'])) for row in source_views})
+            if seed is not None:
+                inputs['journal_observations'] = {'coverage': seed['coverage']}
             owner.write_json('selection-input.json', inputs)
             instructions = (
                 'Select the smallest sufficient set of listed mounted file locators for this article. '
@@ -412,6 +426,7 @@ class WritingToolGateway:
             response = inspect_materials(workspace=self.workspace, context=json.loads(prompt),
                 instructions=instructions, inventories=inventories, owner=owner, identity=identity,
                 client=client, response_model=_MaterialSelection, label='composition-selection',
+                seed=seed,
                 final_fields=('materials', 'figures', 'sources'), excluded_paths={
                     str(self.workspace.resolve(row['document_record'])) for row in source_views})
             owner.write_json('selection-response.json', response)
@@ -472,6 +487,9 @@ class WritingToolGateway:
                 'Unlisted paths are not evidence of absence; private/runtime exclusions still apply.')
         if investigating:
             coverage['selected_windows'] = [window.model_dump(exclude_unset=True) for window in windows]
+            if 'journal_observations' in inputs:
+                from simple_ar.tools.materials import material_seed_coverage
+                coverage['journal_observations'] = material_seed_coverage(inputs['journal_observations'])
             coverage['inspected_inputs'] = [{'path': row['request']['path'], 'sha256': row['data']['sha256']}
                 for row in observations]
         sources = [*request.sources, *selected.sources]
@@ -488,7 +506,8 @@ class WritingToolGateway:
         from simple_ar.report.projection import build_material_report_inputs, apply_report_bibliography
         from simple_ar.report.schema import ReportContext, ReportRuntimeConfig, ReportSectionPlan, ReportDocumentPlan, SourceHandle, ReportMemory
         from simple_ar.report.templates import load_report_template_bundle, intended_use_guidance
-        from simple_ar.report.writing import ARTICLE_OWNER, article_writing_inputs, write_whole_article
+        from simple_ar.report.writing import (ARTICLE_OWNER, SECTION_ARTICLE_OWNER,
+            article_writing_inputs, write_whole_article, write_section_article)
         from simple_ar.research.documents.ingest import DocumentBundle
         from simple_ar.research.contracts import DocumentRecord, TextChunk
         from simple_ar.research.store.retrieval import rank_source_chunks
@@ -506,10 +525,15 @@ class WritingToolGateway:
                 raise ValueError('Retained composition lacks its original request binding; no blind replay')
             original_binding = owner.read_json('request.json') if recovering else None
             request = (ReviewRequest if inspecting else ComposeRequest).model_validate(arguments)
+            if inspecting and request.writing_method is not None:
+                raise ValueError('Independent inspection cannot select a drafting method')
             delivery = request.delivery if inspecting else None
             prepared_delivery = self.workspace.resolve_delivery(delivery) if delivery is not None else None
             delivery_inputs = self.workspace.artifact_hashes(prepared_delivery['artifacts']) if prepared_delivery else {}
             report_binding = self.report_inputs() if self.report_inputs and not inspecting else None
+            if (report_binding is not None and request.writing_method is not None
+                    and request.writing_method != report_binding['requirement']['method']):
+                raise ValueError('Composition cannot replace the frozen report writing method')
             material_report = report_binding is not None and report_binding.get('evidence_contract') == 'materials.v1'
             if material_report:
                 validate_report_requirement(report_binding['requirement'])
@@ -523,13 +547,14 @@ class WritingToolGateway:
             if not inspecting and not request.sources and not request.materials and not request.material_roots and report_binding is None:
                 raise ValueError('Select source chunks or readable material windows; a draft or figure alone is not factual evidence')
             writing_owner = original_binding.get('writing_owner') if recovering else (
-                'independent_review.v1' if inspecting else 'professional_report.v1' if report_binding else ARTICLE_OWNER)
-            if (writing_owner not in {None, ARTICLE_OWNER, 'independent_review.v1', 'professional_report.v1'}
+                'independent_review.v1' if inspecting else 'professional_report.v1' if report_binding else
+                SECTION_ARTICLE_OWNER if request.writing_method == 'sections' else ARTICLE_OWNER)
+            if (writing_owner not in {None, ARTICLE_OWNER, SECTION_ARTICLE_OWNER, 'independent_review.v1', 'professional_report.v1'}
                     or inspecting != (writing_owner == 'independent_review.v1')):
                 raise ValueError('Unknown bound writing owner; no blind replay')
             assembly_mode = ReportAssemblyMode(original_binding.get('assembly_mode', 'section_drafts')
-                if recovering else ('section_drafts' if report_binding and
-                    report_binding['requirement']['method'] == 'sections' else 'whole_article'))
+                if recovering else ('section_drafts' if writing_owner == SECTION_ARTICLE_OWNER or
+                    report_binding and report_binding['requirement']['method'] == 'sections' else 'whole_article'))
             def read_figure(locator: str) -> tuple[Path, bytes]:
                 try:
                     path = self.workspace.resolve(locator)
@@ -978,6 +1003,29 @@ class WritingToolGateway:
                 if written['source_notes']:
                     context, _ = apply_report_bibliography(context, documents=documents,
                         notes=written['source_notes'])
+            elif writing_owner == SECTION_ARTICLE_OWNER:
+                from simple_ar.report.assembler import assemble_report_sections
+                from simple_ar.report.writing import _check_article_constraints
+                from simple_ar.report.schema import ReportSectionDraft
+
+                if not recovering:
+                    client = client or (self.client_factory(identity) if self.client_factory else LLMClient.from_env(
+                        self.model, budget_ledger=self.ledger, budget_session_id=self.session_id, budget_attempt_id=identity))
+                written = write_section_article(store=writer_store, input_store=owner, documents_ref=ref,
+                    identity=identity, report_context=context, title=request.title,
+                    target_words=request.target_words, required_headings=request.required_headings,
+                    max_cited_sources=request.max_cited_sources, prior_draft=previous,
+                    client=client, recovering=recovering)
+                config = ReportRuntimeConfig.model_validate(writer_store.read_json('report_inputs.json')['config'])
+                memory = ReportMemory.model_validate(written['memory'])
+                context, memory = apply_report_bibliography(context, memory, documents=documents,
+                    notes=memory.outline_planning.get('source_notes', []))
+                _check_article_constraints({'constraints': {'outline': [
+                    {'heading': heading, 'required': True} for heading in request.required_headings],
+                    'max_cited_sources': request.max_cited_sources}, 'bibliography': context.papers,
+                    'citation_key_map': context.citation_key_map}, assemble_report_sections(title=request.title,
+                        sections=[ReportSectionDraft.model_validate(row) for row in written['sections']],
+                        assembly_mode=assembly_mode))
             else:
                 # Historical composition remains bound to its original Writer
                 # checkpoint and schema. Never invoke the legacy runtime here.

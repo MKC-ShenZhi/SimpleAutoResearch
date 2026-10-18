@@ -240,6 +240,7 @@ class ImplementationToolGateway:
                  measurement_inputs: Callable[[dict[str, str] | None, bool], dict[str, Any]] | None = None,
                  research_inputs: Callable[[], dict[str, Any]] | None = None,
                  work_context: Callable[[list[str]], dict] | None = None,
+                 material_observations: Callable[[list[str]], list[dict]] | None = None,
                  measurement: dict[str, Any] | None = None,
                  measurement_supplier: Callable[[], dict[str, Any] | None] | None = None,
                  exact: dict[str, Any] | None = None) -> None:
@@ -251,6 +252,7 @@ class ImplementationToolGateway:
         self.measurement_inputs = measurement_inputs
         self.research_inputs = research_inputs
         self.work_context = work_context
+        self.material_observations = material_observations
         self.exact = ExactCodeTask.model_validate(exact) if exact is not None else None
         if measurement_supplier is not None and self.exact is None:
             raise ValueError('A producing measurement supplier requires the exact implementation owner')
@@ -1155,7 +1157,8 @@ class ImplementationToolGateway:
                 material_selection, client = implementation_materials(workspace=self.workspace,
                     roots=request.material_roots, goal=request.goal,
                     owner=ArtifactStore(owner.root / 'material-selection'), identity=identity,
-                    client_factory=lambda: self._client(identity))
+                    client_factory=lambda: self._client(identity),
+                    material_observations=self.material_observations)
                 windows.extend(material_selection['windows'])
             direct_creation = (not request.files and project is None
                 and not owner.exists('selection-input.json')

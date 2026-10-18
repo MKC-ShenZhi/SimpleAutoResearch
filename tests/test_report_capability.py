@@ -569,6 +569,43 @@ class ArticleClient:
 
 
 class StructuredArticleWritingTests(unittest.TestCase):
+    def test_section_call_records_bridge_checkpoints_without_replaying_unknown_responses(self):
+        from simple_ar.integrations.llm import LLMError
+        from simple_ar.report.writing import retained_writing_client
+        from unittest.mock import Mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ArtifactStore(Path(tmp))
+            provider = Mock()
+            provider.ask_json.side_effect = [{'draft_markdown': 'First complete section.'},
+                                            LLMError('Interrupted stream; usage unknown')]
+            client = retained_writing_client(store=store, identity='sections', client=provider)
+            first = client.ask_json('Evidence-bound writing', '{"section":"first"}',
+                                    label='section-first', max_output_tokens=1000)
+            self.assertEqual(first['draft_markdown'], 'First complete section.')
+            options = provider.ask_json.call_args.kwargs
+            self.assertEqual(options['label'], 'section-first')
+            self.assertEqual(options['max_output_tokens'], 1000)
+            self.assertTrue(options['budget_call_id'].startswith('sections:writing:'))
+            # A complete response survives a crash before checkpoint commit.
+            recovered = retained_writing_client(store=store, identity='sections', client=None)
+            self.assertEqual(recovered.ask_json('Evidence-bound writing', '{"section":"first"}',
+                label='section-first', max_output_tokens=1000), first)
+            self.assertEqual(provider.ask_json.call_count, 1)
+            with self.assertRaisesRegex(LLMError, 'usage unknown'):
+                client.ask_json('Evidence-bound writing', '{"section":"second"}', label='section-second')
+            for restoring in (client, recovered):
+                with self.assertRaisesRegex(ValueError, 'no blind replay'):
+                    restoring.ask_json('Evidence-bound writing', '{"section":"second"}', label='section-second')
+            self.assertEqual(provider.ask_json.call_count, 2)
+            record = next(path for path in (store.root / 'model_calls').iterdir()
+                          if (path / 'response.json').exists())
+            (record / 'response.json').write_text('{"response": {"draft_markdown": "Replaced"}}')
+            with self.assertRaisesRegex(ValueError, 'complete bound record'):
+                client.ask_json('Evidence-bound writing', '{"section":"first"}',
+                                label='section-first', max_output_tokens=1000)
+            self.assertEqual(provider.ask_json.call_count, 2)
+
     def request(self, client=None):
         config = ReportRuntimeConfig(reviewer='disabled', max_review_iterations=0,
             allow_source_backtracking=False, outline_strategy='auto', max_section_tokens=900)
@@ -587,6 +624,140 @@ class StructuredArticleWritingTests(unittest.TestCase):
             criteria_markdown='Do not claim an inspection occurred.')
         return ReportWritingRequest(context, ReportMemory(limitations=['Input coverage is partial.']),
             config, template, client or ArticleClient(), method='article')
+
+    def test_explicit_section_composition_uses_existing_checkpoint_and_retained_calls(self):
+        from simple_ar.integrations.llm import LLMError
+        from simple_ar.report.writing import write_section_article
+        from simple_ar.research.documents.ingest import DocumentBundle
+        from tests.report_review_fixtures import prompt_payload
+
+        for interruption in ('none', 'unknown-response', 'checkpoint-write'):
+            with self.subTest(interruption=interruption), tempfile.TemporaryDirectory() as tmp:
+                owner = ArtifactStore(Path(tmp))
+                writer = ArtifactStore(owner.root / 'writer')
+                documents = owner.write_json('documents.json', DocumentBundle([], {}, {}, [], []).to_handoff_dict(),
+                    kind='documents', schema='document_bundle.v1')
+                calls = []
+                class Client:
+                    def ask_json(self, system, prompt, *, label='', **options):
+                        calls.append((label, options))
+                        if interruption == 'unknown-response' and len(calls) == 2:
+                            raise LLMError('Unknown second section request')
+                        section = prompt_payload(prompt)['section']
+                        return {'section_id': section['section_id'], 'heading': section['heading'],
+                                'draft_markdown': 'Only supplied observations; no independent verification.'}
+                context = self.request().report_context
+                arguments = dict(store=writer, input_store=owner, documents_ref=documents,
+                    identity='section-composition', report_context=context, title='Evidence brief',
+                    target_words=3000, required_headings=['Observations', 'Limits'],
+                    max_cited_sources=0, prior_draft='Earlier draft requiring correction.')
+                if interruption == 'unknown-response':
+                    with self.assertRaisesRegex(LLMError, 'Unknown second section'):
+                        write_section_article(**arguments, client=Client())
+                    checkpoint = writer.read_json('sections.json')
+                    self.assertEqual(len(checkpoint['completed']['sections']), 1)
+                    self.assertFalse(writer.exists('writer.json'))
+                    with self.assertRaisesRegex(LLMError, 'no blind replay'):
+                        write_section_article(**arguments, recovering=True)
+                elif interruption == 'checkpoint-write':
+                    write_json = ArtifactStore.write_json
+                    def interrupted_checkpoint(store, path, payload, **options):
+                        if path == 'sections.json' and len(payload['completed']['sections']) == 2:
+                            raise OSError('Checkpoint commit interrupted after complete response')
+                        return write_json(store, path, payload, **options)
+                    with patch.object(ArtifactStore, 'write_json', interrupted_checkpoint):
+                        with self.assertRaisesRegex(OSError, 'Checkpoint commit interrupted'):
+                            write_section_article(**arguments, client=Client())
+                    self.assertEqual(len(writer.read_json('sections.json')['completed']['sections']), 1)
+                    restored = write_section_article(**arguments, recovering=True)
+                    self.assertEqual([row['heading'] for row in restored['sections']], ['Observations', 'Limits'])
+                else:
+                    result = write_section_article(**arguments, client=Client())
+                    self.assertEqual([row['heading'] for row in result['sections']], ['Observations', 'Limits'])
+                    restored = write_section_article(**arguments, recovering=True)
+                    self.assertEqual(result['sections'], restored['sections'])
+                    self.assertFalse(result['reviewer_findings'])
+                    # Neither valid-shaped checkpoint edits nor changed runtime
+                    # inputs may replace the original complete producer records.
+                    original = {path: path.read_bytes() for path in writer.root.rglob('*.json')}
+                    checkpoint = writer.read_json('sections.json')
+                    checkpoint['completed']['sections'][0]['draft_markdown'] = 'Altered checkpoint prose.'
+                    writer.write_json('sections.json', checkpoint)
+                    changed = {path: path.read_bytes() for path in original}
+                    with self.assertRaisesRegex(LLMError, 'complete response producers'):
+                        write_section_article(**arguments, recovering=True)
+                    self.assertEqual({path: path.read_bytes() for path in changed}, changed)
+                    (writer.root / 'sections.json').write_bytes(original[writer.root / 'sections.json'])
+                    checkpoint = writer.read_json('sections.json')
+                    checkpoint['completed']['sections'].append({
+                        **checkpoint['completed']['sections'][-1], 'section_id': 'extra', 'heading': 'Extra'})
+                    writer.write_json('sections.json', checkpoint)
+                    changed = {path: path.read_bytes() for path in original}
+                    with self.assertRaisesRegex(ValueError, 'unmatched complete response producers'):
+                        write_section_article(**arguments, recovering=True)
+                    self.assertEqual({path: path.read_bytes() for path in changed}, changed)
+                    (writer.root / 'sections.json').write_bytes(original[writer.root / 'sections.json'])
+                    with self.assertRaisesRegex(ValueError, 'Frozen section input changed'):
+                        write_section_article(**{**arguments, 'target_words': 4000}, recovering=True)
+                    self.assertEqual({path: path.read_bytes() for path in original}, original)
+                self.assertEqual([label for label, _ in calls],
+                                 ['report-writer-section_1', 'report-writer-section_2'])
+                self.assertEqual(len(list((writer.root / 'model_calls').iterdir())), 2)
+                self.assertNotIn('prior_draft', [row.handle for row in context.source_handles])
+
+    def test_native_composition_selects_section_granularity_without_changing_legacy_or_frozen_methods(self):
+        from simple_ar.core.budget import BudgetLedger
+        from simple_ar.tools.workspace import WorkspaceToolGateway
+        from simple_ar.tools.writing import ComposeRequest, WritingToolGateway
+        from tests.report_review_fixtures import prompt_payload
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'results.csv'
+            source.write_text('run,score\nfirst,0.75\n')
+            calls = []
+            class Client:
+                def ask_json(self, system, prompt, *, label='', **options):
+                    calls.append(label)
+                    view = prompt_payload(prompt)
+                    self_evidence = json.dumps(view)
+                    if '0.75' not in self_evidence:
+                        raise AssertionError('Section Writer lost the original supplied values')
+                    section = view['section']
+                    return {'section_id': section['section_id'], 'heading': section['heading'],
+                            'draft_markdown': 'Recorded score 0.75; one supplied run, not a new measurement.'}
+            ledger = BudgetLedger()
+            (root / 'task').mkdir()
+            workspace = WorkspaceToolGateway(root / 'task', {'source0': source}, ledger)
+            gateway = WritingToolGateway(root / 'task', workspace, ledger, 'bound-client', 'task',
+                client_factory=lambda _: Client())
+            request = {'goal': 'Explain the supplied results and limitations.', 'title': 'Results note',
+                'materials': [{'path': 'source0'}], 'required_headings': ['Results', 'Limits'],
+                'writing_method': 'sections', 'target_words': 3000}
+            legacy = {key: value for key, value in request.items() if key != 'writing_method'}
+            self.assertNotIn('writing_method', ComposeRequest.model_validate(legacy).model_dump())
+            with patch('simple_ar.report.capability.run_report_capability', side_effect=RuntimeError('assembly interrupted')):
+                result = gateway.call('compose_document', request, identity='section-native')
+            self.assertEqual(result.status, 'error')
+            self.assertIn('assembly interrupted', result.error)
+            receipt = ArtifactStore(root / 'task/tools/writing/section-native')
+            self.assertEqual(receipt.read_json('request.json')['writing_owner'], 'section_article.v1')
+            self.assertTrue(receipt.exists('writer/sections.json'))
+            with patch.object(gateway, 'client_factory', side_effect=AssertionError('No model replay')):
+                restored = gateway.call('compose_document', request, identity='section-native')
+            self.assertEqual(restored.status, 'ok', restored.error)
+            body = workspace.resolve(restored.data['editable_markdown']).read_text()
+            self.assertIn('## Results', body)
+            self.assertIn('## Limits', body)
+            self.assertEqual(calls, ['report-writer-section_1', 'report-writer-section_2'])
+            self.assertEqual(gateway.call('compose_document', {**request, 'writing_method': 'article'},
+                identity='section-native').status, 'error')
+            gateway.report_inputs = lambda: {'requirement': {'method': 'article'}}
+            with patch.object(gateway, 'client_factory', side_effect=AssertionError('No unauthorized method')):
+                blocked = gateway.call('compose_document', request, identity='frozen-method')
+            self.assertIn('frozen report writing method', blocked.error)
+            inspected = gateway.call('review_document', {**request, 'prior_draft': 'missing.md'}, identity='inspect-method')
+            self.assertIn('Independent inspection', inspected.error)
 
     def test_article_uses_one_shared_request_and_structured_projection_without_section_runtime(self):
         request = self.request()
