@@ -1400,24 +1400,29 @@ class LLMParsingTests(unittest.TestCase):
         cases = (
             ('reasoning_only', '', private_reasoning, 'length'),
             ('empty', '', '', 'stop'),
+            ('truncated_json', '{"files":[{"path":"unit.py"}', '', 'length'),
+            ('truncated_valid_json', '{"ok": true}', '', 'length'),
             ('invalid_json', 'not JSON', '', 'stop'),
         )
-        for streamed in (False, True):
+        for mode, streamed in (('chat', False), ('chat', True), ('responses', False)):
             for case, content, reasoning, finish_reason in cases:
-                with self.subTest(streamed=streamed, case=case):
+                with self.subTest(mode=mode, streamed=streamed, case=case):
                     ledger = BudgetLedger({'llm_requests': 4, 'total_tokens': 100000})
                     ledger.reserve('old', {'llm_requests': 1, 'total_tokens': 100})
                     old = ledger.mark_unknown('old', reason='earlier transport uncertainty',
                         known_actual={'llm_requests': 1}, retain_reservation=True)
                     old_record = old.to_dict()
                     observed, failures = [], []
-                    client = LLMClient(LLMSettings(api_key='test-key', api_mode='chat',
+                    client = LLMClient(LLMSettings(api_key='test-key', api_mode=mode,
                         stream=streamed, retry_attempts=1, json_response_format='off'),
                         budget_ledger=ledger, usage_callback=observed.append)
                     usage = {'prompt_tokens': 2, 'completion_tokens': 3, 'total_tokens': 5}
 
                     def response(text, thought, reason):
                         message = {'content': text, 'reasoning_content': thought}
+                        if mode == 'responses':
+                            return {'output_text': text, 'reasoning_content': thought,
+                                    'status': 'incomplete' if reason == 'length' else 'completed', 'usage': usage}
                         if streamed:
                             return iter([
                                 {'choices': [{'delta': message, 'finish_reason': reason}]},
@@ -1450,7 +1455,8 @@ class LLMParsingTests(unittest.TestCase):
                     self.assertEqual(attempt, 1)
                     self.assertIs(correct, case == 'invalid_json')
                     self.assertIs(error.correction_allowed, case == 'invalid_json')
-                    self.assertEqual(error.finish_reason, None if correct else finish_reason)
+                    expected_reason = ('incomplete' if finish_reason == 'length' else 'completed') if mode == 'responses' else finish_reason
+                    self.assertEqual(error.finish_reason, None if correct else expected_reason)
                     self.assertEqual(error.raw_response, content if correct else '')
                     self.assertNotIn(private_reasoning, str(error))
                     self.assertNotIn(private_reasoning, repr(error))

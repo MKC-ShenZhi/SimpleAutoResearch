@@ -432,6 +432,15 @@ class LLMClient:
         if not output:
             raise LLMResponseError(_empty_response_message(response),
                 correction_allowed=False, finish_reason=_finish_reason_from_response(response) or None)
+        finish_reason = _finish_reason_from_response(response)
+        if finish_reason in {'length', 'incomplete'}:
+            # Partial text can still contain a parseable nested JSON object.
+            # Reject the provider's incomplete response before parsing or a
+            # consumer can mistake truncation for a correctable format defect.
+            raise LLMResponseError(
+                f'Model response was truncated (finish_reason={finish_reason}; '
+                f'content_chars={len(output)}, output_limit={self.effective_output_limit(max_output_tokens)}); '
+                'partial text was not adopted', correction_allowed=False, finish_reason=finish_reason)
         return output
 
     def chat_turn(
