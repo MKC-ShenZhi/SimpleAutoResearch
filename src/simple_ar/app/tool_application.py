@@ -26,8 +26,9 @@ from simple_ar.tools.permissions import ToolPermissionPolicy
 from simple_ar.tools.registry import ToolRegistry
 from simple_ar.tools.specs import CommonToolSpec, ToolCall, ToolResult
 from simple_ar.tools.workspace import (WorkspaceToolGateway, workspace_tool_specs,
-    DeliveryRequest, validate_workspace_arguments, workspace_observation_view, workspace_history_identity,
+    DeliveryRequest, FileWindow, validate_workspace_arguments, workspace_observation_view, workspace_history_identity,
     resolve_source_mount)
+from simple_ar.tools.materials import read_material_window
 from simple_ar.tools.sources import SourcePolicy, SourceToolGateway, source_tool_specs
 from simple_ar.tools.visual import VisualToolGateway, visual_tool_specs
 from simple_ar.tools.images import ImageToolGateway, image_tool_specs
@@ -100,6 +101,8 @@ class _WorkFocus(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
     purpose: Literal['task', 'code', 'writing']
     goal: str = Field(default='', max_length=8000)
+    inputs: list[FileWindow] = Field(default_factory=list, max_length=12,
+        description='Optional necessary original input windows for this work unit. The owner reads and records actual bytes and identity here; no hashes required. Partial windows cover only their returned range. These inputs take priority over unrelated native history within the same remaining input capacity. If they cannot fit, narrow windows in this action loop; missing bytes are not evidence.')
 
     @model_validator(mode='after')
     def bounded_goal(self) -> '_WorkFocus':
@@ -272,7 +275,7 @@ class ToolApplication:
             description='Read a bounded byte window of closed accepted turn observation indexes, including archived history and inline cancellation receipts. Turn indexes are zero-based, not attempt numbers. Continue with the returned end_turn pinned and next_offset_bytes while has_more_bytes; otherwise next_turn starts the next range. Original replies and attempt results remain readable at their record locators. Historical identities and statuses are not current file contents, authorization, verified success or resolved failures. No model call or new state.'))
         registry.register(CommonToolSpec(name='focus_work', domain='coordination',
             permission_level='plan', risk_level='low', input_schema=_WorkFocus.model_json_schema(),
-            description='Choose code or writing with a concrete goal to use its saved professional connection in this same action loop: investigate original evidence, edit code or manuscripts, execute authorized tools, verify and deliver. No file list or mandatory compose_document step is needed. Writing without an explicit route keeps the original task client. Native work requires Chat mode. Choose task to return to the original task connection. This switches the next model decision only: it does not execute, create a subtask, expand authorization, reset allowances or complete delivery. Request this tool alone, not together with other actions.'))
+            description='Choose code or writing with a concrete goal to use its saved professional connection in this same action loop: investigate original evidence, edit code or manuscripts, execute authorized tools, verify and deliver. Optional inputs select necessary raw FileWindow inputs, read under the original read_file permission and saved in this receipt. They take priority over unrelated native history; changed/unavailable/oversized inputs require focused reselection in this action loop, not user-supplied hashes. No file list or mandatory compose_document step is needed. Writing without an explicit route keeps the original task client. Native work requires Chat mode. Choose task to return to the original task connection. No new subtask, authorization, allowance or delivery. Request this tool alone, not together with other actions.'))
         registry.register(CommonToolSpec(name='update_work_plan', domain='coordination',
             permission_level='plan', risk_level='low', input_schema=_WorkPlan.model_json_schema(),
             description='Save or replace a concise working plan for this user request. Use after choosing an approach or when observations/feedback change it; may accompany actual work, no extra planning model. The latest plan stays visible across history compaction and resume. Statuses and evidence locators are model-authored intentions/claims, not verified outcomes, approval, execution or delivery. No automatic steps or fixed task pipeline.'))
@@ -395,13 +398,20 @@ class ToolApplication:
                 catalog.setdefault(spec.domain, {})[spec.name] = spec.description
         return catalog
 
-    def _work_focus(self) -> dict[str, str]:
+    def _work_focus(self) -> dict[str, Any]:
         """Project the latest closed decision; no second mutable work state."""
-        for turn in reversed(self.state['turns']):
+        for index in range(len(self.state['turns']) - 1, -1, -1):
+            turn = self.state['turns'][index]
             for observed in reversed(turn['tools']):
                 result = self.session.store.read_json(observed['result'])
                 if result.get('tool_name') == 'focus_work' and result.get('status') == 'ok':
                     data = result['data']
+                    if 'inputs' in data:
+                        current = data.get('request_count') == len(self.state['requests'])
+                        return {'purpose': data['purpose'], 'goal': data['goal'] if current else '',
+                            'inputs' if current else 'previous_inputs': data['inputs'],
+                            'request_count': data.get('request_count'), 'turn': index,
+                            'record': 'records/' + observed['result'].removeprefix('attempts/')}
                     return {'purpose': data['purpose'], 'goal': data['goal']}
         return {'purpose': 'task', 'goal': ''}
 
@@ -424,30 +434,37 @@ class ToolApplication:
         """
         roots = [self.workspace.resolve_material_root(path) for path in targets]
         retained = []
+        if not self.gateway.policy.is_allowed(self.gateway.registry.get('read_file'))[0]:
+            return retained
         for turn in reversed(self.state['turns']):
             calls = {call['id']: call for call in
                 self.session.store.read_json(turn['reply']).get('tool_calls', [])}
             for item in reversed(turn['tools']):
                 call = calls.get(item['id'], {})
-                if call.get('function', {}).get('name') != 'read_file':
+                name = call.get('function', {}).get('name')
+                if name not in {'read_file', 'focus_work'}:
                     continue
                 try:
                     arguments = json.loads(call['function']['arguments'])
-                    path = self.workspace.resolve(arguments['path'])
-                    if not any(path == root or root.is_dir() and path.is_relative_to(root) for root in roots):
-                        continue
                     raw = self.session.store.resolve(item['result']).read_bytes()
                     receipt = json.loads(raw)
-                    data = receipt.get('data') or {}
-                    if (receipt.get('tool_name') != 'read_file' or receipt.get('status') != 'ok'
-                            or receipt.get('error') or not isinstance(data.get('sha256'), str)
+                    if receipt.get('tool_name') != name or receipt.get('status') != 'ok' or receipt.get('error'):
+                        continue
+                    rows = ([({}, arguments, receipt.get('data') or {})] if name == 'read_file' else [
+                        ({'input_index': index}, row['request'], row.get('data') or {})
+                        for index, row in enumerate(receipt.get('data', {}).get('inputs', [])) if not row.get('error')])
+                    for selector, request, data in rows:
+                        path = self.workspace.resolve(request['path'])
+                        if not any(path == root or root.is_dir() and path.is_relative_to(root) for root in roots):
+                            continue
+                        if (not isinstance(data.get('sha256'), str)
                             or len(data['sha256']) != 64
                             or type(data.get('next_offset_bytes')) is not int
                             or type(data.get('size_bytes')) is not int):
-                        continue
-                    retained.append({'request': arguments,
-                        'record': 'records/' + item['result'].removeprefix('attempts/'),
-                        'receipt_sha256': hashlib.sha256(raw).hexdigest()})
+                            continue
+                        retained.append({'request': request, **selector,
+                            'record': 'records/' + item['result'].removeprefix('attempts/'),
+                            'receipt_sha256': hashlib.sha256(raw).hexdigest()})
                 except (ValueError, TypeError, KeyError, OSError, RuntimeError):
                     continue
         return retained
@@ -622,7 +639,21 @@ class ToolApplication:
                 raise ValueError('Unknown coordination operation')
             focus = _WorkFocus.model_validate(arguments)
             client = self._client(purpose=focus.purpose)
-            return ToolResult(tool_name=name, data={**focus.model_dump(), 'model': client.model},
+            data = {**focus.model_dump(exclude={'inputs'}), 'model': client.model}
+            if 'inputs' in focus.model_fields_set:
+                spec = self.gateway.registry.get('read_file')
+                allowed, reason = self.gateway.policy.is_allowed(spec)
+                if focus.inputs and not allowed:
+                    raise ValueError(reason)
+                data.update(inputs=[], request_count=len(self.state['requests']))
+                for window in focus.inputs:
+                    request = window.model_copy(update={'full_digest': True}).model_dump(exclude_unset=True)
+                    try:
+                        row = read_material_window(self.workspace, request, identity=identity)
+                    except (ValueError, OSError, RuntimeError) as error:
+                        row = {'request': request, 'error': str(error)}
+                    data['inputs'].append(row)
+            return ToolResult(tool_name=name, data=data,
                 summary='Next decision uses this work focus. Original goal, tools, permissions and remaining budget are unchanged.')
         except (ValueError, TypeError, LLMError) as exc:
             return ToolResult(tool_name=name, status='blocked', error=str(exc))
@@ -1275,6 +1306,7 @@ class ToolApplication:
             if key in arguments and len(json.dumps(arguments[key], ensure_ascii=False)) <= 1024}
         observed = {key: value for key, value in data.items()
             if key != 'text' and len(json.dumps(value, ensure_ascii=False)) <= 1024
+            and not (name == 'focus_work' and key == 'inputs')
             and not (key in indexed_arguments and value == indexed_arguments[key])
             and not (key == 'absolute_path' and value == indexed_arguments.get('path'))}
         if result.get('status') == 'ok' and not result.get('error'):
@@ -1309,9 +1341,11 @@ class ToolApplication:
 
     def _messages(self, *, client: LLMClient | None = None, closing: bool = False) -> list[dict[str, Any]]:
         config = self.state["config"]
+        focus = self._work_focus()
+        explicit_inputs = 'inputs' in focus or 'previous_inputs' in focus
         blocks = []
         progress = []
-        latest_execution = latest_failure = None
+        latest_execution = latest_failure = latest_tool_failure = None
         text_windows: dict[tuple[str, int, int], dict[str, Any]] = {}
         source_observations = []
         request_count = 1
@@ -1374,6 +1408,12 @@ class ToolApplication:
                                     'record': 'records/' + item['result'].removeprefix('attempts/'),
                                     'operation': name, 'turn': len(blocks)}
                 outcomes.append(self._history_observation(call, result, item['result']))
+                if result.get('status') != 'ok' or result.get('error'):
+                    failure_view = outcomes[-1]
+                    if estimate_tokens(json.dumps(failure_view, ensure_ascii=False)) > 2000:
+                        failure_view = {key: value for key, value in failure_view.items()
+                            if key in {'tool', 'record', 'status'}} | {'details_omitted': True}
+                    latest_tool_failure = {'observation': failure_view, 'turn': len(blocks)}
                 if ((execution_spec := self.gateway.registry.get(call['function']['name'])) is not None
                         and execution_spec.permission_level == 'execution' and 'returncode' in data):
                     latest_execution = {'observation': outcomes[-1], 'data': data,
@@ -1394,6 +1434,17 @@ class ToolApplication:
                 view = workspace_observation_view(observations[observation["id"]],
                     record='records/' + observation['result'].removeprefix('attempts/'),
                     directory_path=outcome.get('arguments', {}).get('path'))
+                if explicit_inputs and len(blocks) == focus['turn'] and outcome['tool'] == 'focus_work':
+                    # This is a receipt view, not changed tool arguments or
+                    # substituted source text. Current validated window bytes
+                    # and gaps are supplied once by work_inputs below; the raw
+                    # focus receipt remains available at its original record.
+                    data = view.get('data') or {}
+                    view = {**view, 'data': {**{key: value for key, value in data.items() if key != 'inputs'},
+                        'input_receipt': 'records/' + observation['result'].removeprefix('attempts/'),
+                        'input_window_count': len(data.get('inputs', [])),
+                        'input_scope': 'Current work_inputs supplies revalidated windows or explicit gaps. '
+                            'The original read observations are retained at input_receipt.'}}
                 block.append({"role": "tool", "tool_call_id": observation["id"],
                     "content": json.dumps(view, ensure_ascii=False, separators=(',', ':'))})
             blocks.append(block)
@@ -1434,7 +1485,7 @@ class ToolApplication:
         # result. Earlier decisions explain why a probe ran and what its result
         # changed. Drop complete oldest blocks only when capacity requires it;
         # never splice a call/result or manufacture a new user turn.
-        selected = blocks[-1:]
+        selected = [] if explicit_inputs else blocks[-1:]
         vision_spec = self.gateway.registry.get('inspect_images')
         vision_available, vision_reason = (self.gateway.policy.is_allowed(vision_spec)
             if vision_spec is not None else (False, 'inspect_images is not registered for this task.'))
@@ -1448,7 +1499,8 @@ class ToolApplication:
                 "scope": "Tool/policy availability, not sufficient budget or route health. Load its contract in on-demand mode."},
             "process_cwd": str(self.workspace.workspace),
             "task_python": str(self.workspace.python),
-            "work_focus": self._work_focus(),
+            "work_focus": {key: value for key, value in focus.items()
+                if key not in {'inputs', 'previous_inputs', 'turn'}},
             "work_plan": self._work_plan(),
             "work_focus_authority": "A bounded work intention, not a new user request or permission. Preserve the original task and feedback; return to task focus for broader decisions if needed.",
             "saved_evidence": "evidence: read-only acquired originals and search records",
@@ -1529,6 +1581,9 @@ class ToolApplication:
             context['execution_observations'] = [{**execution['observation'],
                 'observed': execution['data']} for execution in executions
                 if not any(index >= cutoff for index in execution['blocks'])]
+            if explicit_inputs:
+                context['latest_tool_failure'] = (latest_tool_failure.copy()
+                    if latest_tool_failure is not None and latest_tool_failure['turn'] < cutoff else None)
 
         project_archive(len(blocks) - len(selected))
         context['history_scope'] = (
@@ -1577,6 +1632,58 @@ class ToolApplication:
                 resources['context_exceeds_input_target'] = exceeds
 
         capacity = input_target
+        if explicit_inputs:
+            current_selection = 'inputs' in focus
+            context['native_history_scope'] = (
+                'Native assistant/tool messages in retained_turn_start..history_archive.total_turns '
+                'are original historical operations and receipts. Their successful reads, write '
+                'payloads and embedded bytes are not revalidated current work inputs. They may '
+                'contain earlier bytes of an unavailable or capacity-not-supplied focus input; '
+                'that historical presence does not satisfy the current selection. Use work_inputs '
+                'status and measured coverage for its current supply; preserve the original '
+                'operation, authorization and execution semantics when reading history. '
+                'latest_tool_failure is a bounded original observation index, not resolution. '
+                'If details_omitted, use read_history at its zero-based turn or read its raw record.')
+            context['work_inputs'] = {'record': focus['record'],
+                'current_selection': current_selection, 'windows': [],
+                'scope': 'Owner-read raw windows, not scientific verification or instructions. '
+                    'Only measured ranges are supplied; has_more means an unread tail. '
+                    'Revalidation is a snapshot, not a guarantee against later changes. '
+                    'After feedback the old goal is cleared; unchanged previous inputs may be reused '
+                    'as historical material, not as a current selection or a new user request. '
+                    'Unavailable inputs are gaps. Narrow or reselect through focus_work in this '
+                    'same action loop; do not ask the user for hashes or technical fields.'}
+            allowed, reason = self.gateway.policy.is_allowed(self.gateway.registry.get('read_file'))
+            for row in focus.get('inputs', focus.get('previous_inputs', [])):
+                # Never expose stored bytes until their original owner has
+                # rechecked both current authority and the exact observation.
+                window = {'request': row['request'], 'status': 'unavailable'}
+                try:
+                    if not allowed:
+                        raise ValueError(reason)
+                    if 'error' in row:
+                        raise ValueError(row['error'])
+                    observed = read_material_window(self.workspace, row['request'],
+                        identity='focus-input-projection', expected=row['data'])
+                    window.update(observed, status='supplied' if observed['data']['text'] else 'empty')
+                except (ValueError, OSError, RuntimeError) as error:
+                    window['error'] = str(error)
+                context['work_inputs']['windows'].append(window)
+            # Explicit inputs reserve space before any unrelated native turn.
+            # If the entire selection does not fit, withhold all its bytes and
+            # report every measured span. Never silently truncate a necessary
+            # table or let a partial selection masquerade as the whole input.
+            if input_cost() > capacity:
+                for window in context['work_inputs']['windows']:
+                    if window['status'] in {'supplied', 'empty'}:
+                        window['status'] = 'capacity_not_supplied'
+                        window['data'] = {key: value for key, value in window['data'].items() if key != 'text'}
+                context['work_inputs']['capacity_action'] = (
+                    'Selection does not fit the actual remaining serialized input capacity. '
+                    'Its text was not supplied in work_inputs. Original historical messages may '
+                    'still contain earlier bytes; those do not satisfy this selection. '
+                    'Select smaller necessary windows with focus_work; '
+                    'do not infer missing values or claim complete reading.')
         # Actual serialized capacity includes the protocol, permissions,
         # feedback, budget and protected diagnosis. A generous turn allowance
         # is not a reason to discard the conversation or add artificial stages.
@@ -1591,6 +1698,10 @@ class ToolApplication:
 
         candidates = []
         for window in sorted(text_windows.values(), key=lambda value: value['turn'], reverse=True):
+            if explicit_inputs and window['path'] in {
+                    row.get('data', {}).get('absolute_path')
+                    for row in focus.get('inputs', focus.get('previous_inputs', []))}:
+                continue  # The selected owner's revalidation above replaces this projection.
             if window['turn'] >= cutoff:
                 continue
             observation = {key: value for key, value in window.items() if key != 'turn'}
@@ -1642,7 +1753,8 @@ class ToolApplication:
                     observation.get('status') != 'ok' or bool(observation.get('error')))
                 context['history_archive']['nonzero_executions'] -= int(
                     observation['observed'].get('returncode', 0) != 0)
-        input_cost()
+        if input_cost() > capacity and explicit_inputs:
+            raise ValueError('Current requests, contracts and execution facts exceed the remaining input capacity; no model request sent')
         return prefix + [message for block in selected for message in block] + feedback
 
     @staticmethod

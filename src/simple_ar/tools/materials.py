@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import hashlib
-import os
 import re
 from pathlib import Path
 from typing import Any, Callable
@@ -62,6 +61,17 @@ def _journal_receipt(workspace: Any, reference: dict) -> dict:
     if hashlib.sha256(raw).hexdigest() != reference['receipt_sha256']:
         raise ValueError('Parent material receipt changed')
     receipt = json.loads(raw)
+    if receipt.get('tool_name') == 'focus_work' and 'input_index' in reference:
+        if receipt.get('status') != 'ok' or receipt.get('error'):
+            raise ValueError('Parent focus receipt is not successful')
+        index = reference['input_index']
+        windows = receipt.get('data', {}).get('inputs', [])
+        if type(index) is not int or not 0 <= index < len(windows):
+            raise ValueError('Parent focus input index unavailable')
+        row = windows[index]
+        if row.get('error') or row.get('request') != reference['request'] or 'data' not in row:
+            raise ValueError('Parent focus input is not the requested successful read')
+        return row  # A view into the original receipt, never a synthetic read record.
     if (receipt.get('tool_name') != 'read_file' or receipt.get('status') != 'ok'
             or receipt.get('error')):
         raise ValueError('Parent material receipt is not a successful read')
@@ -87,7 +97,7 @@ def material_observation_seed(*, workspace: Any, inventories: list[dict],
     observations, admitted, rejected, seen = [], [], [], set()
     characters = 0
     for reference in references:
-        coverage = {key: reference[key] for key in ('record', 'receipt_sha256', 'request') if key in reference}
+        coverage = {key: reference[key] for key in ('record', 'receipt_sha256', 'request', 'input_index') if key in reference}
         try:
             request = FileWindow.model_validate(reference['request']).model_copy(update={'full_digest': True})
             path = workspace.resolve(request.path)
@@ -115,18 +125,12 @@ def material_observation_seed(*, workspace: Any, inventories: list[dict],
             key = (str(path), digest, start, end)
             if key in seen:
                 raise ValueError('same_path_version_and_measured_window_already_supplied')
-            with path.open('rb') as handle:
-                if os.fstat(handle.fileno()).st_size != size or size != visible[str(path)]:
-                    raise ValueError('current_size_changed')
-                current = hashlib.file_digest(handle, 'sha256').hexdigest()
-                handle.seek(start)
-                raw = handle.read(end - start)
-            if (current != digest or len(raw) != end - start
-                    or raw.decode('utf-8', errors='replace') != data['text']
-                    or workspace.resolve(request.path) != path):
-                raise ValueError('current_bytes_changed')
+            if size != visible[str(path)]:
+                raise ValueError('current_size_changed')
+            read_material_window(workspace, request.model_dump(exclude_unset=True), identity='material-seed', expected=data)
             row = {'request': request.model_dump(exclude_unset=True), 'data': data,
-                'record': reference['record'], 'receipt_sha256': reference['receipt_sha256']}
+                'record': reference['record'], 'receipt_sha256': reference['receipt_sha256'],
+                **({'input_index': reference['input_index']} if 'input_index' in reference else {})}
             if characters + len(data['text']) > 96000:
                 raise ValueError('observation_capacity')
             # Leave room for the normal capacity/admission fields. UTF-8 bytes,
@@ -283,6 +287,21 @@ def observed_window_key(workspace: Any, request: FileWindow, data: dict) -> tupl
         data['next_offset_bytes'], data['sha256'])
 
 
+def read_material_window(workspace: Any, request: dict, *, identity: str,
+                         expected: dict | None = None) -> dict:
+    """Read through the byte owner; an old observation never adopts new bytes.
+
+    Callers still own tool-policy admission. Equality includes the owner's
+    absolute path, full digest and measured coverage, not just decoded text.
+    """
+    actual = workspace.call('read_file', request, identity=identity)
+    if actual.status != 'ok':
+        raise ValueError(f'Material window unavailable: {actual.error}')
+    if expected is not None and actual.data != expected:
+        raise ValueError('Inspected material contents changed; select the current window explicitly')
+    return {'request': request, 'data': actual.data}
+
+
 def selected_material_windows(workspace: Any, selected: MaterialSelection,
                               observations: list[dict], *, identity: str) -> list[dict]:
     """Revalidate inspected bytes and return only selected observed windows."""
@@ -293,9 +312,7 @@ def selected_material_windows(workspace: Any, selected: MaterialSelection,
         if 'record' in row:
             if _journal_receipt(workspace, row).get('data') != row['data']:
                 raise ValueError('Parent material receipt differs from the frozen observation')
-        actual = workspace.call('read_file', row['request'], identity=identity)
-        if actual.status != 'ok' or actual.data != row['data']:
-            raise ValueError('Inspected material contents changed; preserve this version and use a new identity')
+        read_material_window(workspace, row['request'], identity=identity, expected=row['data'])
         observed[window_key(workspace, FileWindow.model_validate(row['request']))] = row
         if row['data'].get('sha256'):
             views[observed_window_key(workspace, FileWindow.model_validate(row['request']), row['data'])] = row

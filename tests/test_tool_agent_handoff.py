@@ -596,13 +596,26 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 extra = materials / 'unread-notes.txt'
                 extra.write_text('UNSELECTED_PARENT_OBSERVATION', encoding='utf-8')
                 for index, path in enumerate((table, extra)):
-                    self._record_parent_material_read(app, path, f'parent-observation-{index}')
+                    # The focus's actual owner read is also an original parent
+                    # observation for both professional consumers. No second
+                    # read receipt or model-transcribed digest is necessary.
+                    if index == 0:
+                        focus = {'purpose': 'writing', 'goal': 'Explain the supplied results',
+                            'inputs': [{'path': str(path)}]}
+                        with patch.object(app, '_client', return_value=SimpleNamespace(model='fixture')):
+                            selected = _call_tool(app.gateway, 'focus_work', focus, identity='parent-focus')
+                        self.assertEqual(selected.status, 'ok', selected.error)
+                        app.state['turns'].append(self._record_native_turn(app, 'focus_work',
+                            focus, selected.data, 'parent-focus'))
+                    else:
+                        self._record_parent_material_read(app, path, f'parent-observation-{index}')
                 # Same receipt range may occur repeatedly in the parent journal.
-                self._record_parent_material_read(app, table, 'parent-observation-repeat')
+                self._record_parent_material_read(app, extra, 'parent-observation-repeat')
                 app.state['requests'].append('Preserve original group order; disclose descriptive limits.')
                 app._save()
                 refs = app._material_observations([str(materials)])
                 self.assertEqual(len(refs), 3)
+                self.assertEqual(sum('input_index' in row for row in refs), 1)
                 self.assertNotIn('UNSELECTED_PARENT_OBSERVATION', json.dumps(refs))
                 identity = f'parent-seeded-{professional}'
                 if professional == 'writing':
@@ -633,6 +646,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 self.assertEqual(len(prompts[0]['observations']), 2)
                 self.assertEqual(sum(row['data']['text'] == table.read_text(encoding='utf-8')
                     for row in prompts[0]['observations']), 1)
+                self.assertEqual(next(row for row in prompts[0]['observations']
+                    if row['data']['text'] == table.read_text(encoding='utf-8'))['input_index'], 0)
                 self.assertEqual(prompts[0]['journal_observation_coverage']['not_admitted_count'], 1)
                 self.assertIn('Preserve original group order', json.dumps(prompts[1]))
                 self.assertNotIn('UNSELECTED_PARENT_OBSERVATION', json.dumps(prompts[1]))
@@ -5176,6 +5191,234 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     ['function']['arguments'], json.dumps({'path': str(current),
                         **({'content': current.read_text()} if operation == 'write_file' else {})}))
                 self.assertEqual(app.ledger.limits, original_limits)
+
+    def test_native_focus_inputs_reserve_working_set_and_preserve_history(self) -> None:
+        for purpose in ('code', 'writing'):
+            with self.subTest(purpose=purpose):
+                _, inputs, fake, _, app, _ = self._native_fixture(tool_contracts='on_demand')
+                table = inputs / 'results.txt'
+                table.write_bytes(b'ORIGINAL_RESULT_ROW\n' * 600)
+                arguments = {'purpose': purpose, 'goal': 'Produce and check a complete result account',
+                    'inputs': [{'path': str(table)}]}
+                with patch.object(app, '_client', return_value=SimpleNamespace(model='fixture')):
+                    selected = _call_tool(app.gateway, 'focus_work', arguments, identity='input-focus')
+                self.assertEqual(selected.status, 'ok', selected.error)
+                observed = selected.data['inputs'][0]
+                self.assertEqual(observed['data']['text'], table.read_text(encoding='utf-8'))
+                self.assertEqual(observed['data']['sha256'], hashlib.sha256(table.read_bytes()).hexdigest())
+                focus = self._record_native_turn(app, 'focus_work', arguments, selected.data, 'input-focus')
+                failed_read = self._record_native_turn(app, 'read_file', {'path': 'source0/missing.txt'},
+                    {}, 'unavailable-history')
+                failed_record = failed_read['tools'][0]['result']
+                app.session.store.write_json(failed_record, {'tool_name': 'read_file', 'status': 'blocked',
+                    'error': 'ORIGINAL_READ_FAILURE', 'data': {'diagnostic': 'LARGE_FAILED_BODY' * 20000}})
+                code = self._record_native_turn(app, 'write_file', {'path': 'workspace/analysis.py',
+                    'content': '# ACTUAL_NATIVE_SOURCE\n' * 2500}, {}, 'source-pressure')
+                failure = self._record_native_turn(app, 'run_process', {'argv': ['python', 'analysis.py']},
+                    {'returncode': 1, 'stdout': '', 'stderr': 'ORIGINAL_EXECUTION_FAILURE'}, 'failed-check')
+                success = self._record_native_turn(app, 'run_process', {'argv': ['python', '-V']},
+                    {'returncode': 0, 'stdout': 'A probe only', 'stderr': ''}, 'probe')
+                for turn in (failed_read, focus, code, failure, success):
+                    turn['request_count'] = 1
+                app.state['turns'] = [failed_read, focus, code, failure, success]
+                app._save()
+                originals = {item: app.session.store.resolve(item).read_bytes()
+                    for turn in app.state['turns'] for item in [turn['reply'], turn['tools'][0]['result']]}
+                before = app.ledger.to_dict()
+                fake.effective_output_limit.return_value = 16384
+                with patch.dict(app.ledger.limits, {'total_tokens': 19529 + 16384}):
+                    messages = app._messages(client=fake)
+                    view = json.loads(messages[1]['content'])
+                    self.assertEqual(view['resources']['context_input_target_tokens'], 19529)
+                    self.assertFalse(view['resources']['context_exceeds_input_target'])
+                    self.assertEqual(view['work_inputs']['windows'][0]['data'], observed['data'])
+                    self.assertTrue(view['work_inputs']['current_selection'])
+                    self.assertNotIn('ACTUAL_NATIVE_SOURCE', json.dumps(messages))
+                    self.assertIn('ORIGINAL_EXECUTION_FAILURE', json.dumps(messages))
+                    self.assertEqual(view['latest_tool_failure']['observation']['error'], 'ORIGINAL_READ_FAILURE')
+                    self.assertNotIn('LARGE_FAILED_BODY', json.dumps(messages))
+                    self.assertIn('A probe only', json.dumps(messages))
+                    self.assertGreater(view['retained_turn_start'], 1)
+                    cost = estimate_tokens(json.dumps(messages, ensure_ascii=False)) + estimate_tokens(
+                        json.dumps(app.schemas, ensure_ascii=False))
+                    self.assertLessEqual(cost, 19529)
+                    # Capacity rejection is explicit and all-or-none; narrower
+                    # windows can be selected by the same action loop.
+                    with patch.dict(fake._settings.__dict__, {'context_input_tokens': cost - 1000}):
+                        smaller = json.loads(app._messages(client=fake)[1]['content'])
+                    gap = smaller['work_inputs']['windows'][0]
+                    self.assertEqual(gap['status'], 'capacity_not_supplied')
+                    self.assertNotIn('text', gap['data'])
+                    self.assertEqual(gap['data']['sha256'], observed['data']['sha256'])
+                    self.assertIn('focus_work', smaller['work_inputs']['capacity_action'])
+                self.assertEqual(app.ledger.to_dict(), before)
+                self.assertEqual({path: app.session.store.resolve(path).read_bytes() for path in originals}, originals)
+                # A huge error field must also remain a raw receipt detail,
+                # rather than a permanently pinned prompt body.
+                with _changed_record(app.session.store.resolve(failed_record), {
+                        'tool_name': 'read_file', 'status': 'blocked', 'data': {},
+                        'error': 'LARGE_ERROR_DETAIL' * 20000}):
+                    bounded = json.loads(app._messages(client=fake)[1]['content'])
+                    self.assertTrue(bounded['latest_tool_failure']['observation']['details_omitted'])
+                    self.assertEqual(bounded['work_inputs']['windows'][0]['status'], 'supplied')
+                # Full source remains in its original journal and raw reader.
+                record = 'records/' + code['reply'].removeprefix('attempts/')
+                raw = app.workspace.call('read_file', {'path': record, 'max_bytes': 64000}, identity='raw-source')
+                self.assertEqual(json.loads(raw.data['text']), app.session.store.read_json(code['reply']))
+                self.assertIn(record, json.dumps(self._read_native_history(app)))
+                # A minimal contract that itself cannot fit must stop before
+                # provider dispatch, even after omitting all selectable text.
+                fake._settings.context_input_tokens = 1
+                with patch.object(app, '_client', return_value=fake):
+                    with self.assertRaisesRegex(ValueError, 'no model request sent'):
+                        app._model(context=SimpleNamespace(attempt=SimpleNamespace(attempt_id='no-send')))
+                fake.chat_turn.assert_not_called()
+
+    def test_native_focus_inputs_keep_owner_authority_versions_and_feedback(self) -> None:
+        from simple_ar.tools.materials import material_inventories, material_observation_seed
+
+        _, inputs, fake, _, app, _ = self._native_fixture(tool_contracts='on_demand')
+        table = inputs / 'results.txt'
+        table.write_bytes(b'prefix\nCURRENT_INPUT\nunread tail\n')
+        empty = inputs / 'empty.txt'
+        empty.write_bytes(b'')
+        arguments = {'purpose': 'writing', 'goal': 'Check the original result',
+            'inputs': [{'path': str(table), 'offset_bytes': 7, 'max_bytes': 14}, {'path': str(empty)}]}
+        original = app.workspace.call
+        with patch.object(app, '_client', return_value=SimpleNamespace(model='fixture')):
+            with patch.object(app.workspace, 'call', wraps=original) as reads:
+                app.gateway.policy.blocked_tools.add('read_file')
+                denied = _call_tool(app.gateway, 'focus_work', arguments, identity='denied-input')
+                self.assertEqual(denied.status, 'blocked')
+                reads.assert_not_called()
+                app.gateway.policy.blocked_tools.clear()
+                with patch.object(app.gateway.policy, 'allowed_permissions', {'plan'}):
+                    self.assertEqual(_call_tool(app.gateway, 'focus_work', arguments,
+                        identity='plan-only-input').status, 'blocked')
+                reads.assert_not_called()
+                selected = _call_tool(app.gateway, 'focus_work', arguments, identity='versioned-input')
+        self.assertEqual(selected.status, 'ok', selected.error)
+        self.assertEqual(selected.data['inputs'][0]['data']['text'], 'CURRENT_INPUT\n')
+        self.assertTrue(selected.data['inputs'][0]['data']['has_more'])
+        turn = self._record_native_turn(app, 'focus_work', arguments, selected.data, 'versioned-input')
+        turn['request_count'] = 1
+        prior_read = app.workspace.call('read_file', {'path': 'source0/notes.txt'}, identity='prior-reasoning')
+        self.assertEqual(prior_read.status, 'ok')
+        prior = self._record_native_turn(app, 'read_file', {'path': 'source0/notes.txt'},
+            prior_read.data, 'prior-reasoning')
+        app.state['turns'] = [prior, turn]
+        app._save()
+        ledger = app.ledger.to_dict()
+        def view(owner=app):
+            return json.loads(owner._messages(client=fake)[1]['content'])
+        current = view()
+        self.assertEqual([row['status'] for row in current['work_inputs']['windows']], ['supplied', 'empty'])
+        # Focus prioritizes evidence; it is not an unconditional boundary that
+        # discards earlier reasoning when the complete history still fits.
+        messages = app._messages(client=fake)
+        self.assertEqual(current['retained_turn_start'], 0)
+        self.assertTrue(any(message.get('role') == 'tool'
+            and message.get('tool_call_id') == prior['tools'][0]['id'] for message in messages))
+        receipt_view = next(json.loads(message['content']) for message in messages
+            if message.get('role') == 'tool' and message.get('tool_call_id') == turn['tools'][0]['id'])
+        self.assertNotIn('inputs', receipt_view['data'])
+        self.assertIn('input_receipt', receipt_view['data'])
+        refs = app._material_observations([str(table)])
+        self.assertEqual(len(refs), 1)
+        self.assertEqual(refs[0]['input_index'], 0)
+        inventory = material_inventories(app.workspace, [str(table)], identity='focus-seed')
+        def seed(reference):
+            return material_observation_seed(workspace=app.workspace, inventories=inventory,
+                provider=lambda _: [reference], roots=[str(table)], context={})
+        self.assertEqual(seed(refs[0])['observations'][0]['data'], selected.data['inputs'][0]['data'])
+        self.assertEqual(seed({**refs[0], 'input_index': 1})['observations'], [])
+        record = app.workspace.resolve(refs[0]['record'])
+        with _changed_record(record, {**read_json(record), 'summary': 'Changed receipt'}):
+            self.assertEqual(seed(refs[0])['observations'], [])
+        # Feedback replaces the old work goal while preserving usable historical
+        # raw material, with its previous selection explicitly distinguished.
+        app.state['requests'].append('Now explain limitations before revising')
+        app._save()
+        restored = ToolApplication.load(app.session.store.root)
+        feedback = view(restored)
+        self.assertEqual(feedback['work_focus']['goal'], '')
+        self.assertFalse(feedback['work_inputs']['current_selection'])
+        self.assertEqual(feedback['work_inputs']['windows'][0]['data'], selected.data['inputs'][0]['data'])
+        self.assertIn('Now explain limitations', json.dumps(feedback['requests']))
+        # Later raw native reads/writes retain exact historical bodies. They
+        # cannot undo the current selection's invalidation or capacity refusal.
+        repeated_read = self._record_native_turn(app, 'read_file', selected.data['inputs'][0]['request'],
+            selected.data['inputs'][0]['data'], 'later-raw-read')
+        repeated_write = self._record_native_turn(app, 'write_file', {'path': str(table),
+            'content': table.read_bytes().decode('utf-8')},
+            {'absolute_path': str(table), 'sha256': hashlib.sha256(table.read_bytes()).hexdigest()}, 'later-raw-write')
+        for row in (repeated_read, repeated_write):
+            row['request_count'] = len(app.state['requests'])
+            app.state['turns'].append(row)
+        # Neither a same-size edit outside the selected window nor a revoked
+        # mount/read permission may silently recertify the old selection.
+        raw = table.read_bytes()
+        table.write_bytes(raw[:-2] + b'X\n')
+        changed_view = view()
+        changed = changed_view['work_inputs']['windows'][0]
+        self.assertEqual(changed['status'], 'unavailable')
+        self.assertIn('changed', changed['error'])
+        self.assertNotIn('data', changed)
+        self.assertNotIn('CURRENT_INPUT', json.dumps(changed_view))
+        changed_messages = app._messages(client=fake)
+        self.assertIn('CURRENT_INPUT', json.dumps(changed_messages[2:]))
+        self.assertIn('not revalidated current work inputs', changed_view['native_history_scope'])
+        self.assertEqual(changed_view['retained_text_windows'], [])
+        self.assertEqual(seed(refs[0])['observations'], [])
+        table.write_bytes(raw)
+        for blocked in ('read_file', 'mount'):
+            with self.subTest(revoked=blocked):
+                if blocked == 'read_file':
+                    app.gateway.policy.blocked_tools.add('read_file')
+                permission = (patch.object(app.workspace, 'resolve', side_effect=ValueError('Mount revoked'))
+                    if blocked == 'mount' else nullcontext())
+                with permission:
+                    revoked_view = view()
+                    revoked = revoked_view['work_inputs']['windows'][0]
+                self.assertEqual(revoked['status'], 'unavailable')
+                self.assertNotIn('data', revoked)
+                self.assertNotIn('CURRENT_INPUT', json.dumps(revoked_view))
+                app.gateway.policy.blocked_tools.clear()
+        if os.name != 'nt':  # No claim about Windows symlink privileges.
+            other = inputs / 'other-results.txt'
+            other.write_bytes(raw)
+            link = inputs / 'selected-link.txt'
+            link.symlink_to(table)
+            linked_args = {**arguments, 'inputs': [{'path': str(link)}]}
+            with patch.object(app, '_client', return_value=SimpleNamespace(model='fixture')):
+                linked = _call_tool(app.gateway, 'focus_work', linked_args, identity='linked-input')
+            self.assertEqual(linked.status, 'ok', linked.error)
+            app.state['turns'].append(self._record_native_turn(app, 'focus_work', linked_args,
+                linked.data, 'linked-input'))
+            link.unlink()
+            link.symlink_to(other)  # Same bytes, different authorized subject.
+            self.assertEqual(view()['work_inputs']['windows'][0]['status'], 'unavailable')
+        huge = inputs / 'too-large.txt'
+        with huge.open('wb') as handle:
+            handle.truncate(64 * 1024 * 1024 + 1)
+        unavailable_args = {**arguments, 'inputs': [{'path': str(huge)}, {'path': 'source0/missing.txt'}]}
+        with patch.object(app, '_client', return_value=SimpleNamespace(model='fixture')):
+            unavailable = _call_tool(app.gateway, 'focus_work', unavailable_args, identity='unavailable-input')
+        self.assertEqual(unavailable.status, 'ok', unavailable.error)
+        self.assertTrue(all('error' in row and 'data' not in row for row in unavailable.data['inputs']))
+        self.assertIn('64 MiB', unavailable.data['inputs'][0]['error'])
+        # Clearing or replacing focus does not inherit the previous selection;
+        # old calls/receipts without inputs keep their original exact shape.
+        with patch.object(app, '_client', return_value=SimpleNamespace(model='fixture')):
+            legacy = _call_tool(app.gateway, 'focus_work', {'purpose': 'task'}, identity='legacy-focus')
+        self.assertNotIn('inputs', legacy.data)
+        app.state['turns'].append(self._record_native_turn(app, 'focus_work', {'purpose': 'task'},
+            legacy.data, 'legacy-focus'))
+        self.assertEqual(app._work_focus(), {'purpose': 'task', 'goal': ''})
+        self.assertNotIn('work_inputs', view())
+        self.assertEqual(app.ledger.to_dict(), ledger)
+        fake.chat_turn.assert_not_called()
+        fake.ask_json.assert_not_called()
 
     def test_native_model_continuation_preserves_closed_failure_budget_and_prior_work(self) -> None:
         from contextlib import nullcontext
