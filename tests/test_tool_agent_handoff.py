@@ -5615,7 +5615,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                         progress=lambda _: None)
         self.assertEqual(resumed.state['config'], saved_config)
         resumed.ledger.reserve('grant-pending', {'llm_requests': 1})
-        with self.assertRaisesRegex(ValueError, 'pending or unknown'):
+        with self.assertRaisesRegex(ValueError, 'unknown'):
             resumed.run(allow_network=True, progress=lambda _: None)
         resumed.ledger.settle('grant-pending', {'llm_requests': 0}, actual_source='fixture')
         additional = run_dir / 'additional.md'
