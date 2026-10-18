@@ -2507,7 +2507,8 @@ class ToolApplication:
             authorization_id: str = "", authorization_reason: str = "",
             decision: dict[str, str] | None = None,
             approve: Callable[[dict[str, Any], str], bool] | None = None,
-            progress: Callable[[str], None] = print) -> dict[str, Any]:
+            progress: Callable[[str], None] = print,
+            should_stop: Callable[[], bool] | None = None) -> dict[str, Any]:
         observer = progress
 
         def progress(message: str) -> None:
@@ -2597,12 +2598,12 @@ class ToolApplication:
                     self._client()  # Reject changed identity before starting an attempt or side effect.
                 if self.session.manifest.status == "paused" and not feedback:
                     pending = self.state['pending']
-                    if pending is None:
+                    if pending is None and self.session.manifest.status_reason != 'Caller requested boundary stop':
                         return self.session.status_snapshot()
                     attempts = self.session.list_attempts()
-                    if not any(a.attempt_id == pending['attempt'] and a.status == 'running' for a in attempts):
+                    if pending is None or not any(a.attempt_id == pending['attempt'] and a.status == 'running' for a in attempts):
                         self.session.continue_with_revision('Resume pending work without resetting its budget')
-                self._run(approved_execution, approve, progress)
+                self._run(approved_execution, approve, progress, should_stop)
             except (Exception, KeyboardInterrupt) as exc:
                 if self.session.manifest.status != "blocked":
                     self.session.manifest.status = "paused"
@@ -2610,12 +2611,17 @@ class ToolApplication:
                 self._save()
             return self.session.status_snapshot()
 
-    def _run(self, approved_execution: str, approve: Any, progress: Callable[[str], None]) -> None:
+    def _run(self, approved_execution: str, approve: Any, progress: Callable[[str], None],
+             should_stop: Callable[[], bool] | None = None) -> None:
         caller_takeover = self._caller_takeover()
         reserve_completion = (self.state['config'].get('completion_policy') in _COMPLETION_POLICIES
             and self.state['config']['model'] is not None and not caller_takeover)
         while True:
             if self._commit_terminal(progress):
+                return
+            if should_stop is not None and should_stop():
+                self.session.pause('Caller requested boundary stop')
+                self._save()
                 return
             pending = self.state["pending"]
             if pending is None:

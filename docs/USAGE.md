@@ -249,6 +249,33 @@ This plots supplied demonstration coordinates, not an experiment.
 Native `--prepare-only` still checks the connection and credentials but makes
 no model/process call; structured preparation can save TOML without credentials.
 
+## Local workspace preview (V2.10 branch)
+
+The development branch includes a thin loopback-only browser client:
+
+```bash
+uv run python -m simple_ar.ui --project-root /absolute/materials --task-root /absolute/native-tasks
+```
+
+Run from the directory containing your private `.env`; use the existing global
+model catalog. Open the full URL printed by this process. Keep that URL private:
+its fragment grants access to this local session. Do not expose the port publicly.
+For remote hosts, forward the same port through SSH rather than changing its bind address.
+
+The page lists native tasks in the task root and its direct children. Material
+paths refer to the execution host and must fall within the project root or an
+explicit repeatable `--read-root PATH`. Creating a task saves the confirmed
+connection, sources, access and hard caps; **Continue** starts execution.
+Saved-result browsing is labelled separately from a worker running in this UI.
+Feedback and exact command approvals use the original task and ledger.
+**Boundary stop** waits for the current action to return; it does not cancel
+an in-flight provider request or process. Keep the launcher alive until it exits.
+
+This is an experimental single-user client, not a sandbox or multi-user service.
+It previews text and raster images; download PDFs and other supported binary files
+to view them. File browsing does not certify scientific quality. Publication
+template adaptation and a fully interactive end-to-end acceptance case remain pending.
+
 ## Troubleshooting
 
 | Symptom | What to check |

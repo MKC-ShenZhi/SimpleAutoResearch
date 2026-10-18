@@ -6,6 +6,7 @@ User-visible changes, newest first. Entries describe behavior on their date; lat
 
 ## Unreleased — V2.10
 
+- Add an experimental loopback workspace client over the native task owner: explicit sources/connections/caps, saved-result browsing, feedback, exact approvals and cooperative boundary stops. No separate scheduler or ledger; publication adaptation remains pending.
 - Explicit native text-connection switches record pinned destinations and intent in the original journal without replaying work, changing accounting or invalidating saved delivery; pending operations retain their recovery contract.
 
 - List and select existing native tasks by directory/name without a second registry; continue feedback through the saved task owner.
