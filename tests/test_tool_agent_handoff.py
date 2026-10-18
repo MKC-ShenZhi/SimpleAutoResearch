@@ -7512,7 +7512,9 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         from simple_ar.integrations.llm import LLMError
 
         inputs, fake, app, materials, table, figure, request = self._material_root_fixture()
-        table.write_bytes(b'x' * 160000)
+        # The line-cap case must actually change observed bytes, not merely
+        # restate an ineffective control on a single-line file.
+        table.write_bytes(b'x\n' * 80000)
         outside = inputs / 'outside.txt'
         outside.write_bytes(b'Authorized mount, outside this candidate inventory.\n')
         original_path = materials / 'original-document.json'
@@ -7559,6 +7561,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     ('writing-inspection-' + name) / 'writer').exists())
         # Boundary success: final selection on decision six, exactly 96000
         # observed characters, and an explicitly capped line window matches.
+        table.write_bytes(b'x' * 160000)
         windows = [{**window, 'offset_bytes': index * 20000,
                     'max_bytes': 20000 if index < 4 else 16000} for index in range(5)]
         windows[0]['max_lines'] = 200
@@ -9184,7 +9187,7 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
         materials = self.workspace.workspace / 'supplied-materials'
         materials.mkdir()
         notes = materials / 'notes.txt'
-        notes.write_bytes(b'Context only.\nKeep iterable order; do not sort.\n')
+        notes.write_bytes('Context μ only.\nKeep iterable order; do not sort.\n'.encode())
         table = materials / 'measurements.csv'
         prefix = b'item,accepted,rejected\n'
         tail = b'17,31,2\n18,29,4\n'
@@ -9202,6 +9205,7 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
             pass  # Symbolic links are not available on every Windows test host.
         windows = [{'path': str(notes)}, {'path': str(table),
             'offset_bytes': len(prefix), 'max_bytes': len(tail)}]
+        selected_windows = [{'path': str(notes), 'max_bytes': notes.stat().st_size}, windows[1]]
         goal = 'Implement the iterable utility using the supplied observations.'
         arguments = {'goal': goal, 'material_roots': [str(materials)]}
         generated = {'summary': 'Prepared utility', 'unresolved': [], 'files': [
@@ -9209,7 +9213,7 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
             self.note]}
         self.fake.ask_json.side_effect = [
             {'read_windows': [*windows, {'path': str(distractor)}]},
-            {'materials': windows}, generated]
+            {'materials': selected_windows}, generated]
         identity = 'implementation-material-windows'
         with patch.object(self.workspace, 'call', wraps=self.workspace.call) as reads:
             result = self._prepare_candidate(self.implementation, self.fake, arguments,
@@ -9221,7 +9225,7 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
         self.assertIsNone(prompts[2]['planned_files'])
         owner = self.run_dir / 'attempts' / identity / 'implementation'
         material_owner = owner / 'material-selection'
-        self.assertEqual(read_json(material_owner / 'selection-response.json'), {'materials': windows})
+        self.assertEqual(read_json(material_owner / 'selection-response.json'), {'materials': selected_windows})
         observations = read_json(material_owner / 'selection-observations.json')
         self.assertEqual(observations, prompts[1]['observations'])
         self.assertEqual(len(observations), 3)
@@ -9323,6 +9327,8 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
             ('unobserved', [{'materials': [{'path': str(source)}]}]),
             ('different-window', [{'read_windows': [{'path': str(source), 'max_bytes': 8}]},
                 {'materials': [{'path': str(source), 'offset_bytes': 8, 'max_bytes': 8}]}]),
+            ('unread-extension', [{'read_windows': [{'path': str(source), 'max_bytes': 8}]},
+                {'materials': [{'path': str(source), 'max_bytes': 64000}]}]),
             ('private', [{'read_windows': [{'path': str(private)}]}]),
             ('outside-inventory', [{'read_windows': [{'path': str(outside)}]}]),
             ('unauthorized', [{'read_windows': [{'path': '../outside.txt'}]}]),

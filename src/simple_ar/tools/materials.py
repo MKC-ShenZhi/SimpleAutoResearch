@@ -92,19 +92,41 @@ def selected_material_windows(workspace: Any, selected: MaterialSelection,
     """Revalidate inspected bytes and return only selected observed windows."""
     if selected.read_windows:
         raise ValueError('Material selection ended without a final selection')
-    observed = {}
+    observed, views = {}, {}
+    def view_key(window: FileWindow, data: dict) -> tuple:
+        return (str(workspace.resolve(window.path)), data.get('offset_bytes', window.offset_bytes),
+            data['next_offset_bytes'], data['sha256'])
     for row in observations:
         actual = workspace.call('read_file', row['request'], identity=identity)
         if actual.status != 'ok' or actual.data != row['data']:
             raise ValueError('Inspected material contents changed; preserve this version and use a new identity')
         observed[window_key(workspace, FileWindow.model_validate(row['request']))] = row
+        if row['data'].get('sha256'):
+            views[view_key(FileWindow.model_validate(row['request']), row['data'])] = row
     windows = [FileWindow(path=row) if isinstance(row, str) else row for row in selected.materials]
     keys = [window_key(workspace, window) for window in windows]
     if len(keys) != len(set(keys)):
         raise ValueError('Material selection requires distinct paths/windows from the bound inventory')
-    if any(key not in observed for key in keys):
-        raise ValueError('Selected material window was not inspected; read its actual contents first')
-    return [observed[key] for key in keys]
+    resolved, selected_views = [], set()
+    for window, key in zip(windows, keys):
+        row = observed.get(key)
+        if row is None and any(path[0] == key[0] for path in observed):
+            # Request ceilings are not content identity: a 16 KB read of a
+            # 315-byte file and a 315-byte read observe exactly the same bytes.
+            # Reuse the original receipt only for the identical measured span
+            # and full source digest, never an unseen extension or subset.
+            actual = workspace.call('read_file', window.model_copy(update={
+                'full_digest': True}).model_dump(exclude_unset=True), identity=identity)
+            if actual.status == 'ok':
+                row = views.get(view_key(window, actual.data))
+        if row is None:
+            raise ValueError('Selected material window was not inspected; read its actual contents first')
+        effective = view_key(FileWindow.model_validate(row['request']), row['data'])
+        if effective in selected_views:
+            raise ValueError('Material selection requires distinct paths/windows from the bound inventory')
+        selected_views.add(effective)
+        resolved.append(row)
+    return resolved
 
 
 def implementation_materials(*, workspace: Any, roots: list[str], goal: str,
