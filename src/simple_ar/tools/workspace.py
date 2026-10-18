@@ -154,7 +154,8 @@ def resolve_source_mount(value: Path) -> Path:
     return resolved
 
 
-def resolve_mounted_path(mounts: dict[str, Path], value: str, *, write: bool = False) -> Path:
+def resolve_mounted_path(mounts: dict[str, Path], value: str, *, write: bool = False,
+                         discovery: bool = False) -> Path:
     """Shared access rule for tools and read-only delivery navigation."""
     native = Path(value)
     rel = PurePosixPath(value)
@@ -181,6 +182,14 @@ def resolve_mounted_path(mounts: dict[str, Path], value: str, *, write: bool = F
         raise ValueError("Path is outside the authorized mounts or writable workspace")
     if any(_private_name(part) for part in parts):
         raise ValueError("Private/runtime paths are not exposed to task tools")
+    if discovery:
+        # Exact roots must obey the same exclusions as directory discovery.
+        # Check the lexical chain before resolve() can erase an in-mount link.
+        for depth in range(len(parts) + 1):
+            ancestor = base.joinpath(*parts[:depth])
+            if (ancestor.is_symlink() or ancestor.is_junction()
+                    or (ancestor.is_dir() and (ancestor / 'pyvenv.cfg').is_file())):
+                raise ValueError('Symlink or Python environment material is excluded from discovery')
     # Mount owners resolve authorized sources; do not adopt a subsequently
     # replaced workspace symlink as a new writable root.
     candidate = base.joinpath(*parts).resolve()
@@ -336,6 +345,9 @@ class WorkspaceToolGateway:
 
     def resolve(self, value: str, *, write: bool = False) -> Path:
         return resolve_mounted_path(self.mounts, value, write=write)
+
+    def resolve_material_root(self, value: str) -> Path:
+        return resolve_mounted_path(self.mounts, value, discovery=True)
 
     def locator(self, value: str) -> str:
         """Expose a short authorized mount spelling, never a new access grant."""

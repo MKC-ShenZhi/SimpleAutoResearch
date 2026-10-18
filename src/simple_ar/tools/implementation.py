@@ -35,6 +35,9 @@ class ImplementationRequest(BaseModel):
         description='Optional explicit candidate files for greenfield or already investigated work. Omit to let the implementation owner select files from the goal and optional existing project.')
     source_windows: list[FileWindow] = Field(default_factory=list, max_length=12,
         description='Exact mounted original code, extracted paper text, data descriptions or diagnostics to use. Same bounded reads and coverage as read_file. No guessed evidence text.')
+    material_roots: list[str] = Field(default_factory=list, max_length=8,
+        exclude_if=lambda value: not value,
+        description='Optional authorized material directories or exact files, separate from the editable project. The owner investigates actual bounded windows before choosing code files; no coordinator-selected file list or hashes needed. Does not authorize execution or scientific verification.')
 
 
 class ExactCodePreparation(BaseModel):
@@ -172,7 +175,7 @@ def implementation_tool_specs(*, exact: bool = False) -> list[CommonToolSpec]:
             description='Implement the frozen scoped code task using its approved isolated-workspace preparation, CodeTask investigation, edit/protected-file gates, independent review and declared validator. Uses this task budget and attempt. Optional instruction/prior_result support feedback on the existing candidate; no arguments change scope, preparation or validator. Requires explicit approval of the displayed work and current source/environment identity. Only the saved technical-repair ceiling is authorized (one for legacy contracts); no scientific measurement. Installation is allowed only by an explicitly frozen environment preparation contract; it shares this attempt and process budget. Inspect the retained result before delivery. Interrupted work without a complete domain result is never replayed automatically.')]
     return [CommonToolSpec(name='prepare_implementation', domain='implementation',
         permission_level='write_patch', risk_level='medium', input_schema=ImplementationRequest.model_json_schema(),
-        description='Prepare a coherent code candidate from a goal without coordinator-selected files or supplied code. With no files or project_path, the implementation owner selects necessary new files. An optional existing project_path adds project inspection/indexed bounded source context to the same shared-budget selection request, then the existing writer generates related files. Or supply explicit files/source_windows for greenfield or investigated work. New files use full content; existing files use exact replacements against hash-bound complete originals. A complete response-contract rejection may receive one correction using the same remaining allowance; rejected proposals are retained. Transport, unknown-use and syntax failures are not replayed here. Saves selection, coverage omissions, source bindings and unresolved gaps in this attempt. Repeating an identity returns an unchanged completed result; interrupted/failed model requests are not blindly replayed. Historical execution observations are evidence, not unresolved-failure declarations. No installs, execution, copying or transfer. Original sources remain unchanged; candidates require separate review and verification.')]
+        description='Prepare a coherent code candidate from a goal without coordinator-selected files or supplied code. Optional material_roots are read-only evidence: the owner investigates actual file windows using the shared material reader before selecting code files. An optional existing project_path supplies editable source context; omit it for new code. Or supply explicit files/source_windows for investigated work. New files use full content; existing files use exact replacements against hash-bound complete originals. A complete response-contract rejection may receive one correction using the same remaining allowance; rejected proposals are retained. Transport, unknown-use and syntax failures are not replayed here. Saves selection, coverage omissions, source bindings and unresolved gaps. Repeating an identity returns only an unchanged completed result. Historical execution observations are evidence, not unresolved-failure declarations. No installs, execution, copying or transfer. Original sources remain unchanged; candidates require separate review and verification.')]
 
 
 class ImplementationToolGateway:
@@ -1032,6 +1035,14 @@ class ImplementationToolGateway:
                 raise ValueError('project_path must be a directory separate from the candidate output')
             if output.exists() and not owner.exists('result.json'):
                 raise ValueError('Candidate output already exists without a completed receipt; inspect it and use a new identity')
+            retained_request = (owner.read_json('request.json').get('request') if owner.exists('request.json')
+                else owner.read_json('selection-input.json').get('request') if owner.exists('selection-input.json') else None)
+            if retained_request is not None and retained_request.get('material_roots', []) != request.material_roots:
+                raise ValueError('Material root contract changed; preserve this identity without model dispatch')
+            for locator in request.material_roots:
+                material = self.workspace.resolve_material_root(locator)
+                if material == output or material.is_relative_to(output) or output.is_relative_to(material):
+                    raise ValueError('Material roots must be separate from the candidate output')
             # Selection and generation use the same execution basis. A later
             # probe during recovery must not change an already selected unit.
             selection_input = owner.read_json('selection-input.json') if owner.exists('selection-input.json') else None
@@ -1052,13 +1063,21 @@ class ImplementationToolGateway:
                     raise ValueError(f'Original window unavailable: {observed.error}')
                 windows.append({'request': source.model_dump(), **observed.data,
                     'role': 'supplied_source_or_diagnostic_not_certified_fact'})
+            material_selection = None
+            if request.material_roots:
+                from simple_ar.tools.materials import implementation_materials
+                material_selection, client = implementation_materials(workspace=self.workspace,
+                    roots=request.material_roots, goal=request.goal,
+                    owner=ArtifactStore(owner.root / 'material-selection'), identity=identity,
+                    client_factory=lambda: self._client(identity))
+                windows.extend(material_selection['windows'])
             if not request.files:
                 selection, client = select_implementation_files(goal=request.goal,
                     request_binding=request.model_dump(), project=project, owner=owner, windows=windows,
                     bind_inventory=lambda: self.workspace.bind_inventory(project, identity=identity),
                     resolve_source=self.workspace.resolve,
                     validate_destination=lambda path: self.workspace.resolve(f'{prefix}/{path}', write=True),
-                    client_factory=lambda: self._client(identity),
+                    client_factory=lambda: client or self._client(identity),
                     execution_observations=selection_observations)
                 request.files = [ImplementationFile.model_validate(row) for row in selection['files']]
                 windows.append({'role': 'owner_project_context_not_execution_authority',
@@ -1090,7 +1109,8 @@ class ImplementationToolGateway:
                 if not row.source_path else set()) for row in request.files]
             binding = {'request': request_data, 'source_windows': windows,
                 **({'original_files': originals} if originals else {}),
-                **({'selection': selection} if selection else {})}
+                **({'selection': selection} if selection else {}),
+                **({'material_selection': material_selection} if material_selection else {})}
             if owner.exists('request.json'):
                 # Automatic observations belong to the original invocation,
                 # not the changing history at recovery time.
@@ -1117,10 +1137,18 @@ class ImplementationToolGateway:
                 files=[row.model_dump() for row in request.files], source_windows=windows,
                 client=client, artifact_dir=owner.root, original_files=originals,
                 task_python=str(self.workspace.python), execution_observations=observations)
+            if material_selection:
+                current, _ = implementation_materials(workspace=self.workspace,
+                    roots=request.material_roots, goal=request.goal,
+                    owner=ArtifactStore(owner.root / 'material-selection'), identity=identity,
+                    client_factory=lambda: self._client(identity))
+                if current != material_selection:
+                    raise ValueError('Materials changed during generation; retain candidate without verification')
             if selection and project is not None and self.workspace.bind_inventory(project, identity=identity) != {
                     key: selection['input'][key] for key in ('project_path', 'file_hashes', 'inventory_scope')}:
                 raise ValueError('Project changed during generation; candidate retained for inspection, use a new identity')
             data = {'data': {**result, 'source_binding': str(owner.root / 'request.json'),
+                    **({'material_coverage': material_selection['coverage']} if material_selection else {}),
                     **({'selection_receipt': str(owner.root / 'selection.json'),
                         'coverage': selection['coverage']} if selection else {})},
                 'artifacts': [f"{prefix}/{row['path']}" for row in result['files']],

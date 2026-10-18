@@ -8881,6 +8881,218 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
         self.routed = self.enterContext(patch(
             'simple_ar.tools.implementation.LLMClient.for_task', return_value=self.fake))
 
+    def test_implementation_material_windows_reach_writer_and_bind_candidate_replay(self) -> None:
+        materials = self.workspace.workspace / 'supplied-materials'
+        materials.mkdir()
+        notes = materials / 'notes.txt'
+        notes.write_bytes(b'Context only.\nKeep iterable order; do not sort.\n')
+        table = materials / 'measurements.csv'
+        prefix = b'item,accepted,rejected\n'
+        tail = b'17,31,2\n18,29,4\n'
+        table.write_bytes(prefix + tail)
+        distractor = materials / 'proposal.md'
+        distractor.write_text('UNSELECTED_PROPOSAL_SENTINEL', encoding='utf-8')
+        (materials / '.env').write_text('PRIVATE_MATERIAL_SENTINEL', encoding='utf-8')
+        environment = materials / 'runtime'
+        environment.mkdir()
+        (environment / 'pyvenv.cfg').write_text('home = fixture\n', encoding='utf-8')
+        (environment / 'secret.txt').write_text('ENVIRONMENT_MATERIAL_SENTINEL', encoding='utf-8')
+        try:
+            (materials / 'linked-evidence.txt').symlink_to(notes)
+        except (OSError, NotImplementedError):
+            pass  # Symbolic links are not available on every Windows test host.
+        windows = [{'path': str(notes)}, {'path': str(table),
+            'offset_bytes': len(prefix), 'max_bytes': len(tail)}]
+        goal = 'Implement the iterable utility using the supplied observations.'
+        arguments = {'goal': goal, 'material_roots': [str(materials)]}
+        selection = {'files': [{'path': 'utility.py', 'purpose': 'Public iterable utility'},
+            {'path': 'README.md', 'purpose': 'Document supplied evidence and limits'}]}
+        generated = {'summary': 'Prepared utility', 'unresolved': [], 'files': [
+            {'path': 'utility.py', 'content': 'def materialize(values):\n    return list(values)\n'},
+            self.note]}
+        self.fake.ask_json.side_effect = [
+            {'read_windows': [*windows, {'path': str(distractor)}]},
+            {'materials': windows}, selection, generated]
+        identity = 'implementation-material-windows'
+        with patch.object(self.workspace, 'call', wraps=self.workspace.call) as reads:
+            result = self._prepare_candidate(self.implementation, self.fake, arguments,
+                identity, calls=4)
+        prompts = [json.loads(call.args[1]) for call in self.fake.ask_json.call_args_list]
+        self.assertEqual(prompts[0]['goal'], goal)
+        self.assertEqual(prompts[0]['observations'], [])
+        self.assertEqual([prompt['decisions_remaining'] for prompt in prompts[:2]], [6, 5])
+        owner = self.run_dir / 'attempts' / identity / 'implementation'
+        material_owner = owner / 'material-selection'
+        self.assertEqual(read_json(material_owner / 'selection-response.json'), {'materials': windows})
+        observations = read_json(material_owner / 'selection-observations.json')
+        self.assertEqual(observations, prompts[1]['observations'])
+        self.assertEqual(len(observations), 3)
+        self.assertEqual(observations[1]['data']['text'], tail.decode())
+        self.assertEqual(observations[1]['data']['next_offset_bytes'], len(prefix + tail))
+        self.assertFalse(observations[1]['data']['has_more'])
+        self.assertTrue((material_owner / 'selection-input.json').is_file())
+        self.assertTrue((material_owner / 'selection-steps/1/observations.json').is_file())
+        actual_reads = [call.args[1] for call in reads.call_args_list if call.args[0] == 'read_file']
+        self.assertTrue(actual_reads)
+        self.assertTrue(all(row['full_digest'] for row in actual_reads))
+        for observation in observations:
+            # The workspace owns full-file SHA receipts; the mock supplies only locators.
+            reread = self.workspace.call('read_file', observation['request'], identity='verify-material-owner')
+            self.assertEqual(reread.status, 'ok', reread.error)
+            self.assertEqual(observation['data']['sha256'], reread.data['sha256'])
+        for prompt in prompts[2:]:
+            context = json.dumps(prompt)
+            self.assertIn('Keep iterable order; do not sort.', context)
+            self.assertIn('17,31,2', context)
+            self.assertIn('offset_bytes', context)
+            self.assertNotIn('UNSELECTED_PROPOSAL_SENTINEL', context)
+            selected_table = [row for row in prompt['source_windows'] if row.get('text') == tail.decode()]
+            self.assertEqual(len(selected_table), 1)
+            self.assertEqual(selected_table[0]['request']['offset_bytes'], len(prefix))
+            self.assertEqual(selected_table[0]['sha256'], observations[1]['data']['sha256'])
+        self.assertNotIn('PRIVATE_MATERIAL_SENTINEL', str(self.fake.ask_json.call_args_list))
+        self.assertNotIn('.env', str(prompts[:2]))
+        self.assertNotIn('secret.txt', str(prompts[:2]))
+        self.assertNotIn('ENVIRONMENT_MATERIAL_SENTINEL', str(self.fake.ask_json.call_args_list))
+        self.assertNotIn('linked-evidence.txt', str(prompts[:2]))
+        binding = read_json(Path(result.data['source_binding']))
+        for observation in observations[:2]:
+            self.assertIn(observation['data']['sha256'], json.dumps(binding))
+        retained = {path: path.read_bytes() for path in owner.rglob('*.json')}
+        accounted = self.ledger.to_dict()
+        with patch.object(self.implementation, '_client', side_effect=AssertionError('No replay model')) as client:
+            replay = self._prepare_candidate(self.implementation, self.fake, arguments, identity, calls=4)
+            self.assertEqual(replay.data, result.data)
+            # Same size, outside the chosen window: full source identity still changes.
+            table.write_bytes(prefix.replace(b'item', b'kind') + tail)
+            rejected = self._prepare_candidate(self.implementation, self.fake, arguments,
+                identity, calls=4, status='error')
+            self.assertIn('changed', rejected.error.lower())
+            client.assert_not_called()
+        self.assertEqual({path: path.read_bytes() for path in retained}, retained)
+        self.assertEqual(self.ledger.to_dict(), accounted)
+        self.assertEqual((Path(result.data['project_dir']) / 'utility.py').read_text(),
+            generated['files'][0]['content'])
+
+    def test_implementation_without_material_roots_preserves_legacy_binding(self) -> None:
+        from pydantic import ValidationError
+        from simple_ar.tools.implementation import ImplementationRequest
+
+        arguments = {'goal': 'Prepare a utility description.',
+            'files': [{'path': 'README.md', 'purpose': 'Explain utility usage'}]}
+        legacy_request = {**arguments, 'source_windows': []}
+        for supplied in ({}, {'material_roots': []}):
+            with self.subTest(supplied=supplied):
+                parsed = ImplementationRequest.model_validate({**arguments, **supplied})
+                self.assertNotIn('material_roots', parsed.model_dump())
+                self.assertNotIn('material_roots', parsed.model_dump(mode='json'))
+        for roots in ('workspace/materials', [1], ['workspace/materials'] * 9):
+            with self.subTest(invalid_roots=roots), self.assertRaises(ValidationError):
+                ImplementationRequest.model_validate({**arguments, 'material_roots': roots})
+        self.fake.ask_json.return_value = {'summary': 'Prepared description',
+            'unresolved': [], 'files': [self.note]}
+        identity = 'implementation-legacy-material-omission'
+        prepared = self._prepare_candidate(self.implementation, self.fake, arguments, identity, calls=1)
+        self.assertEqual(read_json(Path(prepared.data['source_binding'])),
+            {'request': legacy_request, 'source_windows': []})
+        self.assertFalse((self.run_dir / 'attempts' / identity / 'implementation/material-selection').exists())
+        with patch.object(self.implementation, '_client', side_effect=AssertionError('No replay model')):
+            repeated = self._prepare_candidate(self.implementation, self.fake,
+                {**arguments, 'material_roots': []}, identity, calls=1)
+        self.assertEqual(repeated.data, prepared.data)
+        retained = {path: path.read_bytes() for path in Path(prepared.data['source_binding']).parent.rglob('*.json')}
+        with patch.object(self.implementation, '_client', side_effect=AssertionError('Changed roots must not dispatch')):
+            rejected = self._prepare_candidate(self.implementation, self.fake,
+                {**arguments, 'material_roots': [str(self.source)]}, identity, calls=1, status='error')
+        self.assertIn('contract changed', rejected.error)
+        self.assertEqual({path: path.read_bytes() for path in retained}, retained)
+        self.assertFalse((Path(prepared.data['source_binding']).parent / 'material-selection').exists())
+
+    def test_implementation_material_selection_blocks_unobserved_and_unlisted_windows(self) -> None:
+        materials = self.workspace.workspace / 'bounded-materials'
+        materials.mkdir()
+        source = materials / 'evidence.txt'
+        source.write_text('Supplied observed evidence.\n', encoding='utf-8')
+        private = materials / '.env'
+        private.write_text('PRIVATE_SELECTION_SENTINEL', encoding='utf-8')
+        outside = self.workspace.workspace / 'outside-evidence.txt'
+        outside.write_text('Mounted but outside selected roots.\n', encoding='utf-8')
+        arguments = {'goal': 'Explain supplied evidence.', 'material_roots': [str(materials)],
+            'files': [{'path': 'README.md', 'purpose': 'Evidence description'}]}
+        cases = [
+            ('unobserved', [{'materials': [{'path': str(source)}]}]),
+            ('different-window', [{'read_windows': [{'path': str(source), 'max_bytes': 8}]},
+                {'materials': [{'path': str(source), 'offset_bytes': 8, 'max_bytes': 8}]}]),
+            ('private', [{'read_windows': [{'path': str(private)}]}]),
+            ('outside-inventory', [{'read_windows': [{'path': str(outside)}]}]),
+            ('unauthorized', [{'read_windows': [{'path': '../outside.txt'}]}]),
+        ]
+        for name, responses in cases:
+            with self.subTest(selection=name):
+                self.fake.ask_json.reset_mock()
+                self.fake.ask_json.side_effect = responses
+                identity = 'implementation-material-' + name
+                with patch.object(self.workspace, 'call', wraps=self.workspace.call) as reads:
+                    rejected = self._prepare_candidate(self.implementation, self.fake, arguments,
+                        identity, calls=len(responses), status='error')
+                self.assertNotIn('PRIVATE_SELECTION_SENTINEL', rejected.error)
+                read_paths = [call.args[1]['path'] for call in reads.call_args_list
+                    if call.args[0] == 'read_file']
+                self.assertNotIn(str(private), read_paths)
+                self.assertNotIn(str(outside), read_paths)
+                owner = self.run_dir / 'attempts' / identity / 'implementation'
+                self.assertFalse((owner / 'proposal.json').exists())
+                self.assertFalse((self.workspace.workspace / 'implementations' / identity).exists())
+        self.fake.ask_json.reset_mock()
+        environment = materials / 'runtime'
+        environment.mkdir()
+        (environment / 'pyvenv.cfg').write_text('home = fixture\n')
+        hidden = environment / 'secret.txt'
+        hidden.write_text('ENVIRONMENT_EXACT_ROOT_SENTINEL')
+        roots_cases = [('ancestor', [str(self.workspace.workspace)]),
+            ('output', [str(self.workspace.workspace / 'implementations/material-root-output')]),
+            ('environment-file', [str(hidden)]), ('environment-directory', [str(environment)])]
+        try:
+            linked = materials / 'direct-link.txt'
+            linked.symlink_to(source)
+            roots_cases.append(('symlink-file', [str(linked)]))
+            linked_tree = materials / 'linked-runtime'
+            linked_tree.symlink_to(environment, target_is_directory=True)
+            roots_cases.append(('symlink-ancestor', [str(linked_tree / 'secret.txt')]))
+        except (OSError, NotImplementedError):
+            pass
+        for name, roots in roots_cases:
+            with self.subTest(root=name):
+                self._prepare_candidate(self.implementation, self.fake,
+                    {**arguments, 'material_roots': roots}, 'material-root-output', calls=0, status='error')
+
+    def test_implementation_interrupted_material_selection_has_no_blind_replay(self) -> None:
+        materials = self.workspace.workspace / 'interrupted-materials'
+        materials.mkdir()
+        source = materials / 'evidence.txt'
+        source.write_text('Actual supplied evidence.\n', encoding='utf-8')
+        arguments = {'goal': 'Use supplied evidence.', 'material_roots': [str(source)],
+            'files': [{'path': 'README.md', 'purpose': 'Explain evidence'}]}
+        identity = 'implementation-material-interrupted'
+        self.fake.ask_json.side_effect = [
+            {'read_windows': [{'path': str(source)}]}, RuntimeError('Unconfirmed selection transport')]
+        self._prepare_candidate(self.implementation, self.fake, arguments, identity, calls=2, status='error')
+        owner = self.run_dir / 'attempts' / identity / 'implementation'
+        selection_owner = owner / 'material-selection'
+        self.assertTrue((selection_owner / 'selection-input.json').is_file())
+        self.assertTrue((selection_owner / 'selection-steps/1/observations.json').is_file())
+        self.assertFalse((selection_owner / 'selection-response.json').exists())
+        retained = {path: path.read_bytes() for path in owner.rglob('*.json')}
+        accounted = self.ledger.to_dict()
+        with patch.object(self.implementation, '_client', side_effect=AssertionError('No blind replay')) as client:
+            rejected = self._prepare_candidate(self.implementation, self.fake, arguments,
+                identity, calls=2, status='error')
+            self.assertIn('Interrupted material selection', rejected.error)
+            client.assert_not_called()
+        self.assertEqual({path: path.read_bytes() for path in retained}, retained)
+        self.assertEqual(self.ledger.to_dict(), accounted)
+        self.assertFalse((owner / 'proposal.json').exists())
+
     def test_candidate_environment_preparation_shares_validator_measurement_and_feedback_owner(self) -> None:
         from simple_ar.tools.implementation import ImplementationToolGateway
         from simple_ar.tools.scientific import ScientificToolGateway
