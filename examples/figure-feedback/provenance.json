@@ -1,0 +1,62 @@
+{
+  "kind": "byte_identical_export_of_framework_delivered_figure",
+  "published_at": "2026-10-18",
+  "source_commit": "f45b596094afa0b810cb4b7c0f50aa22ac904798",
+  "source_directory": "runs/showcase/figure-feedback-20261017",
+  "native_delivery": "native-tool-0024",
+  "native_status": "partial",
+  "maintainer_edits_to_renderer_data_caption": false,
+  "source_data": "Saverio Vito, Air Quality, UCI Machine Learning Repository, https://doi.org/10.24432/C59K5F; saved derived results only; consult upstream terms",
+  "costs": {
+    "physical_model_requests": 11,
+    "recorded_tokens": 211774,
+    "task_renders": 1,
+    "task_render_seconds": 2.559299897402525,
+    "unknown_in_this_task": 0,
+    "allowance_extended": false
+  },
+  "independent_checks": {
+    "displayed_values": 8,
+    "data_files_preserved": 5,
+    "actual_image_inspection": true,
+    "same_environment_relocated_main_preview_png_identical": true,
+    "fresh_machine": false
+  },
+  "preserved_files": [
+    {
+      "file": "build_figure_v2.py",
+      "sha256": "72bbeb7d0c6ca859bb61073839d739128315958c01e540b8b64b9a99cbb8da71"
+    },
+    {
+      "file": "CAPTION_v2.md",
+      "sha256": "3785aa3e152ed239d37fa1e82f94684a38762e6e808e9d9bf07eed272f9ca5fd"
+    },
+    {
+      "file": "data/cohorts.csv",
+      "sha256": "29af00b6601d5c58db600d6bf9bd9f25e653227bb4c1493c568011917fa587f4"
+    },
+    {
+      "file": "data/monthly_metrics.csv",
+      "sha256": "b51b8b45f6a5ad05216ed0e3649a28462bfe575fed732ec6978b1e277d83c3da"
+    },
+    {
+      "file": "data/overall_metrics.csv",
+      "sha256": "142eee1a9f9fb03bfcba725701240e4d1a5dd7c26890a93648351eaad2e058e5"
+    },
+    {
+      "file": "data/periods.csv",
+      "sha256": "7010e2c205da8475ac3e55ddffa2c4f4493478578f9786382c20067801fa175d"
+    },
+    {
+      "file": "data/recorded_results.json",
+      "sha256": "ce0098d5c7fc569b4bf85199bccc7c2b14e0ef27b557b550ec5a9b1ddd6533c4"
+    }
+  ],
+  "limitations": [
+    "Selected development acceptance, not a benchmark success rate",
+    "No refitting, new metrics, scientific revalidation or physical print proof",
+    "Original caption orientation wording retained; earlier failed task/costs not upgraded",
+    "Original environment paths in metadata are historical provenance, not credentials or dependencies",
+    "Framework license not yet selected"
+  ]
+}

@@ -5,6 +5,7 @@ command and expected outputs. Run commands from the repository root.
 
 | Case | Goal | Entry and preparation |
 | --- | --- | --- |
+| [Saved-result figure feedback](figure-feedback/README.md) | Replay an actual delivered comparison figure; optional new model-assisted request | `uv run python examples/figure-feedback/build_figure_v2.py --output runs/examples/figure-feedback/replay`; no API or training for replay; fresh output directory required |
 | [Survey](survey/README.md) | Literature survey, no training | `research-session --config examples/survey/research.toml`; configure model access |
 | [Data analysis](data-analysis/README.md) | Descriptive statistics and editable plots of existing data | `research-session --config examples/data-analysis/research.toml`; no model or GPU; Matplotlib is installed with the package |
 | [Data curves](data-curves/README.md) | Supplied numeric coordinates, explicit gaps, editable line/scatter figures | `research-session --config examples/data-curves/research.toml`; no model or GPU; no separate plotting setup |

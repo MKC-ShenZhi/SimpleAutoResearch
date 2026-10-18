@@ -2,7 +2,7 @@
 
 **A continuing research assistant that works across sources, code, data, figures and editable reports.**
 
-[中文](README_zh.md) · [Get started](docs/USAGE.md) · [Task guides](docs/WORKFLOWS.md) · [Showcase](docs/showcase/README.md)
+[中文](README_zh.md) · [Get started](docs/USAGE.md) · [Task guides](docs/WORKFLOWS.md) · [Showcase](docs/showcase/README.md) · [Evidence & limits](docs/EVALUATION.md)
 
 Research carries context forward: a source informs a method, code turns it into a calculation, results become figures and prose, and feedback changes the next step. SimpleAutoResearch keeps this work in a saved task so you can inspect the evidence, reuse existing results and continue with new instructions.
 
@@ -43,6 +43,16 @@ Starting from recorded calibration results, the task revised a landscape method 
 | ![Study figure before feedback](docs/showcase/assets/study-figure-before.png) | ![Study figure after feedback](docs/showcase/assets/study-figure-after.png) |
 
 See the [showcase](docs/showcase/README.md) for task provenance, human involvement, versions, costs and limitations.
+
+### A current, replayable feedback case
+
+The frozen candidate revised a saved-result landscape figure into paired visual comparisons, preserving all eight numerical labels and explicit units/scales. It delivered editable source after actual rendering and image inspection; independent relocated replay matched both PNGs.
+
+![Saved-result visual comparison after feedback](docs/showcase/assets/landscape-feedback-after.png)
+
+[Replay with source and saved data—no API key](examples/figure-feedback/README.md) · [Before/after and cost](docs/showcase/README.md#landscape-comparison-a-current-replayable-export)
+
+This bounded feedback task used 11 model requests and 211,774 recorded tokens; it did not refit models. These are inspected development cases, not benchmark rankings. [Measured checks, costs and limitations](docs/EVALUATION.md) distinguish artifact correctness from scientific claims.
 
 ## How a task continues
 

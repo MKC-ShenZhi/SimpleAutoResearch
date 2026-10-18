@@ -1,0 +1,5 @@
+# Preserve the exported renderer's frozen input hashes across Windows checkouts.
+data/* -text
+data/*.csv whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+build_figure_v2.py -text
+CAPTION_v2.md -text

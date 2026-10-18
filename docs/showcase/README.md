@@ -36,10 +36,22 @@ The original task delivered editable drawing source and exports. Independent rev
 
 The run records 34 model requests, 864,326 settled tokens and four processes; five unknown-use reservations remain in its ledger. Goals, execution permissions and review were human-supplied.
 
+## Landscape comparison: a current replayable export
+
+On the frozen `f45b596` candidate, feedback asked for visual Frozen/Monthly comparisons rather than a mostly textual error table, preserving all eight values, units and model-family scale distinctions.
+
+| Exported initial figure | Delivered feedback revision |
+| --- | --- |
+| ![Before](assets/landscape-feedback-before.png) | ![After](assets/landscape-feedback-after.png) |
+
+The framework edited source/caption, rendered, inspected the actual image and delivered a separate version; the maintainer did not rewrite it. Independent checks matched eight displayed values, preserved five input data files and obtained byte-identical main/preview PNGs after moving the project in the same environment. The task used 11 physical requests/211,774 recorded tokens and one 2.56-second render, with no extension or new unknown charge. An earlier failed task remains failed with separate costs; this was a separately authorized bounded task using exported initial materials.
+
+[Source, data, attribution and a no-API replay command](../../examples/figure-feedback/README.md) are now included in a checkout. The preserved caption has a minor orientation-wording issue; native `partial`, scientific/print limits and replay-platform scope remain explicit. This does not turn this selected case into a success-rate benchmark.
+
 ## Provenance and reuse
 
 The published files are byte-for-byte copies of saved acceptance artifacts, not redesigned marketing mockups. [Artifact checksums and source identities](artifacts.json) distinguish the two tasks and versions. Source identities are repository-relative development records; those ignored run archives are not included in a checkout.
 
-The Bike Sharing data is attributed to UCI and Fanaee-T & Gama, *Event labeling combining ensemble detectors and background knowledge*, [DOI](https://doi.org/10.1007/s13748-013-0040-3). Consult upstream data terms before reuse. These files demonstrate outputs; they are not a downloadable reproduction bundle or evidence that V2.9 is fully finished.
+The Bike Sharing data is attributed to UCI and Fanaee-T & Gama, *Event labeling combining ensemble detectors and background knowledge*, [DOI](https://doi.org/10.1007/s13748-013-0040-3). Consult upstream data terms before reuse. The report selections are not full reproduction bundles. The new figure example includes a small saved-result replay export, not original training or the complete execution archive. See [evidence and limits](../EVALUATION.md) for basic scope, costs and benchmark status.
 
 To try your own task, use [Get started](../USAGE.md) and [Task guides](../WORKFLOWS.md). Actual model cost, iteration count and output quality depend on the task and services.

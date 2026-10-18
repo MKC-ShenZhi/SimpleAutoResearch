@@ -100,14 +100,14 @@ Replace endpoint/model with supported values and set the referenced credential p
 | Native writing | Explicit `writing` route; otherwise selected task connection, including explicit profile |
 | Vision / image | Compatible configured `vision` / `image` connection; no text-client substitution |
 
-`[model].name` accepts selectors too. A raw override cannot switch a catalog connection to another model; define another profile. Missing names, credentials or capabilities fail without provider fallback. Profile names must be nonempty and contain no `:`. Routes: `default`, `text`, `code`, `writing`, `vision`, `image`.
+`[model].name` accepts selectors too. With a catalog, a raw model ID is accepted only when it exactly matches the model of the connection resolved for that purpose; it does not search profiles by model ID or switch connections. Use `profile:NAME` to select another connection. Missing names, credentials or capabilities fail without provider fallback. Profile names must be nonempty and contain no `:`. Routes: `default`, `text`, `code`, `writing`, `vision`, `image`.
 
 | Profile field | Default / allowed values |
 | --- | --- |
 | `api` | Required: `openai_chat`, `openai_responses`, `openai_images`, `cctq_images_async` |
 | `base_url`, `model`, `api_key_env`, `capabilities` | Required: HTTP(S) URL without userinfo/query/fragment; nonempty model; credential variable name; nonempty list from `text`, `code`, `vision`, `image_generate`, `image_edit` |
 | `proxy_env` | Empty; variable containing HTTP(S) proxy URL without userinfo/query/fragment; resolved URL is not persisted |
-| `stream`, `http2` | `false`, `false`; streaming supported for Chat only |
+| `stream`, `http2` | `false`, `false`; streaming supported for Chat only; Responses profiles require `stream=false`, including for structured tasks |
 | `request_timeout_sec` | `180`; positive seconds |
 | `max_output_tokens` | Unset; positive output cap |
 | `context_input_tokens` | `24000`; positive native input working-set target, not provider context-window declaration |
@@ -148,7 +148,7 @@ Keep credentials and deployment settings here or in the environment; task paths,
 | `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `SIMPLE_AR_MODEL` | Legacy connection; model `gpt-4o-mini` |
 | `SIMPLE_AR_LLM_TIMEOUT_SEC`, `SIMPLE_AR_MAX_OUTPUT_TOKENS` | `180` seconds; output cap unset |
 | `SIMPLE_AR_LLM_RETRY_ATTEMPTS`, `SIMPLE_AR_LLM_RETRY_BASE_DELAY_SEC`, `SIMPLE_AR_LLM_RETRY_MAX_DELAY_SEC` | `3` attempts; `1`/`12`-second delays |
-| `SIMPLE_AR_LLM_BACKEND`, `SIMPLE_AR_LLM_API` | Legacy transport/API |
+| `SIMPLE_AR_LLM_BACKEND`, `SIMPLE_AR_LLM_API` | Legacy transport/API; API defaults to `responses`. Native decisions require explicit `chat`; these variables do not override catalog profiles |
 | `SIMPLE_AR_JSON_RESPONSE_FORMAT`, `SIMPLE_AR_CHAT_TOKEN_LIMIT_PARAM` | Legacy JSON/token parameter policy |
 | `SIMPLE_AR_LLM_REASONING_EFFORT`, `SIMPLE_AR_LLM_THINKING`, `SIMPLE_AR_LLM_REASONING_OUTPUT_TOKENS`, `SIMPLE_AR_LLM_STREAM` | Legacy reasoning/stream controls |
 | `SIMPLE_AR_INPUT_PRICE_PER_1M`, `SIMPLE_AR_OUTPUT_PRICE_PER_1M` | Optional cost estimates |

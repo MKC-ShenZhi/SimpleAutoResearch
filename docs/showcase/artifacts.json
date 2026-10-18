@@ -1,5 +1,5 @@
 {
-  "published_at": "2026-10-13",
+  "published_at": "2026-10-18",
   "method": "Byte-identical copies of saved development acceptance artifacts; no new run or image editing.",
   "files": [
     {
@@ -26,6 +26,16 @@
       "file": "assets/study-figure-after.png",
       "source": "runs/acceptance/harness-20261009/editable-study-figure-revised-preview.png",
       "sha256": "00f542619d188306ff61815016a8e839517c8b9c2b6674171808fcecb2285158"
+    },
+    {
+      "file": "assets/landscape-feedback-before.png",
+      "source": "runs/showcase/figure-feedback-20261017/rendered_landscape_v1/preview.png",
+      "sha256": "9ae8ba61a78e183a5eaf21ab9d39466a55aaf5035c2794d429d673f7fdbac9fd"
+    },
+    {
+      "file": "assets/landscape-feedback-after.png",
+      "source": "runs/showcase/figure-feedback-20261017/rendered_landscape_v2/preview.png",
+      "sha256": "fcc0ce76945b99859208d52cf7ccd5d6ef8b5bdda125a26cfeec752125e3a4dd"
     }
   ]
 }

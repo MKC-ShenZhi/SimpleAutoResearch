@@ -36,10 +36,22 @@
 
 记录包含 34 次模型请求、864,326 个已结算 tokens 和四次进程执行；账本仍保留五笔未知用量预留。目标、执行授权及审查由人提供。
 
+## 横版比较图：当前可复跑导出
+
+在冻结候选 `f45b596` 上，反馈要求把主要靠文字的误差表变成 Frozen/Monthly 视觉比较，保留八个数值、单位和两类模型的尺度区分。
+
+| 导出的初版 | 实际反馈交付 |
+| --- | --- |
+| ![反馈前](assets/landscape-feedback-before.png) | ![反馈后](assets/landscape-feedback-after.png) |
+
+框架自己改源/图注、渲染、实际看图并交付新版本，没有维护者代写。独立核查八值、五份数据不变，同环境搬迁后的 main/preview PNG 字节一致。该任务 11 次物理请求、211774 记录 tokens、一次渲染约 2.56 秒，无续额或新 unknown。更早失败任务及费用另存；本次是用导出初版材料启动的独立有界任务，不把旧失败追认为成功。
+
+仓库现已包含[源码、数据、归属说明及无 API 复跑命令](../../examples/figure-feedback/README_zh.md)。原图注方位措辞小瑕疵、原生 `partial`、科学/印样限制和复跑平台范围均保留。选取的案例不能用作总体成功率。
+
 ## 来源与使用说明
 
 公开文件是保存成果的逐字节副本，没有为宣传重新绘制。[文件校验值与来源标识](artifacts.json)记录了任务和版本。来源标识对应开发工作区的相对路径；这些被忽略的运行归档不随代码仓库发布。
 
-Bike Sharing 数据归属 UCI 及 Fanaee-T、Gama 的论文 *Event labeling combining ensemble detectors and background knowledge*，见[论文 DOI](https://doi.org/10.1007/s13748-013-0040-3)。再利用前请核对上游数据条款。本页用于展示结果，不是完整复现包，也不是 V2.9 已全部完成的证明。
+Bike Sharing 数据归属 UCI 及 Fanaee-T、Gama 的论文 *Event labeling combining ensemble detectors and background knowledge*，见[论文 DOI](https://doi.org/10.1007/s13748-013-0040-3)。再利用前请核对上游数据条款。报告选集不是完整复现包；新增改图例包含小型保存结果复跑导出，不含原训练或完整执行归档。[效果证据与限制](../EVALUATION_zh.md)明确基础范围、成本和 benchmark 状态。
 
 尝试自己的任务请看[入门](../USAGE_zh.md)和[任务指南](../WORKFLOWS_zh.md)。实际成本、迭代次数与质量取决于任务和服务。

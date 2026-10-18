@@ -93,6 +93,9 @@ Optional writing, vision and image routes, transport settings, and the legacy
 environment-only fallback are in
 [named connections](CONFIG_REFERENCE.md#named-model-connections).
 `--model env` uses the catalog's text/default route when a catalog exists.
+Without a catalog, native tasks require `SIMPLE_AR_LLM_API=chat` in the
+environment or current-directory `.env`; the legacy default is `responses`.
+Responses streaming is unavailable, including for structured tasks.
 
 ### Supply accessible materials
 
@@ -151,7 +154,8 @@ uv run simple-ar results "SESSION"
 Open the actual paths printed by `results`. Check the prose, source references,
 calculated results, validation status and unresolved work relevant to your goal.
 A saved file or delivery record is not a quality certificate.
-During a pause, an older delivery may belong to the request before your feedback.
+During a pause, `results` lists no current reusable delivery for a native task;
+older files may remain on disk from before your feedback.
 
 For deeper artifact inspection:
 

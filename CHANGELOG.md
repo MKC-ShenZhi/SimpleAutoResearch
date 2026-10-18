@@ -4,6 +4,12 @@
 
 User-visible changes, newest first. Entries describe behavior on their date; later entries may change or retire it. See [usage](docs/USAGE.md), [CLI](docs/CLI_REFERENCE.md), and [configuration](docs/CONFIG_REFERENCE.md) for current instructions.
 
+## 2026-10-18 — V2.9 release preparation
+
+- Publish a real saved-result figure replay example, source/data and before/after images; no API or training is needed for replay.
+- Document case checks, costs, known failures and benchmark status separately from capability claims. V2.9 is a development milestone; package metadata remains `0.1.0`, with no new tag or license selection.
+- Align bilingual connection/continuation instructions with current behavior. Verify the existing eight basic scenarios on the frozen installation; no new product behavior or tests.
+
 ## 2026-10-17
 
 - New native tasks protect a follow-up opportunity and require an explicit closing action batch when no further decision fits. Invalid closing batches are retained without execution, not marked successful; saved admission policies and ledgers remain unchanged.

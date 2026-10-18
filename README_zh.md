@@ -2,7 +2,7 @@
 
 **持续科研助手：围绕同一任务组合资料、代码、数据、图形与可编辑报告。**
 
-[English](README.md) · [开始使用](docs/USAGE_zh.md) · [任务指南](docs/WORKFLOWS_zh.md) · [成果展示](docs/showcase/README_zh.md)
+[English](README.md) · [开始使用](docs/USAGE_zh.md) · [任务指南](docs/WORKFLOWS_zh.md) · [成果展示](docs/showcase/README_zh.md) · [效果证据与限制](docs/EVALUATION_zh.md)
 
 科研工作需要持续传递上下文：资料影响方法，代码落实计算，结果进入图表和正文，反馈又改变下一步。SimpleAutoResearch 将这些工作保存在可继续的任务中，让你检查证据、复用已有结果，并通过新指令推进工作。
 
@@ -43,6 +43,16 @@
 | ![反馈前的 study 图形](docs/showcase/assets/study-figure-before.png) | ![反馈后的 study 图形](docs/showcase/assets/study-figure-after.png) |
 
 任务来源、人工参与、版本、成本和限制见[成果展示](docs/showcase/README_zh.md)。
+
+### 当前候选上可复跑的反馈案例
+
+框架将保存结果的横版图改为真正的配对视觉比较，保留八个显示值、单位与明确尺度；实际渲染、看图后交付可编辑源码，独立搬迁复跑两张 PNG 一致。
+
+![保存结果的反馈对比图](docs/showcase/assets/landscape-feedback-after.png)
+
+[无需 API 密钥，使用源码和保存数据复跑](examples/figure-feedback/README_zh.md) · [前后对照与成本](docs/showcase/README_zh.md#横版比较图当前可复跑导出)
+
+该有界反馈任务用 11 次模型请求、211774 记录 tokens，没有重拟合。这是经检查的开发案例，不是 benchmark 排名；[核查、成本和限制](docs/EVALUATION_zh.md)区分了成果正确性与科学主张。
 
 ## 一项任务怎样继续
 

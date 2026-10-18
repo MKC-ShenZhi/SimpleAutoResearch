@@ -102,14 +102,14 @@ writing = "daily"
 | 原生写作 | 明确 writing 路由，否则保持任务所选连接，包括明确 profile |
 | 视觉／图像 | 已配置且能力匹配的 vision/image 连接，不用文本客户端替代 |
 
-`[model].name` 也接受选择器。裸模型覆盖不能让命名连接换模型，应另建 profile。名称、密钥或能力缺失时失败，不切换提供方。profile 名称须非空且不含冒号。路由为 default、text、code、writing、vision、image。
+`[model].name` 也接受选择器。有目录时，裸模型 ID 只有与按用途解析出的连接模型完全一致才被接受；不会按模型 ID 搜索 profile 或切换连接。选择其他连接请用 `profile:NAME`。名称、密钥或能力缺失时失败，不切换提供方。profile 名称须非空且不含冒号。路由为 default、text、code、writing、vision、image。
 
 | Profile 字段 | 默认值／取值 |
 | --- | --- |
 | `api` | 必填：openai_chat、openai_responses、openai_images、cctq_images_async |
 | `base_url`、`model`、`api_key_env`、`capabilities` | 必填：无用户信息/query/fragment 的 HTTP(S) URL；非空模型；密钥变量名；text/code/vision/image_generate/image_edit 中的非空能力列表 |
 | `proxy_env` | 默认空，引用保存 HTTP(S) 代理 URL 的变量；不接受用户信息/query/fragment，实际地址不持久化 |
-| `stream`、`http2` | false、false；仅 Chat 支持流式 |
+| `stream`、`http2` | false、false；仅 Chat 支持流式；Responses profile 必须使用 `stream=false`，结构化任务也不例外 |
 | `request_timeout_sec` | 180，正数秒 |
 | `max_output_tokens` | 未设，显式正整数输出上限 |
 | `context_input_tokens` | 24000，正整数原生输入工作集目标，不代表提供方上下文容量 |
@@ -147,7 +147,7 @@ HTTP/2 需要执行主机安装 `simple-autoresearch[http2]`，源码用 `uv syn
 | `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`SIMPLE_AR_MODEL` | 旧连接，模型默认 gpt-4o-mini |
 | `SIMPLE_AR_LLM_TIMEOUT_SEC`、`SIMPLE_AR_MAX_OUTPUT_TOKENS` | 180 秒，输出上限未设 |
 | `SIMPLE_AR_LLM_RETRY_ATTEMPTS`、`SIMPLE_AR_LLM_RETRY_BASE_DELAY_SEC`、`SIMPLE_AR_LLM_RETRY_MAX_DELAY_SEC` | 3 次，1/12 秒等待 |
-| `SIMPLE_AR_LLM_BACKEND`、`SIMPLE_AR_LLM_API` | 旧运输/API |
+| `SIMPLE_AR_LLM_BACKEND`、`SIMPLE_AR_LLM_API` | 旧运输/API；API 默认 responses，原生决策须明确设为 chat；这些变量不覆盖目录 profile |
 | `SIMPLE_AR_JSON_RESPONSE_FORMAT`、`SIMPLE_AR_CHAT_TOKEN_LIMIT_PARAM` | 旧 JSON/token 参数政策 |
 | `SIMPLE_AR_LLM_REASONING_EFFORT`、`SIMPLE_AR_LLM_THINKING`、`SIMPLE_AR_LLM_REASONING_OUTPUT_TOKENS`、`SIMPLE_AR_LLM_STREAM` | 旧推理/流式控制 |
 | `SIMPLE_AR_INPUT_PRICE_PER_1M`、`SIMPLE_AR_OUTPUT_PRICE_PER_1M` | 可选费用估计 |

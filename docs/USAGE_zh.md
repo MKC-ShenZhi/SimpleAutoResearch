@@ -87,6 +87,8 @@ uv run simple-ar models --profile daily --purpose code
 可选 writing、vision、image 路由、传输设置及旧环境变量回退见
 [命名连接](CONFIG_REFERENCE_zh.md#命名模型连接)。
 有目录时，`--model env` 使用 text/default 路由。
+无目录时，原生任务须在环境或当前目录 `.env` 设置 `SIMPLE_AR_LLM_API=chat`；
+旧连接默认是 `responses`。Responses 不支持流式，结构化任务也不例外。
 
 ### 提供可访问的材料
 
@@ -144,7 +146,7 @@ uv run simple-ar results "SESSION"
 打开 `results` 打印的实际路径。
 按目标检查正文、来源引用、计算结果、验证状态及未解决项。
 文件或交付记录存在不认证质量。
-暂停时，旧交付可能属于当前反馈之前的请求。
+原生任务暂停时，`results` 不列出当前可复用交付；磁盘上仍可能保留反馈之前的旧文件。
 
 进一步检查产物：
 

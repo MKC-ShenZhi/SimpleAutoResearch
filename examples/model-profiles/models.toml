@@ -17,9 +17,9 @@ image = "paper_art"
 
 [profiles.daily]
 api = "openai_chat"
-base_url = "https://www.cctq.ai/v1"
-model = "gpt-5.6-luna"
-api_key_env = "CCTQ_API_KEY"
+base_url = "https://your-provider.example/v1"
+model = "YOUR_TEXT_MODEL"
+api_key_env = "RESEARCH_API_KEY"
 capabilities = ["text", "code"]
 stream = true
 # Optional: install simple-autoresearch[http2] and test your server's route.
