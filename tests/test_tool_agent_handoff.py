@@ -7950,8 +7950,22 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             ('unauthorized', [{'read_windows': [{'path': '../outside.txt'}]}], '', 1),
             ('original-as-text', [{'read_windows': [{'path': str(original_path)}]},
                                   {'sources': [source]}], '', 1),
-            ('character-limit', [{'read_windows': [{**window, 'max_bytes': 64000},
-                {**window, 'offset_bytes': 64000, 'max_bytes': 32001}]}], '96000', 1),
+            ('capacity-is-not-observation', [{'read_windows': [{**window, 'max_bytes': 64000},
+                {**window, 'offset_bytes': 64000, 'max_bytes': 32001}]},
+                {'materials': [{**window, 'offset_bytes': 64000, 'max_bytes': 32001}]}], 'not inspected', 2),
+            ('capacity-does-not-hide-private', [{'read_windows': [{**window, 'max_bytes': 64000},
+                {**window, 'offset_bytes': 64000, 'max_bytes': 32000}]},
+                {'read_windows': [{'path': str(materials / '.env')}]}], 'Private/runtime paths', 2),
+            ('capacity-does-not-hide-repeat', [{'read_windows': [{**window, 'max_bytes': 64000},
+                {**window, 'offset_bytes': 64000, 'max_bytes': 32000}]},
+                {'read_windows': [{**window, 'max_bytes': 64000}]}], 'distinct windows', 2),
+            ('capacity-does-not-hide-invalid-line', [{'read_windows': [{**window, 'max_bytes': 64000},
+                {**window, 'offset_bytes': 64000, 'max_bytes': 32000}]},
+                {'read_windows': [{**window, 'start_line': 1, 'offset_bytes': 1}]}], 'Line reads require', 2),
+            ('capacity-decision-limit', [{'read_windows': [{**window, 'max_bytes': 64000},
+                {**window, 'offset_bytes': 64000, 'max_bytes': 32000}]},
+                *[{'read_windows': [{**window, 'offset_bytes': 96000, 'max_bytes': 1}]}
+                    for _ in range(5)]], 'decision limit', 6),
             ('decision-limit', [{'read_windows': [{**window, 'offset_bytes': index * 10, 'max_bytes': 10}]}
                 for index in range(6)], 'decision limit', 6),
         ]
@@ -7970,6 +7984,77 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 self.assertNotIn(str(outside), read_paths)
                 self.assertFalse((app.session.store.root / 'tools/writing' /
                     ('writing-inspection-' + name) / 'writer').exists())
+                if name.startswith('capacity-'):
+                    owner = app.session.store.root / 'tools/writing' / ('writing-inspection-' + name)
+                    observations = read_json(owner / 'selection-steps/1/observations.json')
+                    self.assertLessEqual(sum(len(row['data']['text']) for row in observations), 96000)
+                    if name in {'capacity-is-not-observation', 'capacity-decision-limit'}:
+                        step = 1 if name == 'capacity-is-not-observation' else 6
+                        admission = read_json(owner / f'selection-steps/{step}/admission.json')
+                        self.assertEqual(admission[0]['reason'], 'observation_capacity')
+                        self.assertFalse(admission[0]['read'])
+                        self.assertFalse(any(row.get('offset_bytes') == admission[0]['request']['offset_bytes']
+                            and row.get('max_bytes') == admission[0]['request']['max_bytes']
+                            for row in (call.args[1] for call in reads.call_args_list
+                                if call.args[0] == 'read_file')))
+        # The same owner can narrow a rejected line window and finalize its
+        # retained observations without resetting the investigation or budget.
+        table.write_bytes(b'x' * 160000)
+        full = [{**window, 'max_bytes': 64000},
+            {**window, 'offset_bytes': 64000, 'max_bytes': 30000}]
+        rejected_window = {**window, 'start_line': 1, 'max_lines': 1, 'max_bytes': 16000}
+        focused = {**rejected_window, 'max_bytes': 2000}
+        fake.ask_json.reset_mock()
+        fake.ask_json.side_effect = [{'read_windows': full}, {'read_windows': [rejected_window]},
+            {'read_windows': [focused]}, {'materials': [full[0], focused]},
+            {'draft_markdown': 'Supplied bounded observations.'}]
+        with patch.object(app.workspace, 'call', wraps=app.workspace.call) as reads:
+            result = self._compose_document(app, request, 'writing-inspection-capacity-focused')
+        self.assertEqual(fake.ask_json.call_count, 5)
+        prompts = [json.loads(row.args[1]) for row in fake.ask_json.call_args_list[:4]]
+        self.assertEqual([row['observation_capacity']['observed_characters'] for row in prompts],
+            [0, 94000, 94000, 96000])
+        self.assertEqual([row['decisions_remaining'] for row in prompts], [6, 5, 4, 3])
+        self.assertEqual(prompts[2]['observations'], prompts[1]['observations'])
+        self.assertEqual(prompts[2]['read_admission'][0]['character_upper_bound'], 16000)
+        self.assertEqual(prompts[2]['read_admission'][0]['remaining_characters'], 2000)
+        self.assertEqual(prompts[2]['read_admission'][0]['next_choices'],
+            ['finalize_observed_windows', 'request_focused_windows'])
+        self.assertEqual(result.data['material_selection']['selected_windows'], [full[0], focused])
+        actual_reads = [row.args[1] for row in reads.call_args_list if row.args[0] == 'read_file']
+        self.assertFalse(any(row.get('start_line') == 1 and row['max_bytes'] == 16000
+            for row in actual_reads))
+        # Capacity refusal must not turn disappeared or resized evidence into
+        # an invitation to finalize; those remain real investigation failures.
+        for changed in ('missing', 'resized'):
+            with self.subTest(capacity_unavailable=changed):
+                replies = iter([{'read_windows': full},
+                    {'read_windows': [{**window, 'offset_bytes': 96000, 'max_bytes': 16000}]}])
+                def unavailable_before_second(*args, **kwargs):
+                    response = next(replies)
+                    if fake.ask_json.call_count == 2:
+                        if changed == 'missing':
+                            table.unlink()
+                        else:
+                            table.write_bytes(b'x' * 160001)
+                    return response
+                fake.ask_json.reset_mock()
+                fake.ask_json.side_effect = unavailable_before_second
+                try:
+                    unavailable = self._compose_document(app, request,
+                        'writing-inspection-capacity-' + changed, status='error')
+                    if changed == 'resized':
+                        self.assertIn('Materials changed', unavailable.error)
+                    else:
+                        self.assertIn('Material investigation window unavailable', unavailable.error)
+                    self.assertEqual(fake.ask_json.call_count, 2)
+                    failed_owner = app.session.store.root / 'tools/writing' / (
+                        'writing-inspection-capacity-' + changed)
+                    self.assertEqual(len(read_json(failed_owner / 'selection-steps/1/observations.json')), 2)
+                    self.assertFalse((failed_owner / 'selection-response.json').exists())
+                    self.assertFalse((failed_owner / 'writer').exists())
+                finally:
+                    table.write_bytes(b'x' * 160000)
         # Boundary success: final selection on decision six, exactly 96000
         # observed characters, and an explicitly capped line window matches.
         table.write_bytes(b'x' * 160000)
@@ -9837,6 +9922,48 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(self.ledger.to_dict(), accounted)
         self.assertEqual((Path(result.data['project_dir']) / 'utility.py').read_text(),
             generated['files'][0]['content'])
+
+        # Implementation shares the same capacity admission, including short
+        # UTF-8 files whose default byte ceiling exceeds the remaining space.
+        # A rejected window can be followed by valid small reads in the same
+        # decision, then finalized without restarting selection.
+        table.write_bytes(prefix + tail)
+        distractor.write_bytes(b'x' * 120000)
+        large = [{'path': str(distractor), 'max_bytes': 64000},
+            {'path': str(distractor), 'offset_bytes': 64000, 'max_bytes': 30000}]
+        refused = {'path': str(distractor), 'offset_bytes': 94000, 'max_bytes': 16000}
+        self.fake.ask_json.reset_mock()
+        self.fake.ask_json.side_effect = [{'read_windows': large},
+            {'read_windows': [refused, *windows]}, {'materials': selected_windows}, generated]
+        capacity_identity = 'implementation-material-capacity'
+        with patch.object(self.workspace, 'call', wraps=self.workspace.call) as reads:
+            capacity_result = self._prepare_candidate(self.implementation, self.fake, arguments,
+                capacity_identity, calls=4)
+        prompts = [json.loads(call.args[1]) for call in self.fake.ask_json.call_args_list]
+        self.assertEqual([prompt['decisions_remaining'] for prompt in prompts[:3]], [6, 5, 4])
+        self.assertEqual(prompts[1]['observation_capacity']['remaining_characters'], 2000)
+        self.assertEqual(prompts[2]['observation_capacity']['observed_characters'],
+            94000 + len(notes.read_text(encoding='utf-8')) + len(tail.decode()))
+        admission = prompts[2]['read_admission'][0]
+        self.assertEqual(admission['request']['path'], str(distractor))
+        self.assertEqual(admission['reason'], 'observation_capacity')
+        self.assertEqual(admission['remaining_characters'], 2000)
+        self.assertFalse(admission['read'])
+        self.assertFalse(any(call.args[1].get('offset_bytes') == 94000
+            for call in reads.call_args_list if call.args[0] == 'read_file'))
+        self.assertEqual([row['text'] for row in prompts[3]['source_windows']],
+            [notes.read_text(encoding='utf-8'), tail.decode()])
+        capacity_owner = self.run_dir / 'attempts' / capacity_identity / 'implementation/material-selection'
+        self.assertEqual(len(read_json(capacity_owner / 'selection-observations.json')), 4)
+        self.assertEqual(read_json(capacity_owner / 'selection-response.json'), {'materials': selected_windows})
+        retained = {path: path.read_bytes() for path in capacity_owner.rglob('*.json')}
+        accounted = self.ledger.to_dict()
+        with patch.object(self.implementation, '_client', side_effect=AssertionError('No capacity replay model')):
+            replay = self._prepare_candidate(self.implementation, self.fake, arguments,
+                capacity_identity, calls=4)
+        self.assertEqual(replay.data, capacity_result.data)
+        self.assertEqual(self.ledger.to_dict(), accounted)
+        self.assertEqual({path: path.read_bytes() for path in retained}, retained)
 
     def test_implementation_without_material_roots_preserves_legacy_binding(self) -> None:
         from pydantic import ValidationError

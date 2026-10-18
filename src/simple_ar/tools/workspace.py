@@ -48,6 +48,13 @@ class FileWindow(_Path):
     max_lines: int = Field(default=200, ge=1, le=1000,
         description="Line count for start_line reads (default 200); when explicitly supplied for a byte-origin read, also cap that window by lines. max_bytes still bounds bytes and may end within a line. Continue at next_offset_bytes.")
 
+    def validate_read_size(self, size: int) -> None:
+        """Shared file-dependent admission; content and digest still use the open file."""
+        if self.full_digest and size > _FULL_DIGEST_MAX_BYTES:
+            raise ValueError('Full-file digest exceeds 64 MiB')
+        if self.start_line is not None and (self.offset_bytes or size > 256000):
+            raise ValueError('Line reads require offset_bytes=0 and a file at most 256000 bytes; use byte windows otherwise')
+
 
 class _Search(_Path):
     query: str = Field(min_length=1, max_length=512)
@@ -483,13 +490,10 @@ class WorkspaceToolGateway:
                     # Digest is streamed; large files are not materialized or sent to the model.
                     with target.open("rb") as handle:
                         size = os.fstat(handle.fileno()).st_size
-                        if model.full_digest and size > _FULL_DIGEST_MAX_BYTES:
-                            raise ValueError('Full-file digest exceeds 64 MiB')
+                        model.validate_read_size(size)
                         digest = hashlib.file_digest(handle, "sha256").hexdigest() if size <= 256000 or model.full_digest else None
                         offset = model.offset_bytes
                         if model.start_line is not None:
-                            if offset or size > 256000:
-                                raise ValueError("Line reads require offset_bytes=0 and a file at most 256000 bytes; use byte windows otherwise")
                             handle.seek(0)
                             lines = io.BytesIO(handle.read(256001)).readlines()
                             offset = sum(map(len, lines[:model.start_line - 1]))

@@ -108,7 +108,7 @@ Replace endpoint/model with supported values and set the referenced credential p
 | `base_url`, `model`, `api_key_env`, `capabilities` | Required: HTTP(S) URL without userinfo/query/fragment; nonempty model; credential variable name; nonempty list from `text`, `code`, `vision`, `image_generate`, `image_edit` |
 | `proxy_env` | Empty; variable containing HTTP(S) proxy URL without userinfo/query/fragment; resolved URL is not persisted |
 | `stream`, `http2` | `false`, `false`; streaming supported for Chat only; Responses profiles require `stream=false`, including for structured tasks |
-| `request_timeout_sec` | `180`; positive seconds |
+| `request_timeout_sec` | `180`; positive seconds. For finite SDK Chat streaming, also caps the entire stream's wall-clock duration, not just inactivity; arriving chunks do not reset it. Expiry without finish/usage stops without adopting partial content or releasing unknown charges. |
 | `connect_timeout_sec` | Unset keeps the historical TCP/TLS cap of 20 seconds. A finite positive value changes SDK connection waiting, bounded by a finite positive request timeout. Text SDK profiles only; not a generation deadline or a retry allowance. |
 | `max_output_tokens` | Unset; positive output cap |
 | `context_input_tokens` | `24000`; positive native input working-set target, not provider context-window declaration |

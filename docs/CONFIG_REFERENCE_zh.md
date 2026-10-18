@@ -110,7 +110,7 @@ writing = "daily"
 | `base_url`、`model`、`api_key_env`、`capabilities` | 必填：无用户信息/query/fragment 的 HTTP(S) URL；非空模型；密钥变量名；text/code/vision/image_generate/image_edit 中的非空能力列表 |
 | `proxy_env` | 默认空，引用保存 HTTP(S) 代理 URL 的变量；不接受用户信息/query/fragment，实际地址不持久化 |
 | `stream`、`http2` | false、false；仅 Chat 支持流式；Responses profile 必须使用 `stream=false`，结构化任务也不例外 |
-| `request_timeout_sec` | 180，正数秒 |
+| `request_timeout_sec` | 180，正数秒。SDK Chat 流式使用有限值时也限制整条流的总墙钟时长，不只是空闲等待；持续到达的片段不会重置它。到期仍无完成标记/用量即停止，不采用截断内容、不释放未知费用。 |
 | `connect_timeout_sec` | 未设置时保留历史 TCP/TLS 建连上限 20 秒。可设有限正秒数，生效值不超过有限正的请求超时；仅文本 SDK 连接支持，不是生成总时限，也不增加重试次数。 |
 | `max_output_tokens` | 未设，显式正整数输出上限 |
 | `context_input_tokens` | 24000，正整数原生输入工作集目标，不代表提供方上下文容量 |
