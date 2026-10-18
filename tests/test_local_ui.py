@@ -118,6 +118,7 @@ class LocalWorkspaceTests(unittest.TestCase):
                 view = json.loads(request('/api/task?task=retained')[1])
                 self.assertIn('unknown', {e['status'] for e in view['resources']['entries']})
                 self.assertIn('reserved', {e['status'] for e in view['resources']['entries']})
+                self.assertTrue(all({'actual_source', 'reason'} <= set(e) for e in view['resources']['entries']))
                 self.assertEqual((root / 'budget_ledger.json').read_bytes(), before)
                 with patch.dict(os.environ, {'UI_TEST_API_KEY': 'credential-do-not-output'}):
                     (project / 'source.txt').write_text('credential-do-not-output', encoding='utf-8')

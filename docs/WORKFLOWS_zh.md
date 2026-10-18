@@ -185,6 +185,31 @@ SVG 图形按需使用 `rsvg-convert`。不加 `--compile` 时交付 LaTeX 工�
 输出目录须为新目录；保留整个工程、图形与编译日志，逐页检查 PDF。
 编译成功不代表符合所有会议要求。具体文件与依赖见[CLI 参考](CLI_REFERENCE_zh.md)。
 
+### 使用提供的模板（V2.10 开发版）
+
+原生任务可使用可信的 **Pandoc LaTeX 模板**替代默认 ACM 排版：
+
+```bash
+uv run simple-ar start "使用给定报告和可信模板，保留Markdown与参考文献，导出可编辑TeX工程和PDF并渲染各页供查看，说明未核查的投稿要求。" --source ./paper --allow-execution
+```
+
+材料目录只放稿件和所需模板文件，不挂载密钥或无关数据。
+模板须含 `$body$`，并在导言区包含标准
+`$for(header-includes)$$header-includes$$endfor$` 钩子。
+这不是任意会议 TeX 的自动转换，也不自动发现官方模板。
+
+共同出版工具 `export_report` 接受可选 `template`：`path` 相对 Markdown 所在目录，
+`assets` 明确列出同目录平铺配套文件，`engine` 为 `pdflatex` 或已安装的 `xelatex`，
+`top_level_division` 可选 `section`、`chapter`、`part`。
+可让助手检查模板后选择正文层级；代码不按类名猜分支，也不因此重组科学内容。
+配套文件最多32份、总计16 MB，不支持模板片段导入、脚本或自定义构建命令。
+独立 `report-export` 命令仍保持 ACM 默认。
+
+模板、图形字节及导出版本沿原审批和恢复合同。只使用可信 TeX；
+禁用 shell escape 不等于安全沙箱。逐页检查并保留警告；字体、显式列宽、
+页数和匿名要求仍需核查，不能把编译成功当合规认证。
+模型视觉检查还需配置 vision 连接并显式授予 `--allow-vision`；渲染本身不授予视觉访问。
+
 ## 有限复现
 
 **提供：** 论文、目标结论、机器资源、已有实现和数据位置。

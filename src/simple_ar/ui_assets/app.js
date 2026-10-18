@@ -75,9 +75,9 @@ async function refresh() {
     pending: snapshot.pending, stop_requested: snapshot.stop_requested, worker_error: snapshot.worker_error});
   $('resources').textContent = pretty(snapshot.resources);
   $('budgetSummary').textContent = Object.entries(snapshot.resources.limits).map(([key, limit]) =>
-    key + '：剩余 ' + snapshot.resources.remaining[key] + ' / 上限 ' + limit).join('\n')
+    key + '：剩余 ' + snapshot.resources.remaining[key] + ' / 当前授权额度 ' + limit).join('\n')
     + '\n未知用量维度：' + (snapshot.resources.unknown_dimensions.join('、') || '无')
-    + '\n未知预留未被释放；详细记录见下方原始账本。';
+    + '\n未知预留未被释放。续额后的额度窗口不等于历次累计耗用；全部历史与授权理由保留在原始账本。';
   $('approvalBox').hidden = !snapshot.approval;
   $('proposal').textContent = pretty(snapshot.approval);
   $('resume').disabled = snapshot.worker_live;

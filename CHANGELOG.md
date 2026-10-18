@@ -6,6 +6,7 @@ User-visible changes, newest first. Entries describe behavior on their date; lat
 
 ## Unreleased — V2.10
 
+- Support explicit trusted Pandoc LaTeX templates through the existing publication owner, with byte-bound companions and declared heading hierarchy. Share figure bounds and wrapping tables across layouts; keep ACM/history defaults and report unchecked compliance honestly.
 - Add an experimental loopback workspace client over the native task owner: explicit sources/connections/caps, saved-result browsing, feedback, exact approvals and cooperative boundary stops. No separate scheduler or ledger; publication adaptation remains pending.
 - Explicit native text-connection switches record pinned destinations and intent in the original journal without replaying work, changing accounting or invalidating saved delivery; pending operations retain their recovery contract.
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,61 @@ from urllib.parse import unquote, urlsplit
 
 class ReportExportError(ValueError):
     pass
+
+
+def publication_template_inputs(root: Path, template: dict[str, Any]) -> dict[str, Path]:
+    """Explicit, flat trusted-TeX bundle; no discovery, downloads or scripts.
+
+    Paths are relative to the manuscript, companions to the template directory.
+    Copy companions to the project root so ordinary TeX class/style lookup works.
+    This bounds imported bytes, not the behavior of trusted TeX or installed packages.
+    """
+    root = root.resolve()
+    name = template['path']
+    relative = Path(name)
+    if (relative.is_absolute() or '\\' in name or '..' in relative.parts
+            or relative.suffix.lower() not in {'.tex', '.latex'}):
+        raise ReportExportError('Use a manuscript-relative Pandoc .tex/.latex template without traversal')
+    assets = template.get('assets', [])
+    if len(assets) > 32 or len({item.lower() for item in assets}) != len(assets):
+        raise ReportExportError('Template companions must be unique, at most 32 files')
+    files = {'template.latex': root / relative}
+    for asset in assets:
+        if (not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,100}', asset)
+                or Path(asset).suffix.lower() not in {'.cls', '.sty', '.bst', '.tex', '.png', '.jpg', '.jpeg', '.pdf'}
+                or asset.lower() in {'main.tex', 'main.pdf', 'body.tex', 'references.bib', 'source.md', 'template.latex'}):
+            raise ReportExportError('Unsupported or reserved template companion filename')
+        files[asset] = root / relative.parent / asset
+    total = 0
+    for target, path in files.items():
+        resolved = path.resolve()
+        if not resolved.is_relative_to(root) or not resolved.is_file():
+            raise ReportExportError('Missing or out-of-scope template input: ' + str(path))
+        if any(part.startswith('.') for part in (*path.relative_to(root).parts, *resolved.relative_to(root).parts)):
+            raise ReportExportError('Private template inputs are not supported')
+        total += resolved.stat().st_size
+        if total > 16_000_000:
+            raise ReportExportError('Template bundle exceeds 16 MB')
+    text = files['template.latex'].read_text(encoding='utf-8')
+    header_hook = re.search(r'\$for\(header-includes\)\$\s*\$header-includes\$\s*\$endfor\$', text)
+    if ('$body$' not in text or header_hook is None or r'\begin{document}' not in text
+            or not header_hook.end() <= text.index(r'\begin{document}') < text.index('$body$')):
+        raise ReportExportError('Pandoc template requires $body$ and the standard header-includes hook in the preamble')
+    # Pandoc partials could read an unlisted file during template expansion.
+    # Support variables/conditionals/loops only, not partial/function syntax.
+    # Consume every slot in order, including escaped literal dollars ($$), so
+    # parentheses in ordinary TeX between slots are not mistaken for partials.
+    directives = [match[1] for match in re.finditer(r'\$\$|\$([^$]*)\$', text) if match[1] is not None]
+    # Reject alternative braced directives as well, so a partial cannot evade
+    # this deliberately narrow dialect. No fallback to Pandoc's partial search.
+    if '${' in text or any(('(' in item or ')' in item)
+            and not re.fullmatch(r'(?:if|elseif|for)\([A-Za-z0-9_.-]+\)', item) for item in directives):
+        raise ReportExportError('Pandoc template partials/functions are not supported; inline them explicitly')
+    if template.get('engine', 'pdflatex') not in {'pdflatex', 'xelatex'}:
+        raise ReportExportError('Supported template engines: pdflatex, xelatex; BibTeX only')
+    if template.get('top_level_division') not in {None, 'section', 'chapter', 'part'}:
+        raise ReportExportError('Supported top-level divisions: section, chapter, part')
+    return files
 
 
 def _run(argv: list[str], *, cwd: Path, text: str | None = None, timeout: int = 60,
@@ -212,7 +268,23 @@ def _prepare_technical_content(fragments: Any, output: Path) -> None:
     """Prepare only the TeX AST; canonical code and display text stay intact."""
     block_index = 0
     for node in _nodes(fragments):
-        if node.get("t") == "CodeBlock":
+        if node.get('t') == 'Table':
+            # Pandoc <=2.9/API1.20 uses five Table fields with numeric widths;
+            # modern Table uses six fields with alignment/ColWidth pairs. Both
+            # select nonwrapping natural columns when every width is default.
+            # Let the writer wrap within the available width without scaling
+            # type or losing longtable paging. Any authored width is preserved.
+            columns = node['c'][2]
+            if len(node['c']) == 5:
+                if columns and all(width == 0 for width in columns):
+                    node['c'][2] = [1 / len(columns)] * len(columns)
+            elif len(node['c']) == 6:
+                if columns and all(width['t'] == 'ColWidthDefault' for _, width in columns):
+                    for column in columns:
+                        column[1] = {'t': 'ColWidth', 'c': 1 / len(columns)}
+            else:
+                raise ReportExportError('Unsupported Pandoc Table protocol; preserve the source and renderer version')
+        elif node.get("t") == "CodeBlock":
             block_index += 1
             path = output / "code" / f"block-{block_index}.txt"
             path.parent.mkdir(exist_ok=True)
@@ -261,9 +333,10 @@ def _scientific_unicode_preamble(*fragments: str) -> str:
 
 def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None = None,
                       compile_pdf: bool = False, render_preview: bool = False, body_name: str = "report_body.md",
-                      runner: Callable | None = None, validate_asset: Callable[[Path], None] | None = None,
-                      caption_owner: Literal['manifest', 'markdown'] = 'manifest') -> dict[str, Any]:
-    """Create a new editable acmart manuscript from the canonical citation body.
+                      runner: Callable | None = None, validate_asset: Callable[[Path], str | None] | None = None,
+                      caption_owner: Literal['manifest', 'markdown'] = 'manifest',
+                      template: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Compatibility entry point for the shared Pandoc publication converter.
 
     Pandoc and optional TeX/librsvg are external rendering dependencies. No
     model is called and no upstream evidence or session state is changed.
@@ -271,6 +344,7 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
     workspace publication explicitly selects Markdown ownership.
     """
     root, output = report_dir.resolve(), output_dir.resolve()
+    template_files = publication_template_inputs(root, template) if template is not None else {}
     if caption_owner not in {'manifest', 'markdown'}:
         raise ReportExportError('Unknown figure caption owner')
     if render_preview and not compile_pdf:
@@ -285,7 +359,7 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
         raise ReportExportError("Choose a new output directory; existing exports are retained.")
     pandoc = shutil.which("pandoc")
     if not pandoc:
-        raise ReportExportError("Install Pandoc to export an ACM project. No model or experiment is required.")
+        raise ReportExportError("Install Pandoc to export a publication project. No model or experiment is required.")
     source = body_path.read_text(encoding="utf-8")
     # Pandoc otherwise expands tabs before parsing literal code. Preserve
     # code bytes here; TeX owns their display width, not source normalization.
@@ -360,6 +434,22 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
         manifest['pdf_preview'] = {'rendered': False, 'visual_reviewed': False,
             'max_pages': 12, 'dpi': 120, 'max_dimension_px': 1600, 'pages': []}
     try:
+        if template_files:
+            manifest['format'] = 'pandoc-latex-template'
+            manifest['template'] = {'path': template['path'], 'engine': template.get('engine', 'pdflatex'),
+                'inputs': {}, 'trust': 'User-supplied trusted TeX; restricted compilation is not a sandbox'}
+            for target, path in template_files.items():
+                content = path.read_bytes()
+                digest = hashlib.sha256(content).hexdigest()
+                if validate_asset is not None:
+                    bound_digest = validate_asset(path)
+                    if bound_digest is not None and bound_digest != digest:
+                        raise ReportExportError('Template input changed during copying')
+                (output / target).write_bytes(content)
+                manifest['template']['inputs'][path.relative_to(root).as_posix()] = digest
+            manifest['compliance'] = {'official_requirements': 'unverified', 'anonymity': 'unverified',
+                'page_limits': 'unverified', 'visual_layout': 'unverified',
+                'citation_keys': 'checked', 'markdown_image_paths': 'checked'}
         image_targets = {url: _copy_image(path, output, index, runner=runner)
                          for index, (url, path) in enumerate(image_sources.items(), start=1)}
         # The body may prefer a PNG preview while its registered figure has
@@ -404,7 +494,9 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
 
         def latex(fragment: list[dict]) -> str:
             document = {**ast, "blocks": fragment}
-            return run([pandoc, "--from=json", "--to=latex", "--natbib", "--no-highlight"],
+            division = template.get('top_level_division') if template_files else None
+            return run([pandoc, "--from=json", "--to=latex", "--natbib", "--no-highlight",
+                        *(['--top-level-division=' + division] if division else [])],
                         cwd=output, text=json.dumps(document)).strip()
 
         heading = latex([{"t": "Plain", "c": title_inlines}])
@@ -432,18 +524,10 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
             # falls back to bitmap fonts. Keep protrusion, but do not require
             # scalable fonts just to export an otherwise valid manuscript.
             "\\microtypesetup{expansion=false}\n"
-            + _scientific_unicode_preamble(heading, body_tex, abstract_tex, bibliography, source)
+            + '$for(header-includes)$\n$header-includes$\n$endfor$\n'
             +
             "\\providecommand{\\tightlist}{\\setlength{\\itemsep}{0pt}\\setlength{\\parskip}{0pt}}\n"
             "\\providecommand{\\passthrough}[1]{#1}\n"
-            "\\providecommand{\\pandocbounded}[1]{#1}\n"
-            # Preserve intrinsic figure sizing (e.g. column-width SVG/PDF),
-            # Shrink to both page dimensions, reserving space for captions.
-            "\\makeatletter\n"
-            "\\def\\sarmaxwidth{\\ifdim\\Gin@nat@width>\\linewidth\\linewidth\\else\\Gin@nat@width\\fi}\n"
-            "\\def\\sarmaxheight{\\ifdim\\Gin@nat@height>0.8\\textheight0.8\\textheight\\else\\Gin@nat@height\\fi}\n"
-            "\\makeatother\n"
-            "\\setkeys{Gin}{width=\\sarmaxwidth,height=\\sarmaxheight,keepaspectratio}\n"
             "\\settopmatter{printacmref=false}\n"
             "\\citestyle{acmnumeric}\n"
             # ACM can emit literal nested brackets for missing authors/dates.
@@ -457,14 +541,51 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
             # address footnote; users can add real authors/addresses themselves.
             "\\authorsaddresses{}\n"
             "\\setlength{\\emergencystretch}{1em}\n"
-            f"\\title[Research report]{{{heading}}}\n\\begin{{document}}\n"
-            + (f"\\begin{{abstract}}\n{abstract_tex}\n\\end{{abstract}}\n" if abstract_tex else "")
-            + "\\maketitle\n\\input{body.tex}\n"
-            + ("\\bibliographystyle{ACM-Reference-Format}\n\\bibliography{references}\n" if citations else "")
+            "\\title[Research report]{$title$}\n\\begin{document}\n"
+            + "$if(abstract)$\\begin{abstract}\n$abstract$\n\\end{abstract}\n$endif$"
+            + "\\maketitle\n$body$\n"
+            + "$if(bibliography)$\\bibliographystyle{ACM-Reference-Format}\n\\bibliography{references}\n$endif$"
             + "\\end{document}\n"
         )
+        if not template_files:
+            (output / 'template.latex').write_text(main, encoding='utf-8')
+        # The same standalone Pandoc expansion owns both built-in and supplied
+        # layouts. Only exporter-created metadata reaches the trusted template;
+        # canonical YAML/raw TeX remains excluded by the existing reader.
+        preamble = ("\\usepackage{longtable,booktabs,array,calc}\n"
+            "\\usepackage{fvextra,seqsplit,etoolbox}\n"
+            "\\robustify\\seqsplit\n"
+            "\\providecommand{\\tightlist}{\\setlength{\\itemsep}{0pt}\\setlength{\\parskip}{0pt}}\n"
+            "\\providecommand{\\passthrough}[1]{#1}\n"
+            "\\setlength{\\emergencystretch}{1em}\n") if template_files else ''
+        # One graphicx owner for built-in and supplied templates, including
+        # older Pandoc includegraphics and newer pandocbounded output. Preserve
+        # small intrinsic sizes; shrink large figures to both page dimensions
+        # with room for captions. Tables remain unscaled, wrapping longtables.
+        preamble += ("\\usepackage{graphicx}\n"
+            "\\providecommand{\\pandocbounded}[1]{#1}\n"
+            "\\makeatletter\n"
+            "\\def\\sarmaxwidth{\\ifdim\\Gin@nat@width>\\linewidth\\linewidth\\else\\Gin@nat@width\\fi}\n"
+            "\\def\\sarmaxheight{\\ifdim\\Gin@nat@height>0.8\\textheight0.8\\textheight\\else\\Gin@nat@height\\fi}\n"
+            "\\makeatother\n"
+            "\\setkeys{Gin}{width=\\sarmaxwidth,height=\\sarmaxheight,keepaspectratio}\n")
+        if not template_files or template.get('engine', 'pdflatex') == 'pdflatex':
+            preamble += _scientific_unicode_preamble(heading, body_tex, abstract_tex, bibliography, source)
+        def meta_tex(value: str) -> dict:
+            return {'t': 'MetaBlocks', 'c': [{'t': 'RawBlock', 'c': ['latex', value]}]}
+        metadata = {'title': meta_tex(heading),
+            'header-includes': {'t': 'MetaList', 'c': [meta_tex(preamble)]}}
+        if abstract_tex:
+            metadata['abstract'] = meta_tex(abstract_tex)
+        if citations:
+            metadata['bibliography'] = {'t': 'MetaString', 'c': 'references.bib'}
+            metadata['biblio-style'] = {'t': 'MetaString', 'c': 'plainnat' if template_files else 'ACM-Reference-Format'}
+        main = run([pandoc, '--from=json', '--to=latex', '--natbib', '--no-highlight', '--wrap=none',
+            '--standalone', '--template=template.latex'], cwd=output,
+            text=json.dumps({**ast, 'meta': metadata,
+                'blocks': [{'t': 'RawBlock', 'c': ['latex', r'\input{body.tex}']}]}))
         (output / "main.tex").write_text(main, encoding="utf-8")
-        (output / "README.txt").write_text(
+        readme = (
             "Editable ACM acmart manuscript demonstration, not a conference-specific submission.\n"
             "Edit main.tex/body.tex/references.bib and the figures. The export does not certify research claims.\n"
             "Class and bibliography style: https://ctan.org/pkg/acmart (install via your TeX distribution).\n"
@@ -480,12 +601,36 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
             "Native experiment record links and their explicitly registered source copies travel with this project.\n"
             "Other local source-evidence links are retained as labels; their original targets are listed in export.json.\n"
             "No arbitrary linked datasets or source directories are copied automatically.\n"
-            "The built-in compile option restricts file access and records logs. Add author/venue metadata yourself.\n",
-            encoding="utf-8",
+            "The built-in compile option restricts file access and records logs. Add author/venue metadata yourself.\n"
         )
+        if template_files:
+            readme = (
+                'Editable publication converted with the explicitly supplied Pandoc LaTeX template.\n'
+                'Canonical Markdown, bibliography and figure inputs were not edited. source.md uses portable figure paths.\n'
+                'Keep template.latex, companion files, code/ and figures/ with main.tex/body.tex/references.bib.\n'
+                'Supported contract: $body$, $title$, $abstract$, the standard '
+                '$for(header-includes)$$header-includes$$endfor$ hook (required in preamble), '
+                '$bibliography$, $biblio-style$; no Pandoc partials, scripts, filters, downloads or arbitrary metadata.\n'
+                'header-includes contains renderer-owned support only; source YAML metadata is excluded.\n'
+                'Templates own class, packages, title/abstract placement and BibTeX style. '
+                'Only pdflatex or xelatex with BibTeX is supported; no Biber or external build recipes.\n'
+                'Body hierarchy uses the declared top_level_division when supplied; no class-name inference.\n'
+                'pdfLaTeX support covers ordinary Latin text and the bounded scientific Greek/math helper, not CJK.\n'
+                'Broader Unicode requires optional xelatex and suitable installed fonts/packages selected by the template; '
+                'no fonts are provisioned and CJK rendering is unverified.\n'
+                'Fenced code remains literal in code/block-*.txt; fvextra and seqsplit are required.\n'
+                'Trusted TeX can execute TeX primitives and installed packages. No shell escape is enabled; '
+                'file restrictions and resource limits are not a security sandbox. Use only trusted templates/companions.\n'
+                'No official requirements, author anonymity, page limit or visual compliance is certified. '
+                'Inspect export.json, build.log and any requested full preview independently.\n'
+                'Missing authors/dates remain missing. External evidence paths are listed in export.json, not copied.\n'
+                f"Rebuild here: {template.get('engine', 'pdflatex')} -no-shell-escape -halt-on-error main.tex; "
+                'bibtex main (if cited); repeat the TeX command twice.\n')
+        (output / 'README.txt').write_text(readme, encoding='utf-8')
         manifest["status"] = "exported"
         if compile_pdf:
-            manifest.update(_compile(output, bool(citations), runner=runner))
+            manifest.update(_compile(output, bool(citations), runner=runner,
+                **({'engine': template.get('engine', 'pdflatex')} if template_files else {})))
         if render_preview:
             if not manifest['compiled']:
                 raise ReportExportError(manifest.get('compile_note') or "PDF compilation did not produce a PDF; requested preview unavailable")
@@ -539,8 +684,11 @@ def _render_pdf_preview(output: Path, *, runner: Callable) -> dict[str, Any]:
             'pages': [path.relative_to(output).as_posix() for path in expected]}
 
 
-def _compile(output: Path, has_citations: bool, *, runner: Callable | None = None) -> dict[str, Any]:
-    latex, bibtex = shutil.which("pdflatex"), shutil.which("bibtex")
+def _compile(output: Path, has_citations: bool, *, runner: Callable | None = None,
+             engine: str = 'pdflatex') -> dict[str, Any]:
+    if engine not in {'pdflatex', 'xelatex'}:
+        raise ReportExportError('Unsupported TeX engine')
+    latex, bibtex = shutil.which(engine), shutil.which("bibtex")
     if not latex or (has_citations and not bibtex):
         return {"status": "exported", "compiled": False, "compile_note": "TeX unavailable; editable source retained."}
     env = {**os.environ, "openin_any": "p", "openout_any": "p", "shell_escape": "f"}
@@ -557,6 +705,6 @@ def _compile(output: Path, has_citations: bool, *, runner: Callable | None = Non
         (output / "build.log").write_text("\n".join(logs), encoding="utf-8")
     compiled = (output / "main.pdf").is_file()
     final_log = (output / "main.log").read_text(encoding="utf-8", errors="replace") if (output / "main.log").is_file() else ""
-    warnings = re.findall(r"(?:Class \w+ Warning|LaTeX Warning|Package \w+ Warning):[^\n]*|Overfull \\[hv]box[^\n]*", final_log)
+    warnings = re.findall(r"(?:Class \w+ Warning|LaTeX Warning|Package \w+ Warning):[^\n]*|Overfull \\[hv]box[^\n]*|Missing character:[^\n]*", final_log)
     return {"status": "compiled" if compiled else "compile_failed", "compiled": compiled,
             "compile_warnings": list(dict.fromkeys(warnings))}

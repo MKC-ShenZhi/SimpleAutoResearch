@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import unittest
@@ -23,7 +24,155 @@ def _ast(image: str | None = None, citation: str = "p1") -> dict:
     return {"pandoc-api-version": [1, 22], "meta": {"header-includes": "untrusted"}, "blocks": blocks}
 
 
+def _standalone_fixture(document: dict, output: Path) -> str:
+    """Fake only the known built-in template slots; real Pandoc is server QA."""
+    template = (output / 'template.latex').read_text(encoding='utf-8')
+    metadata = document['meta']
+    template = re.sub(r'\$if\(([^)]+)\)\$(.*?)\$endif\$',
+        lambda match: match[2] if match[1] in metadata else '', template, flags=re.S)
+    template = template.replace('$for(header-includes)$', '').replace('$endfor$', '')
+    for key, value in metadata.items():
+        if value['t'] == 'MetaList':
+            text = '\n'.join(item['c'][0]['c'][1] for item in value['c'])
+        else:
+            text = value['c'] if value['t'] == 'MetaString' else value['c'][0]['c'][1]
+        template = template.replace('$' + key + '$', text)
+    return template.replace('$body$', document['blocks'][0]['c'][1])
+
+
 class ReportExportTests(unittest.TestCase):
+    def test_explicit_template_uses_bound_publication_owner_and_retains_failed_versions(self):
+        from types import SimpleNamespace
+        from simple_ar.core.budget import BudgetLedger
+        from simple_ar.tools.workspace import WorkspaceToolGateway
+        from simple_ar.tools.publication import ExportRequest, PublicationToolGateway, export_input_binding
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = BudgetLedger({'process_invocations': 30, 'process_wall_seconds': 600},
+                storage_path=root / 'budget.json')
+            workspace = WorkspaceToolGateway(root, {}, ledger)
+            source = workspace.workspace / 'draft.md'
+            source.write_text('# Résumé α\n\nBody [@p1].\n', encoding='utf-8')
+            (source.parent / 'references.bib').write_text('@misc{p1, title={Evidence}}', encoding='utf-8')
+            bundle = source.parent / 'layout'
+            bundle.mkdir()
+            template = bundle / 'article.latex'
+            template.write_text('\\documentclass{article}\n'
+                '$for(header-includes)$\n$header-includes$\n$endfor$\n\\usepackage{natbib}\n'
+                '\\title{$title$}\n\\begin{document}\n\\maketitle\n$abstract$\n$body$\n'
+                '\\bibliographystyle{local}\n\\bibliography{references}\n\\end{document}\n', encoding='utf-8')
+            companion = bundle / 'local.bst'
+            companion.write_text('% trusted bibliography style fixture', encoding='utf-8')
+            arguments = {'markdown': 'workspace/draft.md', 'compile_pdf': False,
+                'template': {'path': 'layout/article.latex', 'assets': ['local.bst'], 'engine': 'xelatex'}}
+            request = ExportRequest.model_validate(arguments)
+            approved = export_input_binding(source, request)
+            self.assertIn('layout/article.latex', approved['inputs'])
+            self.assertIn('layout/local.bst', approved['inputs'])
+            self.assertNotIn('template', export_input_binding(source, ExportRequest(markdown=arguments['markdown'])))
+            gateway = PublicationToolGateway(root, workspace, ledger)
+            standalone = []
+            failure = False
+
+            def render(spec, **kwargs):
+                self.assertIs(kwargs['budget_ledger'], ledger)
+                self.assertNotIn('OPENAI_API_KEY', spec.env)
+                spec.output_dir.mkdir(parents=True, exist_ok=True)
+                if '--to=json' in spec.argv:
+                    text = json.dumps(_ast())
+                else:
+                    document = json.loads(Path(spec.argv[-1]).read_text(encoding='utf-8'))
+                    if '--standalone' in spec.argv:
+                        standalone.append(document)
+                        self.assertIn('--template=template.latex', spec.argv)
+                        text = _standalone_fixture(document, spec.cwd)
+                    else:
+                        text = 'Converted résumé α'
+                (spec.output_dir / 'stdout.log').write_text(text, encoding='utf-8')
+                return SimpleNamespace(returncode=int(failure and '--standalone' in spec.argv), stop_reason=None,
+                    record={'streams': {'stdout': {'log_bytes_discarded': 0}}})
+
+            with patch('simple_ar.report.export.shutil.which', return_value='pandoc'), \
+                    patch('simple_ar.tools.publication.run_process', side_effect=render) as processes:
+                result = gateway.call('export_report', arguments, identity='template')
+                self.assertEqual(result.status, 'ok', result.error)
+                exported = workspace.workspace / 'publications/template'
+                self.assertEqual((exported / 'template.latex').read_bytes(), template.read_bytes())
+                self.assertEqual((exported / 'local.bst').read_bytes(), companion.read_bytes())
+                self.assertIn('workspace/publications/template/local.bst', result.artifacts)
+                self.assertEqual(result.data['manifest']['format'], 'pandoc-latex-template')
+                self.assertEqual(result.data['manifest']['compliance']['anonymity'], 'unverified')
+                header = standalone[0]['meta']['header-includes']
+                self.assertEqual(header['t'], 'MetaList')
+                renderer_preamble = header['c'][0]['c'][0]['c'][1]
+                self.assertIn('\\usepackage{fvextra,seqsplit,etoolbox}', renderer_preamble)
+                self.assertNotIn('untrusted', renderer_preamble)
+                self.assertNotIn('DeclareUnicodeCharacter', renderer_preamble)
+                count = processes.call_count
+                self.assertEqual(gateway.call('export_report', arguments, identity='template').data, result.data)
+                for path in (template, companion):
+                    original = path.read_bytes()
+                    path.write_bytes(original + b'\n% changed')
+                    self.assertNotEqual(export_input_binding(source, request), approved)
+                    changed = gateway.call('export_report', arguments, identity='template')
+                    self.assertEqual(changed.status, 'error')
+                    self.assertIn('inputs changed', changed.error)
+                    path.write_bytes(original)
+                self.assertEqual(processes.call_count, count)
+                (exported / 'local.bst').write_text('% changed after export', encoding='utf-8')
+                self.assertIn('project files changed', gateway.call('export_report', arguments, identity='template').error)
+                failure = True
+                failed = gateway.call('export_report', arguments, identity='failed-template')
+                self.assertEqual(failed.status, 'error')
+                self.assertEqual(failed.data['manifest']['status'], 'failed')
+                count = processes.call_count
+                self.assertEqual(gateway.call('export_report', arguments, identity='failed-template').status, 'error')
+                self.assertEqual(processes.call_count, count)
+                self.assertTrue((root / 'tools/processes/failed-template-render-1/stdout.log').is_file())
+            self.assertEqual(source.read_text(encoding='utf-8'), '# Résumé α\n\nBody [@p1].\n')
+
+    def test_template_scope_partials_missing_companions_and_engine_fail_before_processes(self):
+        from simple_ar.report.export import publication_template_inputs
+        from simple_ar.tools.publication import ExportRequest, export_input_binding
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = self._source(root)
+            template = source / 'layout.latex'
+            valid = ('$for(header-includes)$\n$header-includes$\n$endfor$\n'
+                '$if(title)$$title$$endif$\n\\begin{document}\n$body$')
+            template.write_text(valid, encoding='utf-8')
+            self.assertEqual(set(publication_template_inputs(source, {'path': template.name})), {'template.latex'})
+            for options in ({'path': '../outside.tex'}, {'path': str(template.resolve())},
+                    {'path': 'layout.latex', 'assets': ['missing.sty']},
+                    {'path': 'layout.latex', 'assets': ['main.pdf']},
+                    {'path': 'layout.latex', 'assets': ['run.py']},
+                    {'path': 'layout.latex', 'engine': 'lualatex'},
+                    {'path': 'layout.latex', 'top_level_division': 'automatic'}):
+                with self.subTest(options=options), self.assertRaises(ReportExportError):
+                    publication_template_inputs(source, options)
+            for text in ('$body$', valid.replace('$for(header-includes)$', ''),
+                    valid + '$other()$', valid + '${other()}', valid + '$other(\n)$'):
+                template.write_text(text, encoding='utf-8')
+                with self.subTest(text=text), self.assertRaises(ReportExportError):
+                    publication_template_inputs(source, {'path': template.name})
+            template.write_text(valid, encoding='utf-8')
+            request = ExportRequest(markdown='workspace/report_body.md', template={'path': template.name})
+            with self.assertRaisesRegex(ValueError, 'Derived publication'):
+                export_input_binding(source / 'report_body.md', request, output_root=source)
+            # A symlink cannot add a template from outside the manuscript scope.
+            outside = root / 'outside.latex'
+            outside.write_text(valid, encoding='utf-8')
+            link = source / 'linked.latex'
+            try:
+                link.symlink_to(outside)
+            except OSError:
+                pass  # Windows may disallow symlink creation; server exercises it.
+            else:
+                with self.assertRaisesRegex(ReportExportError, 'out-of-scope'):
+                    publication_template_inputs(source, {'path': link.name})
+
     def test_manifest_caption_binding_handles_both_pandoc_shapes_without_deleting_discussion(self):
         from copy import deepcopy
         from simple_ar.report.export import _bind_figure_captions
@@ -177,6 +326,22 @@ class ReportExportTests(unittest.TestCase):
             root = Path(tmp)
             source = self._source(root)
             document = _ast()
+            tables = []
+            for widths in ([None] * 3, [None] * 5, [0.3, 0.7], [None, 0.6]):
+                columns = [[{'t': ('AlignLeft', 'AlignCenter', 'AlignRight')[index % 3]},
+                    {'t': 'ColWidthDefault'} if width is None else {'t': 'ColWidth', 'c': width}]
+                    for index, width in enumerate(widths)]
+                # Modern Pandoc Table: attributes, caption, ColSpecs, head,
+                # bodies, foot. Real parser/writer coverage lives alongside
+                # the two supplied-layout compile/preview integration cases.
+                tables.append({'t': 'Table', 'c': [['', [], []], [None, []], columns,
+                    [['', [], []], []], [], [['', [], []], []]]})
+            # Independent legacy AST shapes, as emitted by installed Pandoc
+            # 2.9; the real integration below uses one actual parser version.
+            for widths in ([0, 0, 0], [0.3, 0.7], [0, 0.6]):
+                tables.append({'t': 'Table', 'c': [[], [{'t': 'AlignRight'}] * len(widths),
+                    widths, [], []]})
+            document['blocks'].extend(tables)
             document["blocks"].append({"t": "Para", "c": [
                 {"t": "Str", "c": "train/validation/calibration/test"},
                 {"t": "Space"}, {"t": "Str", "c": "10,123/3,639/2,048/5,803"},
@@ -203,6 +368,8 @@ class ReportExportTests(unittest.TestCase):
                 data = json.loads(kwargs["text"])
                 if "--to=latex" in argv:
                     converted.append(data)
+                    if '--standalone' in argv:
+                        return _standalone_fixture(data, kwargs['cwd'])
                 else:
                     markdown.append(data)
                 return "converted text"
@@ -224,6 +391,17 @@ class ReportExportTests(unittest.TestCase):
                 r'\VerbatimInput[breaklines=true,breakanywhere=true,breaksymbolleft={},breaksymbolright={},breakanywheresymbolpre={},breakanywheresymbolpost={}]{code/block-1.txt}'])
             self.assertEqual((root / 'acm/code/block-1.txt').read_text(), code)
             self.assertEqual(markdown[0]['blocks'][-2:], document['blocks'][-2:])
+            rendered_tables = [block for block in converted[1]['blocks'] if block['t'] == 'Table']
+            for index, fraction in ((0, 1 / 3), (1, 1 / 5)):
+                self.assertEqual([column[1] for column in rendered_tables[index]['c'][2]],
+                    [{'t': 'ColWidth', 'c': fraction}] * len(tables[index]['c'][2]))
+                self.assertEqual([column[0] for column in rendered_tables[index]['c'][2]],
+                    [column[0] for column in tables[index]['c'][2]])
+            self.assertEqual(rendered_tables[2:4], tables[2:4])  # Explicit and mixed widths stay authored.
+            self.assertEqual(rendered_tables[4]['c'][2], [1 / 3] * 3)
+            self.assertEqual(rendered_tables[4]['c'][1], tables[4]['c'][1])
+            self.assertEqual(rendered_tables[5:], tables[5:])
+            self.assertEqual([block for block in markdown[0]['blocks'] if block['t'] == 'Table'], tables)
             self.assertIn(r'\usepackage{fvextra,seqsplit,etoolbox,xparse}', (root / 'acm/main.tex').read_text())
             self.assertIn("Missing authors/dates remain missing", (root / "acm/README.txt").read_text())
 
@@ -244,6 +422,8 @@ class ReportExportTests(unittest.TestCase):
                     return json.dumps(_ast())
                 document = json.loads(kwargs["text"])
                 calls.append(document)
+                if '--standalone' in argv:
+                    return _standalone_fixture(document, kwargs['cwd'])
                 return "converted text"
             with patch("simple_ar.report.export.shutil.which", return_value="pandoc"), patch("simple_ar.report.export._run", side_effect=convert):
                 result = export_acm_report(source, root / "acm")
@@ -251,7 +431,10 @@ class ReportExportTests(unittest.TestCase):
             self.assertFalse(result["compiled"])
             self.assertFalse(result["quality_checked"])
             self.assertNotIn('pdf_preview', result)  # Default exports keep their historical shape.
-            self.assertTrue(all(document["meta"] == {} for document in calls))
+            self.assertNotIn('template', result)
+            self.assertNotIn('compliance', result)
+            self.assertTrue(all(document["meta"] == {} for document in calls[:-1]))
+            self.assertEqual(set(calls[-1]['meta']), {'title', 'abstract', 'header-includes', 'bibliography', 'biblio-style'})
             body_headers = [block["c"][0] for block in calls[1]["blocks"] if block["t"] == "Header"]
             self.assertEqual(body_headers, [1])
             self.assertEqual((root / "acm/source.md").read_text(), "converted text")

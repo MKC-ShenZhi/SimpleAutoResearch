@@ -7,8 +7,9 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 
-from simple_ar.report.export import export_acm_report, _nodes
+from simple_ar.report.export import ReportExportError, export_acm_report, _nodes, _run
 
 
 IDENTIFIER = 'Za71c9' * 32
@@ -24,6 +25,149 @@ TECHNICAL_BODY = ('\n`' + INLINE_COMMAND + '`\n\nInline identifier `' + IDENTIFI
     all(shutil.which(name) for name in ("pandoc", "rsvg-convert", "pdflatex", "bibtex")),
     "Opt-in integration requires Pandoc, librsvg and acmart-equipped TeX")
 class PortableExportIntegrationTests(unittest.TestCase):
+    @unittest.skipUnless(all(shutil.which(name) for name in ('pdfinfo', 'pdftoppm', 'pdftotext')),
+        'Supplied-template previews require Poppler')
+    def test_supplied_article_and_titlepage_templates_compile_and_preview(self):
+        # Both required layouts use the baseline pdfLaTeX toolchain, including
+        # the current Greek/Latin helper. Optional XeLaTeX never gates them.
+        layouts = [
+            ('article', 'pdflatex', None, '\\documentclass{article}\n',
+             '\\maketitle\n\\begin{abstract}$abstract$\\end{abstract}\n'),
+            ('titlepage', 'pdflatex', 'chapter', '\\documentclass{report}\n',
+             '\\begin{titlepage}\\centering\\Huge $title$\\end{titlepage}\n'
+             '\\chapter*{Summary}$abstract$\n'),
+        ]
+        if shutil.which('xelatex'):
+            # fontspec's TeX-distribution default covers Latin accents. This
+            # optional case makes no system-font, Greek-glyph or CJK promise.
+            layouts.append(('optional-xelatex', 'xelatex', None,
+                '\\documentclass{article}\n\\usepackage{fontspec}\n', layouts[0][4]))
+        for name, engine, division, preamble, opening in layouts:
+            with self.subTest(layout=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = root / 'input'
+                source.mkdir()
+                body = ('# Résumé α\n\n## Abstract\n\nUnicode β ≤ Γ fixture.\n\n'
+                    if engine == 'pdflatex' else '# Résumé\n\n## Abstract\n\nUnicode café fixture.\n\n')
+                body += ('## Results\n\nCitation [@p1].\n\n'
+                    '| Record label | Input scope | Owner notes | Review status | Source type | Output format | Next action |\n'
+                    '| :--- | :---: | ---: | --- | :--- | :---: | ---: |\n'
+                    '| Case one | Short input | Notes saved | Check open | Local file | Plain text | Read notes |\n'
+                    '| Case two | Full input | Notes ready | Check done | Local data | Saved text | Keep notes |\n\n'
+                    # The grid's authored boundaries give the real reader
+                    # nondefault widths; they must survive the TeX AST pass.
+                    '+----------------+----------------------------------------+\n'
+                    f"| {'Label':<14} | {'Description':<38} |\n"
+                    '+================+========================================+\n'
+                    f"| {'First':<14} | {'A brief note set by the author.':<38} |\n"
+                    f"| {'':<14} | {'More detail follows here.':<38} |\n"
+                    '+----------------+----------------------------------------+\n\n'
+                    '![Bounded fixture](plot.svg)\n') + TECHNICAL_BODY
+                (source / 'report_body.md').write_text(body, encoding='utf-8')
+                (source / 'references.bib').write_text('@misc{p1, title={Fixture}, author={Example, A}, year={2024}}',
+                    encoding='utf-8')
+                # Oversized portrait vector exercises both width and height
+                # bounds. Large native labels remain legible when fitted.
+                image = source / 'plot.svg'
+                image.write_text('<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="4800" viewBox="0 0 2400 4800">'
+                    '<rect width="2400" height="4800" fill="white"/>'
+                    '<g fill="none" stroke="black" stroke-width="12">'
+                    '<rect x="400" y="300" width="1600" height="600"/>'
+                    '<path d="M1200 900 L1200 3900"/>'
+                    '<rect x="400" y="3900" width="1600" height="600"/></g>'
+                    '<g font-size="144" text-anchor="middle">'
+                    '<text x="1200" y="650">Input</text><text x="1200" y="4250">Output</text></g></svg>', encoding='utf-8')
+                original_svg = image.read_bytes()
+                template = source / 'layout.latex'
+                template.write_text(preamble + '$for(header-includes)$\n$header-includes$\n$endfor$\n'
+                    '\\usepackage{natbib,hyperref}\n'
+                    '\\title{$title$}\n\\begin{document}\n' + opening + '\n$body$\n'
+                    '$if(bibliography)$\\bibliographystyle{$biblio-style$}\n'
+                    '\\bibliography{references}$endif$\n\\end{document}\n', encoding='utf-8')
+                options = {'path': template.name, 'engine': engine}
+                if division:
+                    options['top_level_division'] = division
+                with self.assertRaisesRegex(ReportExportError, 'Missing or out-of-scope template'):
+                    export_acm_report(source, root / 'missing-companion',
+                        template={**options, 'assets': ['missing.sty']})
+                self.assertFalse((root / 'missing-companion').exists())
+                image.rename(source / 'withheld.svg')
+                with self.assertRaisesRegex(ReportExportError, 'Missing or out-of-scope report image'):
+                    export_acm_report(source, root / 'missing-image', template=options)
+                self.assertFalse((root / 'missing-image').exists())
+                (source / 'withheld.svg').rename(image)
+                output = root / 'publication'
+                reader_tables, writer_tables = [], []
+
+                def columns(node):
+                    if len(node['c']) == 5:
+                        return node['c'][1], [width or None for width in node['c'][2]]
+                    return ([alignment for alignment, _ in node['c'][2]],
+                        [width.get('c') for _, width in node['c'][2]])
+
+                def render(argv, **kwargs):
+                    # Observe the real Pandoc reader and writer contract; no
+                    # TeX substitution or synthetic table conversion here.
+                    if '--from=json' in argv and '--to=latex' in argv:
+                        writer_tables.extend(columns(node) for node in _nodes(json.loads(kwargs['text']))
+                            if node.get('t') == 'Table')
+                    rendered = _run(argv, **kwargs)
+                    if '--to=json' in argv:
+                        reader_tables.extend(columns(node) for node in _nodes(json.loads(rendered))
+                            if node.get('t') == 'Table')
+                    return rendered
+
+                result = export_acm_report(source, output, template=options,
+                    compile_pdf=True, render_preview=True, caption_owner='markdown', runner=render)
+                self.assertTrue(result['compiled'], result)
+                self.assertTrue(result['pdf_preview']['rendered'], result)
+                self.assertFalse(result['quality_checked'])
+                self.assertEqual(result['compliance']['anonymity'], 'unverified')
+                self.assertFalse(any('undefined citation' in warning.lower() or 'Missing character:' in warning
+                    for warning in result['compile_warnings']), result)
+                # Keep TeX warnings for independent layout review. A slight
+                # overfull box is not synonymous with a cropped page; authored
+                # widths also remain authoritative. Check actual page bounds,
+                # not a requirement that every compiler warning disappear.
+                bbox = subprocess.check_output(['pdftotext', '-bbox', str(output / 'main.pdf'), '-'], text=True)
+                pages = list(ET.fromstring(bbox).iter('{http://www.w3.org/1999/xhtml}page'))
+                self.assertTrue(pages)
+                self.assertTrue(any(list(page.iter('{http://www.w3.org/1999/xhtml}word')) for page in pages))
+                for page in pages:
+                    width, height = float(page.attrib['width']), float(page.attrib['height'])
+                    for word in page.iter('{http://www.w3.org/1999/xhtml}word'):
+                        self.assertGreaterEqual(float(word.attrib['xMin']), 0)
+                        self.assertGreaterEqual(float(word.attrib['yMin']), 0)
+                        self.assertLessEqual(float(word.attrib['xMax']), width)
+                        self.assertLessEqual(float(word.attrib['yMax']), height)
+                self.assertEqual(len(reader_tables), 2)
+                self.assertEqual(len(writer_tables), 2)
+                self.assertTrue(all(width is not None for width in reader_tables[1][1]))
+                # Reader versions may infer widths for a wide pipe table.
+                # Respect its actual ColSpecs, not assumptions based on how
+                # the Markdown fixture happens to look.
+                for original, converted in zip(reader_tables, writer_tables, strict=True):
+                    self.assertEqual(converted[0], original[0])
+                    expected = ([1 / len(original[1])] * len(original[1])
+                        if all(width is None for width in original[1]) else original[1])
+                    self.assertEqual(converted[1], expected)
+                self.assertEqual((output / 'body.tex').read_text(encoding='utf-8').count(r'\begin{longtable}'), 2)
+                self.assertEqual((source / 'report_body.md').read_text(encoding='utf-8'), body)
+                self.assertEqual(image.read_bytes(), original_svg)
+                self.assertEqual((output / 'figures/figure-1.svg').read_bytes(), original_svg)
+                self.assertEqual((output / 'template.latex').read_bytes(), template.read_bytes())
+                self.assertEqual((output / 'code/block-1.txt').read_bytes(), LITERAL_CODE.encode('utf-8'))
+                main = (output / 'main.tex').read_text(encoding='utf-8')
+                self.assertNotIn('acmart', main)
+                self.assertIn('\\input{body.tex}', main)
+                if division:
+                    self.assertIn(r'\chapter{Results}', (output / 'body.tex').read_text(encoding='utf-8'))
+                self.assertNotIn('$header-includes$', main)
+                self.assertIn('\\usepackage{fvextra,seqsplit,etoolbox}', main)
+                self.assertEqual(main.count(r'\def\sarmaxwidth'), 1)
+                self.assertIn(r'\setkeys{Gin}{width=\sarmaxwidth,height=\sarmaxheight,keepaspectratio}', main)
+                self.assertEqual('\\DeclareUnicodeCharacter{03B1}' in main, engine == 'pdflatex')
+
     @unittest.skipUnless(all(shutil.which(name) for name in ('pdfinfo', 'pdftoppm')),
         'PDF preview integration requires Poppler')
     def test_preview_of_compiled_canonical_body_moves_with_project(self):

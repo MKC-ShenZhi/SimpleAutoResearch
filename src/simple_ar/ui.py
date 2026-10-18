@@ -232,7 +232,7 @@ class Workspace:
             sources=list(config.get('sources', {})),
             resources=ledger.snapshot() | {'entries': [
                 {k: e.to_dict()[k] for k in ('reservation_id', 'status', 'reserved', 'actual',
-                    'purpose', 'attempt_id')} for e in ledger.entries]})
+                    'purpose', 'attempt_id', 'actual_source', 'reason')} for e in ledger.entries]})
 
     def file(self, name: str, mount: str, relative: str) -> Path:
         root = self.task(name)

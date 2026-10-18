@@ -199,6 +199,34 @@ Use a new output directory. Keep the whole project, figures and logs, and inspec
 Compilation does not certify conference compliance.
 See the [CLI reference](CLI_REFERENCE.md) for files and dependencies.
 
+### Supplied templates (V2.10 development)
+
+Native tasks can use a trusted **Pandoc LaTeX template** instead of the built-in ACM layout:
+
+```bash
+uv run simple-ar start "Use this report and supplied trusted template. Preserve the Markdown and references, export an editable TeX project and PDF, and render every page for inspection. Explain any unchecked submission requirements." --source ./paper --allow-execution
+```
+
+Keep the report and a focused template bundle in the supplied directory, not your
+credentials or unrelated files. The template needs `$body$` and the standard
+`$for(header-includes)$$header-includes$$endfor$` hook in its preamble.
+This is not automatic conversion of arbitrary conference TeX or official-template discovery.
+
+The shared `export_report` tool accepts an optional `template` object with `path`
+(relative to its Markdown), `assets` (explicit flat companion files), `engine`
+(`pdflatex` or installed `xelatex`) and optional `top_level_division`
+(`section`, `chapter`, `part`). Ask the assistant to inspect the layout and select
+the appropriate hierarchy; no class-name rules or scientific restructuring are inferred.
+At most 32 companions/16 MB are supported; no partials, scripts or custom build commands.
+The standalone `report-export` command keeps its ACM default.
+
+Template bytes, figures and output versions share the existing approval and recovery
+contract. Only use trusted TeX: no shell escape is enabled, but this is not a sandbox.
+Inspect warnings and every page. Fonts, explicit column widths, page limits and
+anonymity still require checking; compilation alone does not establish compliance.
+Model-based visual inspection additionally needs a configured vision connection
+and explicit `--allow-vision`; rendering alone does not grant it.
+
 ## Finite reproduction
 
 **Provide:** the paper, target conclusion, machine resources, available implementation and data.

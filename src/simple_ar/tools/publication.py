@@ -1,20 +1,33 @@
-"""Existing ACM export, with rendering delegated to the shared process owner."""
+"""Template-first publication export through the shared rendering process owner."""
 from __future__ import annotations
 
 import hashlib
 import os
 from pathlib import Path
 import re
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from simple_ar.core.budget import BudgetError
 from simple_ar.core.capabilities import ArtifactStore
 from simple_ar.core.process import ProcessSpec, run_process
-from simple_ar.report.export import ReportExportError, export_acm_report
+from simple_ar.report.export import ReportExportError, export_acm_report, publication_template_inputs
 from simple_ar.tools.specs import CommonToolSpec, ToolResult
 from simple_ar.tools.workspace import DeliveryRequest, resolve_mounted_path
+
+
+class PublicationTemplate(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    path: str = Field(min_length=1, max_length=500,
+        description='Trusted workspace Pandoc LaTeX template, relative to the Markdown directory. Requires $body$ after \\begin{document} and the standard $for(header-includes)$$header-includes$$endfor$ hook in the preamble for renderer-owned support. Source YAML metadata is excluded. No partials/scripts/downloads. Not arbitrary conference TeX or a sandbox.')
+    assets: list[str] = Field(default_factory=list, max_length=32,
+        description='Explicit flat companion filenames beside the template: cls/sty/bst/tex/png/jpg/jpeg/pdf, at most 16 MB total. Copied to project root; reference those names there. No automatic directory copy.')
+    engine: str = Field(default='pdflatex', pattern='^(pdflatex|xelatex)$',
+        description='Installed trusted TeX engine; xelatex for multilingual fonts supplied by template. BibTeX only; no custom build commands.')
+    top_level_division: Literal['section', 'chapter', 'part'] | None = Field(default=None,
+        exclude_if=lambda value: value is None,
+        description='Optional Pandoc body heading level required by the supplied layout, e.g. chapter for a report/book template. No class-name inference or scientific restructuring. Omit to retain the historical section-based body.')
 
 
 class ExportRequest(BaseModel):
@@ -22,6 +35,8 @@ class ExportRequest(BaseModel):
     markdown: str = Field(description="Workspace Markdown file; local figures and references.bib use its directory.")
     title: str = Field(default="", max_length=500)
     compile_pdf: bool = True
+    template: PublicationTemplate | None = Field(default=None,
+        description='Explicit user-provided trusted template bundle. Omit for the historical ACM manuscript layout. Compilation does not establish anonymous/page/official compliance.')
     render_preview: bool = Field(default=False, exclude_if=lambda value: value is False,
         description="Explicitly render every compiled PDF page with Poppler: at most 12 pages, 120 DPI scaled to a maximum 1600 pixels per dimension. Requires compile_pdf=true. Returns PNG locators for optional inspect_images; rendering is not visual review. Incomplete previews prevent delivery. False preserves historical request bindings.")
     delivery: DeliveryRequest | None = Field(default=None,
@@ -37,7 +52,7 @@ class ExportRequest(BaseModel):
 def publication_tool_specs() -> list[CommonToolSpec]:
     return [CommonToolSpec(name="export_report", domain="publication", permission_level="execution",
         risk_level="medium", input_schema=ExportRequest.model_json_schema(),
-        description="Derive editable ACM TeX from the canonical workspace Markdown, citations and local images; optionally compile PDF and explicitly request bounded previews of every PDF page. The same rendering approval covers requested Poppler processes. Preserves the source and records real processes. Preview locators can be passed to inspect_images separately; no review is invoked. Optional explicit delivery ends the task after successful requested export without another model turn; incomplete preview never delivers. Compilation/rendering is not content or visual verification.")]
+        description="Convert canonical workspace Markdown, bibliography and local figures into an editable TeX project using an explicit trusted Pandoc LaTeX template bundle, or ACM by default. Template bytes and companions share existing approval/recovery bindings. No official template discovery, scripts or shell escape; trusted TeX is not sandboxed. Optionally compile and request bounded previews of every PDF page using the same process ledger. Rendering is not scientific, visual, anonymous or official compliance review. Optional explicit delivery ends the task after successful requested export; incomplete preview never delivers.")]
 
 
 def export_input_binding(source: Path, request: ExportRequest, *, output_root: Path | None = None,
@@ -53,6 +68,13 @@ def export_input_binding(source: Path, request: ExportRequest, *, output_root: P
         if path.is_file():
             with path.open('rb') as file:
                 inputs[key] = hashlib.file_digest(file, 'sha256').hexdigest()
+    if request.template is not None:
+        for path in publication_template_inputs(root, request.template.model_dump()).values():
+            authorized = resolve_mounted_path({'workspace': root}, str(path))
+            if output_root is not None and authorized.is_relative_to(output_root.resolve()):
+                raise ValueError('Derived publication files cannot supply a new template')
+            with authorized.open('rb') as file:
+                inputs[authorized.relative_to(root).as_posix()] = hashlib.file_digest(file, 'sha256').hexdigest()
     if not include_images:
         return {**request.model_dump(exclude_none=True), 'inputs': inputs}
     # Approval must cover actual figure bytes, including standalone Markdown
@@ -177,12 +199,14 @@ class PublicationToolGateway:
                     with authorized.open('rb') as file:
                         digest = hashlib.file_digest(file, 'sha256').hexdigest()
                     if binding['inputs'].get(key) != digest:
-                        raise ReportExportError('Figure is outside the bound authoring inputs or changed during rendering')
+                        raise ReportExportError('Figure/template is outside the bound authoring inputs or changed during rendering')
+                    return digest
 
                 try:
                     manifest = export_acm_report(source.parent, output, title=request.title or None,
                         body_name=source.name, compile_pdf=request.compile_pdf, render_preview=request.render_preview, runner=render,
-                        validate_asset=validate_asset, caption_owner='markdown')
+                        validate_asset=validate_asset, caption_owner='markdown',
+                        **({'template': request.template.model_dump()} if request.template is not None else {}))
                 except ReportExportError:
                     if not (output / 'export.json').is_file():
                         raise
