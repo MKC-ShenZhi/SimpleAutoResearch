@@ -7650,6 +7650,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             (writing_arguments['goal'], writing_arguments['title'], 0))
         self.assertEqual(view['front_matter'], [row.to_row() for row in original.sections])
         self.assertEqual(view['citation_key_map'], {'P1': view['source_handles'][0]['paper_id']})
+        self.assertEqual(view['citation_contract']['version'], 'registered_body.v1')
+        self.assertIn('[@P1]', view['citation_contract']['body'])
         evidence = view['source_handles'][0]['metadata']['evidence_passages'][0]
         self.assertEqual(evidence['text'], original.chunks[0].text)
         self.assertEqual(evidence['character_end'], len(original.chunks[0].text))
@@ -7851,7 +7853,10 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     factory.assert_not_called()
 
     def test_composition_recovery_binds_direct_writer_records(self) -> None:
-        from simple_ar.report.writing import ARTICLE_SYSTEM
+        from simple_ar.report.writing import ARTICLE_SYSTEM, article_writing_inputs
+
+        def historical_inputs(**kwargs):
+            return article_writing_inputs(**{**kwargs, 'enforce_citation_contract': False})
 
         historical_system = (
             'Write a complete article for the goal, title and target length. '
@@ -7871,7 +7876,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(hashlib.sha256(historical_system.encode('utf-8')).hexdigest(),
                          'a002d27b21359d8976475749713c7fb52c1ef35e44dbfa2a06228f99c82cfbdf')
         self.assertNotEqual(historical_system, ARTICLE_SYSTEM)
-        with patch('simple_ar.report.writing.ARTICLE_SYSTEM', historical_system):
+        with patch('simple_ar.report.writing.ARTICLE_SYSTEM', historical_system), \
+                patch('simple_ar.report.writing.article_writing_inputs', side_effect=historical_inputs):
             fake, app, _, call, owner = self._interrupted_composition()
         # Direct inputs, raw response and accepted article must stay bound.
         direct_paths = [owner / 'writer' / name for name in ('writer.json', 'response.json', 'report_inputs.json')]
@@ -7879,6 +7885,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         snapshot = direct_records[2]
         self.assertEqual(snapshot['system'], historical_system)
         self.assertNotIn('constraints', snapshot['inputs']['article'])
+        self.assertNotIn('citation_contract', snapshot['inputs']['article'])
         retained_bytes = {path: path.read_bytes() for path in direct_paths}
         self.assertEqual(fake.ask_json.call_args.args[0], historical_system)
         # Generic record/owner/identity failures belong to the shared article
@@ -7904,7 +7911,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             'include every required section, and obey the distinct cited-source ceiling. ', '').rstrip()
         self.assertEqual(hashlib.sha256(previous_system.encode()).hexdigest(),
                          'a2a45241449c56ab563da248f633351a61738d6e168b615225c4d394d2a9979e')
-        with patch('simple_ar.report.writing.ARTICLE_SYSTEM', previous_system):
+        with patch('simple_ar.report.writing.ARTICLE_SYSTEM', previous_system), \
+                patch('simple_ar.report.writing.article_writing_inputs', side_effect=historical_inputs):
             prior_client, prior_app, _, prior_call, _ = self._interrupted_composition()
         with patch.object(prior_app.writing, 'client_factory', side_effect=AssertionError('No replay')):
             prior_result = prior_app.gateway.call(prior_call)
@@ -8146,20 +8154,24 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 self.assertFalse((owner / 'result.json').exists())
 
     def test_composition_rejects_invalid_articles_without_resubmission(self) -> None:
-        _, fake, app, _, arguments = self._writing_fixture()
         # Shape/outline/citation matrices live with StructuredArticleWritingTests.
-        # One rejection proves public error translation and retained recovery.
-        request = {**arguments, 'required_headings': ['Decision', 'Limits']}
-        response = {'draft_markdown': '## Decision\n\nEvidence [P1].'}
-        fake.ask_json.return_value = response
-        rejected = self._compose_document(app, request, 'invalid-article', status='error')
-        self.assertIn('fixed section structure', rejected.error)
-        owner = app.session.store.root / 'tools/writing/invalid-article'
-        with patch.object(app.writing, 'client_factory', side_effect=AssertionError('No rejected replay')):
-            self._compose_document(app, request, 'invalid-article', status='error')
-        fake.ask_json.assert_called_once()
-        self.assertEqual(read_json(owner / 'writer/response.json'), response)
-        self.assertFalse((owner / 'writer/writer.json').exists())
+        # Each distinct admission boundary reaches the public error/no-replay path.
+        for outline, markdown, diagnostic in (
+                (['Decision', 'Limits'], '## Decision\n\nEvidence [P1].', 'fixed section structure'),
+                ([], '## Decision\n\nUnattributed claim.\n\n## References\n\n[@P1]', 'registered body citations')):
+            with self.subTest(diagnostic=diagnostic):
+                _, fake, app, _, arguments = self._writing_fixture()
+                request = {**arguments, 'required_headings': outline}
+                response = {'draft_markdown': markdown}
+                fake.ask_json.return_value = response
+                rejected = self._compose_document(app, request, 'invalid-article', status='error')
+                self.assertIn(diagnostic, rejected.error)
+                owner = app.session.store.root / 'tools/writing/invalid-article'
+                with patch.object(app.writing, 'client_factory', side_effect=AssertionError('No rejected replay')):
+                    self._compose_document(app, request, 'invalid-article', status='error')
+                fake.ask_json.assert_called_once()
+                self.assertEqual(read_json(owner / 'writer/response.json'), response)
+                self.assertFalse((owner / 'writer/writer.json').exists())
 
     def test_composition_recovery_rejects_partial_changed_and_failed_writer_records(self) -> None:
         fake, app, arguments, call, owner = self._interrupted_composition()

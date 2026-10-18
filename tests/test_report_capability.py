@@ -783,7 +783,9 @@ class StructuredArticleWritingTests(unittest.TestCase):
                 'sections', 'document_plan', 'source_handles', 'front_matter', 'bibliography',
                 'citation_key_map', 'problem', 'synthesis', 'hypothesis', 'evidence_summary',
                 'source_comparisons', 'metric_sources', 'execution_context', 'experiment_plan',
-                'results', 'limitations', 'open_questions', 'revision_findings'})
+                'results', 'limitations', 'open_questions', 'revision_findings', 'citation_contract'})
+            self.assertEqual(article['citation_contract']['version'], 'registered_body.v1')
+            self.assertIn('[@P1]', article['citation_contract']['body'])
             writer_ref = next(ref for ref in result.artifacts if ref.kind == 'report_writer_result')
             self.assertEqual(writer_ref.schema, ARTICLE_OWNER)
             writer = store.read_json(writer_ref)
@@ -852,6 +854,35 @@ class StructuredArticleWritingTests(unittest.TestCase):
             self.assertEqual(len(request.llm_client.calls), 1)
             for name, raw in original.items():
                 self.assertEqual(first.resolve(name).read_bytes(), raw)
+
+        # Frozen pre-contract Writer results keep their old validation. They
+        # are recoverable, not retroactively certified as publishable reports.
+        from simple_ar.report.writing import article_writing_inputs
+        def historical_inputs(**kwargs):
+            return article_writing_inputs(**{**kwargs, 'enforce_citation_contract': False})
+        with tempfile.TemporaryDirectory() as tmp:
+            first = ArtifactStore(Path(tmp) / 'historical')
+            request = self.request()
+            request = replace(request, config=request.config.model_copy(update={'max_cited_sources': 1}),
+                report_context=request.report_context.model_copy(update={
+                'papers': [{'id': 'old-source', 'title': 'Original source'}],
+                'citation_key_map': {'P1': 'old-source'}}))
+            with patch('simple_ar.report.writing.article_writing_inputs', side_effect=historical_inputs):
+                result = run_report_writing_capability(context=CapabilityContext(first, AttemptManifest('old')),
+                    request=request)
+            self.assertNotIn('citation_contract', first.read_json('report_inputs.json')['inputs']['article'])
+            self.assertIn('constraints', first.read_json('report_inputs.json')['inputs']['article'])
+            original = {path: path.read_bytes() for path in first.root.iterdir() if path.is_file()}
+            ref = result.artifacts[0]
+            target = ArtifactStore(Path(tmp) / 'recovered')
+            run_report_writing_capability(context=CapabilityContext(target, AttemptManifest('resume'),
+                inputs=(ref,), input_store=first), request=replace(request, resume_ref=ref, llm_client=None))
+            self.assertEqual(target.resolve('writer.json').read_bytes(), first.resolve('writer.json').read_bytes())
+            recovered = run_report_writing_capability(context=CapabilityContext(first, AttemptManifest('old')),
+                request=replace(request, llm_client=None))
+            self.assertEqual(recovered.status, result.status)
+            self.assertEqual({path: path.read_bytes() for path in original}, original)
+            self.assertEqual(len(request.llm_client.calls), 1)
 
     def test_article_inspection_preserves_draft_and_recovers_both_responses(self):
         case = self
@@ -1147,6 +1178,36 @@ class StructuredArticleWritingTests(unittest.TestCase):
                     current = target.read_json(next(r.path for r in recovered.artifacts if r.kind == 'report_writer_result'))
                     self.assertEqual(current, writer)
 
+    def test_article_revision_rejects_lost_citations_without_review_or_replay(self):
+        from simple_ar.literature.verify import CitationError
+
+        client = ArticleClient()
+        request = self.request(client)
+        request = replace(request, config=request.config.model_copy(update={
+            'reviewer': 'llm', 'document_review': True, 'review_scope': 'document',
+            'draft_scope': 'document', 'max_review_iterations': 1}),
+            report_context=request.report_context.model_copy(update={
+                'papers': [{'id': 'source-a', 'title': 'Original source'}],
+                'citation_key_map': {'P1': 'source-a'}}))
+        responses = [{'draft_markdown': 'Supported prose [@P1].'},
+            {'section_reviews': [{'section_id': 'document', 'verdict': 'revise_required',
+                'findings': [{'finding_id': 'style', 'type': 'style', 'severity': 'major',
+                    'required_action': 'revise', 'message': 'Clarify the prose.',
+                    'draft_quotes': [{'section_id': 'document', 'quote': 'Supported prose [@P1].'}]}]}]},
+            {'draft_markdown': 'Revised prose lost its attribution.'}]
+        with tempfile.TemporaryDirectory() as tmp, patch.object(client, 'ask_json', side_effect=responses) as model:
+            store = ArtifactStore(Path(tmp))
+            context = CapabilityContext(store, AttemptManifest('revision-citations'))
+            with self.assertRaisesRegex(CitationError, 'registered body citations'):
+                run_report_writing_capability(context=context, request=request)
+            recovered = run_report_writing_capability(context=context, request=replace(request, llm_client=None))
+            self.assertEqual(recovered.status, 'failed')
+            self.assertEqual(model.call_count, 3)
+            self.assertEqual(store.read_json('writer.json')['sections'][0]['draft_markdown'], responses[0]['draft_markdown'])
+            self.assertEqual(store.read_json('review/revision-1/response.json'), responses[2])
+            self.assertFalse(store.exists('review/revision-1/writer.json'))
+            self.assertFalse(store.exists('review/revision-1/inspection/request.json'))
+
     def test_article_candidate_and_verification_checkpoints_resume_without_repeating_calls(self):
         for stage in ('drafted', 'completed'):
             with self.subTest(stage=stage), tempfile.TemporaryDirectory() as tmp:
@@ -1431,37 +1492,59 @@ class StructuredArticleWritingTests(unittest.TestCase):
                     {'heading': '3. Limits', 'required': True}])
 
     def test_article_citation_cap_counts_source_identity_in_body_only(self):
+        from simple_ar.literature.verify import CitationError
+
         cases = [
-            ('Repeated [@P1; @p2] and [P1, P2] and [@source-a].', True),
-            ('Canonical bare identity [source-a] and alias [P1].', True),
-            ('Two sources [P1; P3].', False),
-            ('Two bare canonical identities [source-a; source-b].', False),
-            ('Two sources @source-a and @source-b.', False),
-            ('Unknown source [@missing].', False),
+            ('Repeated [@P1; @p2] and [P1, P2] and [@source-a].', 1, True, None),
+            ('Canonical bare identity [source-a] and alias [P1].', 1, True, None),
+            ('Two sources [P1; P3].', 1, True, ValueError),
+            ('Two bare canonical identities [source-a; source-b].', 1, True, ValueError),
+            ('Two sources @source-a and @source-b .', 1, True, ValueError),
+            ('Unknown source [@missing].', 1, True, CitationError),
+            # Admission is independent of optional structure/cap controls.
+            ('Unattributed source claims.', 0, True, CitationError),
+            ('Unbound numeric citation [1] or https://example.org/study.', 0, True, CitationError),
+            ('Known [@P1] alongside unknown [@missing].', 0, True, CitationError),
+            ('Only one relevant source [@P1].', 0, True, None),
+            ('| Claim | Source |\n|---|---|\n| Recorded | [@P1] |', 0, True, None),
+            ('# Draft title [@P1]\n\n## Evidence\n\nUnattributed prose.', 0, True, CitationError),
+            ('# Draft title [@P1]\n\n## References\n\n[@P1]', 0, True, CitationError),
+            ('# Draft title [@missing]\n\n## Evidence\n\nSupported prose [@P1].', 0, True, None),
+            ('Local result explanation without bibliography.', 0, False, None),
+            ('Invented citation [@missing] without bibliography.', 0, False, CitationError),
         ]
-        for prose, accepted in cases:
+        for prose, cap, has_sources, rejection in cases:
             with self.subTest(prose=prose), tempfile.TemporaryDirectory() as tmp:
-                markdown = ('## Evidence\n\n' + prose
+                accepted = rejection is None
+                markdown = ((prose if prose.startswith('# ') else '## Evidence\n\n' + prose)
                     + '\n\n```markdown\n## Unplanned\n[@missing; @source-b]\n```'
                     + '\n\n## References\n\n[@missing; @source-b]')
                 request = self.request(ArticleClient({'draft_markdown': markdown}))
                 request = replace(request,
-                    config=request.config.model_copy(update={'max_cited_sources': 1}),
+                    config=request.config.model_copy(update={'max_cited_sources': cap}),
                     report_context=request.report_context.model_copy(update={
-                        'papers': [{'id': 'source-a', 'title': 'A'}, {'id': 'source-b', 'title': 'B'}],
-                        'citation_key_map': {'P1': 'source-a', 'P2': 'source-a', 'P3': 'source-b'}}))
+                        'papers': [{'id': 'source-a', 'title': 'A'}, {'id': 'source-b', 'title': 'B'}] if has_sources else [],
+                        'citation_key_map': {'P1': 'source-a', 'P2': 'source-a', 'P3': 'source-b'} if has_sources else {}}))
+                if not accepted and cap == 0:
+                    request = replace(request, config=request.config.model_copy(update={
+                        'reviewer': 'llm', 'document_review': True, 'review_scope': 'document',
+                        'draft_scope': 'document', 'max_review_iterations': 1}))
                 store = ArtifactStore(Path(tmp))
                 context = CapabilityContext(store, AttemptManifest('citation-cap'))
                 if accepted:
                     self.assertEqual(run_report_writing_capability(context=context, request=request).status, 'completed')
-                    self.assertEqual(store.read_json('writer.json')['constraints_checked'],
-                        {'headings': ['Evidence'], 'distinct_cited_sources': 1})
+                    if cap:
+                        self.assertEqual(store.read_json('writer.json')['constraints_checked'],
+                            {'headings': ['Evidence'], 'distinct_cited_sources': 1})
+                    else:
+                        self.assertNotIn('constraints_checked', store.read_json('writer.json'))
                 else:
                     for offline in (False, True):
-                        with self.assertRaisesRegex(ValueError, 'original response retained'):
+                        with self.assertRaisesRegex(rejection, 'original response retained'):
                             run_report_writing_capability(context=context,
                                 request=replace(request, llm_client=None) if offline else request)
                     self.assertFalse(store.exists('writer.json'))
+                    self.assertFalse(store.exists('review/request.json'))
                 self.assertEqual(store.read_json('response.json'), {'draft_markdown': markdown})
                 self.assertEqual(len(request.llm_client.calls), 1)
 
@@ -1503,7 +1586,7 @@ class StructuredArticleWritingTests(unittest.TestCase):
              'section_id': 'front', 'complete': True},
             {'field': 'doi', 'value': '10.1234/invented', 'quote': 'Absent original text',
              'section_id': 'front', 'complete': True}]}]
-        request = self.request(ArticleClient({'draft_markdown': 'Article.', 'source_notes': notes}))
+        request = self.request(ArticleClient({'draft_markdown': 'Article [@P1].', 'source_notes': notes}))
         request = replace(request, config=request.config.model_copy(update={'max_section_tokens': 0}))
         with tempfile.TemporaryDirectory() as tmp:
             store = ArtifactStore(Path(tmp))

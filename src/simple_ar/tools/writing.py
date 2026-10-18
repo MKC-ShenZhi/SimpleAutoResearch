@@ -989,10 +989,13 @@ class WritingToolGateway:
                     notes=memory.outline_planning.get('source_notes', []))
                 assembly_mode = ReportAssemblyMode.WHOLE_ARTICLE if requirement['method'] == 'article' else ReportAssemblyMode.SECTION_DRAFTS
             elif writing_owner == ARTICLE_OWNER:
+                citation_contract_enabled = (not recovering or
+                    'citation_contract' in writer_store.read_json('report_inputs.json').get('inputs', {}).get('article', {}))
                 inputs = article_writing_inputs(report_context=context, documents=documents, binding=binding,
                     config=config, title=request.title, goal=request.goal,
                     target_words=request.target_words, prior_draft=previous,
-                    required_headings=request.required_headings)
+                    required_headings=request.required_headings,
+                    enforce_citation_contract=citation_contract_enabled)
                 if 'work_context' in binding:
                     inputs['article']['work_context'] = binding['work_context']
                 if not recovering:
