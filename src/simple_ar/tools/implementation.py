@@ -239,6 +239,7 @@ class ImplementationToolGateway:
                  candidate_outputs: Callable[[Path], dict[str, str]] | None = None,
                  measurement_inputs: Callable[[dict[str, str] | None, bool], dict[str, Any]] | None = None,
                  research_inputs: Callable[[], dict[str, Any]] | None = None,
+                 work_context: Callable[[list[str]], dict] | None = None,
                  measurement: dict[str, Any] | None = None,
                  measurement_supplier: Callable[[], dict[str, Any] | None] | None = None,
                  exact: dict[str, Any] | None = None) -> None:
@@ -249,6 +250,7 @@ class ImplementationToolGateway:
         self.candidate_outputs = candidate_outputs
         self.measurement_inputs = measurement_inputs
         self.research_inputs = research_inputs
+        self.work_context = work_context
         self.exact = ExactCodeTask.model_validate(exact) if exact is not None else None
         if measurement_supplier is not None and self.exact is None:
             raise ValueError('A producing measurement supplier requires the exact implementation owner')
@@ -1158,6 +1160,28 @@ class ImplementationToolGateway:
             direct_creation = (not request.files and project is None
                 and not owner.exists('selection-input.json')
                 and (not owner.exists('request.json') or saved_binding.get('generation_method') == 'direct_creation.v1'))
+            # This is goal/feedback context, never an observed file window. Keep
+            # it in the existing selection/request owner so recovery cannot
+            # substitute a newer user request or inspection for this attempt.
+            context_role = 'user_request_and_accepted_feedback_not_source_or_authority'
+            prior_inputs = saved_binding if owner.exists('request.json') else selection_input
+            explicit_originals = None
+            if prior_inputs is not None:
+                windows.extend(row for row in prior_inputs['source_windows']
+                    if row.get('role') == context_role)
+            elif self.work_context is not None:
+                from simple_ar.tools.materials import freeze_work_context
+                targets = ([str(project)] if project is not None else [])
+                targets.extend(str(self.workspace.resolve(row['request']['path']))
+                    for row in windows if 'request' in row)
+                # Validate complete explicit originals before asking for context.
+                if request.files:
+                    explicit_originals = bind_implementation_originals(
+                        [row.model_dump() for row in request.files], resolve_source=self.workspace.resolve)
+                    targets.extend(row['path'] for row in explicit_originals.values())
+                if retained:
+                    targets.extend(row['path'] for row in retained['original_files'].values())
+                windows.append(freeze_work_context(self.work_context, list(dict.fromkeys(targets))))
             if not request.files and not direct_creation and not retained:
                 selection, client = select_implementation_files(goal=request.goal,
                     request_binding=request.model_dump(), project=project, owner=owner, windows=windows,
@@ -1186,7 +1210,8 @@ class ImplementationToolGateway:
                     self.workspace.resolve(f'{prefix}/{path}', write=True)
                     if row.source_path:
                         self.workspace.resolve(row.source_path)
-            originals = (retained['original_files'] if retained else
+            originals = (retained['original_files'] if retained else explicit_originals
+                if explicit_originals is not None else
                 bind_implementation_originals([row.model_dump() for row in request.files],
                     resolve_source=self.workspace.resolve))
             request_data = request.model_dump()

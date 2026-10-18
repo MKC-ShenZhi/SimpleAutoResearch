@@ -4577,22 +4577,24 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                         'completed' if mode in ('final_review', 'terminal_batch') else 'partial')
                 self.assertEqual(restored.ledger.to_dict(), before)
 
-    def test_native_last_decision_closes_or_preserves_unexecuted_work(self) -> None:
+    def test_native_last_decision_executes_accepted_work_without_implicit_delivery(self) -> None:
         from simple_ar.integrations.llm import LLMClient, LLMSettings
 
-        for mode in ('unclosed', 'misordered', 'process', 'failed_process', 'relative_write', 'question', 'v1', 'legacy'):
+        for mode in ('write', 'process', 'failed_process', 'denied_process', 'budget_process',
+                     'relative_write', 'invalid_delivery', 'question', 'legacy'):
             with self.subTest(mode=mode):
-                _, _, _, _, app, _ = self._native_fixture(mount_inputs=False, max_turns=1)
-                if mode in ('v1', 'legacy'):
-                    if mode == 'v1':
-                        app.state['config']['completion_policy'] = 'protected_decision.v1'
-                    else:
-                        app.state['config'].pop('completion_policy')
+                _, _, _, _, app, _ = self._native_fixture(mount_inputs=False, max_turns=1,
+                    allow_execution=mode != 'denied_process',
+                    process_limits={'process_invocations': 0} if mode == 'budget_process' else None)
+                self.assertEqual(app.state['config']['completion_policy'], 'protected_decision.v1')
+                app.session.manifest.budget.max_attempts = 3 if 'process' in mode else 2
+                app.session.save()
+                if mode == 'legacy':
+                    app.state['config'].pop('completion_policy')
                     app._save()
                     app.supply(supply_id='keep-policy', reason='Explicit access supply, not a controller upgrade',
                         changes={'allow_execution': True})
-                    self.assertEqual(app.state['config'].get('completion_policy'),
-                        'protected_decision.v1' if mode == 'v1' else None)
+                    self.assertNotIn('completion_policy', app.state['config'])
                 client = LLMClient(LLMSettings(api_key='fixture', model='fixture', api_mode='chat',
                     retry_attempts=0, max_output_tokens=512))
                 def bound(attempt_id='', **_):
@@ -4601,29 +4603,27 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 delivery = {'summary': 'Actual available result', 'artifacts': ['workspace/result.txt']}
                 if mode == 'question':
                     message = self._native_message('ask_user', {'question': 'Confirm the reduced scope?'}, 'question')
-                elif mode == 'relative_write':
+                elif mode in ('relative_write', 'invalid_delivery'):
                     message = self._native_message('write_file', {'path': 'result.txt',
-                        'content': 'Actual result', 'delivery': {**delivery, 'artifacts': ['result.txt']}}, 'finish')
-                elif mode in ('process', 'failed_process'):
-                    code = ("raise RuntimeError('real failure')" if mode == 'failed_process' else
-                        "from pathlib import Path; Path('result.txt').write_text('Actual result')")
+                        'content': 'Actual result', 'delivery': {**delivery, 'artifacts': [
+                            'missing.txt' if mode == 'invalid_delivery' else 'result.txt']}}, 'finish')
+                elif 'process' in mode:
+                    code = "from pathlib import Path; Path('result.txt').write_text('Actual result')"
+                    if mode == 'failed_process':
+                        code += "; raise RuntimeError('real failure')"
                     message = self._native_message('write_file', {
                         'path': 'workspace/finish.py', 'content': code}, 'prepare')
                     message['tool_calls'] += self._native_message('run_process', {
-                        'argv': ['python', 'finish.py'], 'timeout_sec': 3,
-                        'delivery': delivery}, 'finish')['tool_calls']
+                        'argv': ['python', 'finish.py'], 'timeout_sec': 3}, 'finish')['tool_calls']
                 else:
                     message = self._native_message('write_file', {
                         'path': 'workspace/result.txt', 'content': 'Not verified'}, 'ordinary')
-                    if mode == 'misordered':
-                        message['tool_calls'] = self._native_message('deliver_result',
-                            delivery, 'premature')['tool_calls'] + message['tool_calls']
                 seen = []
                 def provider(api_mode, request, **_):
                     seen.append(request)
                     closing = any('last affordable decision' in str(row.get('content', ''))
                         for row in request['messages'])
-                    self.assertEqual(closing, mode not in ('v1', 'legacy'))
+                    self.assertFalse(closing)
                     context = json.loads(request['messages'][1]['content'])['resources']
                     self.assertEqual(context['decision_budget']['provider_slots_after_one_attempt'], 0)
                     self.assertNotIn('protected_followup_requests', context['decision_budget'])
@@ -4641,26 +4641,33 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 with patch.object(app, '_client', side_effect=bound), patch(
                         'simple_ar.integrations.llm._call_openai_sdk', side_effect=provider):
                     status = app.run(progress=lambda _: None)
-                    if mode in ('process', 'failed_process'):
+                    if 'process' in mode and mode != 'denied_process':
                         self.assertIn('approval', status['status_reason'])
                         self.assertEqual(app.ledger.remaining('process_invocations'), app.ledger.limits['process_invocations'])
                         token = app.approval_token(app.state['pending']['call'])
                         restored = ToolApplication.load(app.session.store.root)
                         with patch.object(restored, '_client', side_effect=bound):
+                            waiting = restored.run(progress=lambda _: None)
+                            self.assertIn('approval', waiting['status_reason'])
+                            self.assertFalse((restored.workspace.workspace/'result.txt').exists())
                             status = restored.run(approved_execution=token, progress=lambda _: None)
                         app = restored
                 self.assertEqual(len(seen), 1)
                 self.assertEqual(app.ledger.remaining('llm_requests'), 0)
                 self.assertEqual(sum(e.status == 'unknown' for e in app.ledger.entries), 0)
                 self.assertIsNone(app.state['pending'])
-                self.assertEqual(app.session.store.exists('delivery.json'), mode in ('process', 'relative_write'))
-                self.assertEqual((app.workspace.workspace/'result.txt').is_file(), mode in ('process', 'relative_write', 'v1', 'legacy'))
-                if mode in ('unclosed', 'misordered'):
-                    self.assertIn('Final decision requires', status['status_reason'])
-                    self.assertEqual(app.state['turns'][-1]['remaining'], [])
-                    self.assertTrue(app.session.store.exists('tools/cancelled/native-turn-0001-0.json'))
-                    self.assertFalse(app.session.list_attempts()[0].status == 'running')
-                if mode in ('process', 'relative_write'):
+                self.assertEqual(app.session.store.exists('delivery.json'), mode == 'relative_write')
+                self.assertEqual((app.workspace.workspace/'result.txt').is_file(),
+                    mode not in ('denied_process', 'budget_process', 'question', 'invalid_delivery'))
+                if 'process' in mode:
+                    process = app.session.store.read_json(app.state['turns'][-1]['tools'][-1]['result'])
+                    self.assertEqual(process['status'] == 'ok', mode in ('process', 'failed_process'))
+                    if mode in ('process', 'failed_process'):
+                        self.assertEqual(process['data']['returncode'], int(mode == 'failed_process'))
+                    remaining = app.ledger.remaining('process_invocations')
+                    self.assertEqual(remaining, app.ledger.limits['process_invocations']
+                        - int(mode not in ('denied_process', 'budget_process')))
+                if mode == 'relative_write':
                     self.assertEqual(status['status'], 'completed')
                     self.assertEqual((app.workspace.workspace/'result.txt').read_text(), 'Actual result')
                 elif mode == 'question':
@@ -4669,9 +4676,94 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     self.assertEqual(status['status'], 'paused')
                 ledger = app.ledger.to_dict()
                 restored = ToolApplication.load(app.session.store.root)
-                with patch.object(restored, '_client', side_effect=AssertionError('No decision replay')), \
-                        patch.object(restored.gateway, 'call', side_effect=AssertionError('No tool replay')):
+                with patch.object(restored, '_client', side_effect=bound), patch(
+                        'simple_ar.integrations.llm._call_openai_sdk', side_effect=AssertionError('No decision replay')) as replay, \
+                        patch.object(restored.gateway, 'call', side_effect=AssertionError('No tool replay')) as work:
                     restored.run(progress=lambda _: None)
+                replay.assert_not_called()
+                work.assert_not_called()
+                self.assertEqual(restored.ledger.to_dict(), ledger)
+
+    def test_native_cached_closing_contract_survives_load_and_supply_without_replay(self) -> None:
+        from simple_ar.integrations.llm import LLMClient, LLMSettings
+
+        for mode in ('required', 'misordered', 'terminal', 'terminal_process', 'false', 'missing_field', 'missing_receipt'):
+            with self.subTest(mode=mode):
+                _, _, _, _, app, _ = self._native_fixture(mount_inputs=False, max_turns=1)
+                app.state['config']['completion_policy'] = 'closing_decision.v2'
+                app._save()
+                app.supply(supply_id='keep-v2', reason='Retain historical decision contract',
+                    changes={'allow_execution': True})
+                self.assertEqual(app.state['config']['completion_policy'], 'closing_decision.v2')
+                message = self._native_message('write_file', {'path': 'workspace/result.txt',
+                    'content': 'Cached proposal', **({'delivery': {'summary': 'Explicit output',
+                        'artifacts': ['workspace/result.txt']}} if mode == 'terminal' else {})}, 'write')
+                if mode == 'misordered':
+                    message['tool_calls'] = self._native_message('deliver_result', {
+                        'summary': 'Premature output', 'artifacts': ['workspace/result.txt']},
+                        'premature')['tool_calls'] + message['tool_calls']
+                elif mode == 'terminal_process':
+                    message = self._native_message('run_process', {
+                        'argv': ['python', '-c', "from pathlib import Path; Path('result.txt').write_text('Cached proposal')"],
+                        'timeout_sec': 3, 'delivery': {'summary': 'Explicit output',
+                            'artifacts': ['workspace/result.txt']}}, 'finish')
+                client = LLMClient(LLMSettings(api_key='fixture', model='fixture', api_mode='chat',
+                    retry_attempts=0, max_output_tokens=512))
+                def bound(attempt_id='', **_):
+                    return client.with_budget(app.ledger,
+                        session_id=app.session.manifest.session_id, attempt_id=attempt_id)
+                response = {'choices': [{'message': message}], 'usage': {
+                    'prompt_tokens': 100, 'completion_tokens': 10, 'total_tokens': 110}}
+                with patch.object(app, '_client', side_effect=bound), patch(
+                        'simple_ar.integrations.llm._call_openai_sdk', return_value=response) as send, \
+                        _interrupt_outcome_commit():
+                    app.run(progress=lambda _: None)
+                self.assertEqual(send.call_count, 1)
+                path = 'attempts/native-turn-0001/decision_budget.json'
+                budget = app.session.store.read_json(path)
+                self.assertTrue(budget['closing_required'])
+                if mode == 'missing_receipt':
+                    app.session.store.resolve(path).unlink()
+                elif mode in ('false', 'missing_field'):
+                    if mode == 'false':
+                        budget['closing_required'] = False
+                    else:
+                        budget.pop('closing_required')
+                    app.session.store.write_json(path, budget)
+                app = ToolApplication.load(app.session.store.root)
+                with patch.object(app, '_client', side_effect=bound), patch(
+                        'simple_ar.integrations.llm._call_openai_sdk', side_effect=AssertionError('No cached decision replay')) as replay:
+                    status = app.run(progress=lambda _: None)
+                    if mode == 'terminal_process':
+                        self.assertIn('approval', status['status_reason'])
+                        self.assertFalse((app.workspace.workspace/'result.txt').exists())
+                        token = app.approval_token(app.state['pending']['call'])
+                        app = ToolApplication.load(app.session.store.root)
+                        self.assertTrue(app._closing_decision())
+                        with patch.object(app, '_client', side_effect=bound):
+                            status = app.run(approved_execution=token, progress=lambda _: None)
+                replay.assert_not_called()
+                cancelled = mode in ('required', 'misordered')
+                self.assertEqual(status['status'], 'completed' if mode in ('terminal', 'terminal_process') else 'paused')
+                self.assertEqual((app.workspace.workspace/'result.txt').exists(), not cancelled)
+                self.assertEqual(app.session.store.exists('delivery.json'), mode in ('terminal', 'terminal_process'))
+                self.assertEqual(app.state['turns'][-1]['remaining'], [])
+                if cancelled:
+                    self.assertIn('Final decision requires', status['status_reason'])
+                    self.assertTrue(app.session.store.exists('tools/cancelled/native-turn-0001-0.json'))
+                    app.supply(supply_id='after-cancellation', reason='Access supply cannot adopt cancelled proposals',
+                        changes={'allow_execution': True})
+                self.assertEqual(app.state['config']['completion_policy'], 'closing_decision.v2')
+                ledger = app.ledger.to_dict()
+                turns = json.loads(json.dumps(app.state['turns']))
+                restored = ToolApplication.load(app.session.store.root)
+                with patch.object(restored, '_client', side_effect=bound), patch.object(
+                        restored.gateway, 'call', side_effect=AssertionError('No cancelled/tool replay')) as work, patch(
+                        'simple_ar.integrations.llm._call_openai_sdk', side_effect=AssertionError('No new decision')) as replay:
+                    restored.run(progress=lambda _: None)
+                work.assert_not_called()
+                replay.assert_not_called()
+                self.assertEqual(restored.state['turns'], turns)
                 self.assertEqual(restored.ledger.to_dict(), ledger)
 
     def test_native_attempt_space_is_reserved_without_faking_a_terminal_result(self) -> None:
@@ -4693,6 +4785,46 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 self.assertLessEqual(app.session.manifest.budget.attempts, attempts)
                 self.assertEqual(fake.chat_turn.call_count, max(0, attempts - 1))
                 self.assertEqual(work.call_count, int(attempts == 3))
+
+        # Once no future decision fits, the accepted queue may use the actual
+        # remaining attempts. A longer queue still cannot exceed that ceiling.
+        for exhausted, attempts in (('requests', 3), ('tokens', 3), ('requests', 2)):
+            with self.subTest(exhausted=exhausted, attempts=attempts):
+                _, _, fake, _, app, _ = self._native_fixture(mount_inputs=False,
+                    max_turns=1 if exhausted == 'requests' else 30)
+                app.session.manifest.budget.max_attempts = attempts
+                app.session.save()
+                message = self._native_message('write_file', {
+                    'path': 'workspace/first.txt', 'content': 'First accepted output'}, 'first')
+                message['tool_calls'] += self._native_message('write_file', {
+                    'path': 'workspace/second.txt', 'content': 'Second accepted output'}, 'second')['tool_calls']
+                if attempts == 2:
+                    message['tool_calls'][-1] = self._native_message('run_process', {
+                        'argv': ['python', '-c', "from pathlib import Path; Path('second.txt').write_text('Must not execute')"],
+                        'timeout_sec': 3}, 'second')['tool_calls'][0]
+                def choose(*args, **kwargs):
+                    if exhausted == 'tokens':
+                        # This fake provider consumes the remaining token balance;
+                        # admission below must use the retained follow-up estimate.
+                        app.ledger.limits['total_tokens'] = 0
+                        app.ledger.save()
+                    return message
+                fake.chat_turn.side_effect = choose
+                status = app.run(approve=lambda *_: True, progress=lambda _: None)
+                self.assertEqual(status['status'], 'blocked' if attempts == 2 else 'paused')
+                self.assertTrue((app.workspace.workspace/'first.txt').exists())
+                self.assertEqual((app.workspace.workspace/'second.txt').exists(), attempts == 3)
+                self.assertEqual(len(app.state['turns'][-1]['remaining']), int(attempts == 2))
+                self.assertEqual(app.session.manifest.budget.attempts, attempts)
+                self.assertFalse(app.session.store.exists('delivery.json'))
+                self.assertFalse(app.session.store.exists('tools/cancelled/native-turn-0001-0.json'))
+                self.assertEqual(app.ledger.remaining('process_invocations'), app.ledger.limits['process_invocations'])
+                restored = ToolApplication.load(app.session.store.root)
+                with patch.object(restored.gateway, 'call', side_effect=AssertionError('No tool replay')) as work:
+                    restored.run(progress=lambda _: None)
+                work.assert_not_called()
+                self.assertEqual(fake.chat_turn.call_count, 1)
+                self.assertEqual(restored.session.manifest.budget.attempts, attempts)
 
         # A pre-policy task keeps its declared admission behavior on reload;
         # installing newer code does not silently rewrite its old contract.
@@ -4818,6 +4950,11 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         for purpose, failure in cases:
             with self.subTest(purpose=purpose, failure=failure):
                 _, _, _, _, app, _ = self._native_fixture(completed=True, max_turns=8)
+                # Reuse the retry/recovery matrix to retain historical v2 as
+                # well as the current default, without duplicating its guards.
+                if purpose == 'task':
+                    app.state['config']['completion_policy'] = 'closing_decision.v2'
+                    app._save()
                 usages = []
                 client = LLMClient(LLMSettings(api_key='fixture', model='fixture', api_mode='chat',
                     retry_attempts=1, max_output_tokens=8192), budget_ledger=app.ledger,
@@ -7155,11 +7292,22 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
         # Feedback belongs to a new article version, not an implicit repair
         # inside the reviewer or a mutation of its original finding.
+        review_reply = 'attempts/standalone-review-decision/native_result.json'
+        review_result = 'attempts/standalone-review/native_result.json'
+        app.session.store.write_json(review_reply, self._native_message('review_document', arguments, 'review'))
+        app.session.store.write_json(review_result, result.model_dump(mode='json'))
+        app.state['turns'].append({'reply': review_reply,
+            'tools': [{'id': 'review', 'result': review_result}], 'remaining': []})
+        app.state['requests'].append('Revise the existing draft in response to the inspection.')
+        feedback = app._work_context([str(draft)])
+        self.assertEqual(feedback['review_observations'][0]['result'], result.model_dump(mode='json'))
+        self.assertTrue(feedback['review_observations'][0]['subjects'][0]['current_matches_review'])
         fake.ask_json.side_effect = None
         fake.ask_json.return_value = {'draft_markdown':
             'Cancellation propagates to sibling tasks but does not undo completed external effects [@P1].'}
         corrected = self._compose_document(app, {**arguments,
             'goal': 'Correct the cancellation boundary from the supplied evidence and keep the rest concise.'}, 'review-feedback')
+        self.assertIn('Bound cancellation to the stated effect.', json.dumps(_writing_prompt(fake)))
         fake.ask_json.return_value = {'section_reviews': [{'section_id': 'document', 'verdict': 'pass'}]}
         checked = _call_tool(app.gateway, 'review_document', {**arguments,
             'prior_draft': corrected.data['editable_markdown']}, identity='review-feedback-check')
@@ -7368,6 +7516,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         old_binding = read_json(request_path)
         old_binding.pop('assembly_mode')
         old_binding.pop('writing_owner')
+        old_binding.pop('work_context', None)  # Historical checkpoints predate automatic feedback inputs.
         write_json(request_path, old_binding)
         paths = [owner / 'writer' / name for name in ('writer.json', 'sections.json', 'report_inputs.json')]
         writer, checkpoint, snapshot = [read_json(path) for path in paths]
@@ -7948,21 +8097,81 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
     def test_visual_review_enforces_authorization_and_routes_the_consumed_inputs(self) -> None:
         inputs, fake, resumed, visual = self._visual_fixture()
+        from PIL import Image
+        from simple_ar.code_task.reviewing import run_visual_review
+        Image.new('RGB', (16, 16), 'white').save(inputs / 'figure.webp')
+        fake.connection_binding.return_value = {'profile': 'fixture-vision'}
+        fake.effective_output_limit.return_value = 16000
+        fake.ask_json.return_value = {'findings': []}
         self.assertEqual(_call_tool(resumed.gateway, "inspect_images",
             {"images": ["source0/notes.txt"], "goal": "Inspect"}, identity="denied-vision").status, "blocked")
         with patch("simple_ar.tools.visual.LLMClient.from_env", return_value=fake) as connection, \
-                patch("simple_ar.tools.visual.run_visual_review", return_value={"findings": []}) as inspect:
-            result = visual.call("inspect_images", {"images": ["source0/notes.txt"],
+                patch("simple_ar.tools.visual.run_visual_review", wraps=run_visual_review) as inspect:
+            result = visual.call("inspect_images", {"images": ["source0/figure.webp"],
                 "goal": "Inspect labels"}, identity="visual-one")
-            self.assertEqual(result.status, "ok")
+            self.assertEqual(result.status, "ok", result.error)
             self.assertEqual(connection.call_args.kwargs["purpose"], "vision")
             self.assertIs(connection.call_args.kwargs["budget_ledger"], resumed.ledger)
-            self.assertEqual(inspect.call_args.kwargs["image_paths"], (inputs / "notes.txt",))
+            self.assertEqual(inspect.call_args.kwargs["image_paths"], (inputs / "figure.webp",))
             self.assertEqual(result.data["scientific_validity"], "not_assessed")
+            self.assertEqual(result.data['input_sha256'], {
+                'source0/figure.webp': hashlib.sha256((inputs / 'figure.webp').read_bytes()).hexdigest()})
             denied = visual.call("inspect_images", {"images": ["source0/.env"],
                 "goal": "Inspect"}, identity="visual-secret")
             self.assertEqual(denied.status, "error")
             self.assertEqual(inspect.call_count, 1)
+
+    def test_related_feedback_uses_original_checks_and_marks_changed_subjects(self) -> None:
+        from PIL import Image
+        inputs, fake, app, visual = self._visual_fixture()
+        fake.connection_binding.return_value = {'profile': 'fixture-vision'}
+        fake.effective_output_limit.return_value = 16000
+        fake.ask_json.return_value = {'findings': [{'severity': 'warning', 'category': 'layout',
+            'summary': 'Label overlaps', 'evidence': 'Right panel', 'recommendation': 'Reposition the label'}]}
+        app.state['requests'].append('Please fix the overlap while preserving the numerical results.')
+        original_requests = list(app.state['requests'])
+        for index, relative in enumerate(('nested/不固定/overview.png', 'another chart.jpg')):
+            image = inputs / relative
+            image.parent.mkdir(parents=True, exist_ok=True)
+            Image.new('RGB', (16, 16), 'white').save(image)
+            identity = f'feedback-check-{index}'
+            arguments = {'images': ['source0/' + relative], 'goal': 'Check readability'}
+            with patch('simple_ar.tools.visual.LLMClient.from_env', return_value=fake):
+                result = visual.call('inspect_images', arguments, identity=identity)
+            self.assertEqual(result.status, 'ok', result.error)
+            reply = f'attempts/{identity}-decision/native_result.json'
+            record = f'attempts/{identity}/native_result.json'
+            app.session.store.write_json(reply, self._native_message('inspect_images', arguments, identity))
+            app.session.store.write_json(record, result.model_dump(mode='json'))
+            app.state['turns'].append({'reply': reply, 'tools': [{'id': identity, 'result': record}], 'remaining': []})
+            context = app._work_context([str(image.parent if index == 0 else image)])
+            self.assertEqual(context['user_requests'], original_requests)
+            self.assertEqual(len(context['review_observations']), 1)
+            observation = context['review_observations'][0]
+            self.assertEqual(observation['result'], result.model_dump(mode='json'))
+            self.assertTrue(observation['subjects'][0]['current_matches_review'])
+            original_hash = observation['subjects'][0]['reviewed_sha256']
+            copied = app.workspace.workspace / f'relocated-{index}{image.suffix}'
+            copied.write_bytes(image.read_bytes())
+            relocated = app._work_context([str(copied)])['review_observations'][0]['subjects'][0]
+            self.assertEqual(relocated['selected_path'], str(copied.resolve()))
+            self.assertTrue(relocated['current_matches_review'])
+            Image.new('RGB', (16, 16), 'black').save(image)
+            stale = app._work_context([str(image)])['review_observations'][0]['subjects'][0]
+            self.assertEqual(stale['reviewed_sha256'], original_hash)
+            self.assertFalse(stale['current_matches_review'])
+            self.assertEqual(app._work_context([str(inputs / 'notes.txt')])['review_observations'], [])
+            # No hash is invented for old checks; original receipts stay readable.
+            historical = result.model_dump(mode='json')
+            historical['data'].pop('input_sha256')
+            app.session.store.write_json(record, historical)
+            self.assertEqual(app._work_context([str(image)])['review_observations'], [])
+            app.session.store.write_json(record, result.model_dump(mode='json'))
+            snapshot = app.workspace.workspace / 'visual-reviews' / identity / f'source-0{image.suffix}'
+            snapshot.write_bytes(b'changed review input')
+            with self.assertRaisesRegex(ValueError, 'reviewed inputs changed'):
+                app._work_context([str(image)])
+        self.assertEqual(fake.ask_json.call_count, 2)
 
     def test_visual_review_replays_confirmed_results_and_retains_failures(self) -> None:
         inputs, fake, resumed, visual = self._visual_fixture()
@@ -9082,6 +9291,44 @@ class AgentHandoffTests(unittest.TestCase):
 
 
 class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
+    def test_professional_feedback_freezes_original_context_without_replaying_or_reclassifying_sources(self) -> None:
+        context = {'user_requests': ['Implement the utility', 'Keep the recorded ordering'],
+            'review_observations': [{'record': 'records/accepted-inspection/native_result.json',
+                'result': {'findings': ['Keep input order']},
+                'subjects': [{'path': str(self.source), 'current_matches_review': False}]}]}
+        provider = Mock(return_value=context)
+        self.implementation.work_context = provider
+        self.fake.ask_json.return_value = {'files': [{'path': 'other_name/utility.py',
+            'content': 'def preserve(values):\n    return list(values)\n'}]}
+        arguments = {'goal': 'Implement from the observed requirements',
+            'files': [{'path': 'other_name/utility.py', 'purpose': 'Utility'}],
+            'source_windows': [{'path': str(self.source)}]}
+        first = self.implementation.call('prepare_implementation', arguments, identity='context-candidate')
+        self.assertEqual(first.status, 'ok', first.error)
+        provider.assert_called_once_with([str(self.source.resolve())])
+        prompt = json.loads(self.fake.ask_json.call_args.args[1])
+        windows = prompt['source_windows']
+        self.assertEqual(windows[0]['text'], self.source_bytes.decode())
+        self.assertEqual(windows[1]['work_context'], context)
+        self.assertNotIn('request', windows[1])
+        self.assertNotIn('original_files', windows[1])
+        frozen = json.loads(json.dumps(windows[1]))
+        context['user_requests'].append('A later request must not replace the old invocation')
+        provider.side_effect = AssertionError('Recovery must use the original context')
+        self.assertEqual(self.implementation.call('prepare_implementation', arguments,
+            identity='context-candidate').model_dump(), first.model_dump())
+        self.assertEqual(self.fake.ask_json.call_count, 1)
+        binding = read_json(self.run_dir / 'attempts/context-candidate/implementation/request.json')
+        self.assertEqual(binding['source_windows'][1], frozen)
+        # A completed historical invocation with no such context stays historical.
+        self.implementation.work_context = None
+        historical = self.implementation.call('prepare_implementation', arguments, identity='legacy-context-candidate')
+        self.assertEqual(historical.status, 'ok', historical.error)
+        self.implementation.work_context = provider
+        self.assertEqual(self.implementation.call('prepare_implementation', arguments,
+            identity='legacy-context-candidate').model_dump(), historical.model_dump())
+        self.assertEqual(self.fake.ask_json.call_count, 2)
+
     def test_direct_creation_rejects_binary_or_private_sources_without_replaying_empty_output(self) -> None:
         from simple_ar.integrations.llm import LLMResponseError
 

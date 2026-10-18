@@ -236,11 +236,13 @@ def writing_tool_specs() -> list[CommonToolSpec]:
 class WritingToolGateway:
     def __init__(self, root: Path, workspace: Any, ledger: Any, model: str, session_id: str,
                  *, client_factory: Callable[[str], Any] | None = None,
-                 report_inputs: Callable[[], dict[str, Any]] | None = None) -> None:
+                 report_inputs: Callable[[], dict[str, Any]] | None = None,
+                 work_context: Callable[[list[str]], dict] | None = None) -> None:
         self.root, self.workspace, self.ledger = root, workspace, ledger
         self.model, self.session_id = model, session_id
         self.client_factory = client_factory
         self.report_inputs = report_inputs
+        self.work_context = work_context
 
     def can_reconcile(self, name: str, identity: str) -> bool:
         """Allow dispatch to this owner, without certifying a completed article."""
@@ -709,6 +711,9 @@ class WritingToolGateway:
                 if hashlib.sha256(current).hexdigest() != prior_binding['sha256']:
                     raise ValueError(f'Prior draft input {request.prior_draft!r}: changed during composition; use a new identity')
                 bindings.append(prior_binding)
+            # Delivery attachments and unselected investigation previews below
+            # are integrity bindings, not selected writing subjects.
+            selected_bindings = list(bindings)
             if delivery_inputs:
                 if self.workspace.artifact_hashes(delivery_inputs) != delivery_inputs:
                     raise ValueError('Declared delivery artifacts changed during evidence selection; preserve this review version')
@@ -739,6 +744,15 @@ class WritingToolGateway:
                 if not source['questions']:
                     source.pop('questions')  # Preserve existing explicit-selection receipt identity.
             binding = {'request': canonical_request, 'inputs': bindings}
+            if recovering:
+                if 'work_context' in original_binding:
+                    binding['work_context'] = original_binding['work_context']
+            elif self.work_context is not None:
+                from simple_ar.tools.materials import freeze_work_context
+                targets = [str(self.workspace.resolve_source_record(row['path'])
+                    if index < len(request.sources) else self.workspace.resolve(row['path']))
+                    for index, row in enumerate(selected_bindings)]
+                binding['work_context'] = freeze_work_context(self.work_context, list(dict.fromkeys(targets)))
             if report_binding is not None:
                 binding['report_binding'] = report_binding
             if writing_owner is not None:
@@ -749,6 +763,9 @@ class WritingToolGateway:
                 binding['assembly_mode'] = assembly_mode.value
             if request.figures and (not recovering or 'figure_caption_contract' in original_binding):
                 binding['figure_caption_contract'] = 'pandoc_image.v1'
+            if (not recovering and 'work_context' in binding
+                    and len(json.dumps(binding, ensure_ascii=False).encode('utf-8')) > 4 * 1024 * 1024):
+                raise ValueError('Composition binding with work context exceeds 4 MiB; narrow related inputs')
             if owner.exists('request.json'):
                 if owner.read_json('request.json') != binding:
                     raise ValueError('Inputs changed; preserve this version and request a new one')
@@ -780,10 +797,14 @@ class WritingToolGateway:
                     documents_ref=ref, assets=[], selected_evidence=True,
                     include_memory=writing_owner is None or material_report)
             context.goal_markdown = request.goal
+            if 'work_context' in binding:
+                context.goal_markdown += '\nOriginal task request and relevant accepted feedback (not source evidence):\n' + json.dumps(
+                    binding['work_context'], ensure_ascii=False)
             projected_memory = memory if material_report else None
             if material_report:
                 context.topic = request.title
-                context.goal_markdown += '\nCurrent user request and feedback:\n' + '\n'.join(report_binding['requests'])
+                if 'work_context' not in binding:
+                    context.goal_markdown += '\nCurrent user request and feedback:\n' + '\n'.join(report_binding['requests'])
             elif report_binding is not None:
                 from simple_ar.core.capabilities import ArtifactRef
                 from simple_ar.report.projection import build_implementation_report_inputs
@@ -806,8 +827,12 @@ class WritingToolGateway:
                 if report_binding.get('measurement_refs') and (execution_projection or not refs):
                     context.evidence_summary = (context.evidence_summary + '\n' + '\n'.join(
                         execution_memory.limitations)).strip()
-                context.goal_markdown += '\nCurrent user request and feedback:\n' + '\n'.join(
-                    ArtifactStore(self.root).read_json('actions.json')['requests'])
+                if 'work_context' not in binding:
+                    context.goal_markdown += '\nCurrent user request and feedback:\n' + '\n'.join(
+                        ArtifactStore(self.root).read_json('actions.json')['requests'])
+            if ('work_context' in binding
+                    and len(context.goal_markdown.encode('utf-8')) > 4 * 1024 * 1024):
+                raise ValueError('Composition goal with work context exceeds 4 MiB; narrow related inputs')
             if inspecting:
                 from simple_ar.report.writing import inspect_article
                 context.topic = request.title
@@ -943,6 +968,8 @@ class WritingToolGateway:
                     config=config, title=request.title, goal=request.goal,
                     target_words=request.target_words, prior_draft=previous,
                     required_headings=request.required_headings)
+                if 'work_context' in binding:
+                    inputs['article']['work_context'] = binding['work_context']
                 if not recovering:
                     client = client or (self.client_factory(identity) if self.client_factory else LLMClient.from_env(
                         self.model, budget_ledger=self.ledger, budget_session_id=self.session_id, budget_attempt_id=identity))

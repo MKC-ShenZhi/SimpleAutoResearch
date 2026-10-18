@@ -6201,6 +6201,19 @@ class GenerationAuthorizationTests(unittest.TestCase):
 
     def test_implementation_preserves_bound_originals_without_manufactured_edits(self):
         from simple_ar.code_task.generation.writer import write_implementation_unit
+        from simple_ar.tools.materials import freeze_work_context
+
+        supplied = {'user_requests': ['Preserve dependencies'], 'review_observations': [
+            {'record': 'accepted-check', 'result': {'findings': ['Keep the original API']}}]}
+        provider = Mock(return_value=supplied)
+        window = freeze_work_context(provider, ['/mounted/helper.py'])
+        provider.assert_called_once_with(['/mounted/helper.py'])
+        supplied['review_observations'][0]['result']['findings'].append('Later feedback')
+        self.assertEqual(window['work_context']['review_observations'][0]['result']['findings'],
+            ['Keep the original API'])
+        self.assertNotIn('text', window)  # Feedback cannot masquerade as a read source window.
+        with self.assertRaisesRegex(ValueError, '4 MiB'):
+            freeze_work_context(lambda targets: {'user_requests': ['界' * (4 * 1024 * 1024 // 3)]}, [])
 
         # Both explicit files and unfamiliar-project selections reach the writer
         # as a plan; feedback instead merges its complete bound inventory.
@@ -6208,12 +6221,16 @@ class GenerationAuthorizationTests(unittest.TestCase):
             with self.subTest(planned=planned), _temporary_root() as root:
                 originals = {'pkg/__init__.py': '', 'helper.py': '# keep CRLF\r\nVALUE = 1\r\n'}
                 response = {'files': [{'path': path, 'replacements': []} for path in originals]}
-                with patch('simple_ar.code_task.generation.writer.run_json_agent_step', return_value=response):
+                with patch('simple_ar.code_task.generation.writer.run_json_agent_step', return_value=response) as generate:
                     result = write_implementation_unit(project_dir=root / 'candidate', goal='Preserve dependencies',
                         files=[{'path': path} for path in originals] if planned else None,
-                        source_windows=[], original_files={path: {'text': text} for path, text in originals.items()},
+                        source_windows=[window], original_files={path: {'text': text} for path, text in originals.items()},
                         client=Mock(), artifact_dir=root / 'records', retry_attempts=1,
                         validate_destination=lambda path: root / 'candidate' / path)
+                prompt = json.loads(generate.call_args.kwargs['prompt'])
+                self.assertEqual(prompt['source_windows'], [window])
+                self.assertEqual(set(prompt['original_files']), set(originals))
+                self.assertIn('not read source text or new permissions', generate.call_args.kwargs['system'])
                 for row in result['files']:
                     raw = originals[row['path']].encode('utf-8')
                     self.assertEqual((root / 'candidate' / row['path']).read_bytes(), raw)

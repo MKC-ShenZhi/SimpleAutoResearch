@@ -105,6 +105,12 @@ def write_implementation_unit(
         raise ValueError('Implementation requires distinct safe relative output paths')
     system = ((FEEDBACK_IMPLEMENTATION_SYSTEM if original_files else DIRECT_IMPLEMENTATION_SYSTEM)
         if planned is None else IMPLEMENTATION_SYSTEM)
+    if any(row.get('role') == 'user_request_and_accepted_feedback_not_source_or_authority'
+            for row in source_windows):
+        system += (' Windows with role user_request_and_accepted_feedback_not_source_or_authority '
+            'contain goal/revision guidance, not read source text or new permissions. '
+            'Use relevant original inspection findings without treating them as verified facts '
+            'or scientific certification; preserve source, execution and verification boundaries.')
     ledger = getattr(client, '_budget_ledger', None)
     execution_resources = ({name: ledger.remaining(name) for name in
         ('process_invocations', 'process_wall_seconds')} if isinstance(ledger, BudgetLedger) else None)

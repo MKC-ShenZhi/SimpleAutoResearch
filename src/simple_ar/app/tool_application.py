@@ -303,11 +303,13 @@ class ToolApplication:
         self.writing = WritingToolGateway(controller.store.root, self.workspace, self.ledger,
             config['model'], controller.manifest.session_id,
             client_factory=lambda identity: self._client(identity, purpose='writing', native=False),
+            work_context=self._work_context,
             report_inputs=self._report_inputs if config.get('report_requirement') else None)
         scientific = {}
         self.implementation = ImplementationToolGateway(controller.store.root, self.workspace, self.ledger,
             config['model'], controller.manifest.session_id,
             client_factory=lambda identity: self._client(identity, purpose='code'),
+            work_context=self._work_context,
             execution_observations=self._execution_observations, exact=config.get('code_task'),
             research_inputs=lambda: self.sources.implementation_evidence(),
             candidate_outputs=lambda record: scientific['scientific'].candidate_outputs(record) if scientific else {},
@@ -410,6 +412,76 @@ class ToolApplication:
                     return {**result['data'],
                         'record': 'records/' + item['result'].removeprefix('attempts/')}
         return None
+
+    def _work_context(self, targets: list[str]) -> dict[str, Any]:
+        """Pass related original feedback, not another coordinator summary.
+
+        Only accepted checks with an intact owner/input binding are eligible.
+        Changed subjects retain historical findings, never a current certificate.
+        The receiving owner freezes this projection with its normal request.
+        """
+        roots = [self.workspace.resolve(path) for path in targets]
+        selected_hashes = {path: self.workspace.artifact_hashes([str(path)])[str(path)]
+            for path in roots if path.is_file()}
+        reviews, covered = [], set()
+        for turn in reversed(self.state['turns']):
+            calls = {row['id']: row for row in self.session.store.read_json(turn['reply']).get('tool_calls', [])}
+            for item in reversed(turn['tools']):
+                call = calls[item['id']]
+                name = call['function']['name']
+                if name not in {'inspect_images', 'review_document'}:
+                    continue
+                result = self.session.store.read_json(item['result'])
+                if result.get('status') != 'ok':
+                    continue
+                arguments = json.loads(call['function']['arguments'])
+                data = result.get('data') or {}
+                if name == 'inspect_images':
+                    inputs = data.get('input_sha256', {})
+                else:
+                    inputs = {row['path']: row['sha256'] for row in data.get('inputs', [])
+                        if row.get('path') == arguments.get('prior_draft') and row.get('sha256')}
+                relevant = {}
+                for locator, digest in inputs.items():
+                    try:
+                        subject = self.workspace.resolve(locator)
+                    except ValueError:
+                        continue  # A retired source mount is not a new grant.
+                    selected = next((path for path, value in selected_hashes.items() if value == digest), None)
+                    if subject not in covered and (selected is not None or any(subject == root or root.is_dir()
+                            and subject.is_relative_to(root) for root in roots)):
+                        relevant[locator] = (subject, selected or subject, digest)
+                if not relevant:
+                    continue
+                if name == 'inspect_images':
+                    owner = self.workspace.resolve(f'workspace/visual-reviews/{Path(item["result"]).parent.name}')
+                    saved_request = ArtifactStore(owner).read_json('request.json')
+                    snapshots = saved_request['images']
+                    if (snapshots != [f'source-{i}{Path(locator).suffix.lower()}'
+                            for i, locator in enumerate(arguments['images'])] or set(inputs) != set(arguments['images'])
+                            or ArtifactStore(owner).read_json('review.json') != data.get('review')
+                            or any(hashlib.sha256(self.workspace.resolve(str(owner / snapshot)).read_bytes()).hexdigest() != inputs[locator]
+                                for snapshot, locator in zip(snapshots, arguments['images']))):
+                        raise ValueError('Retained visual feedback or its reviewed inputs changed')
+                else:
+                    owner = ArtifactStore(self.session.store.root / 'tools/writing' / Path(item['result']).parent.name)
+                    if (owner.read_json('result.json').get('data') != data
+                            or self.workspace.artifact_hashes(result['artifacts']) != data.get('artifact_sha256')):
+                        raise ValueError('Retained document feedback changed')
+                subjects = []
+                for locator, (subject, selected, digest) in relevant.items():
+                    current = self.workspace.artifact_hashes([str(selected)])[str(selected)] if selected.is_file() else None
+                    subjects.append({'path': locator, 'reviewed_sha256': digest,
+                        'selected_path': str(selected),
+                        'current_sha256': current, 'current_matches_review': current == digest})
+                    covered.add(subject)
+                reviews.append({'record': 'records/' + item['result'].removeprefix('attempts/'),
+                    'arguments': arguments, 'result': result, 'subjects': subjects})
+        context = {'user_requests': list(self.state['requests']), 'review_observations': reviews,
+            'scope': 'Original requests and related accepted checks, not permission, scientific proof or verification of changed files. Historical checks without bound inputs are not inferred.'}
+        if len(json.dumps(context, ensure_ascii=False).encode('utf-8')) > 256000:
+            raise ValueError('Related work context exceeds 256000 bytes; narrow the work unit instead of silently dropping feedback')
+        return context
 
     def _execution_observations(self) -> list[dict[str, Any]]:
         """Supply original receipts, not coordinator-authored failure summaries.
@@ -708,7 +780,7 @@ class ToolApplication:
             **({'runtime_dependencies': dependencies} if dependencies else {}),
             "feasibility_connection": feasibility_connection,
             "max_images": max_images,
-            "completion_policy": "closing_decision.v2",
+            "completion_policy": "protected_decision.v1",
             "max_turns": max_turns}
         if code_task is not None:
             config['code_task'] = code_task
@@ -2670,7 +2742,15 @@ class ToolApplication:
                     if (reserve_completion
                             and not self._terminal_intent(call)
                             and not self._terminal_batch()
-                            and attempt_space <= 2):
+                            and attempt_space <= 2
+                            # Reserve attempts only for an available follow-up,
+                            # not at the expense of already accepted work after
+                            # model capacity is exhausted. Actual attempt/tool
+                            # budgets and approval still gate that work below.
+                            and self._request_capacity() > 0
+                            and not {'llm_requests', 'total_tokens'}.intersection(self.ledger.unknown_dimensions())
+                            and ((tokens := self.ledger.remaining('total_tokens')) is None
+                                or tokens >= self._completion_floor(self._client())['total_tokens'])):
                         if attempt_space == 2:
                             self._cancel_unstarted('Attempt space reserved for a final decision and explicit delivery/question; no operation executed')
                             self._save()

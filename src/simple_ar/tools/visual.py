@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
 import re
 from typing import Any, Callable
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from simple_ar.core.capabilities import ArtifactStore
 from simple_ar.code_task.reviewing import run_visual_review
 from simple_ar.integrations.llm import LLMClient, LLMDeadlineError, LLMImageInputError, LLMResponseError, MAX_VISION_BYTES, MAX_VISION_PIXELS
 from simple_ar.tools.specs import CommonToolSpec, ToolResult
@@ -47,6 +49,9 @@ class VisualToolGateway:
                 raise ValueError("Invalid visual invocation")
             request = _Inspect.model_validate(arguments)
             paths = tuple(self.workspace.resolve(path) for path in request.images)
+            if len(set(paths)) != len(paths):
+                raise ValueError('Select each resolved image once')
+            input_hashes = self.workspace.artifact_hashes(request.images)
             # The existing reviewer owns immutable inputs, saved responses and
             # interrupted-call rejection. Do not add another retry/prompt owner.
             client = self.client_factory(identity) if self.client_factory else LLMClient.from_env(purpose="vision", budget_ledger=self.ledger,
@@ -54,8 +59,15 @@ class VisualToolGateway:
             directory = self.workspace.resolve(f"workspace/visual-reviews/{identity}", write=True)
             report = run_visual_review(client=client, image_paths=paths,
                 goal=request.goal, output_dir=directory)
+            # Bind findings to the bytes actually sent, not the later file at
+            # the same path. Old accepted receipts keep their historical shape.
+            snapshots = ArtifactStore(directory).read_json('request.json')['images']
+            if (snapshots != [f'source-{i}{path.suffix.lower()}' for i, path in enumerate(paths)]
+                    or any(hashlib.sha256(self.workspace.resolve(str(directory / snapshot)).read_bytes()).hexdigest() != input_hashes[locator]
+                        for snapshot, locator in zip(snapshots, request.images))):
+                raise ValueError('Visual inputs changed during inspection; retain the unbound review')
             prefix = f"workspace/visual-reviews/{identity}"
-            return ToolResult(tool_name=name, data={"review": report,
+            return ToolResult(tool_name=name, data={"review": report, "input_sha256": input_hashes,
                 "feedback": f"{prefix}/feedback.md",
                 "scientific_validity": "not_assessed"},
                 artifacts=[f"{prefix}/review.json", f"{prefix}/feedback.md"])
