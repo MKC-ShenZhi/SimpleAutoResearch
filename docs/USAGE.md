@@ -219,6 +219,17 @@ Recorded status does not certify quality; `partial` retains unresolved work.
 Feedback continues the same task and ledger; starting from a configuration again creates a new task.
 Creation flags cannot reset saved process limits on resume; additional resources require explicit continuation authorization.
 
+When no operation remains pending, explicitly record another configured text connection, then submit feedback separately:
+
+```bash
+uv run simple-ar start --resume-task SESSION --switch-model profile:another --switch-id connection-1 --switch-reason "Use another configured service"
+uv run simple-ar start --resume-task SESSION "Continue revising the saved report"
+```
+
+Review the displayed task/code/writing destinations and models before confirming. Recording a switch makes no model request, replays no tool, and retains delivery and accounting.
+Each switch ID has one immutable intent; replaying an older ID does not revert a later change.
+Reconcile pending, in-flight or unconsumed responses first. A terminated failed model decision still uses `--retry-model --model profile:another`; switching cannot bypass uncertain operations.
+
 ## Choose a task and its smallest input
 
 Use the [six workflow recipes](WORKFLOWS.md) for research, code, data, writing,

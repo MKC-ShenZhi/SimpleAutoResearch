@@ -6,6 +6,8 @@ User-visible changes, newest first. Entries describe behavior on their date; lat
 
 ## Unreleased — V2.10
 
+- Explicit native text-connection switches record pinned destinations and intent in the original journal without replaying work, changing accounting or invalidating saved delivery; pending operations retain their recovery contract.
+
 - List and select existing native tasks by directory/name without a second registry; continue feedback through the saved task owner.
 - Export annotated native task TOML for review, with explicit CLI overrides and effective cumulative process limits. Resume commands use the actual session path.
 

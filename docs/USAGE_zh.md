@@ -208,6 +208,17 @@ uv run simple-ar start --tasks-in runs/assistant --resume-task EXACT_DIRECTORY_N
 反馈沿原任务、材料和账本继续；再次用配置文件启动则会创建新任务。
 继续时不能用创建参数悄悄重设进程额度，额外资源仍使用显式续额授权。
 
+需要在没有待处理操作时更换工作连接，可显式记录变更，再单独提交反馈：
+
+```bash
+uv run simple-ar start --resume-task SESSION --switch-model profile:another --switch-id connection-1 --switch-reason "使用另一已配置服务"
+uv run simple-ar start --resume-task SESSION "继续修改已有报告"
+```
+
+先核对显示的任务、code、writing端点与模型，确认后才保存。变更不调用模型、重跑工具或清空账本；已交付文件仍保留。
+同一变更ID只能对应同一意图，重复旧ID不会撤销后来变更。任务有待处理/在途/未消费回复时先按原规则恢复；
+已终止的失败模型决策仍使用 `--retry-model --model profile:another`，不要通过改连接规避未确认操作。
+
 ## 选择任务与最小输入
 
 [六项工作流配方](WORKFLOWS_zh.md)覆盖调研、代码、数据、写作、复现和导出。

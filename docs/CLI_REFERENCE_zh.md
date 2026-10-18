@@ -60,6 +60,7 @@ simple-ar start --kind writing --material notes.md --prepare-only
 | `--approve-execution TOKEN` | 提交当前打印的精确审批 token；必须与原生恢复一起使用。 |
 | `--decision-id ID`、`--decision-response accept\|reject\|revise`、`--decision-guidance TEXT` | 恢复时回复冻结设计；guidance用于revise，不代表执行授权。 |
 | `--retry-model` | 显式重试已关闭的失败模型决策，规则见下文。 |
+| `--switch-model profile:NAME`、`--switch-id ID`、`--switch-reason TEXT` | 配合原生恢复，只记录安全时点的显式命名文本连接变更，不发请求/工具/反馈；旧交付和账本保留。独立于retry/反馈/授权使用。 |
 | `--authorize-remaining DIMENSION=AMOUNT` | 恢复时可重复声明新的剩余额度。 |
 | `--authorization-id ID`、`--authorization-reason TEXT` | 改变额度必须提供稳定 ID 和原因。 |
 

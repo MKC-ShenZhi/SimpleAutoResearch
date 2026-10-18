@@ -235,6 +235,63 @@ code = "daily"
             self.assertIn('https://replacement.invalid/v1', output.getvalue())
             self.assertIn('replacement-model', output.getvalue())
 
+    def test_native_switch_cli_records_only_after_confirmation_and_requires_separate_intent(self):
+        app = MagicMock()
+        app.state = {'config': {'model': 'profile:saved'}, 'pending': None}
+        app.session.store.root = Path('saved-task').resolve()
+        target = {'profile': 'new', 'settings': {
+            'base_url': 'https://text.invalid/v1', 'model': 'text-model'},
+            'code_route': {'profile': 'new-code', 'connection': {
+                'base_url': 'https://code.invalid/v1', 'model': 'code-model'}},
+            'writing_route': {'profile': 'new-writing', 'connection': {
+                'base_url': 'https://writing.invalid/v1', 'model': 'writing-model'}}}
+        client = MagicMock()
+        client.connection_binding.return_value = target
+        base = ['start', '--resume-task', 'saved-task']
+        change = ['--switch-model', 'profile:new', '--switch-id', 'service-1',
+                  '--switch-reason', 'Use another connection']
+        with patch('simple_ar.app.tool_application.ToolApplication.load', return_value=app), \
+                patch('simple_ar.integrations.llm.LLMClient.from_env', return_value=client), \
+                patch('simple_ar.cli.main._render_native_result'), \
+                patch('sys.stdin.isatty', return_value=False), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            main([*base, *change, '--prepare-only'])
+            main([*base, *change])
+            app.switch_model.assert_not_called()
+            for answer in ('n', 'y'):
+                with patch('sys.stdin.isatty', return_value=True), \
+                        patch('builtins.input', return_value=answer) as confirm:
+                    main([*base, *change])
+                confirm.assert_called_once()
+                if answer == 'n':
+                    app.switch_model.assert_not_called()
+                else:
+                    app.switch_model.assert_called_once_with('profile:new', switch_id='service-1',
+                        reason='Use another connection', expected_connection=target)
+            app.switch_model.reset_mock()
+            with patch('builtins.input') as confirm:
+                main([*base, *change, '--yes'])
+                confirm.assert_not_called()
+            app.switch_model.assert_called_once_with('profile:new', switch_id='service-1',
+                reason='Use another connection', expected_connection=target)
+            app.switch_model.reset_mock()
+            for flags in ([*change, 'New feedback'], [*change, '--retry-model'],
+                          [*change, '--model', 'profile:new'], [*change, '--allow-network'],
+                          [*change, '--supply-task', 'contracts.toml'],
+                          ['--switch-model', 'profile:new', '--switch-id', 'service-1'],
+                          ['--switch-id', 'service-1'],
+                          ['--switch-model', 'raw-model', '--switch-id', 'service-1', '--switch-reason', 'Change']):
+                with self.subTest(flags=flags), self.assertRaises(SystemExit):
+                    main([*base, *flags, '--yes'])
+            with self.assertRaises(SystemExit):
+                main(['start', *change, '--yes'])
+            app.switch_model.assert_not_called()
+            app.run.assert_not_called()
+            for value in ('https://text.invalid/v1', 'text-model', 'https://code.invalid/v1',
+                          'code-model', 'https://writing.invalid/v1', 'writing-model', 'service-1',
+                          'Use another connection', 'Saved delivery remains valid'):
+                self.assertIn(value, output.getvalue())
+
     def test_native_resume_cli_rejects_explicit_model_change_without_retry(self):
         from simple_ar.core.budget import BudgetLedger
 

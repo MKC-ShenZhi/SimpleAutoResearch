@@ -120,6 +120,9 @@ def add_start_parser(subparsers: argparse._SubParsersAction) -> None:
     native.add_argument("--max-process-seconds", type=float, default=None, help="Native creation: cumulative process wall-time cap in seconds.")
     native.add_argument("--supply-task", type=Path, help="With --resume-task, confirm caller TOML contracts or first model binding. replace_existing=true explicitly revises saved contracts without resetting evidence or ledger. Records without execution; not a model retry or model replacement.")
     native.add_argument("--retry-model", action="store_true", help="With --resume-task, explicitly continue a terminated failed native model decision using a new attempt and remaining budget. Optionally select --model profile:NAME/route:NAME to record a compatible Chat connection change without clearing history or charges. Cached replies keep their saved connection; tools, in-flight requests and whole tasks are not resubmitted. Use separately from feedback or authorization changes.")
+    native.add_argument("--switch-model", metavar="profile:NAME", help="With --resume-task, record a named text connection change only (profile:NAME or route:NAME). Requires --switch-id and --switch-reason. No model call, process or feedback; saved delivery and budgets remain valid. Reconcile pending operations first.")
+    native.add_argument("--switch-id", help="Stable id for an idempotent --switch-model record in the original task journal.")
+    native.add_argument("--switch-reason", help="Explicit human-readable reason for --switch-model.")
     native.add_argument("--authorize-remaining", action="append", default=None, metavar="DIMENSION=AMOUNT", help="Native resume: explicitly authorize a new remaining resource allowance after confirmation; repeat for multiple dimensions.")
     native.add_argument("--authorization-id", default=None, help="Native resume: stable idempotency key required for explicit continuation allowances.")
     native.add_argument("--authorization-reason", default=None, help="Native resume: human-readable reason recorded with a continuation allowance.")
@@ -268,6 +271,8 @@ def migrate_new_start(args: argparse.Namespace) -> bool:
         raise ValueError("--approve-execution requires --resume-task and its saved pending command.")
     if args.retry_model:
         raise ValueError("--retry-model requires --resume-task and its saved failed model decision.")
+    if args.switch_model or args.switch_id is not None or args.switch_reason is not None:
+        raise ValueError("--switch-model requires --resume-task, --switch-id and --switch-reason.")
     from simple_ar.cli.parser import build_parser
     defaults = build_parser().parse_args(["start"])
     explicit = set(getattr(args, "_explicit_start_destinations", ()))

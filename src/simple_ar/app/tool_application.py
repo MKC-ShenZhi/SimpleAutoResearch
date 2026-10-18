@@ -2305,6 +2305,96 @@ class ToolApplication:
             return None
         return attempt
 
+    def _replacement_text_client(self, model_selector: str, *, attempt_id: str = "") -> tuple[LLMClient, dict[str, Any]]:
+        """Resolve an explicit binding without sending work or altering accounting."""
+        if not model_selector.startswith(('profile:', 'route:')):
+            raise ValueError('Explicit model continuation requires a named profile:NAME or route:NAME')
+        parent = LLMClient.from_env(model_selector, budget_ledger=self.ledger,
+            budget_session_id=self.session.manifest.session_id, budget_attempt_id=attempt_id)
+        replacement = parent.connection_binding()
+        if not replacement or parent._settings.api_mode != 'chat':
+            raise ValueError('Replacement must be a named Chat connection; no protocol conversion')
+        client = self._text_client(parent, self._work_focus()['purpose'])
+        attempts = self.session.list_attempts()
+        # Only the existing retry contract's closed, bounded native decision
+        # failures may remain unknown. Their original reservations stay held.
+        for entry in self.ledger.entries:
+            if entry.status == 'unknown' and (
+                    entry.purpose != 'native-turn' or entry.actual_source != 'reservation_bound'
+                    or type(entry.reserved.get('total_tokens')) is not int
+                    or entry.reserved['total_tokens'] <= 0
+                    or not any(row.attempt_id == entry.attempt_id and row.status == 'failed'
+                               and row.capability == 'native_turn' for row in attempts)
+                    or self.session.store.exists(f'attempts/{entry.attempt_id}/native_result.json')):
+                raise ValueError('Unconfirmed operation must be reconciled before changing models')
+        if client._settings.thinking_mode == 'enabled' and any(
+                'reasoning_content' not in self.session.store.read_json(turn['reply'])
+                for turn in self.state['turns']):
+            raise ValueError('Saved history lacks reasoning_content; choose a compatible non-thinking '
+                             'connection, not fabricated or discarded reasoning')
+        if self.state['config'].get('allow_vision'):
+            vision = LLMClient.from_env(purpose='vision')
+            if not model_connections_compatible(self.state['config'].get('vision_connection') or {},
+                                                 self._vision_binding(vision)):
+                raise ValueError('Text replacement cannot silently change the saved vision connection')
+        return client, replacement
+
+    def switch_model(self, model_selector: str, *, switch_id: str, reason: str,
+                     expected_connection: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Record a connection change only after work is reconciled; retain delivery and budgets."""
+        with self.session.mutation_scope():
+            if (not isinstance(switch_id, str) or not switch_id.strip()
+                    or not isinstance(reason, str) or not reason.strip()
+                    or not isinstance(model_selector, str)
+                    or not model_selector.startswith(('profile:', 'route:'))):
+                raise ValueError('Model switch requires a named connection, stable switch id and explicit reason')
+            switch_id, reason = switch_id.strip(), reason.strip()
+            config = self.state['config']
+            records = config.get('model_rebindings', [])
+            previous = next((row for row in records if row.get('switch_id') == switch_id), None)
+            if previous is not None:
+                if (previous['to_selector'] != model_selector or previous['reason'] != reason
+                        or expected_connection is not None and previous['to_connection'] != expected_connection):
+                    raise ValueError('Model switch id already exists with different terms')
+                return previous  # Replaying an older id never reverts a later switch.
+            if config['model'] is None or 'llm_client' in config.get('runtime_dependencies', {}):
+                raise ValueError('Model switch requires an existing non-injected text model authorization')
+            if self.state.get('pending_supply') is not None:
+                raise ValueError('Complete the retained caller supply before changing models')
+            attempts = self.session.list_attempts()
+            accepted = {turn['reply'] for turn in self.state['turns']}
+            if (self.state['pending'] or any(turn['remaining'] for turn in self.state['turns'])
+                    or any(row.status == 'running' for row in attempts)
+                    or any(entry.status == 'reserved' for entry in self.ledger.entries)
+                    or any(row.capability == 'native_turn'
+                        and self.session.store.exists(f'attempts/{row.attempt_id}/native_result.json')
+                        and f'attempts/{row.attempt_id}/native_result.json' not in accepted for row in attempts)):
+                raise ValueError('Reconcile pending, running, reserved or cached operations before changing models')
+            _, replacement = self._replacement_text_client(model_selector)
+            for entry in self.ledger.entries:
+                if entry.status == 'unknown' and (
+                        entry.session_id != self.session.manifest.session_id
+                        or entry.logical_call_id != entry.attempt_id
+                        or self._failed_model_attempt({'kind': 'model', 'attempt': entry.attempt_id},
+                            current_only=False) is None
+                        or set(entry.reserved) != {'llm_requests', 'total_tokens'}
+                        or entry.reserved['llm_requests'] != 1 or entry.actual.get('llm_requests') != 1
+                        or any(key not in entry.reserved or type(value) not in {int, float}
+                            or not math.isfinite(value) or not 0 <= value <= entry.reserved[key]
+                            for key, value in entry.actual.items())):
+                    raise ValueError('Unknown model charges have no recognized retained reservation')
+            if expected_connection is not None and replacement != expected_connection:
+                raise ValueError('Resolved connection changed after confirmation; inspect and confirm again')
+            record = {'switch_id': switch_id, 'reason': reason,
+                'from_selector': config['model'], 'from_connection': config.get('model_connection') or {},
+                'to_selector': model_selector, 'to_connection': replacement}
+            # One original journal commit. No attempt, transition, allowance,
+            # feedback or delivery invalidation accompanies this operation.
+            self.state['config'] = {**config, 'model': model_selector, 'model_connection': replacement,
+                'model_rebindings': [*records, record]}
+            self._save()
+            return record
+
     def _retry_model(self, model_selector: str = "") -> None:
         """Authorize one new decision, retaining failed attempts and all charges."""
         if 'llm_client' in self.state['config'].get('runtime_dependencies', {}):
@@ -2334,35 +2424,7 @@ class ToolApplication:
             raise ValueError('Cannot prove a terminated failed native_turn without accepted outputs')
         replacement = None
         if model_selector:
-            if not model_selector.startswith(('profile:', 'route:')):
-                raise ValueError('Explicit model continuation requires a named profile:NAME or route:NAME')
-            parent = LLMClient.from_env(model_selector, budget_ledger=self.ledger,
-                budget_session_id=self.session.manifest.session_id, budget_attempt_id=attempt.attempt_id)
-            replacement = parent.connection_binding()
-            if not replacement or parent._settings.api_mode != 'chat':
-                raise ValueError('Replacement must be a named Chat connection; no protocol conversion')
-            client = self._text_client(parent, self._work_focus()['purpose'])
-            # Closed unknown reservations remain held. An unrelated unknown
-            # side effect is not authorization to replace its connection.
-            for entry in self.ledger.entries:
-                if entry.status == 'unknown' and (
-                        entry.purpose != 'native-turn' or entry.actual_source != 'reservation_bound'
-                        or type(entry.reserved.get('total_tokens')) is not int
-                        or entry.reserved['total_tokens'] <= 0
-                        or not any(row.attempt_id == entry.attempt_id and row.status == 'failed'
-                                   and row.capability == 'native_turn' for row in attempts)
-                        or self.session.store.exists(f'attempts/{entry.attempt_id}/native_result.json')):
-                    raise ValueError('Unconfirmed operation must be reconciled before changing models')
-            if client._settings.thinking_mode == 'enabled' and any(
-                    'reasoning_content' not in self.session.store.read_json(turn['reply'])
-                    for turn in self.state['turns']):
-                raise ValueError('Saved history lacks reasoning_content; choose a compatible non-thinking '
-                                 'connection, not fabricated or discarded reasoning')
-            if self.state['config'].get('allow_vision'):
-                vision = LLMClient.from_env(purpose='vision')
-                if not model_connections_compatible(self.state['config'].get('vision_connection') or {},
-                                                     self._vision_binding(vision)):
-                    raise ValueError('Text replacement cannot silently change the saved vision connection')
+            client, replacement = self._replacement_text_client(model_selector, attempt_id=attempt.attempt_id)
         else:
             client = self._client(pending['attempt'])
         entries = [entry for entry in self.ledger.entries if entry.attempt_id == attempt.attempt_id]

@@ -60,6 +60,7 @@ Bare start asks for a goal. A positional request or ordinary `--goal` enters the
 | `--approve-execution TOKEN` | Exact current printed approval token; requires native resume |
 | `--decision-id ID`, `--decision-response accept\|reject\|revise`, `--decision-guidance TEXT` | Reply to a frozen research design on resume; guidance accompanies revise. Not process approval |
 | `--retry-model` | Explicitly retry a closed failed model decision; see recovery below |
+| `--switch-model profile:NAME`, `--switch-id ID`, `--switch-reason TEXT` | Native resume: record an explicit named text-connection change at a reconciled point; no request/tool/feedback, retained delivery and accounting; separate from retry/feedback/authorization |
 | `--authorize-remaining DIMENSION=AMOUNT` | Repeatable new remaining allowance on resume |
 | `--authorization-id ID`, `--authorization-reason TEXT` | Required stable ID/reason for allowance changes |
 

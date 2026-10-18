@@ -4608,7 +4608,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                         if row.attempt_id == latest).parent_attempt, identity)
 
     @contextmanager
-    def _model_rebinding_fixture(self, *, purpose='task', candidate=None, cached=False):
+    def _model_rebinding_fixture(self, *, purpose='task', candidate=None, cached=False, outcome='failed'):
         """Use existing history fixtures and real routing/accounting; fake provider IO."""
         import tomllib
         import httpx
@@ -4616,10 +4616,11 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         from simple_ar.integrations.llm import LLMClient, LLMSettings
         from simple_ar.integrations.model_profiles import ModelCatalog
 
-        _, inputs, _, _, app, _ = self._native_fixture(max_turns=8)
-        app.state['turns'].append(self._record_file_observation(
-            app, inputs / 'notes.txt', 'read_file', 'saved-material'))
-        if purpose != 'task':
+        _, inputs, _, _, app, _ = self._native_fixture(max_turns=8, completed=outcome == 'delivered')
+        if outcome != 'delivered':
+            app.state['turns'].append(self._record_file_observation(
+                app, inputs / 'notes.txt', 'read_file', 'saved-material'))
+        if purpose != 'task' and outcome != 'delivered':
             app.state['turns'].append(self._record_native_turn(app, 'focus_work',
                 {'purpose': purpose, 'goal': 'Inspect saved evidence'},
                 {'purpose': purpose, 'goal': 'Inspect saved evidence'}, 'saved-focus'))
@@ -4652,19 +4653,122 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         with patch.dict('os.environ', {'REBINDING_TEST_KEY': 'fixture-only'}), \
                 patch('simple_ar.app.tool_application.LLMClient.from_env', side_effect=resolve), \
                 patch('simple_ar.integrations.llm._call_openai_sdk',
-                    side_effect=None if cached else httpx.ReadError('terminated without usage'),
+                    side_effect=httpx.ReadError('terminated without usage') if outcome == 'failed' and not cached else None,
                     return_value=response) as provider:
             app.state['config'].update(model='profile:old',
                 model_connection=resolve('profile:old').connection_binding())
             app._save()
-            with (_interrupt_outcome_commit() if cached else nullcontext()):
-                app.run(progress=lambda _: None)
-            self.assertEqual(provider.call_count, 1)
-            self.assertEqual(app.session.list_attempts()[-1].status, 'running' if cached else 'failed')
+            if outcome != 'delivered':
+                with (_interrupt_outcome_commit() if cached else nullcontext()):
+                    app.run(progress=lambda _: None)
+                self.assertEqual(provider.call_count, 1)
+                self.assertEqual(app.session.list_attempts()[-1].status,
+                    'running' if cached else 'failed' if outcome == 'failed' else 'completed')
+            else:
+                provider.assert_not_called()
             provider.reset_mock()
             provider.side_effect = None
             provider.return_value = response
             yield app, provider, resolve
+
+    def test_native_explicit_switch_preserves_task_delivery_history_and_idempotency(self):
+        from simple_ar.cli.start import session_materials
+
+        for outcome, purpose in (('ongoing', 'code'), ('delivered', 'task'), ('failed', 'writing')):
+            with self.subTest(outcome=outcome), self._model_rebinding_fixture(
+                    purpose=purpose, outcome=outcome) as (app, provider, resolve):
+                if outcome == 'failed':
+                    # The existing explicit caller takeover closes the failed
+                    # decision without erasing its bounded unknown charge.
+                    app.run(actions=[{'tool_name': 'read_file',
+                        'arguments': {'path': 'source0/notes.txt'}}], progress=lambda _: None)
+                    provider.assert_not_called()
+                before = self._native_snapshot(app)
+                materials = session_materials(app.session.store.root)
+                if outcome == 'delivered':
+                    self.assertTrue(materials.get('artifacts'))
+                    self.assertEqual(app.reusable_materials(), materials)
+                manifest = app.session.manifest.to_dict()
+                attempts = [row.to_dict() for row in app.session.list_attempts()]
+                root = app.session.store.root
+                files = {path: path.read_bytes() for path in root.rglob('*')
+                    if path.is_file() and path.name not in {'actions.json', 'session_manifest.json', '.session.lock'}}
+                expected = resolve('profile:new').connection_binding()
+                record = app.switch_model('profile:new', switch_id='connection-1', reason='Use another service',
+                                          expected_connection=expected)
+                self.assertEqual(record, {'switch_id': 'connection-1', 'reason': 'Use another service',
+                    'from_selector': 'profile:old', 'from_connection': before['state']['config']['model_connection'],
+                    'to_selector': 'profile:new', 'to_connection': expected})
+                self.assertEqual(app.state['config']['model_rebindings'][-1], record)
+                self.assertEqual(app.state['config']['model_connection'], expected)
+                self.assertEqual({key: value for key, value in app.session.manifest.to_dict().items()
+                    if key != 'updated_at'}, {key: value for key, value in manifest.items() if key != 'updated_at'})
+                self.assertEqual([row.to_dict() for row in app.session.list_attempts()], attempts)
+                self.assertEqual(app.ledger.to_dict(), before['ledger'])
+                self.assertEqual(self._native_receipts(app, app.state['turns']), before['receipts'])
+                self.assertEqual({key: value for key, value in app.state.items() if key != 'config'},
+                                 {key: value for key, value in before['state'].items() if key != 'config'})
+                self.assertEqual({key: value for key, value in app.state['config'].items()
+                    if key not in {'model', 'model_connection', 'model_rebindings'}}, {
+                    key: value for key, value in before['state']['config'].items()
+                    if key not in {'model', 'model_connection', 'model_rebindings'}})
+                self.assertEqual({path: path.read_bytes() for path in files}, files)
+                restored = ToolApplication.load(root)
+                self.assertEqual(session_materials(root), materials)
+                if outcome == 'delivered':
+                    self.assertEqual(restored.reusable_materials(), materials)
+                for route, model in (('task', 'new'), ('code', 'new-code'), ('writing', 'new-writing')):
+                    self.assertEqual(restored._client(purpose=route)._settings.model, model)
+                snapshot = self._native_snapshot(restored)
+                self.assertEqual(restored.switch_model('profile:new', switch_id='connection-1',
+                    reason='Use another service'), record)
+                self._assert_native_snapshot(restored, snapshot)
+                for selector, reason in (('profile:old', 'Use another service'), ('profile:new', 'Different intent')):
+                    with self.assertRaises(ValueError):
+                        restored.switch_model(selector, switch_id='connection-1', reason=reason)
+                    self._assert_native_snapshot(restored, snapshot)
+                # A later switch cannot be undone by replaying an earlier id.
+                restored.switch_model('profile:old', switch_id='connection-2', reason='Return explicitly')
+                snapshot = self._native_snapshot(restored)
+                restored.switch_model('profile:new', switch_id='connection-1', reason='Use another service')
+                self._assert_native_snapshot(restored, snapshot)
+                if outcome == 'delivered':
+                    self.assertEqual(restored.run(progress=lambda _: None)['status'], 'completed')
+                    self.assertEqual(session_materials(root), materials)
+                    self.assertEqual({path: path.read_bytes() for path in files}, files)
+                provider.assert_not_called()
+
+    def test_native_explicit_switch_rejects_unreconciled_work_without_mutation(self):
+        for case in ('pending', 'running', 'cached', 'queued', 'reserved', 'unknown', 'supply',
+                     'caller', 'injected', 'confirmed_binding'):
+            with self.subTest(case=case), self._model_rebinding_fixture(
+                    outcome='failed' if case == 'pending' else 'ongoing', cached=case == 'cached') as (app, provider, resolve):
+                if case == 'running':
+                    identity = app.session.list_attempts()[-1].attempt_id
+                    path = app.session.store.root / 'attempts' / identity / 'attempt_manifest.json'
+                    write_json(path, {**read_json(path), 'status': 'running'})
+                if case == 'queued':
+                    app.state['turns'][-1]['remaining'] = self._native_message(
+                        'read_file', {'path': 'source0/notes.txt'}, 'unstarted')['tool_calls']
+                if case in {'reserved', 'unknown'}:
+                    app.ledger.reserve('unconfirmed', {'llm_requests': 1, 'total_tokens': 100})
+                    if case == 'unknown':
+                        app.ledger.mark_unknown('unconfirmed', reason='Unconfirmed provider work')
+                if case == 'supply':
+                    app.state['pending_supply'] = {'supply_id': 'unfinished'}
+                if case == 'caller':
+                    app.state['config']['model'] = None
+                if case == 'injected':
+                    app.state['config']['runtime_dependencies'] = {'llm_client': 'original-service'}
+                app._save()
+                before = self._native_snapshot(app)
+                manifest = app.session.manifest.to_dict()
+                with self.assertRaises(ValueError):
+                    app.switch_model('profile:new', switch_id='connection-1', reason='Change service',
+                        expected_connection={} if case == 'confirmed_binding' else None)
+                self._assert_native_snapshot(app, before)
+                self.assertEqual(app.session.manifest.to_dict(), manifest)
+                provider.assert_not_called()
 
     def test_native_model_rebinding_commits_routes_identity_and_preserves_history_on_resume(self):
         for purpose, selector in (('task', 'profile:new'), ('code', 'route:default'),

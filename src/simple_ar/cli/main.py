@@ -2541,6 +2541,18 @@ def _run_native_start(args: argparse.Namespace) -> None:
         allowances = continuation["authorize_remaining"]
         authorization_id = continuation["authorization_id"] or ""
         authorization_reason = continuation["authorization_reason"] or ""
+        switching = bool(args.switch_model)
+        if switching or args.switch_id is not None or args.switch_reason is not None:
+            if (not switching or not args.resume_task or not (args.switch_id or '').strip()
+                    or not (args.switch_reason or '').strip()):
+                raise ValueError('--switch-model requires --resume-task, --switch-id and --switch-reason')
+            if not args.switch_model.startswith(('profile:', 'route:')):
+                raise ValueError('--switch-model requires a named profile:NAME or route:NAME')
+            if (args.request or args.goal or args.retry_model or args.supply_task or decision
+                    or args.approve_execution or args.source or args.allow_execution or args.allow_network
+                    or args.allow_vision or allowances or authorization_id or authorization_reason
+                    or 'model' in getattr(args, '_explicit_start_destinations', set())):
+                raise ValueError('Use --switch-model separately from feedback, retry, supply, --model or authorization')
         if args.retry_model:
             if not args.resume_task:
                 raise ValueError('--retry-model requires --resume-task')
@@ -2601,10 +2613,11 @@ def _run_native_start(args: argparse.Namespace) -> None:
                 return
             feedback = args.request or args.goal or ""
             explicit_model = 'model' in getattr(args, '_explicit_start_destinations', set())
-            replacement_model = args.model if args.retry_model and explicit_model else ''
+            replacement_model = args.switch_model or (args.model if args.retry_model and explicit_model else '')
             if explicit_model and not args.retry_model and args.model != app.state['config']['model']:
                 raise ValueError('Resume retains its saved model. Change a terminated failed decision '
-                                 'explicitly with --retry-model --model profile:NAME or route:NAME')
+                                 'with --retry-model --model profile:NAME, or record only a connection change '
+                                 'with --switch-model profile:NAME --switch-id ID --switch-reason REASON')
             if replacement_model:
                 target = LLMClient.from_env(replacement_model).connection_binding()
                 settings = target.get('settings') or {}
@@ -2616,9 +2629,22 @@ def _run_native_start(args: argparse.Namespace) -> None:
                     connection = route.get('connection') or settings
                     print_line(f"{purpose}: {route.get('profile') or replacement_model}; "
                                f"endpoint={connection.get('base_url')}; model={connection.get('model')}")
+                if switching:
+                    print_line(f"Switch ID: {args.switch_id}; reason: {args.switch_reason}. "
+                               "Records the connection only; no model request, process or feedback runs. "
+                               "Saved delivery remains valid. Submit new feedback separately.")
                 if not args.prepare_only and not args.yes:
                     if not interactive or input('Confirm connection replacement / 确认连接替换? [y/N]: ').strip().lower() not in {'y', 'yes'}:
                         return
+            if switching:
+                if args.prepare_only:
+                    return
+                app.switch_model(args.switch_model, switch_id=args.switch_id, reason=args.switch_reason,
+                                 expected_connection=target)
+                _render_native_result(app, app.session.status_snapshot())
+                print_line(f"Switch record retained; active text connection: {app.state['config']['model']}. "
+                           "No execution. Continue the original task separately; replaying an old id does not revert later changes.")
+                return
             if args.retry_model:
                 print_line("Explicit model continuation: one new decision attempt, not a task or tool replay. "
                            "Old failures and unknown charges remain; original budgets, access and output cap are retained.")
