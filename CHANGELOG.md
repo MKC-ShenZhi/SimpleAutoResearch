@@ -6,6 +6,7 @@ User-visible changes, newest first. Entries describe behavior on their date; lat
 
 ## Unreleased — V2.10
 
+- New native tasks load professional tool contracts on demand alongside core workspace tools, using the original registry and permissions. Saved eager-contract tasks retain their presentation policy through recovery and supply; professional outcome and efficiency gains remain to be validated.
 - Support trusted Pandoc LaTeX templates with byte-bound companions and declared heading hierarchy. Optional user page/literal rules bind actual PDF/text evidence and gate delivery; absence of a name is not anonymity certification. Share figure/table layout support and preserve ACM/history defaults.
 - Add an experimental loopback workspace client over the native task owner: explicit sources/connections/caps, Unicode task navigation, receipt-derived activity, bounded source previews, in-page confirmations, feedback and boundary stops. No separate scheduler or ledger; full live-task acceptance remains pending.
 - Truncated native replies retain safe counts without exposing or executing partial text. A Chat profile can explicitly authorize one settled-response correction within its original ledger/cap; default-off and pinned authorization preserve historical tasks, unknown charges and strict stop contracts.

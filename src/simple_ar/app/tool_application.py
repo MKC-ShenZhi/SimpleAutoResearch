@@ -246,7 +246,8 @@ class ToolApplication:
             if (not path.is_file() or path.stat().st_size != snapshot['size_bytes']
                     or hashlib.sha256(path.read_bytes()).hexdigest() != snapshot['sha256']):
                 raise ValueError('Retained source snapshot changed: ' + alias)
-        if config.get('tool_contracts', 'full') not in {'full', 'on_demand'}:
+        if (type(config.get('tool_contracts', 'full')) is not str
+                or config.get('tool_contracts', 'full') not in {'full', 'on_demand'}):
             raise ValueError('Unknown saved tool-contract mode; do not silently change historical tasks')
         evidence = controller.store.root / "evidence"
         evidence.mkdir(exist_ok=True)
@@ -531,8 +532,11 @@ class ToolApplication:
                services: Any | None = None,
                snapshot_sources: bool = False,
                max_snapshot_bytes: int = 16 * 1024 * 1024,
+               tool_contracts: Literal['full', 'on_demand'] = 'on_demand',
                retained: bool = False) -> tuple[dict[str, Any], list, dict[str, Any], int]:
         """Validate caller contracts before creation or supply; never execute or persist."""
+        if type(tool_contracts) is not str or tool_contracts not in {'full', 'on_demand'}:
+            raise ValueError('Tool contracts must be full or on_demand')
         if (not goal.strip() or max_images < 0 or
                 (model is not None and (not model.strip() or max_turns < 1 or max_tokens < 1))):
             raise ValueError('Goal and positive model resource bounds are required')
@@ -693,7 +697,7 @@ class ToolApplication:
             _, profile = catalog.select(purpose="image")
             profile.credential()
             profile.resolve_proxy()
-        config = {"model": model,
+        config = {"model": model, "tool_contracts": tool_contracts,
             "model_connection": client.connection_binding() if named_client else None,
             "vision_connection": vision_connection,
             "project_python": str(project_python) if project_python else None,
@@ -748,14 +752,16 @@ class ToolApplication:
                source_operations: int | None = None,
                execution_contract: dict[str, Any] | None = None,
                services: Any | None = None, snapshot_sources: bool = False,
-               max_snapshot_bytes: int = 16 * 1024 * 1024) -> ToolApplication:
+               max_snapshot_bytes: int = 16 * 1024 * 1024,
+               tool_contracts: Literal['full', 'on_demand'] = 'on_demand') -> ToolApplication:
         config, reused, limits, attempts = cls._configuration(root, goal, model=model, sources=sources,
             allow_execution=allow_execution, allow_network=allow_network, allow_vision=allow_vision,
             max_turns=max_turns, max_tokens=max_tokens, max_images=max_images, project_python=project_python,
             code_task=code_task, process_limits=process_limits, report_requirement=report_requirement,
             research_policy=research_policy, table_analysis=table_analysis, max_output_tokens=max_output_tokens,
             max_attempts=max_attempts, source_operations=source_operations, execution_contract=execution_contract,
-            services=services, snapshot_sources=snapshot_sources, max_snapshot_bytes=max_snapshot_bytes)
+            services=services, snapshot_sources=snapshot_sources, max_snapshot_bytes=max_snapshot_bytes,
+            tool_contracts=tool_contracts)
         session = SessionController.create(root, session_id=root.name, topic=goal,
             registry=CapabilityRegistry(), budget=BudgetState(max_attempts=attempts, max_no_progress=6))
         session.manifest.transition_recipe = cls.RECIPE
@@ -858,7 +864,8 @@ class ToolApplication:
                 code_task=candidate.get('code_task'), execution_contract=candidate.get('execution_contract'),
                 research_policy=candidate.get('research_policy'), table_analysis=candidate.get('table_analysis'),
                 report_requirement=candidate.get('report_requirement'), max_output_tokens=candidate.get('max_output_tokens'),
-                max_attempts=self.session.manifest.budget.max_attempts, retained=True, services=self.services)
+                max_attempts=self.session.manifest.budget.max_attempts, retained=True, services=self.services,
+                tool_contracts=candidate.get('tool_contracts', 'full'))
             for name in fields - {'model', 'sources', 'allow_execution', 'allow_network'}:
                 if not replace_existing and old.get(name) is not None and old[name] != config.get(name):
                     raise ValueError(f'{name} is already frozen; use its existing feedback/revision contract')
@@ -880,6 +887,10 @@ class ToolApplication:
                 config['completion_policy'] = old['completion_policy']
             else:
                 config.pop('completion_policy', None)
+            # Supply preserves historical full-by-absence bytes as well as
+            # explicit selections; it does not opt old tasks into a new default.
+            if 'tool_contracts' not in old:
+                config.pop('tool_contracts', None)
             if old.get('source_snapshots'):
                 config['source_snapshots'] = {name: value for name, value in old['source_snapshots'].items()
                     if old['sources'][name] == config['sources'].get(name)}

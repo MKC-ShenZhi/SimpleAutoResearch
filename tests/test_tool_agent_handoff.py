@@ -150,7 +150,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
     def _native_fixture(self, *, counter=False, completed=False, project_python=False,
                         goal='Create and verify a small tool', mount_inputs=True,
                         allow_execution=True, allow_network=False, max_turns=30, code_task=None, process_limits=None,
-                        report_requirement=None, measurement_command=None):
+                        report_requirement=None, measurement_command=None, tool_contracts=None):
         run_dir, inputs = self._tool_materials()
         fake = Mock()
         fake.effective_output_limit.return_value = None
@@ -167,6 +167,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             allow_execution=allow_execution, allow_network=allow_network,
             max_turns=max_turns, project_python=interpreter, code_task=code_task, process_limits=process_limits,
             report_requirement=report_requirement,
+            **({'tool_contracts': tool_contracts} if tool_contracts is not None else {}),
             execution_contract=({'command': measurement_command, 'cwd': str(inputs), 'timeout_sec': 3,
                 'result_schema': {'primary_metric': 'score', 'required_metrics': ['score']},
                 'protocol': {'hypothesis': 'Record the implemented value', 'dataset': 'Supplied local input',
@@ -318,7 +319,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         return context, recent, archive, cutoff
 
     def _native_history_pressure_fixture(self):
-        _, inputs, fake, _, app, code = self._native_fixture(completed=True)
+        # These historical compaction boundaries include the eager catalog cost.
+        _, inputs, fake, _, app, code = self._native_fixture(completed=True, tool_contracts='full')
         saved_turns = list(app.state['turns'])
         diagnostic = {'returncode': 1, 'stdout': 'output\n' * 500,
             'stderr': 'untrusted diagnostic\n' * 450, 'stop_reason': None,
@@ -3623,20 +3625,20 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         names = lambda owner: {row['function']['name'] for row in owner.schemas}
         original_ledger = app.ledger.to_dict()
         original_permissions = set(app.gateway.policy.allowed_permissions)
-        # New tasks expose the actual authorized contracts, without a paid
-        # discovery turn or a competing domain-qualified naming scheme.
-        self.assertNotIn('tool_contracts', app.state['config'])
-        self.assertNotIn('load_tools', names(app))
-        self.assertIn('compose_document', names(app))
+        # Ordinary creation persists the shared default, without a fixture-side
+        # mode override or topic-based specialist selection.
+        self.assertEqual(app.state['config']['tool_contracts'], 'on_demand')
+        self.assertEqual(app.session.store.read_json('actions.json')['config']['tool_contracts'], 'on_demand')
+        self.assertIn('load_tools', names(app))
+        self.assertNotIn('compose_document', names(app))
+        self.assertIn('read_file', names(app))
+        self.assertIn('write_file', names(app))
         self.assertNotIn('run_process', names(app))
         self.assertNotIn('search_sources', names(app))
         self.assertEqual(names(app), names(ToolApplication.load(app.session.store.root)))
         self.assertEqual(app.ledger.to_dict(), original_ledger)
         fake.chat_turn.assert_not_called()
-        # Saved on-demand tasks retain their accepted selection and history.
-        app.state['config']['tool_contracts'] = 'on_demand'
-        app._save()
-        app._configure_tools()
+        # The real journaled load_tools path below activates exact contracts.
         self.assertEqual(app.state['config']['tool_contracts'], 'on_demand')
         self.assertIn('load_tools', names(app))
         self.assertIn('read_history', names(app))
@@ -3652,6 +3654,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 self.assertEqual(description, app.gateway.registry.get(name).description)
                 self.assertEqual(domain, app.gateway.registry.get(name).domain)
         self.assertIn('material_roots', app._specialist_catalog()['writing']['compose_document'])
+        self.assertIn('find_source_passages', app._specialist_catalog()['sources'])
+        self.assertIn('analyze_measurements', app._specialist_catalog()['scientific'])
         for selected in (['unknown'], ['search_sources'], ['run_process']):
             with self.subTest(selected=selected):
                 result = _call_tool(app.gateway, 'load_tools',
@@ -3666,7 +3670,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(app.ledger.to_dict(), original_ledger)
         fake.chat_turn.assert_not_called()
         fake.chat_turn.side_effect = [
-            self._native_message('load_tools', {'names': ['compose_document', 'update_work_plan']}, 'selection-write'),
+            self._native_message('load_tools', {'names': [
+                'compose_document', 'update_work_plan', 'find_source_passages', 'analyze_measurements']}, 'selection-write'),
             self._native_message('load_tools', {'names': ['search_sources']}, 'selection-denied'),
             self._native_message('ask_user', {'question': 'Which report length?'}, 'selection-question')]
         self.assertEqual(app.run(progress=lambda _: None)['status'], 'paused')
@@ -3674,12 +3679,15 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             fake.chat_turn.call_args_list[0].kwargs['tools']})
         self.assertIn('compose_document', {row['function']['name'] for row in
             fake.chat_turn.call_args_list[1].kwargs['tools']})
+        for name in ('find_source_passages', 'analyze_measurements'):
+            self.assertIn(name, names(app))
         # Rejected selection must not replace the last valid one.
         self.assertIn('compose_document', names(app))
         original_receipts = self._native_receipts(app, app.state['turns'])
         restored = ToolApplication.load(app.session.store.root)
         self.assertEqual(names(restored), names(app))
-        self.assertEqual(restored._tool_selection(), {'compose_document', 'update_work_plan'})
+        self.assertEqual(restored._tool_selection(), {
+            'compose_document', 'update_work_plan', 'find_source_passages', 'analyze_measurements'})
         self.assertIn('update_work_plan', names(restored))
         messages = restored._messages(client=fake)
         context = json.loads(messages[1]['content'])
@@ -3702,13 +3710,79 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         # Historical tasks retain full contracts; no migration mutates their state.
         restored.state['config'].pop('tool_contracts')
         restored._save()
+        historical_bytes = (restored.session.store.root / 'actions.json').read_bytes()
         historical = ToolApplication.load(restored.session.store.root)
+        self.assertEqual((restored.session.store.root / 'actions.json').read_bytes(), historical_bytes)
+        self.assertNotIn('tool_contracts', historical.state['config'])
         self.assertNotIn('load_tools', names(historical))
         self.assertIn('compose_document', names(historical))
         self.assertIn('inspect_table', names(historical))
         self.assertIn('update_work_plan', names(historical))
         self.assertNotIn('run_process', names(historical))
         self.assertNotIn('available_specialists', json.loads(historical._messages(client=fake)[1]['content']))
+
+    def test_native_contract_modes_validate_and_supply_preserves_saved_policy(self) -> None:
+        for mode in ('on_demand', 'full', None):
+            with self.subTest(saved_mode=mode):
+                inputs, fake, app = self._supply_fixture()
+                root = app.session.store.root
+                preview, _, _, _ = ToolApplication._configuration(root, 'Configuration preview',
+                    model=None, sources={}, max_attempts=30)
+                self.assertEqual(preview['tool_contracts'], 'on_demand')
+                if mode == 'full':
+                    # Exercise the public compatibility override, not a mock
+                    # that assumes every new model sees specialist schemas.
+                    app = ToolApplication.create(root.parent / 'explicit-full', 'Compatibility control',
+                        model=None, sources={'source0': inputs}, max_attempts=30, tool_contracts='full')
+                    root = app.session.store.root
+                elif mode is None:
+                    app.state['config'].pop('tool_contracts')
+                    app._save()
+                before_bytes = (root / 'actions.json').read_bytes()
+                app = ToolApplication.load(root)
+                self.assertEqual((root / 'actions.json').read_bytes(), before_bytes)
+                self.assertEqual(app.state['config'].get('tool_contracts'), mode)
+                selected = {'find_source_passages', 'analyze_measurements'} if mode == 'on_demand' else set()
+                if selected:
+                    app.run(actions=[
+                        {'tool_name': 'read_file', 'arguments': {'path': 'source0/notes.txt'}},
+                        {'tool_name': 'load_tools', 'arguments': {'names': sorted(selected)}},
+                        {'tool_name': 'ask_user', 'arguments': {'question': 'Await explicit caller work'}}],
+                        progress=lambda _: None)
+                    self.assertEqual(app._tool_selection(), selected)
+                    self.assertEqual(app.session.store.read_json(app.state['turns'][0]['tools'][0]['result'])
+                        ['data']['text'], 'original source')
+                for replace_existing in (False, True):
+                    previous = dict(app.state['config'])
+                    receipts = self._native_receipts(app, app.state['turns'])
+                    terms = dict(supply_id=f'access-{replace_existing}', reason='Explicit access update',
+                        changes={'allow_network': not replace_existing}, replace_existing=replace_existing)
+                    supplied = app.supply(**terms)
+                    self.assertEqual(supplied['previous_config'], previous)
+                    self.assertEqual(app.state['config'].get('tool_contracts'), mode)
+                    self.assertEqual('tool_contracts' in app.state['config'], mode is not None)
+                    self.assertEqual('tool_contracts' in supplied['previous_config'], mode is not None)
+                    app = ToolApplication.load(root)
+                    self.assertEqual(app.state['config'].get('tool_contracts'), mode)
+                    self.assertEqual(app._tool_selection(), selected)
+                    self.assertEqual({path: (root / path).read_bytes() for path in receipts}, receipts)
+                    schemas = {row['function']['name'] for row in app.schemas}
+                    self.assertTrue(selected.issubset(schemas))
+                    self.assertEqual('load_tools' in schemas, mode == 'on_demand')
+                    self.assertEqual('compose_document' in schemas, mode != 'on_demand')
+                    files = self._supply_files(app)
+                    app.supply(**terms)
+                    self.assertEqual(self._supply_files(app), files)
+                fake.chat_turn.assert_not_called()
+                fake.ask_json.assert_not_called()
+        root, _ = self._tool_materials()
+        for number, invalid in enumerate(('', 'FULL', 'auto', None, True, [], {})):
+            with self.subTest(invalid_mode=invalid):
+                target = root / f'invalid-mode-{number}'
+                with self.assertRaisesRegex(ValueError, 'Tool contracts'):
+                    ToolApplication.create(target, 'Reject invalid contract mode', model=None,
+                        sources={}, max_attempts=30, tool_contracts=invalid)
+                self.assertFalse(target.exists())
 
     def test_native_history_preserves_original_messages_and_resource_accounting(self) -> None:
         _, _, _, _, resumed, code = self._native_fixture(completed=True)
@@ -7824,7 +7898,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     self.assertEqual(resources['remaining']['image_requests'], 0)
                     self.assertEqual(resources['unknown_usage'], list(owner.ledger.unknown_dimensions()))
                     self.assertEqual(context['vision_inspection']['available'], available)
-                    self.assertEqual('inspect_images' in {row['function']['name'] for row in restored.schemas}, available)
+                    self.assertNotIn('inspect_images', {row['function']['name'] for row in restored.schemas})
+                    self.assertEqual('inspect_images' in restored._specialist_catalog().get('visual', {}), available)
                     self.assertNotIn('images', restored._specialist_catalog())
                     self.assertIn('generation/edit requests only', resources['semantics']['image_requests'])
                     self.assertIn('inspect_images', resources['semantics']['llm_requests'])
