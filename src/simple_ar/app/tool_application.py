@@ -19,7 +19,7 @@ from simple_ar.core.budget import BudgetLedger
 from simple_ar.core.capabilities import ArtifactRef, ArtifactStore, AttemptManifest, CapabilityContext, CapabilityRegistry, CapabilityResult
 from simple_ar.core.session import BudgetState, SessionController
 from simple_ar.integrations.llm import LLMClient, LLMError, LLMSettings, estimate_tokens
-from simple_ar.integrations.model_profiles import model_connections_compatible
+from simple_ar.integrations.model_profiles import catalog_path, model_connections_compatible
 from simple_ar.tools.gateway import CommonToolGateway
 from simple_ar.tools.openai_schema import export_openai_tool_schemas
 from simple_ar.tools.permissions import ToolPermissionPolicy
@@ -353,7 +353,8 @@ class ToolApplication:
                     contract=config.get('table_analysis')),
                 "visual": VisualToolGateway(controller.store.root, self.workspace, self.ledger,
                     controller.manifest.session_id, client_factory=lambda identity: self._client(identity, purpose='vision')),
-                "images": ImageToolGateway(self.workspace, self.ledger),
+                "images": ImageToolGateway(self.workspace, self.ledger,
+                    fallback_models_config=config.get('model_catalogs', {}).get('image')),
                 "publication": PublicationToolGateway(controller.store.root, self.workspace, self.ledger),
                 "writing": self.writing,
                 "implementation": self.implementation, **scientific})
@@ -605,6 +606,7 @@ class ToolApplication:
                snapshot_sources: bool = False,
                max_snapshot_bytes: int = 16 * 1024 * 1024,
                tool_contracts: Literal['full', 'on_demand'] = 'on_demand',
+               model_catalogs: dict[str, str | None] | None = None,
                retained: bool = False) -> tuple[dict[str, Any], list, dict[str, Any], int]:
         """Validate caller contracts before creation or supply; never execute or persist."""
         if type(tool_contracts) is not str or tool_contracts not in {'full', 'on_demand'}:
@@ -733,11 +735,25 @@ class ToolApplication:
             report_requirement = validate_report_requirement(report_requirement)
         # Preflight connection/protocol before creating a session or making a call.
         dependencies = _runtime_bindings(services)
+        hints = model_catalogs or {}
+        selected_catalogs = {}
+
+        def remember_catalog(purpose: str) -> None:
+            # Historical consumers without a hint keep their original contract.
+            # A location never substitutes for the caller's binding checks.
+            if not retained or purpose in hints:
+                path = catalog_path(fallback_path=hints.get(purpose))
+                if path is not None:
+                    selected_catalogs[purpose] = str(path.resolve())
+
         client = getattr(services, 'llm_client', None)
         if client is not None and model is None:
             raise ValueError('An injected model still requires explicit model resource authorization')
         if client is None:
-            client = LLMClient.from_env(None if model == 'env' else model) if model is not None else None
+            client = LLMClient.from_env(None if model == 'env' else model,
+                fallback_models_config=hints.get('task')) if model is not None else None
+            if client is not None and client.connection_binding():
+                remember_catalog('task')
         if 'llm_client' in dependencies and allow_vision:
             raise ValueError('Injected text clients do not authorize a named vision route')
         if research_policy is not None and getattr(services, 'search_registry', None) is not None:
@@ -757,18 +773,23 @@ class ToolApplication:
                 raise ValueError('Choose a named feasibility connection or an injected reviewer, not both')
             if client is None:
                 raise ValueError('Independent feasibility review requires model authorization')
-            feasibility_connection = LLMClient.from_env(research_policy['feasibility_connection']).connection_binding()
+            feasibility_connection = LLMClient.from_env(research_policy['feasibility_connection'],
+                fallback_models_config=hints.get('feasibility')).connection_binding()
+            remember_catalog('feasibility')
         vision_connection = None
         if allow_vision:
-            vision_connection = cls._vision_binding(LLMClient.from_env(purpose="vision"))
+            vision_connection = cls._vision_binding(LLMClient.from_env(purpose="vision",
+                fallback_models_config=hints.get('vision')))
+            remember_catalog('vision')
         if max_images:
             from simple_ar.integrations.model_profiles import load_model_catalog
-            catalog = load_model_catalog()
+            catalog = load_model_catalog(fallback_path=hints.get('image'))
             if catalog is None:
                 raise ValueError("Image operations require a named image route")
             _, profile = catalog.select(purpose="image")
             profile.credential()
             profile.resolve_proxy()
+            remember_catalog('image')
         config = {"model": model, "tool_contracts": tool_contracts,
             "model_connection": client.connection_binding() if named_client else None,
             "vision_connection": vision_connection,
@@ -782,6 +803,8 @@ class ToolApplication:
             "max_images": max_images,
             "completion_policy": "protected_decision.v1",
             "max_turns": max_turns}
+        if selected_catalogs or any(hints.values()):
+            config['model_catalogs'] = selected_catalogs
         if code_task is not None:
             config['code_task'] = code_task
         if report_requirement is not None:
@@ -921,6 +944,17 @@ class ToolApplication:
                     {**old['sources'], **supplied.get('sources', {})}}
             allowances = terms['resource_allowances']
             first_model = old['model'] is None and candidate['model'] is not None
+            hints = dict(old.get('model_catalogs', {}))
+            # New grants may record their first location; retained consumers
+            # without hints must not be migrated as a side effect of supply.
+            for purpose, newly_authorized in (
+                    ('task', first_model),
+                    ('vision', candidate.get('allow_vision') and not old.get('allow_vision')),
+                    ('image', candidate.get('max_images') and not old.get('max_images')),
+                    ('feasibility', (candidate.get('research_policy') or {}).get('feasibility_connection')
+                        and not (old.get('research_policy') or {}).get('feasibility_connection'))):
+                if newly_authorized:
+                    hints.setdefault(purpose, old.get('model_catalogs', {}).get('task'))
             if first_model and (type(allowances.get('llm_requests')) is not int or allowances['llm_requests'] < 1
                     or type(allowances.get('total_tokens')) is not int or allowances['total_tokens'] < 1):
                 raise ValueError('First model binding requires explicit positive llm_requests and total_tokens allowances')
@@ -935,7 +969,7 @@ class ToolApplication:
                 research_policy=candidate.get('research_policy'), table_analysis=candidate.get('table_analysis'),
                 report_requirement=candidate.get('report_requirement'), max_output_tokens=candidate.get('max_output_tokens'),
                 max_attempts=self.session.manifest.budget.max_attempts, retained=True, services=self.services,
-                tool_contracts=candidate.get('tool_contracts', 'full'))
+                tool_contracts=candidate.get('tool_contracts', 'full'), model_catalogs=hints)
             for name in fields - {'model', 'sources', 'allow_execution', 'allow_network'}:
                 if not replace_existing and old.get(name) is not None and old[name] != config.get(name):
                     raise ValueError(f'{name} is already frozen; use its existing feedback/revision contract')
@@ -1587,7 +1621,7 @@ class ToolApplication:
         return route or {'connection': binding.get('settings') if purpose != 'code' else None}
 
     def _client(self, attempt_id: str = "", *, purpose: str | None = None,
-                native: bool = True) -> LLMClient:
+                native: bool = True, vision_catalog_hint: str | None = None) -> LLMClient:
         if self.state['config']['model'] is None:
             raise ValueError('This caller-directed task has no model connection or model authorization')
         if 'llm_client' in self.state['config'].get('runtime_dependencies', {}):
@@ -1598,6 +1632,7 @@ class ToolApplication:
             return client.with_output_limit(limit) if limit is not None else client
         selector = self.state['config']['model']
         client = LLMClient.from_env(None if selector == 'env' else selector, budget_ledger=self.ledger,
+            fallback_models_config=self.state['config'].get('model_catalogs', {}).get('task'),
             budget_session_id=self.session.manifest.session_id, budget_attempt_id=attempt_id)
         saved = self.state["config"].get("model_connection")
         binding = client.connection_binding()
@@ -1607,6 +1642,8 @@ class ToolApplication:
         purpose = purpose or self._work_focus()['purpose']
         if purpose == 'vision':
             vision = LLMClient.from_env(purpose='vision', budget_ledger=self.ledger,
+                fallback_models_config=self.state['config'].get('model_catalogs', {}).get('vision')
+                    or vision_catalog_hint,
                 budget_session_id=self.session.manifest.session_id, budget_attempt_id=attempt_id)
             saved_vision = self.state['config'].get('vision_connection')
             if saved_vision and not model_connections_compatible(saved_vision, self._vision_binding(vision)):
@@ -1636,6 +1673,7 @@ class ToolApplication:
         if not selector:
             return self._client(attempt_id, purpose='task', native=False) if self.state['config']['model'] is not None else None
         client = LLMClient.from_env(selector, budget_ledger=self.ledger,
+            fallback_models_config=self.state['config'].get('model_catalogs', {}).get('feasibility'),
             budget_session_id=self.session.manifest.session_id, budget_attempt_id=attempt_id)
         saved = self.state['config'].get('feasibility_connection')
         if not saved or not model_connections_compatible(saved, client.connection_binding()):
@@ -2312,9 +2350,19 @@ class ToolApplication:
             self._client()  # Authorization is not a way to switch the saved model.
         config = dict(self.state['config'])
         if vision:
-            vision_client = self._client(purpose='vision')
+            vision_hint = config.get('model_catalogs', {}).get('vision')
+            if not config.get('allow_vision', False) and not config.get('vision_connection'):
+                # Only this explicit first grant may discover a new role in
+                # the task's previously selected catalog. Historical grants
+                # without role hints retain their original env/global lookup.
+                vision_hint = vision_hint or config.get('model_catalogs', {}).get('task')
+            vision_client = self._client(purpose='vision', vision_catalog_hint=vision_hint)
             if not config.get('allow_vision', False):
                 config['vision_connection'] = self._vision_binding(vision_client)
+                path = catalog_path(fallback_path=vision_hint)
+                if path is not None:
+                    config['model_catalogs'] = {**config.get('model_catalogs', {}),
+                        'vision': str(path.resolve())}
         mounts = dict(config['sources'])
         changes = []
         for path in paths:
@@ -2456,11 +2504,22 @@ class ToolApplication:
             raise ValueError('Saved history lacks reasoning_content; choose a compatible non-thinking '
                              'connection, not fabricated or discarded reasoning')
         if self.state['config'].get('allow_vision'):
-            vision = LLMClient.from_env(purpose='vision')
+            vision = LLMClient.from_env(purpose='vision',
+                fallback_models_config=self.state['config'].get('model_catalogs', {}).get('vision'))
             if not model_connections_compatible(self.state['config'].get('vision_connection') or {},
                                                  self._vision_binding(vision)):
                 raise ValueError('Text replacement cannot silently change the saved vision connection')
         return client, replacement
+
+    @staticmethod
+    def _replacement_catalogs(config: dict[str, Any]) -> dict[str, Any]:
+        """An explicit text selection owns a fresh hint, independent of other consumers."""
+        hints = dict(config.get('model_catalogs', {}))
+        hints.pop('task', None)
+        path = catalog_path()
+        if path is not None:
+            hints['task'] = str(path.resolve())
+        return {'model_catalogs': hints} if hints or 'model_catalogs' in config else {}
 
     def switch_model(self, model_selector: str, *, switch_id: str, reason: str,
                      expected_connection: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -2514,6 +2573,7 @@ class ToolApplication:
             # One original journal commit. No attempt, transition, allowance,
             # feedback or delivery invalidation accompanies this operation.
             self.state['config'] = {**config, 'model': model_selector, 'model_connection': replacement,
+                **self._replacement_catalogs(config),
                 'model_rebindings': [*records, record]}
             self._save()
             return record
@@ -2592,6 +2652,7 @@ class ToolApplication:
             # and new decision identity. Historical replies and ledger entries
             # are never rewritten, and no second transition state is created.
             self.state['config'] = {**config, 'model': model_selector, 'model_connection': replacement,
+                **self._replacement_catalogs(config),
                 'model_rebindings': [*config.get('model_rebindings', []), {
                     'failed_attempt': attempt.attempt_id,
                     'from_selector': config['model'], 'from_connection': binding,

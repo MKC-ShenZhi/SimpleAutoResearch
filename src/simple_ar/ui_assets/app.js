@@ -208,7 +208,8 @@ async function refresh() {
   renderActivity();
   $('plan').textContent = snapshot.plan ? pretty(snapshot.plan) : '最近回执中没有当前请求的计划。计划可选，由模型编写；没有计划不表示没有进展。';
   $('pending').textContent = pretty({current_attempt: snapshot.manifest.current_attempt,
-    model: snapshot.model, access: snapshot.access, requests: snapshot.requests,
+    model: snapshot.model, saved_connections: snapshot.saved_connections,
+    saved_catalog_hints: snapshot.catalog_hints, access: snapshot.access, requests: snapshot.requests,
     pending: snapshot.pending, stop_requested: snapshot.stop_requested, worker_error: snapshot.worker_error});
   $('resources').textContent = pretty(snapshot.resources);
   $('budgetSummary').textContent = Object.entries(snapshot.resources.limits).map(([key, limit]) =>

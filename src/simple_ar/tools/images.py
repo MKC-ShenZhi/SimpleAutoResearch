@@ -40,8 +40,9 @@ class ImageToolGateway:
             and (self.workspace.workspace / 'image-versions' / identity / 'result' / 'request.json').is_file()
             and any(entry.reservation_id == f'image:{identity}' for entry in self.ledger.entries))
 
-    def __init__(self, workspace: Any, ledger: Any) -> None:
+    def __init__(self, workspace: Any, ledger: Any, *, fallback_models_config: str | None = None) -> None:
         self.workspace, self.ledger = workspace, ledger
+        self.fallback_models_config = fallback_models_config
 
     def call(self, name: str, arguments: dict[str, Any], *, identity: str) -> ToolResult:
         version = ""
@@ -59,7 +60,7 @@ class ImageToolGateway:
                     and entry.reservation_id != f"image:{version}" and entry.status in {"reserved", "unknown"}
                     for entry in self.ledger.entries):
                 raise ValueError("Recover the pending image version before any new submission")
-            catalog = load_model_catalog()
+            catalog = load_model_catalog(fallback_path=self.fallback_models_config)
             if catalog is None:
                 raise ValueError("Configure a named image route")
             if name == "create_image":

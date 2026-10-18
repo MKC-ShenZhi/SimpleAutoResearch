@@ -328,6 +328,7 @@ class LLMClient:
         budget_session_id: str = "",
         budget_attempt_id: str = "",
         models_config: str | None = None,
+        fallback_models_config: str | None = None,
         purpose: str = "text",
     ) -> "LLMClient":
         """Load provider settings from ``.env`` and environment variables.
@@ -335,6 +336,9 @@ class LLMClient:
         Args:
             model: Optional model override. When omitted, ``SIMPLE_AR_MODEL`` is
                 used, falling back to ``gpt-4o-mini``.
+            fallback_models_config: Previously selected catalog location, used
+                only when no current explicit path/environment selection exists.
+                Task owners must verify their saved binding before dispatch.
             usage_callback: Optional usage callback for token accounting.
             budget_ledger: Optional shared ledger for bounded sessions.
             budget_session_id: Session identity recorded in ledger entries.
@@ -347,7 +351,7 @@ class LLMClient:
         # installed package's directory discovered from the Python call stack.
         load_dotenv(dotenv_path=Path.cwd() / ".env", override=False)
         try:
-            catalog = load_model_catalog(models_config)
+            catalog = load_model_catalog(models_config, fallback_path=fallback_models_config)
             if catalog is not None:
                 name, profile = catalog.select(model, purpose=purpose)
                 values = profile.text_settings()

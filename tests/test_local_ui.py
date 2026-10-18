@@ -399,6 +399,14 @@ class LocalWorkspaceTests(unittest.TestCase):
                                      'https://b.invalid/v1')
                     self.assertEqual((root / 'budget_ledger.json').read_bytes(), ledger_before)
                     self.assertEqual(calls, [])
+                    # The current recipient is retained task data, not a fresh
+                    # catalog read. A subsequent worker can use the saved hint
+                    # without making users restore a process-local variable.
+                    os.environ.pop('SIMPLE_AR_MODELS_CONFIG')
+                    retained = request('/api/task?task=' + name)[1]
+                    self.assertEqual(retained['saved_connections']['task']['base_url'], 'https://b.invalid/v1')
+                    self.assertEqual(retained['saved_connections']['code']['base_url'], 'https://code.invalid/v1')
+                    self.assertEqual(retained['catalog_hints']['task'], str(catalog))
                     self.assertEqual(request('/api/action', dict(op='resume', task=name))[0], 200)
                     self.assertTrue(entered.wait(10))
                     live = request('/api/task?task=' + name)[1]

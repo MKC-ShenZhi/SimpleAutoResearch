@@ -191,19 +191,30 @@ class ModelCatalog(BaseModel):
         return name, profile
 
 
-def catalog_path(path: str | Path | None = None) -> Path | None:
+def catalog_path(path: str | Path | None = None, *, fallback_path: str | Path | None = None) -> Path | None:
+    """Explicit selection wins; a retained location is only a recovery hint.
+
+    Callers must still verify the resolved connection against its original
+    binding before dispatch. No directory scanning or catalog merging occurs.
+    """
     selected = path or os.environ.get("SIMPLE_AR_MODELS_CONFIG")
     if selected:
         candidate = Path(selected).expanduser()
         if not candidate.is_file():
             raise ModelConfigError("The configured model catalog does not exist")
         return candidate
+    if fallback_path:
+        candidate = Path(fallback_path).expanduser()
+        if not candidate.is_absolute():
+            raise ModelConfigError("A retained model catalog location must be absolute")
+        if candidate.is_file():
+            return candidate
     candidate = Path.home() / ".config" / "simple-ar" / "models.toml"
     return candidate if candidate.is_file() else None
 
 
-def load_model_catalog(path: str | Path | None = None) -> ModelCatalog | None:
-    candidate = catalog_path(path)
+def load_model_catalog(path: str | Path | None = None, *, fallback_path: str | Path | None = None) -> ModelCatalog | None:
+    candidate = catalog_path(path, fallback_path=fallback_path)
     if candidate is None:
         return None
     try:

@@ -34,7 +34,7 @@ from simple_ar.code_task.review import review_code_task_changes
 from simple_ar.core.artifacts import read_json, read_jsonl
 from simple_ar.app.tool_application import ToolApplication
 from simple_ar.core.budget import BudgetLedger
-from simple_ar.integrations.llm import estimate_tokens
+from simple_ar.integrations.llm import LLMError, estimate_tokens
 from simple_ar.core.process import run_process
 from simple_ar.core.artifacts import write_json
 from simple_ar.tools.workspace import WorkspaceToolGateway, workspace_history_identity, workspace_observation_view
@@ -4473,6 +4473,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             services = SimpleNamespace(llm_client=client)
             app = ToolApplication.create(root, 'Save and deliver the inspected result', model='fixture',
                 sources={}, services=services, max_turns=3, max_tokens=100000)
+            self.assertNotIn('model_catalogs', app.state['config'])
             poison = self._native_message('write_file', {'path': 'poison.txt', 'content': 'never adopt'}, 'cut')
             complete = self._native_message('write_file', {'path': 'result.txt', 'content': 'complete result',
                 'delivery': {'summary': 'Explicit complete output', 'artifacts': ['result.txt']}}, 'complete')
@@ -5128,6 +5129,206 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             provider.side_effect = None
             provider.return_value = response
             yield app, provider, resolve
+
+    def _local_catalog_task(self):
+        """Real local selection and application guards, with no provider transport."""
+        root = self.enterContext(_temporary_run()).resolve()
+        catalog = root / 'project-models.toml'
+        text = '\n'.join(
+            f'[profiles.{name}]\napi="openai_chat"\nbase_url="https://models.invalid/v1"\n'
+            f'model="{name}"\napi_key_env="CATALOG_TEST_KEY"\n'
+            'capabilities=["text","code","vision"]\nmax_output_tokens=8192\nretry_attempts=1\n'
+            for name in ('task', 'code', 'writing', 'vision', 'review'))
+        text += ('\n[profiles.image]\napi="openai_images"\nbase_url="https://images.invalid/v1"\n'
+            'model="image"\napi_key_env="CATALOG_TEST_KEY"\ncapabilities=["image_generate"]\n'
+            '\n[routes]\ndefault="task"\ncode="code"\nwriting="writing"\nvision="vision"\nimage="image"\n')
+        catalog.write_text(text, encoding='utf-8')
+        self.enterContext(patch.dict(os.environ, {
+            'SIMPLE_AR_MODELS_CONFIG': str(catalog), 'CATALOG_TEST_KEY': 'local-only'}, clear=True))
+        self.enterContext(patch('pathlib.Path.home', return_value=root / 'home'))
+        self.enterContext(patch('simple_ar.integrations.llm.load_dotenv'))
+        provider = self.enterContext(patch('simple_ar.integrations.llm._call_openai_sdk',
+            side_effect=AssertionError('Recovery must not dispatch')))
+        app = ToolApplication.create(root / 'task', 'Inspect the supplied material',
+            model='profile:task', sources={}, allow_vision=True, max_images=1,
+            research_policy={'feasibility_connection': 'profile:review'})
+        return root, catalog, text, app, provider
+
+    def test_native_catalog_hints_restore_consumers_and_follow_compatible_supply(self):
+        root, catalog, text, app, provider = self._local_catalog_task()
+        hints = {purpose: str(catalog.resolve()) for purpose in ('task', 'vision', 'feasibility', 'image')}
+        self.assertEqual(app.state['config']['model_catalogs'], hints)
+        original = json.loads(json.dumps(app.state['config']))
+        granted = ToolApplication.create(root / 'new-grants', 'Inspect material',
+            model='profile:task', sources={})
+        historical = ToolApplication.create(root / 'historical', 'Inspect material',
+            model='profile:task', sources={}, allow_vision=True, max_images=1,
+            research_policy={'feasibility_connection': 'profile:review'})
+        self.assertEqual(granted.state['config']['model_catalogs'], {'task': hints['task']})
+        os.environ.pop('SIMPLE_AR_MODELS_CONFIG')
+        elsewhere = root / 'elsewhere'
+        elsewhere.mkdir()
+        previous_cwd = Path.cwd()
+        self.addCleanup(os.chdir, previous_cwd)
+        os.chdir(elsewhere)
+        from simple_ar.tools.images import ImageToolGateway
+        with patch('simple_ar.app.tool_application.ImageToolGateway', wraps=ImageToolGateway) as images:
+            restored = ToolApplication.load(app.session.store.root)
+            self.assertEqual(images.call_args.kwargs['fallback_models_config'], hints['image'])
+        before = self._native_snapshot(restored)
+        for purpose in ('task', 'code', 'writing', 'vision'):
+            with self.subTest(consumer=purpose):
+                self.assertEqual(restored._client('restore', purpose=purpose).model, purpose)
+        self.assertEqual(restored._feasibility_client('restore').model, 'review')
+        self._assert_native_snapshot(restored, before)
+        # First explicit role grants can use the already selected task file,
+        # even after losing both the selecting environment and original cwd.
+        granted.run(allow_vision=True, should_stop=lambda: True, progress=lambda _: None)
+        self.assertTrue(granted.state['config']['allow_vision'])
+        self.assertEqual(granted.state['config']['model_catalogs'], {
+            'task': hints['task'], 'vision': hints['vision']})
+        granted.supply(supply_id='reviewer', reason='Authorize an independent material review',
+            changes={'research_policy': {'feasibility_connection': 'profile:review'}})
+        self.assertEqual(granted.state['config']['model_catalogs'], {
+            purpose: hints[purpose] for purpose in ('task', 'vision', 'feasibility')})
+        self.assertEqual(granted._client(purpose='vision').model, 'vision')
+        self.assertEqual(granted._feasibility_client('new-review').model, 'review')
+        # Previously authorized roles missing their own hints must not borrow
+        # the task location or have those historical gaps filled by supply.
+        historical.state['config']['model_catalogs'] = {'task': hints['task'], 'image': hints['image']}
+        historical._save()
+        with patch.dict(os.environ, {'SIMPLE_AR_MODELS_CONFIG': str(catalog)}):
+            historical.supply(supply_id='explicit-old-access', reason='Retain historical role lookup',
+                changes={'allow_network': True})
+        self.assertEqual(historical.state['config']['model_catalogs'], {
+            'task': hints['task'], 'image': hints['image']})
+        with self.assertRaises((ValueError, LLMError)):
+            historical._client(purpose='vision')
+        with self.assertRaises((ValueError, LLMError)):
+            historical._feasibility_client('old-review')
+        with self.assertRaises((ValueError, LLMError)):
+            historical.supply(supply_id='old-access', reason='Retain historical role lookup',
+                changes={'allow_network': True})
+        restored.supply(supply_id='access', reason='Permit additional source access',
+            changes={'allow_network': True})
+        self.assertEqual(restored.state['config']['model_catalogs'], hints)
+        # A missing hint file may be replaced by the ordinary global catalog,
+        # but the saved receiver must still match before supply commits it.
+        global_catalog = root / 'home/.config/simple-ar/models.toml'
+        global_catalog.parent.mkdir(parents=True)
+        catalog.replace(global_catalog)
+        self.assertEqual(restored._client().model, 'task')
+        global_catalog.write_text(text.replace('model="task"', 'model="changed"'), encoding='utf-8')
+        before = self._native_snapshot(restored)
+        with self.assertRaises(ValueError):
+            restored.supply(supply_id='drift', reason='Keep the original receiver', changes={'sources': {}})
+        self._assert_native_snapshot(restored, before)
+        global_catalog.write_text(text, encoding='utf-8')
+        restored.supply(supply_id='materials', reason='Inspect additional material', changes={'sources': {}})
+        self.assertEqual(restored.state['config']['model_catalogs'], {
+            purpose: str(global_catalog.resolve()) for purpose in hints})
+        for field in ('model_connection', 'vision_connection', 'feasibility_connection'):
+            self.assertEqual(restored.state['config'][field], original[field])
+        global_catalog.unlink()
+        before = self._native_snapshot(restored)
+        with self.assertRaises((ValueError, LLMError)):
+            restored._client()
+        self._assert_native_snapshot(restored, before)
+        provider.assert_not_called()
+
+    def test_native_catalog_hints_reject_drift_and_respect_explicit_environment(self):
+        root, catalog, text, app, provider = self._local_catalog_task()
+        alternate = root / 'selected-models.toml'
+        alternate.write_text(text.replace('retry_attempts=1', 'retry_attempts=2'), encoding='utf-8')
+        before = self._native_snapshot(app)
+        with patch.dict(os.environ, {'SIMPLE_AR_MODELS_CONFIG': str(alternate)}):
+            self.assertEqual(app._client().model, 'task')
+        # Mutate the original file and then an explicit override. Neither
+        # location is authority to change a receiver or its protocol.
+        for location in (catalog, alternate):
+            for old, new, purpose in (
+                    ('model="task"', 'model="changed"', 'task'),
+                    ('model="code"', 'model="changed"', 'code'),
+                    ('model="writing"', 'model="changed"', 'writing'),
+                    ('model="vision"', 'model="changed"', 'vision'),
+                    ('model="review"', 'model="changed"', 'feasibility'),
+                    ('api="openai_chat"', 'api="openai_responses"', 'task'),
+                    ('capabilities=["text","code","vision"]', 'capabilities=["text"]', 'task'),
+                    ('https://models.invalid/v1', 'https://changed.invalid/v1', 'task')):
+                with self.subTest(location=location.name, consumer=purpose, changed=old):
+                    location.write_text(text.replace(old, new), encoding='utf-8')
+                    with patch.dict(os.environ, {'SIMPLE_AR_MODELS_CONFIG': str(location)}):
+                        with self.assertRaises((ValueError, LLMError)):
+                            if purpose == 'feasibility':
+                                app._feasibility_client('changed')
+                            else:
+                                app._client('changed', purpose=purpose)
+                        with self.assertRaises((ValueError, LLMError)):
+                            app.supply(supply_id='changed', reason='Keep the original receiver',
+                                changes={'allow_network': True})
+                    self._assert_native_snapshot(app, before)
+                    location.write_text(text, encoding='utf-8')
+        # Explicit invalid selection never falls back to the retained file.
+        with patch.dict(os.environ, {'SIMPLE_AR_MODELS_CONFIG': str(root / 'missing.toml')}):
+            with self.assertRaises((ValueError, LLMError)):
+                app._client()
+        os.environ.pop('SIMPLE_AR_MODELS_CONFIG')
+        catalog.write_text(text.replace('model="task"', 'model="changed"'), encoding='utf-8')
+        with self.assertRaises(ValueError):
+            ToolApplication.load(app.session.store.root)._client()
+        self._assert_native_snapshot(app, before)
+        provider.assert_not_called()
+
+    def test_native_catalog_switch_retry_and_historical_hint_boundaries(self):
+        import httpx
+
+        root, catalog, text, app, provider = self._local_catalog_task()
+        replacement = root / 'replacement-models.toml'
+        # The original task remains available; an explicit receiver change is
+        # what authorizes the new task model. Other consumers keep their hints.
+        replacement.write_text(text.replace('model="task"', 'model="replacement"'), encoding='utf-8')
+        original_hints = dict(app.state['config']['model_catalogs'])
+        with patch.dict(os.environ, {'SIMPLE_AR_MODELS_CONFIG': str(replacement)}):
+            app.switch_model('profile:task', switch_id='receiver', reason='Use the selected receiver')
+        expected = {**original_hints, 'task': str(replacement.resolve())}
+        self.assertEqual(app.state['config']['model_catalogs'], expected)
+        os.environ.pop('SIMPLE_AR_MODELS_CONFIG')
+        app = ToolApplication.load(app.session.store.root)
+        self.assertEqual(app._client().model, 'replacement')
+        self.assertEqual(app._client(purpose='vision').model, 'vision')
+        self.assertEqual(app._feasibility_client('review').model, 'review')
+        provider.assert_not_called()
+        provider.side_effect = httpx.ReadError('terminated without usage')
+        app.run(progress=lambda _: None)
+        self.assertEqual(app.session.list_attempts()[-1].status, 'failed')
+        ledger = app.ledger.to_dict()
+        with patch.dict(os.environ, {'SIMPLE_AR_MODELS_CONFIG': str(catalog)}):
+            app.run(retry_model=True, retry_model_selector='profile:task', progress=lambda _: None)
+        self.assertEqual(app.state['config']['model_catalogs'], original_hints)
+        self.assertEqual(app.ledger.to_dict()['entries'][:len(ledger['entries'])], ledger['entries'])
+        # Old sessions have no recovery promise and supply must not backfill
+        # their hints even when a compatible catalog is currently selected.
+        with patch.dict(os.environ, {'SIMPLE_AR_MODELS_CONFIG': str(catalog)}):
+            legacy = ToolApplication.create(root / 'legacy', 'Inspect material', model='profile:task', sources={})
+            injected = ToolApplication.create(root / 'injected', 'Inspect material', model='profile:task',
+                sources={}, services=SimpleNamespace(llm_client=legacy._client()))
+        self.assertNotIn('model_catalogs', injected.state['config'])
+        with patch.dict(os.environ, {'SIMPLE_AR_MODELS_CONFIG': str(root / 'missing.toml')}):
+            self.assertEqual(injected._client().model, 'task')
+        self.assertEqual(set(legacy.state['config']['model_catalogs']), {'task'})
+        legacy.state['config'].pop('model_catalogs')
+        legacy._save()
+        with patch.dict(os.environ, {'SIMPLE_AR_MODELS_CONFIG': str(catalog)}):
+            legacy = ToolApplication.load(legacy.session.store.root)
+            legacy.supply(supply_id='access', reason='Permit source access', changes={'allow_network': True})
+        self.assertNotIn('model_catalogs', legacy.state['config'])
+        with self.assertRaises((ValueError, LLMError)):
+            legacy._client()
+        with patch.dict(os.environ, {'OPENAI_API_KEY': 'local-only', 'SIMPLE_AR_MODEL': 'local-text',
+                                    'SIMPLE_AR_LLM_API': 'chat'}):
+            unbound = ToolApplication.create(root / 'environment', 'Inspect material', model='env', sources={})
+            self.assertNotIn('model_catalogs', unbound.state['config'])
+            self.assertEqual(unbound._client().model, 'local-text')
 
     def test_native_explicit_switch_preserves_task_delivery_history_and_idempotency(self):
         from simple_ar.cli.start import session_materials

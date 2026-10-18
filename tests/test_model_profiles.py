@@ -124,7 +124,7 @@ class ModelProfileTests(unittest.TestCase):
         root.mkdir()
         native_ledger = BudgetLedger({"image_requests": 2}, storage_path=root / "budget.json")
         workspace = WorkspaceToolGateway(root, {}, native_ledger)
-        gateway = ImageToolGateway(workspace, native_ledger)
+        gateway = ImageToolGateway(workspace, native_ledger, fallback_models_config=str(self.path.resolve()))
 
         def native_helper(**request):
             image_store = request["store"]
@@ -138,10 +138,11 @@ class ModelProfileTests(unittest.TestCase):
                 "status": "completed"})
             return payload, {}, image_store.root.parent.name
 
-        with patch("simple_ar.tools.images.load_model_catalog", return_value=catalog), \
+        with patch("simple_ar.tools.images.load_model_catalog", return_value=catalog) as resolve_catalog, \
                 patch("simple_ar.integrations.images.import_module"), \
                 patch("simple_ar.integrations.image_tasks.request_task_image", side_effect=native_helper) as send:
             first = gateway.call("create_image", {"prompt": "Draw an overview"}, identity="first")
+            resolve_catalog.assert_called_with(fallback_path=str(self.path.resolve()))
             self.assertEqual(first.status, "error")
             self.assertEqual(gateway.call("create_image", {"prompt": "Try again"}, identity="duplicate").status, "error")
             self.assertEqual(send.call_count, 1)
@@ -665,6 +666,43 @@ class ModelProfileTests(unittest.TestCase):
         self.assertEqual(legacy.connection_binding(), {})
         with self.assertRaises(LLMError):
             LLMClient.from_env(model="profile:writer")
+
+    def test_retained_catalog_locations_are_hints_not_new_connections(self):
+        from simple_ar.integrations.model_profiles import catalog_path
+
+        original = LLMClient.from_env('profile:writer').connection_binding()
+        hint = str(self.path.resolve())
+        os.environ.pop('SIMPLE_AR_MODELS_CONFIG')
+        # A process-local environment selection need not survive restart. No
+        # nearby project configuration is scanned or merged with this file.
+        self.assertEqual(LLMClient.from_env('profile:writer', fallback_models_config=hint).connection_binding(), original)
+        self.assertEqual(catalog_path(fallback_path=hint), self.path)
+        global_path = self.root / '.config/simple-ar/models.toml'
+        global_path.parent.mkdir(parents=True)
+        global_path.write_text(CATALOG.replace('writer-model', 'another-model'), encoding='utf-8')
+        self.assertEqual(LLMClient.from_env('profile:writer', fallback_models_config=hint).model, 'writer-model')
+        # Explicit caller/environment choices still win. The task owner, not
+        # the locator, must reject incompatible receivers before any dispatch.
+        os.environ['SIMPLE_AR_MODELS_CONFIG'] = str(global_path)
+        self.assertEqual(LLMClient.from_env('profile:writer', fallback_models_config=hint).model, 'another-model')
+        self.assertEqual(LLMClient.from_env('profile:writer', models_config=hint,
+            fallback_models_config=str(global_path)).model, 'writer-model')
+        os.environ['SIMPLE_AR_MODELS_CONFIG'] = str(self.root / 'absent-explicit.toml')
+        with self.assertRaisesRegex(LLMError, 'does not exist'):
+            LLMClient.from_env('profile:writer', fallback_models_config=hint)
+        os.environ.pop('SIMPLE_AR_MODELS_CONFIG')
+        with self.assertRaisesRegex(LLMError, 'absolute'):
+            LLMClient.from_env('profile:writer', fallback_models_config='models.toml')
+        self.path.unlink()
+        self.assertEqual(LLMClient.from_env('profile:writer', fallback_models_config=hint).model, 'another-model')
+        self.path.write_text('api_key = "do-not-echo-this-value"\n', encoding='utf-8')
+        with self.assertRaises(LLMError) as caught:
+            LLMClient.from_env('profile:writer', fallback_models_config=hint)
+        self.assertNotIn('do-not-echo-this-value', str(caught.exception))
+        global_path.unlink()
+        self.path.unlink()
+        with self.assertRaisesRegex(LLMError, 'Named models require'):
+            LLMClient.from_env('profile:writer', fallback_models_config=hint)
 
     def test_saved_session_rejects_connection_drift_before_execution(self):
         from simple_ar.app.research_application import (

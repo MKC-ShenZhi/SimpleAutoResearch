@@ -66,6 +66,16 @@ def public_data(value):
     return public_text(value) if isinstance(value, str) else value
 
 
+def _model_recipients(binding: dict) -> dict:
+    """Display retained recipients, not current credentials or live routing."""
+    settings = binding.get('settings') or {}
+    connections = {'task': settings}
+    connections.update({purpose: ToolApplication._work_connection(binding, purpose).get('connection')
+                        for purpose in ('code', 'writing')})
+    return {purpose: {key: value.get(key) for key in ('base_url', 'model', 'api', 'api_mode') if key in value}
+            if value else None for purpose, value in connections.items()}
+
+
 class Workspace:
     def __init__(self, project: Path, reads: list[Path], tasks: Path):
         self.project = bounded(project, project)
@@ -113,13 +123,7 @@ class Workspace:
                 continue
             try:
                 binding, identity = self.connection('profile:' + name)
-                settings = binding['settings']
-                recipients = {'task': {k: settings.get(k) for k in ('base_url', 'model', 'api_mode')}}
-                for purpose in ('code', 'writing'):
-                    route = binding.get(purpose + '_route') or {}
-                    connection = route.get('connection') or settings
-                    recipients[purpose] = {k: connection.get(k) for k in ('base_url', 'model')}
-                rows.append(dict(selector='profile:' + name, model=profile.model, default=name == default_name, recipients=recipients,
+                rows.append(dict(selector='profile:' + name, model=profile.model, default=name == default_name, recipients=_model_recipients(binding),
                     binding_id=identity, input_price=profile.input_price_per_million,
                     output_price=profile.output_price_per_million))
             except Exception:
@@ -264,7 +268,12 @@ class Workspace:
             requests=state['requests'], plan=plan, pending=pending_view, approval=approval,
             activity=activity, activity_total=sum(len(t['tools']) for t in state['turns']),
             queued_actions=sum(len(t.get('remaining', [])) for t in state['turns']),
-            model=config.get('model'), access={k: config.get(k) for k in
+            model=config.get('model'), saved_connections={
+                **_model_recipients(config.get('model_connection') or {}),
+                **{purpose: _model_recipients(config[field])['task']
+                   for purpose, field in (('vision', 'vision_connection'), ('feasibility', 'feasibility_connection'))
+                   if config.get(field)}},
+            catalog_hints=config.get('model_catalogs', {}), access={k: config.get(k) for k in
                 ('allow_network', 'allow_execution', 'allow_vision')},
             sources=list(config.get('sources', {})),
             resources=ledger.snapshot() | {'entries': [
