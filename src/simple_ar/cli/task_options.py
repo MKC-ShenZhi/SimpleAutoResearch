@@ -74,7 +74,10 @@ def apply_task_config(args: argparse.Namespace) -> None:
                 raise ValueError('Task source must list nonempty file/directory paths')
             value = [(path.parent / Path(item).expanduser()).resolve() for item in value]
         elif name in PATHS:
-            value = (path.parent / Path(value).expanduser()).resolve()
+            candidate = path.parent / Path(value).expanduser()
+            # A venv executable's symlink target belongs to the base runtime;
+            # resolving it silently selects a different Python environment.
+            value = candidate.absolute() if name == 'project_python' else candidate.resolve()
         if name not in explicit and not (name == 'request' and (args.request is not None or args.goal)):
             setattr(args, name, value)
             explicit.add(name)
@@ -101,6 +104,7 @@ def write_task_config(args: argparse.Namespace) -> bool:
         'request': 'Goal, language, length and intended figures belong here; the assistant chooses tools as needed.',
         'model': 'Named connection from your global models.toml; never put credentials in this file.',
         'source': 'Read-only files/directories visible on the execution machine. Relative paths use this file location.',
+        'project_python': 'Python entry path, preserving a virtualenv symlink; relative paths use this file location. Saved task environments do not change on resume.',
         'allow_execution': 'Allows process proposals only. Each actual command still needs approval.',
         'allow_network': 'Allows public source acquisition; does not authorize installations.',
         'allow_vision': 'Allows sending rendered images to the configured vision connection.',

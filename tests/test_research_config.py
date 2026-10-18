@@ -16,8 +16,12 @@ class ReportDocumentArgumentsTests(unittest.TestCase):
         from simple_ar.cli.main import main
         from simple_ar.app.tool_application import ToolApplication
         from simple_ar.cli.task_options import apply_task_config, native_process_limits
+        import venv
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
+            environment = root / 'project-environment'
+            venv.EnvBuilder(with_pip=False, symlinks=sys.platform != 'win32').create(environment)
+            interpreter = environment / ('Scripts/python.exe' if sys.platform == 'win32' else 'bin/python')
             config = root / 'task.toml'
             materials = root / 'materials'
             materials.mkdir()
@@ -26,26 +30,47 @@ class ReportDocumentArgumentsTests(unittest.TestCase):
                     patch('sys.stdin.isatty', return_value=False), redirect_stdout(io.StringIO()):
                 main(['start', 'Inspect results and explain limitations', '--source', str(materials),
                       '--max-processes', '0', '--max-process-seconds', '12',
+                      '--project-python', str(interpreter),
                       '--write-task-config', str(config)])
                 self.assertTrue(config.is_file())
+                import tomllib
+                self.assertEqual(tomllib.loads(config.read_text())['task']['project_python'], str(interpreter))
                 with self.assertRaises(SystemExit):
                     main(['start', '--write-task-config', str(config)])
             # Relative inputs resolve against the configuration, CLI budget overrides it.
             config.write_text('[task]\nrequest="Inspect nested materials"\nsource=["materials"]\n'
+                'project_python=' + json.dumps(str(interpreter.relative_to(root))) + '\n'
                 'max_turns=4\nmax_tokens=500\nmax_processes=0\nmax_process_seconds=12\n', encoding='utf-8')
             args = build_parser().parse_args(['start', '--task-config', str(config), '--max-tokens', '900'])
             args._explicit_start_destinations = {'task_config', 'max_tokens'}
             apply_task_config(args)
             self.assertEqual(args.max_tokens, 900)
             self.assertEqual(args.source, [materials.resolve()])
+            self.assertEqual(args.project_python, interpreter)
             app = ToolApplication.create(root / 'session', args.request, model=None,
                 sources={'source0': args.source[0]}, max_turns=args.max_turns, max_tokens=args.max_tokens,
-                process_limits=native_process_limits(args))
+                process_limits=native_process_limits(args), project_python=args.project_python)
             loaded = ToolApplication.load(app.session.store.root)
             self.assertEqual(loaded.ledger.limits['process_invocations'], 0)
             self.assertEqual(loaded.ledger.limits['process_wall_seconds'], 12)
             self.assertEqual(loaded.state['config']['sources']['source0'], str(materials.resolve()))
             self.assertFalse(loaded.ledger.entries)
+            self.assertEqual(loaded.state['config']['project_python'], str(interpreter))
+            # The public roundtrip must preserve actual venv behavior, not
+            # merely its displayed path while selecting the base interpreter.
+            probe = ToolApplication.create(root / 'environment-check', 'Observe configured interpreter',
+                model=None, sources={}, project_python=args.project_python,
+                process_limits={'process_invocations': 1, 'process_wall_seconds': 10})
+            observed = probe.workspace.call('run_process', {'argv': ['python', '-c',
+                'import sys; print(sys.prefix)'], 'timeout_sec': 5}, identity='roundtrip-environment')
+            self.assertTrue(observed.ok, observed.error)
+            self.assertEqual(observed.data['returncode'], 0, observed.data.get('stderr'))
+            self.assertEqual(observed.data['stdout'].strip(), str(environment))
+            override = build_parser().parse_args(['start', '--task-config', str(config),
+                '--project-python', sys.executable])
+            override._explicit_start_destinations = {'task_config', 'project_python'}
+            apply_task_config(override)
+            self.assertEqual(override.project_python, Path(sys.executable))
             for bad in ('max_turns=true', 'max_process_seconds=inf', 'api_key="not-a-task-setting"'):
                 config.write_text('[task]\n' + bad + '\n', encoding='utf-8')
                 args = build_parser().parse_args(['start', '--task-config', str(config)])
