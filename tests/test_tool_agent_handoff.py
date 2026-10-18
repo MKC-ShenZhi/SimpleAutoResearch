@@ -7841,6 +7841,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(view['source_handles'][0]['metadata']['evidence_passages'][0]['text'], original.chunks[0].text)
 
     def test_composition_binds_supplied_windows_figures_and_saved_output_versions(self) -> None:
+        from simple_ar.report.capability import run_report_capability
+        from simple_ar.report.figures import ReportFigureRecord, ReportFigureResult
         run_dir, inputs, fake, binding, resumed, code = self._native_fixture()
         table = resumed.workspace.workspace / 'observations.csv'
         table.write_text('group,value\nA,3\nB,5\n', encoding='utf-8')
@@ -7849,11 +7851,27 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         figure_path.write_bytes(figure_bytes)
         material_arguments = {'goal': 'Explain these supplied rows; include the existing diagram, without claiming a new measurement.',
             'title': 'Supplied observations', 'materials': [{'path': str(table), 'start_line': 2, 'max_lines': 1}],
-            'figures': [str(figure_path)]}
+            'figures': [{'path': str(figure_path), 'caption': 'Existing supplied diagram.'}]}
         fake.ask_json.return_value = {'draft_markdown': 'The selected row is A,3; other rows were not selected.\n\n![Existing diagram](figures/selected-1.svg)',
             'source_notes': []}
         call = ToolCall(tool_name='compose_document', arguments=material_arguments, trace_id='writing-materials')
-        material_report = resumed.gateway.call(call)
+        class Renderer:
+            # Exercise the real assembly/publication boundary, not scientific
+            # rendering quality. Registered assets need not live in figures/.
+            name = 'fixture'
+            def render(self, *, report_markdown, report_dir, **kwargs):
+                for name in ('panels/context.svg', 'editable/context.svg'):
+                    path = report_dir / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(figure_bytes)
+                return ReportFigureResult(report_markdown=report_markdown
+                    + '\n\n![Registered context](panels/context.svg)\n', figures=[ReportFigureRecord(
+                        figure_id='context', title='Context', path='panels/context.svg', anchor='Context',
+                        caption='Registered context.', exports={'svg': 'editable/context.svg'})])
+        def assemble(*, context, request, **kwargs):
+            return run_report_capability(context=context, request=request, figure_renderer=Renderer())
+        with patch('simple_ar.report.capability.run_report_capability', side_effect=assemble):
+            material_report = resumed.gateway.call(call)
         self.assertEqual(material_report.status, 'ok', material_report.error)
         view = _writing_prompt(fake)
         handles = view['source_handles']
@@ -7862,10 +7880,20 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(supplied['metadata']['evidence_role'], 'selected_file_content_not_independently_verified')
         self.assertTrue(supplied['metadata']['extraction_coverage']['has_more'])
         self.assertNotIn('citation_key', supplied)
-        self.assertIn('figures/selected-1.svg', next(row for row in handles if row['handle'].startswith('figure:'))['summary'])
+        self.assertEqual(next(row for row in handles if row['handle'].startswith('figure:'))['artifact'],
+                         'figures/selected-1.svg')
         body = resumed.workspace.resolve(material_report.data['editable_markdown'])
         self.assertIn('](figures/selected-1.svg)', body.read_text())
         self.assertEqual((body.parent / 'figures/selected-1.svg').read_bytes(), figure_bytes)
+        self.assertIn('](panels/context.svg)', body.read_text())
+        for path in ('panels/context.svg', 'editable/context.svg'):
+            self.assertEqual((body.parent / path).read_bytes(), figure_bytes)
+            self.assertIn(resumed.workspace.locator(body.parent / path), material_report.artifacts)
+        manifest = json.loads((body.parent / 'figures/figures_manifest.json').read_text())
+        self.assertEqual(manifest['figure_count'], 2)
+        self.assertEqual({row['path'] for row in manifest['figures']},
+                         {'panels/context.svg', 'figures/selected-1.svg'})
+        self.assertFalse(any('/writer/' in path or '/assembly/' in path for path in material_report.artifacts))
         self.assertEqual(resumed.workspace.resolve(material_report.artifacts[1]).read_text().strip(), '')
         cached = resumed.gateway.call(call)
         self.assertEqual(cached.artifacts, material_report.artifacts)

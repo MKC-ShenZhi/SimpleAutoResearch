@@ -44,12 +44,14 @@ class LocalWorkspaceTests(unittest.TestCase):
             workspace = Workspace(project, [source_file], tasks)
             name = '保留任务 café'
             root = tasks / name
+            diagnostic = '<img src=x onerror=alert(1)> Candidate evidence needs review\nOriginal diagnostic'
             app = ToolApplication.create(root, 'Inspect retained evidence', model=None,
                 sources={'source0': project, 'source1': source_file, 'source2': project / 'models.toml'},
                 allow_execution=True, max_attempts=80,
                 process_limits={'process_invocations': 1, 'process_wall_seconds': 30})
             app.run(actions=[call('write_file', {'path': 'workspace/report.txt', 'content': 'first report',
-                'delivery': {'summary': 'Initial result', 'artifacts': ['workspace/report.txt']} })],
+                'delivery': {'summary': 'Initial result', 'artifacts': ['workspace/report.txt'],
+                             'unresolved': [diagnostic]} })],
                 progress=lambda _: None)
             initial = (root / 'workspace/report.txt').read_bytes()
             httpd = server(workspace)
@@ -87,10 +89,18 @@ class LocalWorkspaceTests(unittest.TestCase):
                 status, script = request('/app.js')
                 self.assertEqual(status, 200)
                 self.assertNotRegex(script.decode('utf-8'), r'\bconfirm\s*\(')
+                # Static sink/wiring constraints only: these do not execute JS
+                # or establish browser rendering/XSS behavior. Verify DOM on server.
+                source = script.decode('utf-8')
+                self.assertNotIn('innerHTML', source)
+                self.assertIn("paragraph($('delivery'), diagnostic, 'receipt')", source)
+                self.assertIn("delivery.current ? '当前请求交付'", source)
+                self.assertIn("row.observed.returncode !== 0", source)
+                self.assertIn('执行失败（原工具回执状态：', source)
                 self.assertEqual(request('/api/tasks', authenticated=False)[0], 403)
                 self.assertEqual(request('/api/tasks', host='evil.invalid')[0], 403)
                 self.assertEqual(json.loads(request('/api/tasks')[1]),
-                    [dict(task=name, topic='Inspect retained evidence', status='completed')])
+                    [dict(task=name, topic='Inspect retained evidence', status='partial')])
                 self.assertEqual(workspace.task('.'), tasks)
                 for invalid in ('', '..', str(root), name + '/workspace'):
                     with self.assertRaises(ValueError):
@@ -100,7 +110,7 @@ class LocalWorkspaceTests(unittest.TestCase):
                 status, raw = request(f'/api/task?task={name}')
                 self.assertEqual(status, 200)
                 view = json.loads(raw)
-                self.assertEqual(view['manifest']['status'], 'completed')
+                self.assertEqual(view['manifest']['status'], 'partial')
                 self.assertEqual(view['mode'], 'saved results browser')
                 self.assertFalse(view['worker_live'])
                 self.assertIsNone(view['plan'])
@@ -113,9 +123,15 @@ class LocalWorkspaceTests(unittest.TestCase):
                 self.assertEqual(json.loads((root / receipt['record']).read_text())['status'], receipt['status'])
                 delivery = json.loads(request(f'/api/delivery?task={name}')[1])
                 self.assertTrue(delivery['current'])
+                self.assertEqual(delivery['unresolved'], [diagnostic])
+                self.assertEqual(delivery['summary'], 'Initial result')
                 self.assertTrue(any(f['path'] == 'report.txt' for f in delivery['files']))
                 (root / 'workspace/report.txt').write_text('untracked replacement', encoding='utf-8')
-                self.assertFalse(json.loads(request(f'/api/delivery?task={name}')[1])['current'])
+                historical = json.loads(request(f'/api/delivery?task={name}')[1])
+                self.assertFalse(historical['current'])
+                self.assertEqual(historical['unresolved'], [diagnostic])
+                self.assertEqual(historical['summary'], delivery['summary'])
+                self.assertEqual(historical['files'], [])
                 (root / 'workspace/report.txt').write_bytes(initial)
                 self.assertEqual(request(f'/api/file?task={name}&mount=source0&path=source.txt')[1], b'Observed input')
                 rows = json.loads(request(f'/api/files?task={name}&mount=source0')[1])
@@ -185,7 +201,9 @@ class LocalWorkspaceTests(unittest.TestCase):
                 self.assertEqual(view['activity'][0]['request_count'], 1)
                 # Keep old delivery on disk: the HTTP view still says paused.
                 self.assertTrue((root / 'delivery.json').exists())
-                self.assertFalse(json.loads(request(f'/api/delivery?task={name}')[1])['current'])
+                historical = json.loads(request(f'/api/delivery?task={name}')[1])
+                self.assertFalse(historical['current'])
+                self.assertEqual(historical['unresolved'], [diagnostic])
                 app = ToolApplication.load(root)
                 # Bounded recent history includes a real refusal, not model
                 # prose or a synthetic UI status. No plan call is required.
@@ -202,7 +220,7 @@ class LocalWorkspaceTests(unittest.TestCase):
                 self.assertTrue(refusal['error'])
                 self.assertEqual(refusal['request_count'], 2)
                 self.assertEqual((root / 'actions.json').read_bytes(), original_state)
-                app.run(actions=[call('run_process', {'argv': ['python', '-c', 'print("approved")'], 'timeout_sec': 5})],
+                app.run(actions=[call('run_process', {'argv': ['python', '-c', 'print("approved"); raise SystemExit(7)'], 'timeout_sec': 5})],
                         progress=lambda _: None)
                 view = json.loads(request(f'/api/task?task={name}')[1])
                 self.assertIsNotNone(view['approval'])
@@ -210,6 +228,13 @@ class LocalWorkspaceTests(unittest.TestCase):
                 self.assertEqual(view['pending']['call'], view['approval']['call'])
                 self.assertEqual(request('/api/action', {'op': 'approve', 'task': name, 'token': 'wrong'})[0], 400)
                 action('approve', token=view['approval']['token'])
+                process = json.loads(request(f'/api/task?task={name}')[1])['activity'][0]
+                self.assertEqual(process['tool'], 'run_process')
+                self.assertEqual(process['status'], 'ok')
+                self.assertEqual(process['observed']['returncode'], 7)
+                original = json.loads((root / process['record']).read_text())
+                self.assertEqual(original['status'], process['status'])
+                self.assertEqual(original['data']['returncode'], process['observed']['returncode'])
                 ledger = BudgetLedger.load(root / 'budget_ledger.json')
                 self.assertEqual(ledger.remaining('process_invocations'), 0)
                 self.assertEqual(request('/api/action', {'op': 'stop', 'task': name})[0], 400)

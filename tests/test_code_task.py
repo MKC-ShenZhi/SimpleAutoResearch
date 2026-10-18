@@ -6199,6 +6199,77 @@ class WorkspaceSourceBindingTests(unittest.TestCase):
 class GenerationAuthorizationTests(unittest.TestCase):
     """Exercise publication authority through real staging; only the model is fake."""
 
+    def test_implementation_preserves_bound_originals_without_manufactured_edits(self):
+        from simple_ar.code_task.generation.writer import write_implementation_unit
+
+        # Both explicit files and unfamiliar-project selections reach the writer
+        # as a plan; feedback instead merges its complete bound inventory.
+        for planned in (True, False):
+            with self.subTest(planned=planned), _temporary_root() as root:
+                originals = {'pkg/__init__.py': '', 'helper.py': '# keep CRLF\r\nVALUE = 1\r\n'}
+                response = {'files': [{'path': path, 'replacements': []} for path in originals]}
+                with patch('simple_ar.code_task.generation.writer.run_json_agent_step', return_value=response):
+                    result = write_implementation_unit(project_dir=root / 'candidate', goal='Preserve dependencies',
+                        files=[{'path': path} for path in originals] if planned else None,
+                        source_windows=[], original_files={path: {'text': text} for path, text in originals.items()},
+                        client=Mock(), artifact_dir=root / 'records', retry_attempts=1,
+                        validate_destination=lambda path: root / 'candidate' / path)
+                for row in result['files']:
+                    raw = originals[row['path']].encode('utf-8')
+                    self.assertEqual((root / 'candidate' / row['path']).read_bytes(), raw)
+                    self.assertEqual(row['sha256'], hashlib.sha256(raw).hexdigest())
+
+    def test_implementation_rejects_aliases_before_staging_in_every_mode(self):
+        from pathlib import PureWindowsPath
+        from simple_ar.code_task.generation.writer import write_implementation_unit
+
+        # Simulate Windows lexical identity on Linux; this is not a Windows
+        # filesystem integration test. Feedback must include omitted originals.
+        for mode in ('planned', 'direct', 'feedback'):
+            with self.subTest(mode=mode), _temporary_root() as root:
+                destination = root / 'candidate'
+                write_text(destination / 'previous.py', 'ORIGINAL = 1\n')
+                before = _project_bytes(destination)
+                response = {'files': [{'path': 'Helper.py', 'content': 'VALUE = 2\n'}]}
+                if mode != 'feedback':
+                    response['files'].insert(0, {'path': 'helper.py', 'content': 'VALUE = 1\n'})
+                with patch('simple_ar.code_task.generation.writer.run_json_agent_step', return_value=response), \
+                        patch('simple_ar.code_task.generation.writer.Path', PureWindowsPath), \
+                        self.assertRaisesRegex(ValueError, 'alias on this filesystem'):
+                    write_implementation_unit(project_dir=destination, goal='Prepare related files',
+                        files=[{'path': row['path']} for row in response['files']] if mode == 'planned' else None,
+                        source_windows=[], original_files={'helper.py': {'text': 'VALUE = 1\n'}}
+                        if mode == 'feedback' else {}, client=Mock(), artifact_dir=root / 'records',
+                        retry_attempts=1, validate_destination=lambda path: destination / path)
+                self.assertEqual(_project_bytes(destination), before)
+                self.assertFalse(list(root.glob('.candidate.candidate-*')))
+                self.assertFalse(list(root.glob('.candidate.previous-*')))
+
+    def test_implementation_native_case_identity_and_new_empty_file_boundary(self):
+        from simple_ar.code_task.generation.writer import write_implementation_unit
+
+        for planned in (True, False):
+            for empty in (True, False):
+                with self.subTest(planned=planned, empty=empty), _temporary_root() as root:
+                    response = {'files': [{'path': 'helper.py', 'content': 'VALUE = 1\n'},
+                        {'path': 'Helper.py' if not empty else 'pkg/__init__.py',
+                         'content': '' if empty else 'VALUE = 2\n'}]}
+                    def publish():
+                        return write_implementation_unit(project_dir=root / 'candidate', goal='Prepare sources',
+                            files=[{'path': row['path']} for row in response['files']] if planned else None,
+                            source_windows=[], client=Mock(), artifact_dir=root / 'records', retry_attempts=1,
+                            validate_destination=lambda path: root / 'candidate' / path)
+                    with patch('simple_ar.code_task.generation.writer.run_json_agent_step', return_value=response):
+                        if empty or os.name == 'nt':
+                            with self.assertRaisesRegex(ValueError, 'empty' if empty else 'alias on this filesystem'):
+                                publish()
+                            self.assertFalse((root / 'candidate').exists())
+                        else:
+                            result = publish()
+                            self.assertEqual(len(result['files']), 2)
+                            for row in response['files']:
+                                self.assertEqual((root / 'candidate' / row['path']).read_bytes(), row['content'].encode())
+
     @staticmethod
     def _client(contents):
         client = Mock()

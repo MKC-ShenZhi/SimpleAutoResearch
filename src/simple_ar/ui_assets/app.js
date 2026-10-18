@@ -48,7 +48,14 @@ function renderActivity() {
   if (!rows.length) paragraph($('activity'), '尚无已接受工具回执。模型草稿与未执行提案不计入进度。');
   for (const row of rows) {
     const item = document.createElement('li'); item.className = 'activity-item';
-    paragraph(item, (toolLabels[row.tool] || row.tool || '工具记录') + ' · ' + (statusLabels[row.status] || row.status));
+    // Presentation of saved process facts only; do not rewrite the receipt status.
+    const executionFailed = row.tool === 'run_process' && row.status === 'ok' &&
+      ((typeof row.observed?.returncode === 'number' && row.observed.returncode !== 0) || row.observed?.stop_reason);
+    paragraph(item, (toolLabels[row.tool] || row.tool || '工具记录') + ' · ' +
+      (executionFailed ? '执行失败（原工具回执状态：' + row.status + '）' : (statusLabels[row.status] || row.status)));
+    if (row.tool === 'run_process' && row.observed) paragraph(item,
+      '保存的退出码：' + (row.observed.returncode ?? '未记录') +
+      ' · 停止原因：' + (row.observed.stop_reason || '未记录'), 'receipt');
     paragraph(item, '请求 ' + (row.request_count ?? '未记录') + ' · ' + (row.attempt || '历史内联回执') + ' · ' + row.call_id, 'hint');
     if (row.action_unavailable) paragraph(item, '原动作不可读；以下只展示已保存工具回执。', 'hint');
     if (row.summary) paragraph(item, row.summary);
@@ -218,9 +225,13 @@ async function refresh() {
   $('delivery').replaceChildren();
   const heading = document.createElement('h3'); heading.textContent = '交付与复用';
   $('delivery').append(heading);
-  const label = document.createElement('p');
-  label.textContent = delivery.label + (delivery.summary ? ' · ' + delivery.summary : ' · 尚无交付');
-  $('delivery').append(label);
+  paragraph($('delivery'), delivery.current ? '当前请求交付' : '历史交付 / 未验证为当前请求成果');
+  paragraph($('delivery'), delivery.label);
+  paragraph($('delivery'), delivery.summary || '尚无交付摘要');
+  paragraph($('delivery'), '原交付记录的未解决事项（不认证科研质量）：', 'hint');
+  if (delivery.unresolved?.length) {
+    for (const diagnostic of delivery.unresolved) paragraph($('delivery'), diagnostic, 'receipt');
+  } else paragraph($('delivery'), '原交付记录未列出未解决事项。', 'hint');
   for (const row of delivery.files) {
     const button = document.createElement('button'); button.textContent = row.group + ' · ' + row.name;
     button.onclick = () => previewFile({task, mount: row.mount}, row);

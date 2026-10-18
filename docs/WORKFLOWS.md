@@ -211,6 +211,8 @@ Keep the report and a focused template bundle in the supplied directory, not you
 credentials or unrelated files. The template needs `$body$` and the standard
 `$for(header-includes)$$header-includes$$endfor$` hook in its preamble.
 This is not automatic conversion of arbitrary conference TeX or official-template discovery.
+Authored sections, including Abstract or Summary, stay in the supplied template's body;
+their headings do not implicitly populate its `$abstract$` metadata slot.
 
 The shared `export_report` tool accepts an optional `template` object with `path`
 (relative to its Markdown), `assets` (explicit flat companion files), `engine`

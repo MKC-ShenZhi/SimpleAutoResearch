@@ -34,8 +34,7 @@ class PortableExportIntegrationTests(unittest.TestCase):
             ('article', 'pdflatex', None, '\\documentclass{article}\n\\usepackage[T1]{fontenc}\n',
              '\\maketitle\n\\begin{abstract}$abstract$\\end{abstract}\n'),
             ('titlepage', 'pdflatex', 'chapter', '\\documentclass{report}\n\\usepackage[T1]{fontenc}\n',
-             '\\begin{titlepage}\\centering\\Huge $title$\\end{titlepage}\n'
-             '\\chapter*{Summary}$abstract$\n'),
+             '\\begin{titlepage}\\centering\\Huge $title$\\end{titlepage}\n'),
         ]
         if shutil.which('xelatex'):
             # fontspec's TeX-distribution default covers Latin accents. This
@@ -160,6 +159,10 @@ class PortableExportIntegrationTests(unittest.TestCase):
                         if all(width is None for width in original[1]) else original[1])
                     self.assertEqual(converted[1], expected)
                 self.assertEqual((output / 'body.tex').read_text(encoding='utf-8').count(r'\begin{longtable}'), 2)
+                # Both supplied templates preserve the authored Abstract in
+                # the body, including the layout with no abstract slot at all.
+                self.assertIn('Unicode', (output / 'body.tex').read_text(encoding='utf-8'))
+                self.assertIn('fixture.', (output / checked['forbidden_identifiers']['evidence']).read_text(encoding='utf-8'))
                 self.assertEqual((source / 'report_body.md').read_text(encoding='utf-8'), body)
                 self.assertEqual(image.read_bytes(), original_svg)
                 self.assertEqual((output / 'figures/figure-1.svg').read_bytes(), original_svg)

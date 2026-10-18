@@ -197,6 +197,8 @@ uv run simple-ar start "使用给定报告和可信模板，保留Markdown与参
 模板须含 `$body$`，并在导言区包含标准
 `$for(header-includes)$$header-includes$$endfor$` 钩子。
 这不是任意会议 TeX 的自动转换，也不自动发现官方模板。
+原稿各节（包括 Abstract 或 Summary）保留在所供模板的正文中；
+不会凭标题将其移入模板的 `$abstract$` 元数据插槽。
 
 共同出版工具 `export_report` 接受可选 `template`：`path` 相对 Markdown 所在目录，
 `assets` 明确列出同目录平铺配套文件，`engine` 为 `pdflatex` 或已安装的 `xelatex`，

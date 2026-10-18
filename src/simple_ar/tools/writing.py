@@ -998,33 +998,69 @@ class WritingToolGateway:
                     papers=tuple(context.papers), citation_key_map=context.citation_key_map), figure_renderer=renderer)
             if assembled.status != 'completed':
                 raise ValueError('Assembly did not complete; inspect retained artifacts before publication')
-            if figure_captions:
-                assembly_store.write_json('figures/figures_manifest.json', {'figures': figure_captions})
             # The legacy assembler's reader display is a derived snapshot, not
             # a second authoring surface. Feedback and export share this body.
             output_store = ArtifactStore(output)
-            artifacts = []
-            text_outputs = (('report_body.md', 'manuscript.md'),
+            text_outputs = {target: assembly_store.read_text(source) for source, target in (
+                    ('report_body.md', 'manuscript.md'),
                     ('references.bib', 'references.bib'), ('citation_map.json', 'citation_map.json'),
-                    ('citation_cleanup.json', 'citation_cleanup.json'))
+                    ('citation_cleanup.json', 'citation_cleanup.json'))}
+            # The assembly owns generated figures and their exports. Consume
+            # those public artifact roles, not a filename/format whitelist or
+            # the entire internal checkpoint/evidence directory.
+            assets = {}
+            figure_manifest = None
+            for ref in assembled.artifacts:
+                if ref.kind not in {'figure', 'report_figures'}:
+                    continue
+                path = assembly_store.resolve(ref).resolve()
+                if (ref.status != 'available' or not path.is_file()
+                        or not path.is_relative_to(assembly_store.root.resolve())):
+                    raise ValueError('Assembly figure artifact is missing or escapes its owner')
+                if ref.kind == 'report_figures':
+                    figure_manifest = json.loads(path.read_text(encoding='utf-8'))
+                else:
+                    assets[ref.path] = path.read_bytes()
+            for _, target, raw in figure_inputs:
+                if target in assets and assets[target] != raw:
+                    raise ValueError('Supplied and generated figures have conflicting publication paths')
+                assets[target] = raw
             if figure_captions:
-                text_outputs += (('figures/figures_manifest.json', 'figures/figures_manifest.json'),)
+                figure_manifest = figure_manifest or {'figures': []}
+                rows = {row['path']: row for row in figure_manifest['figures']}
+                for row in figure_captions:
+                    if row['path'] in rows and rows[row['path']].get('caption') != row['caption']:
+                        raise ValueError('Supplied and generated figure captions conflict')
+                    rows.setdefault(row['path'], row)
+                figure_manifest['figures'] = list(rows.values())
+                if 'figure_count' in figure_manifest:
+                    figure_manifest['figure_count'] = len(rows)
+            if figure_manifest is not None:
+                if any(path not in assets for row in figure_manifest['figures']
+                        for path in (row['path'], *(row.get('exports') or {}).values())):
+                    raise ValueError('Figure manifest references an unpublished asset')
+                text_outputs['figures/figures_manifest.json'] = json.dumps(
+                    figure_manifest, indent=2, ensure_ascii=False) + '\n'
+            targets = [*text_outputs, *assets]
+            if len({Path(path) for path in targets}) != len(targets):
+                raise ValueError('Publication output paths alias or conflict')
             # A publication interrupted before its receipt may have a prefix
             # of files. Reconcile only matching bytes; never replace edits with
             # a newly certified version. Check the whole prefix before writing.
             if recovering:
-                for source_name, target_name in text_outputs:
-                    published_bytes = assembly_store.read_text(source_name).replace('\n', os.linesep).encode('utf-8')
+                for target_name, text in text_outputs.items():
+                    published_bytes = text.replace('\n', os.linesep).encode('utf-8')
                     if output_store.exists(target_name) and output_store.resolve(target_name).read_bytes() != published_bytes:
                         raise ValueError('Retained publication changed; preserve it and use a new identity')
-                for _, target, raw in figure_inputs:
+                for target, raw in assets.items():
                     if (output / target).exists() and (output / target).read_bytes() != raw:
                         raise ValueError('Retained publication figure changed; preserve it and use a new identity')
-            for source_name, target_name in text_outputs:
+            artifacts = []
+            for target_name, text in text_outputs.items():
                 if not output_store.exists(target_name):
-                    output_store.write_text(target_name, assembly_store.read_text(source_name))
+                    output_store.write_text(target_name, text)
                 artifacts.append(f'{prefix}/{target_name}')
-            for _, target, raw in figure_inputs:
+            for target, raw in assets.items():
                 destination = output / target
                 if not destination.exists():
                     destination.parent.mkdir(parents=True, exist_ok=True)

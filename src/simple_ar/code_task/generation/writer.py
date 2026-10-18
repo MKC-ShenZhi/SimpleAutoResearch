@@ -139,7 +139,7 @@ def write_implementation_unit(
     result = {'project_dir': str(project_dir), 'files': generated,
         'summary': str(response.get('summary', '')), 'unresolved': unresolved,
         'verification': ('Changed/new Python syntax checked only; retained originals preserved; '
-            'no imports, commands or scientific validation.' if planned is None and original_files else
+            'no imports, commands or scientific validation.' if original_files else
             'Python syntax checked only; no imports, commands or scientific validation.')}
     if execution_plan is not None:
         result['execution_plan'] = execution_plan
@@ -196,7 +196,7 @@ def _decode_implementation_response(
             if not isinstance(row.get('content'), str) or 'replacements' in row:
                 raise ValueError('New files require textual content, not replacements')
             content = row['content']
-        retained_original = (planned is None and not legacy and path in original_files
+        retained_original = (not legacy and path in original_files
             and content == original_files[path]['text'])
         if not legacy and not retained_original and (not content.strip() or len(content.encode('utf-8')) > 256000):
             raise ValueError('Generated file is empty or exceeds the text bound')
@@ -218,10 +218,14 @@ def _decode_implementation_response(
         contents = {**{path: original['text'] for path, original in original_files.items()}, **contents}
         if len(contents) > 12:
             raise ValueError('Merged candidate exceeds 12 source files')
-        if len({Path(path) for path in contents}) != len(contents):
-            raise ValueError('Candidate source paths alias on this filesystem')
         for path in contents:
             _validate_text_source(path, validate_destination)
+    if not legacy:
+        # Planned, direct and merged feedback units share one publication
+        # invariant. Use native path identity: case variants are distinct on
+        # Linux but alias on Windows. Check the whole unit before any writes.
+        if len({Path(path) for path in contents}) != len(contents):
+            raise ValueError('Candidate source paths alias on this filesystem')
     unresolved = response.get('unresolved', [])
     if not isinstance(unresolved, list) or any(not isinstance(item, str) for item in unresolved):
         raise ValueError('Unresolved gaps must be a list of strings')

@@ -420,7 +420,11 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
     if not title_inlines:
         title_inlines = [{"t": "Str", "c": "Research report"}]
     abstract: list[dict] = []
-    for index, block in enumerate(blocks):
+    # Only the built-in layout owns the historical abstract projection. A
+    # supplied template may omit or conditionally suppress $abstract$; moving
+    # authored sections into its metadata would silently lose content. Keep
+    # its complete body rather than guessing document roles from headings.
+    for index, block in enumerate(blocks if not template_files else []):
         if block.get("t") == "Header" and _plain_inlines(block["c"][2]).lower() in {
             "abstract", "abstract / executive summary", "summary", "executive summary",
         }:

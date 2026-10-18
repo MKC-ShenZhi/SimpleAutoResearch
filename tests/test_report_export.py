@@ -492,6 +492,41 @@ class ReportExportTests(unittest.TestCase):
         (report / "references.bib").write_text("@misc{p1, title={Evidence}}\n", encoding="utf-8")
         return report
 
+    def test_supplied_templates_preserve_body_without_inferred_abstract_roles(self):
+        # Template variables are presentation, not proof that authored text
+        # will be rendered. Do not move a section out of the body by its name.
+        for heading, abstract_slot in (('Abstract', False), ('Summary', True), ('Executive summary', False)):
+            with self.subTest(heading=heading, abstract_slot=abstract_slot), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = self._source(root)
+                document = _ast()
+                document['blocks'][1]['c'][2] = [{'t': 'Str', 'c': heading}]
+                document['blocks'].extend([
+                    {'t': 'Header', 'c': [3, ['', [], []], [{'t': 'Str', 'c': 'Summary'}]]},
+                    {'t': 'Para', 'c': [{'t': 'Str', 'c': 'Nested discussion is still body content.'}]}])
+                template = source / 'layout.latex'
+                template.write_text('\\documentclass{article}\n'
+                    '$for(header-includes)$\n$header-includes$\n$endfor$\n\\begin{document}\n'
+                    + ('$if(abstract)$$abstract$$endif$\n' if abstract_slot else '')
+                    + '$body$\n\\end{document}\n', encoding='utf-8')
+                converted = []
+                def convert(argv, **kwargs):
+                    if '--to=json' in argv:
+                        return json.dumps(document)
+                    current = json.loads(kwargs['text'])
+                    converted.append(current)
+                    return (_standalone_fixture(current, kwargs['cwd']) if '--standalone' in argv
+                            else json.dumps(current['blocks']))
+                with patch('simple_ar.report.export.shutil.which', return_value='pandoc'), \
+                        patch('simple_ar.report.export._run', side_effect=convert):
+                    result = export_acm_report(source, root / 'export', template={'path': template.name})
+                self.assertEqual(result['status'], 'exported')
+                self.assertEqual(converted[1]['blocks'][0]['c'][2], [{'t': 'Str', 'c': heading}])
+                self.assertIn('A bounded finding.', (root / 'export/body.tex').read_text())
+                self.assertIn('Nested discussion is still body content.', (root / 'export/body.tex').read_text())
+                self.assertNotIn('abstract', converted[-1]['meta'])
+                self.assertEqual(json.loads((root / 'export/source.md').read_text()), document['blocks'])
+
     def test_export_preserves_canonical_sources_and_separates_abstract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
