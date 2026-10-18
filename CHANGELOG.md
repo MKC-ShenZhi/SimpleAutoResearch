@@ -15,6 +15,7 @@ User-visible changes, newest first. Entries describe behavior on their date; lat
 - Explicit native acquisitions can select the existing page-extraction backend without overriding caller-frozen policies or silently retrying. Keep actual fetch diagnostics and byte-pinned observed source passages available under the shared context budget; historical receipts remain unchanged. This is not a claim of validated quality or efficiency gains.
 - File and delivery paths share a workspace-relative default while preserving explicit source aliases, root boundaries, read-only inputs and version checks. A bare output filename no longer prevents otherwise valid write-and-deliver actions.
 - Explicit native text-connection switches record pinned destinations and intent in the original journal without replaying work, changing accounting or invalidating saved delivery; pending operations retain their recovery contract.
+- Explicit access and contract grants share resource authorization's treatment of locally closed, bounded model charges. Historical unknown usage stays unchanged; live/reserved operations, unknown side effects and unrecognized charges still block grants. No request is retried or automatically authorized.
 
 - List and select existing native tasks by directory/name without a second registry; continue feedback through the saved task owner.
 - Export annotated native task TOML for review, with explicit CLI overrides and effective cumulative process limits. Resume commands use the actual session path.

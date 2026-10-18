@@ -827,9 +827,7 @@ class ToolApplication:
                         or any(previous.get(key) != value for key, value in terms.items())):
                     raise ValueError('Supply id already exists with different terms')
                 return previous
-            if any(row.status == 'running' for row in self.session.list_attempts()) or any(
-                    row.status in {'reserved', 'unknown'} for row in self.ledger.entries):
-                raise ValueError('Reconcile running, reserved or unknown operations before supplying contracts')
+            self._check_authorization_operations()
             pending = self.state['pending']
             if pending and (pending['kind'] == 'model' or any(
                     row.attempt_id == pending['attempt'] for row in self.session.list_attempts())):
@@ -2232,8 +2230,7 @@ class ToolApplication:
         """Explicit caller grants within the existing task, never inferred intent."""
         if not (sources or execution or network or vision):
             return ''
-        if any(entry.status in {'reserved', 'unknown'} for entry in self.ledger.entries):
-            raise ValueError('Reconcile pending or unknown operations before changing authorization')
+        self._check_authorization_operations()
         pending = self.state['pending']
         if pending and (pending['kind'] == 'model' or any(
                 row.attempt_id == pending['attempt'] for row in self.session.list_attempts())):
@@ -2267,16 +2264,12 @@ class ToolApplication:
         self._configure_tools()
         return 'User explicitly authorized additional access: ' + '; '.join(changes) + '. Saved budgets are unchanged; individual process commands still need approval.'
 
-    def _authorize_resources(self, allowances: dict[str, int | float],
-                             authorization_id: str, reason: str, *,
-                             model_binding: dict[str, Any] | None = None, persist: bool = True) -> None:
-        if not allowances:
-            if authorization_id or reason:
-                raise ValueError('Resource authorization requires an explicit remaining allowance')
-            return
-        requests = allowances.get('llm_requests', 0)
-        if 'llm_requests' in allowances and (type(requests) is not int or requests <= 0):
-            raise ValueError('llm_requests allowance must be a positive integer')
+    def _check_authorization_operations(self) -> None:
+        """Closed bounded model charges are history, not an in-flight action.
+
+        Access and contract grants share the existing resource-grant boundary;
+        none reconciles unknown charges or permits replay of an old operation.
+        """
         attempts = {attempt.attempt_id: attempt for attempt in self.session.list_attempts()}
         if any(attempt.status == 'running' for attempt in attempts.values()):
             raise ValueError('Reconcile in-flight or unknown operations before authorizing resources')
@@ -2296,6 +2289,17 @@ class ToolApplication:
                     or attempt is None or attempt.status not in {'completed', 'failed'}
                     or attempt.capability not in {'native_turn', 'native_tool'}):
                 raise ValueError('Reconcile in-flight or unknown operations before authorizing resources')
+    def _authorize_resources(self, allowances: dict[str, int | float],
+                             authorization_id: str, reason: str, *,
+                             model_binding: dict[str, Any] | None = None, persist: bool = True) -> None:
+        if not allowances:
+            if authorization_id or reason:
+                raise ValueError('Resource authorization requires an explicit remaining allowance')
+            return
+        requests = allowances.get('llm_requests', 0)
+        if 'llm_requests' in allowances and (type(requests) is not int or requests <= 0):
+            raise ValueError('llm_requests allowance must be a positive integer')
+        self._check_authorization_operations()
         if self.state['config']['model'] is not None:
             self._client()  # Resource authorization cannot change model identity.
         elif not model_binding and set(allowances) & {'llm_requests', 'total_tokens', 'image_requests'}:

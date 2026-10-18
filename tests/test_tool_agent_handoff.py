@@ -2044,6 +2044,32 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertIsNone(restored.state['config']['report_evidence_contract'])
         self.assertEqual(restored._execution_evidence()['measurement_refs'], [measurement_ref])
 
+    def test_closed_bounded_model_charges_do_not_freeze_explicit_access_grants(self):
+        for boundary in ('run', 'supply'):
+            with self.subTest(boundary=boundary), self._model_rebinding_fixture(outcome='ongoing') as (app, provider, _):
+                self.assertFalse(app.state['config'].get('allow_network', False))
+                identity = Path(app.state['turns'][-1]['reply']).parent.name
+                self.assertIsNotNone(app._accepted_model_attempt(identity))
+                app.ledger.reserve('historical-provider-uncertainty', {'llm_requests': 1, 'total_tokens': 100},
+                    session_id=app.session.manifest.session_id, attempt_id=identity,
+                    logical_call_id=identity, purpose='native-turn')
+                app.ledger.mark_unknown('historical-provider-uncertainty', reason='Retained historical charge',
+                    known_actual={'llm_requests': 1}, retain_reservation=True)
+                before = app.ledger.to_dict()
+                turns = json.loads(json.dumps(app.state['turns']))
+                receipts = self._native_receipts(app, turns)
+                if boundary == 'supply':
+                    app.supply(supply_id='additional-access', reason='Inspect additional public sources',
+                        changes={'allow_network': True})
+                else:
+                    app.run(allow_network=True, actions=[{'tool_name': 'ask_user',
+                        'arguments': {'question': 'Access changed; await the next user request'}}], progress=lambda _: None)
+                self.assertTrue(app.state['config']['allow_network'])
+                self.assertEqual(app.ledger.to_dict(), before)
+                self.assertEqual(app.state['turns'][:len(turns)], turns)
+                self.assertEqual(self._native_receipts(app, turns), receipts)
+                provider.assert_not_called()
+
     def test_supply_upgrades_material_report_contract_without_accepting_old_composition(self):
         from simple_ar.tools.writing import freeze_report_requirement
 
