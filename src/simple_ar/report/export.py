@@ -17,6 +17,25 @@ class ReportExportError(ValueError):
     pass
 
 
+class ReportExportResourceError(ReportExportError):
+    """Resource owner refused further dispatch; do not attempt later checks."""
+
+
+def validate_publication_checks(checks: dict[str, Any]) -> None:
+    """Bound user literals only; no policy discovery, regex or inferred identity."""
+    if not isinstance(checks, dict) or not checks or set(checks) - {'max_pages', 'forbidden_identifiers'}:
+        raise ReportExportError('checks requires max_pages and/or forbidden_identifiers')
+    if 'max_pages' in checks and (type(checks['max_pages']) is not int or checks['max_pages'] < 1):
+        raise ReportExportError('max_pages must be a positive integer')
+    if 'forbidden_identifiers' in checks:
+        items = checks['forbidden_identifiers']
+        if (not isinstance(items, list) or not 1 <= len(items) <= 32
+                or any(not isinstance(item, str) or not item.strip() or len(item) > 200
+                       or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in item) for item in items)
+                or len(set(items)) != len(items)):
+            raise ReportExportError('forbidden_identifiers requires 1 to 32 unique nonblank literals, at most 200 characters each, without control characters')
+
+
 def publication_template_inputs(root: Path, template: dict[str, Any]) -> dict[str, Path]:
     """Explicit, flat trusted-TeX bundle; no discovery, downloads or scripts.
 
@@ -335,7 +354,8 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
                       compile_pdf: bool = False, render_preview: bool = False, body_name: str = "report_body.md",
                       runner: Callable | None = None, validate_asset: Callable[[Path], str | None] | None = None,
                       caption_owner: Literal['manifest', 'markdown'] = 'manifest',
-                      template: dict[str, Any] | None = None) -> dict[str, Any]:
+                      template: dict[str, Any] | None = None,
+                      checks: dict[str, Any] | None = None) -> dict[str, Any]:
     """Compatibility entry point for the shared Pandoc publication converter.
 
     Pandoc and optional TeX/librsvg are external rendering dependencies. No
@@ -349,6 +369,10 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
         raise ReportExportError('Unknown figure caption owner')
     if render_preview and not compile_pdf:
         raise ReportExportError("render_preview requires compile_pdf=true")
+    if checks is not None:
+        validate_publication_checks(checks)
+        if not compile_pdf:
+            raise ReportExportError('checks requires compile_pdf=true')
     if Path(body_name).name != body_name:
         raise ReportExportError("Report body must be a filename inside the report directory")
     body_path = root / body_name
@@ -433,6 +457,10 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
     if render_preview:
         manifest['pdf_preview'] = {'rendered': False, 'visual_reviewed': False,
             'max_pages': 12, 'dpi': 120, 'max_dimension_px': 1600, 'pages': []}
+    if checks is not None:
+        manifest['checks'] = {'rules': deepcopy(checks), 'status': 'blocked',
+            'scope': 'User-declared rules only; no official certification. Literal absence does not establish anonymity. Images, metadata and indirect identity are not covered.',
+            'results': {key: {'status': 'blocked', 'error': 'No compiled PDF checked'} for key in checks}}
     try:
         if template_files:
             manifest['format'] = 'pandoc-latex-template'
@@ -631,6 +659,12 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
         if compile_pdf:
             manifest.update(_compile(output, bool(citations), runner=runner,
                 **({'engine': template.get('engine', 'pdflatex')} if template_files else {})))
+        if checks is not None:
+            if manifest['compiled']:
+                _check_publication_pdf(output, manifest['checks'], runner=run)
+            if manifest['checks']['status'] != 'passed':
+                manifest['status'] = 'checks_failed'
+                manifest['error'] = 'Declared publication checks did not pass; inspect checks.results. Editable project retained; no automatic revision or recompilation.'
         if render_preview:
             if not manifest['compiled']:
                 raise ReportExportError(manifest.get('compile_note') or "PDF compilation did not produce a PDF; requested preview unavailable")
@@ -641,6 +675,69 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
     finally:
         (output / "export.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     return manifest
+
+
+def _check_publication_pdf(output: Path, receipt: dict[str, Any], *, runner: Callable) -> None:
+    """Independent observations through the existing runner and process owner."""
+    pdf = output / 'main.pdf'
+    results = receipt['results']
+    try:
+        if pdf.is_symlink() or not pdf.is_file() or not 0 < pdf.stat().st_size <= 32_000_000:
+            raise ReportExportError('Checks require a nonempty PDF no larger than 32 MB')
+        digest = hashlib.sha256(pdf.read_bytes()).hexdigest()
+    except OSError as exc:
+        for row in results.values():
+            row.update(status='blocked', error=str(exc))
+        return
+    except ReportExportError as exc:
+        for row in results.values():
+            row.update(status='blocked', error=str(exc))
+        return
+    receipt['pdf_sha256'] = digest
+    evidence = output / 'checks'
+    evidence.mkdir()
+    for rule, row in results.items():
+        try:
+            executable = shutil.which('pdfinfo' if rule == 'max_pages' else 'pdftotext')
+            if not executable:
+                raise ReportExportError('Required Poppler tool unavailable: ' + ('pdfinfo' if rule == 'max_pages' else 'pdftotext'))
+            argv = ([executable, str(pdf)] if rule == 'max_pages' else
+                    [executable, '-enc', 'UTF-8', str(pdf), '-'])
+            text = runner(argv, cwd=output, timeout=30, env={'LC_ALL': 'C'})
+            raw = text.encode('utf-8', errors='strict')
+            if len(raw) > (64_000 if rule == 'max_pages' else 1_000_000) or '\ufffd' in text:
+                raise ReportExportError('Poppler output exceeds check bound or contains replacement characters; no complete check')
+            path = evidence / ('pdfinfo.txt' if rule == 'max_pages' else 'text.txt')
+            path.write_bytes(raw)
+            row.clear()
+            row.update(evidence=path.relative_to(output).as_posix(),
+                evidence_sha256=hashlib.sha256(raw).hexdigest())
+            if rule == 'max_pages':
+                counts = re.findall(r'^Pages:\s*([0-9]+)\s*$', text, re.M)
+                if len(counts) != 1 or int(counts[0]) < 1:
+                    raise ReportExportError('Poppler did not report one positive PDF page count')
+                count = int(counts[0])
+                row.update(status='passed' if count <= receipt['rules'][rule] else 'failed',
+                    page_count=count, max_pages=receipt['rules'][rule], scope='All PDF pages, including references and appendices')
+            else:
+                if not text.strip():
+                    raise ReportExportError('PDF has no extractable text; literal check unavailable')
+                matches = [{'literal': literal, 'count': text.count(literal)}
+                           for literal in receipt['rules'][rule] if literal in text]
+                row.update(status='failed' if matches else 'passed', matches=matches,
+                    matching='Case-sensitive exact Unicode substrings; no normalization, regex, whitespace joining or OCR',
+                    scope='Extracted text only; absence does not establish anonymity. Images, metadata and indirect identity are not covered.')
+        except ReportExportResourceError as exc:
+            row.update(status='blocked', error=str(exc))
+            raise
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            row.update(status='blocked', error=str(exc))
+    # Pin both observations to the same visible PDF, including failed rules.
+    if hashlib.sha256(pdf.read_bytes()).hexdigest() != digest:
+        for row in results.values():
+            row.update(status='blocked', error='PDF changed during checks; observations cannot be combined')
+    receipt['status'] = ('passed' if all(row['status'] == 'passed' for row in results.values())
+                         else 'blocked' if any(row['status'] == 'blocked' for row in results.values()) else 'failed')
 
 
 def _render_pdf_preview(output: Path, *, runner: Callable) -> dict[str, Any]:

@@ -6,7 +6,7 @@ User-visible changes, newest first. Entries describe behavior on their date; lat
 
 ## Unreleased — V2.10
 
-- Support explicit trusted Pandoc LaTeX templates through the existing publication owner, with byte-bound companions and declared heading hierarchy. Share figure bounds and wrapping tables across layouts; keep ACM/history defaults and report unchecked compliance honestly.
+- Support trusted Pandoc LaTeX templates with byte-bound companions and declared heading hierarchy. Optional user page/literal rules bind actual PDF/text evidence and gate delivery; absence of a name is not anonymity certification. Share figure/table layout support and preserve ACM/history defaults.
 - Add an experimental loopback workspace client over the native task owner: explicit sources/connections/caps, Unicode task navigation, receipt-derived activity, bounded source previews, in-page confirmations, feedback and boundary stops. No separate scheduler or ledger; full live-task acceptance remains pending.
 - Truncated native replies retain safe character/token counts for diagnosis without exposing partial text, executing partial arguments or automatically retrying. Historical failures are not reclassified.
 - Explicit native acquisitions can select the existing page-extraction backend without overriding caller-frozen policies or silently retrying. Keep actual fetch diagnostics and byte-pinned observed source passages available under the shared context budget; historical receipts remain unchanged. This is not a claim of validated quality or efficiency gains.

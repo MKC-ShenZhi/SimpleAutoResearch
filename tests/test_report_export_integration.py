@@ -31,9 +31,9 @@ class PortableExportIntegrationTests(unittest.TestCase):
         # Both required layouts use the baseline pdfLaTeX toolchain, including
         # the current Greek/Latin helper. Optional XeLaTeX never gates them.
         layouts = [
-            ('article', 'pdflatex', None, '\\documentclass{article}\n',
+            ('article', 'pdflatex', None, '\\documentclass{article}\n\\usepackage[T1]{fontenc}\n',
              '\\maketitle\n\\begin{abstract}$abstract$\\end{abstract}\n'),
-            ('titlepage', 'pdflatex', 'chapter', '\\documentclass{report}\n',
+            ('titlepage', 'pdflatex', 'chapter', '\\documentclass{report}\n\\usepackage[T1]{fontenc}\n',
              '\\begin{titlepage}\\centering\\Huge $title$\\end{titlepage}\n'
              '\\chapter*{Summary}$abstract$\n'),
         ]
@@ -118,11 +118,18 @@ class PortableExportIntegrationTests(unittest.TestCase):
                     return rendered
 
                 result = export_acm_report(source, output, template=options,
-                    compile_pdf=True, render_preview=True, caption_owner='markdown', runner=render)
+                    compile_pdf=True, render_preview=True, caption_owner='markdown', runner=render,
+                    checks={'max_pages': 12, 'forbidden_identifiers': ['Résumé', 'Unlisted Person']})
                 self.assertTrue(result['compiled'], result)
                 self.assertTrue(result['pdf_preview']['rendered'], result)
                 self.assertFalse(result['quality_checked'])
                 self.assertEqual(result['compliance']['anonymity'], 'unverified')
+                self.assertEqual(result['status'], 'checks_failed')
+                checked = result['checks']['results']
+                self.assertEqual(checked['max_pages']['status'], 'passed')
+                self.assertEqual(checked['forbidden_identifiers']['status'], 'failed')
+                self.assertTrue(any(row['literal'] == 'Résumé' for row in checked['forbidden_identifiers']['matches']))
+                self.assertIn('Résumé', (output / checked['forbidden_identifiers']['evidence']).read_text(encoding='utf-8'))
                 self.assertFalse(any('undefined citation' in warning.lower() or 'Missing character:' in warning
                     for warning in result['compile_warnings']), result)
                 # Keep TeX warnings for independent layout review. A slight
@@ -132,6 +139,7 @@ class PortableExportIntegrationTests(unittest.TestCase):
                 bbox = subprocess.check_output(['pdftotext', '-bbox', str(output / 'main.pdf'), '-'], text=True)
                 pages = list(ET.fromstring(bbox).iter('{http://www.w3.org/1999/xhtml}page'))
                 self.assertTrue(pages)
+                self.assertEqual(checked['max_pages']['page_count'], len(pages))
                 self.assertTrue(any(list(page.iter('{http://www.w3.org/1999/xhtml}word')) for page in pages))
                 for page in pages:
                     width, height = float(page.attrib['width']), float(page.attrib['height'])

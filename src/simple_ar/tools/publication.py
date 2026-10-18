@@ -12,7 +12,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from simple_ar.core.budget import BudgetError
 from simple_ar.core.capabilities import ArtifactStore
 from simple_ar.core.process import ProcessSpec, run_process
-from simple_ar.report.export import ReportExportError, export_acm_report, publication_template_inputs
+from simple_ar.report.export import (ReportExportError, ReportExportResourceError, export_acm_report,
+    publication_template_inputs, validate_publication_checks)
 from simple_ar.tools.specs import CommonToolSpec, ToolResult
 from simple_ar.tools.workspace import DeliveryRequest, resolve_mounted_path
 
@@ -30,11 +31,26 @@ class PublicationTemplate(BaseModel):
         description='Optional Pandoc body heading level required by the supplied layout, e.g. chapter for a report/book template. No class-name inference or scientific restructuring. Omit to retain the historical section-based body.')
 
 
+class PublicationChecks(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    max_pages: int | None = Field(default=None, gt=0,
+        description='User-declared maximum for all PDF pages, including references and appendices; not an inferred venue policy.')
+    forbidden_identifiers: list[str] | None = Field(default=None, min_length=1, max_length=32,
+        description='User-supplied exact case-sensitive Unicode literals, 1–32 unique nonblank strings of at most 200 characters without controls. Checks extracted text only; no regex, OCR or anonymity certification.')
+
+    @model_validator(mode='after')
+    def validate_rules(self) -> PublicationChecks:
+        validate_publication_checks(self.model_dump(exclude_none=True))
+        return self
+
+
 class ExportRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     markdown: str = Field(description="Workspace Markdown file; local figures and references.bib use its directory.")
     title: str = Field(default="", max_length=500)
     compile_pdf: bool = True
+    checks: PublicationChecks | None = Field(default=None, exclude_if=lambda value: value is None,
+        description='Optional finite rules explicitly supplied by the user. Requires compile_pdf=true and installed Poppler tools. Missing tools, bounded-output failure or rule failure retain diagnostics and prevent final delivery. No automatic edits or recompile; absence of literals never certifies anonymity.')
     template: PublicationTemplate | None = Field(default=None,
         description='Explicit user-provided trusted template bundle. Omit for the historical ACM manuscript layout. Compilation does not establish anonymous/page/official compliance.')
     render_preview: bool = Field(default=False, exclude_if=lambda value: value is False,
@@ -46,13 +62,15 @@ class ExportRequest(BaseModel):
     def validate_preview(self) -> ExportRequest:
         if self.render_preview and not self.compile_pdf:
             raise ValueError("render_preview requires compile_pdf=true")
+        if self.checks is not None and not self.compile_pdf:
+            raise ValueError('checks requires compile_pdf=true')
         return self
 
 
 def publication_tool_specs() -> list[CommonToolSpec]:
     return [CommonToolSpec(name="export_report", domain="publication", permission_level="execution",
         risk_level="medium", input_schema=ExportRequest.model_json_schema(),
-        description="Convert canonical workspace Markdown, bibliography and local figures into an editable TeX project using an explicit trusted Pandoc LaTeX template bundle, or ACM by default. Template bytes and companions share existing approval/recovery bindings. No official template discovery, scripts or shell escape; trusted TeX is not sandboxed. Optionally compile and request bounded previews of every PDF page using the same process ledger. Rendering is not scientific, visual, anonymous or official compliance review. Optional explicit delivery ends the task after successful requested export; incomplete preview never delivers.")]
+        description="Convert canonical workspace Markdown, bibliography and local figures into an editable TeX project using an explicit trusted Pandoc LaTeX template bundle, or ACM by default. Template bytes and companions share existing approval/recovery bindings. No official template discovery, scripts or shell escape; trusted TeX is not sandboxed. Optional finite user-declared checks use Poppler through the same process ledger: all-page count and exact literals in UTF-8 extracted text, separately reported. Literal absence never certifies anonymity; images, metadata and indirect identity are uncovered. Rendering is not scientific, visual or official compliance review. Optional delivery requires every requested check and preview to pass; failure retains the project without revision or recompilation.")]
 
 
 def export_input_binding(source: Path, request: ExportRequest, *, output_root: Path | None = None,
@@ -187,7 +205,7 @@ class PublicationToolGateway:
                             env=environment, output_dir=logs, invocation_id=process_id,
                             attempt_id=identity, tail_bytes=12000, log_bytes=2000000), budget_ledger=self.ledger)
                     except BudgetError as exc:
-                        raise ReportExportError(f"Rendering budget unavailable; inspect tools/processes/{process_id}: {exc}") from exc
+                        raise ReportExportResourceError(f"Rendering budget unavailable; inspect tools/processes/{process_id}: {exc}") from exc
                     if result.returncode or result.stop_reason or any(
                             stream["log_bytes_discarded"] for stream in result.record["streams"].values()):
                         raise ReportExportError(f"Renderer failed or output truncated; inspect tools/processes/{process_id}")
@@ -206,6 +224,7 @@ class PublicationToolGateway:
                     manifest = export_acm_report(source.parent, output, title=request.title or None,
                         body_name=source.name, compile_pdf=request.compile_pdf, render_preview=request.render_preview, runner=render,
                         validate_asset=validate_asset, caption_owner='markdown',
+                        **({'checks': request.checks.model_dump(exclude_none=True)} if request.checks is not None else {}),
                         **({'template': request.template.model_dump()} if request.template is not None else {}))
                 except ReportExportError:
                     if not (output / 'export.json').is_file():
@@ -216,10 +235,12 @@ class PublicationToolGateway:
             artifacts = [f"{prefix}/{file}" for file in ("main.tex", "body.tex", "references.bib", "source.md", "export.json", "main.pdf")
                          if (output / file).is_file()]
             completed = manifest['status'] in {'exported', 'compiled'}
+            if request.checks is not None:
+                completed = completed and manifest.get('compiled') is True and manifest.get('checks', {}).get('status') == 'passed'
             if request.render_preview:
                 completed = completed and manifest.get('compiled') is True and manifest.get('pdf_preview', {}).get('rendered') is True
             hashes = None
-            if completed or (saved is not None and owner.exists('result.json')):
+            if completed or request.checks is not None or (saved is not None and owner.exists('result.json')):
                 if saved is not None and not owner.exists('result.json'):
                     if output_binding_version is not None:
                         raise ValueError('Interrupted publication has no successful output byte binding; inspect retained files and process receipts, do not replay')
@@ -239,6 +260,13 @@ class PublicationToolGateway:
                     if not retained or retained != hashes:
                         raise ValueError('Publication project files changed or are missing; saved rendering applies only to the original byte-bound version, not this project. Preserve both versions; no replay')
                 else:
+                    if request.checks is not None:
+                        receipt = manifest.get('checks', {})
+                        observed = {f'{prefix}/main.pdf': receipt.get('pdf_sha256')}
+                        observed.update({f"{prefix}/{row['evidence']}": row['evidence_sha256']
+                            for row in receipt.get('results', {}).values() if 'evidence_sha256' in row})
+                        if any(digest is not None and hashes.get(path) != digest for path, digest in observed.items()):
+                            raise ValueError('Publication PDF/check evidence changed after observation; retain files and process receipts, no delivery or replay')
                     owner.write_json('result.json', {'artifact_sha256': hashes})
             preview_images = [f"{prefix}/{path}" for path in manifest.get('pdf_preview', {}).get('pages', [])]
             delivery = None
@@ -248,14 +276,16 @@ class PublicationToolGateway:
                 delivery = self.workspace.resolve_delivery(request.delivery.model_copy(update={
                     'artifacts': [*request.delivery.artifacts, *artifacts]}))
             return ToolResult(tool_name=name, status="ok" if completed else "error",
-                error='' if completed else str(manifest.get('compile_note') or manifest.get('error') or 'Publication did not complete; inspect the retained manifest'),
+                error='' if completed else str((manifest.get('error') if request.checks is not None else None)
+                    or manifest.get('compile_note') or manifest.get('error') or 'Publication did not complete; inspect the retained manifest'),
                 data={"manifest": manifest, "project": prefix, "artifacts": artifacts,
                     **({'artifact_sha256': hashes, 'output_integrity': 'byte_bound'} if hashes is not None else {}),
                     **({'delivery': delivery} if delivery is not None else {}),
                     **({'preview_images': preview_images,
                         'preview_scope': 'All PDF pages rendered; visual quality not reviewed. Pass these locators to inspect_images in groups of at most four if review is needed.'}
                        if request.render_preview and completed else {}),
-                    "scope": "Rendering only; scientific and visual quality need independent inspection"}, artifacts=artifacts)
+                    "scope": (manifest['checks']['scope'] if request.checks is not None and 'checks' in manifest
+                              else "Rendering only; scientific and visual quality need independent inspection")}, artifacts=artifacts)
         except Exception as exc:
             return ToolResult(tool_name=name, status="error",
                 error=f"Publication unavailable ({type(exc).__name__}: {exc}); inspect saved export/process records. Source and failed version retained; no blind replay.")

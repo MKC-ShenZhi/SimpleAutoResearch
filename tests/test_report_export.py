@@ -43,7 +43,7 @@ def _standalone_fixture(document: dict, output: Path) -> str:
 class ReportExportTests(unittest.TestCase):
     def test_explicit_template_uses_bound_publication_owner_and_retains_failed_versions(self):
         from types import SimpleNamespace
-        from simple_ar.core.budget import BudgetLedger
+        from simple_ar.core.budget import BudgetLedger, BudgetUnknownError
         from simple_ar.tools.workspace import WorkspaceToolGateway
         from simple_ar.tools.publication import ExportRequest, PublicationToolGateway, export_input_binding
 
@@ -71,15 +71,29 @@ class ReportExportTests(unittest.TestCase):
             self.assertIn('layout/article.latex', approved['inputs'])
             self.assertIn('layout/local.bst', approved['inputs'])
             self.assertNotIn('template', export_input_binding(source, ExportRequest(markdown=arguments['markdown'])))
+            self.assertNotIn('checks', ExportRequest(markdown=arguments['markdown']).model_dump())
+            self.assertNotIn('checks', approved)
             gateway = PublicationToolGateway(root, workspace, ledger)
             standalone = []
             failure = False
+            check_mode = 'pass'
 
             def render(spec, **kwargs):
                 self.assertIs(kwargs['budget_ledger'], ledger)
                 self.assertNotIn('OPENAI_API_KEY', spec.env)
                 spec.output_dir.mkdir(parents=True, exist_ok=True)
-                if '--to=json' in spec.argv:
+                if spec.argv[0] in {'xelatex', 'bibtex'}:
+                    (spec.cwd / 'main.pdf').write_bytes(b'%PDF-check-fixture')
+                    text = 'Compiler fixture'
+                elif spec.argv[0] == 'pdfinfo':
+                    self.assertEqual(spec.env['LC_ALL'], 'C')
+                    if check_mode == 'budget':
+                        raise BudgetUnknownError('Retained unknown process usage')
+                    text = 'Pages: 13\n' if check_mode == 'long' else 'Pages: 2\n'
+                elif spec.argv[0] == 'pdftotext':
+                    self.assertIn('UTF-8', spec.argv)
+                    text = 'Visible résumé 张三' if check_mode == 'hit' else 'Visible résumé only'
+                elif '--to=json' in spec.argv:
                     text = json.dumps(_ast())
                 else:
                     document = json.loads(Path(spec.argv[-1]).read_text(encoding='utf-8'))
@@ -93,7 +107,7 @@ class ReportExportTests(unittest.TestCase):
                 return SimpleNamespace(returncode=int(failure and '--standalone' in spec.argv), stop_reason=None,
                     record={'streams': {'stdout': {'log_bytes_discarded': 0}}})
 
-            with patch('simple_ar.report.export.shutil.which', return_value='pandoc'), \
+            with patch('simple_ar.report.export.shutil.which', side_effect=lambda name: name), \
                     patch('simple_ar.tools.publication.run_process', side_effect=render) as processes:
                 result = gateway.call('export_report', arguments, identity='template')
                 self.assertEqual(result.status, 'ok', result.error)
@@ -130,11 +144,77 @@ class ReportExportTests(unittest.TestCase):
                 self.assertEqual(gateway.call('export_report', arguments, identity='failed-template').status, 'error')
                 self.assertEqual(processes.call_count, count)
                 self.assertTrue((root / 'tools/processes/failed-template-render-1/stdout.log').is_file())
+                failure = False
+                checked = {**arguments, 'compile_pdf': True,
+                    'checks': {'max_pages': 4, 'forbidden_identifiers': ['张三', 'A.*literal']},
+                    'delivery': {'summary': 'Finite user rules checked', 'artifacts': []}}
+                checked_request = ExportRequest.model_validate(checked)
+                self.assertEqual(export_input_binding(source, checked_request)['checks'], checked['checks'])
+                for mode in ('pass', 'hit', 'long', 'missing'):
+                    check_mode = mode
+                    identity = 'checked-' + mode
+                    with patch('simple_ar.report.export.shutil.which',
+                            side_effect=lambda name: None if mode == 'missing' and name == 'pdftotext' else name):
+                        outcome = gateway.call('export_report', checked, identity=identity)
+                    self.assertEqual(outcome.status, 'ok' if mode == 'pass' else 'error', outcome.error)
+                    self.assertEqual('delivery' in outcome.data, mode == 'pass')
+                    receipt = outcome.data['manifest']['checks']
+                    rows = receipt['results']
+                    self.assertEqual(rows['max_pages']['status'], 'failed' if mode == 'long' else 'passed')
+                    self.assertEqual(rows['forbidden_identifiers']['status'],
+                        'failed' if mode == 'hit' else 'blocked' if mode == 'missing' else 'passed')
+                    self.assertIn('pdf_sha256', receipt)
+                    if mode == 'hit':
+                        self.assertEqual(rows['forbidden_identifiers']['matches'], [{'literal': '张三', 'count': 1}])
+                    self.assertEqual(outcome.data['output_integrity'], 'byte_bound')
+                    count = processes.call_count
+                    self.assertEqual(gateway.call('export_report', checked, identity=identity).data, outcome.data)
+                    self.assertEqual(processes.call_count, count)
+                    # A newly reconstructed owner reads the same failed/successful
+                    # bytes, without rerunning Poppler or inventing past checks.
+                    restored = PublicationToolGateway(root, workspace, ledger)
+                    self.assertEqual(restored.call('export_report', checked, identity=identity).data, outcome.data)
+                    self.assertEqual(processes.call_count, count)
+                    project = workspace.workspace / 'publications' / identity
+                    original_pdf = (project / 'main.pdf').read_bytes()
+                    (project / 'main.pdf').write_bytes(original_pdf + b'changed')
+                    self.assertIn('project files changed', restored.call('export_report', checked, identity=identity).error)
+                    self.assertEqual(processes.call_count, count)
+                check_mode = 'budget'
+                count = processes.call_count
+                stopped = gateway.call('export_report', {**checked, 'render_preview': True},
+                    identity='checked-budget')
+                self.assertEqual(stopped.status, 'error')
+                self.assertNotIn('delivery', stopped.data)
+                dispatched = [call.args[0].argv[0] for call in processes.call_args_list[count:]]
+                self.assertEqual(dispatched[-1], 'pdfinfo')
+                self.assertNotIn('pdftotext', dispatched)
+                self.assertNotIn('pdftoppm', dispatched)
+                self.assertEqual(stopped.data['manifest']['checks']['results']['max_pages']['status'], 'blocked')
+                count = processes.call_count
+                self.assertEqual(gateway.call('export_report', {**checked, 'render_preview': True},
+                    identity='checked-budget').data, stopped.data)
+                self.assertEqual(processes.call_count, count)
+                self.assertNotIn('checks', result.data['manifest'])
+                count = processes.call_count
+                retroactive = gateway.call('export_report', checked, identity='template')
+                self.assertIn('inputs changed', retroactive.error)
+                self.assertEqual(processes.call_count, count)
             self.assertEqual(source.read_text(encoding='utf-8'), '# Résumé α\n\nBody [@p1].\n')
 
     def test_template_scope_partials_missing_companions_and_engine_fail_before_processes(self):
         from simple_ar.report.export import publication_template_inputs
         from simple_ar.tools.publication import ExportRequest, export_input_binding
+
+        for checks in ({}, {'max_pages': 0}, {'max_pages': True}, {'max_pages': 1.5},
+                {'forbidden_identifiers': []}, {'forbidden_identifiers': [' ']},
+                {'forbidden_identifiers': ['a' * 201]}, {'forbidden_identifiers': ['a'] * 33},
+                {'forbidden_identifiers': ['same', 'same']}, {'forbidden_identifiers': ['line\nbreak']},
+                {'official_policy': True}):
+            with self.subTest(checks=checks), self.assertRaises(ValueError):
+                ExportRequest(markdown='workspace/draft.md', checks=checks)
+        with self.assertRaisesRegex(ValueError, 'checks requires compile_pdf=true'):
+            ExportRequest(markdown='workspace/draft.md', compile_pdf=False, checks={'max_pages': 1})
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -433,6 +513,7 @@ class ReportExportTests(unittest.TestCase):
             self.assertNotIn('pdf_preview', result)  # Default exports keep their historical shape.
             self.assertNotIn('template', result)
             self.assertNotIn('compliance', result)
+            self.assertNotIn('checks', result)
             self.assertTrue(all(document["meta"] == {} for document in calls[:-1]))
             self.assertEqual(set(calls[-1]['meta']), {'title', 'abstract', 'header-includes', 'bibliography', 'biblio-style'})
             body_headers = [block["c"][0] for block in calls[1]["blocks"] if block["t"] == "Header"]
@@ -821,6 +902,36 @@ class ReportExportTests(unittest.TestCase):
                     export_acm_report(source, root / 'acm', render_preview=True)
                 run.assert_not_called()
                 self.assertFalse((root / 'acm').exists())
+                with self.assertRaisesRegex(ReportExportError, 'checks requires compile_pdf=true'):
+                    export_acm_report(source, root / 'acm', checks={'max_pages': 1})
+                run.assert_not_called()
+
+    def test_finite_checks_keep_independent_observations_when_text_is_unavailable(self):
+        from copy import deepcopy
+        from simple_ar.report.export import _check_publication_pdf
+
+        with tempfile.TemporaryDirectory() as tmp:
+            initial = {'status': 'blocked', 'rules': {'max_pages': 2, 'forbidden_identifiers': ['张三']},
+                'results': {'max_pages': {'status': 'blocked'}, 'forbidden_identifiers': {'status': 'blocked'}}}
+            # A few distinct diagnostic boundaries; no template/engine matrix.
+            for mode in ('oversize', 'empty', 'truncated', 'malformed_count'):
+                output = Path(tmp) / mode
+                output.mkdir()
+                (output / 'main.pdf').write_bytes(b'%PDF-observation-fixture')
+                receipt = deepcopy(initial)
+                def render(argv, **kwargs):
+                    if argv[0] == 'pdfinfo':
+                        return 'Pages: 2\nPages: 3\n' if mode == 'malformed_count' else 'Pages: 2\n'
+                    if mode == 'truncated':
+                        raise ReportExportError('Renderer failed or output truncated; inspect process receipt')
+                    return 'x' * 1_000_001 if mode == 'oversize' else '' if mode == 'empty' else 'Unicode 张三'
+                with self.subTest(mode=mode), patch('simple_ar.report.export.shutil.which', side_effect=lambda name: name):
+                    _check_publication_pdf(output, receipt, runner=render)
+                rows = receipt['results']
+                self.assertEqual(receipt['status'], 'blocked')
+                self.assertEqual(rows['max_pages']['status'], 'blocked' if mode == 'malformed_count' else 'passed')
+                self.assertEqual(rows['forbidden_identifiers']['status'], 'failed' if mode == 'malformed_count' else 'blocked')
+                self.assertIn('pdf_sha256', receipt)
 
     def test_exported_markdown_and_figures_move_together_without_external_data(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
