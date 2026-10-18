@@ -164,15 +164,45 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         external.write_text(code + '# new unexecuted entry\n')
         issues = app.implementation.delivery_issues([{**observed, 'current_request': True}])
         self.assertTrue(issues)
+        # A registered candidate is also the feedback base after a run. Runtime
+        # outputs are not editable originals and cannot leak into the next unit.
+        fake.ask_json.return_value = {'summary': 'Change execution entry only',
+            'unresolved': ['Optional CSV input remains unsupported'], 'files': [],
+            'execution_plan': {'argv': ['python', 'calculate.py'], 'outputs': ['result.txt'], 'timeout_sec': 3}}
+        app.implementation.client_factory = lambda _: fake  # Restore the injected professional client after load.
+        app.run(feedback='Keep the source; use its portable entry for the next run', actions=[
+            {'tool_name': 'prepare_implementation', 'arguments': {
+                'goal': 'Change only the execution entry', 'project_path': str(candidate)}},
+            {'tool_name': 'ask_user', 'arguments': {'question': 'Review the new proposal before running'}}],
+            progress=lambda _: None)
+        revised = app.session.store.read_json(app.state['turns'][-1]['tools'][0]['result'])
+        self.assertEqual(revised['status'], 'ok', revised.get('error'))
+        self.assertEqual((Path(revised['data']['project_dir']) / 'calculate.py').read_text(), code)
+        self.assertFalse((Path(revised['data']['project_dir']) / 'result.txt').exists())
+        self.assertEqual(sorted(_writing_prompt(fake)['original_files']), ['calculate.py'])
+        self.assertIsNone(_writing_prompt(fake)['planned_files'])
+        revision_args = {'goal': 'Change only the execution entry', 'project_path': str(candidate)}
+        revision_id = Path(revised['data']['project_dir']).name
+        repeated = app.implementation.call('prepare_implementation', revision_args, identity=revision_id)
+        self.assertEqual(repeated.data, revised['data'])
+        extra = candidate / 'unlisted-source.txt'
+        extra.write_text('A new source requires investigation, not silent omission.\n')
+        try:
+            rejected = app.implementation.call('prepare_implementation', revision_args, identity=revision_id)
+            self.assertEqual(rejected.status, 'error')
+            self.assertIn('no investigation or replay', rejected.error)
+        finally:
+            extra.unlink()
         fake.chat_turn.assert_not_called()
-        self.assertEqual(fake.ask_json.call_count, 1)
+        self.assertEqual(fake.ask_json.call_count, 2)
 
     def test_prepared_execution_failure_supplies_real_diagnosis_and_feedback_version(self) -> None:
-        _, _, fake, _, app, _ = self._native_fixture(process_limits={
+        _, inputs, fake, _, app, _ = self._native_fixture(process_limits={
             'process_invocations': 3, 'process_wall_seconds': 10})
         fake.chat_turn.side_effect = AssertionError('No coordinator decisions')
         app.implementation.client_factory = lambda _: fake
         stop = {'tool_name': 'ask_user', 'arguments': {'question': 'Await explicit continuation'}}
+        (inputs / 'notes.txt').write_text('A material observation, not an instruction.\n' * 300)
         helper = 'def compute():\n    return 6*7\n'
         bad = "from helper import compute\nraise ValueError('observed fixture failure')\n"
         plan = {'argv': ['python', 'worker.py'], 'outputs': ['answer.txt'], 'timeout_sec': 3}
@@ -181,7 +211,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             'execution_plan': plan}
         app.run(actions=[{'tool_name': 'prepare_implementation', 'arguments': {'goal': 'Save a computed answer',
             'files': [{'path': 'worker.py', 'purpose': 'Run computation'},
-                {'path': 'helper.py', 'purpose': 'Required direct runtime dependency'}]}}, stop], progress=lambda _: None)
+                {'path': 'helper.py', 'purpose': 'Required direct runtime dependency'}],
+            'source_windows': [{'path': 'source0/notes.txt', 'full_digest': True}]}}, stop], progress=lambda _: None)
         first = app.session.store.read_json(app.state['turns'][-1]['tools'][0]['result'])
         app.run(actions=[{'tool_name': 'execute_implementation',
             'arguments': {'prepared_result': first['data']['prepared_result']}}, stop],
@@ -193,11 +224,9 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         old_ledger = app.ledger.to_dict()
         good = "from pathlib import Path\nfrom helper import compute\nPath('answer.txt').write_text(str(compute()))\n"
         fake.ask_json.side_effect = [
-            {'files': [{'path': 'worker.py', 'purpose': 'Repair actual failing implementation'},
-                {'path': 'helper.py', 'purpose': 'Preserve necessary runtime dependency'}]},
             {'summary': 'Repair candidate', 'unresolved': [],
                 'files': [{'path': 'worker.py', 'replacements': [{'old_text': bad, 'new_text': good}]},
-                    {'path': 'helper.py', 'replacements': []}],
+                    {'path': 'CHANGE.md', 'content': 'Repair uses the actual saved process diagnostic.\n'}],
                 'execution_plan': plan}]
         app.run(actions=[{'tool_name': 'prepare_implementation', 'arguments': {
             'goal': 'Repair using actual process error, preserve the first candidate',
@@ -206,8 +235,14 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(second['status'], 'ok', second.get('error'))
         prompt = json.loads(fake.ask_json.call_args.args[1])
         self.assertIn('observed fixture failure', json.dumps(prompt['execution_observations']))
+        self.assertIsNone(prompt['planned_files'])
+        self.assertEqual(len(prompt['source_windows']), 1)
+        self.assertEqual(prompt['source_windows'][0]['text'], (inputs / 'notes.txt').read_text())
+        self.assertEqual(fake.ask_json.call_count, 2)  # Initial generation + direct revision; no selection.
+        self.assertFalse((Path(second['data']['source_binding']).parent / 'selection-input.json').exists())
         self.assertEqual((Path(first['data']['project_dir']) / 'worker.py').read_text(), bad)
         self.assertEqual((Path(second['data']['project_dir']) / 'helper.py').read_text(), helper)
+        self.assertTrue((Path(second['data']['project_dir']) / 'CHANGE.md').exists())
         output = str(Path(second['data']['project_dir']) / 'answer.txt')
         app.run(actions=[{'tool_name': 'execute_implementation', 'arguments': {
             'prepared_result': second['data']['prepared_result'],
@@ -9077,6 +9112,21 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
                 process.assert_not_called()
                 prompt = json.loads(self.fake.ask_json.call_args.args[1])
                 self.assertEqual(prompt['execution']['task_python'], sys.executable)
+        # Registered feedback keeps omitted originals and can add source files
+        # without a preliminary file-list model request or a copied runtime tree.
+        originals = {'compose.py': {'path': '/owner/compose.py', 'sha256': '0' * 64, 'text': content},
+            'notes.txt': {'path': '/owner/notes.txt', 'sha256': '1' * 64, 'text': 'Keep μ and CRLF.\r\n'}}
+        for files in ([], [{'path': 'helper.py', 'content': 'VALUE = 7\n'}]):
+            self.fake.ask_json.reset_mock()
+            self.fake.ask_json.return_value = {'summary': 'Revise execution without rewriting sources',
+                'unresolved': [], 'files': files, 'execution_plan': plan}
+            result = write_implementation_unit(project_dir=candidate, goal='Revise the registered candidate',
+                files=None, original_files=originals, source_windows=[], client=self.fake,
+                artifact_dir=self.run_dir / 'writer-feedback-artifacts', validate_destination=lambda path: None)
+            self.assertEqual((candidate / 'notes.txt').read_bytes(), originals['notes.txt']['text'].encode())
+            self.assertEqual((candidate / 'compose.py').read_text(), content)
+            self.assertEqual(len(result['files']), 2 + len(files))
+            self.assertEqual(self.fake.ask_json.call_count, 1)
 
     def test_writer_rejects_execution_output_conflicts_before_publication(self) -> None:
         from simple_ar.code_task.generation.writer import write_implementation_unit
@@ -9098,6 +9148,14 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
                         artifact_dir=self.run_dir / 'writer-rejected-artifacts', retry_attempts=1)
                 self.assertEqual(self.fake.ask_json.call_count, 1)
                 self.assertEqual({path.name for path in candidate.iterdir()}, {'keep.txt'})
+                self.assertEqual((candidate / 'keep.txt').read_bytes(), original)
+                self.fake.ask_json.return_value = {'summary': 'Rejected feedback output', 'unresolved': [],
+                    'files': [], 'execution_plan': {'argv': ['python', 'src/compose.py'], 'outputs': [output]}}
+                with self.assertRaises(ValueError):
+                    write_implementation_unit(project_dir=candidate, goal='Revise without losing source',
+                        files=None, original_files={'src/compose.py': {'text': 'value = 1\n'}},
+                        source_windows=[], client=self.fake, artifact_dir=self.run_dir / 'writer-feedback-rejected',
+                        validate_destination=lambda path: None, retry_attempts=1)
                 self.assertEqual((candidate / 'keep.txt').read_bytes(), original)
 
     def test_execution_plan_strict_types_and_bounds(self) -> None:

@@ -25,10 +25,9 @@ def _hash(path: Path) -> str:
         return hashlib.file_digest(handle, 'sha256').hexdigest()
 
 
-def prepared_unit(owner: Any, locator: str) -> tuple[dict, Path, dict]:
-    """A path-shaped result or a proposal is not an accepted code unit."""
+def candidate_source(owner: Any, locator: str) -> tuple[Path, dict, dict]:
+    """Resolve an accepted source unit, not an arbitrary project or proposal."""
     from simple_ar.code_task.generation.common import safe_relative_path
-    from simple_ar.code_task.generation.run_plan import ImplementationRunPlan
 
     record = owner.workspace.resolve(locator)
     relative = record.relative_to(owner.root / 'attempts').parts
@@ -47,25 +46,44 @@ def prepared_unit(owner: Any, locator: str) -> tuple[dict, Path, dict]:
     candidate = owner.workspace.resolve(f'workspace/implementations/{relative[0]}', write=True)
     if Path(data['project_dir']).resolve() != candidate:
         raise ValueError('Prepared candidate root differs from its producing attempt')
-    plan = ImplementationRunPlan.model_validate(data['execution_plan'])
-    plan.validate_planned_paths([row['path'] for row in data['files']])
-    files = {}
+    paths = set()
     for row in data['files']:
         path = safe_relative_path(row['path'])
-        if not path or path in files:
+        if not path or path in paths:
             raise ValueError('Invalid prepared code inventory')
-        actual = owner.workspace.resolve(str(candidate / path), write=True)
-        files[str(actual)] = row['sha256']
+        owner.workspace.resolve(str(candidate / path), write=True)
+        paths.add(path)
     binding_path = record.parent / 'request.json'
     if Path(data['source_binding']).resolve() != binding_path.resolve():
         raise ValueError('Prepared source binding is not its producing request')
     source = ArtifactStore(record.parent).read_json('request.json')
+    return candidate, payload, source
+
+
+def prepared_unit(owner: Any, locator: str) -> tuple[dict, Path, dict]:
+    """Only an accepted source unit with a valid plan can authorize execution."""
+    from simple_ar.code_task.generation.run_plan import ImplementationRunPlan
+
+    candidate, payload, source = candidate_source(owner, locator)
+    record = owner.workspace.resolve(locator)
+    data = payload['data']
+    if data.get('execution_plan') is None:
+        raise ValueError('Registered candidate has no execution plan; prepare one before requesting execution')
+    plan = ImplementationRunPlan.model_validate(data['execution_plan'])
+    plan.validate_planned_paths([row['path'] for row in data['files']])
+    files = {str(owner.workspace.resolve(str(candidate / row['path']), write=True)): row['sha256']
+        for row in data['files']}
+    binding_path = record.parent / 'request.json'
     # Reuse actual owner-computed identities, never model-written digests.
     inputs = dict(files)
     inputs[str(record)] = _hash(record)
     inputs[str(binding_path)] = _hash(binding_path)
     for item in source.get('original_files', {}).values():
         inputs[str(owner.workspace.resolve(item['path']))] = item['sha256']
+    if prior := source.get('prior_candidate'):
+        previous = owner.workspace.resolve(prior['result_ref'])
+        inputs[str(previous)] = prior['result_sha256']
+        inputs[str(previous.parent / 'request.json')] = prior['source_binding_sha256']
     inputs.update(source.get('selection', {}).get('input', {}).get('file_hashes', {}))
     for window in source['source_windows']:
         if 'request' in window:

@@ -87,22 +87,25 @@ def inspect_materials(*, workspace: Any, context: dict, instructions: str,
     raise ValueError('Material investigation decision limit reached; preserve records and narrow the goal')
 
 
+def observed_window_key(workspace: Any, request: FileWindow, data: dict) -> tuple:
+    """Measured coverage, independent of ineffective request ceilings/defaults."""
+    return (str(workspace.resolve(request.path)), data.get('offset_bytes', request.offset_bytes),
+        data['next_offset_bytes'], data['sha256'])
+
+
 def selected_material_windows(workspace: Any, selected: MaterialSelection,
                               observations: list[dict], *, identity: str) -> list[dict]:
     """Revalidate inspected bytes and return only selected observed windows."""
     if selected.read_windows:
         raise ValueError('Material selection ended without a final selection')
     observed, views = {}, {}
-    def view_key(window: FileWindow, data: dict) -> tuple:
-        return (str(workspace.resolve(window.path)), data.get('offset_bytes', window.offset_bytes),
-            data['next_offset_bytes'], data['sha256'])
     for row in observations:
         actual = workspace.call('read_file', row['request'], identity=identity)
         if actual.status != 'ok' or actual.data != row['data']:
             raise ValueError('Inspected material contents changed; preserve this version and use a new identity')
         observed[window_key(workspace, FileWindow.model_validate(row['request']))] = row
         if row['data'].get('sha256'):
-            views[view_key(FileWindow.model_validate(row['request']), row['data'])] = row
+            views[observed_window_key(workspace, FileWindow.model_validate(row['request']), row['data'])] = row
     windows = [FileWindow(path=row) if isinstance(row, str) else row for row in selected.materials]
     keys = [window_key(workspace, window) for window in windows]
     if len(keys) != len(set(keys)):
@@ -118,10 +121,10 @@ def selected_material_windows(workspace: Any, selected: MaterialSelection,
             actual = workspace.call('read_file', window.model_copy(update={
                 'full_digest': True}).model_dump(exclude_unset=True), identity=identity)
             if actual.status == 'ok':
-                row = views.get(view_key(window, actual.data))
+                row = views.get(observed_window_key(workspace, window, actual.data))
         if row is None:
             raise ValueError('Selected material window was not inspected; read its actual contents first')
-        effective = view_key(FileWindow.model_validate(row['request']), row['data'])
+        effective = observed_window_key(workspace, FileWindow.model_validate(row['request']), row['data'])
         if effective in selected_views:
             raise ValueError('Material selection requires distinct paths/windows from the bound inventory')
         selected_views.add(effective)

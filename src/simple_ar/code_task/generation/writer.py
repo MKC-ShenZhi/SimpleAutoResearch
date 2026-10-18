@@ -54,8 +54,8 @@ _IMPLEMENTATION_BODY = (
     'script may render, check behavior, and generate captions or a report. Its cwd is fixed to the '
     'candidate root. Outputs must not overlap each other or any planned file, including ancestor or '
     'descendant conflicts; no absolute, traversal, glob, backslash, colon or private/runtime paths. '
-    'For Python use the supplied task interpreter and explicit portable input/output paths; do not '
-    'hardcode plotting layouts. A plan is a proposal only: do not automatically run commands, install '
+    'For Python use the supplied task interpreter and explicit portable input/output paths. '
+    'A plan is a proposal only: do not automatically run commands, install '
     'dependencies, access the network or claim independent scientific verification. Omit the plan '
     'when execution is unnecessary; do not add prerequisites, scaffolding or copied assets. '
     'The calling task will review and execute separately; runnable candidate is not verified success.'
@@ -67,6 +67,16 @@ DIRECT_IMPLEMENTATION_SYSTEM = (_IMPLEMENTATION_HEADER
     'No input project or frozen filename plan was supplied. Runtime-produced images, '
     'tables and documents belong in execution_plan.outputs, not as invented file content. '
     'Do not precompute a binary image as text or create placeholders for outputs. '
+    + _IMPLEMENTATION_BODY)
+FEEDBACK_IMPLEMENTATION_SYSTEM = (_IMPLEMENTATION_HEADER
+    + 'Correct the registered candidate using the complete owner-verified original_files. '
+    'Return only existing files needing exact replacements (replacements: [] is allowed), '
+    'and necessary new editable textual source files with full content. Unmentioned originals '
+    'are retained byte-for-byte; never delete them. The union of originals and returned files '
+    'must contain at most 12 files. Return files: [] only for a plan-only correction, with an '
+    'execution_plan in the same response. Runtime-produced images, tables and documents belong '
+    'in execution_plan.outputs, not textual sources or placeholders. Outputs must not overlap '
+    'any retained original or returned source. No execution has occurred for this proposal. '
     + _IMPLEMENTATION_BODY)
 
 
@@ -91,9 +101,10 @@ def write_implementation_unit(
     planned = [safe_relative_path(row['path']) for row in files] if files is not None else None
     if (not goal.strip() or (planned is not None and (not planned or len(planned) > 12
             or any(not p for p in planned) or len(set(planned)) != len(planned)))
-            or (planned is None and (original_files or validate_destination is None))):
+            or (planned is None and (len(original_files) > 12 or validate_destination is None))):
         raise ValueError('Implementation requires distinct safe relative output paths')
-    system = DIRECT_IMPLEMENTATION_SYSTEM if planned is None else IMPLEMENTATION_SYSTEM
+    system = ((FEEDBACK_IMPLEMENTATION_SYSTEM if original_files else DIRECT_IMPLEMENTATION_SYSTEM)
+        if planned is None else IMPLEMENTATION_SYSTEM)
     ledger = getattr(client, '_budget_ledger', None)
     execution_resources = ({name: ledger.remaining(name) for name in
         ('process_invocations', 'process_wall_seconds')} if isinstance(ledger, BudgetLedger) else None)
@@ -127,10 +138,23 @@ def write_implementation_unit(
                 'line_count': len(content.splitlines())})
     result = {'project_dir': str(project_dir), 'files': generated,
         'summary': str(response.get('summary', '')), 'unresolved': unresolved,
-        'verification': 'Python syntax checked only; no imports, commands or scientific validation.'}
+        'verification': ('Changed/new Python syntax checked only; retained originals preserved; '
+            'no imports, commands or scientific validation.' if planned is None and original_files else
+            'Python syntax checked only; no imports, commands or scientific validation.')}
     if execution_plan is not None:
         result['execution_plan'] = execution_plan
     return result
+
+
+def _validate_text_source(path: str, validate_destination: Callable[[str], Any] | None) -> None:
+    if not isinstance(path, str) or safe_relative_path(path) != path:
+        raise ValueError('Candidate paths must be safe relative paths')
+    if validate_destination is not None:
+        validate_destination(path)
+    media_type = mimetypes.guess_type(path, strict=False)[0] or ''
+    if ((media_type.startswith(('image/', 'audio/', 'video/')) and media_type != 'image/svg+xml')
+            or media_type in {'application/pdf', 'application/zip', 'application/gzip', 'application/octet-stream'}):
+        raise ValueError('Binary artifacts must be produced by execution, not generated textual file content')
 
 
 def _decode_implementation_response(
@@ -142,8 +166,10 @@ def _decode_implementation_response(
     modes: dict[str, str] = {}
     rows = response.get('files')
     if (not isinstance(rows, list) or (len(rows) != len(planned) if planned is not None
-            else legacy or bool(original_files) or not 1 <= len(rows) <= 12)):
+            else legacy or not (0 if original_files else 1) <= len(rows) <= 12)):
         raise ValueError('Generated file set does not match the requested unit; retained proposal was not published')
+    if planned is None and original_files and not rows and 'execution_plan' not in response:
+        raise ValueError('Plan-only feedback requires an execution_plan')
     contents = {}
     for row in rows:
         if not isinstance(row, dict):
@@ -153,13 +179,10 @@ def _decode_implementation_response(
         path = safe_relative_path(str(row.get('path', '')))
         if not path or (planned is not None and path not in planned) or path in contents:
             raise ValueError('Generated path is unplanned, unsafe or repeated')
-        if validate_destination is not None:
+        if not legacy:
+            _validate_text_source(path, validate_destination)
+        elif validate_destination is not None:
             validate_destination(path)
-        media_type = mimetypes.guess_type(path, strict=False)[0] or ''
-        if not legacy and ((media_type.startswith(('image/', 'audio/', 'video/'))
-                and media_type != 'image/svg+xml') or media_type in {
-                    'application/pdf', 'application/zip', 'application/gzip', 'application/octet-stream'}):
-            raise ValueError('Binary artifacts must be produced by execution, not generated textual file content')
         if path in original_files:
             changes = row.get('replacements')
             if ('content' in row or not isinstance(changes, list) or not (1 if legacy else 0) <= len(changes) <= 40
@@ -173,7 +196,9 @@ def _decode_implementation_response(
             if not isinstance(row.get('content'), str) or 'replacements' in row:
                 raise ValueError('New files require textual content, not replacements')
             content = row['content']
-        if not legacy and (not content.strip() or len(content.encode('utf-8')) > 256000):
+        retained_original = (planned is None and not legacy and path in original_files
+            and content == original_files[path]['text'])
+        if not legacy and not retained_original and (not content.strip() or len(content.encode('utf-8')) > 256000):
             raise ValueError('Generated file is empty or exceeds the text bound')
         if legacy:
             candidate = content.strip().rstrip() + '\n'
@@ -184,9 +209,19 @@ def _decode_implementation_response(
                     validation=validation, content=content, summary=str(response.get('summary', '')))
                 raise ValueError(_file_validation_feedback(validation))
             modes[path] = 'llm_repaired' if content != candidate else 'llm'
-        elif Path(path).suffix == '.py':
+        elif not retained_original and Path(path).suffix == '.py':
             ast.parse(content, filename=path)
         contents[path] = content
+    if planned is None and not legacy:
+        # The complete owner-bound original inventory is the base, not a model
+        # selection. Omitted files survive unchanged in the published candidate.
+        contents = {**{path: original['text'] for path, original in original_files.items()}, **contents}
+        if len(contents) > 12:
+            raise ValueError('Merged candidate exceeds 12 source files')
+        if len({Path(path) for path in contents}) != len(contents):
+            raise ValueError('Candidate source paths alias on this filesystem')
+        for path in contents:
+            _validate_text_source(path, validate_destination)
     unresolved = response.get('unresolved', [])
     if not isinstance(unresolved, list) or any(not isinstance(item, str) for item in unresolved):
         raise ValueError('Unresolved gaps must be a list of strings')
