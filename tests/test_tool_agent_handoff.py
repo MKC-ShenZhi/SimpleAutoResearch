@@ -8624,6 +8624,126 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertNotIn('prior_draft', read_json(owner / 'selection-input.json'))
         self.assertEqual((owner / 'selection-input.json').read_bytes(), legacy_bytes)
 
+    def test_composition_reuses_accepted_article_evidence_for_feedback_and_independent_review(self) -> None:
+        from dataclasses import replace
+        from simple_ar.tools.writing import ComposeRequest
+
+        _, fake, app, materials, table, figure, request = self._material_root_fixture()
+        source = materials / 'original-document.json'
+        original = self._original_document()
+        original.records[0] = replace(original.records[0], metadata={'kind': 'supporting_material'})
+        write_json(source, original.to_handoff_dict())
+        citation_id = 'material-' + original.records[0].document_id.encode('utf-8').hex()
+        source_selection = {'document_record': str(source), 'questions': ['Cancellation sibling tasks']}
+        fake.ask_json.side_effect = [
+            {'read_windows': [{'path': str(table), 'start_line': 2, 'max_lines': 1}]},
+            {'sources': [source_selection], 'materials': [{'path': str(table), 'start_line': 2, 'max_lines': 1}]},
+            {'draft_markdown': f'Recorded cancellation [@{citation_id}].\n\n![Supplied comparison diagram.](figures/selected-1.svg)'}]
+        first = self._compose_document(app, request, 'reuse-original')
+        self.assertEqual(fake.ask_json.call_count, 3)  # inspection, selection, Writer
+        self.assertEqual(_writing_prompt(fake)['prior_draft'], 'Earlier descriptive account.')
+        self.assertIn(citation_id, {row['id'] for row in _writing_prompt(fake)['bibliography']})
+        parent = app.session.store.root / 'tools/writing/reuse-original'
+        parent_bytes = {path: path.read_bytes() for path in parent.rglob('*') if path.is_file()}
+        saved_request = read_json(parent / 'request.json')['request']
+        self.assertTrue(saved_request['material_roots'])
+        self.assertTrue(saved_request['materials'])
+        old_draft = app.workspace.resolve(first.data['editable_markdown'])
+        old_bytes = old_draft.read_bytes()
+        self.assertNotIn('reuse_prior_inputs', read_json(parent / 'request.json')['request'])
+        self.assertNotIn('reuse_prior_inputs', ComposeRequest.model_validate(
+            {**request, 'reuse_prior_inputs': False}).model_dump())
+        feedback = {'goal': 'Clarify the existing account using its selected evidence.',
+            'title': 'Clarified account', 'prior_draft': first.data['editable_markdown'],
+            'reuse_prior_inputs': True,
+            'figures': [{'path': str(figure), 'caption': 'Current supplied diagram; not independently verified.'}]}
+        # Figures are current explicit inputs. Changing their source bytes does
+        # not mutate the prior publication or certify a revised scientific figure.
+        figure.write_bytes(figure.read_bytes().replace(b'100', b'120'))
+        fake.ask_json.side_effect = None
+        fake.ask_json.return_value = {'draft_markdown':
+            f'Clarified cancellation boundary [@{citation_id}].\n\n![Current supplied diagram; not independently verified.](figures/selected-1.svg)'}
+        with (patch('simple_ar.research.store.retrieval.rank_source_chunks',
+                    side_effect=AssertionError('Saved question IDs must not be retrieved again')),
+                patch.object(app.writing, '_select_materials', side_effect=AssertionError('No reselection'))):
+            revised = self._replay_interrupted_assembly(app, fake, ToolCall(
+                tool_name='compose_document', arguments=feedback, trace_id='reuse-feedback'))
+        self.assertEqual(fake.ask_json.call_count, 4)  # one new Writer, including recovery
+        view = _writing_prompt(fake)
+        self.assertEqual(view['prior_draft'], old_bytes.decode())
+        passages = [passage['text'] for handle in view['source_handles']
+            for passage in handle.get('metadata', {}).get('evidence_passages', [])]
+        self.assertIn(self._original_document().chunks[0].text, passages)
+        self.assertIn('control,4,2.5\n', passages)
+        self.assertNotIn(old_bytes.decode(), passages)
+        revised_owner = app.session.store.root / 'tools/writing/reuse-feedback'
+        revised_binding = read_json(revised_owner / 'request.json')
+        self.assertEqual(revised_binding['prior_input_reuse']['owner'], 'reuse-original')
+        self.assertEqual(revised_binding['prior_input_reuse']['inputs'], first.data['inputs'][:2])
+        self.assertEqual(revised_binding['inputs'][0]['selected_chunk_ids'], ['original-span'])
+        self.assertFalse((revised_owner / 'selection-input.json').exists())
+        self.assertNotEqual(app.workspace.resolve(revised.data['editable_markdown']).read_bytes(), old_bytes)
+
+        fake.ask_json.return_value = {'section_reviews': [{'section_id': 'document', 'verdict': 'pass'}]}
+        review_args = {**feedback, 'prior_draft': revised.data['editable_markdown']}
+        with patch('simple_ar.research.store.retrieval.rank_source_chunks',
+                   side_effect=AssertionError('Independent review uses resolved evidence')):
+            reviewed = _call_tool(app.gateway, 'review_document', review_args, identity='reuse-review')
+        self.assertEqual(reviewed.status, 'ok', reviewed.error)
+        self.assertEqual(reviewed.data['review_status'], 'reviewed')
+        self.assertNotIn('editable_markdown', reviewed.data)
+        inspection = json.loads(fake.ask_json.call_args.args[1])
+        self.assertIn('control,4,2.5', json.dumps(inspection['source_evidence']))
+        self.assertIn(self._original_document().chunks[0].text, json.dumps(inspection['source_evidence']))
+        self.assertEqual(inspection['sections'][0]['markdown'],
+            app.workspace.resolve(revised.data['editable_markdown']).read_text(encoding='utf-8'))
+        review_owner = app.session.store.root / 'tools/writing/reuse-review'
+        self.assertFalse((review_owner / 'writer').exists())
+        calls = fake.ask_json.call_count
+        ledger_before = app.ledger.to_dict()
+        with patch.object(app.writing, 'client_factory', side_effect=AssertionError('No paid replay or rejection')) as factory:
+            self.assertEqual(_call_tool(app.gateway, 'review_document', review_args,
+                identity='reuse-review').artifacts, reviewed.artifacts)
+            # Both first use and recovery reject changed parent/evidence bytes.
+            for path, changed in ((old_draft, old_bytes + b'changed'),
+                    (source, source.read_bytes() + b'\n'), (table, table.read_bytes().replace(b'2.5', b'9.5')),
+                    (parent / 'result.json', None), (parent / 'writer/writer.json', None),
+                    (parent / 'writer/response.json', None),
+                    (parent / 'writer/response.json', b'{"draft_markdown": "Changed unbound response"}')):
+                with self.subTest(changed=path), _changed_record(path, changed):
+                    self._compose_document(app, feedback, 'reuse-reject', status='error')
+                    self._compose_document(app, feedback, 'reuse-feedback', status='error')
+            changed_request = read_json(parent / 'request.json')
+            changed_request['request']['goal'] = 'Altered original binding'
+            with _changed_record(parent / 'request.json', json.dumps(changed_request).encode()):
+                self._compose_document(app, feedback, 'reuse-reject', status='error')
+            # Exact receipt bytes are frozen by the new request, even when a
+            # later edit changes only JSON whitespace rather than semantics.
+            with _changed_record(parent / 'request.json', (parent / 'request.json').read_bytes() + b'\n'):
+                self._compose_document(app, feedback, 'reuse-feedback', status='error')
+            failed_receipt = read_json(parent / 'result.json')
+            failed_receipt['status'] = 'error'
+            with _changed_record(parent / 'result.json', json.dumps(failed_receipt).encode()):
+                self._compose_document(app, feedback, 'reuse-reject', status='error')
+            with patch.object(app.workspace, 'resolve_source_record', side_effect=ValueError('permission revoked')):
+                self._compose_document(app, feedback, 'reuse-reject', status='error')
+            for conflict in ({'sources': [source_selection]}, {'materials': [{'path': str(table)}]},
+                    {'material_roots': [str(materials)]}, {'prior_draft': reviewed.data['review_path']},
+                    {'prior_draft': str(materials.parent / 'prior.md')}):
+                self._compose_document(app, {**feedback, **conflict}, 'reuse-reject', status='error')
+            factory.assert_not_called()
+        self.assertEqual(fake.ask_json.call_count, calls)
+        self.assertEqual(app.ledger.to_dict(), ledger_before)
+        self.assertEqual({path: path.read_bytes() for path in parent_bytes}, parent_bytes)
+        self.assertEqual(old_draft.read_bytes(), old_bytes)
+        # Absence/false continues to use ordinary fresh directory selection.
+        fake.ask_json.side_effect = [{'sources': [source_selection]},
+            {'draft_markdown': f'Fresh selection [@{citation_id}].'}]
+        fresh = self._compose_document(app, {**request, 'reuse_prior_inputs': False}, 'reuse-fresh-scope')
+        self.assertEqual(fake.ask_json.call_count, calls + 2)
+        self.assertIn('material_selection', fresh.data)
+        self.assertEqual(_writing_prompt(fake)['prior_draft'], 'Earlier descriptive account.')
+
     def test_composition_material_roots_bind_original_sources_and_legacy_mixed_receipts(self) -> None:
         from simple_ar.core.capabilities import ArtifactStore
         from simple_ar.tools.writing import ComposeRequest
