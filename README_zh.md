@@ -22,37 +22,35 @@
 
 ## 看实际交付
 
-以下为开发验收案例，包含人工任务指令、批准和独立检查，过程中也修复了框架问题。展示的是这一过程得到并检查的成果，不是一键无干预完成。
+可以先读完整报告，或直接复跑已交付图形。仓库包含源码、必要的保存结果和重建说明，不只是截图。以下是有人参与的开发案例，不是一键无人干预成果或 benchmark 成绩。
 
-### UCI Bike Sharing：分析、反馈与报告
+### 保存结果 → 分析、五面板图和报告
 
-通过真实框架分析 UCI Bike Sharing 数据集，生成六面板图，再根据反馈分解分析，并将结果整理为四页 ACM PDF。
+任务比较校准模型形式、更新策略、数据覆盖和记录的计算开销，经反馈修正图形与解释，交付六页 PDF、四张表、可编辑代码和冻结输入。报告阶段没有重新拟合模型。
 
-![反馈修订后的 UCI Bike Sharing 六面板图](docs/showcase/assets/bike-sharing-revised.png)
+![保存校准结果的五面板分析图](examples/saved-results-report/report/figures/monthly_update_panel.png)
 
-[查看四页报告](docs/showcase/assets/bike-sharing-report.pdf) · [输入、反馈、成果与检查](docs/showcase/README_zh.md)
+[阅读报告](examples/saved-results-report/report/report.pdf) · [无需密钥复跑](examples/saved-results-report/README_zh.md) · [版本、人工参与和成本](docs/showcase/README_zh.md)
 
-![Bike Sharing ACM 报告第一页](docs/showcase/assets/bike-sharing-report-page-1.png)
+### 机器人方向 → 有出处的技术调研
 
-### 空气质量校准：修改可编辑方法图
+十页报告比较 VLA 策略与世界模型的预测目标、控制角色和公开证据范围，包含 16 项引用、两张说明图、两张表及可编辑 Markdown/LaTeX。这是范围有限的阅读报告，不是完整的 2026 年综述。
 
-从已有校准结果出发，将横向方法图改为单栏、灰度友好的布局，区分拟合、预测与评价。下图展示已有数据重绘，不代表开展了新实验。
+![预测如何进入机器人控制](examples/robotics-survey/report/figures/fig1_prediction_in_loop.png)
 
-| 反馈前 | 反馈后 |
-| --- | --- |
-| ![反馈前的 study 图形](docs/showcase/assets/study-figure-before.png) | ![反馈后的 study 图形](docs/showcase/assets/study-figure-after.png) |
+[阅读调研 PDF](examples/robotics-survey/report/survey.pdf) · [中文简报](examples/robotics-survey/report/briefing_zh.md) · [重建报告](examples/robotics-survey/README_zh.md)
 
-任务来源、人工参与、版本、成本和限制见[成果展示](docs/showcase/README_zh.md)。
+两份最终导出均在与 `d3b0721` 等价的代码上检查，该修复已纳入 main；完整任务历史跨越多个候选和显式续接，仍保留 `partial` 限定。正文与绘图代码由框架生成，人提供目标、反馈、授权和独立检查。[来源与开发成本](docs/showcase/README_zh.md)均公开说明。
 
-### 当前候选上可复跑的反馈案例
+### 不重做实验的图形反馈
 
-框架将保存结果的横版图改为真正的配对视觉比较，保留八个显示值、单位与明确尺度；实际渲染、看图后交付可编辑源码，独立搬迁复跑两张 PNG 一致。
+较早的一项已核任务将保存结果的横版图改为配对视觉比较，保留八个显示值、单位与明确尺度。源码与数据已公开，可以不调用模型复跑。
 
 ![保存结果的反馈对比图](docs/showcase/assets/landscape-feedback-after.png)
 
 [无需 API 密钥，使用源码和保存数据复跑](examples/figure-feedback/README_zh.md) · [前后对照与成本](docs/showcase/README_zh.md#横版比较图当前可复跑导出)
 
-该有界反馈任务用 11 次模型请求、211774 记录 tokens，没有重拟合。这是经检查的开发案例，不是 benchmark 排名；[核查、成本和限制](docs/EVALUATION_zh.md)区分了成果正确性与科学主张。
+该有界反馈任务用 11 次模型请求、211774 记录 tokens，没有重拟合。[较早的 Bike Sharing 与方法图](docs/showcase/README_zh.md#较早成果)保留原版本说明；[效果证据与限制](docs/EVALUATION_zh.md)区分可用成果与科学、自动化主张。
 
 ## 一项任务怎样继续
 
@@ -67,12 +65,20 @@
 执行机器需要 Python 3.12+、Git、[uv](https://docs.astral.sh/uv/) 和 ripgrep（`rg`）。克隆 main 分支：
 
 ```bash
-git clone --branch main https://github.com/Wchanging/SimpleAutoResearch.git
+git clone --branch main https://github.com/MKC-ShenZhi/SimpleAutoResearch.git
 cd SimpleAutoResearch
-uv sync
+uv sync --locked
 ```
 
-### 配置命名模型连接
+### 先试一个离线案例
+
+```bash
+uv run python examples/figure-feedback/build_figure_v2.py --output runs/examples/figure-feedback/replay
+```
+
+使用新的输出目录，打开其中的 `main.png` 或 `main.svg`。这会在保存结果上运行已交付源码，不需要密钥、联网或训练，也不是重新生成一次模型成果。完整图表与报告源码见[保存结果分析](examples/saved-results-report/README_zh.md)。
+
+### 再配置模型，完成新任务
 
 按[模型配置教程](docs/USAGE_zh.md)创建模型目录的 TOML 配置文件，定义名为 `daily` 的 profile，填写服务商实际端点、模型 ID 和凭据环境变量。教程包含默认文件位置、自定义路径和私有 `.env` 配置。
 

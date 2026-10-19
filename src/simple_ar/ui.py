@@ -25,7 +25,8 @@ from simple_ar.core.budget import BudgetLedger
 from simple_ar.integrations.llm import LLMClient
 from simple_ar.integrations.model_profiles import load_model_catalog
 from simple_ar.tools.sources import SourceToolGateway
-from simple_ar.tools.workspace import resolve_mounted_path, resolve_source_mount
+from simple_ar.tools.implementation import ImplementationToolGateway
+from simple_ar.tools.workspace import WorkspaceToolGateway, resolve_mounted_path, resolve_source_mount
 
 
 def native_arguments() -> argparse.Namespace:
@@ -205,16 +206,52 @@ class Workspace:
         root = self.task(name)
         manifest = self.record(root, 'session_manifest.json')
         state = self.record(root, 'actions.json')
-        # Read original records without loading an application on the HTTP read
-        # path: loading configures tools and can create directories.
+        # Ordinary polling reads original records directly. Only a pending
+        # prepared approval below needs its registered execution owner.
         ledger_path = bounded(root / 'budget_ledger.json', root)
         ledger = BudgetLedger.load(ledger_path)
         pending = state.get('pending')
         reason = manifest.get('status_reason', '')
         token = re.search(r'Process requires explicit approval; token=([a-f0-9]{64})', reason)
         approval = None
+        approval_unavailable = None
         if token and pending and pending.get('kind') == 'tool':
             approval = {'token': token[1], 'call': pending['call'], 'attempt': pending['attempt']}
+            if pending['call']['function']['name'] == 'execute_implementation':
+                try:
+                    self.validate_sources(root)
+                    for directory in ('workspace', 'evidence'):
+                        if not bounded(root / directory, root).is_dir():
+                            raise ValueError('Prepared task directory unavailable')
+                    # Resolve this registered proposal through its existing owner,
+                    # only while awaiting approval. Never infer argv from a path
+                    # or expose an unverified replacement under the saved token.
+                    config = state['config']
+                    if (manifest.get('transition_recipe') != ToolApplication.RECIPE
+                            or config.get('code_task') is not None):
+                        raise ValueError('Prepared approval is not available for this task owner')
+                    byte_owner = WorkspaceToolGateway(root, {
+                        **{alias: Path(path) for alias, path in config['sources'].items()},
+                        'evidence': bounded(root / 'evidence', root),
+                        'records': bounded(root / 'attempts', root)}, ledger,
+                        project_python=Path(config['project_python']) if config.get('project_python') else None,
+                        create_workspace=False)
+                    owner = ImplementationToolGateway(root, byte_owner, ledger,
+                        config['model'], manifest['session_id'])
+                    binding = owner.approval_binding(json.loads(pending['call']['function']['arguments']),
+                        identity=pending['attempt'])
+                    identity = hashlib.sha256(json.dumps({'call': pending['call'],
+                        'inputs': binding}, sort_keys=True).encode()).hexdigest()
+                    if identity != token[1]:
+                        raise ValueError('Prepared execution changed since approval was requested')
+                    if (self.record(root, 'actions.json') != state
+                            or self.record(root, 'session_manifest.json') != manifest):
+                        raise ValueError('Pending task changed during approval inspection')
+                    approval['execution'] = {'argv': binding['argv'], 'cwd': binding['cwd'],
+                        'timeout_sec': binding['plan']['timeout_sec']}
+                except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+                    approval = None
+                    approval_unavailable = 'Prepared command unavailable or changed; resume to inspect the current proposal before approval.'
         # A bounded read of accepted observations, never a saved UI index. Do
         # not mistake remaining proposals (or model prose) for executed work.
         plan, activity = None, []
@@ -266,6 +303,7 @@ class Workspace:
             manifest={k: manifest.get(k) for k in ('session_id', 'topic', 'status', 'status_reason',
                 'current_attempt', 'revision', 'budget', 'updated_at')},
             requests=state['requests'], plan=plan, pending=pending_view, approval=approval,
+            approval_unavailable=approval_unavailable,
             activity=activity, activity_total=sum(len(t['tools']) for t in state['turns']),
             queued_actions=sum(len(t.get('remaining', [])) for t in state['turns']),
             model=config.get('model'), saved_connections={

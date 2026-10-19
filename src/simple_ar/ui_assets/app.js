@@ -165,7 +165,8 @@ function query(path, values) { return path + '?' + new URLSearchParams(values); 
 function recipient() {
   const row = metadata.profiles.find(p => p.selector === $('profile').value);
   $('recipient').textContent = row ? Object.entries(row.recipients).map(([purpose, connection]) =>
-    purpose + ' → ' + connection.model + ' · ' + connection.base_url).join('\n')
+    connection ? purpose + ' → ' + connection.model + ' · ' + connection.base_url
+      : purpose + ' → 不可用（未配置连接）').join('\n')
     : '没有可用的命名 Chat 配置；请先在服务端配置连接。';
 }
 function effectiveAccess() {
@@ -210,7 +211,8 @@ async function refresh() {
   $('pending').textContent = pretty({current_attempt: snapshot.manifest.current_attempt,
     model: snapshot.model, saved_connections: snapshot.saved_connections,
     saved_catalog_hints: snapshot.catalog_hints, access: snapshot.access, requests: snapshot.requests,
-    pending: snapshot.pending, stop_requested: snapshot.stop_requested, worker_error: snapshot.worker_error});
+    pending: snapshot.pending, approval_unavailable: snapshot.approval_unavailable,
+    stop_requested: snapshot.stop_requested, worker_error: snapshot.worker_error});
   $('resources').textContent = pretty(snapshot.resources);
   $('budgetSummary').textContent = Object.entries(snapshot.resources.limits).map(([key, limit]) =>
     key + '：剩余 ' + snapshot.resources.remaining[key] + ' / 当前授权额度 ' + limit).join('\n')

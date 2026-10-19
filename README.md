@@ -22,37 +22,35 @@ These capabilities can combine within one task. A figure revision can reuse save
 
 ## See the delivered work
 
-The following are development acceptance cases with human task instructions, approvals and independent checks. Framework fixes were made during the work. They show inspected results from that process, not unattended one-click completion.
+Start with a complete report or replay a delivered figure. Source, saved inputs and build instructions are included—not just screenshots. These are human-assisted development cases, not unattended one-click results or benchmark scores.
 
-### UCI Bike Sharing: analysis, feedback and a report
+### Saved results → analysis, a five-panel figure and a report
 
-A real analysis through the framework used the UCI Bike Sharing dataset, produced a six-panel figure, then continued with feedback to break down the analysis and carry the results into a four-page ACM PDF.
+A task compared calibration model forms, update policies, coverage and recorded computation cost. Feedback corrected figures and explanations; the final delivery contains a six-page PDF, four tables, editable code and frozen inputs. No models were refit for this report.
 
-![Six-panel UCI Bike Sharing figure after revision](docs/showcase/assets/bike-sharing-revised.png)
+![Five-panel analysis of saved calibration results](examples/saved-results-report/report/figures/monthly_update_panel.png)
 
-[Open the four-page report](docs/showcase/assets/bike-sharing-report.pdf) · [Inputs, feedback, artifacts and checks](docs/showcase/README.md)
+[Read the report](examples/saved-results-report/report/report.pdf) · [Replay without an API key](examples/saved-results-report/README.md) · [Versions, human involvement and cost](docs/showcase/README.md)
 
-![First page of the Bike Sharing ACM report](docs/showcase/assets/bike-sharing-report-page-1.png)
+### Robotics → a source-backed technical survey
 
-### Air-quality calibration: revise an editable method figure
+A ten-page survey compares VLA policies with world models: prediction targets, control-loop roles and the breadth of published evidence. It includes 16 references, two explanatory figures, two tables and editable Markdown/LaTeX. It is a bounded reading report, not a comprehensive 2026 review.
 
-Starting from recorded calibration results, the task revised a landscape method figure into a single-column, grayscale layout that separates fitting, prediction and evaluation. The images show a redraw, not results from a new experiment.
+![How prediction enters robot control](examples/robotics-survey/report/figures/fig1_prediction_in_loop.png)
 
-| Before feedback | After feedback |
-| --- | --- |
-| ![Study figure before feedback](docs/showcase/assets/study-figure-before.png) | ![Study figure after feedback](docs/showcase/assets/study-figure-after.png) |
+[Read the survey](examples/robotics-survey/report/survey.pdf) · [中文简报](examples/robotics-survey/report/briefing_zh.md) · [Rebuild the report](examples/robotics-survey/README.md)
 
-See the [showcase](docs/showcase/README.md) for task provenance, human involvement, versions, costs and limitations.
+Both final exports were checked against code equivalent to `d3b0721`, included in main. Their histories span multiple candidates and explicit continuations; they retain `partial` findings. The framework generated the prose and figure code; people supplied goals, feedback, approvals and independent checks. [Full provenance and development costs](docs/showcase/README.md).
 
-### A current, replayable feedback case
+### Figure feedback without rerunning an experiment
 
-The frozen candidate revised a saved-result landscape figure into paired visual comparisons, preserving all eight numerical labels and explicit units/scales. It delivered editable source after actual rendering and image inspection; independent relocated replay matched both PNGs.
+An earlier inspected task revised a saved-result landscape figure into paired visual comparisons, preserving all eight numerical labels and explicit units/scales. Editable source and data let you replay it without a model call.
 
 ![Saved-result visual comparison after feedback](docs/showcase/assets/landscape-feedback-after.png)
 
 [Replay with source and saved data—no API key](examples/figure-feedback/README.md) · [Before/after and cost](docs/showcase/README.md#landscape-comparison-a-current-replayable-export)
 
-This bounded feedback task used 11 model requests and 211,774 recorded tokens; it did not refit models. These are inspected development cases, not benchmark rankings. [Measured checks, costs and limitations](docs/EVALUATION.md) distinguish artifact correctness from scientific claims.
+This bounded feedback task used 11 model requests and 211,774 recorded tokens; it did not refit models. [Earlier Bike Sharing and method-figure results](docs/showcase/README.md#earlier-results) retain their original versions. [Evidence and limits](docs/EVALUATION.md) distinguish usable artifacts from scientific or autonomy claims.
 
 ## How a task continues
 
@@ -67,12 +65,20 @@ Named TOML profiles configure model connections and purpose routes. Text, code, 
 Install Python 3.12+, Git, [uv](https://docs.astral.sh/uv/) and ripgrep (`rg`) on the execution machine. Clone the main branch:
 
 ```bash
-git clone --branch main https://github.com/Wchanging/SimpleAutoResearch.git
+git clone --branch main https://github.com/MKC-ShenZhi/SimpleAutoResearch.git
 cd SimpleAutoResearch
-uv sync
+uv sync --locked
 ```
 
-### Configure a named model connection
+### First, try an offline example
+
+```bash
+uv run python examples/figure-feedback/build_figure_v2.py --output runs/examples/figure-feedback/replay
+```
+
+Use a fresh output directory. Open its `main.png` or `main.svg`. This runs delivered code on saved results without a key, network or training; it is not a new model-generated result. For complete figure/table/report sources, see [saved-result analysis](examples/saved-results-report/README.md).
+
+### Then, configure a model for new work
 
 Follow [model setup](docs/USAGE.md) to create a TOML catalog with a named `daily` profile, the service's actual endpoint and model ID, and its credential environment variable. The guide covers the default catalog location, custom paths and private `.env` setup.
 

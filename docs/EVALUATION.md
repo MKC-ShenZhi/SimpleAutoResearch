@@ -1,51 +1,50 @@
-# Evidence, reproducibility and limits
+# Evidence and boundaries
 
 [中文](EVALUATION_zh.md) · [Showcase](showcase/README.md) · [Get started](USAGE.md)
 
-**Release-readiness snapshot: 18 October 2026.** V2.9 is a development milestone, not the Python distribution version (currently `0.1.0`). The verified behavioral candidate is `f45b596`; later release-preparation documentation/example commits do not retrospectively change the versions that produced these results. This is a source-visible preview, not a claim of production reliability or a license grant.
+SimpleAutoResearch is available for public experimentation, not a production-reliability guarantee. Start with saved-data analysis, Python code work, figure/text feedback and material-grounded reports. Open investigations and autonomous reproduction need closer review. Licensing remains undecided: this is a source-visible preview.
 
-## What the cases actually demonstrate
+## What has actual evidence
 
-| Case | Recorded result/check | Qualification |
+| Capability | Inspected result | Not established |
 | --- | --- | --- |
-| Direction investigation | Started from a question rather than a paper list; revised recommendations for CPU/offline constraints; delivered report/TeX/PDF | A bounded development case, not exhaustive DeepResearch. A separate survey failed and is not counted as a success |
-| Bike Sharing analysis/report | Revised six-panel figure and four-page PDF; 732 table cells independently recomputed with zero differences | Observational analysis; multiple candidates and allowance extensions, not a same-version single-budget success |
-| Saved-result visual feedback | 8 displayed values checked, five data files unchanged; actual image inspection, current-request delivery, relocated PNG replay identical | Current `f45b596` case; native qualified `partial`; no refitting or scientific revalidation |
-| Code creation/maintenance | FASTA project creation and gzip/filter feedback; independent normal/error behavior and relocated use. Separate CQR project patch reconstructed and run | Supported Python scope; not arbitrary languages or the unexecuted historical scikit-garden backend |
-| Finite CQR reproduction | Paper-only request followed by implementation/data/dependency investigation, readiness and five-seed measurement, analysis/report and portability | Single dataset, reduced settings and alternative backend. Not full-paper reproduction or a fresh-machine installation |
-| Result reuse/report revision | Existing measurements retained while arguments/figures changed; originals and recorded costs preserved | Earlier report required caller confirmation of qualified delivery; not an unattended universal success claim |
+| Data analysis and figure/text feedback | Five-panel figure, four tables, six-page PDF; 72 independent numerical checks and relocated replay | Arbitrary statistical correctness, no-feedback completion or low cost |
+| Investigation and writing | Ten-page VLA/world-model report, 16 references, two figures/tables; page inspection and relocated compilation | Exhaustive coverage, full use of acquired text or complete author metadata |
+| Saved-result figure feedback | Eight displayed values and frozen data checked; matching relocated PNGs in the same environment | New experiments, external-site generalisation or print quality |
+| Python creation and repair | Earlier FASTA creation/feedback, abnormal inputs and relocation; engineering patch verification | Arbitrary languages or autonomous large-repository development |
+| Bounded reproduction | Earlier CQR investigation, preparation, short run, reduced measurements, report and relocation | Whole-paper reproduction, arbitrary fresh machines or the identical original backend |
+| Continuation and accounting | Original identities, permissions, failures, unknown usage and journals retained | Automatic replay of unknown requests or unlimited background execution |
 
-These are selected development acceptance cases. Human instructions, side-effect approvals, framework fixes and independent QA were involved. They are **not a random sample**, and no aggregate completion rate or comparison with another agent is justified.
+The [showcase](showcase/README.md) links PDFs, source, costs and limits. Earlier artifacts retain their original versions; the two new final reports used code equivalent to `d3b0721`, while their histories span multiple candidates. Each case's `provenance.json` binds the byte-identical public subset.
 
-Public report/figure copies and hashes are in [the showcase](showcase/README.md). A small delivered figure with its source/data is [replayable from a checkout](../examples/figure-feedback/README.md). The full private development run archives and credentials are not shipped.
+## Rebuilding is not unattended generation
 
-## Costs that must not disappear from the story
+Public examples support three different activities:
 
-| Case | Physical model requests | Recorded tokens | Other recorded costs/limits |
-| --- | ---: | ---: | --- |
-| Bike Sharing | 63 | 2,027,970 settled | 40 processes including publication; five unknown-use reservations total 127,644 tokens, separately retained; original allowance extended |
-| Latest bounded figure revision | 11 | 211,774 | One task render, 2.56 s; no unknown or extension in this task. Earlier failed figure task remains separate, including its 21,638-token unknown reservation |
-| Limited CQR reproduction/delivery | 96 | 3,233,239 | 59 processes; unknown-use upper bound 344,690 tokens retained separately; not a timing or throughput benchmark |
+- **Read:** open the delivered PDF, figures and prose without a model.
+- **Replay offline:** use saved data and generated source to recompute, render or compile—not repeat search or model generation.
+- **Start new work:** send a new goal, materials and permissions; incur new costs with potentially different quality, latency and outcomes.
 
-Tokens are not money, and process time is not end-to-end latency. Models, retry settings and providers differed across development. No paid provider price, free usage or equal-budget superiority is inferred.
+People supplied goals, approvals, defect feedback, dependencies and independent checks, not the new cases' scientific prose or figure code. Framework repairs and explicit continuations occurred. Native `partial` results were not relabelled as success. The two new cases recorded 180/164 settled physical requests and 5,871,880/6,086,900 settled tokens, with unknown usage retained separately. They **do not establish ordinary single-task efficiency**.
 
 ## Engineering checks
 
-The fixed installed candidate discovered 2,041 tests: 2,037 passed and four skipped. Three optional export/rebuild checks were subsequently executed and passed on that installation; the Windows Job Object check remains unexecuted on Linux. Ten historical continuation groups and three stopped-contract loads preserved their saved identities/ledgers. The 18 October spot-check passed eight existing configuration/continuation/reuse/approval/recovery scenarios, without live model calls.
+Before merging, Linux offline discovery ran 2,119 checks: 2,113 passed and six were conditionally skipped. Seven critical checks also passed against the built wheel. All 277 packaged source/template files matched, and 102 tutorial commands parsed successfully. The recipient-rendering check skipped for missing Node was separately verified with local Node.
 
-These checks protect implementation behavior. They are not 2,041 scientific tasks or a benchmark success rate. The latest figure task separately provides real model/vision/render/delivery evidence. Earlier case results retain their original candidate identities; they were not all rerun on the frozen version.
+Published figure source and the six-/ten-page reports were replayed or rebuilt in fresh directories using the documented commands; frozen inputs stayed unchanged and derived numbers were identical. Verification made no new paid model calls and does not count replay as fresh generation success. Original delivery hashes, failures and journals remain retained.
 
-## External benchmark status
+These are software checks, not scientific success rates or proof that every platform, dependency environment or line of the implementation has been audited. Recent production/test changes are still net growth; overall slimming is not complete.
 
-[ARC-Bench](../benchmark/arc_bench/README.md) and [SurveyBench](../benchmark/survey_bench/README.md) adapters exist. Their presence, historical diagnostic outputs or format validation do not constitute a current V2.9 official score. The ARC historical default exposes readable rubric leaves during generation; it must not be compared silently with rubric-hidden systems. No current PaperBench or ScienceAgentBench result is claimed.
+## Practical limits
 
-A future reported comparison must pin framework/model/tool versions, tasks/splits and access, equal budgets, hidden evaluation materials, actual evaluator and costs, failures/unknown usage, and human intervention. This release preparation does not start a new benchmark campaign.
+- **Long tasks and cost:** repeated investigation, coordination overhead and human intervention remain variable. Start bounded, inspect a draft before expanding, and do not treat cumulative development costs as a recommended allowance.
+- **API and network:** both provider and execution-host conditions matter. Final reports used official DeepSeek; CCTQ direct long-stream reliability has not been certified as fixed. Changing an endpoint is not guaranteed recovery.
+- **Evidence and publishing:** acquiring full text does not prove correct use; inspect sources behind claims. PDF compilation does not certify paper quality or venue compliance.
+- **Safety:** read-only source mounts are not an OS sandbox. Review commands, compile only trusted TeX, and exclude credentials or unrelated private materials.
+- **UI scope:** the browser client is an experimental single-user local interface, not a multi-user service. Use the CLI tutorial for a first task.
 
-## Remaining limits and release boundary
+## Benchmarks and release scope
 
-- Model endpoint connectivity is deployment-specific. A successful figure run used a temporary restricted TLS relay. An anonymous direct probe later returned expected HTTP 401, proving only point-in-time reachability, not authenticated generation or stable long streams.
-- Portable artifact replay used an existing fixed environment; arbitrary new machines, GPU setups and platforms are not certified.
-- Broad/deep surveys, long-form reasoning, publication polish and efficient completion remain uneven.
-- Known obsolete CLI creation controls were retired; compatibility APIs remain. Product/test maintenance debt is not audited away, and recent closing changes were net additions, not overall slimming.
-- Workspaces are not OS sandboxes. Review commands and protect credentials; unknown usage is retained rather than silently replayed or cleared.
-- Licensing and a formal tag/GitHub Release remain separate decisions. Do not present these artifacts as officially accepted benchmark results or a claim of autonomous scientific discovery.
+[ARC-Bench](../benchmark/arc_bench/README.md) and [SurveyBench](../benchmark/survey_bench/README.md) adapters exist. There is **no current official score or comparable overall success rate**, nor a claimed PaperBench or ScienceAgentBench result. Interface checks and selected development cases do not replace fixed budgets, hidden evaluation material and independent evaluators.
+
+This preparation adds no large evaluation, license change or formal Release. The public-preview promise is concrete inputs, clear commands, inspectable outputs and honest limits—not automatic resolution of every research question.

@@ -18,6 +18,54 @@ from simple_ar.code_task.runtime.config import load_code_task_init_options, load
 
 
 class StartTests(unittest.TestCase):
+    def test_native_prepared_approval_prints_bound_command_before_confirmation(self):
+        import hashlib
+        from unittest.mock import MagicMock
+        from simple_ar.cli.main import main
+
+        app = MagicMock()
+        app.session.store.root = Path('saved-task').resolve()
+        app.state = {'config': {'model': None}, 'pending': None}
+        app.measurement_completion_actions.return_value = []
+        proposal = {'id': 'prepared-run', 'type': 'function', 'function': {
+            'name': 'execute_implementation', 'arguments': json.dumps({
+                'prepared_result': 'records/prepared/implementation/result.json'})}}
+        binding = {'argv': ['task-python', 'worker.py', '--literal=two words'],
+            'cwd': str(app.session.store.root / 'workspace/implementations/prepared'),
+            'plan': {'timeout_sec': 7}}
+        token = hashlib.sha256(json.dumps({'call': proposal, 'inputs': binding},
+            sort_keys=True).encode()).hexdigest()
+        lines = []
+        app._owner_execution_binding.return_value = binding
+
+        def confirm(_):
+            command = next(line for line in lines if line.startswith('Prepared command: '))
+            self.assertEqual(json.loads(command.removeprefix('Prepared command: ')), {
+                'argv': binding['argv'], 'cwd': binding['cwd'], 'timeout_sec': 7})
+            return 'n'
+
+        def run(**kwargs):
+            self.assertFalse(kwargs['approve'](proposal, token))
+            return {'status': 'paused'}
+
+        app.run.side_effect = run
+        with patch('simple_ar.app.tool_application.ToolApplication.load', return_value=app), \
+                patch('simple_ar.integrations.llm.LLMClient.from_env', side_effect=AssertionError('No live model')), \
+                patch('simple_ar.cli.main._render_native_result'), \
+                patch('simple_ar.core.console.print_line', side_effect=lines.append), \
+                patch('sys.stdin.isatty', return_value=True), \
+                patch('builtins.input', side_effect=confirm) as prompt:
+            main(['start', '--resume-task', 'saved-task'])
+            prompt.assert_called_once()
+            app._owner_execution_binding.assert_called_once_with(proposal)
+            lines.clear()
+            app._owner_execution_binding.return_value = {**binding, 'argv': ['changed-command']}
+            prompt.reset_mock()
+            with self.assertRaisesRegex(SystemExit, 'changed since approval'):
+                main(['start', '--resume-task', 'saved-task'])
+            prompt.assert_not_called()
+            self.assertFalse(any(line.startswith('Prepared command: ') for line in lines))
+
     def test_project_tasks_main_listing_selection_feedback_and_read_only_boundaries(self):
         from simple_ar.app.tool_application import ToolApplication
         from simple_ar.cli.main import main

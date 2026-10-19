@@ -1900,6 +1900,7 @@ code = "daily"
             (case / "code_task.toml").write_text(
                 '[code_task]\ncode_root = "{config_dir}/source project"\n'
                 'task_file = "{config_dir}/task.md"\n'
+                '[workspace]\nmode = "copy"\n'
                 '[environment]\nmode = "external"\n'
                 f'python_executable = "{Path(sys.executable).as_posix()}"\n'
                 'required_paths = ["{config_dir}/shared data"]\n'

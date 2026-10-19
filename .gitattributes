@@ -1,2 +1,7 @@
 # Linux/AutoDL helpers must stay executable by Bash after Windows checkouts.
 *.sh text eol=lf
+
+# Published framework exports are hash-bound originals, including text sources.
+# Do not change their bytes when a Windows checkout enables autocrlf.
+examples/saved-results-report/report/** -text whitespace=cr-at-eol
+examples/robotics-survey/report/** -text whitespace=cr-at-eol

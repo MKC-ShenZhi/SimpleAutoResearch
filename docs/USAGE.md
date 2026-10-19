@@ -21,9 +21,9 @@ You need Python 3.12+, Git, uv, and ripgrep (`rg`) on the execution host.
 Use the main branch. From a terminal:
 
 ```bash
-git clone --branch main https://github.com/Wchanging/SimpleAutoResearch.git
+git clone --branch main https://github.com/MKC-ShenZhi/SimpleAutoResearch.git
 cd SimpleAutoResearch
-uv sync
+uv sync --locked
 uv run simple-ar start --help
 rg --version
 ```
@@ -94,7 +94,8 @@ environment-only fallback are in
 `--model env` uses the catalog's text/default route when a catalog exists.
 Without a catalog, native tasks require `SIMPLE_AR_LLM_API=chat` in the
 environment or current-directory `.env`; the legacy default is `responses`.
-Responses streaming is unavailable, including for structured tasks.
+Native `start` decisions require Chat; configuring a Responses connection for
+other consumers does not change that requirement.
 
 ### Supply accessible materials
 
@@ -124,6 +125,9 @@ source retrieval nor process proposals. Add access only when the task needs it:
 Access and budgets are retained across feedback and resume.
 `--max-turns` and `--max-tokens` bound model work; available request slots do
 not guarantee that the next request fits the token balance.
+These are resource allowances, not a dollar spending cap. Model and image API
+calls may incur provider charges. Optional catalog prices produce local estimates;
+missing prices or unknown usage do not mean a call was free.
 See [native entry](CLI_REFERENCE.md#native-task-entry-experimental) for limits.
 
 If a process is needed, continue with the printed `Task session` path:
@@ -193,9 +197,10 @@ See the CLI reference for additional allowances and recovery options.
 ## Configure once and continue from the result
 
 Export an annotated native task configuration, review it, then start. Exporting needs no model credentials and creates no task:
+Replace `./my-results` with your accessible results directory before running:
 
 ```bash
-uv run simple-ar start "Inspect these results, compare stability and cost, and make a main figure and explanation as needed" --source ./my-results --model profile:daily --max-processes 16 --max-process-seconds 600 --write-task-config task.toml
+uv run simple-ar start "Inspect these results, compare stability and cost, and make a main figure and explanation as needed" --source ./my-results --model profile:daily --allow-execution --max-processes 16 --max-process-seconds 600 --write-task-config task.toml
 uv run simple-ar start --task-config task.toml
 ```
 
@@ -232,8 +237,9 @@ Reconcile pending, in-flight or unconsumed responses first. A terminated failed 
 
 ## Choose a task and its smallest input
 
-Use the [six workflow recipes](WORKFLOWS.md) for research, code, data, writing,
-reproduction and export. `start --guided` offers outcome preferences for native work.
+Use the [workflow recipes](WORKFLOWS.md) to combine research, code, data, figures,
+writing, reproduction and export. They are examples of composing capabilities,
+not fixed execution flows. `start --guided` offers outcome preferences for native work.
 
 For fixed table columns, validation commands or reproduction protocols, use
 structured configuration. Its recovery commands differ from ordinary tasks;
@@ -249,9 +255,9 @@ This plots supplied demonstration coordinates, not an experiment.
 Native `--prepare-only` still checks the connection and credentials but makes
 no model/process call; structured preparation can save TOML without credentials.
 
-## Local workspace preview (V2.10 branch)
+## Local workspace preview
 
-The development branch includes a thin loopback-only browser client:
+An experimental browser client binds to the local loopback address:
 
 ```bash
 uv run python -m simple_ar.ui --project-root /absolute/materials --task-root /absolute/native-tasks
@@ -262,46 +268,26 @@ model catalog. Open the full URL printed by this process. Keep that URL private:
 its fragment grants access to this local session. Do not expose the port publicly.
 For remote hosts, forward the same port through SSH rather than changing its bind address.
 
-The page lists native tasks in the task root and its direct children, including
-non-ASCII names. Material
+The page lists native tasks in the task root and its direct children. Material
 paths refer to the execution host and must fall within the project root or an
 explicit repeatable `--read-root PATH`. Creating a task saves the confirmed
-connection, sources, access and hard caps; **Continue** starts execution.
-Creation, exact approval and connection changes use one in-page confirmation
-area. Review the frozen recipients/operation and caps, then confirm or cancel
-to edit. Submission disables the confirmation controls and background form;
-polling does not replace the reviewed request. The server still checks the
-original binding/token/confirmation and budget; a displayed snapshot does not
-grant extra access or reserve resources. A failed submission is not retried
-automatically; inspect the current task before making a new request.
-Saved-result browsing is labelled separately from a worker running in this UI.
-Recent activity shows at most 24 accepted tool receipts, newest first across
-requests, with action/attempt identities, recorded failures and saved file
-locators. Pending actions and queued proposals are labelled separately; they
-are not proof of execution or delivery. A retained pending attempt may already
-have a failed preflight receipt. No local worker means only that this UI is not
-running it; external worker state is unknown. Plans are optional model-authored
-intent, not verified progress; only plans in the recent receipt window appear.
-Feedback and exact command approvals use the original task and ledger.
-**Boundary stop** waits for the current action to return; it does not cancel
-an in-flight provider request or process. Keep the launcher alive until it exits.
+connection, sources, permissions and caps; **Continue** starts execution.
+Review the destination, operation and caps before confirming creation, command
+approval or a connection change. After a failed submission, inspect the task
+before trying again. Feedback and approvals continue the same task and ledger.
 
-This is an experimental single-user client, not a sandbox or multi-user service.
-Clicking an authorized evidence/material file inspects a declared canonical
-DocumentBundle through the existing source owner: titles, URLs, extraction
-status, retained chunk counts and a bounded text excerpt. This is declared
-provenance, not verification of originality, claims or exhaustive coverage.
-Ordinary JSON remains text; workspace/attempt documents are not promoted to
-original sources. Downloads retain the existing credential redaction. No
-recursive JSON inspection runs during polling. The source owner's recognition
-limit is 8,000,000 bytes; the file preview/download limit remains 16 MiB and
-directory listings remain limited to 256 entries.
-It previews text and raster images; SVG/HTML are text, and PDFs and other
-supported binary files must be downloaded. File browsing does not certify
-scientific quality or turn an unexecuted candidate into a delivery. Publication
-conversion with a trusted user-provided Pandoc template is available through
-[publication export](WORKFLOWS.md); arbitrary publisher-template adaptation and
-a fully interactive end-to-end acceptance case remain pending.
+Inspect recent activity, saved results and unresolved work. Plans and pending
+proposals are not evidence of execution; an idle UI does not prove that an
+external worker has stopped. **Boundary stop** waits for the current action;
+it does not cancel an in-flight request or process. Keep the launcher alive
+until it exits.
+
+This is a single-user client, not a sandbox or multi-user service. It previews
+text and raster images; SVG/HTML appear as text, and supported binary files
+such as PDFs must be downloaded. Source excerpts show declared provenance,
+not independently verified claims. File previews/downloads are limited to
+16 MiB and directory listings to 256 entries. For trusted Pandoc templates,
+see [publication export](WORKFLOWS.md#supplied-templates).
 
 ## Troubleshooting
 

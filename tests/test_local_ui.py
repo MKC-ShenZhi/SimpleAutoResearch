@@ -6,11 +6,13 @@ import http.client
 import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import tempfile
 import threading
 import unittest
 from urllib.parse import quote
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from simple_ar.app.tool_application import ToolApplication
 from simple_ar.core.budget import BudgetLedger
@@ -25,6 +27,100 @@ def call(name, arguments, identity='test-call'):
 
 
 class LocalWorkspaceTests(unittest.TestCase):
+    def test_text_only_recipient_rendering_keeps_task_loading_available(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            catalog = root / 'models.toml'
+            catalog.write_text('version = 1\n[routes]\ntext = "only"\n[profiles.only]\n'
+                'api = "openai_chat"\nmodel = "fake-text"\nbase_url = "https://text.invalid/v1"\n'
+                'api_key_env = "SAR_UI_TEST_KEY"\ncapabilities = ["text"]\n', encoding='utf-8')
+            workspace = Workspace(root, [], root / 'tasks')
+            with patch.dict(os.environ, {'SIMPLE_AR_MODELS_CONFIG': str(catalog),
+                    'SAR_UI_TEST_KEY': 'fake-ui-credential'}), \
+                    patch.object(LLMClient, '_complete_request', side_effect=AssertionError('No provider traffic')):
+                profile, = workspace.profiles()
+            self.assertTrue(profile['default'])
+            self.assertIsNone(profile['recipients']['code'])
+            self.assertEqual(profile['recipients']['writing']['model'], 'fake-text')
+            node = shutil.which('node')
+            if node is None:
+                self.skipTest('Node is required for the recipient JavaScript regression')
+            from simple_ar import ui
+            source = (Path(ui.__file__).parent / 'ui_assets/app.js').read_text(encoding='utf-8')
+            # Execute the real renderer with its minimal DOM contract. A null
+            # recipient must not throw before the following refresh is reached.
+            renderer = source[source.index('function recipient()'):source.index('function effectiveAccess()')]
+            script = """
+const assert = require('node:assert/strict');
+const metadata = {profiles: [JSON.parse(process.argv[1])]};
+const elements = {profile: {value: metadata.profiles[0].selector}, recipient: {textContent: ''}};
+const $ = id => elements[id];
+""" + renderer + """
+let refreshed = false;
+recipient(); refreshed = true;
+assert.equal(refreshed, true);
+assert.match(elements.recipient.textContent, /code → 不可用/);
+assert.match(elements.recipient.textContent, /task → fake-text/);
+assert.match(elements.recipient.textContent, /writing → fake-text/);
+"""
+            result = subprocess.run([node, '-e', script, json.dumps(profile)],
+                capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_prepared_approval_shows_owner_bound_command_and_rejects_changed_inputs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            project = root / 'project'
+            project.mkdir()
+            runner = project / 'runner.py'
+            runner.write_text('print("original")\n', encoding='utf-8')
+            workspace = Workspace(project, [], root / 'tasks')
+            app = ToolApplication.create(workspace.task('prepared'), 'Inspect a prepared command',
+                model=None, sources={'source0': project}, allow_execution=True)
+            client = Mock()
+            client._budget_ledger = None
+            client.ask_json.return_value = {'summary': 'Candidate only', 'unresolved': [],
+                'files': [{'path': 'worker.py', 'content': 'print("candidate")\n'}],
+                'execution_plan': {'argv': ['python', 'source0/runner.py'],
+                    'outputs': ['result.txt'], 'timeout_sec': 7}}
+            app.implementation.client_factory = lambda _: client
+            with patch.object(LLMClient, '_complete_request', side_effect=AssertionError('No provider traffic')), \
+                    patch('simple_ar.tools.workspace.run_process', side_effect=AssertionError('No process execution')):
+                app.run(actions=[call('prepare_implementation', {'goal': 'Prepare a command'})], progress=lambda _: None)
+                result = app.session.store.read_json(app.state['turns'][-1]['tools'][0]['result'])
+                self.assertEqual(result['status'], 'ok', result.get('error'))
+                app.run(actions=[call('execute_implementation', {
+                    'prepared_result': result['data']['prepared_result']})], progress=lambda _: None)
+                pending = app.state['pending']
+                token = app.approval_token(pending['call'])
+                before = {p.relative_to(app.session.store.root): p.read_bytes()
+                    for p in app.session.store.root.rglob('*') if p.is_file()}
+                with patch.object(ToolApplication, 'load', side_effect=AssertionError('GET must not load an application')), \
+                        patch.object(Path, 'mkdir', side_effect=AssertionError('GET must not create directories')):
+                    view = workspace.snapshot('prepared')
+                self.assertEqual(view['approval']['token'], token)
+                self.assertEqual(view['approval']['execution'], {
+                    'argv': [str(app.workspace.python), str(runner)],
+                    'cwd': result['data']['project_dir'], 'timeout_sec': 7})
+                self.assertIsNone(view['approval_unavailable'])
+                self.assertEqual(before, {p.relative_to(app.session.store.root): p.read_bytes()
+                    for p in app.session.store.root.rglob('*') if p.is_file()})
+                runner.write_text('print("replacement")\n', encoding='utf-8')
+                changed = workspace.snapshot('prepared')
+                self.assertIsNone(changed['approval'])
+                self.assertTrue(changed['approval_unavailable'])
+                runner.write_text('print("original")\n', encoding='utf-8')
+                self.assertEqual(workspace.snapshot('prepared')['approval']['token'], token)
+                candidate = Path(result['data']['project_dir']) / 'worker.py'
+                candidate.write_text('print("unregistered change")\n', encoding='utf-8')
+                self.assertIsNone(workspace.snapshot('prepared')['approval'])
+                candidate.write_text('print("candidate")\n', encoding='utf-8')
+                (app.session.store.root / 'evidence').rmdir()
+                with patch.object(ToolApplication, 'load', side_effect=AssertionError('GET must not repair a task')), \
+                        patch.object(Path, 'mkdir', side_effect=AssertionError('GET must not repair directories')):
+                    self.assertIsNone(workspace.snapshot('prepared')['approval'])
+                self.assertFalse((app.session.store.root / 'evidence').exists())
+
     def test_http_owner_feedback_approval_records_and_guards(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary).resolve()
@@ -230,11 +326,12 @@ class LocalWorkspaceTests(unittest.TestCase):
                 action('approve', token=view['approval']['token'])
                 process = json.loads(request(f'/api/task?task={name}')[1])['activity'][0]
                 self.assertEqual(process['tool'], 'run_process')
-                self.assertEqual(process['status'], 'ok')
+                self.assertEqual(process['status'], 'error')
                 self.assertEqual(process['observed']['returncode'], 7)
                 original = json.loads((root / process['record']).read_text())
                 self.assertEqual(original['status'], process['status'])
                 self.assertEqual(original['data']['returncode'], process['observed']['returncode'])
+                self.assertIn('Process failed or stopped', original['error'])
                 ledger = BudgetLedger.load(root / 'budget_ledger.json')
                 self.assertEqual(ledger.remaining('process_invocations'), 0)
                 self.assertEqual(request('/api/action', {'op': 'stop', 'task': name})[0], 400)

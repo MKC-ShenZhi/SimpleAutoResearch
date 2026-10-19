@@ -16,8 +16,10 @@ Complete [model setup](USAGE.md) first. Replace `SESSION` and example paths with
 | Write from existing materials | [Writing and publication](#writing-and-publication) |
 | Check a result from a paper | [Finite reproduction](#finite-reproduction) |
 
-These are starting points, not exclusive modes. A task can investigate sources, change code,
-run calculations and produce a report. Existing results can be reused without rerunning experiments.
+These recipes compose capabilities, rather than select fixed execution flows.
+A task can investigate sources, change code, run calculations and produce a report.
+Existing results can be reused without rerunning experiments. Grant only the access
+needed by the recipe; commands still need approval and model/API calls may incur charges.
 
 ## Direction research
 
@@ -199,7 +201,7 @@ Use a new output directory. Keep the whole project, figures and logs, and inspec
 Compilation does not certify conference compliance.
 See the [CLI reference](CLI_REFERENCE.md) for files and dependencies.
 
-### Supplied templates (V2.10 development)
+### Supplied templates
 
 Native tasks can use a trusted **Pandoc LaTeX template** instead of the built-in ACM layout:
 
@@ -227,35 +229,20 @@ contract. Only use trusted TeX: no shell escape is enabled, but this is not a sa
 Inspect warnings and every page. Fonts, explicit column widths, page limits and
 anonymity still require checking; compilation alone does not establish compliance.
 
-For finite rules explicitly supplied by the user, `export_report` also accepts
-`"checks": {"max_pages": 4, "forbidden_identifiers": ["Example Author", "某研究所"]}`.
-Either rule can be omitted; the object must contain at least one. `max_pages`
-is a positive integer counting **all** PDF pages, including references/appendices.
-Identifiers are 1–32 unique, nonblank literal strings, each at most 200 Unicode
-characters without control characters. Matching is case-sensitive exact substring
-matching, without regex, normalization, whitespace joining or OCR. Supply the actual
-identifiers to check; the assistant must not infer author identities or venue rules.
+You can also ask the assistant to check a page limit or specific identifying
+strings you supply. The shared `export_report` tool accepts, for example,
+`"checks": {"max_pages": 4, "forbidden_identifiers": ["Example Author"]}`;
+either rule may be omitted. These checks require PDF compilation and installed
+Poppler `pdfinfo` and/or `pdftotext`, and use the same command approval and process
+budget. The standalone `report-export` CLI does not expose these options.
 
-Checks require `compile_pdf=true` and existing Poppler `pdfinfo` (page count) and/or
-`pdftotext -enc UTF-8` (text). Each requested observation uses the same approved
-runner/process ledger: at most 30 seconds per tool, PDF at most 32 MB, page-info
-output at most 64 KB and UTF-8 text at most 1 MB. No tools, fonts or packages are
-installed. Page and text results are separate in `export.json` under `checks`;
-accepted output is retained in `checks/pdfinfo.txt` and/or `checks/text.txt`, with
-evidence hashes and the checked PDF hash. Inspect those files and process receipts.
-No extractable text, replacement characters, unavailable tools, exceeded bounds,
-truncated output or failed rules prevent optional final delivery while preserving
-the editable project and diagnostics. No automatic edits, suppression of facts or
-extra compilation attempts follow a check failure.
-
-A literal miss only means the supplied string was absent from extracted text.
-Images, PDF metadata and indirect identity are not covered; anonymity, visual
-quality and official compliance remain unverified.
-Successful and failed declared checks share the existing output byte binding.
-Reading a saved result does not rerun checks, and changed files require a new
-export identity. Omitted checks preserve historical request/manifest bindings;
-old exports acquire no retroactive check evidence. The standalone `report-export`
-CLI has no new flags; this optional declaration belongs to the shared tool.
+Page limits count all pages, including references and appendices. String checks
+match case-sensitive literal substrings in extracted text; they do not cover
+images, metadata or indirect identification, and do not certify anonymity.
+Inspect `export.json` and the retained `checks/pdfinfo.txt` or `checks/text.txt`.
+Failed or unavailable checks block optional final delivery but retain the project
+and diagnostics. They do not automatically revise the manuscript. Reading a saved
+result does not rerun checks; changed files need a new export.
 
 Model-based visual inspection additionally needs a configured vision connection
 and explicit `--allow-vision`; rendering alone does not grant it.

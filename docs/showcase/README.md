@@ -1,57 +1,63 @@
-# Delivered work
+# See what the assistant delivered
 
-[中文](README_zh.md) · [Project home](../../README.md)
+[中文](README_zh.md) · [Get started](../USAGE.md) · [Evidence and limits](../EVALUATION.md)
 
-These examples show artifacts produced through SimpleAutoResearch's native task and feedback path during development acceptance. They are not benchmarks or promises of unattended completion. Humans supplied goals, approvals and independent checks; framework fixes and additional authorized budgets were needed. No manually authored RSI report is presented here as framework output.
+The framework generated the scientific prose, figures and code—not a maintainer ghostwriting the result. People supplied goals, approvals, defect feedback, environment setup and independent checks. Framework repairs and explicit continuations occurred during development: these cases are not one-shot success or cost guarantees.
 
-## Bike Sharing: from observations to a revised report
+## Saved results: analysis, figure feedback and a report
 
-**The task.** Analyse the public [UCI Bike Sharing dataset](https://doi.org/10.24432/C5W894), explain patterns and limitations, and deliver rerunnable analysis, a figure and a report. The input included daily and hourly files plus their description; the analysis used 731 daily observations from 2011–2012, without pooling daily and hourly rows.
+**Request:** compare model form, monthly updates, coverage and recorded computation cost without repeating the experiment.
 
-**The feedback.** Break the year-to-year comparison down by working-day status and distinguish within-group changes from changes in the mix of days. Preserve the original accepted tables.
+**Delivery:** a six-page PDF, five-panel figure, four tables, frozen inputs, plotting source and editable TeX. Feedback corrected timing aggregates, figure labels and unsupported application interpretations.
 
-![Revised six-panel analysis](assets/bike-sharing-revised.png)
+[Read the report](../../examples/saved-results-report/report/report.pdf) · [Replay tables/figures and rebuild the PDF](../../examples/saved-results-report/README.md) · [File provenance and hashes](../../examples/saved-results-report/provenance.json)
 
-**The delivery.** The framework generated analysis code, numerical tables, the revised figure and manuscript, and an ACM export. The public selection contains the figure and [four-page PDF](assets/bike-sharing-report.pdf); the original acceptance package also retained scripts, data references and rebuild materials.
+![Five-panel result analysis](../../examples/saved-results-report/report/figures/monthly_update_panel.png)
 
-[![First page of the delivered report](assets/bike-sharing-report-page-1.png)](assets/bike-sharing-report.pdf)
+Independent verification covered 72 numerical conditions and relocated rebuilds; all six final pages were inspected separately. Findings apply to these saved results: no uncertainty intervals, machine-specific timings, annualised cost scenarios rather than measurements, and no established physical domain or target units. Native status remains `partial`.
 
-Independent checking recomputed 732 table cells with no differences and checked relocation/rebuilding. The saved content review records no manual rewriting of the canonical manuscript. These checks support this artifact, not all possible analyses.
+## Robotics: a direction becomes a technical survey
 
-**What remains imperfect.** This is descriptive observational analysis, not evidence of causality or independent repeated experiments. Dense figure labels, awkward code and table wrapping, and a sparse last page remain visible. Compilation is not a scientific quality score.
+**Request:** compare what VLA policies and world models predict, where prediction enters control, and the breadth of the evidence.
 
-**Cost and version context.** The saved run records 63 physical model requests, 2,027,970 settled tokens and 40 process invocations including compilation. Five unknown-use reservations totaling 127,644 tokens were retained separately. The original 40-request/1.6M-token allowance was insufficient; four additional bounded authorizations were recorded. Publication continued through r1–r3 development candidates, including a caption-ownership fix. This was not a single frozen-version, single-budget success.
+**Delivery:** a ten-page PDF, 16 references, two explanatory figures, two tables, a Chinese brief and editable Markdown/LaTeX. Figures explain mechanisms and evidence, not invented cross-paper performance rankings.
 
-## Study figure: feedback without repeating the experiment
+[Read the survey](../../examples/robotics-survey/report/survey.pdf) · [中文简报](../../examples/robotics-survey/report/briefing_zh.md) · [Source and rebuild instructions](../../examples/robotics-survey/README.md) · [File provenance and hashes](../../examples/robotics-survey/provenance.json)
 
-**The task.** Turn already recorded air-quality calibration results into an editable explanatory figure. Then revise it for a single-column, grayscale presentation, separating fitting, prediction and evaluation.
+![Where prediction enters control](../../examples/robotics-survey/report/figures/fig1_prediction_in_loop.png)
 
-| Initial figure | Feedback version |
-| --- | --- |
-| ![Initial study figure](assets/study-figure-before.png) | ![Revised study figure](assets/study-figure-after.png) |
+This is not a comprehensive 2026 review: most sources are from 2024–2025, only two from 2026; some acquired full text was underused and some author metadata remains unverified. The final report passed independent page inspection and relocated compilation, not complete automated vision sign-off. Native status remains `partial`.
 
-The first figure had layout collisions and its visual check encountered a service failure; it was not a passing final artifact. The feedback version changed the layout and hierarchy while using existing recorded measurements. It did not retrain a model, run a new experiment or establish external-site validity.
+## Landscape comparison: a current, replayable export
 
-The original task delivered editable drawing source and exports. Independent review recorded two relocated drawing rebuilds with byte-identical rasters and 132 original files unchanged. This public selection publishes the before/after PNGs, not the complete execution archive.
+This earlier case is a convenient no-key first exercise: turn a largely textual result into paired visual comparisons while retaining eight values, units and the two model scales.
 
-The run records 34 model requests, 864,326 settled tokens and four processes; five unknown-use reservations remain in its ledger. Goals, execution permissions and review were human-supplied.
-
-## Landscape comparison: a current replayable export
-
-On the frozen `f45b596` candidate, feedback asked for visual Frozen/Monthly comparisons rather than a mostly textual error table, preserving all eight values, units and model-family scale distinctions.
-
-| Exported initial figure | Delivered feedback revision |
+| Initial export | After feedback |
 | --- | --- |
 | ![Before](assets/landscape-feedback-before.png) | ![After](assets/landscape-feedback-after.png) |
 
-The framework edited source/caption, rendered, inspected the actual image and delivered a separate version; the maintainer did not rewrite it. Independent checks matched eight displayed values, preserved five input data files and obtained byte-identical main/preview PNGs after moving the project in the same environment. The task used 11 physical requests/211,774 recorded tokens and one 2.56-second render, with no extension or new unknown charge. An earlier failed task remains failed with separate costs; this was a separately authorized bounded task using exported initial materials.
+[Copy the replay command](../../examples/figure-feedback/README.md). Generation used `f45b596`; independent checks verified the eight values and frozen data, and relocated replay matched both PNGs in the same environment. There was no refitting. Original `partial` status and caption limitations remain.
 
-[Source, data, attribution and a no-API replay command](../../examples/figure-feedback/README.md) are now included in a checkout. The preserved caption has a minor orientation-wording issue; native `partial`, scientific/print limits and replay-platform scope remain explicit. This does not turn this selected case into a success-rate benchmark.
+## Human involvement, versions and cost
 
-## Provenance and reuse
+The two new final deliveries were checked on code equivalent to `d3b0721`, whose fixes are included in main. Public scientific files are byte-identical selections from the deliveries; maintainers wrote the tutorials. Full conversations, journals, prior failures and acquired paper full texts are not redistributed.
 
-The published files are byte-for-byte copies of saved acceptance artifacts, not redesigned marketing mockups. [Artifact checksums and source identities](artifacts.json) distinguish the two tasks and versions. Source identities are repository-relative development records; those ignored run archives are not included in a checkout.
+| Case | Settled physical requests | Settled tokens | Scope |
+| --- | ---: | ---: | --- |
+| Saved-result analysis report | 180 | 5,871,880 | All stages, multiple candidates/connections and explicit continuations |
+| Robotics survey | 164 | 6,086,900 | All stages, multiple candidates/connections and explicit continuations |
+| Landscape figure feedback | 11 | 211,774 | One bounded feedback task; earlier failures recorded separately |
 
-The Bike Sharing data is attributed to UCI and Fanaee-T & Gama, *Event labeling combining ensemble detectors and background knowledge*, [DOI](https://doi.org/10.1007/s13748-013-0040-3). Consult upstream data terms before reuse. The report selections are not full reproduction bundles. The new figure example includes a small saved-result replay export, not original training or the complete execution archive. See [evidence and limits](../EVALUATION.md) for basic scope, costs and benchmark status.
+Final writing for the first two used official `deepseek-flash`, low thinking and streaming—not one model throughout. Unknown usage remains reserved in the original journals, not treated as zero or released. These are development histories, not ordinary single-task costs or monetary bills. **Offline replay makes no model calls; a fresh generation has new costs and may produce different results.**
 
-To try your own task, use [Get started](../USAGE.md) and [Task guides](../WORKFLOWS.md). Actual model cost, iteration count and output quality depend on the task and services.
+## Earlier results
+
+These retain their original version context; they were not regenerated on the latest candidate:
+
+- **UCI Bike Sharing:** [four-page ACM report](assets/bike-sharing-report.pdf) and [six-panel figure](assets/bike-sharing-revised.png). Analysis used 731 daily observations; feedback separated within-group changes from composition changes. Independent recalculation matched 732 table cells. Across development candidates: 63 physical requests, 2,027,970 settled tokens and 127,644 unknown reservations. Not causal research or single-budget success.
+- **Method figure feedback:** [initial](assets/study-figure-before.png) and [single-column grayscale revision](assets/study-figure-after.png). Reused saved air-quality calibration results without new experiments; 34 requests and 864,326 settled tokens, with five unknown reservations retained. The initial layout had defects and is not a passing final result.
+- [Historical display-file hashes](artifacts.json) cover these earlier exports. Each new case has its own `provenance.json`; do not mix the versions.
+
+Bike Sharing comes from [UCI](https://doi.org/10.24432/C5W894); earlier air-quality results from [UCI Air Quality](https://doi.org/10.24432/C59K5F). Check upstream terms before reuse. Project licensing remains undecided; this page grants no additional rights to third-party material.
+
+For your own files, start with [Get started](../USAGE.md). For remaining reliability boundaries, read [Evidence and limits](../EVALUATION.md).

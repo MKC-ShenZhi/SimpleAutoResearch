@@ -19,9 +19,9 @@
 在终端执行：
 
 ```bash
-git clone --branch main https://github.com/Wchanging/SimpleAutoResearch.git
+git clone --branch main https://github.com/MKC-ShenZhi/SimpleAutoResearch.git
 cd SimpleAutoResearch
-uv sync
+uv sync --locked
 uv run simple-ar start --help
 rg --version
 ```
@@ -88,7 +88,8 @@ uv run simple-ar models --profile daily --purpose code
 [命名连接](CONFIG_REFERENCE_zh.md#命名模型连接)。
 有目录时，`--model env` 使用 text/default 路由。
 无目录时，原生任务须在环境或当前目录 `.env` 设置 `SIMPLE_AR_LLM_API=chat`；
-旧连接默认是 `responses`。Responses 不支持流式，结构化任务也不例外。
+旧连接默认是 `responses`。
+原生 `start` 的模型决策仍要求 Chat；为其他用途配置 Responses 连接不会改变这一要求。
 
 ### 提供可访问的材料
 
@@ -117,6 +118,8 @@ uv run simple-ar start "根据所给曲线数据与配置写一份简短 Markdow
 
 反馈与恢复沿用访问权限和预算。
 `--max-turns`、`--max-tokens` 限制模型工作；剩余请求次数不保证下一次请求能放入 token 余额。
+这些是资源额度，不是美元费用上限。模型和图像 API 调用可能产生服务商费用。
+模型目录中的可选价格仅用于本地估算；缺少价格或用量未知不表示免费。
 具体限额见[原生入口](CLI_REFERENCE_zh.md#原生任务入口实验性)。
 
 需要进程时，用打印的 `Task session` 路径续跑：
@@ -183,9 +186,10 @@ uv run simple-ar start --resume-task "SESSION"
 ## 配置一次，围绕成果继续
 
 可以先生成带关键注释的原生任务配置，编辑后启动。生成配置不需要模型凭据，也不创建任务：
+执行前，将 `./my-results` 替换为可访问的实际结果目录：
 
 ```bash
-uv run simple-ar start "检查这些实验结果，解释稳定性与开销，按需要制作主图和结果说明" --source ./my-results --model profile:daily --max-processes 16 --max-process-seconds 600 --write-task-config task.toml
+uv run simple-ar start "检查这些实验结果，解释稳定性与开销，按需要制作主图和结果说明" --source ./my-results --model profile:daily --allow-execution --max-processes 16 --max-process-seconds 600 --write-task-config task.toml
 uv run simple-ar start --task-config task.toml
 ```
 
@@ -221,7 +225,8 @@ uv run simple-ar start --resume-task SESSION "继续修改已有报告"
 
 ## 选择任务与最小输入
 
-[六项工作流配方](WORKFLOWS_zh.md)覆盖调研、代码、数据、写作、复现和导出。
+[工作流配方](WORKFLOWS_zh.md)展示调研、代码、数据、图形、写作、复现和导出的组合方式，
+不是固定执行流程。
 `start --guided` 提供原生成果偏好。
 
 需要固定表格列、验证命令或复现协议时，可使用结构化配置。
@@ -237,9 +242,9 @@ uv run simple-ar research-session --config examples/data-curves/research.toml
 原生 `--prepare-only` 仍检查连接与凭据，但不调用模型或进程；
 结构化准备可在无凭据时保存 TOML。
 
-## 本地工作区预览（V2.10 分支）
+## 本地工作区预览
 
-开发分支提供仅绑定本机回环地址的薄浏览器界面：
+实验性浏览器界面仅绑定本机回环地址：
 
 ```bash
 uv run python -m simple_ar.ui --project-root /absolute/materials --task-root /absolute/native-tasks
@@ -249,31 +254,21 @@ uv run python -m simple_ar.ui --project-root /absolute/materials --task-root /ab
 链接片段是本次本地会话的访问凭据，请勿分享或公开端口。
 远程服务器使用 SSH 转发相同端口，不修改绑定地址。
 
-页面列出任务根目录及其直接子目录中的原生任务，支持中文等非 ASCII 目录名。材料路径属于执行主机，
+页面列出任务根目录及其直接子目录中的原生任务。材料路径属于执行主机，
 必须在项目根目录或显式重复指定的 `--read-root PATH` 内。
-创建只保存已确认的连接、材料、权限和硬上限，点“继续执行”才开始工作。
-创建、精确批准和换连接共用页面内确认区：核对冻结的接收方/操作与额度，
-再确认或取消返回修改。提交时禁用确认控件和后台表单，轮询不替换已核对请求。
-服务端仍核对原 binding、token、确认和账本；所示快照不新增权限或预留资源。
-失败不会自动重试；再次请求前先检查当前任务。
-界面明确区分保存成果浏览与本界面的实时工作线程；
-最近活动按新到旧展示最多 24 项跨请求的已接受工具回执，包括动作/attempt 身份、
-原失败和保存文件定位。pending 动作与保留提案单独标明，不代表已执行或交付；
-保留的 pending attempt 也可能已有失败的预检回执。本界面无线程运行时，外部线程状态仍未知。
-计划可选，由模型编写，只表示意图；只展示最近回执窗口内的当前请求计划，不当作已验证进度。
-反馈和精确命令批准沿原任务及账本继续。
-“边界停止”等当前行动返回，不表示提供方请求或进程已取消；
-请保持启动进程，直到它正常退出。
+创建只保存已确认的连接、材料、权限和额度，点“继续执行”才开始工作。
+创建、批准命令或更换连接前，先核对接收方、操作与额度；
+提交失败后先检查任务，再决定是否重试。反馈和批准沿原任务及账本继续。
 
-点击已授权的证据/材料文件时，既有来源 owner 识别声明的标准 DocumentBundle，
-展示标题、URL、提取状态、保留文本块数及有限摘录；这些是声明的来源信息，
-不认证原始性、主张或穷尽覆盖。普通 JSON 仍按文本显示，workspace/attempt 文档不会被提升为原始来源。
-下载沿用既有凭据脱敏；轮询不递归解析 JSON。来源 owner 的识别上限为 8,000,000 字节，
-文件预览/下载仍限 16 MiB，目录列表仍限 256 项。
-这是实验性单用户客户端，不是沙箱或多用户服务。支持文本及位图预览，SVG/HTML 按文本显示，
-PDF 等支持的二进制文件下载后查看。浏览文件不认证科研质量，不把未执行候选当正式交付。
-可信用户 Pandoc 模板转换已可通过[出版导出](WORKFLOWS_zh.md)使用；
-任意出版方模板适配及完整实时交互用户验收仍待完成。
+检查最近活动、保存成果和未完成项。计划和待批准提案不是执行证据；
+界面空闲也不能证明外部工作进程已停止。“边界停止”等当前行动返回，
+不会取消在途请求或进程。请保持启动进程，直到它正常退出。
+
+这是单用户客户端，不是沙箱或多用户服务。支持文本及位图预览，
+SVG/HTML 按文本显示，PDF 等支持的二进制文件下载后查看。
+来源摘录只展示声明的来源信息，不独立验证主张。
+文件预览/下载限 16 MiB，目录列表限 256 项。
+可信 Pandoc 模板的使用见[出版导出](WORKFLOWS_zh.md#使用提供的模板)。
 
 ## 排错
 

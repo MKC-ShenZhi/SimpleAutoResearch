@@ -363,14 +363,18 @@ class WorkspaceToolGateway:
         return False
 
     def __init__(self, root: Path, sources: dict[str, Path], ledger: BudgetLedger,
-                 project_python: Path | None = None, record_artifacts: Any | None = None) -> None:
+                 project_python: Path | None = None, record_artifacts: Any | None = None,
+                 create_workspace: bool = True) -> None:
         self.root = root.resolve()
         # Keep a venv's entry path, not its resolved system-Python symlink.
         self.python = (project_python or Path(sys.executable)).expanduser().absolute()
         if not self.python.is_file():
             raise ValueError("Task Python interpreter is unavailable")
         self.workspace = self.root / "workspace"
-        self.workspace.mkdir(exist_ok=True)
+        if create_workspace:
+            self.workspace.mkdir(exist_ok=True)
+        elif not self.workspace.is_dir():
+            raise ValueError('Existing task workspace is unavailable')
         self.mounts = {"workspace": self.workspace, **{name: path.resolve() for name, path in sources.items()}}
         if "workspace" in sources:
             raise ValueError("Sources cannot replace the writable workspace mount")

@@ -548,7 +548,8 @@ class CodeTaskInterfaceTests(unittest.TestCase):
                 root = Path(tmp)
                 source = root / 'source'
                 original = 'VALUE = 1\n# Preserve the complete original.\n'
-                write_text(source / 'library.py', original)
+                source.mkdir()
+                (source / 'library.py').write_bytes(original.encode('utf-8'))
                 write_text(source / 'method.txt', 'Original method definition.\n')
                 ledger = BudgetLedger({'llm_requests': 2})
                 workspace = WorkspaceToolGateway(root, {'source': source}, ledger)
@@ -587,16 +588,20 @@ class CodeTaskInterfaceTests(unittest.TestCase):
                     ledger.settle(label, {'llm_requests': 1})
                     request = json.loads(prompt)
                     if label == 'implementation-selection':
+                        self.assertEqual(inputs, 'project')
                         self.assertFalse(output.exists())
                         self.assertEqual(request['goal'], arguments['goal'])
-                        if inputs in ('goal', 'windows'):
-                            self.assertIsNone(request['project_path'])
-                            self.assertNotIn('project_index', request)
-                        if inputs == 'windows':
-                            self.assertIn('Original method definition.', str(request['source_windows']))
+                        self.assertEqual(request['project_path'], str(source.resolve()))
+                        self.assertIn('project_index', request)
                         return {'files': selected}
-                    self.assertEqual([row['path'] for row in request['planned_files']],
-                        ['library.py', 'USAGE.md'])
+                    self.assertEqual(label, 'implementation-unit')
+                    self.assertEqual(request['goal'], arguments['goal'])
+                    if inputs in ('goal', 'windows'):
+                        # New units choose files and content in one writer call.
+                        self.assertIsNone(request['planned_files'])
+                    else:
+                        self.assertEqual([row['path'] for row in request['planned_files']],
+                            ['library.py', 'USAGE.md'])
                     self.assertEqual(request['execution_observations'], observations.return_value)
                     if inputs in ('project', 'saved_project'):
                         self.assertEqual(request['original_files']['library.py']['text'], original)
@@ -623,14 +628,23 @@ class CodeTaskInterfaceTests(unittest.TestCase):
                     self.assertEqual(result.status, 'ok', result.error)
                     if inputs in ('goal', 'windows', 'explicit'):
                         inventory_calls.assert_not_called()
-                self.assertEqual((source / 'library.py').read_text(), original)
-                self.assertEqual((output / 'library.py').read_text(),
-                    original.replace('VALUE = 1', 'VALUE = 2') if inputs in ('project', 'saved_project') else 'VALUE = 2\n')
+                self.assertEqual((source / 'library.py').read_bytes(), original.encode('utf-8'))
+                self.assertEqual((output / 'library.py').read_bytes(),
+                    (original.replace('VALUE = 1', 'VALUE = 2') if inputs in ('project', 'saved_project')
+                        else 'VALUE = 2\n').encode('utf-8'))
                 self.assertFalse((output / 'main.py').exists())
                 self.assertEqual(result.data['unresolved'], ['Execution remains to be verified.'])
-                self.assertEqual(client.ask_json.call_count, 1 if inputs in ('saved_project', 'explicit') else 2)
-                self.assertEqual(ledger.remaining('llm_requests'), 1 if inputs in ('saved_project', 'explicit') else 0)
+                self.assertEqual(client.ask_json.call_count, 2 if inputs == 'project' else 1)
+                self.assertEqual(ledger.remaining('llm_requests'), 0 if inputs == 'project' else 1)
                 factory.assert_called_once_with('unit')
+                if inputs in ('goal', 'windows'):
+                    binding = read_json(owner / 'request.json')
+                    self.assertEqual(binding['generation_method'], 'direct_creation.v1')
+                    self.assertEqual(binding['request']['files'], [])
+                    self.assertFalse((owner / 'selection-input.json').exists())
+                    self.assertFalse((owner / 'selection.json').exists())
+                    self.assertEqual([row['path'] for row in result.data['files']],
+                        ['library.py', 'USAGE.md'])
                 if inputs == 'explicit':
                     binding = read_json(owner / 'request.json')
                     self.assertNotIn('selection', binding)
@@ -662,26 +676,43 @@ class CodeTaskInterfaceTests(unittest.TestCase):
         from simple_ar.tools.implementation import ImplementationToolGateway
         from simple_ar.tools.workspace import WorkspaceToolGateway
 
-        for failure in ('traversal', 'private', 'missing_project', 'overlap',
-                        'unknown_selection', 'unknown_writer', 'budget'):
-            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmp:
+        cases = [('project', failure) for failure in (
+            'traversal', 'private', 'missing_project', 'overlap',
+            'unknown_selection', 'unknown_writer', 'budget')]
+        cases += [('direct', failure) for failure in (
+            'traversal', 'private', 'unknown_writer', 'budget')]
+        for route, failure in cases:
+            with self.subTest(route=route, failure=failure), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 ledger = BudgetLedger({'llm_requests': 1 if failure == 'budget' else 2})
                 workspace = WorkspaceToolGateway(root, {}, ledger)
                 arguments = {'goal': 'Create a library.'}
+                if route == 'project':
+                    write_text(workspace.workspace / 'source/library.py', 'VALUE = 1\n')
+                    arguments['project_path'] = 'workspace/source'
                 if failure in ('missing_project', 'overlap'):
                     arguments['project_path'] = 'workspace/missing' if failure == 'missing_project' else 'workspace'
                 client = Mock()
                 client._budget_ledger = ledger
+                physical_calls = []
 
                 def respond(_system, _prompt, *, label, **_kwargs):
-                    ledger.reserve(label, {'llm_requests': 1})
+                    # Corrections are new physical attempts, not idempotent
+                    # reuses of an already settled logical-label reservation.
+                    reservation = f'{label}:{client.ask_json.call_count}'
+                    ledger.reserve(reservation, {'llm_requests': 1})
+                    physical_calls.append(label)
                     if ((failure == 'unknown_selection' and label == 'implementation-selection')
                             or (failure == 'unknown_writer' and label == 'implementation-unit')):
-                        ledger.mark_unknown(label, reason='Interrupted response')
+                        ledger.mark_unknown(reservation, reason='Interrupted response')
                         raise LLMStreamError('Incomplete response')
-                    ledger.settle(label, {'llm_requests': 1})
+                    ledger.settle(reservation, {'llm_requests': 1})
                     path = '../escape.py' if failure == 'traversal' else '.env' if failure == 'private' else 'library.py'
+                    if label == 'implementation-unit':
+                        # Budget's completed invalid response needs correction,
+                        # but the exhausted ledger must prevent that dispatch.
+                        return {'files': [{'path': path, **({} if failure == 'budget'
+                            else {'content': 'VALUE = 2\n'})}]}
                     return {'files': [{'path': path, 'purpose': 'Library implementation.'}]}
 
                 client.ask_json.side_effect = respond
@@ -691,8 +722,29 @@ class CodeTaskInterfaceTests(unittest.TestCase):
                 self.assertEqual(result.status, 'error')
                 calls = client.ask_json.call_count
                 self.assertEqual(calls, 0 if failure in ('missing_project', 'overlap')
-                    else 2 if failure in ('unknown_writer', 'budget') else 1)
+                    else 2 if (route == 'project' and failure in ('unknown_writer', 'budget')
+                        or route == 'direct' and failure in ('traversal', 'private')) else 1)
+                if failure in ('missing_project', 'overlap'):
+                    expected_physical = []
+                elif route == 'project':
+                    expected_physical = ['implementation-selection']
+                    if failure == 'unknown_writer':
+                        expected_physical.append('implementation-unit')
+                else:
+                    expected_physical = ['implementation-unit'] * calls
+                self.assertEqual(physical_calls, expected_physical)
+                self.assertEqual(len(ledger.entries), len(expected_physical))
+                if failure.startswith('unknown'):
+                    self.assertIsNone(ledger.remaining('llm_requests'))
+                    self.assertEqual(ledger.entries[-1].status, 'unknown')
+                else:
+                    self.assertEqual(ledger.remaining('llm_requests'),
+                        (1 if failure == 'budget' else 2) - len(expected_physical))
                 self.assertFalse((workspace.workspace / 'implementations/unit').exists())
+                self.assertFalse((workspace.workspace / 'implementations/escape.py').exists())
+                self.assertFalse((workspace.workspace / 'escape.py').exists())
+                if route == 'project':
+                    self.assertEqual((workspace.workspace / 'source/library.py').read_text(), 'VALUE = 1\n')
                 before = ledger.to_dict()
                 self.assertEqual(gateway.call('prepare_implementation', arguments, identity='unit').status, 'error')
                 self.assertEqual(client.ask_json.call_count, calls)

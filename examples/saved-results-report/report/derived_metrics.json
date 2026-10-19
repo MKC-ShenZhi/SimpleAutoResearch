@@ -1,0 +1,339 @@
+{
+  "scope": {
+    "test_hours": 3493,
+    "months": [
+      "2004-11",
+      "2004-12",
+      "2005-01",
+      "2005-02",
+      "2005-03",
+      "2005-04"
+    ],
+    "test_period": [
+      "2004-11-01T00:00:00",
+      "2005-04-04T14:00:00"
+    ],
+    "fit_window_first": 5498,
+    "fit_window_last": 8904,
+    "source": "saved calibration results (recorded_results.json + reference CSVs)",
+    "refits_run_here": 0
+  },
+  "pooled": {
+    "linear/frozen": {
+      "n": 3493.0,
+      "rmse": 2.5260884003271107,
+      "mae": 2.1286988240325835,
+      "bias": -1.8965304125213134,
+      "p95_abs_error": 4.450852475433585,
+      "r2": 0.8922632416778158,
+      "negative_prediction_count": 644.0
+    },
+    "linear/updated": {
+      "n": 3493.0,
+      "rmse": 1.7009954743419402,
+      "mae": 1.1460913578735483,
+      "bias": -0.7674935081014378,
+      "p95_abs_error": 3.182610050693475,
+      "r2": 0.9511490368143094,
+      "negative_prediction_count": 391.0
+    },
+    "quadratic/frozen": {
+      "n": 3493.0,
+      "rmse": 0.1464534461196211,
+      "mae": 0.10891319118665951,
+      "bias": -0.06639512980033613,
+      "p95_abs_error": 0.30441551309782033,
+      "r2": 0.999637868748639,
+      "negative_prediction_count": 9.0
+    },
+    "quadratic/updated": {
+      "n": 3493.0,
+      "rmse": 0.09260607171286263,
+      "mae": 0.057339137582911155,
+      "bias": -0.024666950320035377,
+      "p95_abs_error": 0.17772906834720165,
+      "r2": 0.9998552076092666,
+      "negative_prediction_count": 6.0
+    }
+  },
+  "policy_effect": {
+    "linear": {
+      "ratio": 1.4850647391077698,
+      "rel_rmse": 32.66286824634984,
+      "rel_p95": 28.49437117361574,
+      "rel_mae": 46.1600041802811
+    },
+    "quadratic": {
+      "ratio": 1.5814669968262922,
+      "rel_rmse": 36.76757074243013,
+      "rel_p95": 41.61629066187225,
+      "rel_mae": 47.35335824965298
+    }
+  },
+  "form_gap_quad_frozen_over_linear_updated": 0.08609866888463015,
+  "monthly_delta": {
+    "2004-11/linear": {
+      "n": 720,
+      "rmse_frozen": 1.8973641257987643,
+      "rmse_updated": 1.8973641257987643,
+      "delta_rmse": 0.0,
+      "pct_rmse": 0.0
+    },
+    "2004-11/quadratic": {
+      "n": 720,
+      "rmse_frozen": 0.09893324952775162,
+      "rmse_updated": 0.09893324952775162,
+      "delta_rmse": 0.0,
+      "pct_rmse": 0.0
+    },
+    "2004-12/linear": {
+      "n": 664,
+      "rmse_frozen": 2.3825314248778753,
+      "rmse_updated": 2.2711876816726826,
+      "delta_rmse": -0.11134374320519269,
+      "pct_rmse": -4.673337864196271
+    },
+    "2004-12/quadratic": {
+      "n": 664,
+      "rmse_frozen": 0.12629141859006315,
+      "rmse_updated": 0.13038671137029859,
+      "delta_rmse": 0.004095292780235432,
+      "pct_rmse": 3.2427324247014653
+    },
+    "2005-01/linear": {
+      "n": 683,
+      "rmse_frozen": 2.442692191393637,
+      "rmse_updated": 1.5072233431925044,
+      "delta_rmse": -0.9354688482011326,
+      "pct_rmse": -38.296632359045475
+    },
+    "2005-01/quadratic": {
+      "n": 683,
+      "rmse_frozen": 0.1409666293550907,
+      "rmse_updated": 0.07637518083537088,
+      "delta_rmse": -0.0645914485197198,
+      "pct_rmse": -45.8203823239725
+    },
+    "2005-02/linear": {
+      "n": 596,
+      "rmse_frozen": 2.847888085211236,
+      "rmse_updated": 1.2784545965573348,
+      "delta_rmse": -1.5694334886539012,
+      "pct_rmse": -55.108678490696086
+    },
+    "2005-02/quadratic": {
+      "n": 596,
+      "rmse_frozen": 0.17044954503000115,
+      "rmse_updated": 0.0629012168785274,
+      "delta_rmse": -0.10754832815147375,
+      "pct_rmse": -63.09687018087608
+    },
+    "2005-03/linear": {
+      "n": 743,
+      "rmse_frozen": 2.7790978600286356,
+      "rmse_updated": 1.3088526715418076,
+      "delta_rmse": -1.470245188486828,
+      "pct_rmse": -52.90368538773509
+    },
+    "2005-03/quadratic": {
+      "n": 743,
+      "rmse_frozen": 0.16855013143985478,
+      "rmse_updated": 0.07768764851369467,
+      "delta_rmse": -0.09086248292616012,
+      "pct_rmse": -53.90828363642265
+    },
+    "2005-04/linear": {
+      "n": 87,
+      "rmse_frozen": 3.8364573723646718,
+      "rmse_updated": 1.8287292043385597,
+      "delta_rmse": -2.0077281680261123,
+      "pct_rmse": -52.33286788192858
+    },
+    "2005-04/quadratic": {
+      "n": 87,
+      "rmse_frozen": 0.2465020214777186,
+      "rmse_updated": 0.09549930771890236,
+      "delta_rmse": -0.15100271375881624,
+      "pct_rmse": -61.258205045781104
+    }
+  },
+  "coverage": [
+    {
+      "month": "2004-11",
+      "fit_n": 5498,
+      "available": 720,
+      "eligible": 720,
+      "excluded": 0,
+      "coverage": 100.0,
+      "share_test": 20.612653879186944
+    },
+    {
+      "month": "2004-12",
+      "fit_n": 6218,
+      "available": 744,
+      "eligible": 664,
+      "excluded": 80,
+      "coverage": 89.24731182795699,
+      "share_test": 19.009447466361294
+    },
+    {
+      "month": "2005-01",
+      "fit_n": 6882,
+      "available": 744,
+      "eligible": 683,
+      "excluded": 61,
+      "coverage": 91.8010752688172,
+      "share_test": 19.553392499284282
+    },
+    {
+      "month": "2005-02",
+      "fit_n": 7565,
+      "available": 672,
+      "eligible": 596,
+      "excluded": 76,
+      "coverage": 88.69047619047619,
+      "share_test": 17.06269682221586
+    },
+    {
+      "month": "2005-03",
+      "fit_n": 8161,
+      "available": 744,
+      "eligible": 743,
+      "excluded": 1,
+      "coverage": 99.86559139784946,
+      "share_test": 21.271113655883195
+    },
+    {
+      "month": "2005-04",
+      "fit_n": 8904,
+      "available": 87,
+      "eligible": 87,
+      "excluded": 0,
+      "coverage": 100.0,
+      "share_test": 2.4906956770684228
+    }
+  ],
+  "timing": {
+    "per_month_ms": {
+      "linear/2004-11": {
+        "fit": 2.9742978513240814,
+        "predict": 0.40359795093536377
+      },
+      "linear/2004-12": {
+        "fit": 3.090381622314453,
+        "predict": 0.39712339639663696
+      },
+      "linear/2005-01": {
+        "fit": 3.137316554784775,
+        "predict": 0.3709644079208374
+      },
+      "linear/2005-02": {
+        "fit": 3.3377036452293396,
+        "predict": 0.3805980086326599
+      },
+      "linear/2005-03": {
+        "fit": 3.343529999256134,
+        "predict": 0.36197900772094727
+      },
+      "linear/2005-04": {
+        "fit": 4.994995892047882,
+        "predict": 0.4550330340862274
+      },
+      "quadratic/2004-11": {
+        "fit": 19.803419709205627,
+        "predict": 0.9262897074222565
+      },
+      "quadratic/2004-12": {
+        "fit": 20.679794251918793,
+        "predict": 0.8307807147502899
+      },
+      "quadratic/2005-01": {
+        "fit": 22.67725020647049,
+        "predict": 0.838693231344223
+      },
+      "quadratic/2005-02": {
+        "fit": 25.65997838973999,
+        "predict": 0.8400939404964447
+      },
+      "quadratic/2005-03": {
+        "fit": 35.573989152908325,
+        "predict": 1.1468157172203064
+      },
+      "quadratic/2005-04": {
+        "fit": 39.62899371981621,
+        "predict": 0.8507221937179565
+      }
+    },
+    "fit_median_ms_range": {
+      "linear": [
+        2.9742978513240814,
+        4.994995892047882
+      ],
+      "quadratic": [
+        19.803419709205627,
+        39.62899371981621
+      ]
+    },
+    "predict_median_ms_range": {
+      "linear": [
+        0.36197900772094727,
+        0.4550330340862274
+      ],
+      "quadratic": [
+        0.8307807147502899,
+        1.1468157172203064
+      ]
+    },
+    "six_refit_total_s": {
+      "linear": 0.020878225564956665,
+      "quadratic": 0.16402342543005943
+    },
+    "six_prediction_total_s": {
+      "linear": 0.0023692958056926727,
+      "quadratic": 0.005433395504951477
+    },
+    "annualised_fit_s": {
+      "linear": 0.04175645112991333,
+      "quadratic": 0.32804685086011887
+    },
+    "us_per_test_hour": {
+      "linear": 5.97716162752839,
+      "quadratic": 46.95775133983952
+    },
+    "recorded_pred_us_per_row": {
+      "linear/2004-11": 0.5605527096324496,
+      "linear/2004-12": 0.5980774042118027,
+      "linear/2005-01": 0.543139689488781,
+      "linear/2005-02": 0.6385872628064764,
+      "linear/2005-03": 0.48718574390437047,
+      "linear/2005-04": 5.230264759611809,
+      "quadratic/2004-11": 1.2865134825309117,
+      "quadratic/2004-12": 1.2511757752263402,
+      "quadratic/2005-01": 1.2279549507236063,
+      "quadratic/2005-02": 1.4095535914369877,
+      "quadratic/2005-03": 1.5434935628806277,
+      "quadratic/2005-04": 9.778416019746627
+    },
+    "implied_pred_batch_rows": {
+      "linear/2004-11": 720.0000000000001,
+      "linear/2004-12": 664.0,
+      "linear/2005-01": 683.0,
+      "linear/2005-02": 596.0,
+      "linear/2005-03": 743.0000000000001,
+      "linear/2005-04": 87.00000000000001,
+      "quadratic/2004-11": 720.0000000000001,
+      "quadratic/2004-12": 664.0000000000001,
+      "quadratic/2005-01": 683.0,
+      "quadratic/2005-02": 596.0000000000001,
+      "quadratic/2005-03": 743.0,
+      "quadratic/2005-04": 87.0
+    },
+    "scope_note": "costs are medians of repeated in-process timings; they exclude hourly ingestion, feature construction, evaluation and plotting"
+  },
+  "checks": {
+    "failures": [],
+    "warnings": [
+      "JSON overall block not identified (28 candidate records); CSV treated as the frozen pooled table"
+    ]
+  }
+}

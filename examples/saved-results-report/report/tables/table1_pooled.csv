@@ -1,0 +1,5 @@
+model,policy,n,rmse,mae,abs_bias,p95_abs_error,r2,negative_predictions,negative_pct
+linear,frozen,3493,2.5261,2.1287,1.8965,4.4509,0.8923,644,18.44
+linear,updated,3493,1.7010,1.1461,0.7675,3.1826,0.9511,391,11.19
+quadratic,frozen,3493,0.1465,0.1089,0.0664,0.3044,0.9996,9,0.26
+quadratic,updated,3493,0.0926,0.0573,0.0247,0.1777,0.9999,6,0.17

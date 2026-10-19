@@ -1,0 +1,36 @@
+{
+  "schema_version": "report_export.v1",
+  "format": "pandoc-latex-template",
+  "source_report": "/root/autodl-tmp/SimpleAutoResearch/runs/main-survey-showcase-20261019/s2-results/task/workspace/report/manuscript.md",
+  "status": "compiled",
+  "compiled": true,
+  "quality_checked": false,
+  "figure_caption_owner": "markdown",
+  "bound_figure_captions": [],
+  "template": {
+    "path": "template.article.latex",
+    "engine": "pdflatex",
+    "inputs": {
+      "template.article.latex": "9b4e1ef5f38fb0f85a512f63451788c0599be0dd84696bcf7940ceca80cdff35"
+    },
+    "trust": "User-supplied trusted TeX; restricted compilation is not a sandbox"
+  },
+  "compliance": {
+    "official_requirements": "unverified",
+    "anonymity": "unverified",
+    "page_limits": "unverified",
+    "visual_layout": "unverified",
+    "citation_keys": "checked",
+    "markdown_image_paths": "checked"
+  },
+  "figure_exports": {},
+  "experiment_record_files": [],
+  "external_source_references": [],
+  "external_sources_included": false,
+  "compile_warnings": [
+    "Overfull \\hbox (1.65631pt too wide) in paragraph at lines 111--112",
+    "Overfull \\hbox (7.77005pt too wide) in paragraph at lines 128--129",
+    "Overfull \\hbox (7.77005pt too wide) in paragraph at lines 147--148",
+    "Overfull \\hbox (1.65631pt too wide) in paragraph at lines 149--150"
+  ]
+}

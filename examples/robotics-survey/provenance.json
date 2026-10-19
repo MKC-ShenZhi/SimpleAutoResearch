@@ -1,0 +1,53 @@
+{
+  "schema": "public_example_export.v1",
+  "final_code_commit": "d3b0721a6cb29a531d16c77160273ced27fc3567",
+  "source_task": "runs/main-survey-showcase-20261019/robot-world-action/task",
+  "status": "partial",
+  "export_method": "Selected byte-identical final artifacts; original journals, raw acquired articles, old revisions and build intermediates excluded.",
+  "human_role": "Goals, approvals, defect feedback, environment setup and independent verification; no manual scientific prose or plotting implementation.",
+  "all_stage_settled_physical_requests": 164,
+  "all_stage_settled_tokens": 6086900,
+  "cost_scope": "Multiple candidates, connections and explicit continuations. Not single-run cost or a monetary bill; unknown usage is retained in original journals.",
+  "files": [
+    {
+      "path": "report/briefing_zh.md",
+      "sha256": "1673def86af81634c7d9bbc0af9facc8ba983aa1458a473ef5133894235fc077"
+    },
+    {
+      "path": "report/figures/fig1_prediction_in_loop.png",
+      "sha256": "1961c203195f7bb7a74b5d150ffe7faa4be3d7009b911a176ca468fb0a671ceb"
+    },
+    {
+      "path": "report/figures/fig1_prediction_in_loop.svg",
+      "sha256": "3374fdfbf152d2d2136b2de31a304f2a134969d3d5522e670c19594c7047e10c"
+    },
+    {
+      "path": "report/figures/fig2_evidence_map.png",
+      "sha256": "11dc91392d3f92bac1a1ff9cf2744e0bb8776d882e4f3ef966592ba6af054330"
+    },
+    {
+      "path": "report/figures/fig2_evidence_map.svg",
+      "sha256": "bf298697d6329d74be2318c81bf747a40ebf0698fa8913b01c5548c17ac4f903"
+    },
+    {
+      "path": "report/make_figures.py",
+      "sha256": "f4d2afff3987ab9e5a0c595c0ad516f11cea6b3a53386bcea1f6b0a6d852723e"
+    },
+    {
+      "path": "report/manuscript.md",
+      "sha256": "1e43ea0695378b2841fd96450951a0ce7d821ee5b7a704f57dd8c5373388770e"
+    },
+    {
+      "path": "report/references.bib",
+      "sha256": "1846898f5ce59cdbe5ec719e7b7ad6da9427a875a141e2b0a02e007a9ce2d3d9"
+    },
+    {
+      "path": "report/survey.pdf",
+      "sha256": "e0a98df1e7b866cb53eeaa277e9c0bc6d05d38d279edb37b4eb224160f9d5cf5"
+    },
+    {
+      "path": "report/survey.tex",
+      "sha256": "cdbe78624bf2319a4027fe30d1b4a7c25b85f44569586bbb62a815ee5a5a6de6"
+    }
+  ]
+}

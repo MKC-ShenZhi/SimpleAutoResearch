@@ -74,9 +74,15 @@ class DocumentFirstTests(unittest.TestCase):
             self.assertFalse((owner / 'writer/sections.json').exists())
             figure = next(row for row in snapshot['inputs']['article']['source_handles'] if row['handle'].startswith('figure:'))
             self.assertEqual(figure['metadata']['caption'], caption)
-            self.assertNotIn('summary', figure)  # Do not supply the same caption twice.
-            self.assertIn(caption, client.ask_json.call_args.args[1])
-            self.assertEqual(client.ask_json.call_args.args[1].count(caption), 1)
+            # Metadata binds the supplied caption; summary carries the writer's
+            # embedding instructions. Both describe one publication caption.
+            self.assertIn('alt is the sole publication caption', figure['summary'])
+            self.assertIn('do not repeat it in an adjacent paragraph', figure['summary'])
+            self.assertIn('or assign a figure number', figure['summary'])
+            self.assertTrue(figure['summary'].endswith(caption))
+            prompt = json.loads(client.ask_json.call_args.args[1])
+            self.assertEqual([row for row in prompt['source_handles']
+                if row['handle'].startswith('figure:')], [figure])
             self.assertEqual(client.ask_json.call_count, 1)
             with patch.object(gateway, 'client_factory', side_effect=AssertionError('no model replay')):
                 composed = gateway.call('compose_document', request, identity=identity)
@@ -88,7 +94,9 @@ class DocumentFirstTests(unittest.TestCase):
             self.assertEqual(json.loads(manifest.read_text(encoding='utf-8')),
                 {'figures': [{'path': 'figures/selected-1.svg', 'caption': caption}]})
             self.assertIn(str(manifest.relative_to(root)).replace('\\', '/'), composed.artifacts)
-            self.assertIn(caption, manuscript.read_text(encoding='utf-8'))
+            body = manuscript.read_text(encoding='utf-8')
+            self.assertIn(f'![{caption}](figures/selected-1.svg)', body)
+            self.assertEqual(body.count(caption), 1)
             self.assertEqual((manuscript.parent / 'figures/selected-1.svg').read_bytes(), original)
             self.assertEqual(image.read_bytes(), original)
             with self.assertRaises(ValueError):

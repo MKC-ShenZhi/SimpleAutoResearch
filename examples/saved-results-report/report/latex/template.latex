@@ -1,0 +1,17 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+$for(header-includes)$
+$header-includes$
+$endfor$
+\usepackage{natbib,hyperref}
+\usepackage{graphicx,longtable,booktabs,array,float,caption}
+\usepackage{amsmath}
+\setlength{\emergencystretch}{3em}
+\providecommand{\tightlist}{\setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
+\title{$title$}
+\author{}
+\date{}
+\begin{document}
+\maketitle
+$body$
+\end{document}

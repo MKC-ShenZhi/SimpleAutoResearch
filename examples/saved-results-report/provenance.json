@@ -1,0 +1,113 @@
+{
+  "schema": "public_example_export.v1",
+  "final_code_commit": "d3b0721a6cb29a531d16c77160273ced27fc3567",
+  "source_task": "runs/main-survey-showcase-20261019/s2-results/task",
+  "status": "partial",
+  "export_method": "Selected byte-identical final artifacts; original journals, raw acquired articles, old revisions and build intermediates excluded.",
+  "human_role": "Goals, approvals, defect feedback, environment setup and independent verification; no manual scientific prose or plotting implementation.",
+  "all_stage_settled_physical_requests": 180,
+  "all_stage_settled_tokens": 5871880,
+  "cost_scope": "Multiple candidates, connections and explicit continuations. Not single-run cost or a monetary bill; unknown usage is retained in original journals.",
+  "files": [
+    {
+      "path": "report/derived_metrics.json",
+      "sha256": "54cdd7da969a9ff79f6e910f789b56ab20669aea0220772dc4669e9c4f8fda0b"
+    },
+    {
+      "path": "report/figures/figure_data.csv",
+      "sha256": "fe3ebf29d699891c09a764b360a3b0b51b91f3e96863a0c8e62b61165db92a86"
+    },
+    {
+      "path": "report/figures/monthly_update_panel.pdf",
+      "sha256": "cd80b524e9acd64d8ad7a81bb4fa674b9dc1bc50bb272828b7e5527b691f0933"
+    },
+    {
+      "path": "report/figures/monthly_update_panel.png",
+      "sha256": "0b0b6411749528e183fbe4a43c955d49393d6b9918b3abc19ee9404368c1b3f0"
+    },
+    {
+      "path": "report/inputs/cohorts.csv",
+      "sha256": "29af00b6601d5c58db600d6bf9bd9f25e653227bb4c1493c568011917fa587f4"
+    },
+    {
+      "path": "report/inputs/monthly_metrics.csv",
+      "sha256": "b51b8b45f6a5ad05216ed0e3649a28462bfe575fed732ec6978b1e277d83c3da"
+    },
+    {
+      "path": "report/inputs/overall_metrics.csv",
+      "sha256": "142eee1a9f9fb03bfcba725701240e4d1a5dd7c26890a93648351eaad2e058e5"
+    },
+    {
+      "path": "report/inputs/periods.csv",
+      "sha256": "7010e2c205da8475ac3e55ddffa2c4f4493478578f9786382c20067801fa175d"
+    },
+    {
+      "path": "report/inputs/recorded_results.json",
+      "sha256": "ce0098d5c7fc569b4bf85199bccc7c2b14e0ef27b557b550ec5a9b1ddd6533c4"
+    },
+    {
+      "path": "report/latex/body.tex",
+      "sha256": "655f69a8e1350fce88bdabfa1932f28ad3aff27b0c2f0c13fb2d0b425dba565f"
+    },
+    {
+      "path": "report/latex/export.json",
+      "sha256": "086b60262ad716e8c420a95382a8a588d1fb3131f4582fd87322ba3b22ea7451"
+    },
+    {
+      "path": "report/latex/figures/figure-1.png",
+      "sha256": "0b0b6411749528e183fbe4a43c955d49393d6b9918b3abc19ee9404368c1b3f0"
+    },
+    {
+      "path": "report/latex/main.tex",
+      "sha256": "ba48b0b99d770418c3380d0e5c0fe15fdc51db4cb59b65301d9eeb6bd8ca3a69"
+    },
+    {
+      "path": "report/latex/README.txt",
+      "sha256": "35878eab9e864f844a7dad18b86997d4aa67b02f263ab8df65baa886957d53ee"
+    },
+    {
+      "path": "report/latex/references.bib",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "report/latex/template.latex",
+      "sha256": "9b4e1ef5f38fb0f85a512f63451788c0599be0dd84696bcf7940ceca80cdff35"
+    },
+    {
+      "path": "report/make_figure_tables_v2.py",
+      "sha256": "6bcc1f89bef032464780878efa1a96978f647889f410d3ca2b06b6733d19adbb"
+    },
+    {
+      "path": "report/manuscript.md",
+      "sha256": "eca63607ad4e31a61137214c36db35c0f704092ec1a2b398279adb470293f3cd"
+    },
+    {
+      "path": "report/report.pdf",
+      "sha256": "3bfbb1e8a250a4f3c5fe9d377bbd8791a86fac31d174b74ece38b160453a0164"
+    },
+    {
+      "path": "report/tables/table1_pooled.csv",
+      "sha256": "afaf79c1bc82388997f0a4be454d89eff9f9cd417597b261f80b9cf95fa98edb"
+    },
+    {
+      "path": "report/tables/table2_monthly_delta.csv",
+      "sha256": "703ae41721b3a89c831790bc1ba646eb48aa3f039924ef54fc402c93192ed3fc"
+    },
+    {
+      "path": "report/tables/table3_coverage.csv",
+      "sha256": "4840cc78e00319131b9264924c95209cbb8e7ebb49f54c3e61cbf1315f1330ca"
+    },
+    {
+      "path": "report/tables/table4_timing.csv",
+      "sha256": "adebc075f1eb07746c0f870abf88db446e627028adc7c64b43be7e46d33c0f36"
+    },
+    {
+      "path": "report/tables/tables.md",
+      "sha256": "bbcab4f3130f7762f7611f5ce0c33bb2ff4b79f95328d0aa53b3d46736e6e3ae"
+    },
+    {
+      "path": "report/template.article.latex",
+      "sha256": "9b4e1ef5f38fb0f85a512f63451788c0599be0dd84696bcf7940ceca80cdff35"
+    }
+  ]
+}

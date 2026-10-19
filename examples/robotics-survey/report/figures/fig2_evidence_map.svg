@@ -1,0 +1,92 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1300" height="782" viewBox="0 0 1300 782">
+<defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#2f5d8a"/></marker></defs>
+<rect width="1300" height="782" fill="#ffffff"/>
+<text x="40.0" y="46.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="26" font-weight="bold" font-style="normal" fill="#1c2530" text-anchor="start">Figure 2. What has been measured, by family</text>
+<text x="40.0" y="78.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" font-style="normal" fill="#55606d" text-anchor="start">A reading of the sixteen papers cited in this report, not a leaderboard. Cells are qualitative; they carry no score and no cross-row comparison.</text>
+<rect x="40" y="138" width="20" height="15" rx="3" fill="#2f5d8a" stroke="#2f5d8a"/>
+<text x="67.0" y="150.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" font-style="normal" fill="#55606d" text-anchor="start">reported directly</text>
+<rect x="223.4" y="138" width="20" height="15" rx="3" fill="#dbe7f4" stroke="#8fb0d2"/>
+<text x="250.4" y="150.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" font-style="normal" fill="#55606d" text-anchor="start">reported, narrow or indirect</text>
+<rect x="486.0" y="138" width="20" height="15" rx="3" fill="#ffffff" stroke="#8a97a8"/>
+<text x="513.0" y="150.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="14" font-weight="normal" font-style="normal" fill="#55606d" text-anchor="start">not located in our corpus</text>
+<rect x="330" y="212" width="186" height="54" rx="6" fill="#eef1f5" stroke="#c9d0d8"/>
+<text x="423.0" y="234.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" font-style="normal" fill="#1c2530" text-anchor="middle">VLA</text>
+<text x="423.0" y="253.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" font-style="normal" fill="#1c2530" text-anchor="middle">policy</text>
+<rect x="524" y="212" width="186" height="54" rx="6" fill="#eef1f5" stroke="#c9d0d8"/>
+<text x="617.0" y="234.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" font-style="normal" fill="#1c2530" text-anchor="middle">Action +</text>
+<text x="617.0" y="253.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" font-style="normal" fill="#1c2530" text-anchor="middle">future</text>
+<rect x="718" y="212" width="186" height="54" rx="6" fill="#eef1f5" stroke="#c9d0d8"/>
+<text x="811.0" y="234.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" font-style="normal" fill="#1c2530" text-anchor="middle">World model</text>
+<text x="811.0" y="253.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" font-style="normal" fill="#1c2530" text-anchor="middle">as planner</text>
+<rect x="912" y="212" width="186" height="54" rx="6" fill="#eef1f5" stroke="#c9d0d8"/>
+<text x="1005.0" y="234.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" font-style="normal" fill="#1c2530" text-anchor="middle">World model</text>
+<text x="1005.0" y="253.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" font-style="normal" fill="#1c2530" text-anchor="middle">as data</text>
+<rect x="1106" y="212" width="186" height="54" rx="6" fill="#eef1f5" stroke="#c9d0d8"/>
+<text x="1199.0" y="234.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" font-style="normal" fill="#1c2530" text-anchor="middle">World model</text>
+<text x="1199.0" y="253.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="15" font-weight="bold" font-style="normal" fill="#1c2530" text-anchor="middle">as trainer</text>
+<rect x="40" y="274" width="270" height="74" rx="6" fill="#f2f4f7" stroke="#dfe4ea"/>
+<text x="52.0" y="307.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#1c2530" text-anchor="start">Prediction accuracy</text>
+<text x="52.0" y="326.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#1c2530" text-anchor="start">measured</text>
+<rect x="330" y="274" width="186" height="74" rx="6" fill="#ffffff" stroke="#8a97a8"/>
+<text x="423.0" y="316.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" font-style="normal" fill="#7b8794" text-anchor="middle">no future</text>
+<rect x="524" y="274" width="186" height="74" rx="6" fill="#dbe7f4" stroke="#8fb0d2"/>
+<text x="617.0" y="316.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" font-style="normal" fill="#22384d" text-anchor="middle">pixel FVD (sim)</text>
+<rect x="718" y="274" width="186" height="74" rx="6" fill="#ffffff" stroke="#8a97a8"/>
+<text x="811.0" y="316.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" font-style="normal" fill="#7b8794" text-anchor="middle">no direct metric</text>
+<rect x="912" y="274" width="186" height="74" rx="6" fill="#dbe7f4" stroke="#8fb0d2"/>
+<text x="1005.0" y="316.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" font-style="normal" fill="#22384d" text-anchor="middle">downstream proxy</text>
+<rect x="1106" y="274" width="186" height="74" rx="6" fill="#dbe7f4" stroke="#8fb0d2"/>
+<text x="1199.0" y="316.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" font-style="normal" fill="#22384d" text-anchor="middle">game return only</text>
+<rect x="40" y="356" width="270" height="74" rx="6" fill="#f2f4f7" stroke="#dfe4ea"/>
+<text x="52.0" y="398.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#1c2530" text-anchor="start">Closed loop in simulation</text>
+<rect x="330" y="356" width="186" height="74" rx="6" fill="#2f5d8a" stroke="#2f5d8a"/>
+<text x="423.0" y="398.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="13" font-weight="bold" font-style="normal" fill="#ffffff" text-anchor="middle">LIBERO suites</text>
+<rect x="524" y="356" width="186" height="74" rx="6" fill="#2f5d8a" stroke="#2f5d8a"/>
+<text x="617.0" y="398.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="13" font-weight="bold" font-style="normal" fill="#ffffff" text-anchor="middle">LIBERO + grasp</text>
+<rect x="718" y="356" width="186" height="74" rx="6" fill="#2f5d8a" stroke="#2f5d8a"/>
+<text x="811.0" y="398.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="13" font-weight="bold" font-style="normal" fill="#ffffff" text-anchor="middle">6 planning envs.</text>
+<rect x="912" y="356" width="186" height="74" rx="6" fill="#dbe7f4" stroke="#8fb0d2"/>
+<text x="1005.0" y="398.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" font-style="normal" fill="#22384d" text-anchor="middle">policy on synthetic</text>
+<rect x="1106" y="356" width="186" height="74" rx="6" fill="#2f5d8a" stroke="#2f5d8a"/>
+<text x="1199.0" y="398.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="13" font-weight="bold" font-style="normal" fill="#ffffff" text-anchor="middle">Minecraft</text>
+<rect x="40" y="438" width="270" height="74" rx="6" fill="#f2f4f7" stroke="#dfe4ea"/>
+<text x="52.0" y="480.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#1c2530" text-anchor="start">Real robot, one laboratory</text>
+<rect x="330" y="438" width="186" height="74" rx="6" fill="#2f5d8a" stroke="#2f5d8a"/>
+<text x="423.0" y="480.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="13" font-weight="bold" font-style="normal" fill="#ffffff" text-anchor="middle">yes, several</text>
+<rect x="524" y="438" width="186" height="74" rx="6" fill="#dbe7f4" stroke="#8fb0d2"/>
+<text x="617.0" y="480.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" font-style="normal" fill="#22384d" text-anchor="middle">narrow, sim-heavy</text>
+<rect x="718" y="438" width="186" height="74" rx="6" fill="#2f5d8a" stroke="#2f5d8a"/>
+<text x="811.0" y="480.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="13" font-weight="bold" font-style="normal" fill="#ffffff" text-anchor="middle">yes, two arm types</text>
+<rect x="912" y="438" width="186" height="74" rx="6" fill="#2f5d8a" stroke="#2f5d8a"/>
+<text x="1005.0" y="480.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="13" font-weight="bold" font-style="normal" fill="#ffffff" text-anchor="middle">humanoid, 22 tasks</text>
+<rect x="1106" y="438" width="186" height="74" rx="6" fill="#2f5d8a" stroke="#2f5d8a"/>
+<text x="1199.0" y="480.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="13" font-weight="bold" font-style="normal" fill="#ffffff" text-anchor="middle">automated, one arm</text>
+<rect x="40" y="520" width="270" height="74" rx="6" fill="#f2f4f7" stroke="#dfe4ea"/>
+<text x="52.0" y="553.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#1c2530" text-anchor="start">Real robot, several</text>
+<text x="52.0" y="572.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#1c2530" text-anchor="start">laboratories</text>
+<rect x="330" y="520" width="186" height="74" rx="6" fill="#2f5d8a" stroke="#2f5d8a"/>
+<text x="423.0" y="562.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="13" font-weight="bold" font-style="normal" fill="#ffffff" text-anchor="middle">yes (RoboArena)</text>
+<rect x="524" y="520" width="186" height="74" rx="6" fill="#ffffff" stroke="#8a97a8"/>
+<text x="617.0" y="562.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" font-style="normal" fill="#7b8794" text-anchor="middle">not located</text>
+<rect x="718" y="520" width="186" height="74" rx="6" fill="#dbe7f4" stroke="#8fb0d2"/>
+<text x="811.0" y="562.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" font-style="normal" fill="#22384d" text-anchor="middle">two labs (V-JEPA 2)</text>
+<rect x="912" y="520" width="186" height="74" rx="6" fill="#ffffff" stroke="#8a97a8"/>
+<text x="1005.0" y="562.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" font-style="normal" fill="#7b8794" text-anchor="middle">not located</text>
+<rect x="1106" y="520" width="186" height="74" rx="6" fill="#ffffff" stroke="#8a97a8"/>
+<text x="1199.0" y="562.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" font-style="normal" fill="#7b8794" text-anchor="middle">not located</text>
+<rect x="40" y="602" width="270" height="74" rx="6" fill="#f2f4f7" stroke="#dfe4ea"/>
+<text x="52.0" y="644.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="15" font-weight="normal" font-style="normal" fill="#1c2530" text-anchor="start">Blind or randomised trials</text>
+<rect x="330" y="602" width="186" height="74" rx="6" fill="#2f5d8a" stroke="#2f5d8a"/>
+<text x="423.0" y="644.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="13" font-weight="bold" font-style="normal" fill="#ffffff" text-anchor="middle">yes (one lab)</text>
+<rect x="524" y="602" width="186" height="74" rx="6" fill="#ffffff" stroke="#8a97a8"/>
+<text x="617.0" y="644.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" font-style="normal" fill="#7b8794" text-anchor="middle">not located</text>
+<rect x="718" y="602" width="186" height="74" rx="6" fill="#ffffff" stroke="#8a97a8"/>
+<text x="811.0" y="644.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" font-style="normal" fill="#7b8794" text-anchor="middle">not located</text>
+<rect x="912" y="602" width="186" height="74" rx="6" fill="#ffffff" stroke="#8a97a8"/>
+<text x="1005.0" y="644.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" font-style="normal" fill="#7b8794" text-anchor="middle">not located</text>
+<rect x="1106" y="602" width="186" height="74" rx="6" fill="#ffffff" stroke="#8a97a8"/>
+<text x="1199.0" y="644.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" font-style="normal" fill="#7b8794" text-anchor="middle">not located</text>
+<text x="40.0" y="706.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" font-style="normal" fill="#55606d" text-anchor="start">An empty cell means that we did not locate such a measurement in the sixteen papers we read; it is not evidence that no such measurement exists.</text>
+<text x="40.0" y="728.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" font-style="normal" fill="#55606d" text-anchor="start">"Simulation" and "real robot" cells describe protocol breadth, not success rates: no success number is comparable across rows or columns.</text>
+<text x="40.0" y="754.0" font-family="DejaVu Sans, Helvetica, Arial, sans-serif" font-size="13" font-weight="normal" font-style="normal" fill="#8a97a8" text-anchor="start">Prepared for this survey from the cited papers. Conceptual reading aid.</text>
+</svg>

@@ -1,10 +1,14 @@
 # Examples
 
-Each directory is one complete case with its own inputs, configuration, entry
-command and expected outputs. Run commands from the repository root.
+Choose an offline replay or a new model-assisted task. Each case states its inputs,
+dependencies, commands and limits. Run from the repository root unless the case
+explicitly changes directory. Rebuilding saved artifacts is not a replay of a
+model conversation or proof of autonomous scientific success.
 
 | Case | Goal | Entry and preparation |
 | --- | --- | --- |
+| [Saved results → figure and report](saved-results-report/README.md) | Rebuild a five-panel figure and four tables; read a six-page framework-generated report | Copy to a fresh `runs/examples/` directory, then run the delivered script; no API or training. Optional PDF rebuild needs TeX. |
+| [Robotics technical survey](robotics-survey/README.md) | Read a ten-page VLA/world-model report with diagrams, tables and bibliography | PDF opens directly; optional Markdown/TeX/figure rebuilds need Pandoc, TeX and `rsvg-convert`, not a model key. |
 | [Saved-result figure feedback](figure-feedback/README.md) | Replay an actual delivered comparison figure; optional new model-assisted request | `uv run python examples/figure-feedback/build_figure_v2.py --output runs/examples/figure-feedback/replay`; no API or training for replay; fresh output directory required |
 | [Survey](survey/README.md) | Literature survey, no training | `research-session --config examples/survey/research.toml`; configure model access |
 | [Data analysis](data-analysis/README.md) | Descriptive statistics and editable plots of existing data | `research-session --config examples/data-analysis/research.toml`; no model or GPU; Matplotlib is installed with the package |
