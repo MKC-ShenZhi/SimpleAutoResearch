@@ -1100,6 +1100,12 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             identity='directory-delivery')
         self.assertEqual(delivered.status, 'ok')
         self.assertEqual(delivered.data['artifacts'], ['workspace/delivery-project/src/main.py'])
+        bare = standalone.call('deliver_result', {'summary': 'Same project',
+            'artifacts': ['delivery-project']}, identity='bare-directory-delivery')
+        self.assertEqual(bare.status, 'ok', bare.error)
+        self.assertEqual(bare.data['artifacts'], delivered.data['artifacts'])
+        listed = standalone.call('list_directory', {'path': 'delivery-project', 'recursive': True}, identity='bare-directory-list')
+        self.assertEqual(listed.status, 'ok', listed.error)
         self.assertEqual(standalone.call('deliver_result', {'summary': 'Wrong ownership',
             'artifacts': ['source0']}, identity='directory-source').status, 'blocked')
         evidence_dir = run_dir / 'evidence'

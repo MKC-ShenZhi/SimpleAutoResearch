@@ -700,6 +700,8 @@ class WorkspaceToolGateway:
         if Path(requested).is_absolute():
             return str(path)
         alias = PurePosixPath(requested).parts[0]
+        if alias not in self.mounts:
+            return self.locator(str(path))
         return f"{alias}/{path.relative_to(self.mounts[alias]).as_posix()}"
 
     def _search(self, request: _Search, identity: str) -> dict[str, Any]:
