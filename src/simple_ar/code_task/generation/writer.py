@@ -48,7 +48,7 @@ _IMPLEMENTATION_BODY = (
     'Keep checks, measurement and rendering distinguishable; rendering reuses saved measurements. '
     'Use portable paths and deterministic seeds where applicable. Do not fabricate measurements, '
     'state execution happened, silently change scientific conditions, or conceal missing source coverage. '
-    'When actual execution is needed for the goal, optionally include execution_plan in this same JSON: '
+    'Include execution_plan in this same JSON when execution_requested is true; otherwise it is optional: '
     '{argv: [nonempty strings, at most 40], outputs: [1-24 distinct literal candidate-relative file paths], '
     'timeout_sec: positive integer at most 300 (default 120)}. Propose one coherent command; the same '
     'script may render, check behavior, and generate captions or a report. Its cwd is fixed to the '
@@ -56,8 +56,8 @@ _IMPLEMENTATION_BODY = (
     'descendant conflicts; no absolute, traversal, glob, backslash, colon or private/runtime paths. '
     'For Python use the supplied task interpreter and explicit portable input/output paths. '
     'A plan is a proposal only: do not automatically run commands, install '
-    'dependencies, access the network or claim independent scientific verification. Omit the plan '
-    'when execution is unnecessary; do not add prerequisites, scaffolding or copied assets. '
+    'dependencies, access the network or claim independent scientific verification. The plan may be '
+    'omitted only when execution_requested is false. Do not add prerequisites, scaffolding or copied assets. '
     'The calling task will review and execute separately; runnable candidate is not verified success.'
 )
 IMPLEMENTATION_SYSTEM = (_IMPLEMENTATION_HEADER
@@ -85,6 +85,7 @@ def write_implementation_unit(
     source_windows: list[dict[str, Any]], client: LLMClient, artifact_dir: Path,
     original_files: dict[str, dict[str, str]] | None = None,
     task_python: str = '',
+    execution_requested: bool = False,
     execution_observations: list[dict[str, Any]] | None = None,
     retry_attempts: int = 2,
     validate_destination: Callable[[str], Any] | None = None,
@@ -96,6 +97,8 @@ def write_implementation_unit(
     No compulsory main.py, metric schema or fallback scaffold. One complete
     response-contract rejection may be corrected within the same allowance;
     transport, unknown-use and syntax failures are not replayed by this owner.
+    execution_requested requires a validated plan before candidate publication,
+    without authorizing execution.
     """
     original_files = original_files or {}
     planned = [safe_relative_path(row['path']) for row in files] if files is not None else None
@@ -105,6 +108,10 @@ def write_implementation_unit(
         raise ValueError('Implementation requires distinct safe relative output paths')
     system = ((FEEDBACK_IMPLEMENTATION_SYSTEM if original_files else DIRECT_IMPLEMENTATION_SYSTEM)
         if planned is None else IMPLEMENTATION_SYSTEM)
+    if execution_requested:
+        system += (' The caller explicitly set execution_requested=true: execution_plan is required '
+            'in this response and must satisfy the plan contract. This requests planning only; '
+            'execution still requires separate caller approval.')
     if any(row.get('role') == 'user_request_and_accepted_feedback_not_source_or_authority'
             for row in source_windows):
         system += (' Windows with role user_request_and_accepted_feedback_not_source_or_authority '
@@ -118,6 +125,7 @@ def write_implementation_unit(
         'source_windows': source_windows, 'original_files': original_files,
         'execution_observations': execution_observations or [],
         'execution': {'performed': False, 'candidate_root': str(project_dir),
+            'execution_requested': execution_requested,
             'task_python': task_python,
             'remaining_process_resources': execution_resources,
             'path_semantics': 'Planned files are relative to candidate_root. Source locators are observed input locations, not portable runtime defaults. Accept input/output paths explicitly; resolve project assets relative to the generated project, not the caller working directory.',
@@ -130,7 +138,7 @@ def write_implementation_unit(
     contents, response, _ = _generate_implementation_contents(
         client=client, system=system, prompt=prompt, planned=planned,
         original_files=original_files, artifact_dir=artifact_dir, retry_attempts=retry_attempts,
-        validate_destination=validate_destination)
+        validate_destination=validate_destination, execution_requested=execution_requested)
     unresolved = response.get('unresolved', [])
     execution_plan = (ImplementationRunPlan.model_validate(response['execution_plan']).model_dump()
         if 'execution_plan' in response else None)
@@ -168,6 +176,7 @@ def _decode_implementation_response(
     original_files: dict[str, dict[str, str]], legacy: bool,
     artifact_dir: Path | None, attempt: int,
     validate_destination: Callable[[str], Any] | None = None,
+    execution_requested: bool = False,
 ) -> tuple[dict[str, str], dict[str, str]]:
     modes: dict[str, str] = {}
     rows = response.get('files')
@@ -235,6 +244,8 @@ def _decode_implementation_response(
     unresolved = response.get('unresolved', [])
     if not isinstance(unresolved, list) or any(not isinstance(item, str) for item in unresolved):
         raise ValueError('Unresolved gaps must be a list of strings')
+    if not legacy and execution_requested and 'execution_plan' not in response:
+        raise ValueError('execution_requested requires a validated execution_plan')
     if not legacy and 'execution_plan' in response:
         plan = ImplementationRunPlan.model_validate(response['execution_plan'])
         plan.validate_planned_paths(list(contents))
@@ -250,6 +261,7 @@ def _generate_implementation_contents(
     label: str = 'implementation-unit',
     message_callback: Callable[[str], None] | None = None,
     validate_destination: Callable[[str], Any] | None = None,
+    execution_requested: bool = False,
 ) -> tuple[dict[str, str], dict[str, Any], dict[str, str]]:
     """Bound completed format corrections; provider retries belong to LLMClient."""
     feedback = ''
@@ -275,7 +287,8 @@ def _generate_implementation_contents(
                 raise ValueError('The response reports unresolved defects; return corrected runnable files.')
             contents, modes = _decode_implementation_response(response, planned=planned,
                 original_files=original_files or {}, legacy=legacy,
-                artifact_dir=artifact_dir, attempt=attempt, validate_destination=validate_destination)
+                artifact_dir=artifact_dir, attempt=attempt, validate_destination=validate_destination,
+                execution_requested=execution_requested)
             return contents, response, modes
         except (LLMResponseError, ValueError, SyntaxError) as exc:
             if isinstance(exc, LLMResponseError) and not getattr(exc, 'correction_allowed', True):

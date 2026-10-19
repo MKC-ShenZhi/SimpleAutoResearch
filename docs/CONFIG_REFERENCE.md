@@ -24,6 +24,8 @@ Structured precedence is defaults → TOML → explicit CLI. CLI lists replace f
 
 For direct native creation, `ToolApplication.create(..., delivery_files=["**/*.md", "**/*.pdf"])` can require nonempty workspace output files before an unqualified completed delivery. These relative patterns check presence, not scientific quality; a disclosed partial delivery remains possible. The API does not infer these requirements from prose or count source PDFs as output. Existing tasks can explicitly replace `delivery_files`, `tool_contracts` or `completion_policy` through caller `supply(..., replace_existing=True)`; unrelated supply preserves the saved policy and ledger.
 
+Native tasks retain `completion_policy="protected_decision.v1"` by default: accepted work can run and be retained even when the last response omits a delivery. Python callers may explicitly select `closing_decision.v2` to require a final delivery or question before dispatch. This stricter policy can reject otherwise useful non-closing work; it is not a guarantee of task completion. Historical tasks keep their saved policy.
+
 `app.run()` and read-only `app.result_snapshot()` also report `retained_work`: existing intermediate workspace files, the last operation and continuation guidance. These files are not an accepted delivery. Failed composition may retain a candidate manuscript; a rejected independent review may retain `incomplete_review.json` with individually validated observations. Correct using the original evidence and a new version; incomplete inspection remains unresolved. New composition checks CommonMark image links before registering its canonical result; export keeps its full path and compilation checks.
 
 New ordinary `run_process` calls return an error for a nonzero exit or stop, retaining the exit code and logs. Historical observations are not rewritten. Invalid execution proposals return the professional owner's preflight diagnosis without running the proposal. Section writing rejects a known outline that cannot fit even one request per section before spending requests on material selection; this lower bound does not guarantee that the remaining work fits.
@@ -107,6 +109,8 @@ Replace endpoint/model with supported values and set the referenced credential p
 | Vision / image | Compatible configured `vision` / `image` connection; no text-client substitution |
 
 `[model].name` accepts selectors too. With a catalog, a raw model ID is accepted only when it exactly matches the model of the connection resolved for that purpose; it does not search profiles by model ID or switch connections. Use `profile:NAME` to select another connection. Missing names, credentials or capabilities fail without provider fallback. Profile names must be nonempty and contain no `:`. Routes: `default`, `text`, `code`, `writing`, `vision`, `image`.
+
+Changing a saved text connection explicitly starts a new native conversation boundary, not a new task or budget. A professional focus whose actual connection changes does the same; an unchanged connection keeps its boundary. Original replies, reasoning and tool records remain available, but incompatible prior assistant messages are not replayed as the new provider's conversation. This allows supported thinking-mode transitions without inventing missing reasoning.
 
 | Profile field | Default / allowed values |
 | --- | --- |

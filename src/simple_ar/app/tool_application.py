@@ -64,9 +64,9 @@ SYSTEM = (
     "or a fixed sequence when direct work is sufficient. "
     "Keep one canonical article body and follow its owner's revision contract; unmanaged Markdown "
     "may be edited directly. Let publication derive TeX/PDF and requested page previews rather than "
-    "independently authoring a second body unless custom typesetting is requested. focus_work can use "
-    "a configured code or writing connection in this same action loop to investigate evidence, "
-    "correct the work, verify and deliver a bounded goal, then return to task when useful. "
+    "independently authoring a second body unless custom typesetting is requested. focus_work only "
+    "selects the connection and inputs for subsequent decisions in this same loop; it does not "
+    "delegate or perform the work, make another model call, or provide extra capacity. "
     "No tool choice, candidate or work focus alone completes or verifies a task.\n\n"
     "Use saved observations and the user's goal to decide remaining work. A persisted work plan is "
     "optional for complex or changed scope, not a required stage; update it alongside actual work "
@@ -278,7 +278,7 @@ class ToolApplication:
             description='Read a bounded byte window of closed accepted turn observation indexes, including archived history and inline cancellation receipts. Turn indexes are zero-based, not attempt numbers. Continue with the returned end_turn pinned and next_offset_bytes while has_more_bytes; otherwise next_turn starts the next range. Original replies and attempt results remain readable at their record locators. Historical identities and statuses are not current file contents, authorization, verified success or resolved failures. No model call or new state.'))
         registry.register(CommonToolSpec(name='focus_work', domain='coordination',
             permission_level='plan', risk_level='low', input_schema=_WorkFocus.model_json_schema(),
-            description='Choose code or writing with a concrete goal to use its saved professional connection in this same action loop: investigate original evidence, edit code or manuscripts, execute authorized tools, verify and deliver. Optional inputs select necessary raw FileWindow inputs, read under the original read_file permission and saved in this receipt. They take priority over unrelated native history; changed/unavailable/oversized inputs require focused reselection in this action loop, not user-supplied hashes. No file list or mandatory compose_document step is needed. Writing without an explicit route keeps the original task client. Native work requires Chat mode. Choose task to return to the original task connection. No new subtask, authorization, allowance or delivery. Request this tool alone, not together with other actions.'))
+            description='Select the saved code, writing or task connection and goal for subsequent decisions in this same action loop. This operation only records the selection: it does not invoke a model, investigate, edit, execute, inspect or deliver work. Subsequent decisions need their own remaining shared allowance. Optional inputs select necessary raw FileWindow inputs, read under the original read_file permission and saved in this receipt. They take priority over unrelated native history; changed/unavailable/oversized inputs require focused reselection, not user-supplied hashes. No file list or mandatory compose_document step is needed. Writing without an explicit route keeps the original task client. Native work requires Chat mode. Choose task to return to the original task connection. No new subtask, authorization, allowance or delivery. Request this tool alone, not together with other actions.'))
         registry.register(CommonToolSpec(name='update_work_plan', domain='coordination',
             permission_level='plan', risk_level='low', input_schema=_WorkPlan.model_json_schema(),
             description='Save or replace a concise working plan for this user request. Use after choosing an approach or when observations/feedback change it; may accompany actual work, no extra planning model. The latest plan stays visible across history compaction and resume. Statuses and evidence locators are model-authored intentions/claims, not verified outcomes, approval, execution or delivery. No automatic steps or fixed task pipeline.'))
@@ -409,20 +409,32 @@ class ToolApplication:
 
     def _work_focus(self) -> dict[str, Any]:
         """Project the latest closed decision; no second mutable work state."""
+        selected = None
+        boundary = {}
         for index in range(len(self.state['turns']) - 1, -1, -1):
             turn = self.state['turns'][index]
             for observed in reversed(turn['tools']):
                 result = self.session.store.read_json(observed['result'])
                 if result.get('tool_name') == 'focus_work' and result.get('status') == 'ok':
                     data = result['data']
+                    if 'native_history_start_turn' in data:
+                        start = data['native_history_start_turn']
+                        if type(start) is not int or not 0 <= start <= len(self.state['turns']):
+                            raise ValueError('Invalid focus native history boundary')
+                        boundary['native_history_start_turn'] = max(
+                            start, boundary.get('native_history_start_turn', 0))
+                    if selected is not None:
+                        continue
                     if 'inputs' in data:
                         current = data.get('request_count') == len(self.state['requests'])
-                        return {'purpose': data['purpose'], 'goal': data['goal'] if current else '',
+                        selected = {'purpose': data['purpose'], 'goal': data['goal'] if current else '',
                             'inputs' if current else 'previous_inputs': data['inputs'],
                             'request_count': data.get('request_count'), 'turn': index,
                             'record': 'records/' + observed['result'].removeprefix('attempts/')}
-                    return {'purpose': data['purpose'], 'goal': data['goal']}
-        return {'purpose': 'task', 'goal': ''}
+                    else:
+                        selected = {'purpose': data['purpose'], 'goal': data['goal']}
+        # A same-connection focus must not reopen an older provider session.
+        return {**(selected or {'purpose': 'task', 'goal': ''}), **boundary}
 
     def _work_plan(self) -> dict[str, Any] | None:
         """One view of closed tool receipts; never another mutable plan store."""
@@ -614,6 +626,11 @@ class ToolApplication:
                 self._validate_tool_selection({'names': focus.tools})
             client = self._client(purpose=focus.purpose)
             data = {**focus.model_dump(exclude={'inputs'}), 'model': client.model}
+            current = self._client()
+            leaves = [{key: value for key, value in owner.connection_binding().items()
+                if key not in {'code_route', 'writing_route'}} for owner in (current, client)]
+            if not model_connections_compatible(*leaves):
+                data['native_history_start_turn'] = len(self.state['turns'])
             if 'inputs' in focus.model_fields_set:
                 spec = self.gateway.registry.get('read_file')
                 allowed, reason = self.gateway.policy.is_allowed(spec)
@@ -909,7 +926,8 @@ class ToolApplication:
                services: Any | None = None, snapshot_sources: bool = False,
                max_snapshot_bytes: int = 16 * 1024 * 1024,
                delivery_files: list[str] | None = None,
-               tool_contracts: Literal['full', 'on_demand'] = 'on_demand') -> ToolApplication:
+               tool_contracts: Literal['full', 'on_demand'] = 'on_demand',
+               completion_policy: str = 'protected_decision.v1') -> ToolApplication:
         config, reused, limits, attempts = cls._configuration(root, goal, model=model, sources=sources,
             allow_execution=allow_execution, allow_network=allow_network, allow_vision=allow_vision,
             max_turns=max_turns, max_tokens=max_tokens, max_images=max_images, project_python=project_python,
@@ -917,7 +935,7 @@ class ToolApplication:
             research_policy=research_policy, table_analysis=table_analysis, max_output_tokens=max_output_tokens,
             max_attempts=max_attempts, source_operations=source_operations, execution_contract=execution_contract,
             services=services, snapshot_sources=snapshot_sources, max_snapshot_bytes=max_snapshot_bytes,
-            tool_contracts=tool_contracts, delivery_files=delivery_files)
+            tool_contracts=tool_contracts, completion_policy=completion_policy, delivery_files=delivery_files)
         session = SessionController.create(root, session_id=root.name, topic=goal,
             registry=CapabilityRegistry(), budget=BudgetState(max_attempts=attempts, max_no_progress=6))
         session.manifest.transition_recipe = cls.RECIPE
@@ -1334,10 +1352,20 @@ class ToolApplication:
         return table if len(json.dumps(table, ensure_ascii=False)) < len(
             json.dumps(turns, ensure_ascii=False)) else turns
 
-    def _messages(self, *, client: LLMClient | None = None, closing: bool = False) -> list[dict[str, Any]]:
+    def _messages(self, *, client: LLMClient | None = None, closing: bool = False,
+                  native_history_start_turn: int | None = None) -> list[dict[str, Any]]:
         config = self.state["config"]
+        if native_history_start_turn is None:
+            rebindings = config.get('model_rebindings', [])
+            native_history_start_turn = rebindings[-1].get('native_history_start_turn', 0) if rebindings else 0
+        if type(native_history_start_turn) is not int or not 0 <= native_history_start_turn <= len(self.state['turns']):
+            raise ValueError('Invalid native history boundary')
         focus = self._work_focus()
-        explicit_inputs = 'inputs' in focus or 'previous_inputs' in focus
+        native_history_start_turn = max(native_history_start_turn, focus.get('native_history_start_turn', 0))
+        # Feedback retires the old selection's priority, not its receipts.
+        # Otherwise an oversized historical selection can evict every newer
+        # read indefinitely, so the model never sees what it just requested.
+        explicit_inputs = 'inputs' in focus
         blocks = []
         progress = []
         latest_execution = latest_failure = latest_tool_failure = None
@@ -1350,8 +1378,9 @@ class ToolApplication:
                      for request in self.state["requests"][request_count:count]]
             reply = self.session.store.read_json(turn["reply"])
             if turn.get('origin') == 'caller':
-                # Submission provenance belongs to the journal, not the Chat protocol.
-                reply = {key: reply[key] for key in ('role', 'content', 'tool_calls') if key in reply}
+                # Caller actions are journal evidence, not provider-authored
+                # assistant messages with an invented reasoning history.
+                native_history_start_turn = max(native_history_start_turn, len(blocks) + 1)
             observations = {item["id"]: self.session.store.read_json(item["result"]) for item in turn["tools"]}
             calls = {call['id']: call for call in reply.get('tool_calls', [])}
             outcomes = []
@@ -1456,7 +1485,7 @@ class ToolApplication:
         # result. Earlier decisions explain why a probe ran and what its result
         # changed. Drop complete oldest blocks only when capacity requires it;
         # never splice a call/result or manufacture a new user turn.
-        selected = [] if explicit_inputs else blocks[-1:]
+        selected = [] if explicit_inputs else blocks[native_history_start_turn:][-1:]
         vision_spec = self.gateway.registry.get('inspect_images')
         vision_available, vision_reason = (self.gateway.policy.is_allowed(vision_spec)
             if vision_spec is not None else (False, 'inspect_images is not registered for this task.'))
@@ -1605,7 +1634,7 @@ class ToolApplication:
                 resources['context_exceeds_input_target'] = exceeds
 
         capacity = input_target
-        if explicit_inputs:
+        if explicit_inputs or 'previous_inputs' in focus:
             current_selection = 'inputs' in focus
             context['native_history_scope'] = (
                 'Native assistant/tool messages in retained_turn_start..history_archive.total_turns '
@@ -1657,10 +1686,10 @@ class ToolApplication:
                     'still contain earlier bytes; those do not satisfy this selection. '
                     'Select smaller necessary windows with focus_work; '
                     'do not infer missing values or claim complete reading.')
-        # Actual serialized capacity includes the protocol, permissions,
-        # feedback, budget and protected diagnosis. A generous turn allowance
-        # is not a reason to discard the conversation or add artificial stages.
-        for index in range(len(blocks) - len(selected) - 1, -1, -1):
+        # Expand the contiguous native suffix first, within this provider
+        # session. All journal turns above still supply indexes and validated
+        # originals; an explicit rebind never rewrites their replies.
+        for index in range(len(blocks) - len(selected) - 1, native_history_start_turn - 1, -1):
             selected.insert(0, blocks[index])
             project_archive(index)
             if input_cost() > capacity:
@@ -1678,11 +1707,6 @@ class ToolApplication:
             if window['turn'] >= cutoff:
                 continue
             observation = {key: value for key, value in window.items() if key != 'turn'}
-            if any(existing['path'] == observation['path']
-                    and existing['sha256'] == observation['sha256']
-                    and existing['offset_bytes'] < observation['next_offset_bytes']
-                    and observation['offset_bytes'] < existing['next_offset_bytes'] for existing in candidates):
-                continue
             location = window['path']
             if location not in current_digests:
                 current_digests[location] = None
@@ -1700,14 +1724,28 @@ class ToolApplication:
         for window in self.sources.retained_passages(source_observations, before_turn=cutoff):
             candidates.append({key: value for key, value in window.items() if key != 'turn'}
                               | {'_observed_turn': window['turn']})
-        # Supplement omitted conversation with exact, current-version originals;
-        # do not duplicate native observations already retained above.
+        # Supplement omitted native history with exact, revalidated originals.
+        def contains_text_window(outer: dict, inner: dict) -> bool:
+            return (outer['path'] == inner['path'] and outer['sha256'] == inner['sha256']
+                and outer['offset_bytes'] <= inner['offset_bytes']
+                and inner['next_offset_bytes'] <= outer['next_offset_bytes'])
+
         for candidate in sorted(candidates, key=lambda value: value['_observed_turn'], reverse=True):
             observation = {key: value for key, value in candidate.items() if key != '_observed_turn'}
-            retained = context['retained_source_passages' if 'passage' in observation else 'retained_text_windows']
+            field = 'retained_source_passages' if 'passage' in observation else 'retained_text_windows'
+            retained = context[field]
+            previous = retained[:]
+            if field == 'retained_text_windows':
+                if any(contains_text_window(existing, observation) for existing in retained):
+                    continue
+                # Only a successfully admitted containing original replaces
+                # smaller windows. Keep them as fallback if it cannot fit;
+                # partial overlap alone never discards observed coverage.
+                retained[:] = [existing for existing in retained
+                    if not contains_text_window(observation, existing)]
             retained.append(observation)
             if input_cost() > capacity:
-                retained.pop()
+                retained[:] = previous
         recent = []
         for row in reversed(progress[:cutoff]):
             proposed = self._history_view([row] + recent)
@@ -1728,6 +1766,12 @@ class ToolApplication:
                     observation['observed'].get('returncode', 0) != 0)
         if input_cost() > capacity and explicit_inputs:
             raise ValueError('Current requests, contracts and execution facts exceed the remaining input capacity; no model request sent')
+        if getattr(client._settings, 'thinking_mode', '') == 'enabled' and any(
+                message['role'] == 'assistant' and not any(isinstance(message.get(key), str)
+                    for key in ('reasoning_content', 'reasoning'))
+                for block in selected for message in block):
+            raise ValueError('Native history lacks reasoning_content or reasoning; explicitly switch models to start '
+                             'a new native session without fabricating or changing saved reasoning')
         return prefix + [message for block in selected for message in block] + feedback
 
     @staticmethod
@@ -1884,7 +1928,7 @@ class ToolApplication:
                     # can repair the contract rather than repeat an opaque gate.
                     try:
                         self._owner_execution_binding(call)
-                    except (ValueError, TypeError, KeyError) as exc:
+                    except (ValueError, TypeError, KeyError, OSError) as exc:
                         result = ToolResult(tool_name=call['function']['name'], status='error',
                             error=f'Execution proposal is invalid: {exc}; no execution occurred',
                             data={'executed': False})
@@ -2638,11 +2682,6 @@ class ToolApplication:
                              and not self.session.store.exists(f'attempts/{entry.attempt_id}/native_result.json'))
                             or allow_completed_unknown and self._accepted_model_attempt(entry.attempt_id) is not None)):
                 raise ValueError('Unconfirmed operation must be reconciled before changing models')
-        if client._settings.thinking_mode == 'enabled' and any(
-                'reasoning_content' not in self.session.store.read_json(turn['reply'])
-                for turn in self.state['turns']):
-            raise ValueError('Saved history lacks reasoning_content; choose a compatible non-thinking '
-                             'connection, not fabricated or discarded reasoning')
         if self.state['config'].get('allow_vision'):
             vision = LLMClient.from_env(purpose='vision',
                 fallback_models_config=self.state['config'].get('model_catalogs', {}).get('vision'))
@@ -2663,7 +2702,7 @@ class ToolApplication:
 
     def switch_model(self, model_selector: str, *, switch_id: str, reason: str,
                      expected_connection: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Record a connection change only after work is reconciled; retain delivery and budgets."""
+        """Start a native session after reconciliation; retain the task journal and budgets."""
         with self.session.mutation_scope():
             if (not isinstance(switch_id, str) or not switch_id.strip()
                     or not isinstance(reason, str) or not reason.strip()
@@ -2709,7 +2748,8 @@ class ToolApplication:
                 raise ValueError('Resolved connection changed after confirmation; inspect and confirm again')
             record = {'switch_id': switch_id, 'reason': reason,
                 'from_selector': config['model'], 'from_connection': config.get('model_connection') or {},
-                'to_selector': model_selector, 'to_connection': replacement}
+                'to_selector': model_selector, 'to_connection': replacement,
+                'native_history_start_turn': len(self.state['turns'])}
             # One original journal commit. No attempt, transition, allowance,
             # feedback or delivery invalidation accompanies this operation.
             self.state['config'] = {**config, 'model': model_selector, 'model_connection': replacement,
@@ -2780,7 +2820,8 @@ class ToolApplication:
         # effective cap as chat_turn. LLMClient still owns actual reservations
         # and each physical provider attempt, including its existing retries.
         tokens = self.ledger.remaining('total_tokens')
-        required = self._decision_tokens(client)
+        required = self._decision_tokens(client, self._messages(client=client,
+            native_history_start_turn=len(self.state['turns']) if model_selector else None))
         if tokens is None or tokens < required:
             raise ValueError('Remaining token budget cannot cover the saved output cap and decision input')
         if self.session.manifest.status != 'running':
@@ -2797,6 +2838,7 @@ class ToolApplication:
                     'failed_attempt': attempt.attempt_id,
                     'from_selector': config['model'], 'from_connection': binding,
                     'to_selector': model_selector, 'to_connection': replacement,
+                    'native_history_start_turn': len(self.state['turns']),
                     'reason': 'Explicit --retry-model --model continuation; original task, access and budget retained',
                 }]}
         self.state['pending'] = {'kind': 'model', 'attempt': identity}
@@ -3039,10 +3081,11 @@ class ToolApplication:
                     and not self._terminal_error(call)):
                 try:
                     token = self.approval_token(call)
-                except (ValueError, TypeError, KeyError):
+                except (ValueError, TypeError, KeyError, OSError):
                     # Invalid proposals must reach the existing tool validator
                     # as observations, not halt the task before it can correct
-                    # its formatting. They cannot authorize execution.
+                    # its inputs, including unavailable source receipts. They
+                    # cannot authorize execution.
                     token = None
                 started = self.gateway.has_started(ToolCall(tool_name=name, trace_id=pending["attempt"]))
                 if token is not None and not started and approved_execution != token and not (approve and approve(call, token)):

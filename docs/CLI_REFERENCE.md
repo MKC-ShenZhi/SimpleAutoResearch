@@ -126,7 +126,7 @@ New remaining allowances are future capacity, not historical totals. ID/reason w
 
 Retry-model permits a new decision only after a terminated failure without an accepted reply, using saved finite output cap and remaining capacity. It does not replay tools or whole tasks. Cached replies use ordinary recovery; in-flight requests, unconfirmed reservations, unbounded charges and pending tools refuse retry. Use it separately from feedback, grants and command approval.
 
-For that closed failure only, add `--model profile:NAME` or `route:NAME` to record a replacement Chat connection with the same finite output cap. Text/code/writing bindings and transition are saved together; vision retains its binding. Missing required reasoning history is not reconstructed; choose a compatible non-thinking profile. Cached replies cannot switch. A different explicit model without retry is rejected; omission retains the saved selector. Prepare-only makes no retry or mutation.
+For that closed failure only, add `--model profile:NAME` or `route:NAME` to record a replacement Chat connection with the same finite output cap. Text/code/writing bindings and transition are saved together; vision retains its binding. Replacement starts a new provider-native conversation inside the same task: prior replies remain in the journal and `read_history`, while authorized, version-checked material stays reusable. Missing reasoning is never fabricated. Cached replies cannot switch. A different explicit model without retry is rejected; omission retains the saved selector. Prepare-only makes no retry or mutation.
 
 ### Structured compatibility selection
 
@@ -791,7 +791,7 @@ File tools accept authorized source0/... and workspace/... locators or observed 
 | copy_file | Binary/text bytes ≤64 MiB, source digest required; existing destination also needs observed digest |
 | search_files | Literal rg search within authorized roots; paginated scanned-file coverage. Consumes process receipt/allowance even though read-only |
 | inspect_project: data_paths | Read-only dependency/entry/test/document/coverage observation and full attempt; no project import or execution |
-| prepare_implementation: goal, project_path, files | Optional project selection request binds originals before generation. Unchanged selected files may return empty replacements. One complete-contract correction permitted; transport/unknown/Python-syntax failures are not replayed |
+| prepare_implementation: goal, project_path, files, execution_requested | Optional project selection binds originals before generation. `execution_requested=true` requires a validated execution plan before publication; readiness is returned as `executable`/`next_operation`, without granting execution approval. Unchanged selected files may return empty replacements. One complete-contract correction permitted; transport/unknown/Python-syntax failures are not replayed |
 | update_work_plan | Current-request plan persists through compaction/resume; no separate planner/scheduler. Step claims neither verify work nor authorize execution |
 
 Copy-project takes source directory and nonexistent workspace path. It copies an editable subset without execution/network, skipping caches/builds/symlinks/private paths, .git/.aws/.ssh/.codex/.agents/venvs/all .env* (including .env.example). Oversized files are skipped; empty source/existing destination/count or total overflow refuse publication. Inspect omissions before treating the package as complete.

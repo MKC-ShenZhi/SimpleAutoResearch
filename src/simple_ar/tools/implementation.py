@@ -31,6 +31,8 @@ class ImplementationFile(BaseModel):
 class ImplementationRequest(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
     goal: str = Field(min_length=1, max_length=16000)
+    execution_requested: bool = Field(default=False, exclude_if=lambda value: not value,
+        description='Require a validated execution_plan with the generated candidate. Planning only; execution still requires separate caller approval. Omit for code-only work.')
     project_path: str = Field(default='', description='Authorized existing project root. With files omitted, an unchanged registered candidate reuses its bound sources/materials directly for feedback; unfamiliar projects retain investigation and file selection.')
     files: list[ImplementationFile] = Field(default_factory=list, max_length=12,
         description='Optional explicit candidate files for greenfield or already investigated work. Omit to let the implementation owner select files from the goal and optional existing project.')
@@ -1098,6 +1100,9 @@ class ImplementationToolGateway:
                 else owner.read_json('selection-input.json').get('request') if owner.exists('selection-input.json') else None)
             if retained_request is not None and retained_request.get('material_roots', []) != request.material_roots:
                 raise ValueError('Material root contract changed; preserve this identity without model dispatch')
+            if (retained_request is not None
+                    and retained_request.get('execution_requested', False) != request.execution_requested):
+                raise ValueError('Execution planning contract changed; preserve this identity without model dispatch')
             for locator in request.material_roots:
                 material = self.workspace.resolve_material_root(locator)
                 if material == output or material.is_relative_to(output) or output.is_relative_to(material):
@@ -1257,6 +1262,7 @@ class ImplementationToolGateway:
                 files=None if direct_creation or retained else [row.model_dump() for row in request.files], source_windows=windows,
                 client=client, artifact_dir=owner.root, original_files=originals,
                 task_python=str(self.workspace.python), execution_observations=observations,
+                execution_requested=request.execution_requested,
                 validate_destination=lambda path: self.workspace.resolve(f'{prefix}/{path}', write=True))
             if retained and self._retained_candidate(project, identity=identity) != retained:
                 raise ValueError('Retained source unit changed during revision; keep the unverified candidate')
@@ -1277,6 +1283,12 @@ class ImplementationToolGateway:
                 'artifacts': [f"{prefix}/{row['path']}" for row in result['files']],
                 'summary': 'Candidate saved. Original sources unchanged; execution and scientific correctness remain unverified.'}
             data['data']['prepared_result'] = f'records/{identity}/implementation/result.json'
+            executable = 'execution_plan' in result
+            data['data']['executable'] = executable
+            data['data']['next_operation'] = (
+                {'operation': 'execute_implementation',
+                    'prepared_result': data['data']['prepared_result']}
+                if executable else {'operation': 'plan_needed', 'candidate_path': str(output)})
             data['metadata'] = {'capability_artifacts': [ArtifactStore(owner.root.parent).ref(
                 'implementation/result.json', kind='prepared_implementation',
                 schema='prepared_implementation.v1').to_dict()]}

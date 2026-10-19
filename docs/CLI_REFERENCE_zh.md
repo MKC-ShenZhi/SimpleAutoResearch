@@ -138,7 +138,7 @@ simple-ar start --resume-task SESSION --authorize-remaining llm_requests=10 --au
 
 仅在这种已关闭失败中，可以加 `--model profile:NAME` 或 `route:NAME`，记录新的 Chat 连接。替代连接必须使用相同的有限输出上限。文本、代码和写作绑定与切换记录一起保存，vision 绑定不变。
 
-缺失的必要 reasoning 历史不会重建；此时应选择兼容的非 thinking profile。缓存回复不能切换连接。不带重试却指定不同模型会被拒绝；省略模型会沿用保存的选择。`--prepare-only` 不会执行重试或修改状态。
+替换连接会在原任务内开始新的提供方原生对话；旧回复仍保留在原历史及 `read_history`，已授权且版本核对有效的材料仍可续用，不伪造缺失的 reasoning。缓存回复不能切换连接。不带重试却指定不同模型会被拒绝；省略模型会沿用保存的选择。`--prepare-only` 不会执行重试或修改状态。
 
 ### 结构化兼容入口
 
