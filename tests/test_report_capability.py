@@ -5,7 +5,7 @@ from dataclasses import replace
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from tests.report_review_fixtures import changed_record
 
 from simple_ar.core import CapabilityRegistry, SessionController
@@ -760,6 +760,80 @@ class StructuredArticleWritingTests(unittest.TestCase):
             self.assertEqual(calls, ['report-writer-section_1', 'report-writer-section_2'])
             self.assertEqual(gateway.call('compose_document', {**request, 'writing_method': 'article'},
                 identity='section-native').status, 'error')
+            # Complete producers of all supported granularities share one
+            # read-only evidence-reuse lifecycle, including publication replay.
+            from simple_ar.tools.writing import freeze_report_requirement, material_report_binding
+            from tests.report_review_fixtures import changed_record
+            for producer in ('section-native', 'professional-article', 'professional-sections'):
+                with self.subTest(producer=producer):
+                    if producer != 'section-native':
+                        method = 'sections' if producer.endswith('sections') else 'article'
+                        requirement = freeze_report_requirement({'outline_strategy': 'template',
+                            'reviewer': 'disabled', 'document_review': False, 'max_review_iterations': 0,
+                            'allow_source_backtracking': False, 'allow_llm_fallback': False,
+                            'figures': {'enabled': False}}, method=method)
+                        report = material_report_binding(workspace, requirement, mounts=['source0'])
+                        gateway.report_inputs = lambda: report
+                        def professional(system, prompt, *, label='', **options):
+                            calls.append(label)
+                            view = prompt_payload(prompt)
+                            self.assertIn('0.75', json.dumps(view))
+                            if 'section' in view:
+                                row = view['section']
+                                return {'section_id': row['section_id'], 'heading': row['heading'],
+                                    'draft_markdown': 'Recorded 0.75; no independent measurement.'}
+                            return {'draft_markdown': '\n\n'.join('## ' + row['heading']
+                                + '\n\nRecorded 0.75; no independent measurement.' for row in requirement['outline'])}
+                        provider = Mock()
+                        provider.ask_json.side_effect = professional
+                        gateway.client_factory = lambda _: provider
+                        produced = gateway.call('compose_document', {**legacy, 'required_headings': []}, identity=producer)
+                        self.assertEqual(produced.status, 'ok', produced.error)
+                    else:
+                        produced = restored
+                    parent = root / 'task/tools/writing' / producer
+                    original = {path: path.read_bytes() for path in parent.rglob('*') if path.is_file()}
+                    published = workspace.resolve(produced.data['editable_markdown'])
+                    published_bytes = published.read_bytes()
+                    gateway.report_inputs = None
+                    feedback = {'goal': 'Clarify the observation limits.', 'title': 'Revised evidence note',
+                        'prior_draft': produced.data['editable_markdown'], 'reuse_prior_inputs': True}
+                    new_client = Mock()
+                    new_client.ask_json.return_value = {'draft_markdown': 'Recorded 0.75; uncertainty was not measured.'}
+                    gateway.client_factory = lambda _: new_client
+                    with patch.object(gateway, '_select_materials', side_effect=AssertionError('No reselection')):
+                        revised = gateway.call('compose_document', feedback, identity=producer + '-feedback')
+                    self.assertEqual(revised.status, 'ok', revised.error)
+                    self.assertEqual(new_client.ask_json.call_count, 1)
+                    child = ArtifactStore(root / 'task/tools/writing' / (producer + '-feedback'))
+                    linkage = child.read_json('request.json')['prior_input_reuse']
+                    self.assertEqual(set(linkage['receipt_sha256']),
+                        {path.relative_to(parent).as_posix() for path in original})
+                    with patch.object(gateway, 'client_factory', side_effect=AssertionError('No model for validation or replay')) as factory:
+                        replay = gateway.call('compose_document', feedback, identity=producer + '-feedback')
+                        self.assertEqual(replay.artifacts, revised.artifacts, replay.error)
+                        response = next(path for path in original if path.name == 'response.json')
+                        for path in (parent / 'writer/writer.json', response):
+                            with changed_record(path, None):
+                                missing_bytes = {p: p.read_bytes() for p in parent.rglob('*') if p.is_file()}
+                                rejected = gateway.call('compose_document', feedback, identity=producer + '-reject')
+                                self.assertEqual(rejected.status, 'error')
+                                self.assertEqual({p: p.read_bytes() for p in parent.rglob('*') if p.is_file()}, missing_bytes)
+                        with changed_record(response, response.read_bytes() + b'\n'):
+                            rejected = gateway.call('compose_document', feedback, identity=producer + '-feedback')
+                            self.assertEqual(rejected.status, 'error')
+                        with changed_record(source, b'run,score\nfirst,9.0\n'):
+                            self.assertEqual(gateway.call('compose_document', feedback,
+                                identity=producer + '-reject').status, 'error')
+                        if producer == 'professional-sections':
+                            unmarked = json.loads((parent / 'request.json').read_text())
+                            self.assertEqual(unmarked.pop('section_response_contract'), 'atomic_complete.v1')
+                            with changed_record(parent / 'request.json', unmarked):
+                                rejected = gateway.call('compose_document', feedback, identity=producer + '-reject')
+                                self.assertIn('no verifiable complete response receipts', rejected.error)
+                        factory.assert_not_called()
+                    self.assertEqual({p: p.read_bytes() for p in parent.rglob('*') if p.is_file()}, original)
+                    self.assertEqual(published.read_bytes(), published_bytes)
             gateway.report_inputs = lambda: {'requirement': {'method': 'article'}}
             with patch.object(gateway, 'client_factory', side_effect=AssertionError('No unauthorized method')):
                 blocked = gateway.call('compose_document', request, identity='frozen-method')

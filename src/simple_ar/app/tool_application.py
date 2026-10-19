@@ -101,6 +101,9 @@ class _WorkFocus(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
     purpose: Literal['task', 'code', 'writing']
     goal: str = Field(default='', max_length=8000)
+    tools: list[str] | None = Field(default=None, max_length=20,
+        exclude_if=lambda value: value is None,
+        description='Optional exact professional tool names to select together with this work focus, replacing load_tools as a separate step. Empty clears selection; omission preserves it. Selection grants no permission.')
     inputs: list[FileWindow] = Field(default_factory=list, max_length=12,
         description='Optional necessary original input windows for this work unit. The owner reads and records actual bytes and identity here; no hashes required. Partial windows cover only their returned range. These inputs take priority over unrelated native history within the same remaining input capacity. If they cannot fit, narrow windows in this action loop; missing bytes are not evidence.')
 
@@ -371,6 +374,9 @@ class ToolApplication:
                 result = self.session.store.read_json(item['result'])
                 if result.get('tool_name') == 'load_tools' and result.get('status') == 'ok':
                     return set(_ToolSelection.model_validate(result['data']).names)
+                if (result.get('tool_name') == 'focus_work' and result.get('status') == 'ok'
+                        and 'tools' in result['data']):
+                    return set(_ToolSelection.model_validate({'names': result['data']['tools']}).names)
         return set()
 
     def _record_artifacts(self) -> tuple[Path, ...]:
@@ -622,11 +628,7 @@ class ToolApplication:
                     'next_turn': end if stop == len(raw) else page.start_turn},
                     summary='Historical observation snapshot, not current state or verified outcomes.')
             if name == 'load_tools':
-                selection = _ToolSelection.model_validate(arguments)
-                for tool in selection.names:
-                    spec = self.gateway.registry.get(tool)
-                    if spec is None or not self.gateway.policy.is_allowed(spec)[0]:
-                        raise ValueError(f'Unknown or unauthorized tool: {tool}')
+                selection = self._validate_tool_selection(arguments)
                 return ToolResult(tool_name=name, data=selection.model_dump(),
                     summary='Selected contracts available to the next decision; no professional work or permission change.')
             if name == 'update_work_plan':
@@ -638,6 +640,8 @@ class ToolApplication:
             if name != 'focus_work':
                 raise ValueError('Unknown coordination operation')
             focus = _WorkFocus.model_validate(arguments)
+            if focus.tools is not None:
+                self._validate_tool_selection({'names': focus.tools})
             client = self._client(purpose=focus.purpose)
             data = {**focus.model_dump(exclude={'inputs'}), 'model': client.model}
             if 'inputs' in focus.model_fields_set:
@@ -654,9 +658,17 @@ class ToolApplication:
                         row = {'request': request, 'error': str(error)}
                     data['inputs'].append(row)
             return ToolResult(tool_name=name, data=data,
-                summary='Next decision uses this work focus. Original goal, tools, permissions and remaining budget are unchanged.')
+                summary='Next decision uses this work focus and any explicitly selected contracts. Original goal, permissions and remaining budget are unchanged.')
         except (ValueError, TypeError, LLMError) as exc:
             return ToolResult(tool_name=name, status='blocked', error=str(exc))
+
+    def _validate_tool_selection(self, arguments: dict) -> _ToolSelection:
+        selection = _ToolSelection.model_validate(arguments)
+        for name in selection.names:
+            spec = self.gateway.registry.get(name)
+            if spec is None or not self.gateway.policy.is_allowed(spec)[0]:
+                raise ValueError(f'Unknown or unauthorized tool: {name}')
+        return selection
 
     @classmethod
     def _configuration(cls, root: Path, goal: str, *, model: str | None, sources: dict[str, Path],

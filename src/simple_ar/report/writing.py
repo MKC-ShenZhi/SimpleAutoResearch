@@ -161,6 +161,118 @@ def _retain_records(store: ArtifactStore, sources: Sequence[ArtifactStore], reco
             store.write_json(name, value)
 
 
+class _CompletedWritingStore(ArtifactStore):
+    """Run the existing recovery validators without repairing a parent record."""
+
+    def write_json(self, path: str, data: Any, **options: Any) -> ArtifactRef:
+        if not self.exists(path) or self.read_json(path) != data:
+            raise ValueError('Completed Writer record is missing or changed; no parent recovery')
+        return self.ref(path, **options)
+
+    def write_text(self, path: str, text: str, **options: Any) -> ArtifactRef:
+        raise ValueError('Completed Writer validation cannot write parent text')
+
+
+def _writing_child(store: ArtifactStore, path: str) -> ArtifactStore:
+    original = store.original if isinstance(store, _SectionRecoveryStore) else store
+    return (_CompletedWritingStore if isinstance(original, _CompletedWritingStore) else ArtifactStore)(store.root / path)
+
+
+class _SectionRecoveryStore(ArtifactStore):
+    """Reconstruct section responses while retaining the saved progress prefix."""
+
+    def __init__(self, original: ArtifactStore) -> None:
+        super().__init__(original.root)
+        self.original = original
+        self.completed = original.read_json('sections.json')['completed']['sections'] if original.exists('sections.json') else []
+
+    def write_json(self, path: str, payload: Any, **options: Any) -> ArtifactRef:
+        if path == 'writer.json':
+            if payload['sections'][:len(self.completed)] != self.completed:
+                raise ValueError('Section checkpoint has unmatched complete response producers')
+            _retain_records(self.original, (), {path: payload})
+            return self.ref(path, **options)
+        if path == 'sections.json':
+            sections = payload['completed']['sections']
+            count = min(len(sections), len(self.completed))
+            if sections[:count] != self.completed[:count]:
+                raise ValueError('Section checkpoint differs from its complete response producers')
+            if len(sections) <= len(self.completed):
+                return self.ref(path, **options)
+        return self.original.write_json(path, payload, **options)
+
+
+def completed_composition_writer(*, store: ArtifactStore, binding: dict[str, Any], identity: str) -> None:
+    """Prove a completed composition through its original Writer recovery owner.
+
+    This is a read-only admission check, not interrupted-work recovery. Historical
+    professional section protocols without the response marker cannot establish
+    this stronger contract from their checkpoint alone.
+    """
+    writer = _CompletedWritingStore(store.root / 'writer')
+    snapshot = writer.read_json('report_inputs.json')
+    documents = store.ref('documents.json', kind='documents', schema='document_bundle.v1')
+    owner = binding.get('writing_owner')
+    if owner == ARTICLE_OWNER:
+        if snapshot.get('inputs', {}).get('binding') != binding:
+            raise ValueError('Prior article input binding changed')
+        if 'writer_projection' in snapshot['inputs']:
+            raise ValueError('Standalone article has a professional Writer projection')
+        if not writer.exists('writer.json'):
+            raise ValueError('Prior article has no completed Writer result; no parent recovery')
+        write_whole_article(store=writer, inputs=snapshot['inputs'], identity=identity, recovering=True)
+    elif owner == SECTION_ARTICLE_OWNER:
+        if not all(writer.exists(path) for path in ('writer.json', 'sections.json')):
+            raise ValueError('Prior section article has no completed Writer result; no parent recovery')
+        saved = binding['request']
+        context = ReportContext.model_validate(snapshot['context'])
+        # write_section_article adds this context itself, using the saved prose.
+        context.source_handles = [row for row in context.source_handles if row.kind != 'prior_draft']
+        write_section_article(store=writer, input_store=store, documents_ref=documents,
+            identity=identity, report_context=context, title=saved['title'],
+            target_words=saved['target_words'], required_headings=saved.get('required_headings', []),
+            max_cited_sources=saved.get('max_cited_sources', 0),
+            prior_draft=next((row.get('metadata', {}).get('draft_markdown', '')
+                for row in snapshot['context']['source_handles'] if row['kind'] == 'prior_draft'), ''),
+            recovering=True)
+    elif owner == 'professional_report.v1':
+        article = snapshot.get('owner') == ARTICLE_OWNER
+        if not article and binding.get('section_response_contract') != 'atomic_complete.v1':
+            raise ValueError('Professional section protocol has no verifiable complete response receipts; '
+                'explicit input reuse unavailable, no fresh selection fallback')
+        completed = store.read_json('professional_result.json')
+        if hashlib.sha256(writer.resolve(completed['writer_path']).read_bytes()).hexdigest() != completed['writer_sha256']:
+            raise ValueError('Professional Writer result changed')
+        frozen = snapshot['inputs']['binding'] if article else snapshot
+        requirement = binding['report_binding']['requirement']
+        config = ReportRuntimeConfig.model_validate(requirement['config'])
+        saved = binding['request']
+        if not config.longform.target_words and saved['target_words']:
+            config.longform.target_words = saved['target_words']
+        limits = [value for value in (config.max_cited_sources, saved.get('max_cited_sources', 0)) if value]
+        config.max_cited_sources = min(limits) if limits else 0
+        if (requirement['method'] != ('article' if article else 'sections')
+                or frozen['config'] != config.model_dump(mode='json')
+                or frozen['template'] != requirement['template']
+                or frozen['sources'] != [documents.to_dict()]):
+            raise ValueError('Professional Writer projection differs from its frozen report binding')
+        if not article and not all(writer.exists(path) for path in ('writer.json', 'sections.json')):
+            raise ValueError('Professional section result is incomplete; no parent recovery')
+        request = ReportWritingRequest(report_context=ReportContext.model_validate(frozen['context']),
+            memory=ReportMemory.model_validate(frozen['memory']),
+            config=ReportRuntimeConfig.model_validate(frozen['config']),
+            template=ReportTemplateBundle.model_validate(frozen['template']),
+            llm_client=None if article else retained_writing_client(store=writer, identity=identity, client=None),
+            method='article' if article else 'sections', prior_draft=frozen.get('prior_draft', ''))
+        result = run_report_writing_capability(context=CapabilityContext(writer if article else _SectionRecoveryStore(writer), AttemptManifest(identity),
+            inputs=tuple(ArtifactRef.from_dict(row) for row in frozen['sources']), input_store=store), request=request)
+        produced = next(row for row in result.artifacts if row.kind == 'report_writer_result')
+        if result.status != 'completed' or produced.path != completed['writer_path']:
+            raise ValueError('Professional Writer did not prove its completed result')
+    else:
+        raise ValueError('Unknown completed composition producer; explicit input reuse unavailable')
+
+
 def _review_pending(reviews: Sequence[Any]) -> bool:
     from simple_ar.report.editor import _needs_revision
     return any(_needs_revision(row) or row.context_requests for row in reviews)
@@ -189,7 +301,7 @@ def retained_writing_client(*, store: ArtifactStore, identity: str, client: Any)
             location = store.root / 'model_calls' / key
             if client is None and not (location / 'request.json').is_file():
                 raise ValueError('Section request has no matching saved complete response; no blind replay')
-            call_store = ArtifactStore(location)
+            call_store = _writing_child(store, 'model_calls/' + key)
             if client is None and snapshot_id:
                 retained = call_store.read_json('request.json')
                 if retained.get('input_snapshot') != snapshot_id or retained.get('options') != options:
@@ -369,7 +481,7 @@ def inspect_article(*, store: ArtifactStore, identity: str, client: Any,
         def ask_json(self, system: str, prompt: str, **options: Any) -> Any:
             nonlocal active
             correcting = bool(json.loads(prompt)['response_format_correction'])
-            active = ArtifactStore(source.root / 'format_correction') if correcting else source
+            active = _writing_child(source, 'format_correction') if correcting else source
             request = {'system': system, 'prompt': prompt, 'options': options}
             if evidence_contract:
                 request['evidence_reference_contract'] = evidence_contract
@@ -655,30 +767,7 @@ def write_section_article(*, store: ArtifactStore, input_store: ArtifactStore,
             sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         if not store.exists('report_inputs.json') or store.read_json('report_inputs.json') != expected:
             raise ValueError('Frozen section input changed; preserve its snapshot, no blind replay')
-        completed = store.read_json('sections.json')['completed']['sections'] if store.exists('sections.json') else []
-        original_store = store
-
-        class RecoveryStore(ArtifactStore):
-            def write_json(self, path: str, payload: Any, **options: Any) -> ArtifactRef:
-                if path == 'writer.json' and payload['sections'][:len(completed)] != completed:
-                    raise ValueError('Section checkpoint has unmatched complete response producers')
-                if path == 'writer.json':
-                    # Recovery may complete a missing result, but cannot heal a
-                    # changed completed producer. Use the same retained-record
-                    # parity as whole-article recovery before writing anything.
-                    _retain_records(original_store, (), {path: payload})
-                    return self.ref(path, kind=options.get('kind', ''), schema=options.get('schema', ''))
-                if path == 'sections.json':
-                    sections = payload['completed']['sections']
-                    count = min(len(sections), len(completed))
-                    if sections[:count] != completed[:count]:
-                        raise ValueError('Section checkpoint differs from its complete response producers')
-                    if len(sections) <= len(completed):
-                        # Do not erase retained progress while reconstructing it.
-                        return self.ref(path, kind=options.get('kind', ''), schema=options.get('schema', ''))
-                return original_store.write_json(path, payload, **options)
-
-        store = RecoveryStore(store.root)
+        store = _SectionRecoveryStore(store)
     result = run_report_writing_capability(context=CapabilityContext(store, AttemptManifest(identity),
         inputs=(documents_ref,), input_store=input_store),
         request=ReportWritingRequest(context, memory, config, template,
@@ -839,8 +928,8 @@ def _edit_article(*, store: ArtifactStore, retained: ArtifactStore, written: dic
             revision_findings={'status': 'Editing concerns, not source facts; preserve the original evidence.',
                 'reviews': [row.model_dump(mode='json') for row in event.section_reviews]})
         path = f'review/revision-{event.iteration}'
-        revision = ArtifactStore(store.root / path)
-        prior = ArtifactStore(retained.root / path)
+        revision = _writing_child(store, path)
+        prior = _writing_child(retained, path)
         return write_whole_article(store=revision, inputs=revised_inputs,
             identity=f'{written["source_attempt"]}:revision-{event.iteration}',
             client=None if recover_only else request.llm_client, recovering=revision.exists('report_inputs.json'),
@@ -855,8 +944,8 @@ def _edit_article(*, store: ArtifactStore, retained: ArtifactStore, written: dic
                 event: ReportIterationRecord | None = None) -> list[ReportSectionReview]:
         event = event or next(row for row in reversed(iterations) if row.action == 'document_joint_revise')
         path = f'review/revision-{event.iteration}/inspection'
-        result = inspect_article(store=ArtifactStore(store.root / path),
-            resume_store=ArtifactStore(retained.root / path) if retained.root != store.root else None,
+        result = inspect_article(store=_writing_child(store, path),
+            resume_store=_writing_child(retained, path) if retained.root != store.root else None,
             identity=f'{written["source_attempt"]}:revision-{event.iteration}',
             client=None if recover_only else request.llm_client,
             report_context=request.report_context, config=config, template=request.template,
@@ -939,7 +1028,7 @@ def _run_article_writing(*, context: CapabilityContext, request: ReportWritingRe
         resume_store=ArtifactStore(context.require_input(request.resume_ref).parent) if request.resume_ref else None)
     writer_path, status, diagnostics = 'writer.json', 'completed', ('Whole article drafted without independent writing review or source backtracking.',)
     if article_inspection_enabled(config):
-        review_store = ArtifactStore(context.store.root / 'review')
+        review_store = _writing_child(context.store, 'review')
         report = inspect_article(store=review_store, identity=written['source_attempt'], client=request.llm_client,
             report_context=report_context, config=config, template=request.template,
             markdown=written['sections'][0]['draft_markdown'], target_words=config.longform.target_words,

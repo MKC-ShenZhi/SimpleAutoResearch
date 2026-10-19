@@ -165,7 +165,7 @@ class ComposeRequest(BaseModel):
         description="Authorized existing PNG/JPEG/SVG/PDF files: legacy path strings, or {path, caption} for an explicit publication caption. Writer places the caption only in the standalone image alt; export owns figure numbering. Contents are not visually or scientifically verified by composition.")
     prior_draft: str = Field(default="", description="Optional mounted Markdown draft for any revision, including review corrections or user feedback. Binds its actual bytes as a prior version, not primary evidence or a new review certificate.")
     reuse_prior_inputs: bool = Field(default=False, exclude_if=lambda value: value is False,
-        description="Opt in to the already-resolved original sources and file windows of an intact producer-completed same-task standalone whole-article prior_draft. The completed writing-owner receipt is required, not prior native-journal adoption or final delivery; reuse does not certify either. Requires prior_draft and no sources/materials/material_roots; use fresh selection for scope changes or other writing owners. Supply current figures explicitly. Revalidates evidence permissions and bytes before Writer or independent review; prior prose is never primary evidence.")
+        description="Opt in to the resolved original sources and file windows of an intact producer-completed same-task article, section article or material professional report prior_draft. Existing Writer recovery must prove complete responses; professional section protocols without those receipts and execution-only projections fail explicitly. Completion does not certify native-journal adoption or delivery. Requires prior_draft and no sources/materials/material_roots; use fresh selection for scope changes. Supply current figures explicitly. Revalidates evidence permissions and bytes before Writer or independent review; prior prose is never primary evidence.")
     writing_method: Literal['article', 'sections'] | None = Field(default=None,
         exclude_if=lambda value: value is None,
         description="Optional composition granularity, not a task type or model selector. article returns one complete draft; sections uses the existing planned section Writer and complete-response checkpoints for longer work. Omitted keeps the original article/frozen-report method. Does not add review, retries or budget; cannot replace a frozen report method.")
@@ -240,8 +240,8 @@ def writing_tool_specs() -> list[CommonToolSpec]:
             description="Independently inspect an existing prior_draft against the goal and retained source/material evidence using the existing document reviewer. Shares composition's evidence selection, version binding and model budget, but never drafts or rewrites the manuscript. Saves review.json with concrete findings, evidence/draft quotes and review_status; needs_revision is not an accepted correction. No search, execution, automatic correction or visual inspection; use inspect_images for rendered figures. Complete responses recover without another call; unknown/rejected responses are not resent.")]
     for spec in specs:
         spec.description += (' Optional reuse_prior_inputs reuses resolved evidence only from an intact producer-completed '
-            'same-task standalone whole-article canonical prior_draft. Professional reports, section compositions, '
-            'external drafts and reviews cannot be reuse parents; use ordinary fresh evidence selection for them. '
+            'same-task canonical article, section article or material professional report prior_draft through Writer recovery. '
+            'Professional section protocols without complete response receipts and execution-only projections fail explicitly; external drafts and reviews cannot be parents. '
             'Opt-in requires no sources/materials/material_roots; supply current figures explicitly.')
     return specs
 
@@ -259,14 +259,15 @@ class WritingToolGateway:
         self.work_context = work_context
         self.material_observations = material_observations
 
-    def _prior_inputs(self, request: ComposeRequest, identity: str) -> tuple[ComposeRequest, dict, dict]:
+    def _prior_inputs(self, request: ComposeRequest, identity: str,
+                      retained_linkage: dict | None = None) -> tuple[ComposeRequest, dict, dict]:
         """Read a completed same-task producer, not certify journal adoption.
 
         Explicit input reuse grants no read authority, delivery status or budget.
         A domain-complete result can outlive an interrupted caller commit; its
         original evidence still has to pass current permissions and byte checks.
         """
-        from simple_ar.report.writing import ARTICLE_OWNER, write_whole_article
+        from simple_ar.report.writing import completed_composition_writer
 
         path = self.workspace.resolve(request.prior_draft)
         prior_id = path.parent.name
@@ -279,22 +280,34 @@ class WritingToolGateway:
             raise ValueError('Prior composition owner escapes this task')
         # Fixed owner files only: neither search history nor infer a missing receipt.
         names = ('request.json', 'result.json', 'documents.json', 'writer/writer.json',
-            'writer/report_inputs.json', 'writer/response.json')
+            'writer/report_inputs.json')
         if not all(store.exists(name) for name in names):
             raise ValueError('Prior input reuse requires a complete writing-owner receipt; no recovery')
-        hashes = {name: hashlib.sha256(store.resolve(name).read_bytes()).hexdigest() for name in names}
+        # Bind every retained parent receipt, including section calls, review
+        # corrections/revisions and delegated selection, not just writer.json.
+        paths = [path for path in store.root.rglob('*') if path.is_file()]
+        if any(not path.resolve().is_relative_to(store.root.resolve()) for path in paths):
+            raise ValueError('Prior composition receipt escapes its owner')
+        hashes = {path.relative_to(store.root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in paths}
+        if retained_linkage is not None:
+            # Old opt-in requests froze six fixed receipts. Recheck exactly
+            # that saved contract on replay; do not migrate their identity.
+            recorded = retained_linkage['receipt_sha256']
+            if any(hashes.get(name) != digest for name, digest in recorded.items()):
+                raise ValueError('Prior composition receipt hashes changed')
+            hashes = {name: hashes[name] for name in recorded}
         binding, result = store.read_json('request.json'), store.read_json('result.json')
-        snapshot = store.read_json('writer/report_inputs.json')
-        if (binding.get('writing_owner') != ARTICLE_OWNER or snapshot.get('owner') != ARTICLE_OWNER
-                or snapshot.get('inputs', {}).get('binding') != binding):
-            raise ValueError('Prior input reuse requires an intact completed standalone article input binding; use fresh selection for other owners')
-        # The existing Writer validates its system, snapshot, complete response,
-        # citation contract and retained writer parity. Require every record it
-        # could retain first: this validation must never heal a prior attempt.
-        if 'writer_projection' in snapshot['inputs']:
-            raise ValueError('Prior input reuse requires a standalone whole-article parent, not a professional report')
-        write_whole_article(store=ArtifactStore(store.root / 'writer'), inputs=snapshot['inputs'],
-            identity=prior_id, client=None, recovering=True)
+        if binding.get('writing_owner') == 'professional_report.v1':
+            report = binding.get('report_binding', {})
+            if report.get('evidence_contract') != 'materials.v1':
+                raise ValueError('Explicit input reuse supports material professional reports only; '
+                    'execution-report projections require their original owner, no fresh selection fallback')
+            if self.workspace.artifact_hashes(report['evidence_sha256']) != report['evidence_sha256']:
+                raise ValueError('Prior professional report evidence changed')
+            if result.get('data', {}).get('report_binding') != report:
+                raise ValueError('Prior professional report receipt binding changed')
+        completed_composition_writer(store=store, binding=binding, identity=prior_id)
         data = result['data']
         prefix = f'workspace/manuscripts/{prior_id}'
         artifacts = data.get('artifact_sha256')
@@ -305,15 +318,22 @@ class WritingToolGateway:
                 or f'{prefix}/manuscript.md' not in artifacts
                 or self.workspace.artifact_hashes(artifacts) != artifacts):
             raise ValueError('Prior composition receipt or canonical artifacts changed or are incomplete')
+        # Old figure inputs and prior prose are context, not the reusable
+        # evidence recipe. Current figures must be supplied explicitly.
+        saved = binding['request']
+        self._check_input_bytes(binding['inputs'][:len(saved['sources']) + len(saved['materials'])])
+        if any(not store.exists(name) or hashlib.sha256(store.resolve(name).read_bytes()).hexdigest() != digest
+               for name, digest in hashes.items()):
+            raise ValueError('Prior composition receipts changed during completed-producer validation')
         # This is the owner's resolved recipe, not another caller request:
         # delegated selection retains its roots alongside resolved windows.
         # Validate only the existing typed selections; preserve the original
         # binding intact for Writer equality and byte linkage above/below.
-        saved = binding['request']
         sources = [SelectedSource.model_validate(row) for row in saved['sources']]
         materials = [FileWindow.model_validate(row) for row in saved['materials']]
         if not (sources or materials):
-            raise ValueError('Prior composition has no resolved original evidence to reuse')
+            raise ValueError('Prior composition has no resolved source/window recipe; execution-only '
+                'professional reports are not supported by explicit input reuse, no fresh selection fallback')
         # Keep the saved selection representation. The common source/window
         # reader below consumes its resolved IDs and exact observed byte ranges.
         resolved = request.model_copy(update={'sources': sources, 'materials': materials})
@@ -333,7 +353,14 @@ class WritingToolGateway:
 
     def check_delivery(self, data: dict[str, Any]) -> None:
         """Current source bytes, including bounded windows, still own this text."""
-        for row in data['inputs']:
+        self._check_input_bytes(data['inputs'])
+        receipt = ArtifactStore(self.root / 'tools/writing' / Path(data['version']).name)
+        completed = receipt.read_json('professional_result.json')
+        if hashlib.sha256(receipt.resolve('writer/' + completed['writer_path']).read_bytes()).hexdigest() != completed['writer_sha256']:
+            raise ValueError('Report Writer evidence changed; no completed delivery')
+
+    def _check_input_bytes(self, inputs: list[dict[str, Any]]) -> None:
+        for row in inputs:
             if row.get('sha256') is not None:
                 if self.workspace.artifact_hashes([row['path']])[row['path']] != row['sha256']:
                     raise ValueError('Report source changed; compose a new current version')
@@ -345,10 +372,6 @@ class WritingToolGateway:
                 if (read.status != 'ok' or read.data['size_bytes'] != selection['size_bytes']
                         or hashlib.sha256(read.data['text'].encode('utf-8')).hexdigest() != selection['window_sha256']):
                     raise ValueError('Report source window changed; compose a new current version')
-        receipt = ArtifactStore(self.root / 'tools/writing' / Path(data['version']).name)
-        completed = receipt.read_json('professional_result.json')
-        if hashlib.sha256(receipt.resolve('writer/' + completed['writer_path']).read_bytes()).hexdigest() != completed['writer_sha256']:
-            raise ValueError('Report Writer evidence changed; no completed delivery')
 
     @staticmethod
     def _completed_writer(store: ArtifactStore, expected: dict[str, Any], identity: str) -> dict:
@@ -624,7 +647,8 @@ class WritingToolGateway:
                     raise ValueError('The bound prior draft is revision context, not selectable material evidence')
             reuse_binding, reuse_linkage = None, None
             if request.reuse_prior_inputs:
-                request, reuse_binding, reuse_linkage = self._prior_inputs(request, identity)
+                request, reuse_binding, reuse_linkage = self._prior_inputs(request, identity,
+                    original_binding.get('prior_input_reuse') if recovering else None)
             if inspecting and request.writing_method is not None:
                 raise ValueError('Independent inspection cannot select a drafting method')
             delivery = request.delivery if inspecting else None
@@ -811,6 +835,29 @@ class WritingToolGateway:
                     text=text, source_path=window.path, line_start=window.start_line, metadata={'selection': selection})
             if reuse_linkage is not None and bindings != reuse_linkage['inputs']:
                 raise ValueError('Prior composition selected inputs changed; use fresh selection for changed evidence')
+            if reuse_linkage is not None:
+                prior_store = ArtifactStore(self.root / 'tools/writing' / reuse_linkage['owner'])
+                prior_projection = prior_store.read_json('documents.json')
+                projection = DocumentBundle(list(records.values()), {}, {},
+                    list(sections.values()), list(chunks.values())).to_handoff_dict()
+                # A line window is replayed by its exact byte range. Restoring
+                # start_line changes dict insertion order in the generated
+                # abstract's JSON, although typed coverage is identical. Only
+                # normalize our own proven generated description, in memory;
+                # preserve historical snapshots and all user-authored abstracts.
+                material_ids = {f'compose-material-{number}' for number in range(1, len(request.materials) + 1)}
+                for projected in (prior_projection, projection):
+                    for document in projected['documents']:
+                        if (document['document_id'] not in material_ids
+                                or document['metadata'].get('kind') != 'selected_artifact'):
+                            continue
+                        coverage = document['metadata']['fulltext_extraction']['coverage']
+                        suffix = '. Full-file digest may be unavailable; only this window was read.'
+                        if document['abstract'] != 'Selected file window: ' + json.dumps(coverage, ensure_ascii=False) + suffix:
+                            raise ValueError('Prior generated material description changed')
+                        document['abstract'] = 'Selected file window: ' + json.dumps(coverage, ensure_ascii=False, sort_keys=True) + suffix
+                if prior_projection != projection:
+                    raise ValueError('Prior resolved source/window projection changed')
             figure_inputs, figure_captions, figure_paths = [], [], set()
             for number, supplied in enumerate(request.figures, 1):
                 locator = supplied if isinstance(supplied, str) else supplied.path
@@ -890,6 +937,15 @@ class WritingToolGateway:
                 binding['work_context'] = freeze_work_context(self.work_context, list(dict.fromkeys(targets)))
             if report_binding is not None:
                 binding['report_binding'] = report_binding
+            if (writing_owner == 'professional_report.v1'
+                    and report_binding['requirement']['method'] == 'sections'
+                    and (recovering or (
+                        report_binding['requirement']['config']['reviewer'] == 'disabled'
+                        and not report_binding['requirement']['config']['document_review']
+                        and not report_binding['requirement']['config']['allow_source_backtracking']
+                        and report_binding['requirement']['config']['max_review_iterations'] == 0))
+                    and (not recovering or 'section_response_contract' in original_binding)):
+                binding['section_response_contract'] = 'atomic_complete.v1'
             if writing_owner is not None:
                 binding['writing_owner'] = writing_owner
             # Preserve historical partial publication bytes. Only new work
@@ -1078,6 +1134,9 @@ class WritingToolGateway:
                 else:
                     client = client or (self.client_factory(identity) if self.client_factory else LLMClient.from_env(
                         self.model, budget_ledger=self.ledger, budget_session_id=self.session_id, budget_attempt_id=identity))
+                    if binding.get('section_response_contract') == 'atomic_complete.v1':
+                        from simple_ar.report.writing import retained_writing_client
+                        client = retained_writing_client(store=writer_store, identity=identity, client=client)
                     result = run_report_writing_capability(context=CapabilityContext(writer_store,
                         AttemptManifest(identity), inputs=(ref, *((resume,) if resume else ())),
                         input_store=owner), request=ReportWritingRequest(report_context=context, memory=memory,

@@ -4169,6 +4169,28 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertNotIn('available_specialists', json.loads(historical._messages(client=fake)[1]['content']))
 
     def test_native_contract_modes_validate_and_supply_preserves_saved_policy(self) -> None:
+        # A coherent professional focus selects contracts in its own journal
+        # entry; it need not spend another decision merely loading tools.
+        _, _, _, _, focused, _ = self._native_fixture()
+        before = focused.ledger.to_dict()
+        for index, selection in enumerate((['compose_document'], None, [], ['search_sources'])):
+            arguments = {'purpose': 'writing', 'goal': 'Revise the existing account.'}
+            if selection is not None:
+                arguments['tools'] = selection
+            with patch.object(focused, '_client', return_value=SimpleNamespace(model='fixture')):
+                result = _call_tool(focused.gateway, 'focus_work', arguments, identity=f'focus-selection-{index}')
+            if selection == ['search_sources']:
+                self.assertEqual(result.status, 'blocked')
+                continue
+            self.assertEqual(result.status, 'ok', result.error)
+            focused.state['turns'].append(self._record_native_turn(focused, 'focus_work',
+                arguments, result.data, f'focus-selection-{index}'))
+            focused._save()
+            self.assertEqual(ToolApplication.load(focused.session.store.root)._tool_selection(),
+                {'compose_document'} if index < 2 else set())
+            if selection is None:
+                self.assertNotIn('tools', result.data)
+        self.assertEqual(focused.ledger.to_dict(), before)
         for mode in ('on_demand', 'full', None):
             with self.subTest(saved_mode=mode):
                 inputs, fake, app = self._supply_fixture()
@@ -8718,6 +8740,22 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(revised_binding['inputs'][0]['selected_chunk_ids'], ['original-span'])
         self.assertFalse((revised_owner / 'selection-input.json').exists())
         self.assertNotEqual(app.workspace.resolve(revised.data['editable_markdown']).read_bytes(), old_bytes)
+        # The saved line-window description and byte replay serialize coverage
+        # keys differently. Their typed evidence agrees; neither parent nor
+        # historical child snapshots should be rewritten to normalize it.
+        parent_material = next(row for row in read_json(parent / 'documents.json')['documents']
+            if row['document_id'] == 'compose-material-1')
+        revised_material = next(row for row in read_json(revised_owner / 'documents.json')['documents']
+            if row['document_id'] == 'compose-material-1')
+        self.assertEqual(parent_material['metadata'], revised_material['metadata'])
+        self.assertNotEqual(parent_material['abstract'], revised_material['abstract'])
+        altered_projection = read_json(parent / 'documents.json')
+        next(row for row in altered_projection['documents']
+            if row['document_id'] == 'compose-material-1')['abstract'] = 'Altered evidence description'
+        with (_changed_record(parent / 'documents.json', json.dumps(altered_projection).encode()),
+                patch.object(app.writing, 'client_factory', side_effect=AssertionError('No model for altered projection'))):
+            rejected = self._compose_document(app, feedback, 'reuse-projection-reject', status='error')
+            self.assertIn('generated material description changed', rejected.error)
 
         fake.ask_json.return_value = {'section_reviews': [{'section_id': 'document', 'verdict': 'pass'}]}
         review_args = {**feedback, 'prior_draft': revised.data['editable_markdown']}
@@ -8778,6 +8816,23 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(fake.ask_json.call_count, calls + 2)
         self.assertIn('material_selection', fresh.data)
         self.assertEqual(_writing_prompt(fake)['prior_draft'], 'Earlier descriptive account.')
+
+        # Saved opt-in requests predating the broader producer check froze six
+        # receipts. Their replay must retain that exact linkage identity.
+        legacy_prior_inputs = app.writing._prior_inputs
+        fixed = ('request.json', 'result.json', 'documents.json', 'writer/writer.json',
+            'writer/report_inputs.json', 'writer/response.json')
+        def historical_linkage(*args, **kwargs):
+            resolved, binding, linkage = legacy_prior_inputs(*args, **kwargs)
+            linkage['receipt_sha256'] = {key: linkage['receipt_sha256'][key] for key in fixed}
+            return resolved, binding, linkage
+        fake.ask_json.side_effect = None
+        fake.ask_json.return_value = {'draft_markdown': f'Historical explicit reuse [@{citation_id}].'}
+        with patch.object(app.writing, '_prior_inputs', side_effect=historical_linkage):
+            historical = self._compose_document(app, feedback, 'reuse-historical-linkage')
+        with patch.object(app.writing, 'client_factory', side_effect=AssertionError('No historical model replay')):
+            replayed = self._compose_document(app, feedback, 'reuse-historical-linkage')
+        self.assertEqual(replayed.artifacts, historical.artifacts)
 
     def test_composition_material_roots_bind_original_sources_and_legacy_mixed_receipts(self) -> None:
         from simple_ar.core.capabilities import ArtifactStore
