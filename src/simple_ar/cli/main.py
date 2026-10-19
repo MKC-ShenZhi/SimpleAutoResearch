@@ -2461,10 +2461,12 @@ def _render_native_result(app: Any, status: dict[str, Any]) -> None:
         reason = "Insufficient remaining budget before dispatch / 发送前剩余额度不足"
     elif reason.startswith("BudgetUnknownError:"):
         reason = "Prior usage is unknown / 先前用量未核清"
-    elif ":" in reason:
-        reason = "Saved stop detail withheld; inspect session_manifest.json locally"
     elif reason.startswith("Process requires explicit approval"):
         reason = "Process awaits explicit approval / 执行等待明确授权"
+    elif reason.startswith(('LLM', 'Connect', 'Timeout')):
+        reason = "Model connection or response failed / 模型连接或响应失败；已保存调用记录"
+    elif ":" in reason:
+        reason = "Saved stop detail withheld; inspect session_manifest.json locally"
     elif reason not in {
         "", "Delivery manifest saved; scientific quality requires independent checking",
         "Model returned prose without a delivery or question; inspect the saved reply before continuing",
@@ -2481,6 +2483,22 @@ def _render_native_result(app: Any, status: dict[str, Any]) -> None:
         lines.append(f"Selected attempt / 当前尝试: attempts/{attempt}")
     if status['status'] not in {"completed", "partial"}:
         lines.append("Current request has no confirmed delivery / 当前请求未确认交付")
+        lines.append(f'Continue / 继续: simple-ar start --resume-task "{root}"')
+        lines.append('Resolve the stop condition first; approvals, unavailable services and exhausted budgets require action. / 先处理授权、服务或额度等停止条件，再继续原任务。')
+        retained = status.get('retained_work') or {}
+        last = retained.get('last_operation') or {}
+        failure = {'image_reference': 'Image references are missing or outside this manuscript / 正文图片缺失或引用超出稿件目录',
+            'review_incomplete': 'Independent inspection did not complete / 独立审阅未完成，有效意见如已保存可继续使用',
+            'composition_incomplete': 'Document preparation did not complete / 文稿处理未完成，已有候选如已保存可继续修改'}.get(last.get('failure_kind'))
+        if failure:
+            lines.append(f'Issue / 问题: {failure}')
+        for locator in retained.get('artifacts', [])[:6]:
+            try:
+                path = app.workspace.resolve(locator)
+                if path.is_file() and path.is_relative_to(app.workspace.workspace):
+                    lines.append(f'Retained work, not accepted / 已保留，未验收: {location(path)}')
+            except (OSError, ValueError, TypeError):
+                continue
     else:
         lines.append("Session status is terminal; partial retains unresolved work. Delivery binding and quality are not certified.")
     if app.session.store.exists("delivery.json"):

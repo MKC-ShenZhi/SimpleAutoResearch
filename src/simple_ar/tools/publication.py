@@ -291,5 +291,15 @@ class PublicationToolGateway:
                     "scope": (manifest['checks']['scope'] if request.checks is not None and 'checks' in manifest
                               else "Rendering only; scientific and visual quality need independent inspection")}, artifacts=artifacts)
         except Exception as exc:
+            retained = []
+            if 'request' in locals():
+                try:
+                    source = self.workspace.resolve(request.markdown)
+                    if source.is_file() and source.is_relative_to(self.workspace.workspace):
+                        retained.append(request.markdown)
+                except (ValueError, OSError):
+                    pass
             return ToolResult(tool_name=name, status="error",
+                artifacts=retained, summary='Export stopped; source manuscript retained.',
+                data={'incomplete': True, 'next_action': 'Correct the reported source/asset or build issue, then export a new version. Do not repeat an unchanged failed export.'},
                 error=f"Publication unavailable ({type(exc).__name__}: {exc}); inspect saved export/process records. Source and failed version retained; no blind replay.")

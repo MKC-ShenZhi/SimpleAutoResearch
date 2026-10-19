@@ -1352,6 +1352,8 @@ class StartTests(unittest.TestCase):
                 self.assertIn('unreconciled=1', text)
                 self.assertIn('unknown', text)
                 self.assertIn('not establish acceptance', text)
+                if saved_status == 'paused':
+                    self.assertIn('simple-ar start --resume-task', text)
                 self.assertNotIn('unlisted.md', text)
                 self.assertNotIn('.env', text)
                 self.assertNotIn('private-provider', text)

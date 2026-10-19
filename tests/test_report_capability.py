@@ -569,6 +569,43 @@ class ArticleClient:
 
 
 class StructuredArticleWritingTests(unittest.TestCase):
+    def test_article_projection_keeps_exact_current_figure_paths_and_caption_instructions(self):
+        from simple_ar.core.capabilities import ArtifactRef
+        from simple_ar.report.writing import ARTICLE_SYSTEM, article_writing_inputs
+
+        request = self.request()
+        figures = [SourceHandle(handle=f'figure:{path}', kind='material', artifact=path,
+            title=f'input-{index}.png', summary=f'Embed as a standalone Markdown image at {path}.',
+            metadata={'evidence_role': 'supplied_figure_not_visually_or_scientifically_verified',
+                      **({'caption': 'Exact supplied caption [@P1].'} if index == 1 else {})})
+            for index, path in enumerate(('figures/selected-1.png', 'figures/selected-2.svg'), 1)]
+        context = request.report_context.model_copy(deep=True)
+        context.source_handles.extend(figures)
+        binding = {'context': context.model_dump(mode='json'),
+            'memory': request.memory.model_dump(mode='json'),
+            'template': request.template.model_dump(mode='json')}
+        prior = '![Stale caption](figures/old.png)'
+        for structured in (False, True):
+            with self.subTest(structured=structured):
+                inputs = article_writing_inputs(report_context=context, documents=None,
+                    binding=binding, config=request.config, title=context.topic,
+                    goal=context.goal_markdown, target_words=137,
+                    prior_draft=prior, projection_ref=ArtifactRef(path='report_snapshot.json')
+                        if structured else None)
+                article = inputs['article']
+                projected = article['source_handles'][-2:]
+                self.assertEqual([row['artifact'] for row in projected],
+                    ['figures/selected-1.png', 'figures/selected-2.svg'])
+                self.assertEqual([row['summary'] for row in projected], [row.summary for row in figures])
+                self.assertEqual(projected[0]['metadata']['caption'], 'Exact supplied caption [@P1].')
+                self.assertNotIn('caption', projected[1]['metadata'])
+                self.assertEqual(article['prior_draft'], prior)
+                self.assertEqual(article['target_words'], 137)
+                self.assertNotIn('constraints', article)
+                self.assertEqual(context.source_handles[-2:], figures)
+        self.assertIn('exact artifact path as the image destination', ARTICLE_SYSTEM)
+        self.assertIn('prior-draft image links do not', ARTICLE_SYSTEM)
+
     def test_section_call_records_bridge_checkpoints_without_replaying_unknown_responses(self):
         from simple_ar.integrations.llm import LLMError
         from simple_ar.report.writing import retained_writing_client

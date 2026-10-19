@@ -6,11 +6,11 @@ import hashlib
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import httpx
 
-from simple_ar.core.artifacts import write_jsonl
+from simple_ar.core.artifacts import write_json, write_jsonl
 from simple_ar.literature.models import Paper
 from simple_ar.literature.semantic_scholar_client import _paper_from_row as semantic_scholar_paper
 from simple_ar.research.evidence.reader import ReadRequest, read_documents
@@ -23,6 +23,64 @@ from simple_ar._legacy.documents import load_search_document_bundle
 
 
 class DocumentIngestTests(unittest.TestCase):
+    def test_source_identity_preserves_webpage_scope_without_rejecting_html(self) -> None:
+        from simple_ar.tools.sources import SourceToolGateway
+
+        for url, title, expected_scope in (
+            ('https://arxiv.org/abs/2601.12345', 'Paper landing page',
+             'source_webpage_not_verified_paper_fulltext'),
+            ('https://example.test/paper.html', 'Complete HTML article', None),
+            ('https://docs.example.test/guide', 'Official documentation',
+             'source_webpage_not_verified_paper_fulltext'),
+        ):
+            with self.subTest(url=url), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                paper = Paper(id='web-result', title=title, authors=[], abstract='Search excerpt',
+                              source='web', url=url, fulltext_url=url)
+                response = BytesIO(b'<html><h1>Source text</h1><p>Documented conditions.</p></html>')
+                response.headers = {'Content-Type': 'text/html'}
+                with patch('simple_ar.research.documents.fulltext.urllib.request.urlopen', return_value=response):
+                    bundle = build_document_bundle(papers=[paper], source_plan=SourcePlan(
+                        queries=['conditions'], require_fulltext=True), cache_dir=root / 'cache',
+                        extraction_dir=root / 'parsed')
+                record = bundle.records[0]
+                self.assertEqual(record.extraction_status, 'parsed')
+                self.assertTrue(bundle.chunks)
+                self.assertEqual(record.metadata['fulltext_extraction']['coverage'].get('content_scope'), expected_scope)
+                path = root / 'document.json'
+                workspace = Mock()
+                workspace.resolve_source_record.return_value = path
+                owner = SourceToolGateway(root, workspace, Mock())
+                with patch.object(owner, '_bundle', return_value=bundle):
+                    acquired = owner._acquire([], [], root / 'acquired')
+                self.assertEqual(acquired['documents'][0].get('content_scope'), expected_scope)
+                # Both current extraction metadata and historical acquisition-only
+                # bundles must disclose the same source scope after round-trip.
+                for historical in (False, True):
+                    if historical:
+                        record.metadata['fulltext_extraction'].pop('coverage')
+                    write_json(path, bundle.to_handoff_dict())
+                    inventory = owner.inventory_source(path)
+                    for query in ('', 'conditions'):
+                        result = owner.call('find_source_passages', {
+                            'document_record': str(path), 'query': query}, identity='inspect')
+                        self.assertEqual(result.status, 'ok', result.error)
+                        identity = result.data['documents'][0]
+                        self.assertEqual(identity, inventory['documents'][0])
+                        self.assertEqual(identity['status'], 'parsed')
+                        self.assertEqual(identity['hint_kind'], 'html')
+                        self.assertEqual(identity.get('content_scope'), expected_scope)
+                        if expected_scope:
+                            self.assertEqual(identity['original_hint_kind'], 'landing')
+                        if query:
+                            self.assertIn('Documented conditions.', result.data['matches'][0]['text'])
+                    compact = owner.history_identity('acquire_source', {
+                        'documents': inventory['documents'], 'acquisition': bundle.fulltext_manifest})
+                    self.assertEqual(compact['documents'][0].get('content_scope'), expected_scope)
+                    hint = compact['acquisition']['hints'][0]
+                    self.assertEqual(hint['kind'], 'html')
+                    self.assertEqual(hint.get('content_scope'), expected_scope)
+
     def test_plain_webpage_url_uses_existing_html_parser_and_cache(self) -> None:
         body = (b"<!doctype html><html><h1>Official guidance</h1><p>Documented conditions.</p>"
                 b'<a href="https://example.test/code">Author code</a> '
@@ -64,6 +122,8 @@ class DocumentIngestTests(unittest.TestCase):
             extract.assert_called_once_with(paper.url)
             page_hint = page.fulltext_manifest["documents"][0]["hints"][0]
             cached_hint = cached_page.fulltext_manifest["documents"][0]["hints"][0]
+            self.assertEqual(page.records[0].metadata['fulltext_extraction']['coverage']['content_scope'],
+                             'source_webpage_not_verified_paper_fulltext')
             self.assertTrue(page_hint["acquisition"]["provider_requested"])
             self.assertFalse(cached_hint["acquisition"]["provider_requested"])
             self.assertIn("Documented conditions", " ".join(c.text for c in page.chunks))

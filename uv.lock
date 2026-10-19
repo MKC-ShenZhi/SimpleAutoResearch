@@ -2040,6 +2040,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "arxiv" },
+    { name = "markdown-it-py" },
     { name = "matplotlib" },
     { name = "openai" },
     { name = "packaging" },
@@ -2068,6 +2069,7 @@ requires-dist = [
     { name = "h2", marker = "extra == 'http2'", specifier = ">=4,<5" },
     { name = "litellm", marker = "extra == 'litellm'", specifier = ">=1.86.2" },
     { name = "matplotlib", specifier = ">=3.10" },
+    { name = "markdown-it-py", specifier = ">=4" },
     { name = "openai", specifier = ">=2.34.0" },
     { name = "packaging", specifier = ">=24.0" },
     { name = "pyalex", specifier = ">=0.21" },

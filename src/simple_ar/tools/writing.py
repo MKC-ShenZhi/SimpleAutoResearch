@@ -641,6 +641,11 @@ class WritingToolGateway:
                 raise ValueError('Retained composition lacks its original request binding; no blind replay')
             original_binding = owner.read_json('request.json') if recovering else None
             request = (ReviewRequest if inspecting else ComposeRequest).model_validate(arguments)
+            if not recovering and not inspecting and request.writing_method == 'sections' and request.required_headings:
+                remaining = self.ledger.remaining('llm_requests')
+                if remaining is not None and remaining < len(request.required_headings):
+                    raise ValueError('Section writing needs at least one request per required section; '
+                        'remaining allowance cannot cover this plan. Choose article writing or reduce scope before selecting materials.')
             if not recovering and request.prior_draft:
                 prior_path = self.workspace.resolve(request.prior_draft)
                 if any(self.workspace.resolve(window.path) == prior_path for window in request.materials):
@@ -733,6 +738,7 @@ class WritingToolGateway:
                 request, material_selection = self._select_materials(request, owner, identity, client,
                     previous, prior_binding)
             bindings, records, chunks, sections = [], {}, {}, {}
+            query_groups, explicit_chunks = [], set()
             evidence_binding = original_binding if recovering else reuse_binding
             for source_index, source in enumerate(request.sources):
                 try:
@@ -753,6 +759,7 @@ class WritingToolGateway:
                     raise ValueError(f'Source input {source.document_record!r}: invalid retained DocumentBundle') from None
                 by_id = {row.chunk_id: row for row in bundle.chunks}
                 selected_ids = list(source.chunk_ids)
+                explicit_chunks.update(selected_ids)
                 if evidence_binding is not None and source.questions:
                     saved_source = evidence_binding['request']['sources'][source_index]
                     if saved_source != source.model_dump():
@@ -763,6 +770,7 @@ class WritingToolGateway:
                     if not matches:
                         raise ValueError(f'Source input {source.document_record!r}: no lexical passage matches this source question; inspect the original or refine the question, not an abstract fallback')
                     selected_ids.extend(row.chunk_id for row in matches)
+                    query_groups.append([row.chunk_id for row in matches])
                 selected_ids = list(dict.fromkeys(selected_ids))
                 source_binding = {'path': source.document_record, 'sha256': hashlib.sha256(raw).hexdigest()}
                 if source.questions:
@@ -877,7 +885,23 @@ class WritingToolGateway:
             if any(row.document_id not in records for row in chunks.values()):
                 raise ValueError('Selected chunk has no source identity')
             if sum(len(row.text) for row in chunks.values()) > 96000:
-                raise ValueError('Selected text exceeds the composition window; choose passages relevant to this article')
+                if evidence_binding is not None or not query_groups:
+                    raise ValueError('Selected text exceeds the composition window; choose passages relevant to this article')
+                from simple_ar.research.store.retrieval import bound_ranked_passages
+                mandatory = explicit_chunks | {f'compose-material-{number}'
+                    for number in range(1, len(request.materials) + 1)}
+                chosen = bound_ranked_passages(chunks, query_groups, mandatory, max_characters=96000)
+                owner.write_json('retrieval-coverage.json', {'policy': 'query_round_robin.v1',
+                    'character_limit': 96000, 'selected_chunk_ids': [key for key in chunks if key in chosen],
+                    'omitted_chunk_ids': [key for key in chunks if key not in chosen],
+                    'scope': 'Bounded original passages, not exhaustive full-text coverage or verified claim support'})
+                chunks = {key: row for key, row in chunks.items() if key in chosen}
+                for binding_row in bindings[:len(request.sources)]:
+                    if 'selected_chunk_ids' in binding_row:
+                        binding_row['selected_chunk_ids'] = [key for key in binding_row['selected_chunk_ids'] if key in chosen]
+                selected_documents = {row.document_id for row in chunks.values()}
+                records = {key: row for key, row in records.items() if key in selected_documents}
+                sections = {key: row for key, row in sections.items() if row.document_id in selected_documents}
             if prior_binding is not None:
                 try:
                     current = self.workspace.resolve(request.prior_draft).read_bytes()
@@ -1313,6 +1337,15 @@ class WritingToolGateway:
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     destination.write_bytes(raw)
                 artifacts.append(f'{prefix}/{target}')
+            # Validate the actual published body before issuing its canonical
+            # receipt. Keep the candidate for correction; never guess aliases.
+            from simple_ar.report.export import report_image_targets, _asset_path
+            for target in report_image_targets(text_outputs['manuscript.md']):
+                try:
+                    _asset_path(output.resolve(), target)
+                except ValueError:
+                    failure_kind = 'image_reference'
+                    raise
             data = {'artifacts': artifacts, 'data': {'version': prefix,
                 'editable_markdown': f'{prefix}/manuscript.md',
                 'artifact_sha256': self.workspace.artifact_hashes(artifacts),
@@ -1330,5 +1363,25 @@ class WritingToolGateway:
             owner.write_json('result.json', data)
             return ToolResult(tool_name=name, **data)
         except Exception as exc:
+            retained = []
+            if 'owner' in locals() and 'output' in locals():
+                # These are incomplete outputs, never a successful canonical
+                # receipt. They remain readable without exposing private inputs.
+                for leaf in ('manuscript.md', 'references.bib'):
+                    if (output / leaf).is_file():
+                        retained.append(f'{prefix}/{leaf}')
+                subset = owner.root / 'review/validated_subset.json'
+                if subset.is_file():
+                    target = output / 'incomplete_review.json'
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    if not target.exists():
+                        target.write_bytes(subset.read_bytes())
+                    elif target.read_bytes() != subset.read_bytes():
+                        return ToolResult(tool_name=name, status='error', error='Retained partial review changed; preserve both versions before continuing.')
+                    retained.append(f'{prefix}/incomplete_review.json')
             return ToolResult(tool_name=name, status='error',
+                artifacts=retained, data={'incomplete': True,
+                    'failure_kind': locals().get('failure_kind', 'review_incomplete' if locals().get('inspecting') else 'composition_incomplete'),
+                    'next_action': 'Use retained candidate and original evidence for a new correction; unresolved inspection remains required. Do not repeat the failed request blindly.'},
+                summary='Professional work stopped; retained outputs are incomplete and need correction.',
                 error=f'Composition unavailable ({type(exc).__name__}: {exc}); preserve source, Writer checkpoint and budget records; no blind retry.')

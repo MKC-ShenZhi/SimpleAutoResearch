@@ -34,6 +34,8 @@ ARTICLE_SYSTEM = (
     'The optional prior draft is editable prose, not primary evidence. '
     'Use supplied figures when relevant as standalone Markdown images, with the exact '
     'caption when provided in the alt, without adjacent duplicate captions or figure numbers. '
+    'For supplied figure handles, use the exact artifact path as the image destination. '
+    'Current figure handles authorize assets; prior-draft image links do not. '
     'Return {"draft_markdown": "complete article Markdown"}, optionally with source_notes '
     'using {paper_id, bibliographic_fields: [{field, value, quote, section_id, complete}]}. '
     'Bibliographic notes must quote the supplied original front_matter exactly; '
@@ -44,6 +46,8 @@ ARTICLE_SYSTEM = (
     + CITATION_FIELD_VALUE_RULE
 )
 _ARTICLE_SYSTEM_SHA256 = frozenset({
+    # Recover completed requests from before explicit figure-path guidance.
+    'b85d0f898a67d3a7e5c00cefa00a2ba4db2926f29aa27aa2faa76c0e220ce43c',
     'e936d297d9b574cc417247d795c9f630895de52e40fa00079438089bb8486c61',
     # The retired method trial may recover its saved response, never replay it.
     'a002d27b21359d8976475749713c7fb52c1ef35e44dbfa2a06228f99c82cfbdf',
@@ -70,7 +74,8 @@ def article_writing_inputs(*, report_context: ReportContext, documents: Document
     if not structured:
         for row in handles:
             metadata = row.get('metadata', {})
-            if metadata.get('evidence_passages') or metadata.get('caption'):
+            # Figure summaries carry embedding instructions even with an exact caption.
+            if metadata.get('evidence_passages'):
                 row.pop('summary', None)
     from simple_ar.report.projection import bibliography_planning_views
     article = {'goal': goal, 'title': title, 'target_words': target_words,
@@ -499,6 +504,12 @@ def inspect_article(*, store: ArtifactStore, identity: str, client: Any,
         # second response store or a review checkpoint.
         _retain_records(active, (), {'rejection.json': {'validation_error': reason}})
 
+    def retain_subset(reviews: list) -> None:
+        _retain_records(active, (), {'validated_subset.json': {
+            'review_status': 'incomplete',
+            'section_reviews': [row.model_dump(mode='json') for row in reviews],
+            'scope': 'Validated observations from a rejected review; not a complete inspection or approval.'}})
+
     section = ReportSectionPlan(section_id='document', heading=report_context.topic,
         goal=report_context.goal_markdown, target_words=target_words)
     memory = ReportMemory(objective=report_context.goal_markdown, report_mode=report_context.report_mode,
@@ -514,6 +525,7 @@ def inspect_article(*, store: ArtifactStore, identity: str, client: Any,
         sections=[ReportSectionDraft(section_id='document', heading=report_context.topic, draft_markdown=markdown)],
         config=review_config, execution_summary=_compact_execution_results(report_context.results),
         allow_format_correction=contract is not None, on_invalid_response=retain_rejection,
+        on_validated_subset=retain_subset,
         evidence_reference_contract=evidence_contract,
         execution_evidence=report_execution_evidence(report_context),
         metric_summary=_prompt_metrics(memory, detail='summary'), complete_candidate=True,
@@ -536,7 +548,7 @@ def inspect_article(*, store: ArtifactStore, identity: str, client: Any,
         'scope': 'Independent model inspection of the supplied draft and selected evidence, not scientific certification or visual inspection. Missing evidence remains unknown; no prose was changed.'}
     if resume_store is not None and source.exists('request.json'):
         records = {name: source.read_json(name) for prefix in ('', 'format_correction/')
-            for leaf in ('request.json', 'response.json', 'response_complete.json', 'rejection.json', 'response_error.json')
+            for leaf in ('request.json', 'response.json', 'response_complete.json', 'rejection.json', 'response_error.json', 'validated_subset.json')
             if source.exists(name := prefix + leaf)}
         _retain_records(store, (source,), records)
     return result

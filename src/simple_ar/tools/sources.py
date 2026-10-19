@@ -133,7 +133,7 @@ class _Acquire(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     search_record: str = Field(default="", description="Saved evidence/.../search.json returned by search_sources.")
     paper_id: str = Field(default="", description="Exact ID in that saved search record, not a guessed citation.")
-    url: str = Field(default="", description="Alternatively, an explicit public HTTPS document URL; no credentials.")
+    url: str = Field(default="", description="Explicit public HTTPS document URL; no credentials. May accompany a saved search record and paper ID only when it equals that paper's recorded fulltext_url, preserving its metadata.")
     web_extract_backend: Literal['direct', 'tavily_basic'] | None = Field(default=None,
         description="Omit to retain the current backend. Explicit selection must match any caller-supplied source policy; Tavily requires web provider authority and its credential. No automatic fallback.")
 
@@ -158,6 +158,41 @@ def source_tool_specs() -> list[CommonToolSpec]:
             ("find_source_passages", _Passages, "read_only", "Query retained text for bounded lexical matches together with source titles, URLs and retained coverage. Omit the query only for identity/coverage inspection; a separate identity lookup is not needed after querying this record. Lexical selection is not exhaustive reading; no new network or model call."))]
 
 
+def _source_identity(record: DocumentRecord, bundle: DocumentBundle) -> dict[str, Any]:
+    """Project observed extraction coverage without certifying paper access."""
+    extraction = record.metadata.get('fulltext_extraction') or {}
+    coverage = extraction.get('coverage') or {}
+    row = {'id': record.document_id, 'title': record.title, 'url': record.url,
+           'status': record.extraction_status}
+    if extraction.get('hint_kind'):
+        row['hint_kind'] = extraction['hint_kind']
+    # Older saved bundles retain this qualification only in the acquisition
+    # manifest. Use the selected cached resource, never a failed alternative.
+    hint = next((hint for document in bundle.fulltext_manifest.get('documents', [])
+        if document.get('document_id') == record.document_id
+        for hint in document.get('hints', [])
+        if record.extraction_status == 'parsed' and hint.get('status') == 'cached'
+        and hint.get('local_path')
+        and (not extraction.get('source_path') or hint['local_path'] == extraction['source_path'])), {})
+    scope = (coverage.get('content_scope') or hint.get('content_scope')
+             or hint.get('acquisition', {}).get('content_scope') or record.metadata.get('content_scope'))
+    if scope:
+        row['content_scope'] = scope
+    original_kind = coverage.get('original_hint_kind') or hint.get('original_hint', {}).get('kind')
+    if original_kind:
+        row['original_hint_kind'] = original_kind
+    if not row.get('hint_kind') and hint.get('kind'):
+        row['hint_kind'] = hint['kind']
+    observed = {key: coverage[key] for key in ('total_pages', 'extracted_pages', 'truncated',
+        'notebook_cells', 'extracted_cells', 'cells_with_omitted_outputs', 'unpaired_unicode_replacements')
+        if key in coverage}
+    if coverage.get('empty_text_pages'):
+        observed['empty_text_page_count'] = len(coverage['empty_text_pages'])
+    if observed:
+        row['coverage'] = observed
+    return row
+
+
 class SourceToolGateway:
     @staticmethod
     def inventory_source(path: Path) -> dict[str, Any] | None:
@@ -177,8 +212,7 @@ class SourceToolGateway:
             return None
         bundle = DocumentBundle.from_handoff_dict(payload)
         return {'document_record': str(path),
-            'documents': [{'id': row.document_id, 'title': row.title, 'url': row.url,
-                'status': row.extraction_status} for row in bundle.records[:20]],
+            'documents': [_source_identity(row, bundle) for row in bundle.records[:20]],
             'documents_truncated': len(bundle.records) > 20,
             'retained_chunks': len(bundle.chunks),
             'retained_preview': source_chunk_views(bundle.chunks[:1], max_chars=1200),
@@ -210,10 +244,16 @@ class SourceToolGateway:
                     if not isinstance(hint, dict) or len(hints) >= 8:
                         continue
                     observed = {key: hint[key][:limit] for key, limit in
-                        (('url', 2048), ('status', 64), ('reason', 300)) if isinstance(hint.get(key), str)}
+                        (('url', 2048), ('status', 64), ('reason', 300), ('kind', 64),
+                         ('content_scope', 300)) if isinstance(hint.get(key), str)}
+                    original_kind = hint.get('original_hint', {}).get('kind')
+                    if isinstance(original_kind, str):
+                        observed['original_hint_kind'] = original_kind[:64]
                     provenance = hint.get('acquisition')
                     if isinstance(provenance, dict) and isinstance(provenance.get('provider'), str):
                         observed['provider'] = provenance['provider'][:64]
+                    if isinstance(provenance, dict) and isinstance(provenance.get('content_scope'), str):
+                        observed.setdefault('content_scope', provenance['content_scope'][:300])
                     if observed:
                         hints.append(observed)
             if hints:
@@ -323,9 +363,7 @@ class SourceToolGateway:
                     "document_record": request.document_record,
                     "document_path": str(path),
                     "document_sha256": hashlib.sha256(raw).hexdigest(),
-                    "documents": [{"id": record.document_id, "title": record.title,
-                        "url": record.url, "status": record.extraction_status}
-                        for record in bundle.records[:20]],
+                    "documents": [_source_identity(record, bundle) for record in bundle.records[:20]],
                     "documents_truncated": len(bundle.records) > 20,
                     "retained_chunks": len(bundle.chunks), "retained_sections": len(bundle.sections),
                 }
@@ -368,8 +406,8 @@ class SourceToolGateway:
                 papers = []
                 records = []
                 if request.search_record:
-                    if request.url or not request.paper_id:
-                        raise ValueError("Choose a saved search result OR an explicit URL")
+                    if not request.paper_id:
+                        raise ValueError("Saved search acquisition requires its paper ID")
                     path = self.workspace.resolve(request.search_record)
                     if not path.is_relative_to(self.root / "evidence"):
                         raise ValueError("Use a saved search result from the task evidence directory")
@@ -377,6 +415,8 @@ class SourceToolGateway:
                     papers = [paper for paper in result.papers if paper.id == request.paper_id]
                     if not papers:
                         raise ValueError("Paper ID is absent from this saved search result")
+                    if request.url and any(request.url != paper.fulltext_url for paper in papers):
+                        raise ValueError("Explicit URL differs from the saved paper's fulltext_url")
                     for paper in papers:
                         validate_public_url(paper.fulltext_url or paper.url)
                 else:
@@ -446,8 +486,7 @@ class SourceToolGateway:
         (directory / "passages.txt").write_text(text, encoding="utf-8")
         return {"document_record": f"evidence/{directory.name}/document.json",
             "passages": f"evidence/{directory.name}/passages.txt", "text_bytes": len(text.encode()),
-            "documents": [{"id": record.document_id, "title": record.title,
-                "url": record.url, "status": record.extraction_status} for record in bundle.records],
+            "documents": [_source_identity(record, bundle) for record in bundle.records],
             "acquisition": bundle.fulltext_manifest, "extraction": bundle.fulltext_extraction,
             "scope": "Only acquired passages support original-text claims; metadata is not full text"}
 

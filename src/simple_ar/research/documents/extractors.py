@@ -249,6 +249,15 @@ def _parse_hint(
         text=text,
     )
     metadata = dict(record.metadata)
+    # Parsing establishes usable text, not the extent of the fetched source.
+    # Keep the selected hint's qualification with the extracted record so all
+    # consumers (including retained bundles) see the same observed coverage.
+    if hint.get("content_scope"):
+        coverage["content_scope"] = hint["content_scope"]
+    elif hint.get("acquisition", {}).get("content_scope"):
+        coverage["content_scope"] = hint["acquisition"]["content_scope"]
+    if hint.get("original_hint", {}).get("kind"):
+        coverage["original_hint_kind"] = hint["original_hint"]["kind"]
     metadata["fulltext_extraction"] = {
         "status": "parsed",
         "parser": parser_name,

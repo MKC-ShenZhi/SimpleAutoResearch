@@ -22,6 +22,12 @@ Structured precedence is defaults → TOML → explicit CLI. CLI lists replace f
 
 ### Python task creation
 
+For direct native creation, `ToolApplication.create(..., delivery_files=["**/*.md", "**/*.pdf"])` can require nonempty workspace output files before an unqualified completed delivery. These relative patterns check presence, not scientific quality; a disclosed partial delivery remains possible. The API does not infer these requirements from prose or count source PDFs as output. Existing tasks can explicitly replace `delivery_files`, `tool_contracts` or `completion_policy` through caller `supply(..., replace_existing=True)`; unrelated supply preserves the saved policy and ledger.
+
+`app.run()` and read-only `app.result_snapshot()` also report `retained_work`: existing intermediate workspace files, the last operation and continuation guidance. These files are not an accepted delivery. Failed composition may retain a candidate manuscript; a rejected independent review may retain `incomplete_review.json` with individually validated observations. Correct using the original evidence and a new version; incomplete inspection remains unresolved. New composition checks CommonMark image links before registering its canonical result; export keeps its full path and compilation checks.
+
+New ordinary `run_process` calls return an error for a nonzero exit or stop, retaining the exit code and logs. Historical observations are not rewritten. Invalid execution proposals return the professional owner's preflight diagnosis without running the proposal. Section writing rejects a known outline that cannot fit even one request per section before spending requests on material selection; this lower bound does not guarantee that the remaining work fits.
+
 Structured research, writing, tables and declared execution use the same creation owner as the CLI:
 
 ```python

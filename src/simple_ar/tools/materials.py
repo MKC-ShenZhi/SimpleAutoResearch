@@ -372,7 +372,7 @@ def selected_material_windows(workspace: Any, selected: MaterialSelection,
     """Revalidate inspected bytes and return only selected observed windows."""
     if selected.read_windows:
         raise ValueError('Material selection ended without a final selection')
-    observed, views = {}, {}
+    observed, spans = {}, {}
     for row in observations:
         if 'record' in row:
             if _journal_receipt(workspace, row).get('data') != row['data']:
@@ -380,7 +380,20 @@ def selected_material_windows(workspace: Any, selected: MaterialSelection,
         read_material_window(workspace, row['request'], identity=identity, expected=row['data'])
         observed[window_key(workspace, FileWindow.model_validate(row['request']))] = row
         if row['data'].get('sha256'):
-            views[observed_window_key(workspace, FileWindow.model_validate(row['request']), row['data'])] = row
+            path, start, end, digest = observed_window_key(
+                workspace, FileWindow.model_validate(row['request']), row['data'])
+            spans.setdefault((path, digest), []).append((start, end))
+
+    def covered(path: str, digest: str, start: int, end: int) -> bool:
+        cursor = start
+        for left, right in sorted(spans.get((path, digest), [])):
+            if left > cursor:
+                break
+            if right >= cursor:
+                cursor = right
+                if cursor >= end:
+                    return True
+        return False
     windows = [FileWindow(path=row) if isinstance(row, str) else row for row in selected.materials]
     keys = [window_key(workspace, window) for window in windows]
     if len(keys) != len(set(keys)):
@@ -389,30 +402,27 @@ def selected_material_windows(workspace: Any, selected: MaterialSelection,
     for window, key in zip(windows, keys):
         row = observed.get(key)
         if row is None and any(path[0] == key[0] for path in observed):
-            # Request ceilings are not content identity: a 16 KB read of a
-            # 315-byte file and a 315-byte read observe exactly the same bytes.
-            # Reuse the original receipt only for the identical measured span
-            # and full source digest, never an unseen extension or subset.
-            # A byte-origin request with incompatible measured coverage cannot
-            # reuse a receipt. Reject it before reading an unseen extension
-            # (including a window refused by investigation capacity admission).
+            # Selection may join contiguous reads or focus an already-read
+            # range. Coverage belongs to a file version, not request ceilings.
+            # Never bridge a gap or count a capacity-refused read as evidence.
             possible = window.start_line is not None
             if not possible:
                 for previous_key, previous in observed.items():
                     data = previous['data']
-                    offset = data.get('offset_bytes', previous['request'].get('offset_bytes', 0))
                     end = window.offset_bytes + min(window.max_bytes,
                         max(0, data['size_bytes'] - window.offset_bytes))
-                    if previous_key[0] == key[0] and offset == window.offset_bytes:
-                        possible = (end == data['next_offset_bytes'] if 'max_lines' not in window.model_fields_set
-                            else end >= data['next_offset_bytes'])
+                    if previous_key[0] == key[0]:
+                        possible = covered(key[0], data.get('sha256', ''), window.offset_bytes, end)
                         if possible:
                             break
             if possible:
                 actual = workspace.call('read_file', window.model_copy(update={
                     'full_digest': True}).model_dump(exclude_unset=True), identity=identity)
                 if actual.status == 'ok':
-                    row = views.get(observed_window_key(workspace, window, actual.data))
+                    path, start, end, digest = observed_window_key(workspace, window, actual.data)
+                    if covered(path, digest, start, end):
+                        row = {'request': window.model_copy(update={'full_digest': True}).model_dump(
+                            exclude_unset=True), 'data': actual.data}
         if row is None:
             raise ValueError('Selected material window was not inspected; read its actual contents first')
         effective = observed_window_key(workspace, FileWindow.model_validate(row['request']), row['data'])

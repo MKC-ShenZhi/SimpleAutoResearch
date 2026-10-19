@@ -12,6 +12,29 @@ from typing import Any
 from simple_ar.research.contracts import TextChunk
 
 
+def bound_ranked_passages(chunks: Mapping[str, TextChunk], groups: list[list[str]],
+                         required: set[str], *, max_characters: int) -> set[str]:
+    """Keep explicit evidence and each query's best hit, then share capacity.
+
+    Whole retained chunks are the unit; no summarization, text truncation or
+    claim of exhaustive coverage. Callers must record the omitted candidates.
+    """
+    selected = required | {group[0] for group in groups if group}
+    used = sum(len(chunks[key].text) for key in selected)
+    if used > max_characters:
+        raise ValueError('Explicit evidence and best query passages exceed the composition window; narrow the requested scope')
+    for rank in range(1, max((len(group) for group in groups), default=0)):
+        for group in groups:
+            if rank >= len(group) or group[rank] in selected:
+                continue
+            key = group[rank]
+            size = len(chunks[key].text)
+            if used + size <= max_characters:
+                selected.add(key)
+                used += size
+    return selected
+
+
 def order_source_chunks(chunks: list[TextChunk]) -> list[TextChunk]:
     """Restore retained source order when every chunk has comparable positions.
 

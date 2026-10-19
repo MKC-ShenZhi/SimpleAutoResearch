@@ -25,6 +25,35 @@ from simple_ar.tools.specs import CommonToolSpec, ToolResult
 _COPY_MAX_BYTES = 64 * 1024 * 1024
 _FULL_DIGEST_MAX_BYTES = 64 * 1024 * 1024
 
+
+def validate_delivery_patterns(patterns: list[str]) -> list[str]:
+    """Caller-declared output paths, independent of task kind or chosen tools."""
+    if not isinstance(patterns, list) or len(patterns) > 32:
+        raise ValueError('Delivery files must be a list of at most 32 workspace-relative patterns')
+    for pattern in patterns:
+        if (not isinstance(pattern, str) or not pattern.strip() or len(pattern) > 300
+                or '\\' in pattern or ':' in pattern or '\x00' in pattern
+                or PurePosixPath(pattern).is_absolute()
+                or any(part in {'.', '..', ''} for part in pattern.split('/'))):
+            raise ValueError('Delivery patterns must stay relative to the workspace without traversal')
+    return list(dict.fromkeys(patterns))
+
+
+def missing_delivery_files(workspace: Any, artifacts: list[str], patterns: list[str]) -> list[str]:
+    """Check actual delivered nonempty files, not every file on disk or source PDFs.
+
+    This is completeness only. Domain verification and independent content/visual
+    review remain necessary; a matching filename is not a correctness certificate.
+    """
+    names = []
+    for locator in artifacts:
+        path = workspace.resolve(locator)
+        if path.is_relative_to(workspace.workspace) and path.is_file() and path.stat().st_size:
+            names.append(PurePosixPath(path.relative_to(workspace.workspace).as_posix()))
+    return [pattern for pattern in validate_delivery_patterns(patterns)
+        if not any(name.match(pattern) or pattern.startswith('**/') and name.match(pattern[3:])
+            for name in names)]
+
 class _Path(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     path: str = Field(description="Relative paths default to the task workspace, e.g. reports/result.md. Explicit registered mount paths such as workspace/project or source0/README.md and observed absolute paths within those roots also work. Source mounts remain read-only; mount names are tool locators, not filesystem directories for program code.")
@@ -432,6 +461,10 @@ class WorkspaceToolGateway:
                         return ToolResult(tool_name=name, status='blocked', data=data,
                             error='Final process failed or stopped; no delivery. Inspect the retained process receipt and correct or explicitly deliver existing work separately.')
                     data['delivery'], metadata['delivery_hashes'] = self._process_delivery(model, identity, recovering=recovering)
+                elif data.get('returncode') != 0 or data.get('stop_reason'):
+                    return ToolResult(tool_name=name, status='error', data=data,
+                        error='Process failed or stopped; inspect returncode and retained stderr before correcting the same work.',
+                        summary='Process did not complete successfully; logs and invocation retained.')
             elif name == "search_files":
                 data = self._search(model, identity)
             elif name == "inspect_project":

@@ -122,6 +122,18 @@ def _asset_path(root: Path, target: str) -> Path:
     return path
 
 
+def report_image_targets(markdown: str) -> list[str]:
+    """Parse CommonMark images, including reference links, excluding code."""
+    from markdown_it import MarkdownIt
+    def images(tokens):
+        for token in tokens:
+            if token.type == 'image':
+                yield token.attrGet('src')
+            if token.children:
+                yield from images(token.children)
+    return list(dict.fromkeys(images(MarkdownIt().parse(markdown))))
+
+
 def _copy_image(source: Path, output: Path, index: int | str, *, convert_svg: bool = True,
                 runner: Callable | None = None) -> str:
     assets = output / "figures"

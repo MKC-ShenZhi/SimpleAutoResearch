@@ -657,11 +657,18 @@ class ToolApplication:
                snapshot_sources: bool = False,
                max_snapshot_bytes: int = 16 * 1024 * 1024,
                tool_contracts: Literal['full', 'on_demand'] = 'on_demand',
+               completion_policy: str = 'protected_decision.v1',
+               delivery_files: list[str] | None = None,
                model_catalogs: dict[str, str | None] | None = None,
                retained: bool = False) -> tuple[dict[str, Any], list, dict[str, Any], int]:
         """Validate caller contracts before creation or supply; never execute or persist."""
         if type(tool_contracts) is not str or tool_contracts not in {'full', 'on_demand'}:
             raise ValueError('Tool contracts must be full or on_demand')
+        if completion_policy not in _COMPLETION_POLICIES:
+            raise ValueError('Unsupported completion policy')
+        if delivery_files is not None:
+            from simple_ar.tools.workspace import validate_delivery_patterns
+            delivery_files = validate_delivery_patterns(delivery_files)
         if (not goal.strip() or max_images < 0 or
                 (model is not None and (not model.strip() or max_turns < 1 or max_tokens < 1))):
             raise ValueError('Goal and positive model resource bounds are required')
@@ -852,7 +859,7 @@ class ToolApplication:
             **({'runtime_dependencies': dependencies} if dependencies else {}),
             "feasibility_connection": feasibility_connection,
             "max_images": max_images,
-            "completion_policy": "protected_decision.v1",
+            "completion_policy": completion_policy,
             "max_turns": max_turns}
         if selected_catalogs or any(hints.values()):
             config['model_catalogs'] = selected_catalogs
@@ -863,6 +870,8 @@ class ToolApplication:
             config['report_evidence_contract'] = (
                 'execution.v1' if code_task is not None or execution_contract is not None
                     or allow_execution and (research_policy or {}).get('require_design') else 'materials.v1')
+        if delivery_files is not None:
+            config['delivery_files'] = delivery_files
         if snapshots:
             config['source_snapshots'] = {}
             for name, original, content in snapshots:
@@ -899,6 +908,7 @@ class ToolApplication:
                execution_contract: dict[str, Any] | None = None,
                services: Any | None = None, snapshot_sources: bool = False,
                max_snapshot_bytes: int = 16 * 1024 * 1024,
+               delivery_files: list[str] | None = None,
                tool_contracts: Literal['full', 'on_demand'] = 'on_demand') -> ToolApplication:
         config, reused, limits, attempts = cls._configuration(root, goal, model=model, sources=sources,
             allow_execution=allow_execution, allow_network=allow_network, allow_vision=allow_vision,
@@ -907,7 +917,7 @@ class ToolApplication:
             research_policy=research_policy, table_analysis=table_analysis, max_output_tokens=max_output_tokens,
             max_attempts=max_attempts, source_operations=source_operations, execution_contract=execution_contract,
             services=services, snapshot_sources=snapshot_sources, max_snapshot_bytes=max_snapshot_bytes,
-            tool_contracts=tool_contracts)
+            tool_contracts=tool_contracts, delivery_files=delivery_files)
         session = SessionController.create(root, session_id=root.name, topic=goal,
             registry=CapabilityRegistry(), budget=BudgetState(max_attempts=attempts, max_no_progress=6))
         session.manifest.transition_recipe = cls.RECIPE
@@ -946,7 +956,8 @@ class ToolApplication:
                 raise ValueError('Supply requires a stable id, reason, explicit contracts and a boolean replacement choice')
             supply_id, reason = supply_id.strip(), reason.strip()
             fields = {'model', 'sources', 'allow_execution', 'allow_network', 'code_task',
-                'execution_contract', 'research_policy', 'table_analysis', 'report_requirement', 'max_output_tokens'}
+                'execution_contract', 'research_policy', 'table_analysis', 'report_requirement', 'max_output_tokens',
+                'tool_contracts', 'completion_policy', 'delivery_files'}
             if set(changes) - fields:
                 raise ValueError('Unsupported supply fields: ' + ', '.join(sorted(set(changes) - fields)))
             supplied = dict(changes)
@@ -1020,7 +1031,9 @@ class ToolApplication:
                 research_policy=candidate.get('research_policy'), table_analysis=candidate.get('table_analysis'),
                 report_requirement=candidate.get('report_requirement'), max_output_tokens=candidate.get('max_output_tokens'),
                 max_attempts=self.session.manifest.budget.max_attempts, retained=True, services=self.services,
-                tool_contracts=candidate.get('tool_contracts', 'full'), model_catalogs=hints)
+                tool_contracts=candidate.get('tool_contracts', 'full'),
+                completion_policy=candidate.get('completion_policy', 'protected_decision.v1'),
+                delivery_files=candidate.get('delivery_files'), model_catalogs=hints)
             for name in fields - {'model', 'sources', 'allow_execution', 'allow_network'}:
                 if not replace_existing and old.get(name) is not None and old[name] != config.get(name):
                     raise ValueError(f'{name} is already frozen; use its existing feedback/revision contract')
@@ -1036,16 +1049,16 @@ class ToolApplication:
             # max_turns remains the initial allowance: the budget authorization
             # below accounts for newly authorized decisions exactly once.
             config['max_turns'] = old['max_turns']
-            # Supply changes the declared work, not a historical controller's
-            # spending policy. New tasks already carry the current policy.
-            if 'completion_policy' in old:
-                config['completion_policy'] = old['completion_policy']
-            else:
-                config.pop('completion_policy', None)
-            # Supply preserves historical full-by-absence bytes as well as
-            # explicit selections; it does not opt old tasks into a new default.
-            if 'tool_contracts' not in old:
-                config.pop('tool_contracts', None)
+            # A policy upgrade is a caller supply, never a side effect of load.
+            # Its previous config is journaled below; old decision receipts keep
+            # their original closing obligation. Absent historical fields stay
+            # absent unless explicitly supplied, including unrelated supplies.
+            for field in ('completion_policy', 'tool_contracts'):
+                if field not in supplied:
+                    if field in old:
+                        config[field] = old[field]
+                    else:
+                        config.pop(field, None)
             if old.get('source_snapshots'):
                 config['source_snapshots'] = {name: value for name, value in old['source_snapshots'].items()
                     if old['sources'][name] == config['sources'].get(name)}
@@ -1460,6 +1473,7 @@ class ToolApplication:
             "work_focus": {key: value for key, value in focus.items()
                 if key not in {'inputs', 'previous_inputs', 'turn'}},
             "work_plan": self._work_plan(),
+            "required_delivery_files": config.get('delivery_files', []),
             "work_focus_authority": "A bounded work intention, not a new user request or permission. Preserve the original task and feedback; return to task focus for broader decisions if needed.",
             "saved_evidence": "evidence: read-only acquired originals and search records",
             "earlier_turns": [],
@@ -1865,8 +1879,18 @@ class ToolApplication:
                 approval = pending.get('execution_approval') or pending.get('implementation_approval')
                 requires_approval = self.gateway.registry.get(call['function']['name']).permission_level == 'execution'
                 if requires_approval and not approval:
-                    result = ToolResult(tool_name=call['function']['name'], status='blocked',
-                        error='Execution needs valid arguments and explicit saved approval; no execution occurred')
+                    # Invalid proposals cannot obtain approval. Return the
+                    # owner's actual preflight diagnosis so the next decision
+                    # can repair the contract rather than repeat an opaque gate.
+                    try:
+                        self._owner_execution_binding(call)
+                    except (ValueError, TypeError, KeyError) as exc:
+                        result = ToolResult(tool_name=call['function']['name'], status='error',
+                            error=f'Execution proposal is invalid: {exc}; no execution occurred',
+                            data={'executed': False})
+                    else:
+                        result = ToolResult(tool_name=call['function']['name'], status='blocked',
+                            error='Execution needs explicit saved approval; no execution occurred')
                 elif (requires_approval and not owner.has_started(context.attempt.attempt_id)
                         and approval['token'] != self.approval_token(call)):
                     raise ValueError('Approved execution source or contract changed before execution')
@@ -2338,6 +2362,13 @@ class ToolApplication:
                     and self.session.store.read_json('delivery.json') == data):
                 return True  # Already committed, including historical unbound deliveries.
             data = self.workspace.resolve_delivery(request)
+            if not request.unresolved:
+                from simple_ar.tools.workspace import missing_delivery_files
+                missing = missing_delivery_files(self.workspace, data['artifacts'],
+                    self.state['config'].get('delivery_files') or [])
+                if missing:
+                    raise ValueError('Delivery is missing required workspace outputs: ' + ', '.join(missing)
+                        + '; finish the work or explicitly disclose partial delivery')
             hashes = (payload.get('metadata') or {}).get('delivery_hashes')
             if hashes is None or self.workspace.artifact_hashes(data['artifacts']) != hashes:
                 raise ValueError('Delivery version is unbound or changed; inspect retained results before continuing')
@@ -2771,6 +2802,35 @@ class ToolApplication:
         self.state['pending'] = {'kind': 'model', 'attempt': identity}
         self._save()
 
+    def result_snapshot(self) -> dict[str, Any]:
+        """Read saved results for users; never execute, certify or change state."""
+        result = self.session.status_snapshot()
+        artifacts, next_action, last_operation = [], '', None
+        observations = (tool for turn in reversed(self.state.get('turns', []))
+            for tool in reversed(turn.get('tools', [])))
+        for tool in observations:
+            try:
+                observed = self.session.store.read_json(tool['result'])
+            except (OSError, ValueError, KeyError):
+                continue
+            if last_operation is None:
+                last_operation = {'tool_name': observed.get('tool_name'), 'status': observed.get('status'),
+                    'failure_kind': (observed.get('data') or {}).get('failure_kind')}
+            for locator in observed.get('artifacts', []):
+                try:
+                    path = self.workspace.resolve(locator)
+                    if path.is_file() and path.is_relative_to(self.workspace.workspace):
+                        artifacts.append(locator)
+                except (ValueError, OSError):
+                    continue
+            next_action = next_action or (observed.get('data') or {}).get('next_action', '')
+            if artifacts:
+                break
+        result['retained_work'] = {'artifacts': artifacts, 'acceptance': 'not_inferred',
+            'last_operation': last_operation,
+            'next_action': next_action or 'Resume this saved task after addressing the stop condition; completed work and accounting are retained.'}
+        return result
+
     def run(self, *, feedback: str = "", approved_execution: str = "",
             actions: list[dict[str, Any]] | None = None,
             retry_model: bool = False, retry_model_selector: str = "",
@@ -2813,7 +2873,7 @@ class ToolApplication:
                 if response.get('proposal_kind') == 'caller_execution_protocol':
                     if awaiting is None and not self.state['pending'] and not any(
                             row['remaining'] for row in self.state['turns']):
-                        return self.session.status_snapshot()
+                        return self.result_snapshot()
                     if response['decision_response'] == 'accept':
                         # Acknowledging the same caller contract is not a new
                         # goal: preserve its queued, as-yet unapproved commands.
@@ -2862,9 +2922,9 @@ class ToolApplication:
                 self.session.continue_with_revision('Explicit resource continuation: ' + authorization_id)
             try:
                 if self._commit_terminal(progress):
-                    return self.session.status_snapshot()
+                    return self.result_snapshot()
                 if self.session.manifest.status in {'completed', 'partial'} and not feedback:
-                    return self.session.status_snapshot()
+                    return self.result_snapshot()
                 if (self.state['config']['model'] is not None
                         and not (self._caller_takeover()
                             and (self.state['pending'] is None or self.state['pending']['kind'] == 'tool'))):
@@ -2872,7 +2932,7 @@ class ToolApplication:
                 if self.session.manifest.status == "paused" and not feedback:
                     pending = self.state['pending']
                     if pending is None and self.session.manifest.status_reason != 'Caller requested boundary stop':
-                        return self.session.status_snapshot()
+                        return self.result_snapshot()
                     attempts = self.session.list_attempts()
                     if pending is None or not any(a.attempt_id == pending['attempt'] and a.status == 'running' for a in attempts):
                         self.session.continue_with_revision('Resume pending work without resetting its budget')
@@ -2882,7 +2942,7 @@ class ToolApplication:
                     self.session.manifest.status = "paused"
                 self.session.manifest.status_reason = f"{type(exc).__name__}: {exc}"
                 self._save()
-            return self.session.status_snapshot()
+            return self.result_snapshot()
 
     def _run(self, approved_execution: str, approve: Any, progress: Callable[[str], None],
              should_stop: Callable[[], bool] | None = None) -> None:
