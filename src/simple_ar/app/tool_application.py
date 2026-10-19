@@ -396,12 +396,15 @@ class ToolApplication:
             policy=self.gateway.policy, names=selected)
 
     def _specialist_catalog(self) -> dict[str, dict[str, str]]:
-        """Expose work-unit purposes from their owners, not a second routing policy."""
+        """Index callable names; selected schemas already carry their descriptions."""
         catalog: dict[str, dict[str, str]] = {}
+        selected = self._tool_selection()
         for spec in self.gateway.list_specs():
             if (spec.domain != 'workspace' and spec.name not in _CORE_COORDINATION
                     and self.gateway.policy.is_allowed(spec)[0]):
-                catalog.setdefault(spec.domain, {})[spec.name] = spec.description
+                catalog[spec.name] = {'domain': spec.domain}
+                if spec.name not in selected:
+                    catalog[spec.name]['description'] = spec.description
         return catalog
 
     def _work_focus(self) -> dict[str, Any]:
@@ -1572,9 +1575,10 @@ class ToolApplication:
             context['table_analysis'] = config['table_analysis']
         if config.get('tool_contracts') == 'on_demand':
             context['available_specialists'] = self._specialist_catalog()
-            context['tool_contracts'] = ('Core tools stay available. Use load_tools with exact names from '
+            context['tool_contracts'] = ('Core tools stay available. Use load_tools with exact name keys from '
                 'available_specialists to receive their full schemas on the next decision; it replaces '
-                'the previous selection, not permissions. Choose the needed professional work units '
+                'the previous selection, not permissions. Domain values are categories, not name prefixes. '
+                'Selected tools have descriptions in their active schemas. Choose the needed professional work units '
                 'rather than reading or writing their answers in advance. All registered tools remain '
                 'guarded by the same gateway; loading is neither execution nor validation.')
         context["resources"]["context_input_target_tokens"] = input_target

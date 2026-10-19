@@ -1602,7 +1602,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         inspected_table = _call_tool(app.gateway, 'inspect_table',
             {'path': 'source0/observations.csv'}, identity='table-shape')
         self.assertEqual(inspected_table.data['row_count'], 2)
-        self.assertIn('analyze_table', app._specialist_catalog()['analysis'])
+        self.assertIn('analyze_table', app._specialist_catalog())
         self.assertNotIn('search_sources', {tool['function']['name'] for tool in app.schemas})
         self.assertNotIn('acquire_source', {tool['function']['name'] for tool in app.schemas})
         project = inputs / 'project'
@@ -4098,17 +4098,21 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(app.gateway.registry.get('read_history').permission_level, 'read_only')
         self.assertIn('deliver_result', names(app))
         self.assertNotIn('update_work_plan', names(app))
-        self.assertIn('update_work_plan', app._specialist_catalog()['coordination'])
+        self.assertIn('update_work_plan', app._specialist_catalog())
         self.assertNotIn('compose_document', names(app))
         self.assertNotIn('run_process', names(app))
-        self.assertNotIn('search_sources', app._specialist_catalog().get('sources', []))
-        for domain, tools in app._specialist_catalog().items():
-            for name, description in tools.items():
-                self.assertEqual(description, app.gateway.registry.get(name).description)
-                self.assertEqual(domain, app.gateway.registry.get(name).domain)
-        self.assertIn('material_roots', app._specialist_catalog()['writing']['compose_document'])
-        self.assertIn('find_source_passages', app._specialist_catalog()['sources'])
-        self.assertIn('analyze_measurements', app._specialist_catalog()['scientific'])
+        self.assertNotIn('search_sources', app._specialist_catalog())
+        for name, entry in app._specialist_catalog().items():
+            self.assertEqual(entry['description'], app.gateway.registry.get(name).description)
+            self.assertEqual(entry['domain'], app.gateway.registry.get(name).domain)
+        self.assertIn('material_roots', app._specialist_catalog()['compose_document']['description'])
+        self.assertIn('find_source_passages', app._specialist_catalog())
+        self.assertIn('analyze_measurements', app._specialist_catalog())
+        advertised = sorted(app._specialist_catalog())
+        catalog_selection = _call_tool(app.gateway, 'load_tools', {'names': advertised}, identity='catalog-names')
+        self.assertEqual(catalog_selection.status, 'ok')
+        self.assertEqual(catalog_selection.data['names'], advertised)
+        self.assertEqual(app.ledger.to_dict(), original_ledger)
         for selected in (['unknown'], ['search_sources'], ['run_process']):
             with self.subTest(selected=selected):
                 result = _call_tool(app.gateway, 'load_tools',
@@ -4144,7 +4148,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertIn('update_work_plan', names(restored))
         messages = restored._messages(client=fake)
         context = json.loads(messages[1]['content'])
-        self.assertIn('compose_document', context['available_specialists']['writing'])
+        self.assertEqual(context['available_specialists']['compose_document'], {'domain': 'writing'})
+        self.assertIn('description', context['available_specialists']['inspect_table'])
         self._assert_native_input_accounting(restored, messages)
         fake.chat_turn.side_effect = [
             self._native_message('load_tools', {'names': ['inspect_table']}, 'selection-data'),
@@ -6483,7 +6488,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(resumed.workspace.resolve('source1').read_text(), additional.read_text())
         self.assertIn('User explicitly authorized', resumed.state['requests'][-1])
         self.assertTrue(ToolApplication.load(resumed.session.store.root).state['config']['allow_network'])
-        self.assertIn('search_sources', resumed._specialist_catalog()['sources'])
+        self.assertIn('search_sources', resumed._specialist_catalog())
         self.assertEqual((resumed.workspace.workspace / 'counter.txt').read_text(), '1')
         self.assertEqual(len(list((resumed.session.store.root / 'tools/processes').glob('*/invocation.json'))), 1)
 
