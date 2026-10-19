@@ -680,6 +680,14 @@ class StructuredArticleWritingTests(unittest.TestCase):
                     # Neither valid-shaped checkpoint edits nor changed runtime
                     # inputs may replace the original complete producer records.
                     original = {path: path.read_bytes() for path in writer.root.rglob('*.json')}
+                    retained_writer = writer.read_json('writer.json')
+                    retained_writer['sections'][0]['draft_markdown'] = 'Changed completed writer prose.'
+                    writer.write_json('writer.json', retained_writer)
+                    changed = {path: path.read_bytes() for path in original}
+                    with self.assertRaisesRegex(ValueError, 'differ from original response'):
+                        write_section_article(**arguments, recovering=True)
+                    self.assertEqual({path: path.read_bytes() for path in changed}, changed)
+                    (writer.root / 'writer.json').write_bytes(original[writer.root / 'writer.json'])
                     checkpoint = writer.read_json('sections.json')
                     checkpoint['completed']['sections'][0]['draft_markdown'] = 'Altered checkpoint prose.'
                     writer.write_json('sections.json', checkpoint)

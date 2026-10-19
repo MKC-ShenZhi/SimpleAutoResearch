@@ -8259,6 +8259,14 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
     def test_composition_rejects_invalid_explicit_inputs_before_material_selection(self) -> None:
         inputs, fake, app, materials, table, figure, request = self._material_root_fixture()
+        prior = request['prior_draft']
+        conflict = {**request, 'material_roots': [], 'materials': [{'path': prior}]}
+        with patch.object(app.writing, 'client_factory',
+                side_effect=AssertionError('role conflict before client')) as factory:
+            rejected = self._compose_document(app, conflict, 'explicit-prior-role-conflict', status='error')
+            self.assertIn('revision context', rejected.error)
+            factory.assert_not_called()
+            fake.ask_json.assert_not_called()
         request.pop('prior_draft')  # Admission starts with the original roots-only request.
         invalid_utf8 = inputs / 'invalid.md'
         invalid_utf8.write_bytes(b'\xffPRIVATE_SENTINEL')
@@ -8586,12 +8594,23 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
     def test_composition_material_roots_bind_positive_constraints_and_replay_without_selection(self) -> None:
         _, fake, app, _, table, _, request = self._material_root_fixture()
+        prior = Path(request['prior_draft'])
+        table.write_bytes(prior.read_bytes())  # Same prose, different explicitly assigned role.
+        request = {**request, 'material_roots': [*request['material_roots'], str(prior)]}
+        self._record_parent_material_read(app, prior, 'prior-context-parent')
         request = {**request, 'required_headings': ['Summary', 'Limits'], 'max_cited_sources': 1}
         fake.ask_json.side_effect = [{'read_windows': [{'path': str(table)}]}, {'materials': [str(table)]}, {
             'draft_markdown': '## Summary\n\nSupplied yields.\n\n## Limits\n\nDescriptive observations only.'}]
         result = self._compose_document(app, request, 'writing-root-constraints')
         owner = app.session.store.root / 'tools/writing/writing-root-constraints'
-        self.assertNotIn('journal_observations', read_json(owner / 'selection-input.json'))
+        selection = read_json(owner / 'selection-input.json')
+        self.assertEqual(selection['prior_draft_role'], 'context_only.v1')
+        prompt = json.loads(fake.ask_json.call_args_list[0].args[1])
+        self.assertEqual(json.dumps(prompt).count(prior.read_text(encoding='utf-8')), 1)
+        self.assertEqual(prompt['observations'], [])
+        self.assertEqual(prompt['journal_observation_coverage']['not_admitted_count'], 1)
+        self.assertFalse(any(str(prior) in row['candidate_files'] for row in selection['inventories']))
+        self.assertEqual(result.data['material_selection']['selected_materials'], [str(table)])
         for path in ('selection-input.json', 'request.json'):
             bound = read_json(owner / path)['request']
             self.assertEqual(bound['required_headings'], request['required_headings'])
@@ -8612,6 +8631,10 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         legacy_selection = read_json(owner / 'selection-input.json')
         legacy_selection.pop('prior_draft')
         legacy_selection.pop('selection_method')
+        legacy_selection.pop('prior_draft_role')
+        from simple_ar.tools.materials import material_inventories
+        legacy_selection['inventories'] = material_inventories(app.workspace,
+            request['material_roots'], identity='writing-root-constraints')
         write_json(owner / 'selection-input.json', legacy_selection)
         # A pre-investigation candidate receipt never had observation records.
         (owner / 'selection-observations.json').unlink()
@@ -8623,6 +8646,18 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(fake.ask_json.call_count, 3)
         self.assertNotIn('prior_draft', read_json(owner / 'selection-input.json'))
         self.assertEqual((owner / 'selection-input.json').read_bytes(), legacy_bytes)
+        # New selection must block both a fresh read and a direct final choice.
+        for index, response in enumerate(({'read_windows': [{'path': str(prior)}]},
+                {'materials': [str(prior)]})):
+            with self.subTest(draft_response=response):
+                fake.ask_json.side_effect = [response]
+                rejected = self._compose_document(app, request, f'prior-role-reject-{index}', status='error')
+                self.assertIn('not anonymous material reads' if index == 0 else 'revision context', rejected.error)
+        # Interrupted new selections retain their marker and are never reseeded.
+        with patch.object(app.writing, 'material_observations', side_effect=AssertionError('No reseeding')), \
+                patch.object(app.writing, 'client_factory', side_effect=AssertionError('No replay')):
+            rejected = self._compose_document(app, request, 'prior-role-reject-0', status='error')
+            self.assertIn('Interrupted material selection', rejected.error)
 
     def test_composition_reuses_accepted_article_evidence_for_feedback_and_independent_review(self) -> None:
         from dataclasses import replace

@@ -662,6 +662,12 @@ def write_section_article(*, store: ArtifactStore, input_store: ArtifactStore,
             def write_json(self, path: str, payload: Any, **options: Any) -> ArtifactRef:
                 if path == 'writer.json' and payload['sections'][:len(completed)] != completed:
                     raise ValueError('Section checkpoint has unmatched complete response producers')
+                if path == 'writer.json':
+                    # Recovery may complete a missing result, but cannot heal a
+                    # changed completed producer. Use the same retained-record
+                    # parity as whole-article recovery before writing anything.
+                    _retain_records(original_store, (), {path: payload})
+                    return self.ref(path, kind=options.get('kind', ''), schema=options.get('schema', ''))
                 if path == 'sections.json':
                     sections = payload['completed']['sections']
                     count = min(len(sections), len(completed))

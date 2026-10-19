@@ -398,10 +398,20 @@ class WritingToolGateway:
         # Existing receipts without the candidate contract retain full-project
         # hashing and its original limits, including interrupted selections.
         retained = owner.read_json('selection-input.json') if owner.exists('selection-input.json') else None
+        # Freeze the role rule only for new selections. Older receipts retain
+        # their inventory and evidence-selection contract on replay.
+        context_only_paths = ({str(self.workspace.resolve(request.prior_draft))}
+            if request.prior_draft and (retained is None or
+                retained.get('prior_draft_role') == 'context_only.v1') else set())
         candidates = retained is None or all(item.get('inventory_policy') == 'writing_candidates.v1'
             for item in retained['inventories'])
         def inventories_now() -> list[dict]:
-            return material_inventories(self.workspace, roots, identity=identity, candidates=candidates)
+            rows = material_inventories(self.workspace, roots, identity=identity, candidates=candidates)
+            for row in rows:
+                key = 'candidate_files' if candidates else 'file_hashes'
+                row[key] = {path: value for path, value in row[key].items()
+                    if path not in context_only_paths}
+            return rows
         inventories = inventories_now()
         def inventory_paths(item: dict) -> dict:
             return item['candidate_files'] if candidates else item['file_hashes']
@@ -438,6 +448,8 @@ class WritingToolGateway:
             if not selection_request[key]:
                 selection_request.pop(key)  # Preserve existing directory-selection receipt bindings.
         inputs = {'request': selection_request, 'inventories': inventories}
+        if context_only_paths:
+            inputs['prior_draft_role'] = 'context_only.v1'
         investigating = retained is None or retained.get('selection_method') == 'inspect_windows.v1'
         if investigating:
             inputs['selection_method'] = 'inspect_windows.v1'
@@ -475,10 +487,13 @@ class WritingToolGateway:
             if len(prompt.encode('utf-8')) > 128000:
                 raise ValueError('Material selection inventory exceeds 128 KB; choose focused roots')
             from simple_ar.tools.materials import material_observation_seed
+            # Source bundles keep their own exclusion owner; draft exclusion
+            # applies only to the explicitly bound revision input.
+            excluded_paths = context_only_paths | {
+                str(self.workspace.resolve(row['document_record'])) for row in source_views}
             seed = material_observation_seed(workspace=self.workspace, inventories=inventories,
                 provider=self.material_observations, roots=roots, context=json.loads(prompt),
-                excluded_paths={
-                    str(self.workspace.resolve(row['document_record'])) for row in source_views})
+                excluded_paths=excluded_paths)
             if seed is not None:
                 inputs['journal_observations'] = {'coverage': seed['coverage']}
             owner.write_json('selection-input.json', inputs)
@@ -504,13 +519,14 @@ class WritingToolGateway:
                 instructions=instructions, inventories=inventories, owner=owner, identity=identity,
                 client=client, response_model=_MaterialSelection, label='composition-selection',
                 seed=seed,
-                final_fields=('materials', 'figures', 'sources'), excluded_paths={
-                    str(self.workspace.resolve(row['document_record'])) for row in source_views})
+                final_fields=('materials', 'figures', 'sources'), excluded_paths=excluded_paths)
             owner.write_json('selection-response.json', response)
         selected = _MaterialSelection.model_validate(response)
         if selected.read_windows:
             raise ValueError('Material selection ended without a final selection')
         windows = [FileWindow(path=row) if isinstance(row, str) else row for row in selected.materials]
+        if any(str(self.workspace.resolve(window.path)) in context_only_paths for window in windows):
+            raise ValueError('The bound prior draft is revision context, not selectable material evidence')
         observations = owner.read_json('selection-observations.json') if investigating else []
         if investigating:
             selected_material_windows(self.workspace, selected, observations, identity=identity)
@@ -602,6 +618,10 @@ class WritingToolGateway:
                 raise ValueError('Retained composition lacks its original request binding; no blind replay')
             original_binding = owner.read_json('request.json') if recovering else None
             request = (ReviewRequest if inspecting else ComposeRequest).model_validate(arguments)
+            if not recovering and request.prior_draft:
+                prior_path = self.workspace.resolve(request.prior_draft)
+                if any(self.workspace.resolve(window.path) == prior_path for window in request.materials):
+                    raise ValueError('The bound prior draft is revision context, not selectable material evidence')
             reuse_binding, reuse_linkage = None, None
             if request.reuse_prior_inputs:
                 request, reuse_binding, reuse_linkage = self._prior_inputs(request, identity)
