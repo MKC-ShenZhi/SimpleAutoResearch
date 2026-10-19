@@ -744,7 +744,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         reference = refs[0]
         record = app.workspace.resolve(reference['record'])
         receipt = read_json(record)
-        for case in ('blocked', 'error', 'unknown', 'no-hash', 'no-range', 'wrong-text', 'changed-receipt',
+        for case in ('blocked', 'error', 'unknown', 'no-hash', 'no-range', 'wrong-range', 'wrong-path', 'no-coverage', 'wrong-text', 'changed-receipt',
                 'stale-file', 'outside-inventory', 'revoked', 'source-owner'):
             with self.subTest(case=case):
                 original = record.read_bytes()
@@ -759,6 +759,12 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     changed['data']['sha256'] = None
                 elif case == 'no-range':
                     changed['data'].pop('next_offset_bytes')
+                elif case == 'wrong-range':
+                    changed['data']['next_offset_bytes'] += 1
+                elif case == 'wrong-path':
+                    changed['data']['absolute_path'] = str(other if subject == current else current)
+                elif case == 'no-coverage':
+                    changed['data'].pop('has_more')
                 elif case == 'wrong-text':
                     changed['data']['text'] = 'NOT OBSERVED'
                 elif case == 'changed-receipt':
@@ -800,9 +806,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             {'path': str(source), 'offset_bytes': 94000, 'max_bytes': 16000}]
         refs = []
         for index, arguments in enumerate(windows):
-            observed = app.workspace.call('read_file', arguments, identity=f'capacity-parent-{index}')
-            app.state['turns'].append(self._record_native_turn(app, 'read_file', arguments,
-                observed.data, f'capacity-parent-{index}'))
+            self._record_parent_material_read(app, source, f'capacity-parent-{index}',
+                **{key: value for key, value in arguments.items() if key != 'path'})
             refs.append(app._material_observations([str(source)])[0])
         inventories = material_inventories(app.workspace, [str(source)], identity='seed-capacity')
         seed = material_observation_seed(workspace=app.workspace, inventories=inventories,

@@ -28,7 +28,7 @@ from simple_ar.tools.specs import CommonToolSpec, ToolCall, ToolResult
 from simple_ar.tools.workspace import (WorkspaceToolGateway, workspace_tool_specs,
     DeliveryRequest, FileWindow, validate_workspace_arguments, workspace_observation_view, workspace_history_identity,
     resolve_source_mount)
-from simple_ar.tools.materials import read_material_window
+from simple_ar.tools.materials import read_material_window, journal_material_references, observe_text_window
 from simple_ar.tools.sources import SourcePolicy, SourceToolGateway, source_tool_specs
 from simple_ar.tools.visual import VisualToolGateway, visual_tool_specs
 from simple_ar.tools.images import ImageToolGateway, image_tool_specs
@@ -441,42 +441,9 @@ class ToolApplication:
         The material owner admits these receipts against its actual inventory,
         current permissions and bytes. Only a new selection calls this provider.
         """
-        roots = [self.workspace.resolve_material_root(path) for path in targets]
-        retained = []
         if not self.gateway.policy.is_allowed(self.gateway.registry.get('read_file'))[0]:
-            return retained
-        for turn in reversed(self.state['turns']):
-            calls = {call['id']: call for call in
-                self.session.store.read_json(turn['reply']).get('tool_calls', [])}
-            for item in reversed(turn['tools']):
-                call = calls.get(item['id'], {})
-                name = call.get('function', {}).get('name')
-                if name not in {'read_file', 'focus_work'}:
-                    continue
-                try:
-                    arguments = json.loads(call['function']['arguments'])
-                    raw = self.session.store.resolve(item['result']).read_bytes()
-                    receipt = json.loads(raw)
-                    if receipt.get('tool_name') != name or receipt.get('status') != 'ok' or receipt.get('error'):
-                        continue
-                    rows = ([({}, arguments, receipt.get('data') or {})] if name == 'read_file' else [
-                        ({'input_index': index}, row['request'], row.get('data') or {})
-                        for index, row in enumerate(receipt.get('data', {}).get('inputs', [])) if not row.get('error')])
-                    for selector, request, data in rows:
-                        path = self.workspace.resolve(request['path'])
-                        if not any(path == root or root.is_dir() and path.is_relative_to(root) for root in roots):
-                            continue
-                        if (not isinstance(data.get('sha256'), str)
-                            or len(data['sha256']) != 64
-                            or type(data.get('next_offset_bytes')) is not int
-                            or type(data.get('size_bytes')) is not int):
-                            continue
-                        retained.append({'request': request, **selector,
-                            'record': 'records/' + item['result'].removeprefix('attempts/'),
-                            'receipt_sha256': hashlib.sha256(raw).hexdigest()})
-                except (ValueError, TypeError, KeyError, OSError, RuntimeError):
-                    continue
-        return retained
+            return []
+        return journal_material_references(self.workspace, self.session.store, self.state['turns'], targets)
 
     def _work_context(self, targets: list[str]) -> dict[str, Any]:
         """Pass related original feedback, not another coordinator summary.
@@ -1396,32 +1363,8 @@ class ToolApplication:
                     # may change files; validate candidates once at selection,
                     # rather than discard observations or reread at each receipt.
                     if name in {'read_file', 'write_file', 'edit_file', 'copy_file'}:
-                        try:
-                            locator = data.get('absolute_path') or data.get('path') or arguments.get('path', '')
-                            path = self.workspace.resolve(locator)
-                            if Path(locator).is_absolute() and path != Path(locator):
-                                path = None  # Do not rebind old text to a replaced symlink target.
-                        except (ValueError, KeyError, OSError, RuntimeError):
-                            path = None
-                        if path is not None and not path.is_relative_to(self.session.store.root / 'attempts'):
-                            location = str(path)
-                            digest = data.get('sha256')
-                            changed = name != 'read_file'
-                            text_windows = {key: value for key, value in text_windows.items()
-                                if key[0] != location or (not changed and value['sha256'] == digest)}
-                            text = data.get('text') if name == 'read_file' else arguments.get('content') if name == 'write_file' else None
-                            if isinstance(text, str) and text and isinstance(digest, str) and len(digest) == 64:
-                                start = data.get('offset_bytes', arguments.get('offset_bytes', 0)) if name == 'read_file' else 0
-                                end = data.get('next_offset_bytes', start + len(text.encode('utf-8')))
-                                # Newer covering observations replace older
-                                # windows of the same observed version.
-                                text_windows = {key: value for key, value in text_windows.items()
-                                    if key[0] != location or not (start <= key[1] and key[2] <= end)}
-                                key = (location, start, end)
-                                text_windows[key] = {'path': location, 'sha256': digest,
-                                    'offset_bytes': start, 'next_offset_bytes': end, 'text': text,
-                                    'record': 'records/' + item['result'].removeprefix('attempts/'),
-                                    'operation': name, 'turn': len(blocks)}
+                        text_windows = observe_text_window(text_windows, self.workspace, name, arguments, data,
+                            record='records/' + item['result'].removeprefix('attempts/'), turn=len(blocks))
                 outcomes.append(self._history_observation(call, result, item['result']))
                 if result.get('status') != 'ok' or result.get('error'):
                     failure_view = outcomes[-1]

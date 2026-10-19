@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import hashlib
-import re
 from pathlib import Path
 from typing import Any, Callable
 
@@ -53,6 +52,90 @@ def window_key(workspace: Any, window: FileWindow) -> tuple:
         window.start_line, window.max_lines if 'max_lines' in window.model_fields_set or window.start_line else None)
 
 
+def journal_read_windows(receipt: dict, request: dict) -> list[dict]:
+    """Decode successful byte-owner reads; no current access or fact certification."""
+    if receipt.get('status') != 'ok' or receipt.get('error'):
+        return []
+    if receipt.get('tool_name') == 'read_file':
+        return [{'request': request, 'data': receipt.get('data') or {}}]
+    if receipt.get('tool_name') == 'focus_work':
+        return [{**row, 'input_index': index} for index, row in
+                enumerate(receipt.get('data', {}).get('inputs', [])) if not row.get('error')]
+    return []
+
+
+
+
+def observe_text_window(windows: dict, workspace: Any, name: str, arguments: dict,
+                        data: dict, *, record: str, turn: int) -> dict:
+    """Project reads and invalidate edited versions in the caller's transient view."""
+    try:
+        locator = data.get('absolute_path') or data.get('path') or arguments.get('path', '')
+        path = workspace.resolve(locator)
+        if ((Path(locator).is_absolute() and path != Path(locator))
+                or path.is_relative_to(workspace.root / 'attempts')):
+            return windows
+    except (ValueError, KeyError, OSError, RuntimeError):
+        return windows
+    location, digest = str(path), data.get('sha256')
+    windows = {key: value for key, value in windows.items()
+        if key[0] != location or (name == 'read_file' and value['sha256'] == digest)}
+    text = data.get('text') if name == 'read_file' else arguments.get('content') if name == 'write_file' else None
+    if not isinstance(text, str) or not text or not isinstance(digest, str) or len(digest) != 64:
+        return windows
+    if name == 'read_file':
+        try:
+            request = FileWindow.model_validate(arguments)
+            end = data.get('next_offset_bytes',
+                data.get('offset_bytes', request.offset_bytes) + len(text.encode('utf-8')))
+            _, start, end, digest = observed_window_key(workspace, request, {**data, 'next_offset_bytes': end})
+        except (ValueError, KeyError, TypeError, OSError, RuntimeError):
+            return windows
+    else:
+        start = 0
+        end = data.get('next_offset_bytes', len(text.encode('utf-8')))
+    windows = {key: value for key, value in windows.items()
+        if key[0] != location or not (start <= key[1] and key[2] <= end)}
+    windows[(location, start, end)] = {'path': location, 'sha256': digest,
+        'offset_bytes': start, 'next_offset_bytes': end, 'text': text,
+        'record': record, 'operation': name, 'turn': turn}
+    return windows
+
+
+def journal_material_references(workspace: Any, store: Any, turns: list[dict],
+                                targets: list[str]) -> list[dict]:
+    """Locate original read references; consumers still admit bytes and coverage."""
+    roots = [workspace.resolve_material_root(path) for path in targets]
+    retained = []
+    for turn in reversed(turns):
+        calls = {call['id']: call for call in store.read_json(turn['reply']).get('tool_calls', [])}
+        for item in reversed(turn['tools']):
+            call = calls.get(item['id'], {}).get('function', {})
+            if call.get('name') not in {'read_file', 'focus_work'}:
+                continue
+            try:
+                request = json.loads(call['arguments'])
+                raw = store.resolve(item['result']).read_bytes()
+                receipt = json.loads(raw)
+                if receipt.get('tool_name') != call['name']:
+                    continue
+                for row in journal_read_windows(receipt, request):
+                    path = workspace.resolve(row['request']['path'])
+                    data = row.get('data') or {}
+                    if (not any(path == root or root.is_dir() and path.is_relative_to(root) for root in roots)
+                            or not isinstance(data.get('sha256'), str) or len(data['sha256']) != 64
+                            or type(data.get('next_offset_bytes')) is not int
+                            or type(data.get('size_bytes')) is not int):
+                        continue
+                    retained.append({'request': row['request'],
+                        **({'input_index': row['input_index']} if 'input_index' in row else {}),
+                        'record': 'records/' + item['result'].removeprefix('attempts/'),
+                        'receipt_sha256': hashlib.sha256(raw).hexdigest()})
+            except (ValueError, TypeError, KeyError, OSError, RuntimeError):
+                continue
+    return retained
+
+
 def _journal_receipt(workspace: Any, reference: dict) -> dict:
     record = reference['record']
     if not isinstance(record, str) or not record.startswith('records/'):
@@ -61,21 +144,13 @@ def _journal_receipt(workspace: Any, reference: dict) -> dict:
     if hashlib.sha256(raw).hexdigest() != reference['receipt_sha256']:
         raise ValueError('Parent material receipt changed')
     receipt = json.loads(raw)
-    if receipt.get('tool_name') == 'focus_work' and 'input_index' in reference:
-        if receipt.get('status') != 'ok' or receipt.get('error'):
-            raise ValueError('Parent focus receipt is not successful')
-        index = reference['input_index']
-        windows = receipt.get('data', {}).get('inputs', [])
-        if type(index) is not int or not 0 <= index < len(windows):
-            raise ValueError('Parent focus input index unavailable')
-        row = windows[index]
-        if row.get('error') or row.get('request') != reference['request'] or 'data' not in row:
-            raise ValueError('Parent focus input is not the requested successful read')
-        return row  # A view into the original receipt, never a synthetic read record.
-    if (receipt.get('tool_name') != 'read_file' or receipt.get('status') != 'ok'
-            or receipt.get('error')):
-        raise ValueError('Parent material receipt is not a successful read')
-    return receipt
+    rows = journal_read_windows(receipt, reference['request'])
+    for row in rows:
+        if (row.get('input_index') == reference.get('input_index')
+                and type(row.get('input_index')) is type(reference.get('input_index'))
+                and row['request'] == reference['request'] and 'data' in row):
+            return row
+    raise ValueError('Parent material receipt is not the requested successful read')
 
 
 def material_observation_seed(*, workspace: Any, inventories: list[dict],
@@ -105,29 +180,19 @@ def material_observation_seed(*, workspace: Any, inventories: list[dict],
                 raise ValueError('outside_candidate_inventory_or_source_owner')
             receipt = _journal_receipt(workspace, reference)
             data = receipt['data']
-            digest = data.get('sha256')
-            start = data.get('offset_bytes', request.offset_bytes)
-            end, size = data.get('next_offset_bytes'), data.get('size_bytes')
-            if (not isinstance(digest, str) or not re.fullmatch(r'[a-f0-9]{64}', digest)
-                    or any(type(value) is not int for value in (start, end, size))
-                    or not 0 <= start < end <= size or end - start > request.max_bytes
-                    or (request.start_line is not None and type(data.get('offset_bytes')) is not int)
-                    or (request.start_line is None and start != request.offset_bytes)
-                    or not isinstance(data.get('text'), str) or not data['text']
-                    or type(data.get('has_more')) is not bool or data['has_more'] != (end < size)):
-                raise ValueError('missing_full_digest_or_measured_window')
-            location = data.get('absolute_path')
-            if (not isinstance(location, str) or not Path(location).is_absolute()
-                    or workspace.resolve(location) != path or str(path) != location):
-                raise ValueError('original_path_changed')
+            # The byte owner proves the entire retained observation, including
+            # full digest, original path, measured range and has_more. Do not
+            # maintain another handwritten approximation of its read contract.
+            read_material_window(workspace, request.model_dump(exclude_unset=True), identity='material-seed', expected=data)
+            if not data['text']:
+                raise ValueError('empty_material_window')
+            _, start, end, digest = observed_window_key(workspace, request, data)
             coverage.update(path=str(path), sha256=digest, offset_bytes=start, next_offset_bytes=end)
-            request.validate_read_size(size)
             key = (str(path), digest, start, end)
             if key in seen:
                 raise ValueError('same_path_version_and_measured_window_already_supplied')
-            if size != visible[str(path)]:
+            if data['size_bytes'] != visible[str(path)]:
                 raise ValueError('current_size_changed')
-            read_material_window(workspace, request.model_dump(exclude_unset=True), identity='material-seed', expected=data)
             row = {'request': request.model_dump(exclude_unset=True), 'data': data,
                 'record': reference['record'], 'receipt_sha256': reference['receipt_sha256'],
                 **({'input_index': reference['input_index']} if 'input_index' in reference else {})}
