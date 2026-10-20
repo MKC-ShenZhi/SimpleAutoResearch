@@ -421,6 +421,7 @@ def native_creation_options(args: argparse.Namespace) -> dict:
     """One projection of native creation access, frozen contracts and budgets."""
     from simple_ar.cli.task_options import native_process_limits
     return dict(model=args.model or None, report_protocol='canonical_report.v1', professional_inputs=True,
+        context_protocol='conversation.v1',
         sources={f'source{index}': path for index, path in enumerate(args.source)},
         allow_execution=args.allow_execution, allow_network=args.allow_network, allow_vision=args.allow_vision,
         max_turns=args.max_turns, max_tokens=args.max_tokens, max_images=args.max_images,

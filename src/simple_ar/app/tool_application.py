@@ -21,7 +21,7 @@ from simple_ar.core.session import BudgetState, SessionController
 from simple_ar.integrations.llm import LLMClient, LLMError, LLMSettings, estimate_tokens
 from simple_ar.integrations.model_profiles import catalog_path, model_connections_compatible
 from simple_ar.tools.gateway import CommonToolGateway
-from simple_ar.tools.openai_schema import export_openai_tool_schemas
+from simple_ar.tools.openai_schema import compact_json_schema, export_openai_tool_schemas
 from simple_ar.tools.permissions import ToolPermissionPolicy
 from simple_ar.tools.registry import ToolRegistry
 from simple_ar.tools.specs import CommonToolSpec, ToolCall, ToolResult
@@ -284,6 +284,8 @@ class ToolApplication:
             raise ValueError('Unknown saved tool-contract mode; do not silently change historical tasks')
         if config.get('report_protocol') not in {None, _REPORT_PROTOCOL}:
             raise ValueError('Unknown saved report protocol; preserve its original contract')
+        if config.get('context_protocol') not in {None, 'conversation.v1'}:
+            raise ValueError('Unknown saved context protocol; preserve its original contract')
         evidence = controller.store.root / "evidence"
         evidence.mkdir(exist_ok=True)
         self.workspace = WorkspaceToolGateway(controller.store.root,
@@ -455,6 +457,9 @@ class ToolApplication:
                         parameters.get('properties', {}).pop(field, None)
                     parameters['required'] = [field for field in parameters.get('required', [])
                         if field not in {'goal', 'materials', 'sources'}]
+        if self.state['config'].get('context_protocol') == 'conversation.v1':
+            schemas = [{**row, 'function': {**row['function'],
+                'parameters': compact_json_schema(row['function']['parameters'])}} for row in schemas]
         return schemas
 
     def _closing_schemas(self) -> list[dict[str, Any]]:
@@ -1134,7 +1139,10 @@ class ToolApplication:
                max_snapshot_bytes: int = 16 * 1024 * 1024,
                delivery_files: list[str] | None = None,
                tool_contracts: Literal['full', 'on_demand', 'outcomes'] = 'on_demand',
-               completion_policy: str = 'closing_decision.v2', professional_inputs: bool = False) -> ToolApplication:
+               completion_policy: str = 'closing_decision.v2', professional_inputs: bool = False,
+               context_protocol: Literal['conversation.v1'] | None = 'conversation.v1') -> ToolApplication:
+        if context_protocol not in {None, 'conversation.v1'}:
+            raise ValueError('Unsupported context protocol')
         config, reused, limits, attempts = cls._configuration(root, goal, model=model, sources=sources,
             allow_execution=allow_execution, allow_network=allow_network, allow_vision=allow_vision,
             max_turns=max_turns, max_tokens=max_tokens, max_images=max_images, project_python=project_python,
@@ -1147,6 +1155,8 @@ class ToolApplication:
             raise ValueError('professional_inputs must be boolean')
         if professional_inputs:
             config['professional_inputs'] = 'owner.v1'
+        if context_protocol is not None:
+            config['context_protocol'] = context_protocol
         session = SessionController.create(root, session_id=root.name, topic=goal,
             registry=CapabilityRegistry(), budget=BudgetState(max_attempts=attempts, max_no_progress=6))
         session.manifest.transition_recipe = cls.RECIPE
@@ -1266,6 +1276,8 @@ class ToolApplication:
                 delivery_files=candidate.get('delivery_files'), model_catalogs=hints)
             if old.get('professional_inputs') is not None:
                 config['professional_inputs'] = old['professional_inputs']
+            if 'context_protocol' in old:
+                config['context_protocol'] = old['context_protocol']
             for name in fields - {'model', 'sources', 'allow_execution', 'allow_network'}:
                 if not replace_existing and old.get(name) is not None and old[name] != config.get(name):
                     raise ValueError(f'{name} is already frozen; use its existing feedback/revision contract')
@@ -1577,6 +1589,12 @@ class ToolApplication:
 
     def _messages(self, *, client: LLMClient | None = None, closing: bool = False,
                   native_history_start_turn: int | None = None, schemas: list | None = None) -> list[dict[str, Any]]:
+        protocol = self.state['config'].get('context_protocol')
+        if protocol == 'conversation.v1':
+            return self._conversation_messages(client=client, closing=closing,
+                native_history_start_turn=native_history_start_turn, schemas=schemas)
+        if protocol is not None:
+            raise ValueError('Unknown saved context protocol; no projection migration')
         config = self.state["config"]
         if native_history_start_turn is None:
             rebindings = config.get('model_rebindings', [])
@@ -2149,6 +2167,205 @@ class ToolApplication:
                              'a new native session without fabricating or changing saved reasoning')
         return prefix + [message for block in selected for message in block] + feedback
 
+    def _conversation_messages(self, *, client: LLMClient | None = None, closing: bool = False,
+                               native_history_start_turn: int | None = None,
+                               schemas: list | None = None) -> list[dict[str, Any]]:
+        """One chronological working set; receipts retain their actual text once.
+
+        This is historical conversation, not a revalidated evidence cache. Tool
+        owners still validate current permissions, source bytes and acceptance.
+        No file discovery, source reads, model calls or new persisted state.
+        """
+        config, turns = self.state['config'], self.state['turns']
+        client = client or self._client()
+        focus = self._work_focus()
+        if native_history_start_turn is None:
+            rebindings = config.get('model_rebindings', [])
+            native_history_start_turn = rebindings[-1].get('native_history_start_turn', 0) if rebindings else 0
+        if type(native_history_start_turn) is not int or not 0 <= native_history_start_turn <= len(turns):
+            raise ValueError('Invalid native history boundary')
+        boundary = max(native_history_start_turn, focus.get('native_history_start_turn', 0))
+        output = client.effective_output_limit() or 0
+        target = client._settings.context_input_tokens
+        remaining = self.ledger.remaining('total_tokens')
+        if remaining is not None:
+            target = min(target, max(0, remaining - output))
+        requests = self._request_capacity()
+        report = self._report_projection()
+        plan = self._work_plan()
+        context = {
+            'context_protocol': 'conversation.v1', 'requests': self.state['requests'],
+            'mounts': config['sources'], 'workspace': str(self.workspace.workspace),
+            'authorized_roots': {name: str(path) for name, path in self.workspace.mounts.items()},
+            'permissions': sorted(self.gateway.policy.allowed_permissions),
+            'process_cwd': str(self.workspace.workspace), 'task_python': str(self.workspace.python),
+            'required_delivery_files': config.get('delivery_files', []),
+            'work_focus': {key: value for key, value in focus.items()
+                if key not in {'inputs', 'previous_inputs', 'turn'}},
+            'work_focus_authority': 'Saved work intention, not a user request, evidence or permission.',
+            'work_plan': {key: plan[key] for key in ('steps', 'scope', 'request_count', 'record') if key in plan} if plan else None,
+            'frozen_contracts': {key: config[key] for key in ('code_task', 'execution_contract',
+                'research_policy', 'table_analysis') if config.get(key) is not None},
+            'resources': {'limits': self.ledger.limits,
+                'remaining': {key: self.ledger.remaining(key) for key in self.ledger.limits},
+                'unknown_usage': list(self.ledger.unknown_dimensions()),
+                'model_turns_remaining': requests, 'context_input_target_tokens': target,
+                'next_output_token_reservation': output,
+                'decision_budget': {'includes_current_decision': True,
+                    'provider_slots_after_one_attempt': max(0, requests - 1),
+                    'nested_provider_slots_after_decision_and_followup': max(0, requests - 2),
+                    'followup_policy': config.get('completion_policy', 'none'), 'closing_required': closing},
+                'semantics': {
+                    'llm_requests': 'Shared physical provider attempts: decisions, professional selection/writing/review, inspect_images and retries.',
+                    'total_tokens': 'Model input/output, including image inputs to inspect_images.',
+                    'image_requests': 'Image generation/edit requests only; zero does not prohibit authorized inspection.'}},
+            'report_protocol': {'version': config.get('report_protocol'),
+                'effective': {key: value for key, value in report.items() if key != 'requirement'}},
+            'retained_text_windows': [], 'retained_source_passages': [],
+            'work_inputs': {'windows': [], 'scope': 'Focus text is supplied only in retained native tool messages; no second text projection.'},
+            'material_supply': {'native_context': [], 'omitted': [],
+                'scope': 'Original historical observations in native messages, not current file state or verified facts. '
+                    'No read text or write payload is replaced. Archived text is not supplied; use read_history for original receipts.'},
+        }
+        if report['requirement'] is not None:
+            requirement = report['requirement']
+            controls = requirement['config']
+            context['report_requirement'] = {'method': requirement['method'], 'outline': requirement['outline'],
+                'max_cited_sources': controls.get('max_cited_sources', 0),
+                'target_words': controls.get('longform', {}).get('target_words', 0),
+                'review': {key: controls[key] for key in ('reviewer', 'document_review', 'review_scope',
+                    'max_review_iterations') if key in controls}}
+            context['report_delivery'] = BOUND_REPORT_REVISION
+        if config.get('report_protocol') == _REPORT_PROTOCOL:
+            context['report_protocol']['instruction'] = (
+                'Declare report, original-text conversion or none using update_work_plan.report_intent, '
+                'with the actual current request_index and exact quote. Existing obligations persist across feedback. '
+                'Formal reports require the canonical writing/publication identity; raw writes remain candidates.')
+        if config.get('tool_contracts', 'full') != 'full':
+            context['available_specialists'] = self._specialist_catalog()
+            context['tool_contracts'] = {'mode': config['tool_contracts'],
+                'instruction': 'load_tools selects exact catalog names; selection grants no permission or completion.'}
+        vision = self.gateway.registry.get('inspect_images')
+        allowed, reason = self.gateway.policy.is_allowed(vision) if vision is not None else (False, 'Not registered')
+        context['vision_inspection'] = {'available': allowed, 'reason': reason}
+        # Index columns are fixed and bodies stay at the exact reply/result refs.
+        columns = ['turn', 'request_count', 'reply', 'operations']
+        operation_columns = ['id', 'tool', 'arguments', 'record', 'status', 'error', 'artifacts']
+        blocks, index, supplies = [], [], []
+        count = 1
+        for position, turn in enumerate(turns):
+            current = turn.get('request_count', 1)
+            block = [{'role': 'user', 'content': request} for request in self.state['requests'][count:current]]
+            count = current
+            reply = self.session.store.read_json(turn['reply'])
+            calls = {call['id']: call for call in reply.get('tool_calls', [])}
+            results = {item['id']: item for item in turn['tools']}
+            complete = not turn.get('remaining') and set(calls) == set(results)
+            block.append(reply)
+            operations, supplied = [], []
+            for call_id in [*results, *(key for key in calls if key not in results)]:
+                call = calls[call_id]
+                item = results.get(call_id)
+                result = self.session.store.read_json(item['result']) if item else {'status': 'not_executed'}
+                record = 'records/' + item['result'].removeprefix('attempts/') if item else None
+                indexed = self._history_observation(call, result, item['result'] if item else turn['reply'])
+                error = result.get('error', '')
+                if isinstance(error, str) and len(error) > 512:
+                    error = {'preview': error[:512], 'omitted_characters': len(error) - 512,
+                        'record': record, 'field': 'error'}
+                operations.append([call_id, call['function']['name'], indexed['arguments'], record,
+                    result.get('status'), error, result.get('artifacts', [])])
+                if call['function']['name'] == 'write_file':
+                    try:
+                        arguments = json.loads(call['function']['arguments'])
+                    except (ValueError, TypeError):
+                        arguments = {}
+                    text = arguments.get('content') if isinstance(arguments, dict) else None
+                    if isinstance(text, str) and text:
+                        supplied.append({'turn': position, 'record': 'records/' + turn['reply'].removeprefix('attempts/'),
+                            'call_id': call_id, 'field': 'function.arguments.content', 'role': 'write_context',
+                            'path': arguments.get('path'), 'text_bytes': len(text.encode('utf-8')),
+                            'text_characters': len(text), 'version_scope': 'Authored payload, not evidence or current file state'})
+                if item:
+                    block.append({'role': 'tool', 'tool_call_id': call_id,
+                        'content': json.dumps(result, ensure_ascii=False, separators=(',', ':'))})
+                    data = result.get('data') or {}
+                    text_rows = [(data, 'data.text')]
+                    text_rows.extend((row.get('data') or {}, f'data.inputs.{number}.data.text')
+                        for number, row in enumerate(data.get('inputs') or []) if isinstance(row, dict))
+                    for key in ('matches', 'retained_preview'):
+                        text_rows.extend((row, f'data.{key}.{number}.text')
+                            for number, row in enumerate(data.get(key) or []) if isinstance(row, dict))
+                    for row, field in text_rows:
+                        text = row.get('text')
+                        if not isinstance(text, str) or not text:
+                            continue
+                        supplied.append({'turn': position, 'record': record, 'field': field,
+                            'tool': call['function']['name'], 'role': 'historical_observation',
+                            **({'path': indexed['arguments']['path']}
+                                if 'path' in indexed['arguments'] and field == 'data.text' else {}),
+                            **{key: row[key] for key in ('path', 'absolute_path', 'sha256', 'offset_bytes',
+                                'next_offset_bytes', 'has_more', 'chunk_id') if key in row},
+                            'text_bytes': len(text.encode('utf-8')), 'text_characters': len(text),
+                            'version_scope': 'Recorded observation; current bytes not revalidated by conversation projection'})
+            index.append([position, current, 'records/' + turn['reply'].removeprefix('attempts/'), operations])
+            blocks.append(block if complete else [])
+            supplies.append(supplied)
+            if turn.get('origin') == 'caller' or not complete:
+                boundary = max(boundary, position + 1)
+        feedback = [{'role': 'user', 'content': request} for request in self.state['requests'][count:]]
+        prefix = [{'role': 'system', 'content': SYSTEM + ('\n\n' + _CLOSING_DECISION if closing else '')},
+                  {'role': 'user', 'content': ''}]
+        schema_cost = estimate_tokens(json.dumps(self.schemas if schemas is None else schemas, ensure_ascii=False))
+        start = boundary
+
+        def project() -> tuple[list, int]:
+            index_start = max(0, start - 16)
+            context['retained_turn_start'] = start
+            context['history_archive'] = {'start_turn': 0, 'end_turn': start, 'total_turns': len(turns),
+                'native_history_start_turn': boundary, 'capacity_evicted_turns': start - boundary}
+            context['earlier_turns'] = {'columns': columns, 'operation_columns': operation_columns,
+                'start_turn': index_start, 'end_turn': start, 'total_archived_turns': start,
+                'omitted_turns': index_start, 'rows': index[index_start:start],
+                'scope': 'Recent archived index only (at most 16 turn blocks), not exhaustive history. '
+                    'Ranges are zero-based and end-exclusive. Use read_history for older turns; '
+                    'complete exact arguments are at reply refs under their call id, and results at record refs.'}
+            context['material_supply']['native_context'] = [row for rows in supplies[start:] for row in rows]
+            context['material_supply']['omitted'] = ([{'start_turn': 0, 'end_turn': start,
+                'status': 'history_not_supplied', 'access': 'read_history for the archived turn range'}] if start else [])
+            if 'inputs' in focus or 'previous_inputs' in focus:
+                current_selection = 'inputs' in focus
+                context['work_inputs'].update(record=focus['record'], current_selection=current_selection,
+                    windows=[{'request': row['request'],
+                        'status': ('unavailable' if 'error' in row else
+                            ('supplied_native' if (row.get('data') or {}).get('text') else 'empty')
+                            if focus['turn'] >= start else 'history_not_supplied')
+                            if current_selection else 'previous_not_selected',
+                        **({'error': row['error']} if 'error' in row else {})}
+                        for row in focus.get('inputs', focus.get('previous_inputs', []))])
+            resources = context['resources']
+            resources.update(approximate_next_input_tokens=0, context_exceeds_input_target=False)
+            while True:
+                prefix[1]['content'] = json.dumps(context, ensure_ascii=False, separators=(',', ':'))
+                messages = prefix + [message for block in blocks[start:] for message in block] + feedback
+                cost = estimate_tokens(json.dumps(messages, ensure_ascii=False)) + schema_cost
+                exceeds = resources['context_exceeds_input_target'] or cost > target
+                if resources['approximate_next_input_tokens'] == cost and resources['context_exceeds_input_target'] == exceeds:
+                    return messages, cost
+                resources.update(approximate_next_input_tokens=cost, context_exceeds_input_target=exceeds)
+
+        messages, cost = project()
+        while cost > target and start < len(blocks):
+            start += 1
+            messages, cost = project()
+        if cost > target:
+            raise ValueError('Current requests, contracts and history index exceed remaining input capacity; no model request sent')
+        if getattr(client._settings, 'thinking_mode', '') == 'enabled' and any(
+                message['role'] == 'assistant' and not any(isinstance(message.get(key), str)
+                    for key in ('reasoning_content', 'reasoning')) for block in blocks[start:] for message in block):
+            raise ValueError('Native history lacks reasoning_content or reasoning; explicitly switch models to start a new native session')
+        return messages
+
     @staticmethod
     def _vision_binding(client: LLMClient) -> dict[str, Any]:
         # Vision does not consume the code route. Pin only its own non-secret
@@ -2258,6 +2475,8 @@ class ToolApplication:
             context.store.write_json('decision_budget.json', {
                 'estimated_followup_tokens': floor['total_tokens'],
                 'closing_required': closing,
+                **({'context_protocol': 'conversation.v1'}
+                    if self.state['config'].get('context_protocol') == 'conversation.v1' else {}),
                 **({'closing_action_contract': 'single_terminal.v1'} if closing else {}),
                 'input_projection': {
                     'resources': projection['resources'],
@@ -2268,7 +2487,9 @@ class ToolApplication:
                         | ({'passage_range': {key: row['passage'][key] for key in
                                 ('chunk_id', 'character_start', 'character_end') if key in row['passage']}}
                             if 'passage' in row else {})
-                        for row in [*projection['retained_text_windows'], *projection['retained_source_passages']]],
+                        for row in [*projection['retained_text_windows'], *projection['retained_source_passages'],
+                            *(projection['material_supply']['native_context']
+                                if projection.get('context_protocol') == 'conversation.v1' else [])]],
                     'work_inputs': [{key: value for key, value in row.items() if key != 'data'} |
                         {'data': {key: value for key, value in row.get('data', {}).items() if key != 'text'}}
                         for row in projection.get('work_inputs', {}).get('windows', [])]},

@@ -155,7 +155,9 @@ def draft_quote_present(sources: Mapping[str, str | tuple[str, ...]], section_id
     return bool(quote) and bool(values) and (quote == values[0] or any(quote in value for value in values[1:]))
 
 
-def _resolve_pointer(view: Mapping[str, Any], pointer: str, *, allow_empty: bool = False) -> tuple[list[str], Any]:
+def _resolve_pointer(view: Mapping[str, Any], pointer: str, *, allow_empty: bool = False,
+                     allow_list: bool = False) -> tuple[list[str], Any]:
+    # Bound producer metadata can opt into lists; review quotes stay scalar.
     def location(value: Any, path: list[str]) -> str:
         parent = "/" + "/".join(key.replace("~", "~0").replace("/", "~1") for key in path)
         if isinstance(value, Mapping):
@@ -182,8 +184,8 @@ def _resolve_pointer(view: Mapping[str, Any], pointer: str, *, allow_empty: bool
         else:
             raise LLMResponseError(f"Review evidence pointer is absent from the current prompt: {pointer}. {location(value, consumed)}. No pointer or quote was repaired.")
         consumed.append(segment)
-    if isinstance(value, (Mapping, list)) and not (allow_empty and not value
-            and view.get("evidence_reference_contract") == GAP_EVIDENCE_CONTRACT):
+    if isinstance(value, (Mapping, list)) and not (allow_list and isinstance(value, list)) and not (
+            allow_empty and not value and view.get("evidence_reference_contract") == GAP_EVIDENCE_CONTRACT):
         raise LLMResponseError(f"Review evidence must locate a scalar field, not a whole container: {pointer}. {location(value, segments)}. Select a supplied scalar explicitly; no pointer or quote was repaired.")
     return segments, value
 

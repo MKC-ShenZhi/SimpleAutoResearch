@@ -445,6 +445,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             interpreter = run_dir / 'task-python'
             interpreter.symlink_to(sys.executable)
         app = ToolApplication.create(run_dir / 'native', goal,
+            context_protocol=None,  # Historical projection fixtures keep their original contract.
             model='fixture', sources={'source0': inputs} if mount_inputs else {},
             allow_execution=allow_execution, allow_network=allow_network,
             max_turns=max_turns, project_python=interpreter, code_task=code_task, process_limits=process_limits,
@@ -2901,6 +2902,55 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertIn('changed during approval', guarded.session.manifest.status_reason)
         self.assertFalse((guarded.workspace.workspace / 'result.txt').exists())
         self.assertFalse(list((guarded.session.store.root / 'tools/processes').glob('*/invocation.json')))
+
+    def test_supplied_article_adoption_keeps_citations_assets_and_real_producer_without_generation(self):
+        from tests.report_review_fixtures import changed_record
+        _, fake, app, _, request = self._writing_fixture()
+        first = self._compose_document(app, request, 'original-article')
+        original_path = app.workspace.resolve(first.data['editable_markdown'])
+        self.assertIn('Cancellation propagates', original_path.read_text())
+        owner = app.session.store.root / 'tools/writing/original-article'
+        retained = {path: path.read_bytes() for path in owner.rglob('*') if path.is_file()}
+        fake.ask_json.reset_mock()
+        fake.ask_json.side_effect = None
+        fake.ask_json.return_value = {'section_reviews': [{'section_id': 'document', 'verdict': 'pass'}]}
+        adopted = self._compose_document(app, {'title': 'Adopted article', 'goal': 'Retain the supported observation.',
+            'prior_draft': first.data['editable_markdown'], 'adopt_draft': True,
+            'reuse_prior_inputs': True, 'professional_review': {'max_revision_rounds': 0}}, 'adopted-article')
+        self.assertEqual(fake.ask_json.call_count, 1)
+        self.assertEqual(fake.ask_json.call_args.kwargs['label'], 'article-independent-review')
+        self.assertEqual(app.workspace.resolve(adopted.data['editable_markdown']).with_name('references.bib').read_bytes(),
+            original_path.with_name('references.bib').read_bytes())
+        proof = app.session.store.read_json('tools/writing/adopted-article/writer/writer.json')
+        self.assertEqual(proof['producer']['kind'], 'supplied_candidate.v1')
+        self.assertEqual(proof['producer']['pointer'], '/sections/0/draft_markdown')
+        self.assertNotIn('response_sha256', proof)
+        self.assertFalse((app.session.store.root / 'tools/writing/adopted-article/writer/response.json').exists())
+        self.assertEqual(app.writing.publication_source(adopted.data['editable_markdown'], None)['composition'],
+            adopted.data['version'])
+        self.assertEqual(fake.ask_json.call_count, 1)
+        self.assertEqual({path: path.read_bytes() for path in retained}, retained)
+        with changed_record(owner / 'writer/writer.json', None), self.assertRaises((ValueError, OSError)):
+            app.writing.publication_source(adopted.data['editable_markdown'], None)
+
+        # A supplied external body imports only exact authorized local assets;
+        # no model-generated rewrite is needed just to acquire a receipt.
+        figures = app.workspace.workspace / 'figures'
+        figures.mkdir(exist_ok=True)
+        (figures / 'plot.svg').write_text('<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>')
+        draft = app.workspace.workspace / 'external.md'
+        draft.write_text('An unverified note.\n\n![A supplied figure](figures/plot.svg)\n')
+        external = self._compose_document(app, {'title': 'Supplied note', 'goal': 'Inspect this note.',
+            'prior_draft': 'workspace/external.md', 'adopt_draft': True,
+            'materials': [{'path': 'source0/notes.txt'}], 'figures': ['workspace/figures/plot.svg'],
+            'professional_review': {'max_revision_rounds': 0}}, 'external-adoption')
+        copied = app.workspace.resolve(external.data['editable_markdown']).parent / 'figures/plot.svg'
+        self.assertEqual(copied.read_bytes(), (figures / 'plot.svg').read_bytes())
+        self.assertEqual(fake.ask_json.call_count, 2)
+        self.assertEqual(app.writing.publication_source(external.data['editable_markdown'], None)['composition'],
+            external.data['version'])
+        with changed_record(draft, b'changed body'), self.assertRaises(ValueError):
+            app.writing.publication_source(external.data['editable_markdown'], None)
 
     def test_versioned_report_writer_receives_original_material_and_feedback_creates_new_version(self):
         from simple_ar.tools.workspace import ReportDelivery
@@ -13619,6 +13669,333 @@ class MCPServerTests(unittest.TestCase):
             content = called["result"]["structuredContent"]  # type: ignore[index]
             self.assertEqual(content["status"], "ok")
             self.assertTrue(content["data"]["matches"])
+
+
+class ConversationContextTests(unittest.TestCase):
+    """Offline tests for the new projector; historical test cases stay intact."""
+    _tool_materials = CommonToolLayerTests._tool_materials
+    _native_fixture = CommonToolLayerTests._native_fixture
+    _native_message = staticmethod(CommonToolLayerTests._native_message)
+    _record_native_turn = CommonToolLayerTests._record_native_turn
+
+    def _fixture(self):
+        root, inputs, fake, _, app, _ = self._native_fixture()
+        app = ToolApplication.create(root / 'conversation', 'Use original measurements; preserve unknowns.',
+            model='fixture', sources={'source0': inputs}, context_protocol='conversation.v1')
+        return inputs, fake, app
+
+    def _read(self, app, path, identity, **window):
+        # Saved receipt fixture: projection must not execute/revalidate the read.
+        arguments = {'path': str(path), **window}
+        raw = path.read_bytes()
+        offset = window.get('offset_bytes', 0)
+        end = min(len(raw), offset + window.get('max_bytes', 16000))
+        result = SimpleNamespace(data={'path': str(path), 'absolute_path': str(path),
+            'text': raw[offset:end].decode('utf-8'), 'sha256': hashlib.sha256(raw).hexdigest(),
+            'size_bytes': len(raw), 'offset_bytes': offset, 'next_offset_bytes': end, 'has_more': end < len(raw)})
+        app.state['turns'].append(self._record_native_turn(app, 'read_file', arguments, result.data, identity))
+        return result
+
+    def test_conversation_v1_creation_supply_and_historical_dispatch(self):
+        with _temporary_run() as root:
+            for protocol in (None, 'conversation.v1'):
+                app = ToolApplication.create(root / str(protocol), 'Keep the supplied goal', model=None,
+                    sources={}, context_protocol=protocol)
+                self.assertEqual(app.state['config'].get('context_protocol'), protocol)
+                app.supply(supply_id='files', reason='Declare final files', changes={'delivery_files': ['*.txt']})
+                loaded = ToolApplication.load(app.session.store.root)
+                self.assertEqual(loaded.state['config'].get('context_protocol'), protocol)
+                if protocol is None:
+                    self.assertNotIn('context_protocol', loaded.state['config'])
+                    with patch.object(loaded, '_conversation_messages', side_effect=AssertionError('No migration')), \
+                            patch.object(loaded, '_client', side_effect=RuntimeError('Legacy entry reached')):
+                        with self.assertRaisesRegex(RuntimeError, 'Legacy entry reached'):
+                            loaded._messages()
+                with self.assertRaisesRegex(ValueError, 'Unsupported supply fields'):
+                    loaded.supply(supply_id='migration', reason='Must not migrate', changes={'context_protocol': 'conversation.v1'})
+            with self.assertRaisesRegex(ValueError, 'Unsupported context protocol'):
+                ToolApplication.create(root / 'unknown', 'Goal', model=None, sources={}, context_protocol='unknown')
+
+    def test_conversation_v1_read_text_and_write_payload_are_native_and_projection_is_read_only(self):
+        inputs, fake, app = self._fixture()
+        source = inputs / 'records.json'
+        original = json.dumps({'label': 'Recorded condition', 'observations': list(range(4200))})
+        source.write_text(original, encoding='utf-8')
+        observed = self._read(app, source, 'original', max_bytes=64000, full_digest=True)
+        payload = "print('use the original labels')\n"
+        app.state['turns'].append(self._record_native_turn(app, 'write_file',
+            {'path': 'workspace/plot.py', 'content': payload}, {'path': 'workspace/plot.py'}, 'source'))
+        app._save()
+        files = {path: path.read_bytes() for path in app.session.store.root.rglob('*') if path.is_file()}
+        before = app.ledger.to_dict()
+        with patch.object(app.workspace, 'resolve', side_effect=AssertionError('No source re-read')), \
+                patch.object(fake, 'chat_turn', side_effect=AssertionError('No model call')):
+            messages = app._messages(client=fake)
+        context = json.loads(messages[1]['content'])
+        result = next(json.loads(row['content']) for row in messages if row['role'] == 'tool'
+            and row['tool_call_id'] == 'original')
+        self.assertEqual(result['data']['text'], observed.data['text'])
+        reply = next(row for row in messages if row.get('tool_calls', [{}])[0].get('id') == 'source')
+        self.assertEqual(json.loads(reply['tool_calls'][0]['function']['arguments'])['content'], payload)
+        self.assertEqual(context['retained_text_windows'], [])
+        self.assertEqual(context['retained_source_passages'], [])
+        supplied = context['material_supply']['native_context']
+        self.assertEqual(next(row['text_bytes'] for row in supplied if row.get('tool') == 'read_file'),
+            len(observed.data['text'].encode('utf-8')))
+        self.assertTrue(any(row['role'] == 'write_context' for row in supplied))
+        self.assertNotIn('text_supply', result['data'])
+        self.assertEqual(app.ledger.to_dict(), before)
+        self.assertEqual({path: path.read_bytes() for path in files}, files)
+        self.assertEqual(app.state['config']['tool_contracts'], 'on_demand')
+        self.assertLessEqual(context['resources']['approximate_next_input_tokens'], fake._settings.context_input_tokens)
+
+    def test_conversation_v1_schema_compaction_keeps_validation_and_instance_titles(self):
+        from copy import deepcopy
+        from simple_ar.tools.openai_schema import compact_json_schema
+        schema = {'title': 'Display only', 'type': 'object', 'additionalProperties': False,
+            'properties': {'title': {'title': 'Title label', 'type': 'string', 'minLength': 2,
+                    'description': 'Real title property', 'default': 'Hi'},
+                'payload': {'$ref': '#/$defs/Used'},
+                'metadata': {'type': 'object', 'default': {'title': 'Keep this value'},
+                    'examples': [{'title': 'Keep this example'}], 'const': {'title': 'fixed'}}},
+            'required': ['title', 'payload'], '$defs': {
+                'Unused': {'title': 'Unused', 'type': 'string'},
+                'Used': {'title': 'Used label', 'type': 'object', 'properties': {
+                    'title': {'$ref': '#/$defs/Leaf'}}, 'required': ['title'], 'additionalProperties': False},
+                'Leaf': {'title': 'Leaf label', 'type': 'integer', 'minimum': 1}}}
+        original = deepcopy(schema)
+        compact = compact_json_schema(schema)
+        self.assertEqual(schema, original)
+        self.assertNotIn('title', compact)
+        self.assertIn('title', compact['properties'])
+        self.assertEqual(compact['properties']['title'], {key: value for key, value in
+            schema['properties']['title'].items() if key != 'title'})
+        self.assertEqual(compact['properties']['metadata'], schema['properties']['metadata'])
+        self.assertEqual(set(compact['$defs']), {'Used', 'Leaf'})
+        self.assertNotIn('title', compact['$defs']['Used'])
+        self.assertEqual(compact_json_schema(compact), compact)
+        anchored = {'$ref': '#leaf', '$defs': {'Leaf': {'$anchor': 'leaf', 'type': 'integer'}}}
+        self.assertEqual(compact_json_schema(anchored), anchored)
+        try:
+            from jsonschema import Draft202012Validator
+        except ImportError:
+            return  # Structural assertions above need no optional validator dependency.
+        Draft202012Validator.check_schema(compact)
+        for value in ({'title': 'Hi', 'payload': {'title': 1}},
+                {'title': 'Hi', 'payload': {'title': 1}, 'metadata': {'title': 'fixed'}},
+                {'title': 'H', 'payload': {'title': 1}}, {'payload': {'title': 1}},
+                {'title': 'Hi', 'payload': {'title': 0}}, {'title': 'Hi', 'payload': {'title': '1'}},
+                {'title': 'Hi', 'payload': {'title': 1}, 'extra': True}):
+            self.assertEqual(Draft202012Validator(schema).is_valid(value),
+                Draft202012Validator(compact).is_valid(value))
+
+    def test_conversation_v1_only_compacts_display_schemas_after_owner_filter(self):
+        from simple_ar.tools.openai_schema import compact_json_schema
+        _, _, app = self._fixture()
+        report = {'kind': 'report', 'evidence_contract': 'materials.v1'}
+        app.writing.professional_inputs = True
+        original_registry = {spec.name: json.dumps(spec.input_schema, sort_keys=True) for spec in app.gateway.list_specs()}
+        with patch.object(app, '_report_projection', return_value=report), \
+                patch.object(app, '_tool_selection', return_value={'compose_document'}):
+            app.state['config'].pop('context_protocol')
+            legacy = app.schemas
+            app.state['config']['context_protocol'] = 'conversation.v1'
+            new = app.schemas
+            self.assertEqual([row['function']['name'] for row in new], [row['function']['name'] for row in legacy])
+            for old, row in zip(legacy, new):
+                self.assertEqual(row['function']['parameters'], compact_json_schema(old['function']['parameters']))
+                self.assertEqual(row['function']['description'], old['function']['description'])
+            compose = next(row['function']['parameters'] for row in new if row['function']['name'] == 'compose_document')
+            self.assertFalse({'goal', 'materials', 'sources'} & compose['properties'].keys())
+            self.assertNotIn('SelectedSource', compose.get('$defs', {}))
+            self.assertIn('title', compose['properties'])
+            self.assertIn('title', compose['required'])
+            self.assertIn('goal', app.gateway.registry.get('compose_document').input_schema['properties'])
+            app.state['config'].pop('context_protocol')
+            self.assertEqual(app.schemas, legacy)
+        self.assertEqual({spec.name: json.dumps(spec.input_schema, sort_keys=True) for spec in app.gateway.list_specs()}, original_registry)
+        self.assertLess(estimate_tokens(json.dumps(new)), estimate_tokens(json.dumps(legacy)))
+
+    def test_conversation_v1_evicts_whole_blocks_and_preserves_index_and_feedback(self):
+        inputs, fake, app = self._fixture()
+        payload = 'SOURCE_PAYLOAD_UNCHANGED\n' * 6000
+        app.state['turns'].append(self._record_native_turn(app, 'write_file',
+            {'path': 'workspace/big.py', 'content': payload}, {'path': 'workspace/big.py'}, 'giant'))
+        self._read(app, inputs / 'notes.txt', 'recent')
+        feedback = 'Keep original costs separate from projections. Preserve every prior version.'
+        app.state['requests'].append(feedback)
+        messages = app._messages(client=fake)
+        context = json.loads(messages[1]['content'])
+        self.assertEqual(context['retained_turn_start'], 1)
+        self.assertEqual(context['history_archive']['native_history_start_turn'], 0)
+        self.assertEqual(context['history_archive']['capacity_evicted_turns'], 1)
+        self.assertFalse(any(row.get('tool_call_id') == 'giant' for row in messages))
+        self.assertFalse(any(row.get('tool_calls', [{}])[0].get('id') == 'giant' for row in messages))
+        self.assertEqual(messages[-1], {'role': 'user', 'content': feedback})
+        self.assertEqual(context['requests'], app.state['requests'])
+        self.assertEqual(context['earlier_turns']['rows'][0][3][0][1], 'write_file')
+        self.assertEqual(context['earlier_turns']['rows'][0][3][0][2]['path'], 'workspace/big.py')
+        self.assertEqual((context['earlier_turns']['start_turn'], context['earlier_turns']['end_turn']), (0, 1))
+        self.assertEqual(context['earlier_turns']['total_archived_turns'], 1)
+        self.assertEqual(context['earlier_turns']['omitted_turns'], 0)
+        self.assertEqual(context['material_supply']['omitted'][0]['start_turn'], 0)
+        self.assertEqual([row['turn'] for row in context['material_supply']['native_context']], [1])
+        replies = {call['id'] for row in messages for call in row.get('tool_calls', [])}
+        results = {row['tool_call_id'] for row in messages if row['role'] == 'tool'}
+        self.assertEqual(replies, results)
+        fake._settings.context_input_tokens = 1
+        with self.assertRaisesRegex(ValueError, 'no model request sent'):
+            app._messages(client=fake)
+
+        # Serializing false/true can cross a one-token boundary. Estimation
+        # must converge rather than toggle forever before history eviction.
+        _, fresh_client, fresh = self._fixture()
+        target = fresh_client._settings.context_input_tokens
+        estimates = []
+        def boundary_estimate(text):
+            payload = json.loads(text)
+            if not payload or not isinstance(payload, list) or 'role' not in payload[0]:
+                return 0  # Tool schema cost.
+            resources = json.loads(payload[1]['content'])['resources']
+            estimates.append(resources['context_exceeds_input_target'])
+            self.assertLessEqual(len(estimates), 8, 'Estimation oscillated at the serialized boundary')
+            return target if resources['context_exceeds_input_target'] else target + 1
+        with patch('simple_ar.app.tool_application.estimate_tokens', side_effect=boundary_estimate):
+            bounded = fresh._messages(client=fresh_client)
+        self.assertTrue(json.loads(bounded[1]['content'])['resources']['context_exceeds_input_target'])
+        self.assertLessEqual(len(estimates), 3)
+
+    def test_conversation_v1_long_archive_index_and_diagnostics_are_bounded(self):
+        _, fake, app = self._fixture()
+        diagnostic = 'Original diagnostic line.\n' * 2000
+        records = []
+        for number in range(41):
+            turn = self._record_native_turn(app, 'read_file', {'path': f'source0/file-{number}.json'},
+                {}, f'error-{number}')
+            record = turn['tools'][0]['result']
+            app.session.store.write_json(record, {'tool_name': 'read_file', 'status': 'error',
+                'error': diagnostic if number < 40 else 'Fresh error remains complete.\n' * 40, 'data': {}})
+            records.append(record)
+            app.state['turns'].append(turn)
+        before = {path: app.session.store.resolve(path).read_bytes() for path in records}
+        messages = app._messages(client=fake, native_history_start_turn=40)
+        context = json.loads(messages[1]['content'])
+        index = context['earlier_turns']
+        self.assertEqual((index['start_turn'], index['end_turn'], index['total_archived_turns']), (24, 40, 40))
+        self.assertEqual(index['omitted_turns'], 24)
+        self.assertEqual(len(index['rows']), 16)
+        for number, row in enumerate(index['rows'], 24):
+            operation = row[3][0]
+            self.assertEqual(operation[3], 'records/' + records[number].removeprefix('attempts/'))
+            error = operation[5]
+            self.assertEqual(error['preview'], diagnostic[:512])
+            self.assertEqual(error['omitted_characters'], len(diagnostic) - 512)
+            self.assertEqual(error['record'], operation[3])
+            self.assertEqual(error['field'], 'error')
+        self.assertEqual(len(context['material_supply']['omitted']), 1)
+        self.assertEqual(context['material_supply']['omitted'][0]['end_turn'], 40)
+        fresh = next(json.loads(row['content']) for row in messages if row['role'] == 'tool')
+        self.assertEqual(fresh['error'], 'Fresh error remains complete.\n' * 40)
+        self.assertEqual({path: app.session.store.resolve(path).read_bytes() for path in records}, before)
+        self.assertLessEqual(context['resources']['approximate_next_input_tokens'], 24000)
+
+    def test_conversation_v1_focus_constraints_boundaries_and_model_consumer(self):
+        from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
+        inputs, fake, app = self._fixture()
+        raw = (inputs / 'notes.txt').read_bytes()
+        observed = SimpleNamespace(data={'text': raw.decode('utf-8'), 'path': 'source0/notes.txt',
+            'sha256': hashlib.sha256(raw).hexdigest(), 'offset_bytes': 0,
+            'next_offset_bytes': len(raw), 'has_more': False})
+        data = {'purpose': 'writing', 'goal': 'Inspect the original account', 'request_count': 1,
+            'inputs': [{'request': {'path': 'source0/notes.txt'}, 'data': observed.data}]}
+        app.state['turns'].append(self._record_native_turn(app, 'focus_work',
+            {'purpose': 'writing', 'goal': data['goal'], 'inputs': [{'path': 'source0/notes.txt'}]}, data, 'focus'))
+        requirement = {'method': 'article', 'outline': [], 'config': {'max_cited_sources': 3,
+            'longform': {'target_words': 650}, 'reviewer': 'llm', 'document_review': True,
+            'max_review_iterations': 0, 'unneeded_runtime_detail': 'DETAIL' * 20000}, 'template': {}}
+        report = {'kind': 'report', 'requirement': requirement, 'evidence_contract': 'materials.v1',
+            'formats': ['markdown', 'pdf'], 'intent': {'kind': 'report'}, 'conversion_source': None}
+        plan = {'steps': [{'step': 'Use actual records', 'status': 'in_progress'}],
+            'report_requirement': requirement, 'report_intent': report['intent'],
+            'explanation': 'Repeated detail ' * 2000, 'evidence_records': ['records/external-proof.json'],
+            'scope': 'intention_not_verified_outcome', 'request_count': 1, 'record': 'records/plan/native_result.json'}
+        with patch.object(app, '_report_projection', return_value=report), patch.object(app, '_work_plan', return_value=plan):
+            messages = app._messages(client=fake)
+            context = json.loads(messages[1]['content'])
+            self.assertEqual(context['report_requirement'], {'method': 'article', 'outline': [],
+                'max_cited_sources': 3, 'target_words': 650,
+                'review': {'reviewer': 'llm', 'document_review': True, 'max_review_iterations': 0}})
+            self.assertNotIn('report_requirement', context['work_plan'])
+            self.assertEqual(set(context['work_plan']), {'steps', 'scope', 'request_count', 'record'})
+            self.assertEqual(context['work_plan']['steps'], plan['steps'])
+            semantics = context['resources']['semantics']
+            self.assertEqual(set(semantics), {'llm_requests', 'total_tokens', 'image_requests'})
+            self.assertIn('zero does not prohibit authorized inspection', semantics['image_requests'])
+            self.assertEqual(context['work_inputs']['windows'][0]['status'], 'supplied_native')
+            self.assertTrue(context['material_supply']['native_context'])
+            hidden = json.loads(app._messages(client=fake, native_history_start_turn=1)[1]['content'])
+            self.assertEqual(hidden['material_supply']['native_context'], [])
+            self.assertEqual(hidden['history_archive']['native_history_start_turn'], 1)
+            self.assertEqual(hidden['history_archive']['capacity_evicted_turns'], 0)
+            self.assertEqual(hidden['work_inputs']['windows'][0]['status'], 'history_not_supplied')
+            app.state['requests'].append('The real current feedback, not the focus goal.')
+            revised = json.loads(app._messages(client=fake)[1]['content'])
+            self.assertEqual(revised['work_inputs']['windows'][0]['status'], 'previous_not_selected')
+            self.assertEqual(revised['work_focus']['goal'], '')
+        store = ArtifactStore(app.session.store.root / 'attempts/offline-model')
+        fake.chat_turn.return_value = {'role': 'assistant', 'content': 'Offline fixture response'}
+        with patch.object(app, '_client', return_value=fake), \
+                patch.object(app, '_completion_floor', return_value={'llm_requests': 1, 'total_tokens': 100}):
+            app._model(context=CapabilityContext(store, AttemptManifest('offline-model')))
+        receipt = store.read_json('decision_budget.json')
+        self.assertEqual(receipt['context_protocol'], 'conversation.v1')
+        self.assertTrue(receipt['input_projection']['supplied'])
+
+    @unittest.skipUnless(os.environ.get('SIMPLE_AR_CONVERSATION_REPLAY_ROOT'), 'Saved failed trajectory is not mounted locally')
+    def test_conversation_v1_saved_failed_trajectory_offline_preview(self):
+        """Set ROOT to the original task; optional CUT is its pre-write reply attempt id."""
+        root = Path(os.environ['SIMPLE_AR_CONVERSATION_REPLAY_ROOT']).resolve()
+        before = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in root.rglob('*') if path.is_file()}
+        with patch('simple_ar.integrations.llm.LLMClient.chat_turn', side_effect=AssertionError('No paid call')), \
+                patch('simple_ar.integrations.llm.LLMClient.ask_json', side_effect=AssertionError('No paid call')):
+            app = ToolApplication.load(root)
+            cut = os.environ.get('SIMPLE_AR_CONVERSATION_REPLAY_CUT', 'native-turn-0019')
+            stop = next(index for index, turn in enumerate(app.state['turns'])
+                if Path(turn['reply']).parent.name == cut)
+            app.state['turns'] = app.state['turns'][:stop]
+            client = app._client()
+            # Final exhausted accounting must not pretend no input can fit at the old cut.
+            from simple_ar.core.budget import BudgetEntry
+            projected = BudgetLedger(app.ledger.limits)
+            retained = {Path(turn['reply']).parent.name for turn in app.state['turns']}
+            retained.update(Path(item['result']).parent.name for turn in app.state['turns'] for item in turn['tools'])
+            for entry in app.ledger.entries:
+                if entry.attempt_id in retained:
+                    projected._entries[entry.reservation_id] = BudgetEntry.from_dict(entry.to_dict())
+            app.ledger = projected
+            app.state['config'].pop('context_protocol', None)
+            old_schemas = app.schemas
+            old = app._messages(client=client)
+            app.state['config']['context_protocol'] = 'conversation.v1'
+            new = app._messages(client=client)
+            schemas = app.schemas
+            estimates = {name: estimate_tokens(json.dumps(messages, ensure_ascii=False))
+                + estimate_tokens(json.dumps(tools, ensure_ascii=False))
+                for name, messages, tools in [('old', old, old_schemas), ('conversation.v1', new, schemas)]}
+            inline = [json.loads(row['content']) for row in new if row['role'] == 'tool']
+            reads = [row['data']['text'] for row in inline
+                if row.get('tool_name') == 'read_file' and (row.get('data') or {}).get('text')]
+            self.assertEqual(len(app.state['turns']), stop)
+            frame = json.loads(new[1]['content'])
+            print(json.dumps({'cut': cut, 'closed_turns': stop, 'estimated_tokens': estimates,
+                'native_read_count': len(reads), 'native_read_bytes': sum(len(text.encode('utf-8')) for text in reads),
+                'retained_turn_start': frame['retained_turn_start'], 'history_archive': frame['history_archive'],
+                'schema_tokens': estimate_tokens(json.dumps(schemas, ensure_ascii=False)),
+                'frame_section_tokens': {key: estimate_tokens(json.dumps(value, ensure_ascii=False))
+                    for key, value in frame.items()}}, sort_keys=True))
+            self.assertTrue(reads, 'The retained trajectory must actually supply read text')
+        self.assertEqual({path: hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in root.rglob('*') if path.is_file()}, before)
 
 
 if __name__ == "__main__":

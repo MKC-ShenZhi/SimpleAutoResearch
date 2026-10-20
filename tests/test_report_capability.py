@@ -1633,56 +1633,195 @@ class StructuredArticleWritingTests(unittest.TestCase):
                     self.assertEqual(_edit_article(**arguments, request=replace(request, llm_client=None)), edited)
                     self.assertEqual(calls, ['article-independent-review', 'composition-article', 'article-independent-review'])
 
-    def test_supplied_prior_noop_is_independently_inspected_and_atomically_adopted(self):
-        prior = '# Existing candidate\n\nPreserve spacing.  \n\nConditions unchanged.\n'
-        calls = []
-        outer = self
-        class Client:
-            def ask_json(self, system, prompt, *, label='', **options):
-                calls.append(label)
-                view = json.JSONDecoder().raw_decode(prompt[prompt.index('{'):])[0]
-                if label == 'composition-article':
-                    outer.assertEqual(view['prior_draft'], prior)
-                    return {'prior_draft_sha256': view['edit_contract']['prior_draft_sha256'], 'replacements': []}
-                outer.assertEqual(view['sections'][0]['markdown'], prior)
-                pending = len(calls) == 2
-                return {'section_reviews': [{'section_id': 'document',
-                    'verdict': 'revise_required' if pending else 'pass',
-                    'findings': [{'finding_id': 'clarity', 'type': 'style', 'severity': 'major',
-                        'required_action': 'revise', 'message': 'Check whether clarification is necessary.',
-                        'draft_quotes': [{'section_id': 'document', 'quote': 'Conditions unchanged.'}]}] if pending else []}]}
+    def test_supplied_candidate_inspection_patch_adoption_and_zero_call_recovery(self):
+        import hashlib
+
+        prior = '# Existing candidate\r\n\r\nPreserve spacing.  \r\n\r\nConditions unchanged.\r\n\r\nRecorded evidence [@P1].\r\n'
+        revised = prior.replace('Conditions unchanged.', 'Conditions clarified.')
+        notes = [{'paper_id': 'source-a', 'bibliographic_fields': [
+            {'field': 'authors', 'value': ['Original Author'], 'quote': 'Original Author',
+                'section_id': 'source-front', 'complete': True}]}]
+        for mode, rounds, projected_source in (('accepted', 0, False), ('rejected', 0, False),
+                ('corrected', 1, False), ('patch_rejected', 1, False), ('noop', 1, False),
+                ('accepted', 0, True), ('corrected', 1, True)):
+            with self.subTest(mode=mode, projection=projected_source), tempfile.TemporaryDirectory() as tmp:
+                candidate = Path(tmp) / ('candidate.json' if projected_source else 'candidate.md')
+                candidate.write_bytes(json.dumps({'draft/body~': prior, 'provenance': 'original', 'source_notes': notes}).encode('utf-8')
+                    if projected_source else prior.encode('utf-8'))
+                candidate_source = {'path': str(candidate), 'sha256': hashlib.sha256(candidate.read_bytes()).hexdigest()}
+                if projected_source:
+                    candidate_source.update(pointer='/draft~1body~0',
+                        body_sha256=hashlib.sha256(prior.encode('utf-8')).hexdigest(), notes_pointer='/source_notes')
+                calls = []
+                outer = self
+                class Client:
+                    def ask_json(self, system, prompt, *, label='', **options):
+                        calls.append(label)
+                        view = json.JSONDecoder().raw_decode(prompt[prompt.index('{'):])[0]
+                        if label == 'composition-article':
+                            outer.assertTrue(rounds)
+                            outer.assertEqual(view['prior_draft'], prior)
+                            return {'prior_draft_sha256': view['edit_contract']['prior_draft_sha256'],
+                                'replacements': [] if mode == 'noop' else [
+                                    {'old_text': 'Conditions unchanged.', 'new_text': 'Conditions clarified.'}]}
+                        body = view['sections'][0]['markdown']
+                        outer.assertEqual(body, revised if len(calls) > 1 and mode != 'noop' else prior)
+                        pending = mode != 'accepted' and (len(calls) == 1 or mode in {'rejected', 'patch_rejected'})
+                        return {'section_reviews': [{'section_id': 'document',
+                            'verdict': 'revise_required' if pending else 'pass',
+                            'findings': [{'finding_id': 'clarity', 'type': 'style', 'severity': 'major',
+                                'required_action': 'revise', 'message': 'Clarify the interpretation.',
+                                'draft_quotes': [{'section_id': 'document', 'quote': body}]}] if pending else []}]}
+
+                request = self.request(Client())
+                request = replace(request, prior_draft=prior, candidate_source=candidate_source,
+                    report_context=request.report_context.model_copy(update={
+                        'papers': [{'id': 'source-a', 'title': 'Original source'}], 'citation_key_map': {'P1': 'source-a'}}),
+                    config=request.config.model_copy(update={'reviewer': 'llm', 'document_review': True,
+                        'review_scope': 'document', 'draft_scope': 'document', 'max_review_iterations': rounds}))
+                store = ArtifactStore(Path(tmp) / 'first')
+                result = run_report_writing_capability(context=CapabilityContext(store, AttemptManifest('adopt')), request=request)
+                written = store.read_json(next(ref for ref in result.artifacts if ref.kind == 'report_writer_result'))
+                accepted = mode not in {'rejected', 'patch_rejected'}
+                self.assertEqual(result.status, 'completed' if accepted else 'failed')
+                expected = revised if mode == 'corrected' else prior
+                self.assertEqual(written['sections'][0]['draft_markdown'].encode('utf-8'), expected.encode('utf-8'))
+                self.assertEqual(written['adopted_revision'] is not None if rounds else False, mode in {'corrected', 'noop'})
+                self.assertEqual(written['independent_review']['review_status'], 'reviewed' if accepted else 'needs_revision')
+                initial = store.read_json('writer.json')
+                self.assertEqual(initial['producer'], {'kind': 'supplied_candidate.v1', **candidate_source,
+                    **({'source_notes': notes} if projected_source else {})})
+                self.assertEqual(initial['source_notes'], notes if projected_source else [])
+                self.assertEqual(initial['memory']['outline_planning']['source_notes'], initial['source_notes'])
+                if not rounds:
+                    self.assertEqual(written['source_notes'], initial['source_notes'])
+                self.assertNotIn('response_sha256', initial)
+                self.assertFalse(store.exists('response.json'))
+                snapshot = store.read_json('report_inputs.json')
+                self.assertEqual(snapshot['inputs']['candidate_source'], candidate_source)
+                self.assertNotIn('system', snapshot)
+                expected_calls = ['article-independent-review'] + (['composition-article', 'article-independent-review'] if rounds else [])
+                self.assertEqual(calls, expected_calls)
+                if rounds:
+                    self.assertNotIn('candidate_source', store.read_json('review/revision-1/report_inputs.json')['inputs'])
+                    self.assertEqual(store.read_json('review/checkpoint.json')['seed']['producer_sha256'], initial['producer_sha256'])
+                original = {p: p.read_bytes() for p in store.root.rglob('*.json')}
+                ref = result.artifacts[0]
+                target = ArtifactStore(Path(tmp) / 'resume')
+                recovered = run_report_writing_capability(context=CapabilityContext(target, AttemptManifest('resume'),
+                    inputs=(ref,), input_store=store), request=replace(request, resume_ref=ref, llm_client=None))
+                self.assertEqual(recovered.status, result.status)
+                self.assertEqual(target.read_json(next(ref for ref in recovered.artifacts if ref.kind == 'report_writer_result')), written)
+                self.assertFalse(target.exists('response.json'))
+                self.assertEqual(calls, expected_calls)
+                if mode == 'accepted':
+                    # Reconstructed content and provenance must still match the
+                    # original file and retained producer before any review call.
+                    for path, changed in ((candidate, b'Changed body'), (candidate, None),
+                            (store.resolve('writer.json'), {**initial, 'producer_sha256': '0' * 64}),
+                            (store.resolve('report_inputs.json'), {**snapshot, 'producer': {'kind': 'model'}})):
+                        with self.subTest(changed=path), changed_record(path, changed), self.assertRaises(ValueError):
+                            run_report_writing_capability(context=CapabilityContext(store, AttemptManifest('adopt')), request=request)
+                    self.assertFalse(store.exists('response.json'))
+                    try:
+                        store.write_json('response.json', {'draft_markdown': prior})
+                        with self.assertRaisesRegex(ValueError, 'cannot have a model response receipt'):
+                            run_report_writing_capability(context=CapabilityContext(store, AttemptManifest('adopt')), request=request)
+                    finally:
+                        store.resolve('response.json').unlink()
+                    self.assertFalse(store.exists('response.json'))
+                    self.assertEqual(calls, expected_calls)
+                    if projected_source:
+                        # Whole-file provenance remains pinned even when the
+                        # selected author's body itself has not changed.
+                        with changed_record(candidate, {'draft/body~': prior, 'provenance': 'changed'}), self.assertRaises(ValueError):
+                            run_report_writing_capability(context=CapabilityContext(store, AttemptManifest('adopt')), request=request)
+                        with changed_record(candidate, {'draft/body~': prior, 'provenance': 'original', 'source_notes': []}), self.assertRaises(ValueError):
+                            run_report_writing_capability(context=CapabilityContext(store, AttemptManifest('adopt')), request=request)
+                        self.assertEqual(calls, expected_calls)
+                self.assertEqual({p: p.read_bytes() for p in original}, original)
+
+    def test_supplied_candidate_admission_and_completed_native_proof(self):
+        import hashlib
+        from simple_ar.report.writing import completed_composition_writer, run_composition_article
 
         with tempfile.TemporaryDirectory() as tmp:
-            store = ArtifactStore(Path(tmp) / 'first')
-            request = self.request(Client())
-            request = replace(request, prior_draft=prior, config=request.config.model_copy(update={
-                'reviewer': 'llm', 'document_review': True, 'review_scope': 'document',
-                'draft_scope': 'document', 'max_review_iterations': 1}))
-            result = run_report_writing_capability(context=CapabilityContext(store, AttemptManifest('noop')), request=request)
-            written = store.read_json(next(ref for ref in result.artifacts if ref.kind == 'report_writer_result'))
+            candidate = Path(tmp) / 'candidate.md'
+            candidate.write_bytes(b'Supplied body.')
+            source = {'path': str(candidate), 'sha256': hashlib.sha256(candidate.read_bytes()).hexdigest()}
+            parent_writer = Path(tmp) / 'parent-writer.json'
+            parent_writer.write_bytes(json.dumps({'sections': [{'draft_markdown': 'Supplied body.'}],
+                'count': 1, 'source_notes': []}).encode('utf-8'))
+            projection = {'path': str(parent_writer), 'sha256': hashlib.sha256(parent_writer.read_bytes()).hexdigest(),
+                'pointer': '/sections/0/draft_markdown', 'body_sha256': source['sha256']}
+            base = self.request()
+            base = replace(base, prior_draft='Supplied body.', candidate_source=source,
+                config=base.config.model_copy(update={'reviewer': 'llm', 'document_review': True, 'review_scope': 'document'}))
+            for index, request in enumerate((replace(base, method='sections'),
+                    replace(base, config=base.config.model_copy(update={'reviewer': 'disabled'})),
+                    replace(base, candidate_source={**source, 'sha256': '0' * 64}),
+                    replace(base, prior_draft='Different supplied body.'),
+                    replace(base, candidate_source={**source, 'path': str(candidate) + '-missing'}),
+                    *(replace(base, candidate_source={**projection, 'pointer': pointer}) for pointer in (
+                        '/missing', '/sections', '/count', '/sections/00/draft_markdown', '/bad~9')),
+                    replace(base, candidate_source={**projection, 'body_sha256': '0' * 64}),
+                    *(replace(base, candidate_source={**projection, 'notes_pointer': pointer}) for pointer in (
+                        '/missing', '/count', '/sections/0', '/bad~9')),
+                    replace(base, candidate_source={**source, 'notes_pointer': '/source_notes'}),
+                    replace(base, candidate_source={**source, 'pointer': '/sections/0/draft_markdown'}))):
+                with self.subTest(case=index):
+                    store = ArtifactStore(Path(tmp) / str(index))
+                    with self.assertRaises(ValueError):
+                        run_report_writing_capability(context=CapabilityContext(store, AttemptManifest('invalid')), request=request)
+                    self.assertFalse(store.exists('report_inputs.json'))
+                    self.assertFalse(base.llm_client.calls)
+            binding = {'writing_owner': ARTICLE_OWNER, 'request': {'professional_review': {'max_revision_rounds': 0}}}
+            inputs = {'binding': binding, 'assembly_config': base.config.model_dump(mode='json'),
+                'candidate_source': {**projection, 'notes_pointer': '/source_notes'},
+                'article': {'title': 'Supplied candidate', 'goal': 'Inspect supplied prose.',
+                    'target_words': 0, 'source_handles': [], 'bibliography': [], 'citation_key_map': {},
+                    'prior_draft': base.prior_draft}}
+            client = ArticleClient({'section_reviews': [{'section_id': 'document', 'verdict': 'pass'}]})
+            parent = ArtifactStore(Path(tmp) / 'native')
+            store = ArtifactStore(parent.root / 'writer')
+            result = run_composition_article(store=store, inputs=inputs, identity='native', client=client)
             self.assertEqual(result.status, 'completed')
-            self.assertEqual(written['sections'][0]['draft_markdown'].encode('utf-8'), prior.encode('utf-8'))
-            self.assertIsNotNone(written['adopted_revision'])
-            self.assertEqual(written['independent_review']['review_status'], 'reviewed')
-            self.assertEqual(calls, ['composition-article', 'article-independent-review'] * 2)
-            ref = result.artifacts[0]
-            target = ArtifactStore(Path(tmp) / 'resume')
-            recovered = run_report_writing_capability(context=CapabilityContext(target, AttemptManifest('resume'),
-                inputs=(ref,), input_store=store), request=replace(request, resume_ref=ref, llm_client=None))
-            self.assertEqual(recovered.status, 'completed')
-            self.assertEqual(target.read_json(next(ref for ref in recovered.artifacts if ref.kind == 'report_writer_result')), written)
-            self.assertEqual(len(calls), 4)
+            writer = next(ref for ref in result.artifacts if ref.kind == 'report_writer_result')
+            parent.write_json('professional_result.json', {'writer_path': writer.path,
+                'writer_sha256': hashlib.sha256(store.resolve(writer).read_bytes()).hexdigest()})
+            protected = {p: p.read_bytes() for p in parent.root.rglob('*.json')}
+            completed_composition_writer(store=parent, binding=binding, identity='native')
+            self.assertEqual([row[2]['label'] for row in client.calls], ['article-independent-review'])
+            for path in (store.resolve(writer), store.resolve('review/response.json')):
+                with self.subTest(missing=path), changed_record(path, None), self.assertRaises(ValueError):
+                    completed_composition_writer(store=parent, binding=binding, identity='native')
+            self.assertEqual({p: p.read_bytes() for p in protected}, protected)
+            # A source changed while being inspected cannot become an accepted
+            # Writer. Its complete inspection survives for explicit recovery.
+            race = ArticleClient({'section_reviews': [{'section_id': 'document', 'verdict': 'pass'}]})
+            def change_source(system, prompt, **options):
+                candidate.write_bytes(b'Changed during inspection.')
+                return race.response
+            race.ask_json = Mock(side_effect=change_source)
+            race_store = ArtifactStore(Path(tmp) / 'race')
+            with self.assertRaisesRegex(ValueError, 'source changed'):
+                run_report_writing_capability(context=CapabilityContext(race_store, AttemptManifest('race')),
+                    request=replace(base, llm_client=race))
+            self.assertFalse(race_store.exists('reviewed_writer.json'))
+            self.assertEqual(race.ask_json.call_count, 1)
 
     def test_article_candidate_and_verification_checkpoints_resume_without_repeating_calls(self):
+        import hashlib
+
         for stage in ('drafted', 'completed'):
             with self.subTest(stage=stage), tempfile.TemporaryDirectory() as tmp:
+                candidate = Path(tmp) / 'candidate.md'
+                candidate.write_bytes(b'Initial.')
                 calls = []
                 class Client:
                     def ask_json(self, system, prompt, *, label='', **options):
                         calls.append(label)
                         if label == 'composition-article':
-                            if len(calls) == 1:
-                                return {'draft_markdown': 'Initial.'}
                             view = json.loads(prompt)
                             return {'prior_draft_sha256': view['edit_contract']['prior_draft_sha256'],
                                 'replacements': [{'old_text': 'Initial.', 'new_text': 'Revised.'}]}
@@ -1692,8 +1831,10 @@ class StructuredArticleWritingTests(unittest.TestCase):
                             'findings': [{'finding_id': 'style', 'type': 'style', 'severity': 'major', 'required_action': 'revise',
                                 'message': 'Improve the prose.', 'draft_quotes': [{'section_id': 'document', 'quote': 'Initial.'}]}] if pending else []}]}
                 request = self.request(Client())
-                request = replace(request, config=request.config.model_copy(update={'reviewer': 'llm',
-                    'document_review': True, 'review_scope': 'document', 'draft_scope': 'document', 'max_review_iterations': 1}))
+                request = replace(request, prior_draft='Initial.', candidate_source={'path': str(candidate),
+                    'sha256': hashlib.sha256(candidate.read_bytes()).hexdigest()},
+                    config=request.config.model_copy(update={'reviewer': 'llm', 'document_review': True,
+                        'review_scope': 'document', 'draft_scope': 'document', 'max_review_iterations': 1}))
                 store = ArtifactStore(Path(tmp) / 'first')
                 original_write = ArtifactStore.write_json
                 def interrupt(owner, path, value, **options):
@@ -1710,6 +1851,7 @@ class StructuredArticleWritingTests(unittest.TestCase):
                     AttemptManifest('resume'), inputs=(ref,), input_store=store), request=replace(request, resume_ref=ref))
                 self.assertEqual(recovered.status, 'completed')
                 self.assertEqual(calls[count:], ['article-independent-review'] if stage == 'drafted' else [])
+                self.assertFalse(store.exists('response.json'))
 
     def test_interrupted_article_uses_retained_response_but_missing_response_never_replays(self):
         for response_state in ('missing', 'saved', 'raw'):

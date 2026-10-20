@@ -96,6 +96,44 @@ def _apply_article_replacements(response: Any, contract: dict[str, Any], prior: 
     return markdown
 
 
+def _supplied_candidate_producer(candidate: Any, markdown: str) -> dict[str, Any]:
+    """Validate a bound file or JSON string projection without copying its body."""
+    if (not isinstance(candidate, dict) or set(candidate) not in (
+                {'path', 'sha256'}, {'path', 'sha256', 'pointer', 'body_sha256'},
+                {'path', 'sha256', 'pointer', 'body_sha256', 'notes_pointer'})
+            or not isinstance(candidate['path'], str) or not Path(candidate['path']).is_absolute()
+            or not markdown.strip()):
+        raise ValueError('Supplied candidate requires an absolute path and exact file/body SHA-256 binding')
+    try:
+        raw = Path(candidate['path']).read_bytes()
+    except OSError as exc:
+        raise ValueError('Supplied candidate source is unavailable; no regeneration') from exc
+    if candidate['sha256'] != hashlib.sha256(raw).hexdigest():
+        raise ValueError('Supplied candidate source changed from its bound file SHA-256; no regeneration')
+    body, metadata = raw, {}
+    if 'pointer' in candidate:
+        from simple_ar.integrations.llm import LLMResponseError
+        from simple_ar.report.review_evidence import _resolve_pointer
+        try:
+            document = json.loads(raw.decode('utf-8'))
+            _, projected = _resolve_pointer(document, candidate['pointer'])
+            if 'notes_pointer' in candidate:
+                _, notes = _resolve_pointer(document, candidate['notes_pointer'], allow_list=True)
+                if not isinstance(notes, list):
+                    raise ValueError('Supplied candidate notes pointer must select an existing list')
+                metadata['source_notes'] = notes
+        except (UnicodeError, ValueError, LLMResponseError) as exc:
+            raise ValueError('Supplied candidate JSON string projection is invalid; no regeneration') from exc
+        if not isinstance(projected, str):
+            raise ValueError('Supplied candidate JSON pointer must select an existing string')
+        body = projected.encode('utf-8')
+        if candidate['body_sha256'] != hashlib.sha256(body).hexdigest():
+            raise ValueError('Supplied candidate projected body SHA-256 changed; no regeneration')
+    if body != markdown.encode('utf-8'):
+        raise ValueError('Supplied candidate source differs from its bound body; no regeneration')
+    return {'kind': 'supplied_candidate.v1', **candidate, **metadata}
+
+
 def article_writing_inputs(*, report_context: ReportContext, documents: DocumentBundle | None,
     binding: dict[str, Any], config: ReportRuntimeConfig, title: str, goal: str, target_words: int,
     prior_draft: str = '', projection_ref: ArtifactRef | None = None,
@@ -317,7 +355,8 @@ def completed_composition_writer(*, store: ArtifactStore, binding: dict[str, Any
             config=ReportRuntimeConfig.model_validate(frozen['config']),
             template=ReportTemplateBundle.model_validate(frozen['template']),
             llm_client=None if article else retained_writing_client(store=writer, identity=identity, client=None),
-            method='article' if article else 'sections', prior_draft=frozen.get('prior_draft', ''))
+            method='article' if article else 'sections', prior_draft=frozen.get('prior_draft', ''),
+            candidate_source=snapshot.get('inputs', {}).get('candidate_source') if article else None)
         result = run_report_writing_capability(context=CapabilityContext(writer if article else _SectionRecoveryStore(writer), AttemptManifest(identity),
             inputs=tuple(ArtifactRef.from_dict(row) for row in frozen['sources']), input_store=store), request=request)
         produced = next(row for row in result.artifacts if row.kind == 'report_writer_result')
@@ -389,7 +428,28 @@ def write_whole_article(*, store: Any, inputs: dict[str, Any], identity: str,
     prior = inputs['article'].get('prior_draft', '')
     edit_contract = {**ARTICLE_EDIT_CONTRACT, **({'prior_draft_sha256':
         hashlib.sha256(prior.encode('utf-8')).hexdigest()} if prior else {})}
-    if recovering:
+    supplied = inputs.get('candidate_source') is not None
+    if supplied:
+        producer = _supplied_candidate_producer(inputs['candidate_source'], prior)
+        if source.exists('response.json') or store.exists('response.json'):
+            raise ValueError('Supplied candidate cannot have a model response receipt')
+        if recovering:
+            if not source.exists('report_inputs.json'):
+                raise ValueError('Supplied candidate snapshot unavailable; no regeneration')
+            saved = source.read_json('report_inputs.json')
+            if resume_store is not None and isinstance(saved, dict):
+                identity = saved.get('source_attempt')
+        snapshot = {'owner': ARTICLE_OWNER, 'source_attempt': identity, 'inputs': inputs,
+            'producer': producer, 'edit_contract': edit_contract}
+        snapshot['snapshot_id'] = digest(snapshot)
+        if recovering and saved != snapshot:
+            raise ValueError('Supplied candidate snapshot or provenance changed; no regeneration')
+        # The atomic input snapshot is the complete supplied-body receipt.
+        # No model response, fictional usage or separate producer ledger exists.
+        if not recovering:
+            _retain_records(store, (), {'report_inputs.json': snapshot})
+        markdown, source_notes = prior, producer.get('source_notes', [])
+    elif recovering:
         if not source.exists('report_inputs.json'):
             raise ValueError('Article input snapshot changed or is unavailable; no blind replay')
         snapshot = source.read_json('report_inputs.json')
@@ -436,15 +496,17 @@ def write_whole_article(*, store: Any, inputs: dict[str, Any], identity: str,
             system, json.dumps({**inputs['article'], **({'edit_contract': edit_contract} if editing else {})}, ensure_ascii=False),
             label='composition-article', budget_call_id=f'{identity}:article', **output_limit))
     # Persist the original response before any contract or assembly validation.
-    if editing:
-        markdown = _apply_article_replacements(response, edit_contract, prior)
-    elif (not isinstance(response, dict) or 'draft_markdown' not in response
-            or set(response) - {'draft_markdown', 'source_notes'}
-            or not isinstance(response.get('source_notes', []), list)
-            or not isinstance(response['draft_markdown'], str) or not response['draft_markdown'].strip()):
-        raise ValueError('Article response requires one nonempty draft_markdown; no automatic correction')
-    else:
-        markdown = response['draft_markdown']
+    if not supplied:
+        if editing:
+            markdown = _apply_article_replacements(response, edit_contract, prior)
+        elif (not isinstance(response, dict) or 'draft_markdown' not in response
+                or set(response) - {'draft_markdown', 'source_notes'}
+                or not isinstance(response.get('source_notes', []), list)
+                or not isinstance(response['draft_markdown'], str) or not response['draft_markdown'].strip()):
+            raise ValueError('Article response requires one nonempty draft_markdown; no automatic correction')
+        else:
+            markdown = response['draft_markdown']
+        source_notes = response.get('source_notes', [])
     from simple_ar.report.schema import ReportSectionDraft
     section = ReportSectionDraft(section_id='document', heading=inputs['article']['title'],
         draft_markdown=markdown)
@@ -457,8 +519,10 @@ def write_whole_article(*, store: Any, inputs: dict[str, Any], identity: str,
         # but it cannot publish it as a constraints-checked manuscript.
         checked = {'status': 'needs_revision', 'diagnostic': str(exc)}
     written = {'schema_version': ARTICLE_OWNER, 'snapshot_id': snapshot['snapshot_id'],
-        'source_attempt': identity, 'response_sha256': digest(response),
-        'sections': [section.model_dump(mode='json')], 'source_notes': response.get('source_notes', [])}
+        'source_attempt': identity,
+        **({'producer': snapshot['producer'], 'producer_sha256': digest(snapshot['producer'])} if supplied
+           else {'response_sha256': digest(response)}),
+        'sections': [section.model_dump(mode='json')], 'source_notes': source_notes}
     if checked is not None:
         written['constraints_checked'] = checked
     if 'writer_projection' in inputs:
@@ -475,7 +539,9 @@ def write_whole_article(*, store: Any, inputs: dict[str, Any], identity: str,
     # Validate all retained/cross-attempt records before copying any. The
     # original identity, system and response move together, never a new request.
     if resume_store is not None:
-        records.update({'report_inputs.json': snapshot, 'response.json': source.read_json('response.json')})
+        records['report_inputs.json'] = snapshot
+        if not supplied:
+            records['response.json'] = source.read_json('response.json')
     _retain_records(store, (source,) if resume_store is not None else (), records)
     return written
 
@@ -652,10 +718,11 @@ class ReportWritingRequest:
     method: Literal['article', 'sections'] = 'sections'
     prior_draft: str = ''
     composition_inputs: dict[str, Any] | None = None
+    candidate_source: dict[str, Any] | None = None
 
 
 def run_composition_article(*, store: ArtifactStore, inputs: dict[str, Any], identity: str,
-                            client: Any = None) -> CapabilityResult:
+                            client: Any = None, candidate_source: dict[str, Any] | None = None) -> CapabilityResult:
     """Adapt native composition to the shared article owner, preserving saved inputs."""
     from simple_ar.report.templates import load_report_template_bundle
     config = ReportRuntimeConfig.model_validate(inputs['assembly_config'])
@@ -667,7 +734,8 @@ def run_composition_article(*, store: ArtifactStore, inputs: dict[str, Any], ide
     memory = initialize_report_memory(context=context, template=template)
     return run_report_writing_capability(context=CapabilityContext(store, AttemptManifest(identity)),
         request=ReportWritingRequest(context, memory, config, template, client, method='article',
-            prior_draft=article.get('prior_draft', ''), composition_inputs=inputs))
+            prior_draft=article.get('prior_draft', ''), composition_inputs=inputs,
+            candidate_source=candidate_source if candidate_source is not None else inputs.get('candidate_source')))
 
 
 def _writing_identity(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -740,6 +808,9 @@ def resolve_report_writing_resume(*, report_context: ReportContext, memory: Repo
 def run_report_writing_capability(*, context: CapabilityContext, request: ReportWritingRequest) -> CapabilityResult:
     if request.method not in {'article', 'sections'}:
         raise ValueError('Report writing method must be article or sections.')
+    if request.candidate_source is not None and (
+            request.method != 'article' or not article_inspection_enabled(request.config)):
+        raise ValueError('Supplied candidate adoption requires article method and enabled independent document inspection')
     if request.resume_ref is not None:
         previous = context.read_input_json(request.resume_ref)
         if previous.get('owner') == ARTICLE_OWNER or previous.get('schema_version') == ARTICLE_OWNER:
@@ -998,7 +1069,9 @@ def _edit_article(*, store: ArtifactStore, retained: ArtifactStore, written: dic
     from simple_ar.report.schema import ReportIterationRecord, ReportSectionDraft, ReportSectionReview, ReviewerFinding
     config = request.config
     source = store if store.exists('review/checkpoint.json') else retained
-    seed = {'snapshot_id': written['snapshot_id'], 'response_sha256': written['response_sha256']}
+    seed = {'snapshot_id': written['snapshot_id'],
+        **({'producer_sha256': written['producer_sha256']} if 'producer' in written
+           else {'response_sha256': written['response_sha256']})}
     state = source.read_json('review/checkpoint.json') if source.exists('review/checkpoint.json') else None
     if state is not None and state.get('seed') != seed:
         raise ValueError('Article edit checkpoint belongs to different original inputs or response.')
@@ -1031,6 +1104,7 @@ def _edit_article(*, store: ArtifactStore, retained: ArtifactStore, written: dic
 
     def produce(event: ReportIterationRecord, baseline: list[ReportSectionDraft], *, recover_only: bool = False) -> dict[str, Any]:
         revised_inputs = deepcopy(inputs)
+        revised_inputs.pop('candidate_source', None)
         revised_inputs.pop('pending_constraints', None)
         revised_inputs['article'].update(prior_draft=baseline[0].draft_markdown,
             revision_findings={'status': 'Editing concerns, not source facts; preserve the original evidence.',
@@ -1132,6 +1206,15 @@ def _run_article_writing(*, context: CapabilityContext, request: ReportWritingRe
         target_words=config.longform.target_words, prior_draft=request.prior_draft,
         projection_ref=projection_ref, enforce_output_constraints=constraints_enabled,
         enforce_citation_contract=citation_contract_enabled)
+    if request.candidate_source is not None:
+        if inputs['article'].get('prior_draft') != request.prior_draft:
+            raise ValueError('Supplied candidate body differs from the bound article prior_draft')
+        if 'candidate_source' in inputs and inputs['candidate_source'] != request.candidate_source:
+            raise ValueError('Supplied candidate source differs from its frozen inputs')
+        inputs = {**inputs, 'candidate_source': dict(request.candidate_source)}
+    if inputs.get('candidate_source') is not None and (
+            request.method != 'article' or not article_inspection_enabled(config)):
+        raise ValueError('Supplied candidate adoption requires article method and enabled independent document inspection')
     if article_inspection_enabled(config) and config.max_review_iterations > 0:
         inputs['pending_constraints'] = True
     written = write_whole_article(store=context.store, inputs=inputs, identity=context.attempt.attempt_id,
@@ -1153,7 +1236,7 @@ def _run_article_writing(*, context: CapabilityContext, request: ReportWritingRe
             *(finding for row in report['section_reviews'] for finding in row['findings'])]}
         # Historical structured zero-round inspections publish a qualified
         # candidate. Native composition reports unresolved status explicitly.
-        if request.composition_inputs is not None:
+        if request.composition_inputs is not None or inputs.get('candidate_source') is not None:
             status = 'failed' if report['review_status'] == 'needs_revision' else 'completed'
         if config.max_review_iterations > 0:
             edited = _edit_article(store=context.store, retained=retained, written=written,
@@ -1167,6 +1250,8 @@ def _run_article_writing(*, context: CapabilityContext, request: ReportWritingRe
                 reviewed['constraints_checked'] = _check_article_constraints(inputs['article'], edited['sections'][0]['draft_markdown'])
         writer_path = ('reviewed_writer-' + hashlib.sha256(json.dumps(reviewed, sort_keys=True).encode()).hexdigest()[:16] + '.json'
                        if config.max_review_iterations else 'reviewed_writer.json')
+        if inputs.get('candidate_source') is not None:
+            _supplied_candidate_producer(inputs['candidate_source'], inputs['article']['prior_draft'])
         if context.store.exists(writer_path) and context.store.read_json(writer_path) != reviewed:
             raise ValueError('Reviewed Writer projection changed; no replacement or replay')
         if not context.store.exists(writer_path):

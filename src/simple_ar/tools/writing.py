@@ -170,6 +170,8 @@ class ComposeRequest(BaseModel):
     figures: list[str | ComposeFigure] = Field(default_factory=list, max_length=12,
         description="Authorized existing PNG/JPEG/SVG/PDF files: legacy path strings, or {path, caption} for an explicit publication caption. Writer places the caption only in the standalone image alt; export owns figure numbering. Contents are not visually or scientifically verified by composition.")
     prior_draft: str = Field(default="", description="Optional mounted Markdown draft for any revision, including review corrections or user feedback. Binds its actual bytes as a prior version, not primary evidence or a new review certificate.")
+    adopt_draft: bool = Field(default=False, exclude_if=lambda value: value is False,
+        description='Explicitly inspect and adopt the existing prior_draft without first regenerating it. Requires article writing with independent professional review enabled; unresolved findings block accepted publication. Evidence and supplied figure bytes are still bound. This never certifies an external draft or authorizes input reuse by itself.')
     reuse_prior_inputs: bool = Field(default=False, exclude_if=lambda value: value is False,
         description="Opt in to the resolved original sources and file windows of an intact producer-completed same-task article, section article or material professional report prior_draft. Existing Writer recovery must prove complete responses; professional section protocols without those receipts and execution-only projections fail explicitly. Completion does not certify native-journal adoption or delivery. Requires prior_draft and no sources/materials/material_roots; use fresh selection for scope changes. Supply current figures explicitly. Revalidates evidence permissions and bytes before Writer or independent review; prior prose is never primary evidence.")
     writing_method: Literal['article', 'sections'] | None = Field(default=None,
@@ -187,6 +189,8 @@ class ComposeRequest(BaseModel):
     @model_validator(mode='after')
     def material_input(self) -> 'ComposeRequest':
         from simple_ar.report.assembler import _heading_title, _strip_heading_number
+        if self.adopt_draft and not self.prior_draft:
+            raise ValueError('adopt_draft requires an existing prior_draft')
         if self.reuse_prior_inputs and (not self.prior_draft or self.sources or self.materials or self.material_roots):
             raise ValueError('reuse_prior_inputs requires prior_draft and no explicit sources, materials or material_roots; use fresh selection for scope changes')
         headings = [_strip_heading_number(_heading_title(heading)).casefold() for heading in self.required_headings]
@@ -771,6 +775,14 @@ class WritingToolGateway:
             if request.professional_review is not None and (inspecting or report_binding is not None
                     or request.writing_method == 'sections'):
                 raise ValueError('professional_review requires unbound article composition; frozen report controls remain authoritative')
+            if request.adopt_draft:
+                from simple_ar.report.writing import article_inspection_enabled
+                controls = (report_binding or {}).get('requirement')
+                if (inspecting or request.writing_method == 'sections'
+                        or controls and (controls['method'] != 'article'
+                            or not article_inspection_enabled(ReportRuntimeConfig.model_validate(controls['config'])))
+                        or controls is None and request.professional_review is None):
+                    raise ValueError('adopt_draft requires article composition with independent professional review enabled; frozen controls are not replaced')
             if (report_binding is not None and request.writing_method is not None
                     and request.writing_method != report_binding['requirement']['method']):
                 raise ValueError('Composition cannot replace the frozen report writing method')
@@ -979,6 +991,16 @@ class WritingToolGateway:
                 if prior_projection != projection:
                     raise ValueError('Prior resolved source/window projection changed')
             figure_inputs, figure_captions, figure_paths = [], [], set()
+            adopted_images = {}
+            if request.adopt_draft:
+                from simple_ar.report.export import report_image_targets, _asset_path
+                for reference in report_image_targets(previous):
+                    # Import only actual bound local assets, never filename guesses.
+                    resolved = self.workspace.resolve(str(_asset_path(
+                        self.workspace.resolve(request.prior_draft).parent, reference)))
+                    if resolved in adopted_images:
+                        raise ValueError('Adopted image has multiple path spellings; normalize the supplied draft explicitly')
+                    adopted_images[resolved] = reference
             for number, supplied in enumerate(request.figures, 1):
                 locator = supplied if isinstance(supplied, str) else supplied.path
                 path, raw = read_figure(locator)
@@ -988,6 +1010,8 @@ class WritingToolGateway:
                     raise ValueError(f'Figure input {locator!r}: select each resolved figure once, with one caption owner')
                 figure_paths.add(path)
                 target = f'figures/selected-{number}{path.suffix.lower()}'
+                if path in adopted_images:
+                    target = adopted_images[path]
                 figure_binding = {'path': locator, 'sha256': hashlib.sha256(raw).hexdigest(), 'manuscript_path': target}
                 if isinstance(supplied, ComposeFigure):
                     figure_binding['caption'] = supplied.caption
@@ -1055,6 +1079,27 @@ class WritingToolGateway:
                 if not source['questions']:
                     source.pop('questions')  # Preserve existing explicit-selection receipt identity.
             binding = {'request': canonical_request, 'inputs': bindings}
+            if request.adopt_draft:
+                candidate_source = {**prior_binding,
+                    'path': str(self.workspace.resolve(request.prior_draft))}
+                if request.reuse_prior_inputs:
+                    # Reuse has already proved the actual canonical producer.
+                    # Its authorial body retains registered citations; never
+                    # guess identities from rendered numeric bibliography labels.
+                    parent = ArtifactStore(self.root / 'tools/writing' / reuse_linkage['owner'])
+                    writer_path = (parent.read_json('professional_result.json')['writer_path']
+                        if parent.exists('professional_result.json') else 'writer.json')
+                    producer_path = parent.resolve('writer/' + writer_path)
+                    producer = json.loads(producer_path.read_bytes())
+                    if len(producer.get('sections', [])) != 1:
+                        raise ValueError('adopt_draft input reuse requires a single completed article body; section reorganization needs explicit editing')
+                    previous = producer['sections'][0]['draft_markdown']
+                    candidate_source = {'path': str(producer_path),
+                        'sha256': hashlib.sha256(producer_path.read_bytes()).hexdigest(),
+                        'pointer': '/sections/0/draft_markdown',
+                        **({'notes_pointer': '/source_notes'} if 'source_notes' in producer else {}),
+                        'body_sha256': hashlib.sha256(previous.encode('utf-8')).hexdigest()}
+                binding['candidate_source'] = candidate_source
             if professional_inputs:
                 binding['input_contract'] = 'owner.v1'
             if reuse_linkage is not None:
@@ -1279,7 +1324,8 @@ class WritingToolGateway:
                         AttemptManifest(identity), inputs=(ref, *((resume,) if resume else ())),
                         input_store=owner), request=ReportWritingRequest(report_context=context, memory=memory,
                             config=config, template=template, llm_client=client, method=requirement['method'],
-                            prior_draft=previous, resume_ref=resume))
+                            prior_draft=previous, resume_ref=resume,
+                            candidate_source=binding.get('candidate_source')))
                     writer_ref = next((row for row in reversed(result.artifacts) if row.kind == 'report_writer_result'), None)
                     if writer_ref is None:
                         raise ValueError('Professional writing incomplete; retain its checkpoint: ' + '; '.join(result.diagnostics))
@@ -1319,6 +1365,8 @@ class WritingToolGateway:
                     target_words=request.target_words, prior_draft=previous,
                     required_headings=request.required_headings,
                     enforce_citation_contract=citation_contract_enabled)
+                if request.adopt_draft:
+                    inputs['candidate_source'] = binding['candidate_source']
                 if 'work_context' in binding:
                     inputs['article']['work_context'] = binding['work_context']
                 if not recovering:
