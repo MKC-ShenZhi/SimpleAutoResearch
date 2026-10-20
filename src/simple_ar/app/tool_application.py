@@ -2334,6 +2334,11 @@ class ToolApplication:
                         result = self.gateway.call(ToolCall(tool_name=call['function']['name'],
                             arguments=arguments, trace_id=context.attempt.attempt_id), context=context, approval=approval)
             else:
+                approval = (self.state.get('pending') or {}).get('execution_approval')
+                if (call['function']['name'] == 'run_process' and approval
+                        and not self.workspace.has_started(context.attempt.attempt_id)
+                        and approval['token'] != self.approval_token(call)):
+                    raise ValueError('Approved process inputs changed before execution')
                 with self.ledger.protect_remaining(floor):
                     result = self.gateway.call(ToolCall(tool_name=call["function"]["name"],
                         arguments=arguments, trace_id=context.attempt.attempt_id))
@@ -3543,11 +3548,12 @@ class ToolApplication:
                     if name in {'prepare_code_task', 'implement_code_task'}:
                         progress('Frozen CodeTask contract: ' + json.dumps(self.implementation.exact.model_dump(), ensure_ascii=False))
                     return
-                if (owner := self.gateway.session_owner(name)) is not None and token is not None and not started:
-                    binding = self._owner_execution_binding(call)
-                    if token != hashlib.sha256(json.dumps({'call': call, 'inputs': binding}, sort_keys=True).encode()).hexdigest():
+                if token is not None and not started:
+                    if token != self.approval_token(call):
                         raise ValueError('Execution inputs changed during approval; approve the current identity')
-                    pending['execution_approval'] = {'token': token, 'binding': binding}
+                    pending['execution_approval'] = {'token': token}
+                    if self.gateway.session_owner(name) is not None:
+                        pending['execution_approval']['binding'] = self._owner_execution_binding(call)
                     self._save()
             progress(f"Tool {name} — {pending['attempt']}")
             relative = self._attempt("native_tool", pending)

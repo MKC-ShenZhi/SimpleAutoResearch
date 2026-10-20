@@ -978,8 +978,23 @@ class StructuredArticleWritingTests(unittest.TestCase):
                             unmarked = json.loads((parent / 'request.json').read_text())
                             self.assertEqual(unmarked.pop('section_response_contract'), 'atomic_complete.v1')
                             with changed_record(parent / 'request.json', unmarked):
+                                publication = gateway.publication_source(produced.data['editable_markdown'],
+                                    produced.data['report_binding'])
+                                self.assertEqual(publication['composition'], produced.data['version'])
+                                self.assertEqual(publication['manuscript'], produced.data['editable_markdown'])
                                 rejected = gateway.call('compose_document', feedback, identity=producer + '-reject')
                                 self.assertIn('no verifiable complete response receipts', rejected.error)
+                                completed = json.loads((parent / 'professional_result.json').read_text())
+                                with changed_record(parent / 'professional_result.json',
+                                        {**completed, 'writer_sha256': '0' * 64}):
+                                    with self.assertRaisesRegex(ValueError, 'Report Writer evidence changed'):
+                                        gateway.publication_source(produced.data['editable_markdown'],
+                                            produced.data['report_binding'])
+                            self.assertEqual(json.loads((parent / 'request.json').read_text())[
+                                'section_response_contract'], 'atomic_complete.v1')
+                            self.assertEqual(gateway.publication_source(produced.data['editable_markdown'],
+                                produced.data['report_binding']), publication)
+                            self.assertEqual(new_client.ask_json.call_count, 1)
                         factory.assert_not_called()
                     self.assertEqual({p: p.read_bytes() for p in parent.rglob('*') if p.is_file()}, original)
                     self.assertEqual(published.read_bytes(), published_bytes)

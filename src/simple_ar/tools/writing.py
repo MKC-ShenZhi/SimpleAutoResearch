@@ -367,6 +367,13 @@ class WritingToolGateway:
         self.workspace.check_artifact_producers(row['path'] for row in data['inputs'])
 
     @staticmethod
+    def _check_professional_writer(store: ArtifactStore) -> None:
+        """Retain historical publication proof without upgrading input reuse."""
+        completed = store.read_json('professional_result.json')
+        if hashlib.sha256(store.resolve('writer/' + completed['writer_path']).read_bytes()).hexdigest() != completed['writer_sha256']:
+            raise ValueError('Report Writer evidence changed; no completed delivery')
+
+    @staticmethod
     def _same_report_content(saved: dict, current: dict, intent: dict | None) -> bool:
         if saved == current:
             return True
@@ -411,7 +418,12 @@ class WritingToolGateway:
             raise ValueError('Canonical report receipt, source binding or authoring artifacts changed')
         self.check_delivery(data)
         from simple_ar.report.writing import completed_composition_writer
-        completed_composition_writer(store=store, binding=request, identity=identity)
+        if (request.get('writing_owner') == 'professional_report.v1'
+                and 'section_response_contract' not in request
+                and request['report_binding']['requirement']['method'] == 'sections'):
+            self._check_professional_writer(store)
+        else:
+            completed_composition_writer(store=store, binding=request, identity=identity)
         result = {'composition': data['version'], 'manuscript': data['editable_markdown'],
             'receipt_sha256': hashlib.sha256(store.resolve('result.json').read_bytes()).hexdigest(),
             'artifact_sha256': data['artifact_sha256']}
@@ -441,9 +453,7 @@ class WritingToolGateway:
                     or self.workspace.artifact_hashes(row['artifacts']) != data.get('artifact_sha256')):
                 continue
             self.check_delivery(data)  # Historical receipts keep their original proof strength.
-            completed = store.read_json('professional_result.json')
-            if hashlib.sha256(store.resolve('writer/' + completed['writer_path']).read_bytes()).hexdigest() != completed['writer_sha256']:
-                raise ValueError('Report Writer evidence changed; no completed delivery')
+            self._check_professional_writer(store)
             return {'manuscript': data['editable_markdown']}
         raise ValueError('Report delivery needs a current canonical composition receipt, intact manuscript and original evidence; deliver an explicit candidate when incomplete')
 

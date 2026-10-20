@@ -2888,6 +2888,19 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(rebuilt.status, 'ok', rebuilt.error)
         app.workspace.check_artifact_producers(['workspace/result.txt'])
         self.assertEqual((app.workspace.workspace / 'result.txt').read_text(), 'third')
+        # Approval of an old byte identity must not authorize callback-time edits.
+        _, _, _, _, guarded, _ = self._native_fixture(mount_inputs=False)
+        guarded_script = guarded.workspace.workspace / 'build.py'
+        guarded_script.write_text("from pathlib import Path\nPath('result.txt').write_text('before')\n")
+        def changed_during_approval(call, token):
+            guarded_script.write_text("from pathlib import Path\nPath('result.txt').write_text('after')\n")
+            return True
+        outcome = guarded.run(actions=[{'tool_name': 'run_process', 'arguments': arguments}],
+            approve=changed_during_approval, progress=lambda _: None)
+        self.assertEqual(outcome['status'], 'paused')
+        self.assertIn('changed during approval', guarded.session.manifest.status_reason)
+        self.assertFalse((guarded.workspace.workspace / 'result.txt').exists())
+        self.assertFalse(list((guarded.session.store.root / 'tools/processes').glob('*/invocation.json')))
 
     def test_versioned_report_writer_receives_original_material_and_feedback_creates_new_version(self):
         from simple_ar.tools.workspace import ReportDelivery
