@@ -3220,7 +3220,13 @@ class ToolApplication:
             if last_operation is None:
                 last_operation = {'tool_name': observed.get('tool_name'), 'status': observed.get('status'),
                     'failure_kind': (observed.get('data') or {}).get('failure_kind')}
-            for locator in observed.get('artifacts', []):
+            # Terminal work tools keep their adopted output inventory in the
+            # common delivery binding, not necessarily top-level artifacts.
+            # Reuse that owner receipt; never scan/guess workspace outputs or
+            # promote this presence-only view into a current acceptance check.
+            delivered = ((observed.get('metadata') or {}).get('delivery_hashes') or {}
+                if observed.get('status') == 'ok' else {})
+            for locator in dict.fromkeys([*observed.get('artifacts', []), *delivered]):
                 try:
                     path = self.workspace.resolve(locator)
                     if path.is_file() and path.is_relative_to(self.workspace.workspace):

@@ -4636,6 +4636,12 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 bound = receipt.with_name('terminal_delivery.json')
                 self.assertEqual(bound.exists(), mode in {'success', 'late-change'})
                 self.assertEqual(app.session.store.exists('delivery.json'), mode == 'success')
+                before_snapshot = self._native_snapshot(app)
+                snapshot = app.result_snapshot()
+                self.assertEqual(snapshot['retained_work']['artifacts'],
+                    ['workspace/result.txt'] if mode == 'success' else [])
+                self.assertEqual(snapshot['retained_work']['acceptance'], 'not_inferred')
+                self._assert_native_snapshot(app, before_snapshot)
                 ledger = app.ledger.to_dict()
                 with patch('simple_ar.tools.workspace.run_process', side_effect=AssertionError('No replay')):
                     if mode == 'success':
