@@ -2355,10 +2355,16 @@ class ToolApplication:
                 resources.update(approximate_next_input_tokens=cost, context_exceeds_input_target=exceeds)
 
         messages, cost = project()
-        while cost > target and start < len(blocks):
+        # The working target is not permission to discard the only fresh
+        # observation and pay to read it again. Keep the latest atomic native
+        # turn; the actual shared token allowance remains a hard preflight.
+        latest = max((number for number in range(boundary, len(blocks)) if blocks[number]), default=None)
+        while cost > target and start < (latest if latest is not None else len(blocks)):
             start += 1
             messages, cost = project()
-        if cost > target:
+        if remaining is not None and cost + output > remaining:
+            raise ValueError('Latest complete observation and contracts exceed the remaining token allowance; no model request sent')
+        if cost > target and latest is None:
             raise ValueError('Current requests, contracts and history index exceed remaining input capacity; no model request sent')
         if getattr(client._settings, 'thinking_mode', '') == 'enabled' and any(
                 message['role'] == 'assistant' and not any(isinstance(message.get(key), str)

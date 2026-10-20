@@ -13844,7 +13844,15 @@ class ConversationContextTests(unittest.TestCase):
         results = {row['tool_call_id'] for row in messages if row['role'] == 'tool'}
         self.assertEqual(replies, results)
         fake._settings.context_input_tokens = 1
+        over_target = app._messages(client=fake)
+        self.assertTrue(json.loads(over_target[1]['content'])['resources']['context_exceeds_input_target'])
+        self.assertTrue(any(row['role'] == 'tool' for row in over_target))
+        _, empty_client, empty = self._fixture()
+        empty_client._settings.context_input_tokens = 1
         with self.assertRaisesRegex(ValueError, 'no model request sent'):
+            empty._messages(client=empty_client)
+        app.ledger.limits['total_tokens'] = 1
+        with self.assertRaisesRegex(ValueError, 'remaining token allowance'):
             app._messages(client=fake)
 
         # Serializing false/true can cross a one-token boundary. Estimation
