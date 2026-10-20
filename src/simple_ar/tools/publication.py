@@ -5,7 +5,7 @@ import hashlib
 import os
 from pathlib import Path
 import re
-from typing import Any, Literal
+from typing import Any, Literal, Callable
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -143,8 +143,58 @@ class PublicationToolGateway:
     def has_started(self, identity: str) -> bool:
         return (self.root / 'tools' / 'publications' / identity / 'request.json').is_file()
 
-    def __init__(self, root: Path, workspace: Any, ledger: Any) -> None:
+    def __init__(self, root: Path, workspace: Any, ledger: Any, *,
+                 report_source: Callable[[str], dict | None] | None = None) -> None:
         self.root, self.workspace, self.ledger = root, workspace, ledger
+        self.report_source = report_source
+
+    def check_report_delivery(self, observations: list[dict], identity: dict | None, artifacts: list[str], *,
+                              formats: list[str], manuscript: str | None, proposed: dict | None = None) -> None:
+        """Prove requested publication roles belong to this authoring version."""
+        source = manuscript or (identity or {}).get('manuscript')
+        if not source:
+            raise ValueError('Canonical conversion delivery must identify its actual input manuscript')
+        if identity is not None and set(formats) <= {'markdown'}:
+            return
+        if proposed is not None:
+            if self.workspace.resolve(proposed['markdown']) != self.workspace.resolve(source):
+                raise ValueError('Proposed publication uses a different authoring version')
+            if 'pdf' in formats and not proposed.get('compile_pdf', True):
+                raise ValueError('The declared PDF obligation requires compilation')
+            return  # The same rule rechecks actual owner results before terminal commit.
+        delivered = {self.workspace.resolve(path) for path in artifacts}
+        for row in observations:
+            data = row.get('data') or {}
+            if row.get('tool_name') != 'export_report' or row.get('status') != 'ok' or not data.get('project'):
+                continue
+            project = self.workspace.resolve(data['project'])
+            owner = ArtifactStore(self.root / 'tools/publications' / project.name)
+            saved, result = owner.read_json('request.json'), owner.read_json('result.json')
+            if (self.workspace.resolve(saved['markdown']) != self.workspace.resolve(source)
+                    or saved.get('report_identity') != identity or data.get('report_identity') != identity
+                    or result.get('report_identity') != identity):
+                continue
+            hashes = result.get('artifact_sha256')
+            if (not hashes or data.get('artifact_sha256') != hashes
+                    or self.workspace.artifact_hashes(hashes) != hashes
+                    or ArtifactStore(project).read_json('export.json') != data['manifest']):
+                raise ValueError('Publication project or owner evidence changed')
+            request = ExportRequest.model_validate({key: value for key, value in saved.items()
+                if key not in {'inputs', 'image_binding_version', 'output_binding_version', 'report_identity'}})
+            current = export_input_binding(self.workspace.resolve(saved['markdown']), request,
+                output_root=self.workspace.workspace / 'publications')
+            if current['inputs'] != saved.get('inputs'):
+                raise ValueError('Publication authoring inputs changed')
+            required = {project / 'main.pdf'} if 'pdf' in formats else set()
+            if 'pdf' in formats and data['manifest'].get('compiled') is not True:
+                continue
+            if 'tex' in formats:
+                required.update(self.workspace.resolve(path) for path in hashes)
+            if not required:
+                required.add(project / 'source.md')
+            if required.issubset(delivered) and all(path.is_file() for path in required):
+                return
+        raise ValueError('Requested report formats need a byte-bound publication of the same manuscript, figures and bibliography')
 
     def call(self, name: str, arguments: dict[str, Any], *, identity: str) -> ToolResult:
         try:
@@ -162,6 +212,9 @@ class PublicationToolGateway:
             saved = owner.read_json('request.json') if owner.exists('request.json') else None
             binding = export_input_binding(source, request, output_root=self.workspace.workspace / 'publications',
                 include_images=saved is None or 'image_binding_version' in saved)
+            report_identity = self.report_source(request.markdown) if self.report_source else None
+            if report_identity is not None:
+                binding['report_identity'] = report_identity
             if saved is not None:
                 output_binding_version = saved.get('output_binding_version')
                 if output_binding_version not in {None, 1}:
@@ -236,6 +289,11 @@ class PublicationToolGateway:
                     # A failed preview can still retain accurate compilation
                     # evidence. Return that terminal manifest without delivery.
                     manifest = ArtifactStore(output).read_json('export.json')
+            if report_identity is not None and self.report_source(request.markdown) != report_identity:
+                raise ValueError('Canonical authoring identity changed during publication')
+            if self.report_source is not None and export_input_binding(source, request,
+                    output_root=self.workspace.workspace / 'publications')['inputs'] != binding['inputs']:
+                raise ValueError('Publication authoring inputs changed during rendering')
             artifacts = [f"{prefix}/{file}" for file in ("main.tex", "body.tex", "references.bib", "source.md", "export.json", "main.pdf")
                          if (output / file).is_file()]
             completed = manifest['status'] in {'exported', 'compiled'}
@@ -271,7 +329,8 @@ class PublicationToolGateway:
                             for row in receipt.get('results', {}).values() if 'evidence_sha256' in row})
                         if any(digest is not None and hashes.get(path) != digest for path, digest in observed.items()):
                             raise ValueError('Publication PDF/check evidence changed after observation; retain files and process receipts, no delivery or replay')
-                    owner.write_json('result.json', {'artifact_sha256': hashes})
+                    owner.write_json('result.json', {'artifact_sha256': hashes,
+                        **({'report_identity': report_identity} if report_identity is not None else {})})
             preview_images = [f"{prefix}/{path}" for path in manifest.get('pdf_preview', {}).get('pages', [])]
             delivery = None
             if completed and request.delivery is not None:
@@ -283,6 +342,7 @@ class PublicationToolGateway:
                 error='' if completed else str((manifest.get('error') if request.checks is not None else None)
                     or manifest.get('compile_note') or manifest.get('error') or 'Publication did not complete; inspect the retained manifest'),
                 data={"manifest": manifest, "project": prefix, "artifacts": artifacts,
+                    **({'report_identity': report_identity} if report_identity is not None else {}),
                     **({'artifact_sha256': hashes, 'output_integrity': 'byte_bound'} if hashes is not None else {}),
                     **({'delivery': delivery} if delivery is not None else {}),
                     **({'preview_images': preview_images,

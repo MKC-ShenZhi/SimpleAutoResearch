@@ -47,6 +47,7 @@ _TOOL_CONTRACT_MODES = {'full', 'on_demand', 'outcomes'}
 _DEFERRED_WORKSPACE_TOOLS = {'write_file', 'edit_file', 'run_process'}
 _FINAL_WORK_TOOLS = {'write_file', 'export_report', 'run_process', 'execute_implementation', 'review_document', 'measure_experiment', 'analyze_measurements'}
 _COMPLETION_POLICIES = {'protected_decision.v1', 'closing_decision.v2'}
+_REPORT_PROTOCOL = 'canonical_report.v1'
 _CLOSING_DECISION = (
     'This is the last affordable decision under the saved resource contract. '
     'Return one executable action batch ending with exactly one explicit delivery or question. '
@@ -148,12 +149,25 @@ class _WorkPlanStep(BaseModel):
         return self
 
 
+class _ReportIntent(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    request_index: int = Field(ge=0, description='Zero-based index in actual user requests.')
+    quote: str = Field(min_length=1, max_length=8000, description='Exact user-request excerpt supporting this interpretation, not a coordinator summary.')
+    kind: Literal['report', 'conversion', 'none']
+    formats: list[Literal['markdown', 'tex', 'pdf']] = Field(default_factory=list, max_length=3)
+    method: Literal['article', 'sections'] | None = None
+    source: str | None = Field(default=None, description='For conversion only: adopt this existing manuscript, unchanged. Its owner and current bytes are frozen in this receipt.')
+    replace: bool = Field(default=False, description='Explicitly change an inherited obligation only on newer user semantics supported by this quote; ordinary omission/clearing does not cancel it.')
+
+
 class _WorkPlan(BaseModel):
     """An advisory intention, not an executable schedule or verified task state."""
     model_config = ConfigDict(extra='forbid', strict=True)
     explanation: str = Field(default='', max_length=1200)
-    steps: list[_WorkPlanStep] = Field(min_length=1, max_length=8)
+    steps: list[_WorkPlanStep] = Field(default_factory=list, max_length=8)
     evidence_records: list[str] = Field(default_factory=list, max_length=12)
+    report_intent: _ReportIntent | None = Field(default=None, exclude_if=lambda value: value is None,
+        description='Declare report or no-report intent from the actual request before substantive work, in the same action batch. Empty steps suffice; this does not run a planner or grant authority.')
 
     @model_validator(mode='after')
     def bounded_records(self) -> '_WorkPlan':
@@ -260,6 +274,8 @@ class ToolApplication:
         if (type(config.get('tool_contracts', 'full')) is not str
                 or config.get('tool_contracts', 'full') not in _TOOL_CONTRACT_MODES):
             raise ValueError('Unknown saved tool-contract mode; do not silently change historical tasks')
+        if config.get('report_protocol') not in {None, _REPORT_PROTOCOL}:
+            raise ValueError('Unknown saved report protocol; preserve its original contract')
         evidence = controller.store.root / "evidence"
         evidence.mkdir(exist_ok=True)
         self.workspace = WorkspaceToolGateway(controller.store.root,
@@ -316,7 +332,7 @@ class ToolApplication:
             client_factory=lambda identity: self._client(identity, purpose='writing', native=False),
             work_context=self._work_context,
             material_observations=self._material_observations,
-            report_inputs=self._report_inputs if config.get('report_requirement') else None)
+            report_inputs=self._report_inputs if config.get('report_requirement') or config.get('report_protocol') else None)
         scientific = {}
         self.implementation = ImplementationToolGateway(controller.store.root, self.workspace, self.ledger,
             config['model'], controller.manifest.session_id,
@@ -357,6 +373,27 @@ class ToolApplication:
                 if getattr(self.services, 'search_registry', None) is not None else
                 SearchProviderRegistry()
                 if 'search_registry' in config.get('runtime_dependencies', {}) else None))
+        self.publication = PublicationToolGateway(controller.store.root, self.workspace, self.ledger,
+            report_source=(lambda path: self.writing.publication_source(path,
+                self._report_inputs() if self._report_projection()['requirement'] else None,
+                intent=self._report_projection()['intent'], adopted=self._report_projection()['conversion_source']))
+                if config.get('report_protocol') == _REPORT_PROTOCOL else None)
+        if config.get('report_protocol') != _REPORT_PROTOCOL:
+            # Disabled protocol fields must not consume historical context in
+            # every nested delivery schema (or change the old planning shape).
+            for spec in registry.list_specs():
+                schema = spec.input_schema
+                definitions = schema.get('$defs', {})
+                definitions.pop('ReportDelivery', None)
+                definitions.pop('_ReportIntent', None)
+                definitions.get('DeliveryRequest', {}).get('properties', {}).pop('report', None)
+                if spec.name == 'deliver_result':
+                    schema.get('properties', {}).pop('report', None)
+                if spec.name == 'update_work_plan':
+                    schema['properties'].pop('report_intent', None)
+                    schema['properties']['steps'].pop('default', None)
+                    schema['properties']['steps']['minItems'] = 1
+                    schema['required'] = ['steps']
         self.gateway = CommonToolGateway(controller.store.root, registry=registry,
             policy=ToolPermissionPolicy(allowed_permissions=permissions, max_risk_level="high",
                 blocked_tools=blocked),
@@ -368,7 +405,7 @@ class ToolApplication:
                     controller.manifest.session_id, client_factory=lambda identity: self._client(identity, purpose='vision')),
                 "images": ImageToolGateway(self.workspace, self.ledger,
                     fallback_models_config=config.get('model_catalogs', {}).get('image')),
-                "publication": PublicationToolGateway(controller.store.root, self.workspace, self.ledger),
+                "publication": self.publication,
                 "writing": self.writing,
                 "implementation": self.implementation, **scientific})
 
@@ -411,6 +448,8 @@ class ToolApplication:
                 continue
             deferred = (spec.name in _DEFERRED_WORKSPACE_TOOLS if mode == 'outcomes' else
                 mode == 'on_demand' and spec.domain != 'workspace' and spec.name not in _CORE_COORDINATION)
+            if spec.name == 'update_work_plan' and self.state['config'].get('report_protocol') == _REPORT_PROTOCOL:
+                deferred = False
             if not deferred or spec.name in selected:
                 active.add(spec.name)
             if deferred:
@@ -458,6 +497,89 @@ class ToolApplication:
                     return {**result['data'],
                         'record': 'records/' + item['result'].removeprefix('attempts/')}
         return None
+
+    def _report_projection(self) -> dict[str, Any]:
+        """Effective obligation from frozen configuration and accepted plan receipts."""
+        config = self.state['config']
+        declaration = None
+        if config.get('report_protocol') == _REPORT_PROTOCOL:
+            for turn in reversed(self.state['turns']):
+                for item in reversed(turn['tools']):
+                    row = self.session.store.read_json(item['result'])
+                    if row.get('tool_name') == 'update_work_plan' and row.get('status') == 'ok' and row.get('data', {}).get('report_intent'):
+                        declaration = row['data']
+                        break
+                if declaration is not None:
+                    break
+        intent = declaration['report_intent'] if declaration else None
+        requirement = config.get('report_requirement') or (declaration or {}).get('report_requirement')
+        kind = ('conversion' if intent and intent['kind'] == 'conversion' else
+            'report' if config.get('report_requirement') else intent['kind'] if intent else 'pending')
+        execution = (config.get('code_task') is not None or config.get('execution_contract') is not None
+            or (config.get('research_policy') or {}).get('require_design', False))
+        evidence_contract = config.get('report_evidence_contract')
+        # Only a new dynamic obligation needs a default. Frozen/legacy reports
+        # without this field historically require execution evidence.
+        if (evidence_contract is None and config.get('report_protocol') == _REPORT_PROTOCOL
+                and not config.get('report_requirement')):
+            evidence_contract = 'execution.v1' if execution else 'materials.v1'
+        return {'kind': kind, 'requirement': requirement,
+            'evidence_contract': evidence_contract,
+            'formats': list(dict.fromkeys(['markdown', *(intent or {}).get('formats', [])])) if requirement
+                else (intent or {}).get('formats', []),
+            'intent': intent, 'conversion_source': (declaration or {}).get('conversion_source')}
+
+    def _declare_report(self, intent: _ReportIntent) -> dict[str, Any]:
+        if self.state['config'].get('report_protocol') != _REPORT_PROTOCOL:
+            raise ValueError('Report intent requires the explicitly versioned report protocol')
+        requests = self.state['requests']
+        if (intent.request_index != len(requests) - 1 or not intent.quote.strip()
+                or intent.quote not in requests[intent.request_index]):
+            raise ValueError('Report intent must quote the current actual user request at its zero-based index')
+        previous = self._report_projection()
+        old = previous['intent']
+        data = intent.model_dump(mode='json')
+        frozen = self.state['config'].get('report_requirement')
+        if frozen and (intent.kind == 'none' or intent.method not in {None, frozen['method']}):
+            raise ValueError('Frozen report configuration takes precedence over a plan declaration')
+        if old and old['kind'] != 'none':
+            if intent.kind != old['kind'] and intent.request_index <= old['request_index']:
+                raise ValueError('Changing report purpose requires newer quoted user semantics')
+            if intent.replace:
+                if intent.request_index <= old['request_index']:
+                    raise ValueError('Replacing a report obligation requires newer quoted user semantics')
+            else:
+                if intent.kind != old['kind'] and intent.kind != 'conversion':
+                    raise ValueError('A plan cannot clear an inherited report obligation; quote newer user semantics and explicitly replace')
+                if intent.method and previous['requirement'] and intent.method != previous['requirement']['method']:
+                    raise ValueError('Changing the inherited writing method requires newer user semantics and replace')
+                data['formats'] = list(dict.fromkeys([*old['formats'], *data['formats']]))
+                data['method'] = intent.method or old.get('method')
+        requirement = self.state['config'].get('report_requirement')
+        if not requirement and data['kind'] == 'conversion':
+            requirement = previous['requirement']
+        if not requirement and data['kind'] == 'report':
+            from simple_ar.tools.writing import freeze_report_requirement
+            requirement = (previous['requirement'] if old and not intent.replace else None) or freeze_report_requirement(
+                {'reviewer': 'disabled', 'document_review': False, 'max_review_iterations': 0,
+                 'allow_source_backtracking': False, 'allow_llm_fallback': False, 'figures': {'enabled': False}},
+                method=data['method'] or 'article')
+        if requirement and data['method'] not in {None, requirement['method']}:
+            raise ValueError('A declaration cannot change the effective writing method without replacing its report requirement')
+        conversion = None
+        if intent.kind == 'conversion':
+            if not intent.source:
+                raise ValueError('Conversion must explicitly adopt an existing manuscript source')
+            conversion = self.writing.publication_source(intent.source,
+                self._report_inputs() if previous['requirement'] else None, intent=data)
+            if previous['requirement'] and not conversion.get('composition'):
+                raise ValueError('An inherited report conversion must adopt its completed canonical manuscript, not replacement prose')
+            if old and old['kind'] == 'conversion' and not intent.replace and conversion != previous['conversion_source']:
+                raise ValueError('Changing the adopted conversion source requires newer user semantics and replace')
+        elif intent.source is not None:
+            raise ValueError('Only conversion declarations adopt an existing manuscript source')
+        return {'report_intent': data, **({'report_requirement': requirement} if requirement else {}),
+            **({'conversion_source': conversion} if conversion else {})}
 
     def _material_observations(self, targets: list[str]) -> list[dict[str, Any]]:
         """Locate successful parent reads, without transferring bodies or authority.
@@ -627,7 +749,10 @@ class ToolApplication:
                     summary='Selected contracts available to the next decision; no professional work or permission change.')
             if name == 'update_work_plan':
                 plan = _WorkPlan.model_validate(arguments)
-                return ToolResult(tool_name=name, data={**plan.model_dump(),
+                if not plan.steps and plan.report_intent is None:
+                    raise ValueError('Provide work steps or an explicit report intent')
+                declaration = self._declare_report(plan.report_intent) if plan.report_intent is not None else {}
+                return ToolResult(tool_name=name, data={**plan.model_dump(), **declaration,
                     'request_count': len(self.state['requests']),
                     'scope': 'intention_not_verified_outcome'},
                     summary='Working intention recorded. Actual observations, approval and delivery remain authoritative.')
@@ -675,7 +800,7 @@ class ToolApplication:
                max_tokens: int = 600000, max_images: int = 0,
                project_python: Path | None = None, code_task: dict[str, Any] | None = None,
                process_limits: dict[str, int | float] | None = None,
-               report_requirement: dict[str, Any] | None = None,
+               report_requirement: dict[str, Any] | None = None, report_protocol: str | None = None,
                research_policy: dict[str, Any] | None = None,
                table_analysis: dict[str, Any] | None = None,
                max_output_tokens: int | None = None,
@@ -691,6 +816,8 @@ class ToolApplication:
                model_catalogs: dict[str, str | None] | None = None,
                retained: bool = False) -> tuple[dict[str, Any], list, dict[str, Any], int]:
         """Validate caller contracts before creation or supply; never execute or persist."""
+        if report_protocol not in {None, _REPORT_PROTOCOL}:
+            raise ValueError('Unsupported report protocol')
         if type(tool_contracts) is not str or tool_contracts not in _TOOL_CONTRACT_MODES:
             raise ValueError('Tool contracts must be full, on_demand or outcomes')
         if completion_policy not in _COMPLETION_POLICIES:
@@ -899,6 +1026,8 @@ class ToolApplication:
             config['report_evidence_contract'] = (
                 'execution.v1' if code_task is not None or execution_contract is not None
                     or allow_execution and (research_policy or {}).get('require_design') else 'materials.v1')
+        if report_protocol is not None:
+            config['report_protocol'] = report_protocol
         if delivery_files is not None:
             config['delivery_files'] = delivery_files
         if snapshots:
@@ -928,7 +1057,7 @@ class ToolApplication:
                max_tokens: int = 600000, max_images: int = 0,
                project_python: Path | None = None, code_task: dict[str, Any] | None = None,
                process_limits: dict[str, int | float] | None = None,
-               report_requirement: dict[str, Any] | None = None,
+               report_requirement: dict[str, Any] | None = None, report_protocol: str | None = None,
                research_policy: dict[str, Any] | None = None,
                table_analysis: dict[str, Any] | None = None,
                max_output_tokens: int | None = None,
@@ -943,7 +1072,7 @@ class ToolApplication:
         config, reused, limits, attempts = cls._configuration(root, goal, model=model, sources=sources,
             allow_execution=allow_execution, allow_network=allow_network, allow_vision=allow_vision,
             max_turns=max_turns, max_tokens=max_tokens, max_images=max_images, project_python=project_python,
-            code_task=code_task, process_limits=process_limits, report_requirement=report_requirement,
+            code_task=code_task, process_limits=process_limits, report_requirement=report_requirement, report_protocol=report_protocol,
             research_policy=research_policy, table_analysis=table_analysis, max_output_tokens=max_output_tokens,
             max_attempts=max_attempts, source_operations=source_operations, execution_contract=execution_contract,
             services=services, snapshot_sources=snapshot_sources, max_snapshot_bytes=max_snapshot_bytes,
@@ -1059,7 +1188,8 @@ class ToolApplication:
                 project_python=Path(candidate['project_python']) if candidate.get('project_python') else None,
                 code_task=candidate.get('code_task'), execution_contract=candidate.get('execution_contract'),
                 research_policy=candidate.get('research_policy'), table_analysis=candidate.get('table_analysis'),
-                report_requirement=candidate.get('report_requirement'), max_output_tokens=candidate.get('max_output_tokens'),
+                report_requirement=candidate.get('report_requirement'), report_protocol=old.get('report_protocol'),
+                max_output_tokens=candidate.get('max_output_tokens'),
                 max_attempts=self.session.manifest.budget.max_attempts, retained=True, services=self.services,
                 tool_contracts=candidate.get('tool_contracts', 'full'),
                 completion_policy=candidate.get('completion_policy', 'protected_decision.v1'),
@@ -1071,6 +1201,9 @@ class ToolApplication:
                     config[name] = None  # Explicit removal must not resurrect the old optional contract on merge.
             if 'report_requirement' in supplied and supplied['report_requirement'] is None:
                 config['report_evidence_contract'] = None
+            elif (old.get('report_requirement') is not None and 'report_evidence_contract' not in old
+                    and 'report_requirement' not in supplied):
+                config.pop('report_evidence_contract', None)  # Unrelated supply is not a historical contract migration.
             for name in ('model_connection', 'vision_connection', 'feasibility_connection'):
                 if old.get(name) is not None:
                     if not model_connections_compatible(old[name], config.get(name) or {}):
@@ -1083,7 +1216,7 @@ class ToolApplication:
             # Its previous config is journaled below; old decision receipts keep
             # their original closing obligation. Absent historical fields stay
             # absent unless explicitly supplied, including unrelated supplies.
-            for field in ('completion_policy', 'tool_contracts'):
+            for field in ('completion_policy', 'tool_contracts', 'report_protocol'):
                 if field not in supplied:
                     if field in old:
                         config[field] = old[field]
@@ -1554,8 +1687,13 @@ class ToolApplication:
                 'Select the exact condition_id and analyze all required actual conditions of the current revision; do not infer source from comparison role. '
                 'Flat contracts use the validated implementation. Preparation, validator and formal measurement are distinct.'
                 if config.get('code_task') is not None else 'Caller-frozen command or complete condition set. Select exact condition_id when present; do not alter or drop declared roles, seeds or protocol. Analyze the complete actual set before claiming completion. Subsequent execution still requires approval.')
-        if config.get('report_requirement'):
-            requirement = config['report_requirement']
+        report = self._report_projection()
+        if config.get('report_protocol') == _REPORT_PROTOCOL:
+            context['report_protocol'] = {'version': _REPORT_PROTOCOL,
+                'effective': {key: value for key, value in report.items() if key != 'requirement'},
+                'instruction': 'Interpret the actual user request as report, conversion of existing text, or none using update_work_plan.report_intent with a zero-based request_index and exact quote. Declare in the same normal action batch before substantive work; steps may be empty. Existing report obligations persist across feedback and omitted plans. Unknown intent does not forbid investigation. Declare before terminal delivery. Conversion preserves the supplied original; it does not require scientific rewriting. Direct writes/processes remain candidates or technical work. Formal report identity does not verify scientific claims.'}
+        if report['kind'] == 'report':
+            requirement = report['requirement']
             # Writer owns the full frozen template/configuration. The action
             # loop needs delivery constraints, not another copy of its prompts.
             context['report_requirement'] = {'method': requirement['method'], 'outline': requirement['outline'],
@@ -1563,7 +1701,7 @@ class ToolApplication:
                 'target_words': requirement['config']['longform']['target_words']}
             context['report_delivery'] = (('compose_document uses the frozen material/report requirements and actual supplied/source/table evidence. '
                 'Select relevant original passages and analysis artifacts, not just summaries. ' if
-                config.get('report_evidence_contract') == 'materials.v1' else
+                report['evidence_contract'] == 'materials.v1' else
                 'After required execution and analysis, compose_document consumes actual code/measurement ')
                 + 'evidence automatically and executes the frozen writing method, including adaptive planning/review/revision. '
                 'Include its canonical manuscript.md and requested execution artifacts in delivery. '
@@ -1961,7 +2099,16 @@ class ToolApplication:
         if payload.get('status') == 'ok' and delivery is not None:
             outputs = tuple(store.require(ArtifactRef.from_dict(row))
                 for row in payload.get('metadata', {}).get('capability_artifacts', []))
-            delivery = self.workspace.resolve_delivery(DeliveryRequest.model_validate(delivery), current_outputs=outputs)
+            request = DeliveryRequest.model_validate(delivery)
+            delivery = self.workspace.resolve_delivery(request, current_outputs=outputs)
+            if self.state['config'].get('report_protocol') == _REPORT_PROTOCOL:
+                try:
+                    self._validated_report_delivery(delivery['artifacts'], claim=request.report,
+                        partial=bool(request.unresolved),
+                        publication=payload if call['function']['name'] == 'export_report' else None)
+                except (ValueError, OSError, KeyError, RuntimeError) as exc:
+                    payload.update(status='blocked', error=str(exc))
+                    return payload
             if call['function']['name'] == 'deliver_result':
                 payload['data'] = delivery
             else:
@@ -2071,7 +2218,8 @@ class ToolApplication:
             payload = self.session.store.read_json(ref)
             paths.update((Path(ref).parent / row['path']).as_posix()
                          for row in payload.get('artifact_refs', {}).values())
-        current_report = self.state['config'].get('report_evidence_contract') == 'execution.v1'
+        report = self._report_projection()
+        current_report = report['requirement'] is not None and report['evidence_contract'] == 'execution.v1'
         contract = self.scientific.execution_contract if self.scientific is not None else None
         scientific = (self.scientific.report_evidence(measurements, refs,
             analysis_records=analyses if current_report else None)
@@ -2086,8 +2234,13 @@ class ToolApplication:
             'evidence_sha256': {**scientific.get('evidence_sha256', {}), **{path: hashlib.sha256(self.session.store.resolve(path).read_bytes()).hexdigest()
                                 for path in sorted(paths)}}}
 
-    def _report_inputs(self) -> dict[str, Any]:
-        if self.state['config'].get('report_evidence_contract') == 'materials.v1':
+    def _report_inputs(self) -> dict[str, Any] | None:
+        report = self._report_projection()
+        if self.state['config'].get('report_protocol') == _REPORT_PROTOCOL and report['kind'] == 'pending':
+            raise ValueError('Report intent is undetermined; declare report, conversion or none before Writer consumption in the same action batch')
+        if report['requirement'] is None:
+            return None
+        if report['evidence_contract'] == 'materials.v1':
             from simple_ar.tools.writing import material_report_binding
             observations = []
             active = {domain: {id(turn) for turn in self._evidence_turns(domain)}
@@ -2106,40 +2259,55 @@ class ToolApplication:
                 # portable package. Report feedback binds that actual snapshot,
                 # not a permanent dependency on the original external CSV.
                 mounts = [name for name in mounts if name != table['path']]
-            return material_report_binding(self.workspace, self.state['config']['report_requirement'],
+            binding = material_report_binding(self.workspace, report['requirement'],
                 mounts=mounts, observations=observations,
                 requests=self.state['requests'])
-        evidence = self._execution_evidence()
-        if not self.implementation.exact and not evidence.get('analysis_records'):
-            raise ValueError('A measurement report requires the matching deterministic analysis before composition')
-        return {**evidence, 'requirement': self.state['config']['report_requirement']}
+        else:
+            evidence = self._execution_evidence(require_current_origin=report['kind'] != 'conversion')
+            if not self.implementation.exact and not evidence.get('analysis_records'):
+                raise ValueError('A measurement report requires the matching deterministic analysis before composition')
+            binding = {**evidence, 'requirement': report['requirement']}
+        if self.state['config'].get('report_protocol') == _REPORT_PROTOCOL:
+            binding['report_protocol'] = _REPORT_PROTOCOL
+            binding['obligation'] = {'intent': report['intent'], 'formats': report['formats']}
+        return binding
 
-    def _validated_report_delivery(self, artifacts: list[str]) -> None:
-        binding = self._report_inputs()
-        delivered = {self.workspace.resolve(path) for path in artifacts}
-        for turn in reversed(self.state['turns']):
-            if turn.get('request_count', 1) != len(self.state['requests']):
-                continue
-            for item in reversed(turn['tools']):
-                observed = self.session.store.read_json(item['result'])
-                if observed.get('tool_name') != 'compose_document' or observed.get('status') != 'ok':
-                    continue
-                data = observed.get('data') or {}
-                if data.get('report_binding') != binding:
-                    continue
-                manuscript = data.get('editable_markdown')
-                if (not manuscript or self.workspace.resolve(manuscript) not in delivered or data.get('unresolved')
-                        or self.workspace.artifact_hashes(observed['artifacts']) != data.get('artifact_sha256')):
-                    continue
-                # Validate the canonical owner receipt as well as its accepted observation.
-                identity = Path(data['version']).name
-                receipt = ArtifactStore(self.session.store.root / 'tools/writing' / identity)
-                saved = receipt.read_json('result.json')
-                if (saved.get('data') == data and saved.get('artifacts') == observed['artifacts']
-                        and receipt.read_json('request.json').get('report_binding') == binding):
-                    self.writing.check_delivery(data)
-                    return
-        raise ValueError('Completed execution/report delivery needs a current canonical composition receipt, intact manuscript and execution evidence; disclose unresolved work for partial delivery.')
+    def _validated_report_delivery(self, artifacts: list[str], *, claim: Any = None,
+                                   partial: bool = False, publication: dict | None = None,
+                                   proposed_export: dict | None = None) -> None:
+        report = self._report_projection()
+        versioned = self.state['config'].get('report_protocol') == _REPORT_PROTOCOL
+        if versioned:
+            if report['intent'] is None and self.state['config'].get('report_requirement') is None:
+                raise ValueError('Report intent is undetermined; declare report, conversion or none from the actual request before delivery')
+            if report['kind'] == 'none':
+                return
+            if claim is None:
+                raise ValueError('Declare delivery.report as candidate or canonical; unresolved alone does not establish report identity')
+            if claim.status == 'candidate':
+                if not partial:
+                    raise ValueError('A candidate delivery must explicitly disclose unresolved report work')
+                return
+        observations = [self.session.store.read_json(item['result']) for turn in reversed(self.state['turns'])
+            if report['kind'] == 'conversion' or turn.get('request_count', 1) == len(self.state['requests'])
+            for item in reversed(turn['tools'])]
+        if versioned and report['kind'] == 'conversion':
+            if not claim.manuscript or not report['conversion_source']:
+                raise ValueError('Conversion delivery must identify its explicitly adopted manuscript')
+            identity = self.writing.publication_source(claim.manuscript, self._report_inputs(),
+                intent=report['intent'], adopted=report['conversion_source'])
+            if identity is not None and self.workspace.resolve(identity['manuscript']) not in {
+                    self.workspace.resolve(path) for path in artifacts}:
+                raise ValueError('Include the unchanged canonical manuscript in the conversion delivery')
+        elif report['requirement'] is not None:
+            identity = self.writing.report_delivery(observations, self._report_inputs(), artifacts,
+                manuscript=claim.manuscript if claim else None,
+                intent=report['intent'])
+        else:
+            raise ValueError('No current canonical report obligation')
+        if versioned:
+            self.publication.check_report_delivery(observations + ([publication] if publication else []), identity,
+                artifacts, formats=report['formats'], manuscript=claim.manuscript, proposed=proposed_export)
 
     def reusable_materials(self) -> dict[str, list[Path]]:
         """Read named domain outputs in the current delivery, never infer by filename.
@@ -2309,25 +2477,33 @@ class ToolApplication:
                         return '; '.join(gaps) + '; disclose unresolved work for partial delivery.'
             except (ValueError, OSError, KeyError, TypeError, RuntimeError) as exc:
                 return str(exc)
-        if self.implementation.exact or self.state['config'].get('report_requirement'):
+        versioned_report = self.state['config'].get('report_protocol') == _REPORT_PROTOCOL
+        report = self._report_projection()
+        report_required = report['kind'] == 'report'
+        if self.implementation.exact or report_required or versioned_report:
             try:
                 arguments = json.loads(call['function']['arguments'])
-                request = DeliveryRequest.model_validate(arguments if call['function']['name'] == 'deliver_result'
-                    else arguments['delivery'])
+                retained = next((self._delivery(call, self.session.store.read_json(item['result']))
+                    for item in turn['tools'] if item['id'] == call['id']), None)
+                request = DeliveryRequest.model_validate(retained or (arguments if call['function']['name'] == 'deliver_result'
+                    else arguments['delivery']))
             except (ValueError, TypeError, KeyError):
                 return ''  # The tool's argument validator will reject this proposal.
-            if not request.unresolved:
-                try:
+            try:
+                if versioned_report or report_required and not request.unresolved:
+                    self._validated_report_delivery(request.artifacts, claim=request.report,
+                        partial=bool(request.unresolved), proposed_export=arguments
+                            if versioned_report and retained is None and call['function']['name'] == 'export_report' else None)
+                if not request.unresolved:
                     if self.implementation.exact:
-                        self._validated_code_delivery(request.artifacts)
-                    if self.state['config'].get('report_requirement'):
-                        self._validated_report_delivery(request.artifacts)
+                        self._validated_code_delivery(request.artifacts, require_current_origin=report['kind'] != 'conversion')
                     if self.implementation.exact and self.scientific is not None and self.scientific.execution_contract is not None:
-                        gaps = self.scientific.delivery_requirement(self._execution_evidence())
+                        gaps = self.scientific.delivery_requirement(self._execution_evidence(
+                            require_current_origin=report['kind'] != 'conversion'))
                         if gaps:
                             return '; '.join(gaps) + '; disclose unresolved work for partial delivery.'
-                except (ValueError, OSError, KeyError, RuntimeError) as exc:
-                    return str(exc)
+            except (ValueError, OSError, KeyError, RuntimeError) as exc:
+                return str(exc)
         observations = []
         active = {domain: {id(row) for row in self._evidence_turns(domain)}
             for domain in ('sources', 'analysis', 'scientific', 'implementation')}

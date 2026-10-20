@@ -359,6 +359,84 @@ class WritingToolGateway:
         if hashlib.sha256(receipt.resolve('writer/' + completed['writer_path']).read_bytes()).hexdigest() != completed['writer_sha256']:
             raise ValueError('Report Writer evidence changed; no completed delivery')
 
+    @staticmethod
+    def _same_report_content(saved: dict, current: dict, intent: dict | None) -> bool:
+        if saved == current:
+            return True
+        # Explicit formatting/conversion intent can reuse a finished body;
+        # evidence, frozen method/review, source bytes and execution remain bound.
+        feedback_only = {'requests', 'requests_sha256', 'request_count', 'obligation'}
+        return bool(isinstance(saved, dict) and isinstance(current, dict)
+            and intent and intent['kind'] == 'conversion' and
+            {key: value for key, value in saved.items() if key not in feedback_only} ==
+            {key: value for key, value in current.items() if key not in feedback_only})
+
+    def publication_source(self, markdown: str, binding: dict | None, *, intent: dict | None = None,
+                           adopted: dict | None = None, observation: dict | None = None) -> dict:
+        """Prove one canonical authoring version, never infer identity from prose."""
+        path = self.workspace.resolve(markdown)
+        identity = path.parent.name
+        if (not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', identity)
+                or path != self.workspace.resolve(f'workspace/manuscripts/{identity}/manuscript.md')):
+            from simple_ar.tools.publication import ExportRequest, export_input_binding
+            # Publication owns original-text conversion input bytes too. A raw
+            # input identity never acquires a scientific composition identity.
+            inputs = export_input_binding(path, ExportRequest(markdown=markdown),
+                output_root=self.workspace.workspace / 'publications')['inputs']
+            result = {'kind': 'conversion', 'manuscript': self.workspace.locator(str(path)), 'inputs': inputs}
+            if adopted is not None and result != adopted:
+                raise ValueError('Adopted conversion source or input bytes changed')
+            return result
+        store = ArtifactStore(self.root / 'tools/writing' / identity)
+        saved, request = store.read_json('result.json'), store.read_json('request.json')
+        data = saved['data']
+        if data.get('unresolved'):
+            raise ValueError('Canonical report has unresolved writing findings/review; deliver a candidate with explicit unresolved work')
+        if (saved.get('status', 'ok') != 'ok' or saved.get('error')
+                or observation is not None and (observation.get('data') != data or observation.get('artifacts') != saved['artifacts'])
+                or not self._same_report_content(data.get('report_binding'), binding, intent)
+                or request.get('report_binding') != data.get('report_binding')
+                or data.get('inputs') != request['inputs']
+                or self.workspace.resolve(data['editable_markdown']) != path
+                or data.get('version') != f'workspace/manuscripts/{identity}'
+                or set(data['artifact_sha256']) != set(saved['artifacts'])
+                or self.workspace.artifact_hashes(saved['artifacts']) != data['artifact_sha256']):
+            raise ValueError('Canonical report receipt, source binding or authoring artifacts changed')
+        self.check_delivery(data)
+        from simple_ar.report.writing import completed_composition_writer
+        completed_composition_writer(store=store, binding=request, identity=identity)
+        result = {'composition': data['version'], 'manuscript': data['editable_markdown'],
+            'receipt_sha256': hashlib.sha256(store.resolve('result.json').read_bytes()).hexdigest(),
+            'artifact_sha256': data['artifact_sha256']}
+        if adopted is not None and result != adopted:
+            raise ValueError('Adopted canonical manuscript identity changed')
+        return result
+
+    def report_delivery(self, observations: Iterable[dict], binding: dict, artifacts: list[str], *,
+                        manuscript: str | None = None, intent: dict | None = None) -> dict:
+        """Own accepted composition, original evidence and current version checks."""
+        delivered = {self.workspace.resolve(path) for path in artifacts}
+        for row in observations:
+            data = row.get('data') or {}
+            if (row.get('tool_name') != 'compose_document' or row.get('status') != 'ok'
+                    or not self._same_report_content(data.get('report_binding', {}), binding, intent)
+                    or not data.get('editable_markdown')
+                    or self.workspace.resolve(data['editable_markdown']) not in delivered
+                    or manuscript is not None and self.workspace.resolve(manuscript) != self.workspace.resolve(data['editable_markdown'])
+                    or data.get('unresolved') and not binding.get('report_protocol')):
+                continue
+            if binding.get('report_protocol'):
+                return self.publication_source(data['editable_markdown'], binding, intent=intent, observation=row)
+            store = ArtifactStore(self.root / 'tools/writing' / Path(data['version']).name)
+            saved = store.read_json('result.json')
+            if (saved.get('data') != data or saved.get('artifacts') != row['artifacts']
+                    or store.read_json('request.json').get('report_binding') != data.get('report_binding')
+                    or self.workspace.artifact_hashes(row['artifacts']) != data.get('artifact_sha256')):
+                continue
+            self.check_delivery(data)  # Historical receipts keep their original proof strength.
+            return {'manuscript': data['editable_markdown']}
+        raise ValueError('Report delivery needs a current canonical composition receipt, intact manuscript and original evidence; deliver an explicit candidate when incomplete')
+
     def _check_input_bytes(self, inputs: list[dict[str, Any]]) -> None:
         for row in inputs:
             if row.get('sha256') is not None:

@@ -206,6 +206,36 @@ class StartTests(unittest.TestCase):
                 self.assertTrue(any((path / 'research_summary.md').exists() for path in (root / 'attempts').iterdir()))
             self.assertIn('not complete', output.getvalue())
 
+    def test_structured_material_and_table_delivery_declare_roles_without_model_or_writer(self):
+        from simple_ar.cli.main import main
+        from simple_ar.app.tool_application import ToolApplication
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch('simple_ar.integrations.llm.LLMClient.from_env',
+                    side_effect=AssertionError('Structured deterministic output needs no model')), \
+                contextlib.redirect_stdout(io.StringIO()):
+            root = Path(temporary).resolve()
+            paper = root / 'paper.md'
+            paper.write_text('# Conditions\nOriginal supplied material; no experiment claimed.', encoding='utf-8')
+            main(['research-session', '--topic', 'Summarize supplied conditions', '--local-document', str(paper),
+                '--outputs', 'summary', '--model', '', '--output-root', str(root / 'summary')])
+            table = root / 'data.csv'
+            table.write_text('value\n1\n2\n', encoding='utf-8')
+            config = self.prepare('--kind', 'data_analysis', '--goal', 'Describe the supplied observations',
+                '--data-file', str(table), '--value-column', 'value', '--observation-unit', 'one row',
+                '--output-root', str(root / 'analysis'), '--prepare-only')
+            main(['research-session', '--config', str(config)])
+            for parent in (root / 'summary', root / 'analysis'):
+                records = list(parent.rglob('actions.json'))
+                self.assertEqual(len(records), 1)
+                app = ToolApplication.load(records[0].parent)
+                self.assertEqual(app.session.manifest.status, 'completed', app.session.manifest.status_reason)
+                self.assertIsNone(app.state['config']['model'])
+                self.assertEqual(app.state['config']['report_protocol'], 'canonical_report.v1')
+                self.assertEqual(app._report_projection()['kind'], 'none')
+                intent = app._report_projection()['intent']
+                self.assertIn(intent['quote'], app.state['requests'][intent['request_index']])
+                self.assertFalse((app.session.store.root / 'tools/writing').exists())
+
     def test_fixed_protocol_confirmation_retains_queue_and_requires_separate_process_approval(self):
         from simple_ar.cli.main import main
         from simple_ar.app.tool_application import ToolApplication
@@ -225,9 +255,17 @@ class StartTests(unittest.TestCase):
             self.assertEqual(app.session.manifest.transition_recipe, ToolApplication.RECIPE)
             proposal = app.sources.pending_decision()
             self.assertEqual(proposal['proposal_kind'], 'caller_execution_protocol')
-            self.assertFalse(app.session.list_attempts())
+            # The caller may record its explicit no-report role before design
+            # confirmation, but cannot measure, call a model or consume budget.
+            attempt, = app.session.list_attempts()
+            self.assertEqual(attempt.status, 'completed')
+            declaration = app.session.store.read_json(f'attempts/{attempt.attempt_id}/native_result.json')
+            self.assertEqual(declaration['tool_name'], 'update_work_plan')
+            self.assertEqual(declaration['data']['report_intent']['kind'], 'none')
+            self.assertFalse(app.ledger.entries)
             self.assertFalse((root / 'calls.txt').exists())
-            queue = json.loads(json.dumps(app.state['turns'][-1]['remaining']))
+            queue = json.loads(json.dumps([call for call in app.state['turns'][-1]['remaining']
+                if call['function']['name'] == 'measure_experiment']))
             requests = list(app.state['requests'])
             reply = {'decision_id': proposal['decision_id'], 'decision_response': 'accept'}
             app = ToolApplication.load(session)
@@ -312,6 +350,7 @@ class StartTests(unittest.TestCase):
         def capture(*args, **kwargs):
             app.state.setdefault('config', kwargs)
             app.state['config'] = kwargs
+            app.state['requests'] = [args[1]]
             return app
         create.side_effect = capture
         return app
@@ -478,6 +517,7 @@ class StartTests(unittest.TestCase):
                 bound = creation_contract.bind(*create.call_args.args, **kwargs)
                 bound.apply_defaults()
                 self.assertEqual(bound.arguments['tool_contracts'], 'outcomes')
+                self.assertEqual(bound.arguments['report_protocol'], 'canonical_report.v1')
                 self.assertEqual(kwargs["model"], "profile:chosen")
                 self.assertEqual(kwargs["max_turns"], 7)
                 self.assertEqual(kwargs["max_tokens"], 43210)
@@ -1484,7 +1524,9 @@ class StartTests(unittest.TestCase):
                     self.assertIsNone(options['model'])
                     self.assertIsNone(options['report_requirement'])
                     self.assertTrue(callable(app.run.call_args.kwargs['approve']))
-                    self.assertEqual(len(app.run.call_args.kwargs['actions']), 1)
+                    self.assertEqual(len(app.run.call_args.kwargs['actions']), 2)
+                    self.assertEqual(app.run.call_args.kwargs['actions'][0]['arguments']['report_intent'], {
+                        'kind': 'none', 'request_index': 0, 'quote': app.state['requests'][0][:8000]})
             legacy.assert_not_called()
 
     def test_code_outputs_compose_with_sources_summary_and_fixed_experiments(self):
@@ -1584,8 +1626,11 @@ class StartTests(unittest.TestCase):
             app.state = {'turns': [{'origin': 'caller'}], 'pending': {'attempt': 'first'}}
             app.measurement_completion_actions.return_value = []
             def run_batch(*, actions, approve, progress):
-                self.assertEqual(len(actions), 4)
+                self.assertEqual(len(actions), 5)
+                self.assertEqual(actions[0]['arguments']['report_intent']['kind'], 'none')
                 for index, action in enumerate(actions):
+                    if action['tool_name'] == 'update_work_plan':
+                        continue
                     call = {'id': f'caller-0-{index}', 'function': {'name': action['tool_name'],
                         'arguments': json.dumps(action['arguments'])}}
                     changed = {**call, 'function': {**call['function'], 'arguments': json.dumps({
@@ -1596,7 +1641,7 @@ class StartTests(unittest.TestCase):
                     app.state['turns'][0]['origin'] = 'caller'
                     app.scientific.approval_binding.return_value = ({'environment_preparation': {
                         'steps': [[sys.executable, '-c', 'pass']], 'profile': {'timeout_sec': 5}},
-                        'limits': limits} if index == 0 else {'shared_environment': {'attempt_id': 'first'}})
+                        'limits': limits} if index == 1 else {'shared_environment': {'attempt_id': 'first'}})
                     self.assertTrue(approve(call, 'literal-initial-condition'))
                     self.assertFalse(approve(call, 'never-retry'))
                 return {'status': 'completed'}
@@ -1861,13 +1906,16 @@ class StartTests(unittest.TestCase):
                                          [(4, 'source1'), (9, 'source2')] if paired else [(None, 'source1')])
                         app.run.assert_called_once()
                         actions = app.run.call_args.kwargs['actions']
-                        self.assertEqual([row['arguments']['condition_id'] for row in actions],
+                        self.assertEqual(actions[0]['arguments']['report_intent']['kind'], 'none')
+                        self.assertEqual([row['arguments']['condition_id'] for row in actions if row['tool_name'] == 'measure_experiment'],
                                          ['candidate:0', 'candidate:1'] if paired else ['candidate:0'])
                         if paired:
-                            self.assertEqual([row['arguments']['command'] for row in actions],
+                            self.assertEqual([row['arguments']['command'] for row in actions if row['tool_name'] == 'measure_experiment'],
                                 [[sys.executable, 'measure.py', '--seed', str(seed)] for seed in (4, 9)])
                         approve = app.run.call_args.kwargs['approve']
                         for index, action in enumerate(actions):
+                            if action['tool_name'] == 'update_work_plan':
+                                continue
                             call = {'id': f'caller-0-{index}', 'function': {
                                 'name': action['tool_name'], 'arguments': json.dumps(action['arguments'])}}
                             altered = deepcopy(call)

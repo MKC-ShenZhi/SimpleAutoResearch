@@ -398,7 +398,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                         goal='Create and verify a small tool', mount_inputs=True,
                         allow_execution=True, allow_network=False, max_turns=30, code_task=None, process_limits=None,
                         report_requirement=None, measurement_command=None, tool_contracts=None,
-                        completion_policy=None):
+                        completion_policy=None, report_protocol=None):
         run_dir, inputs = self._tool_materials()
         fake = Mock()
         fake.effective_output_limit.return_value = None
@@ -415,6 +415,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             allow_execution=allow_execution, allow_network=allow_network,
             max_turns=max_turns, project_python=interpreter, code_task=code_task, process_limits=process_limits,
             report_requirement=report_requirement,
+            **({'report_protocol': report_protocol} if report_protocol is not None else {}),
             **({'tool_contracts': tool_contracts} if tool_contracts is not None else {}),
             **({'completion_policy': completion_policy} if completion_policy is not None else {}),
             execution_contract=({'command': measurement_command, 'cwd': str(inputs), 'timeout_sec': 3,
@@ -644,6 +645,54 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         result = _call_tool(app.gateway, 'compose_document', arguments, identity=identity)
         self.assertEqual(result.status, status, result.error)
         return result
+
+    def _accepted_report_tool(self, app, name, arguments, identity):
+        # Exercise the real owner; retain its complete accepted observation,
+        # including artifacts, rather than manufacturing a canonical receipt.
+        result = _call_tool(app.gateway, name, arguments, identity=identity)
+        self.assertEqual(result.status, 'ok', result.error)
+        turn = self._record_native_turn(app, name, arguments, result.data, identity)
+        app.session.store.write_json(turn['tools'][0]['result'], result.model_dump(mode='json'))
+        turn['request_count'] = len(app.state['requests'])
+        app.state['turns'].append(turn)
+        app._save()
+        return result
+
+    def _report_intent(self, app, identity, kind='report', **fields):
+        return self._accepted_report_tool(app, 'update_work_plan', {'report_intent': {
+            'request_index': len(app.state['requests']) - 1, 'quote': app.state['requests'][-1],
+            'kind': kind, **fields}}, identity)
+
+    def _publication_fixture_export(self, app, manuscript, identity):
+        # Mock only the external renderer. Publication's request/result/manifest
+        # binding, input hashing and output hashing remain real.
+        def render(source, output, *, body_name, **kwargs):
+            output.mkdir(parents=True, exist_ok=True)
+            body = (source / body_name).read_text(encoding='utf-8')
+            for name in ('source.md', 'body.tex', 'main.tex'):
+                (output / name).write_text(body, encoding='utf-8')
+            (output / 'main.pdf').write_bytes(b'fixture-render:' + body.encode())
+            manifest = {'status': 'compiled', 'compiled': True}
+            write_json(output / 'export.json', manifest)
+            return manifest
+        with patch('simple_ar.tools.publication.export_acm_report', side_effect=render):
+            return self._accepted_report_tool(app, 'export_report', {'markdown': manuscript}, identity)
+
+    def _canonical_report_fixture(self, *, requirement=None, formats=None):
+        _, inputs, fake, _, app, _ = self._native_fixture(
+            goal='Write a report using the supplied original source.', report_requirement=requirement,
+            report_protocol='canonical_report.v1')
+        self.enterContext(patch('simple_ar.app.tool_application.LLMClient.for_task', return_value=fake))
+        if requirement is None or formats:
+            self._report_intent(app, 'report-intent', formats=formats or ['markdown'])
+        outline = app._report_projection()['requirement']['outline']
+        fake.ask_json.return_value = {'draft_markdown': '\n\n'.join('## ' + row['heading']
+            + '\n\nThe original source is retained; no new measurements are claimed.' for row in outline)
+            or 'The original source is retained; no new measurements are claimed.'}
+        written = self._accepted_report_tool(app, 'compose_document', {
+            'title': 'Source account', 'goal': 'Explain the original evidence without invented findings.',
+            'materials': [{'path': 'source0/notes.txt'}]}, 'report-v1')
+        return app, fake, inputs, written
 
     def _assert_composition_input_rejections(self, app, fake, request, cases):
         """Admission rejects explicit inputs before selecting materials or a Writer."""
@@ -2666,12 +2715,301 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 self.assertEqual(self._native_receipts(app, turns), receipts)
                 provider.assert_not_called()
 
+    def test_versioned_report_ordinary_decision_declares_no_report_alongside_work(self):
+        goal = 'Create a plotting script only; do not write a scientific report.'
+        _, _, fake, _, app, _ = self._native_fixture(goal=goal, report_protocol='canonical_report.v1')
+        self.enterContext(patch('simple_ar.app.tool_application.LLMClient.for_task', return_value=fake))
+        # Undetermined semantics do not mechanically prohibit investigation.
+        self.assertEqual(_call_tool(app.gateway, 'read_file', {'path': 'source0/notes.txt'},
+            identity='initial-read').status, 'ok')
+        batch = self._native_message('update_work_plan', {'report_intent': {
+            'request_index': 0, 'quote': goal, 'kind': 'none'}}, 'intent')
+        batch['tool_calls'] += self._native_message('write_file', {
+            'path': 'workspace/plot.py', 'content': '# supplied plotting script\n'}, 'script')['tool_calls']
+        fake.chat_turn.side_effect = [batch, self._native_message('deliver_result', {
+            'summary': 'Script supplied, not executed.', 'artifacts': ['workspace/plot.py']}, 'finish')]
+        self.assertEqual(app.run(progress=lambda _: None)['status'], 'completed')
+        self.assertEqual(fake.chat_turn.call_count, 2)  # No classification/planning model call.
+        fake.ask_json.assert_not_called()
+        self.assertEqual(app._report_projection()['kind'], 'none')
+        self.assertIn('_ReportIntent', json.dumps(app.schemas))
+        # Old API + missing saved version retain old schemas and context capacity.
+        _, _, _, _, legacy, _ = self._native_fixture()
+        self.assertNotIn('report_protocol', legacy.state['config'])
+        self.assertNotIn('_ReportIntent', json.dumps(legacy.schemas))
+        self.assertNotIn('ReportDelivery', json.dumps(legacy.schemas))
+
+    def test_versioned_report_declaration_inherits_and_requires_explicit_user_replacement(self):
+        _, _, _, _, app, _ = self._native_fixture(report_protocol='canonical_report.v1')
+        first = self._report_intent(app, 'intent-first', method='article', formats=['pdf'])
+        original = first.data['report_requirement']
+        self.assertEqual(original['config']['reviewer'], 'disabled')
+        self.assertEqual(original['config']['max_review_iterations'], 0)
+        self.assertFalse(original['config']['document_review'])
+        for change in ({'quote': 'invented request'}, {'request_index': 1},
+                {'kind': 'none'}, {'method': 'sections'}, {'kind': 'none', 'replace': True}):
+            with self.subTest(invalid=change):
+                rejected = _call_tool(app.gateway, 'update_work_plan', {'report_intent': {
+                    'kind': 'report', 'request_index': 0, 'quote': app.state['requests'][0], **change}},
+                    identity='invalid-' + str(len(change)) + '-' + str(list(change)[0]))
+                self.assertNotEqual(rejected.status, 'ok')
+                self.assertEqual(app._report_projection()['requirement'], original)
+        app.state['requests'].append('Use sections for the report, retaining the PDF obligation.')
+        self._accepted_report_tool(app, 'update_work_plan', {'steps': [
+            {'step': 'Use retained evidence', 'status': 'in_progress'}]}, 'omitted-intent')
+        self.assertEqual(app._report_projection()['requirement'], original)
+        self.assertEqual(app._report_projection()['formats'], ['markdown', 'pdf'])
+        changed = self._report_intent(app, 'replace-method', method='sections', replace=True)
+        self.assertEqual(changed.data['report_intent']['method'], 'sections')
+        self.assertEqual(changed.data['report_requirement']['method'], 'sections')
+        app.state['requests'].append('Cancel the report; retain only the code.')
+        rejected = _call_tool(app.gateway, 'update_work_plan', {'report_intent': {
+            'kind': 'none', 'request_index': 2, 'quote': app.state['requests'][-1]}}, identity='no-silent-cancel')
+        self.assertNotEqual(rejected.status, 'ok')
+        self._report_intent(app, 'explicit-cancel', kind='none', replace=True)
+        self.assertEqual(app._report_projection()['kind'], 'none')
+        self.assertIsNone(app._report_projection()['requirement'])
+
+    def test_versioned_report_writer_receives_original_material_and_feedback_creates_new_version(self):
+        from simple_ar.tools.workspace import ReportDelivery
+        app, fake, inputs, first = self._canonical_report_fixture()
+        manuscript = first.data['editable_markdown']
+        original = app.workspace.resolve(manuscript).read_bytes()
+        self.assertIn('original source', json.dumps(_writing_prompt(fake)))
+        saved = app.session.store.read_json('tools/writing/report-v1/request.json')
+        self.assertTrue(saved['inputs'])
+        self.assertEqual(saved['report_binding']['requests'], app.state['requests'])
+        claim = ReportDelivery(status='canonical', manuscript=manuscript)
+        binding = app._report_inputs()
+        # One accepted owner admission: do not load/hash then repeat it through
+        # publication_source. The observation remains part of that admission.
+        with patch.object(app.workspace, 'artifact_hashes', wraps=app.workspace.artifact_hashes) as hashes:
+            identity = app.writing.report_delivery([first.model_dump(mode='json')], binding,
+                [manuscript], manuscript=manuscript)
+        self.assertEqual(identity['composition'], first.data['version'])
+        self.assertEqual(sum(set(call.args[0]) == set(first.artifacts) for call in hashes.call_args_list), 1)
+        app._validated_report_delivery([manuscript], claim=claim)
+        app.state['requests'].append('Revise the explanation: make the lack of new measurements explicit.')
+        app._save()
+        with self.assertRaisesRegex(ValueError, 'canonical composition'):
+            app._validated_report_delivery([manuscript], claim=claim)
+        fake.ask_json.return_value = {'draft_markdown': fake.ask_json.return_value['draft_markdown']
+            + '\n\nNo new measurements were performed; this is supplied evidence only.'}
+        revised = self._accepted_report_tool(app, 'compose_document', {
+            'title': 'Revised account', 'goal': app.state['requests'][-1],
+            'prior_draft': manuscript, 'reuse_prior_inputs': True}, 'report-v2')
+        self.assertNotEqual(revised.data['version'], first.data['version'])
+        # Reuse original evidence, while binding the prior body separately as
+        # revision context. Prior prose must not become primary evidence.
+        self.assertEqual(revised.data['inputs'][:-1], first.data['inputs'])
+        self.assertEqual(revised.data['inputs'][-1], {
+            'path': manuscript, 'sha256': hashlib.sha256(original).hexdigest()})
+        self.assertNotIn(manuscript, revised.data['report_binding']['evidence_sha256'])
+        self.assertIn(app.state['requests'][-1], json.dumps(_writing_prompt(fake)))
+        self.assertEqual(app.workspace.resolve(manuscript).read_bytes(), original)
+        current = revised.data['editable_markdown']
+        app._validated_report_delivery([current], claim=ReportDelivery(status='canonical', manuscript=current))
+        self.assertEqual(fake.ask_json.call_count, 2)
+        (inputs / 'notes.txt').write_text('changed evidence', encoding='utf-8')
+        with self.assertRaises(ValueError):
+            app._validated_report_delivery([current], claim=ReportDelivery(status='canonical', manuscript=current))
+
+    def test_versioned_report_publication_binds_same_body_and_rejects_unrelated_or_stale_pdf(self):
+        from simple_ar.core.capabilities import ArtifactStore
+        from simple_ar.tools.specs import ToolResult
+        from simple_ar.tools.workspace import ReportDelivery
+        from simple_ar.app.tool_application import _FINAL_WORK_TOOLS
+        app, fake, _, written = self._canonical_report_fixture(formats=['pdf'])
+        manuscript = written.data['editable_markdown']
+        claim = ReportDelivery(status='canonical', manuscript=manuscript)
+        published = self._publication_fixture_export(app, manuscript, 'report-pdf-v1')
+        artifacts = [manuscript, *published.artifacts]
+        app._validated_report_delivery(artifacts, claim=claim)
+        unrelated = app.workspace.workspace / 'unrelated.pdf'
+        unrelated.write_bytes(b'unrelated document')
+        with self.assertRaisesRegex(ValueError, 'same manuscript'):
+            app._validated_report_delivery([manuscript, 'workspace/unrelated.pdf'], claim=claim)
+        pdf = app.workspace.resolve(published.data['project'] + '/main.pdf')
+        original_pdf = pdf.read_bytes()
+        pdf.write_bytes(b'overwritten PDF')
+        with self.assertRaisesRegex(ValueError, 'changed'):
+            app._validated_report_delivery(artifacts, claim=claim, partial=True)
+        pdf.write_bytes(original_pdf)
+        # Every final-work tool, and ordinary delivery, passes the SAME rule at
+        # observation binding; unresolved does not waive canonical identities.
+        for name in sorted(_FINAL_WORK_TOOLS | {'deliver_result'}):
+            with self.subTest(terminal=name):
+                delivery = {'summary': 'Incomplete report', 'artifacts': [manuscript, 'workspace/unrelated.pdf'],
+                    'unresolved': ['Layout not verified'], 'report': claim.model_dump()}
+                call = self._native_message(name, delivery if name == 'deliver_result' else
+                    {'delivery': delivery}, 'terminal-' + name)['tool_calls'][0]
+                payload = ToolResult(tool_name=name, data=delivery if name == 'deliver_result' else
+                    {'delivery': delivery}).model_dump(mode='json')
+                app._bind_delivery(call, payload, ArtifactStore(app.session.store.root / 'tools' / ('bind-' + name)))
+                self.assertEqual(payload['status'], 'blocked')
+                self.assertNotIn('delivery_hashes', payload['metadata'])
+        app.state['requests'].append('Revise the scientific explanation, preserving the original source.')
+        app._save()
+        revised = self._accepted_report_tool(app, 'compose_document', {
+            'title': 'Revised account', 'goal': app.state['requests'][-1], 'prior_draft': manuscript,
+            'reuse_prior_inputs': True}, 'report-pdf-v2')
+        with self.assertRaisesRegex(ValueError, 'same manuscript'):
+            app._validated_report_delivery([revised.data['editable_markdown'], *published.artifacts],
+                claim=ReportDelivery(status='canonical', manuscript=revised.data['editable_markdown']))
+        self.assertEqual(fake.ask_json.call_count, 2)
+
+    def test_versioned_report_partial_requires_explicit_candidate_not_unresolved_escape(self):
+        from simple_ar.tools.workspace import ReportDelivery
+        _, _, fake, _, app, _ = self._native_fixture(report_protocol='canonical_report.v1')
+        self.enterContext(patch('simple_ar.app.tool_application.LLMClient.for_task', return_value=fake))
+        with patch.object(app.writing, 'client_factory', side_effect=AssertionError('No unbound Writer call')) as client:
+            rejected = _call_tool(app.gateway, 'compose_document', {'title': 'Undeclared body',
+                'goal': 'Do not spend before declaring semantics', 'materials': [{'path': 'source0/notes.txt'}]},
+                identity='pending-writer')
+            self.assertEqual(rejected.status, 'error')
+            self.assertIn('undetermined', rejected.error)
+            client.assert_not_called()
+        fake.ask_json.side_effect = lambda *args, **kwargs: {'draft_markdown': '\n\n'.join(
+            '## ' + row['heading'] + '\n\nThis is supplied original source, not a new measurement.'
+            for row in app._report_projection()['requirement']['outline'])
+            or 'This is supplied original source, not a new measurement.'}
+        # The ordinary action loop sees an accepted declaration before the
+        # Writer in the SAME batch, without a separate classification call.
+        result = app.run(actions=[{'tool_name': 'update_work_plan', 'arguments': {'report_intent': {
+            'request_index': 0, 'quote': app.state['requests'][0], 'kind': 'report'}}},
+            {'tool_name': 'compose_document', 'arguments': {'title': 'Bound body', 'goal': 'Explain the original',
+                'materials': [{'path': 'source0/notes.txt'}]}},
+            {'tool_name': 'ask_user', 'arguments': {'question': 'Which publication layout is required?'}}],
+            progress=lambda _: None)
+        self.assertEqual(result['status'], 'paused')
+        self.assertEqual(app.session.store.read_json(app.state['turns'][-1]['tools'][1]['result'])['status'], 'ok')
+        self.assertEqual(fake.ask_json.call_count, 1)
+        draft = app.workspace.workspace / 'draft.md'
+        draft.write_text('Technical candidate, not a scientific report.', encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'candidate or canonical'):
+            app._validated_report_delivery(['workspace/draft.md'], partial=True)
+        with self.assertRaisesRegex(ValueError, 'canonical composition'):
+            app._validated_report_delivery(['workspace/draft.md'], partial=True,
+                claim=ReportDelivery(status='canonical', manuscript='workspace/draft.md'))
+        with self.assertRaisesRegex(ValueError, 'disclose unresolved'):
+            app._validated_report_delivery(['workspace/draft.md'], claim=ReportDelivery(status='candidate'))
+        result = app.run(actions=[{'tool_name': 'deliver_result', 'arguments': {
+            'summary': 'Candidate only', 'artifacts': ['workspace/draft.md'],
+            'unresolved': ['Scientific body and PDF are not complete'], 'report': {'status': 'candidate'}}}],
+            progress=lambda _: None)
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(app.session.store.read_json('delivery.json')['report']['status'], 'candidate')
+
+    def test_versioned_report_frozen_contract_and_pure_publication_reuse_canonical_body(self):
+        from simple_ar.tools.writing import freeze_report_requirement
+        from simple_ar.tools.workspace import ReportDelivery
+        requirement = freeze_report_requirement({'outline_strategy': 'template', 'reviewer': 'disabled',
+            'document_review': False, 'max_review_iterations': 0, 'allow_source_backtracking': False,
+            'allow_llm_fallback': False, 'figures': {'enabled': False}})
+        app, fake, _, written = self._canonical_report_fixture(requirement=requirement)
+        # An explicit frozen contract needs no duplicate model declaration.
+        self.assertIsNone(app._report_projection()['intent'])
+        manuscript = written.data['editable_markdown']
+        original = app.workspace.resolve(manuscript).read_bytes()
+        app._validated_report_delivery([manuscript], claim=ReportDelivery(status='canonical', manuscript=manuscript))
+        app.state['requests'].append('Only change font/template and export PDF; preserve the completed body.')
+        app._save()
+        raw = app.workspace.workspace / 'replacement.md'
+        raw.write_text('An unrelated body.', encoding='utf-8')
+        for fields in ({'source': 'workspace/replacement.md'}, {'source': manuscript, 'method': 'sections'},
+                {'kind': 'none', 'replace': True}):
+            with self.subTest(frozen=fields):
+                bad = _call_tool(app.gateway, 'update_work_plan', {'report_intent': {
+                    'kind': 'conversion', 'request_index': 1, 'quote': app.state['requests'][-1], **fields}},
+                    identity='invalid-frozen-' + str(list(fields)[0]) + '-' + str(len(fields)))
+                self.assertNotEqual(bad.status, 'ok')
+        self._report_intent(app, 'font-only', kind='conversion', source=manuscript, formats=['pdf'])
+        self.assertEqual(app._report_projection()['requirement'], requirement)
+        published = self._publication_fixture_export(app, manuscript, 'font-only-pdf')
+        self.assertEqual(published.data['report_identity']['composition'], written.data['version'])
+        app._validated_report_delivery([manuscript, *published.artifacts],
+            claim=ReportDelivery(status='canonical', manuscript=manuscript))
+        with self.assertRaisesRegex(ValueError, 'conversion source'):
+            app._validated_report_delivery(['workspace/replacement.md', *published.artifacts],
+                claim=ReportDelivery(status='canonical', manuscript='workspace/replacement.md'))
+        self.assertEqual(app.workspace.resolve(manuscript).read_bytes(), original)
+        self.assertEqual(fake.ask_json.call_count, 1)
+        # An ok envelope is not proof that required review/findings are closed.
+        # The SAME owner identity admission must reject these for conversion.
+        saved = app.session.store.read_json('tools/writing/report-v1/result.json')
+        saved['data']['unresolved'] = [{'type': 'incomplete_independent_review'}]
+        app.session.store.write_json('tools/writing/report-v1/result.json', saved)
+        with self.assertRaisesRegex(ValueError, 'unresolved writing findings/review'):
+            app.writing.publication_source(manuscript, app._report_inputs(), intent=app._report_projection()['intent'])
+
+    def test_versioned_original_text_conversion_pins_adopted_bytes_without_writer(self):
+        from simple_ar.tools.workspace import ReportDelivery
+        _, _, fake, _, app, _ = self._native_fixture(
+            goal='Convert my existing manuscript without rewriting it.', report_protocol='canonical_report.v1')
+        source = app.workspace.workspace / 'provided.md'
+        source.write_text('User-supplied original prose.', encoding='utf-8')
+        self._report_intent(app, 'adopt-original', kind='conversion', source='workspace/provided.md', formats=['pdf'])
+        adopted = app._report_projection()['conversion_source']
+        self.assertEqual(adopted['inputs']['provided.md'], hashlib.sha256(source.read_bytes()).hexdigest())
+        self.assertNotIn('composition', adopted)
+        published = self._publication_fixture_export(app, 'workspace/provided.md', 'original-pdf')
+        app._validated_report_delivery(['workspace/provided.md', *published.artifacts],
+            claim=ReportDelivery(status='canonical', manuscript='workspace/provided.md'))
+        source.write_text('Changed prose after adoption.', encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'conversion source'):
+            app._validated_report_delivery(['workspace/provided.md', *published.artifacts],
+                claim=ReportDelivery(status='canonical', manuscript='workspace/provided.md'))
+        fake.ask_json.assert_not_called()
+        fake.chat_turn.assert_not_called()
+
+    def test_versioned_report_history_and_supply_do_not_upgrade_missing_contracts(self):
+        from simple_ar.tools.writing import freeze_report_requirement
+        requirement = freeze_report_requirement({'outline_strategy': 'template'})
+        _, _, fake, _, app, _ = self._native_fixture(report_requirement=requirement, allow_execution=False)
+        app.state['config'].pop('report_evidence_contract')
+        app._save()
+        ledger = app.ledger.to_dict()
+        restored = ToolApplication.load(app.session.store.root)
+        restored.supply(supply_id='unrelated-contracts', reason='Show the full existing tool catalog',
+            changes={'tool_contracts': 'full'}, replace_existing=True)
+        self.assertNotIn('report_protocol', restored.state['config'])
+        self.assertNotIn('report_evidence_contract', restored.state['config'])
+        self.assertEqual(restored.state['config']['report_requirement'], requirement)
+        with self.assertRaisesRegex(ValueError, 'actual execution evidence'):
+            restored._report_inputs()
+        self.assertEqual(restored.ledger.to_dict(), ledger)
+        self.assertNotIn('ReportDelivery', json.dumps(restored.schemas))
+        fake.chat_turn.assert_not_called()
+        fake.ask_json.assert_not_called()
+        _, _, _, _, current, _ = self._native_fixture(report_protocol='canonical_report.v1')
+        self._report_intent(current, 'no-report-supply', kind='none')
+        current.supply(supply_id='full-catalog', reason='Use the existing full tool presentation',
+            changes={'tool_contracts': 'full'}, replace_existing=True)
+        self.assertEqual(current.state['config']['report_protocol'], 'canonical_report.v1')
+        self.assertEqual(current._report_projection()['kind'], 'none')
+
     def test_supply_upgrades_material_report_contract_without_accepting_old_composition(self):
         from simple_ar.tools.writing import freeze_report_requirement
 
         requirement = freeze_report_requirement({'outline_strategy': 'template'})
         _, _, fake, _, app, _ = self._native_fixture(allow_execution=False, report_requirement=requirement)
         self.enterContext(patch('simple_ar.app.tool_application.LLMClient.for_task', return_value=fake))
+        with self.subTest(history='frozen report without evidence contract'):
+            # Historical saved configs did not always carry this field. Absence
+            # must not reinterpret an execution-backed report as materials-only.
+            contract = app.state['config'].pop('report_evidence_contract')
+            app._save()
+            historical = ToolApplication.load(app.session.store.root)
+            self.assertNotIn('report_protocol', historical.state['config'])
+            self.assertNotIn('report_evidence_contract', historical.state['config'])
+            self.assertEqual(historical._report_projection()['requirement'], requirement)
+            self.assertIsNone(historical._report_projection()['evidence_contract'])
+            with self.assertRaisesRegex(ValueError, 'actual execution evidence'):
+                historical._report_inputs()
+            self.assertNotIn('report_evidence_contract', historical.state['config'])
+            fake.ask_json.assert_not_called()
+            app.state['config']['report_evidence_contract'] = contract
+            app._save()
         fake.chat_turn.side_effect = AssertionError('Only explicit caller actions are requested')
         fake.ask_json.return_value = {'draft_markdown': '\n\n'.join(
             '## ' + row['heading'] + '\n\nRetained source material; no stability claim.'

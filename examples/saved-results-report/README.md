@@ -88,6 +88,14 @@ uncertainty intervals, only one test season, machine-specific timings, minor TeX
 overflow warnings and no successful fresh paid visual review of the final figure.
 The inputs do not establish a physical application domain or target units.
 
+**Timing-scope correction:** the report's statement that feature construction is
+outside the recorded timings is too narrow. The `timing_scope` field in the
+[saved record](report/inputs/recorded_results.json) includes pipeline construction,
+preprocessing and indexing in fitting, and batch indexing and transformations in
+prediction. It excludes imports, disk operations, plotting and tuning. Sums of
+monthly medians are not a timed end-to-end workflow. The original generated prose
+and PDF remain unchanged; numerical and build checks did not certify every claim.
+
 `provenance.json` binds the selected files to the original delivery. Original
 failures and journals are retained privately; they are not redistributed here.
 Historical environment paths in saved metadata are not runtime dependencies.

@@ -12,7 +12,7 @@ import shutil
 import sys
 import tempfile
 import zipfile
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -98,12 +98,20 @@ class _Project(_Path):
         description="Explicit authorized data files or directories to inspect for presence/size, not contents.")
 
 
+class ReportDelivery(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    status: Literal['candidate', 'canonical']
+    manuscript: str | None = None
+
+
 class DeliveryRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     summary: str = Field(min_length=1)
     artifacts: list[str] = Field(default_factory=list,
         description="Existing workspace outputs (workspace-relative or explicitly mounted paths) or retained files in this task's evidence mount. Evidence remains read-only and is referenced, not copied or certified. Directories expand to a snapshot of at most 200 accessible files; private paths, virtual environments, Python bytecode caches and symlinks are excluded by the existing inventory rules. Oversized inventories must be narrowed explicitly; this is not an archive or correctness certificate.")
     unresolved: list[str] = Field(default_factory=list)
+    report: ReportDelivery | None = Field(default=None, exclude_if=lambda value: value is None,
+        description='For a versioned report obligation, explicitly deliver a candidate with unresolved work, or a canonical compose_document manuscript and its same-version publication. Candidate status never certifies a scientific report.')
 
 
 class _Write(_Path):

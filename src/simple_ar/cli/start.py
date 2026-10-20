@@ -420,7 +420,7 @@ def _quote(value: str) -> str:
 def native_creation_options(args: argparse.Namespace) -> dict:
     """One projection of native creation access, frozen contracts and budgets."""
     from simple_ar.cli.task_options import native_process_limits
-    return dict(model=args.model or None,
+    return dict(model=args.model or None, report_protocol='canonical_report.v1',
         sources={f'source{index}': path for index, path in enumerate(args.source)},
         allow_execution=args.allow_execution, allow_network=args.allow_network, allow_vision=args.allow_vision,
         max_turns=args.max_turns, max_tokens=args.max_tokens, max_images=args.max_images,
@@ -488,7 +488,14 @@ def _run_created_research(app, *, request: str, root: Path, outputs: tuple,
             {'tool_name': 'research_collect' if saved['allow_network'] else 'research', 'arguments': {
                 'operation': 'summary', 'question': question,
                 'materials': saved['research_policy']['materials'], 'use_llm': False}})
-        status = app.run(actions=[action], progress=print_line)
+        actions = [action]
+        if saved.get('report_protocol') == 'canonical_report.v1' and not saved.get('report_requirement'):
+            # Structured outputs are already the caller's explicit contract;
+            # deterministic analysis/material owners need no model classifier.
+            actions.insert(0, {'tool_name': 'update_work_plan', 'arguments': {'report_intent': {
+                'kind': 'none', 'request_index': len(app.state['requests']) - 1,
+                'quote': app.state['requests'][-1][:8000]}}})
+        status = app.run(actions=actions, progress=print_line)
         turn = app.state['turns'][-1]
         result = app.session.store.read_json(turn['tools'][-1]['result']) if turn['tools'] else {}
         if result.get('status') == 'ok' and result.get('artifacts'):
@@ -636,11 +643,17 @@ def create_declared_research(args: argparse.Namespace, *, execution: dict,
         {**row['execution'], 'condition_id': row['id']} if grouped else
         row['execution'] if args.model else {**row['execution'], 'delivery': {'summary': request, 'artifacts': []}}}
         for row in conditions]
+    if (not args.model and app.state['config'].get('report_protocol') == 'canonical_report.v1'
+            and not app.state['config'].get('report_requirement')):
+        actions.insert(0, {'tool_name': 'update_work_plan', 'arguments': {'report_intent': {
+            'kind': 'none', 'request_index': len(app.state['requests']) - 1,
+            'quote': app.state['requests'][-1][:8000]}}})
     print_line('Declared measurement uses the common task owner and original cwd/argv. '
         + ('Accept the bound protocol, then approve each process separately.' if confirm else
            'Each initial literal condition carries one-use caller intent; later proposals require approval.'))
     print_line(f'Task session: {root}\nResume: simple-ar start --resume-task "{root}" --approve-execution TOKEN')
-    remaining = {f'caller-0-{index}': row['arguments'] for index, row in enumerate(actions)}
+    remaining = {f'caller-0-{index}': row['arguments'] for index, row in enumerate(actions)
+        if row['tool_name'] == 'measure_experiment'}
 
     def approve(call: dict, token: str) -> bool:
         print_line(f"Execution proposal: {call['function']['arguments']}\nApproval token: {token}")
