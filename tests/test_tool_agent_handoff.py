@@ -4811,7 +4811,9 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         loaded = app._messages(client=fake)
         target = json.loads(loaded[1]['content'])['resources']['approximate_next_input_tokens'] + estimate_tokens(text) // 4
         script = app.workspace.workspace / 'draft.py'
-        script.write_text('# GENERATED_CONTEXT_BOUNDARY\n' + '# editing context only\n' * (len(text) // 2), encoding='utf-8')
+        # Each body fits alone, but their combination competes for capacity.
+        # A recent automatic write echo must not displace an observed input.
+        script.write_text('# GENERATED_CONTEXT_BOUNDARY\n' + '# editing context only\n' * (len(text) // 40), encoding='utf-8')
         authored = self._record_file_observation(app, script, 'write_file', 'material-first-write')
         app.state['turns'].append(authored)
         app._save()

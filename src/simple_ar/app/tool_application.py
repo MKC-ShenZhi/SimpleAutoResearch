@@ -1943,7 +1943,11 @@ class ToolApplication:
                         'status': 'unavailable', 'reason': 'Source owner could not admit this original passage/version.'},
                         fresh=row['turn'] == working_turn)
         seen_ranges, pending_material = set(), []
-        for candidate in sorted(candidates, key=lambda value: value['_observed_turn'], reverse=True):
+        # Reading requests a working input; writing authors an output, not a
+        # request to pin its whole body over earlier inputs. Explicit rereads
+        # of edited/generated files are inputs too, without suffix/domain rules.
+        for candidate in sorted(candidates, key=lambda value: (
+                value['role'] != 'write_context', value['_observed_turn']), reverse=True):
             observation = {key: value for key, value in candidate.items() if key != '_observed_turn'}
             passage = observation.get('passage')
             key = (observation['path'], observation['sha256'], json.dumps(observation.get('evidence_role'), sort_keys=True),
