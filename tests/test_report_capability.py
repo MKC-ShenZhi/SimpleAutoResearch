@@ -78,6 +78,9 @@ class CompositionArticleOwnerTests(unittest.TestCase):
                 self.assertEqual(produced.status, 'ok', produced.error)
                 expected = 'needs_revision' if pending and not rounds else 'reviewed'
                 self.assertEqual(produced.data['independent_review']['review_status'], expected)
+                self.assertEqual(json.loads(workspace.resolve(produced.data['review_path']).read_text()),
+                    produced.data['independent_review'])
+                self.assertIn(produced.data['review_path'], produced.artifacts)
                 self.assertEqual(bool(produced.data['unresolved']), expected == 'needs_revision')
                 self.assertEqual(len(calls), 4 if pending and rounds else 2)
                 self.assertEqual(calls[0], ('composition-article', 'reviewed-native:article'))

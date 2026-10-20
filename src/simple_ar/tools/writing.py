@@ -1394,6 +1394,11 @@ class WritingToolGateway:
                     ('report_body.md', 'manuscript.md'),
                     ('references.bib', 'references.bib'), ('citation_map.json', 'citation_map.json'),
                     ('citation_cleanup.json', 'citation_cleanup.json'))}
+            if written.get('independent_review') is not None:
+                # Feedback consumes a public professional result, not private
+                # Writer checkpoints or an oversized historical tool response.
+                text_outputs['review.json'] = json.dumps(written['independent_review'],
+                    ensure_ascii=False, indent=2) + '\n'
             # The assembly owns generated figures and their exports. Consume
             # those public artifact roles, not a filename/format whitelist or
             # the entire internal checkpoint/evidence directory.
@@ -1482,6 +1487,8 @@ class WritingToolGateway:
                         if material_report else 'Canonical execution report; checks and limitations retain their recorded evidence scope.'))
                 data['summary'] = BOUND_REPORT_REVISION
             data['metadata'] = {'reusable_materials': {'report': artifacts}}
+            if written.get('independent_review') is not None:
+                data['data']['review_path'] = f'{prefix}/review.json'
             owner.write_json('result.json', data)
             return ToolResult(tool_name=name, **data)
         except Exception as exc:
