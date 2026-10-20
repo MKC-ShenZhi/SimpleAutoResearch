@@ -447,16 +447,32 @@ class ToolApplication:
         schemas = export_openai_tool_schemas(self.gateway.registry, read_only_only=False,
             policy=self.gateway.policy, names=active)
         obligation = self._report_projection()
-        if (self.writing.professional_inputs and obligation['kind'] == 'report'
-                and obligation['evidence_contract'] == 'materials.v1'):
-            for row in schemas:
-                if row['function']['name'] == 'compose_document':
-                    row['function']['parameters'] = json.loads(json.dumps(row['function']['parameters']))
-                    parameters = row['function']['parameters']
-                    for field in ('goal', 'materials', 'sources'):
-                        parameters.get('properties', {}).pop(field, None)
-                    parameters['required'] = [field for field in parameters.get('required', [])
-                        if field not in {'goal', 'materials', 'sources'}]
+        for row in schemas:
+            if row['function']['name'] == 'compose_document':
+                row['function']['parameters'] = json.loads(json.dumps(row['function']['parameters']))
+            if row['function']['name'] == 'compose_document' and obligation.get('requirement') is not None:
+                parameters = row['function']['parameters']
+                parameters.get('properties', {}).pop('professional_review', None)
+            if (self.writing.professional_inputs and obligation['kind'] == 'report'
+                    and obligation['evidence_contract'] == 'materials.v1'
+                    and row['function']['name'] == 'compose_document'):
+                parameters = row['function']['parameters']
+                for field in ('goal', 'materials', 'sources'):
+                    parameters.get('properties', {}).pop(field, None)
+                parameters['required'] = [field for field in parameters.get('required', [])
+                    if field not in {'goal', 'materials', 'sources'}]
+                parameters['properties']['figures']['items'] = {'type': 'string', 'minLength': 1}
+                parameters['properties']['figures']['description'] = (
+                    'Optional existing image paths. The writing owner investigates the actual materials '
+                    'and authors/reconciles captions; the coordinator does not supply authoritative captions.')
+                row['function']['description'] = (
+                    'Complete the saved user report request using the writing owner. '
+                    'The owner investigates actual original materials, selects evidence and authors the article '
+                    'and captions, with the frozen report writing/review controls. Supply optional material_roots '
+                    'or prior_draft and reuse_prior_inputs for relevant unchanged evidence, not rewritten goals '
+                    'or preselected windows. Explicit adopt_draft independently checks an existing candidate '
+                    'rather than regenerating it. No execution, network, visual or scientific certification. '
+                    'Returns editable manuscript and review records for the same publication owner.')
         if self.state['config'].get('context_protocol') == 'conversation.v1':
             schemas = [{**row, 'function': {**row['function'],
                 'parameters': compact_json_schema(row['function']['parameters'])}} for row in schemas]

@@ -1156,32 +1156,19 @@ class ImplementationToolGateway:
                     windows.append({'request': arguments, **observed.data,
                         'role': 'retained_observed_material_not_certified_fact'})
                     supplied.add(coverage)
-            material_selection = None
-            if request.material_roots:
-                from simple_ar.tools.materials import implementation_materials
-                material_selection, client = implementation_materials(workspace=self.workspace,
-                    roots=request.material_roots, goal=request.goal,
-                    owner=ArtifactStore(owner.root / 'material-selection'), identity=identity,
-                    client_factory=lambda: self._client(identity),
-                    material_observations=self.material_observations)
-                windows.extend(material_selection['windows'])
-            direct_creation = (not request.files and project is None
-                and not owner.exists('selection-input.json')
-                and (not owner.exists('request.json') or saved_binding.get('generation_method') == 'direct_creation.v1'))
-            # This is goal/feedback context, never an observed file window. Keep
-            # it in the existing selection/request owner so recovery cannot
-            # substitute a newer user request or inspection for this attempt.
             context_role = 'user_request_and_accepted_feedback_not_source_or_authority'
             prior_inputs = saved_binding if owner.exists('request.json') else selection_input
             explicit_originals = None
-            if prior_inputs is not None:
-                windows.extend(row for row in prior_inputs['source_windows']
-                    if row.get('role') == context_role)
-            elif self.work_context is not None:
+
+            def freeze_context(*, material_roots: bool = False) -> dict:
                 from simple_ar.tools.materials import freeze_work_context
+                nonlocal explicit_originals
                 targets = ([str(project)] if project is not None else [])
                 targets.extend(str(self.workspace.resolve(row['request']['path']))
                     for row in windows if 'request' in row)
+                if material_roots:
+                    targets.extend(str(self.workspace.resolve_material_root(path))
+                        for path in request.material_roots)
                 # Validate complete explicit originals before asking for context.
                 if request.files:
                     explicit_originals = bind_implementation_originals(
@@ -1189,7 +1176,40 @@ class ImplementationToolGateway:
                     targets.extend(row['path'] for row in explicit_originals.values())
                 if retained:
                     targets.extend(row['path'] for row in retained['original_files'].values())
-                windows.append(freeze_work_context(self.work_context, list(dict.fromkeys(targets))))
+                return freeze_work_context(self.work_context, list(dict.fromkeys(targets)))
+
+            # Pin feedback before any material decisions. Historical selections
+            # retain their original goal and late context binding, even when
+            # only the material-selection receipt survived an interruption.
+            early_context = None
+            material_owner = ArtifactStore(owner.root / 'material-selection')
+            if request.material_roots:
+                if material_owner.exists('selection-input.json'):
+                    early_context = material_owner.read_json('selection-input.json').get('work_context')
+                elif prior_inputs is None and self.work_context is not None:
+                    early_context = freeze_context(material_roots=True)
+            material_selection = None
+            if request.material_roots:
+                from simple_ar.tools.materials import implementation_materials
+                material_selection, client = implementation_materials(workspace=self.workspace,
+                    roots=request.material_roots, goal=request.goal,
+                    owner=material_owner, identity=identity,
+                    client_factory=lambda: self._client(identity),
+                    material_observations=self.material_observations, work_context=early_context)
+                windows.extend(material_selection['windows'])
+            direct_creation = (not request.files and project is None
+                and not owner.exists('selection-input.json')
+                and (not owner.exists('request.json') or saved_binding.get('generation_method') == 'direct_creation.v1'))
+            # This is goal/feedback context, never an observed file window. Keep
+            # it in the existing selection/request owner so recovery cannot
+            # substitute a newer user request or inspection for this attempt.
+            if prior_inputs is not None:
+                windows.extend(row for row in prior_inputs['source_windows']
+                    if row.get('role') == context_role)
+            elif early_context is not None:
+                windows.append(early_context)
+            elif self.work_context is not None:
+                windows.append(freeze_context())
             if not request.files and not direct_creation and not retained:
                 selection, client = select_implementation_files(goal=request.goal,
                     request_binding=request.model_dump(), project=project, owner=owner, windows=windows,
@@ -1270,7 +1290,7 @@ class ImplementationToolGateway:
                 current, _ = implementation_materials(workspace=self.workspace,
                     roots=request.material_roots, goal=request.goal,
                     owner=ArtifactStore(owner.root / 'material-selection'), identity=identity,
-                    client_factory=lambda: self._client(identity))
+                    client_factory=lambda: self._client(identity), work_context=early_context)
                 if current != material_selection:
                     raise ValueError('Materials changed during generation; retain candidate without verification')
             if selection and project is not None and self.workspace.bind_inventory(project, identity=identity) != {

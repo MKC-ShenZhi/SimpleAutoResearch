@@ -535,7 +535,8 @@ def selected_material_windows(workspace: Any, selected: MaterialSelection,
 
 def implementation_materials(*, workspace: Any, roots: list[str], goal: str,
                              owner: Any, identity: str, client_factory: Any,
-                             material_observations: Callable[[list[str]], list[dict]] | None = None) -> tuple[dict, Any]:
+                             material_observations: Callable[[list[str]], list[dict]] | None = None,
+                             work_context: dict[str, Any] | None = None) -> tuple[dict, Any]:
     """Investigate read-only inputs separately from editable project selection.
 
     Saved complete observations can be reused, never failed model requests.
@@ -545,12 +546,17 @@ def implementation_materials(*, workspace: Any, roots: list[str], goal: str,
     resolved = list(dict.fromkeys(str(workspace.resolve_material_root(path)) for path in roots))
     inventories = material_inventories(workspace, resolved, identity=identity)
     inputs = {'goal': goal, 'roots': resolved, 'inventories': inventories}
+    retained = owner.read_json('selection-input.json') if owner.exists('selection-input.json') else None
+    # Presence belongs to the original selection contract; do not migrate
+    # historical selections when feedback support becomes available.
+    if (retained is None and work_context is not None
+            or retained is not None and 'work_context' in retained):
+        inputs['work_context'] = work_context
     client = None
-    if owner.exists('selection-input.json'):
-        retained = owner.read_json('selection-input.json')
+    if retained is not None:
         if 'journal_observations' in retained:
             inputs['journal_observations'] = retained['journal_observations']
-        if owner.read_json('selection-input.json') != inputs:
+        if retained != inputs:
             raise ValueError('Material selection inputs changed; preserve this attempt and use a new identity')
         if not owner.exists('selection-response.json'):
             raise ValueError('Interrupted material selection; inspect retained records and budget, no blind replay')
@@ -562,6 +568,8 @@ def implementation_materials(*, workspace: Any, roots: list[str], goal: str,
             'omitted_files': [{**row, 'path': workspace.locator(row['path'])} for row in item['omitted_files']],
             'scope': item['inventory_scope']} for item in inventories],
             'response_schema': MaterialSelection.model_json_schema()}
+        if 'work_context' in inputs:
+            context['work_context'] = inputs['work_context']
         if len(json.dumps(context, ensure_ascii=False).encode('utf-8')) > 128000:
             raise ValueError('Material selection inventory exceeds 128 KB; choose focused roots')
         seed = material_observation_seed(workspace=workspace, inventories=inventories,

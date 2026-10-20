@@ -2839,20 +2839,35 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self._accepted_report_tool(app, 'load_tools', {'names': ['compose_document']}, 'load-owner')
         schema = next(row['function']['parameters'] for row in app.schemas
             if row['function']['name'] == 'compose_document')
-        self.assertFalse({'goal', 'materials', 'sources'} & schema['properties'].keys())
+        self.assertFalse({'goal', 'materials', 'sources', 'professional_review'} & schema['properties'].keys())
+        self.assertEqual(schema['properties']['figures']['items'], {'type': 'string', 'minLength': 1})
         self.assertIn('goal', app.gateway.registry.get('compose_document').input_schema['properties'])
+        context = {'user_requests': list(app.state['requests']), 'review_observations': [
+            {'result': {'finding': 'Inspect the actual source before choosing evidence.'}}]}
+        app.writing.work_context = Mock(return_value=context)
         headings = app._report_projection()['requirement']['outline']
         fake.ask_json.side_effect = [
             {'read_windows': [{'path': 'source0/notes.txt'}]},
             {'materials': ['source0/notes.txt']},
             {'draft_markdown': '\n\n'.join('## ' + row['heading'] + '\n\nThe source is supplied, not verified.'
                 for row in headings) or 'The source is supplied, not verified.'}]
-        arguments = {'title': 'Source account'}
+        image = app.workspace.workspace / 'diagram.svg'
+        image.write_text('<svg xmlns="http://www.w3.org/2000/svg" width="60" height="30"><text x="2" y="20">Plot</text></svg>')
+        arguments = {'title': 'Source account', 'figures': [
+            {'path': 'workspace/diagram.svg', 'caption': 'Coordinator-invented authoritative caption'}]}
         produced = self._accepted_report_tool(app, 'compose_document', arguments, 'autonomous-writer')
         request = app.session.store.read_json('tools/writing/autonomous-writer/request.json')
         self.assertEqual(request['input_contract'], 'owner.v1')
         self.assertEqual(request['request']['goal'], app.state['requests'][0])
         self.assertEqual(request['request']['materials'][0]['path'], 'source0/notes.txt')
+        self.assertEqual(request['request']['figures'], ['workspace/diagram.svg'])
+        self.assertNotIn('Coordinator-invented authoritative caption', json.dumps(_writing_prompt(fake)))
+        selection = app.session.store.read_json('tools/writing/autonomous-writer/selection-input.json')
+        self.assertEqual(request['work_context'], selection['work_context'])
+        self.assertEqual(json.loads(fake.ask_json.call_args_list[0].args[1])['work_context'], request['work_context'])
+        app.writing.work_context.assert_called_once()
+        context['user_requests'].append('Later feedback cannot replace a saved investigation')
+        app.writing.work_context.side_effect = AssertionError('Recovery must retain original context')
         calls = fake.ask_json.call_count
         replay = _call_tool(app.gateway, 'compose_document', arguments, identity='autonomous-writer')
         self.assertEqual(replay.status, 'ok', replay.error)
@@ -12365,11 +12380,19 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
             {'read_windows': [*windows, {'path': str(distractor)}]},
             {'materials': selected_windows}, generated]
         identity = 'implementation-material-windows'
+        guidance = {'user_requests': [goal, 'Keep original input ordering.'],
+            'review_observations': [{'result': {'finding': 'Read the row-level records before choosing files.'}}]}
+        provider = Mock(return_value=guidance)
+        self.implementation.work_context = provider
         with patch.object(self.workspace, 'call', wraps=self.workspace.call) as reads:
             result = self._prepare_candidate(self.implementation, self.fake, arguments,
                 identity, calls=3)
         prompts = [json.loads(call.args[1]) for call in self.fake.ask_json.call_args_list]
         self.assertEqual(prompts[0]['goal'], goal)
+        self.assertEqual(prompts[0]['work_context']['work_context'], guidance)
+        self.assertEqual(prompts[1]['work_context'], prompts[0]['work_context'])
+        self.assertIn(prompts[0]['work_context'], prompts[2]['source_windows'])
+        provider.assert_called_once()
         self.assertEqual(prompts[0]['observations'], [])
         self.assertEqual([prompt['decisions_remaining'] for prompt in prompts[:2]], [6, 5])
         self.assertIsNone(prompts[2]['planned_files'])
@@ -12415,6 +12438,8 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
             self.assertIn(observation['data']['sha256'], json.dumps(binding))
         retained = {path: path.read_bytes() for path in owner.rglob('*.json')}
         accounted = self.ledger.to_dict()
+        guidance['user_requests'].append('Later feedback must not replace retained material decisions')
+        provider.side_effect = AssertionError('No feedback lookup while recovering completed work')
         with patch.object(self.implementation, '_client', side_effect=AssertionError('No replay model')) as client:
             replay = self._prepare_candidate(self.implementation, self.fake, arguments, identity, calls=3)
             self.assertEqual(replay.data, result.data)
@@ -12428,6 +12453,7 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(self.ledger.to_dict(), accounted)
         self.assertEqual((Path(result.data['project_dir']) / 'utility.py').read_text(),
             generated['files'][0]['content'])
+        self.implementation.work_context = None
 
         # Implementation shares the same capacity admission, including short
         # UTF-8 files whose default byte ceiling exceeds the remaining space.
@@ -13792,7 +13818,7 @@ class ConversationContextTests(unittest.TestCase):
     def test_conversation_v1_only_compacts_display_schemas_after_owner_filter(self):
         from simple_ar.tools.openai_schema import compact_json_schema
         _, _, app = self._fixture()
-        report = {'kind': 'report', 'evidence_contract': 'materials.v1'}
+        report = {'kind': 'report', 'evidence_contract': 'materials.v1', 'requirement': {}}
         app.writing.professional_inputs = True
         original_registry = {spec.name: json.dumps(spec.input_schema, sort_keys=True) for spec in app.gateway.list_specs()}
         with patch.object(app, '_report_projection', return_value=report), \
@@ -13806,7 +13832,8 @@ class ConversationContextTests(unittest.TestCase):
                 self.assertEqual(row['function']['parameters'], compact_json_schema(old['function']['parameters']))
                 self.assertEqual(row['function']['description'], old['function']['description'])
             compose = next(row['function']['parameters'] for row in new if row['function']['name'] == 'compose_document')
-            self.assertFalse({'goal', 'materials', 'sources'} & compose['properties'].keys())
+            self.assertFalse({'goal', 'materials', 'sources', 'professional_review'} & compose['properties'].keys())
+            self.assertNotIn('ComposeFigure', compose.get('$defs', {}))
             self.assertNotIn('SelectedSource', compose.get('$defs', {}))
             self.assertIn('title', compose['properties'])
             self.assertIn('title', compose['required'])

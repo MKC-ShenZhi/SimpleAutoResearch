@@ -573,6 +573,14 @@ class WritingToolGateway:
             if not selection_request[key]:
                 selection_request.pop(key)  # Preserve existing directory-selection receipt bindings.
         inputs = {'request': selection_request, 'inventories': inventories}
+        if retained is not None:
+            if 'work_context' in retained:
+                inputs['work_context'] = retained['work_context']
+        elif self.work_context is not None:
+            from simple_ar.tools.materials import freeze_work_context
+            targets = [*roots, *([request.prior_draft] if request.prior_draft else []),
+                *(row if isinstance(row, str) else row.path for row in request.figures)]
+            inputs['work_context'] = freeze_work_context(self.work_context, list(dict.fromkeys(targets)))
         if context_only_paths:
             inputs['prior_draft_role'] = 'context_only.v1'
         investigating = retained is None or retained.get('selection_method') == 'inspect_windows.v1'
@@ -608,6 +616,8 @@ class WritingToolGateway:
                 'response_schema': _MaterialSelection.model_json_schema()}
             if 'prior_draft' in inputs:
                 prompt['prior_draft'] = inputs['prior_draft']
+            if 'work_context' in inputs:
+                prompt['work_context'] = inputs['work_context']
             prompt = json.dumps(prompt, ensure_ascii=False)
             if len(prompt.encode('utf-8')) > 128000:
                 raise ValueError('Material selection inventory exceeds 128 KB; choose focused roots')
@@ -749,6 +759,13 @@ class WritingToolGateway:
                     and report_binding.get('evidence_contract') == 'materials.v1'):
                 if not recovering and (arguments.get('materials') or arguments.get('sources')):
                     raise ValueError('Professional writing selects its own evidence; supply material_roots or reuse_prior_inputs, not preselected windows')
+                if not recovering or all(isinstance(row, str) for row in original_binding['request']['figures']):
+                    # Keep valid asset locators, not coordinator-authored prose
+                    # promoted into an immutable publication requirement. Exact
+                    # user caption requirements remain in the original request.
+                    arguments = {**arguments, 'figures': [
+                        ComposeFigure.model_validate(row).path if isinstance(row, dict) else row
+                        for row in arguments.get('figures', [])]}
                 goal = original_binding['request']['goal'] if recovering else '\n\n'.join(report_binding['requests'])
                 if recovering and 'goal' in arguments and arguments['goal'] != goal:
                     raise ValueError('Retained professional request changed')
@@ -1112,6 +1129,8 @@ class WritingToolGateway:
             if recovering:
                 if 'work_context' in original_binding:
                     binding['work_context'] = original_binding['work_context']
+            elif owner.exists('selection-input.json') and 'work_context' in owner.read_json('selection-input.json'):
+                binding['work_context'] = owner.read_json('selection-input.json')['work_context']
             elif self.work_context is not None:
                 from simple_ar.tools.materials import freeze_work_context
                 targets = [str(self.workspace.resolve_source_record(row['path'])
