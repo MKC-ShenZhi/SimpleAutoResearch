@@ -457,6 +457,10 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
     def _record_file_observation(self, app, path, operation, identity):
         # A saved observation of fixture bytes, not an injected current-file summary.
+        if operation == 'read_file':
+            observed = app.workspace.call('read_file', {'path': str(path)}, identity=identity)
+            self.assertEqual(observed.status, 'ok', observed.error)
+            return self._record_native_turn(app, operation, {'path': str(path)}, observed.data, identity)
         raw = path.read_bytes()
         text = raw.decode('utf-8')
         return self._record_native_turn(app, operation,
@@ -880,6 +884,150 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 finally:
                     record.write_bytes(original)
                     subject.write_bytes(content)
+
+    def test_shared_observation_admission_preserves_large_generated_reads_and_history(self):
+        from simple_ar.tools.materials import material_inventories, material_observation_seed
+
+        _, inputs, fake, _, app, _ = self._native_fixture()
+        app.state['config']['tool_contracts'] = 'on_demand'
+        # The same byte protocol covers supplied sources, generated prose,
+        # plotting code and bibliography. None becomes independent evidence.
+        paths = [inputs / 'large.txt', app.workspace.workspace / 'manuscript.md',
+            app.workspace.workspace / 'plot.py', app.workspace.workspace / 'references.bib']
+        for index, path in enumerate(paths):
+            path.write_bytes(('已观察的材料\n' * 50000).encode('utf-8'))
+            self._record_parent_material_read(app, path, f'shared-window-{index}',
+                offset_bytes=9, max_bytes=73, full_digest=True)
+        app.state['requests'].append('Revise the retained report using the same original materials.')
+        app._save()
+        receipts = self._native_receipts(app, app.state['turns'])
+        ledger = app.ledger.to_dict()
+        state = json.loads(json.dumps(app.state))
+
+        def both_consumers():
+            roots = [str(path) for path in paths]
+            seed = material_observation_seed(workspace=app.workspace,
+                inventories=material_inventories(app.workspace, roots, identity='shared-observations'),
+                provider=app._material_observations, roots=roots, context={})
+            context = json.loads(app._messages(client=fake,
+                native_history_start_turn=len(app.state['turns']))[1]['content'])
+            return seed, context['retained_text_windows']
+
+        seed, windows = both_consumers()
+        self.assertEqual(len(seed['observations']), 4)
+        self.assertEqual(len(windows), 4)
+        for row in seed['observations']:
+            path = str(app.workspace.resolve(row['request']['path']))
+            window = next(window for window in windows if window['path'] == path)
+            self.assertEqual(window['text'], row['data']['text'])
+            self.assertEqual(window['sha256'], row['data']['sha256'])
+            self.assertEqual((window['offset_bytes'], window['next_offset_bytes']), (9, 82))
+            self.assertEqual(window['operation'], 'read_file')
+            self.assertNotIn('evidence_role', window)  # No role inferred from suffix/content.
+        # No guessed version for a large historical read without full_digest.
+        self._record_parent_material_read(app, paths[0], 'shared-no-version', max_bytes=73)
+        app.state['turns'] = [app.state['turns'][-1]]
+        self.assertEqual(both_consumers()[1], [])
+        app.state = state
+        loaded = ToolApplication.load(app.session.store.root)
+        self.assertEqual(json.loads(loaded._messages(client=fake,
+            native_history_start_turn=len(loaded.state['turns']))[1]['content'])['retained_text_windows'], windows)
+        self.assertEqual(self._native_receipts(app, app.state['turns']), receipts)
+        self.assertEqual(app.ledger.to_dict(), ledger)
+        self.assertEqual(app.state, state)
+
+    def test_shared_observation_cache_rechecks_bytes_permissions_and_receipts(self):
+        from simple_ar.tools.materials import (current_text_window, material_inventories,
+            material_observation_seed, observe_text_window, validate_material_observation)
+
+        _, inputs, _, _, app, _ = self._native_fixture()
+        source = inputs / 'notes.txt'
+        self._record_parent_material_read(app, source, 'shared-cache', max_bytes=23)
+        reference, = app._material_observations([str(source)])
+        record = app.workspace.resolve(reference['record'])
+        receipt = read_json(record)
+        indexed = observe_text_window({}, app.workspace, 'read_file', reference['request'], receipt['data'],
+            record=reference['record'], receipt_sha256=reference['receipt_sha256'], turn=0)
+        window, = indexed.values()
+        cache = {}
+        inventories = material_inventories(app.workspace, [str(source)], identity='cache-validation')
+        with patch.object(app.workspace, 'call', wraps=app.workspace.call) as reads, \
+                patch('simple_ar.tools.workspace.hashlib.file_digest', wraps=hashlib.file_digest) as hashes:
+            original = validate_material_observation(app.workspace, reference, identity='first', cache=cache)
+            self.assertEqual(current_text_window(app.workspace, window, cache=cache)['text'], original['data']['text'])
+            self.assertEqual(reads.call_count, 2)  # Windows always pass through their byte owner.
+            self.assertEqual(hashes.call_count, 1)
+            with patch.object(app.workspace, 'resolve', side_effect=ValueError('Authorization revoked')):
+                with self.assertRaisesRegex(ValueError, 'Authorization revoked'):
+                    current_text_window(app.workspace, window, cache=cache)
+            with _changed_record(record, {**receipt, 'status': 'blocked'}):
+                with self.assertRaisesRegex(ValueError, 'receipt changed'):
+                    current_text_window(app.workspace, window, cache=cache)
+            # A changed unread tail invalidates the old version even though
+            # this window's text is identical; cached reads cannot adopt it.
+            source.write_bytes(source.read_bytes() + b'UNREAD_CHANGE')
+            with self.assertRaisesRegex(ValueError, 'contents changed'):
+                current_text_window(app.workspace, window, cache=cache)
+            self.assertEqual(hashes.call_count, 2)
+        seed = material_observation_seed(workspace=app.workspace, inventories=inventories,
+            provider=lambda _: [reference], roots=[str(source)], context={})
+        self.assertEqual(seed['observations'], [])
+        self.assertEqual(len(seed['coverage']['not_admitted']), 1)
+
+    def test_workspace_digest_scope_reuses_versions_across_distinct_windows(self):
+        from simple_ar.tools.materials import read_material_window
+
+        _, inputs, _, _, app, _ = self._native_fixture()
+        source = inputs / 'digest-windows.txt'
+        raw = ('原始与生成内容\n' * 50000).encode('utf-8')
+        source.write_bytes(raw)
+        cache = {}
+        requests = [dict(path=str(source), full_digest=True, **window) for window in (
+            {'max_bytes': 73}, {'offset_bytes': 9, 'max_bytes': 101},
+            {'offset_bytes': 200, 'max_bytes': 80, 'max_lines': 1})]
+        digest_file = hashlib.file_digest
+        with patch('simple_ar.tools.workspace.hashlib.file_digest', wraps=hashlib.file_digest) as hashes:
+            for index, request in enumerate(requests):
+                observed = read_material_window(app.workspace, request, identity=f'digest-window-{index}', cache=cache)
+                self.assertEqual(observed['data']['sha256'], hashlib.sha256(raw).hexdigest())
+                start = request.get('offset_bytes', 0)
+                expected = raw[start:start + request['max_bytes']]
+                if 'max_lines' in request:
+                    expected = b''.join(expected.splitlines(keepends=True)[:request['max_lines']])
+                self.assertEqual(observed['data']['text'], expected.decode('utf-8', errors='replace'))
+                self.assertEqual(observed['data']['next_offset_bytes'], start + len(expected))
+            self.assertEqual(hashes.call_count, 1)
+            # Window admission remains per call; the cache cannot lift the
+            # byte owner's line-read restriction for a large file.
+            with self.assertRaisesRegex(ValueError, 'Line reads require'):
+                read_material_window(app.workspace, {**requests[0], 'start_line': 2},
+                    identity='digest-line-refused', cache=cache)
+            with patch.object(app.workspace, 'resolve', side_effect=ValueError('Authorization revoked')):
+                with self.assertRaisesRegex(ValueError, 'Authorization revoked'):
+                    read_material_window(app.workspace, requests[0], identity='digest-revoked', cache=cache)
+            # Same-size mutation outside every observed span invalidates the
+            # shared digest, even when the requested text stays identical.
+            source.write_bytes(raw[:-1] + b'!')
+            changed = read_material_window(app.workspace, requests[1], identity='digest-changed', cache=cache)
+            self.assertNotEqual(changed['data']['sha256'], hashlib.sha256(raw).hexdigest())
+            self.assertEqual(hashes.call_count, 2)
+            read_material_window(app.workspace, requests[2], identity='digest-changed-next', cache=cache)
+            self.assertEqual(hashes.call_count, 2)
+            # The dictionary is scoped to one invocation, never a gateway or
+            # persistent state. A new invocation must measure its own version.
+            read_material_window(app.workspace, requests[0], identity='digest-new-scope', cache={})
+            self.assertEqual(hashes.call_count, 3)
+        # A mutation during hashing must not publish or cache that mixed read.
+        def mutate_during_digest(handle, algorithm):
+            digest = digest_file(handle, algorithm)
+            source.write_bytes(source.read_bytes() + b'x')
+            return digest
+
+        interrupted_cache = {}
+        with patch('simple_ar.tools.workspace.hashlib.file_digest', side_effect=mutate_during_digest):
+            with self.assertRaisesRegex(ValueError, 'File changed during material read'):
+                read_material_window(app.workspace, requests[0], identity='digest-concurrent-change', cache=interrupted_cache)
+        self.assertEqual(interrupted_cache, {})
 
     def test_parent_material_seed_capacity_exposes_refusals_without_consuming_extra_decisions(self):
         from simple_ar.core.capabilities import ArtifactStore

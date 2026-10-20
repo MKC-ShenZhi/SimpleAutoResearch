@@ -7,7 +7,7 @@ User-visible changes, newest first. Entries describe behavior on their date; lat
 ## Unreleased — V2.10
 
 - **Runnable examples:** publish saved-result analysis and a robotics survey with original report/figure sources, offline rebuild instructions, file hashes and explicit development costs/human involvement.
-- **Continue existing work:** code and writing reuse version-checked original materials and completed producers. Feedback no longer lets stale selections hide new reads; explicit connection changes preserve the original task history and ledger.
+- **Continue existing work:** code, writing and coordinator context share version-checked material reads, including bounded windows from larger files. Different windows reuse a measured digest within one check; changed files and revoked access invalidate observations. Feedback preserves completed producers, task history and the original ledger.
 - **Execution and recovery:** validate requested runnable plans before publication, explain missing receipts without executing, and retain unknown charges and historical contracts. Approved local work can finish within remaining process resources after model capacity is exhausted.
 - **Writing and publishing:** trusted Pandoc templates, declared heading hierarchy and optional numeric citations; deliver canonical text with bound figures and references. Compilation does not certify scientific quality or venue compliance.
 - **Configuration and tools:** named connection timeouts, annotated task TOML, on-demand professional tool contracts and clearer goal/permission boundaries. No second task runtime or implicit budget expansion.

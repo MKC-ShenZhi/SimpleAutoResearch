@@ -64,11 +64,22 @@ def journal_read_windows(receipt: dict, request: dict) -> list[dict]:
     return []
 
 
-
-
 def observe_text_window(windows: dict, workspace: Any, name: str, arguments: dict,
-                        data: dict, *, record: str, turn: int) -> dict:
-    """Project reads and invalidate edited versions in the caller's transient view."""
+                        data: dict, *, record: str, turn: int,
+                        receipt_sha256: str) -> dict:
+    """Index original observations; defer byte/range admission to their owner.
+
+    Writes invalidate earlier versions but retain authored text as write context.
+    The index is transient and never changes journal or selection receipts.
+    """
+    if name == 'focus_work':
+        for row in journal_read_windows({'tool_name': name, 'status': 'ok', 'data': data}, arguments):
+            windows = observe_text_window(windows, workspace, 'read_file', row['request'], row['data'],
+                record=record, turn=turn, receipt_sha256=receipt_sha256)
+            key = (record, json.dumps(row['request'], sort_keys=True))
+            if key in windows:
+                windows[key]['reference']['input_index'] = row['input_index']
+        return windows
     try:
         locator = data.get('absolute_path') or data.get('path') or arguments.get('path', '')
         path = workspace.resolve(locator)
@@ -79,27 +90,80 @@ def observe_text_window(windows: dict, workspace: Any, name: str, arguments: dic
         return windows
     location, digest = str(path), data.get('sha256')
     windows = {key: value for key, value in windows.items()
-        if key[0] != location or (name == 'read_file' and value['sha256'] == digest)}
-    text = data.get('text') if name == 'read_file' else arguments.get('content') if name == 'write_file' else None
-    if not isinstance(text, str) or not text or not isinstance(digest, str) or len(digest) != 64:
+        if value['path'] != location or (name == 'read_file' and value['sha256'] == digest)}
+    if not isinstance(digest, str) or len(digest) != 64:
         return windows
     if name == 'read_file':
-        try:
-            request = FileWindow.model_validate(arguments)
-            end = data.get('next_offset_bytes',
-                data.get('offset_bytes', request.offset_bytes) + len(text.encode('utf-8')))
-            _, start, end, digest = observed_window_key(workspace, request, {**data, 'next_offset_bytes': end})
-        except (ValueError, KeyError, TypeError, OSError, RuntimeError):
-            return windows
+        reference = {'request': arguments, 'record': record, 'receipt_sha256': receipt_sha256}
+    elif name == 'write_file' and isinstance(arguments.get('content'), str) and arguments['content']:
+        reference = {'generated_text': arguments['content']}
     else:
-        start = 0
-        end = data.get('next_offset_bytes', len(text.encode('utf-8')))
-    windows = {key: value for key, value in windows.items()
-        if key[0] != location or not (start <= key[1] and key[2] <= end)}
-    windows[(location, start, end)] = {'path': location, 'sha256': digest,
-        'offset_bytes': start, 'next_offset_bytes': end, 'text': text,
+        return windows
+    # A write receipt owns one destination. Do not serialize/copy its entire
+    # generated body just to key a transient index. Focus reads can own several
+    # windows, so those still distinguish the original request parameters.
+    key = json.dumps(arguments, sort_keys=True) if name == 'read_file' else location
+    windows[(record, key)] = {
+        'path': location, 'sha256': digest, 'reference': reference,
         'record': record, 'operation': name, 'turn': turn}
     return windows
+
+
+def validate_material_observation(workspace: Any, reference: dict, *, identity: str,
+                                  cache: dict | None = None) -> dict:
+    """One current byte/version/range admission for journal and frozen reads.
+
+    Both consumers keep their own capacity policy. No input role is inferred:
+    a read of generated prose/code remains that read, never scientific proof.
+    """
+    request = FileWindow.model_validate(reference['request']).model_copy(update={'full_digest': True})
+    receipt = _journal_receipt(workspace, reference) if 'record' in reference else reference
+    data = receipt['data']
+    if 'data' in reference and reference['data'] != data:
+        raise ValueError('Parent material receipt differs from the frozen observation')
+    if not isinstance(data.get('sha256'), str) or len(data['sha256']) != 64:
+        raise ValueError('Material observation has no full-file version')
+    read_material_window(workspace, request.model_dump(exclude_unset=True), identity=identity,
+        expected=data, cache=cache)
+    return {'request': request.model_dump(exclude_unset=True), 'data': data,
+        **{key: reference[key] for key in ('record', 'receipt_sha256', 'input_index') if key in reference}}
+
+
+def current_text_window(workspace: Any, window: dict, *, cache: dict | None = None) -> dict:
+    """Project validated reads or authored write context in the historical shape."""
+    reference = window['reference']
+    if window['operation'] == 'read_file':
+        row = validate_material_observation(workspace, reference, identity='history-observation', cache=cache)
+        _, start, end, digest = observed_window_key(workspace, FileWindow.model_validate(row['request']), row['data'])
+        text = row['data']['text']
+        if not text:
+            raise ValueError('Empty historical material window')
+    else:
+        text = reference['generated_text']
+        raw = text.encode('utf-8')
+        digest = hashlib.sha256(raw).hexdigest()
+        # The write's original body is available even when it exceeds one read
+        # window. The same byte owner proves its current full-file version.
+        row = read_material_window(workspace, {'path': window['path'], 'max_bytes': 1,
+            'full_digest': True}, identity='history-authored-text', cache=cache)
+        if (digest != window['sha256'] or row['data']['sha256'] != digest
+                or row['data']['absolute_path'] != window['path']):
+            raise ValueError('Authored material version changed')
+        start, end = 0, len(raw)
+    return {key: value for key, value in window.items() if key != 'reference'} | {
+        'sha256': digest, 'offset_bytes': start, 'next_offset_bytes': end, 'text': text}
+
+
+def admit_text_window(retained: list[dict], observation: dict) -> list[dict] | None:
+    """Propose coverage replacement; the consumer commits only if capacity fits."""
+    def contains(outer: dict, inner: dict) -> bool:
+        return (outer['path'] == inner['path'] and outer['sha256'] == inner['sha256']
+            and outer['offset_bytes'] <= inner['offset_bytes']
+            and inner['next_offset_bytes'] <= outer['next_offset_bytes'])
+
+    if any(contains(existing, observation) for existing in retained):
+        return None
+    return [existing for existing in retained if not contains(observation, existing)] + [observation]
 
 
 def journal_material_references(workspace: Any, store: Any, turns: list[dict],
@@ -170,20 +234,16 @@ def material_observation_seed(*, workspace: Any, inventories: list[dict],
         return None
     visible = {path: size for item in inventories for path, size in item['candidate_files'].items()}
     observations, admitted, rejected, seen = [], [], [], set()
-    characters = 0
+    characters, cache = 0, {}
     for reference in references:
         coverage = {key: reference[key] for key in ('record', 'receipt_sha256', 'request', 'input_index') if key in reference}
         try:
-            request = FileWindow.model_validate(reference['request']).model_copy(update={'full_digest': True})
+            request = FileWindow.model_validate(reference['request'])
             path = workspace.resolve(request.path)
             if str(path) not in visible or str(path) in (excluded_paths or set()):
                 raise ValueError('outside_candidate_inventory_or_source_owner')
-            receipt = _journal_receipt(workspace, reference)
-            data = receipt['data']
-            # The byte owner proves the entire retained observation, including
-            # full digest, original path, measured range and has_more. Do not
-            # maintain another handwritten approximation of its read contract.
-            read_material_window(workspace, request.model_dump(exclude_unset=True), identity='material-seed', expected=data)
+            row = validate_material_observation(workspace, reference, identity='material-seed', cache=cache)
+            data = row['data']
             if not data['text']:
                 raise ValueError('empty_material_window')
             _, start, end, digest = observed_window_key(workspace, request, data)
@@ -193,9 +253,6 @@ def material_observation_seed(*, workspace: Any, inventories: list[dict],
                 raise ValueError('same_path_version_and_measured_window_already_supplied')
             if data['size_bytes'] != visible[str(path)]:
                 raise ValueError('current_size_changed')
-            row = {'request': request.model_dump(exclude_unset=True), 'data': data,
-                'record': reference['record'], 'receipt_sha256': reference['receipt_sha256'],
-                **({'input_index': reference['input_index']} if 'input_index' in reference else {})}
             if characters + len(data['text']) > 96000:
                 raise ValueError('observation_capacity')
             # Leave room for the normal capacity/admission fields. UTF-8 bytes,
@@ -353,18 +410,20 @@ def observed_window_key(workspace: Any, request: FileWindow, data: dict) -> tupl
 
 
 def read_material_window(workspace: Any, request: dict, *, identity: str,
-                         expected: dict | None = None) -> dict:
+                         expected: dict | None = None, cache: dict | None = None) -> dict:
     """Read through the byte owner; an old observation never adopts new bytes.
 
     Callers still own tool-policy admission. Equality includes the owner's
     absolute path, full digest and measured coverage, not just decoded text.
     """
-    actual = workspace.call('read_file', request, identity=identity)
+    actual = workspace.call('read_file', request, identity=identity,
+        **({'read_cache': cache} if cache is not None else {}))
     if actual.status != 'ok':
         raise ValueError(f'Material window unavailable: {actual.error}')
-    if expected is not None and actual.data != expected:
+    data = actual.data
+    if expected is not None and data != expected:
         raise ValueError('Inspected material contents changed; select the current window explicitly')
-    return {'request': request, 'data': actual.data}
+    return {'request': request, 'data': data}
 
 
 def selected_material_windows(workspace: Any, selected: MaterialSelection,
@@ -372,12 +431,9 @@ def selected_material_windows(workspace: Any, selected: MaterialSelection,
     """Revalidate inspected bytes and return only selected observed windows."""
     if selected.read_windows:
         raise ValueError('Material selection ended without a final selection')
-    observed, spans = {}, {}
+    observed, spans, cache = {}, {}, {}
     for row in observations:
-        if 'record' in row:
-            if _journal_receipt(workspace, row).get('data') != row['data']:
-                raise ValueError('Parent material receipt differs from the frozen observation')
-        read_material_window(workspace, row['request'], identity=identity, expected=row['data'])
+        validate_material_observation(workspace, row, identity=identity, cache=cache)
         observed[window_key(workspace, FileWindow.model_validate(row['request']))] = row
         if row['data'].get('sha256'):
             path, start, end, digest = observed_window_key(
@@ -417,7 +473,7 @@ def selected_material_windows(workspace: Any, selected: MaterialSelection,
                             break
             if possible:
                 actual = workspace.call('read_file', window.model_copy(update={
-                    'full_digest': True}).model_dump(exclude_unset=True), identity=identity)
+                    'full_digest': True}).model_dump(exclude_unset=True), identity=identity, read_cache=cache)
                 if actual.status == 'ok':
                     path, start, end, digest = observed_window_key(workspace, window, actual.data)
                     if covered(path, digest, start, end):

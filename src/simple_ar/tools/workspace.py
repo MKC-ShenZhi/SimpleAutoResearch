@@ -428,7 +428,8 @@ class WorkspaceToolGateway:
             raise ValueError("Generated output or attempt history is not original-source evidence")
         return path
 
-    def call(self, name: str, arguments: dict[str, Any], *, identity: str) -> ToolResult:
+    def call(self, name: str, arguments: dict[str, Any], *, identity: str,
+             read_cache: dict | None = None) -> ToolResult:
         try:
             if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,100}", identity):
                 raise ValueError("Invalid durable tool invocation identity")
@@ -526,9 +527,23 @@ class WorkspaceToolGateway:
                 elif name == "read_file":
                     # Digest is streamed; large files are not materialized or sent to the model.
                     with target.open("rb") as handle:
-                        size = os.fstat(handle.fileno()).st_size
+                        def version(stat: os.stat_result | None = None) -> tuple:
+                            stat = stat if stat is not None else os.fstat(handle.fileno())
+                            return (str(target), stat.st_dev, stat.st_ino, stat.st_size,
+                                stat.st_mtime_ns, stat.st_ctime_ns)
+
+                        before = version()
+                        size = before[3]
                         model.validate_read_size(size)
-                        digest = hashlib.file_digest(handle, "sha256").hexdigest() if size <= 256000 or model.full_digest else None
+                        digest = None
+                        if size <= 256000 or model.full_digest:
+                            # An internal caller owns this ephemeral dictionary.
+                            # Cache only an actual digest of this opened version,
+                            # independent of offset/byte/line limits. Every call
+                            # still resolves authority, opens and reads its window.
+                            digest = read_cache.get(before) if read_cache is not None else None
+                            if digest is None:
+                                digest = hashlib.file_digest(handle, "sha256").hexdigest()
                         offset = model.offset_bytes
                         if model.start_line is not None:
                             handle.seek(0)
@@ -540,6 +555,11 @@ class WorkspaceToolGateway:
                             raw = handle.read(model.max_bytes)
                             if 'max_lines' in model.model_fields_set:
                                 raw = b''.join(io.BytesIO(raw).readlines()[:model.max_lines])
+                        if (version() != before or self.resolve(model.path) != target
+                                or version(target.stat()) != before):
+                            raise ValueError('File changed during material read; inspect its current window')
+                        if read_cache is not None and digest is not None:
+                            read_cache[before] = digest
                     data = {"text": raw.decode("utf-8", errors="replace"), "sha256": digest,
                             "size_bytes": size, "next_offset_bytes": offset + len(raw),
                             "has_more": offset + len(raw) < size}

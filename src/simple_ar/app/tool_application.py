@@ -28,7 +28,10 @@ from simple_ar.tools.specs import CommonToolSpec, ToolCall, ToolResult
 from simple_ar.tools.workspace import (WorkspaceToolGateway, workspace_tool_specs,
     DeliveryRequest, FileWindow, validate_workspace_arguments, workspace_observation_view, workspace_history_identity,
     resolve_source_mount)
-from simple_ar.tools.materials import read_material_window, journal_material_references, observe_text_window
+from simple_ar.tools.materials import (
+    read_material_window, journal_material_references, observe_text_window,
+    current_text_window, admit_text_window,
+)
 from simple_ar.tools.sources import SourcePolicy, SourceToolGateway, source_tool_specs
 from simple_ar.tools.visual import VisualToolGateway, visual_tool_specs
 from simple_ar.tools.images import ImageToolGateway, image_tool_specs
@@ -1369,7 +1372,7 @@ class ToolApplication:
         blocks = []
         progress = []
         latest_execution = latest_failure = latest_tool_failure = None
-        text_windows: dict[tuple[str, int, int], dict[str, Any]] = {}
+        text_windows: dict[tuple[str, str], dict[str, Any]] = {}
         source_observations = []
         request_count = 1
         for turn in self.state["turns"]:
@@ -1404,9 +1407,10 @@ class ToolApplication:
                     # not another memory or a model-authored summary. Processes
                     # may change files; validate candidates once at selection,
                     # rather than discard observations or reread at each receipt.
-                    if name in {'read_file', 'write_file', 'edit_file', 'copy_file'}:
+                    if name in {'read_file', 'focus_work', 'write_file', 'edit_file', 'copy_file'}:
                         text_windows = observe_text_window(text_windows, self.workspace, name, arguments, data,
-                            record='records/' + item['result'].removeprefix('attempts/'), turn=len(blocks))
+                            record='records/' + item['result'].removeprefix('attempts/'), turn=len(blocks),
+                            receipt_sha256=hashlib.sha256(self.session.store.resolve(item['result']).read_bytes()).hexdigest())
                 outcomes.append(self._history_observation(call, result, item['result']))
                 if result.get('status') != 'ok' or result.get('error'):
                     failure_view = outcomes[-1]
@@ -1613,8 +1617,6 @@ class ToolApplication:
             'omission is not evidence of absence. Retained source passages are exact observed '
             'chunk windows bound to the unchanged original source-record bytes, not a summary, '
             'complete reading or verified support. Both collections share the same input capacity.')
-        current_digests: dict[str, str | None] = {}
-
         def input_cost() -> int:
             # One serialized capacity includes the material, native protocol,
             # indexes, contracts and the cost report itself. Separate fixed
@@ -1699,51 +1701,40 @@ class ToolApplication:
         project_archive(cutoff)
 
         candidates = []
-        for window in sorted(text_windows.values(), key=lambda value: value['turn'], reverse=True):
-            if explicit_inputs and window['path'] in {
-                    row.get('data', {}).get('absolute_path')
-                    for row in focus.get('inputs', focus.get('previous_inputs', []))}:
+        observation_reads: dict = {}
+        read_allowed = self.gateway.policy.is_allowed(self.gateway.registry.get('read_file'))[0]
+        focused_paths = {row.get('data', {}).get('absolute_path')
+            for row in focus.get('inputs', focus.get('previous_inputs', []))} if explicit_inputs else set()
+        for window in sorted(text_windows.values(), key=lambda value: value['turn'], reverse=True) if read_allowed else ():
+            if window['path'] in focused_paths:
                 continue  # The selected owner's revalidation above replaces this projection.
             if window['turn'] >= cutoff:
                 continue
-            observation = {key: value for key, value in window.items() if key != 'turn'}
-            location = window['path']
-            if location not in current_digests:
-                current_digests[location] = None
-                try:
-                    path = self.workspace.resolve(location)
-                    if path == Path(location) and path.is_file():
-                        with path.open('rb') as handle:
-                            raw = handle.read(256001)
-                        if len(raw) <= 256000 and self.workspace.resolve(location) == path:
-                            current_digests[location] = hashlib.sha256(raw).hexdigest()
-                except (ValueError, KeyError, OSError, RuntimeError):
-                    pass
-            if current_digests[location] == window['sha256']:
-                candidates.append({**observation, '_observed_turn': window['turn']})
+            try:
+                observation = current_text_window(self.workspace, window, cache=observation_reads)
+            except (ValueError, TypeError, KeyError, OSError, RuntimeError):
+                continue
+            candidates.append({key: value for key, value in observation.items() if key != 'turn'}
+                | {'_observed_turn': window['turn']})
         for window in self.sources.retained_passages(source_observations, before_turn=cutoff):
             candidates.append({key: value for key, value in window.items() if key != 'turn'}
                               | {'_observed_turn': window['turn']})
         # Supplement omitted native history with exact, revalidated originals.
-        def contains_text_window(outer: dict, inner: dict) -> bool:
-            return (outer['path'] == inner['path'] and outer['sha256'] == inner['sha256']
-                and outer['offset_bytes'] <= inner['offset_bytes']
-                and inner['next_offset_bytes'] <= outer['next_offset_bytes'])
-
         for candidate in sorted(candidates, key=lambda value: value['_observed_turn'], reverse=True):
             observation = {key: value for key, value in candidate.items() if key != '_observed_turn'}
             field = 'retained_source_passages' if 'passage' in observation else 'retained_text_windows'
             retained = context[field]
             previous = retained[:]
             if field == 'retained_text_windows':
-                if any(contains_text_window(existing, observation) for existing in retained):
+                proposed = admit_text_window(retained, observation)
+                if proposed is None:
                     continue
                 # Only a successfully admitted containing original replaces
                 # smaller windows. Keep them as fallback if it cannot fit;
                 # partial overlap alone never discards observed coverage.
-                retained[:] = [existing for existing in retained
-                    if not contains_text_window(observation, existing)]
-            retained.append(observation)
+                retained[:] = proposed
+            else:
+                retained.append(observation)
             if input_cost() > capacity:
                 retained[:] = previous
         recent = []
