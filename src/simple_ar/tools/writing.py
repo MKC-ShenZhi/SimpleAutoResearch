@@ -152,6 +152,12 @@ class ComposeFigure(BaseModel):
         return self
 
 
+class ProfessionalReview(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    max_revision_rounds: int = Field(default=0, ge=0, le=3,
+        description='Independent document inspection followed by at most this many existing editor revision rounds. Zero inspects only; unresolved findings remain explicit.')
+
+
 class ComposeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     goal: str = Field(min_length=1, max_length=16000)
@@ -170,6 +176,9 @@ class ComposeRequest(BaseModel):
         exclude_if=lambda value: value is None,
         description="Optional composition granularity, not a task type or model selector. article returns one complete draft; sections uses the existing planned section Writer and complete-response checkpoints for longer work. Omitted keeps the original article/frozen-report method. Does not add review, retries or budget; cannot replace a frozen report method.")
     target_words: int = Field(default=0, ge=0, le=20000)
+    professional_review: ProfessionalReview | None = Field(default=None,
+        exclude_if=lambda value: value is None,
+        description='Explicit bounded professional review for an unbound article, including prior_draft feedback. Uses the existing article reviewer/editor and task budget. Findings are not scientific certification. Frozen report controls cannot be replaced.')
     required_headings: list[str] = Field(default_factory=list, max_length=32,
         description="Optional ordered article-level section titles (case and presentation numbering ignored). Subsections remain free; title and references belong to publication. A missing or reordered heading rejects the retained response, without redrafting.")
     max_cited_sources: int = Field(default=0, ge=0,
@@ -234,7 +243,7 @@ class _AssemblyStore(ArtifactStore):
 def writing_tool_specs() -> list[CommonToolSpec]:
     specs = [CommonToolSpec(name="compose_document", domain="writing", permission_level="write_patch",
         risk_level="medium", input_schema=ComposeRequest.model_json_schema(),
-        description="Draft or rewrite an article from retained source questions/chunk IDs and/or local materials. Provide material_roots to delegate source/passage, file and figure selection, including the task evidence directory, or supply explicit inputs. Declared original bundles retain their provenance rather than becoming anonymous local text. Selection and writing share the task budget and existing inventory/Writer/assembly owners; native tasks use the configured writing connection when present, otherwise their task connection. A frozen report requirement executes its saved article/section method, adaptive planning and review/revision controls in this attempt. Execution reports automatically supply actual accepted execution evidence. Material reports can automatically select from bound mounted files and accepted source/table artifacts when explicit evidence selection is omitted. Unbound compositions have no automatic review. No network or execution. Reuse figures and a prior draft when relevant. Produces editable manuscript.md, references and local figure assets; export this same manuscript. Selection is bounded, not exhaustive reading; supplied results and figures are not independently verified."),
+        description="Draft or rewrite an article from retained source questions/chunk IDs and/or local materials. Provide material_roots to delegate source/passage, file and figure selection, including the task evidence directory, or supply explicit inputs. Declared original bundles retain their provenance rather than becoming anonymous local text. Selection and writing share the task budget and existing inventory/Writer/assembly owners; native tasks use the configured writing connection when present, otherwise their task connection. A frozen report requirement executes its saved article/section method, adaptive planning and review/revision controls in this attempt. Execution reports automatically supply actual accepted execution evidence. Material reports can automatically select from bound mounted files and accepted source/table artifacts when explicit evidence selection is omitted. Unbound articles can explicitly request professional_review for independent inspection and bounded correction through the existing article owner. No network or execution. Reuse figures and a prior draft when relevant. Produces editable manuscript.md, references and local figure assets; export this same manuscript. Selection is bounded, not exhaustive reading; supplied results and figures are not independently verified."),
         CommonToolSpec(name="review_document", domain="writing", permission_level="write_patch",
             risk_level="medium", input_schema=ReviewRequest.model_json_schema(),
             description="Independently inspect an existing prior_draft against the goal and retained source/material evidence using the existing document reviewer. Shares composition's evidence selection, version binding and model budget, but never drafts or rewrites the manuscript. Saves review.json with concrete findings, evidence/draft quotes and review_status; needs_revision is not an accepted correction. No search, execution, automatic correction or visual inspection; use inspect_images for rendered figures. Complete responses recover without another call; unknown/rejected responses are not resent.")]
@@ -701,7 +710,7 @@ class WritingToolGateway:
         from simple_ar.report.schema import ReportContext, ReportRuntimeConfig, ReportSectionPlan, ReportDocumentPlan, SourceHandle, ReportMemory
         from simple_ar.report.templates import load_report_template_bundle, intended_use_guidance
         from simple_ar.report.writing import (ARTICLE_OWNER, SECTION_ARTICLE_OWNER,
-            article_writing_inputs, write_whole_article, write_section_article)
+            article_writing_inputs, run_composition_article, write_section_article)
         from simple_ar.research.documents.ingest import DocumentBundle
         from simple_ar.research.contracts import DocumentRecord, TextChunk
         from simple_ar.research.store.retrieval import rank_source_chunks
@@ -738,6 +747,9 @@ class WritingToolGateway:
             prepared_delivery = self.workspace.resolve_delivery(delivery) if delivery is not None else None
             delivery_inputs = self.workspace.artifact_hashes(prepared_delivery['artifacts']) if prepared_delivery else {}
             report_binding = self.report_inputs() if self.report_inputs and not inspecting else None
+            if request.professional_review is not None and (inspecting or report_binding is not None
+                    or request.writing_method == 'sections'):
+                raise ValueError('professional_review requires unbound article composition; frozen report controls remain authoritative')
             if (report_binding is not None and request.writing_method is not None
                     and request.writing_method != report_binding['requirement']['method']):
                 raise ValueError('Composition cannot replace the frozen report writing method')
@@ -1260,6 +1272,13 @@ class WritingToolGateway:
                     notes=memory.outline_planning.get('source_notes', []))
                 assembly_mode = ReportAssemblyMode.WHOLE_ARTICLE if requirement['method'] == 'article' else ReportAssemblyMode.SECTION_DRAFTS
             elif writing_owner == ARTICLE_OWNER:
+                if request.professional_review is not None:
+                    config.reviewer = 'llm'
+                    config.document_review = True
+                    config.review_scope = 'document'
+                    config.draft_scope = 'document'
+                    config.max_review_iterations = request.professional_review.max_revision_rounds
+                    config.longform.target_words = request.target_words
                 citation_contract_enabled = (not recovering or
                     'citation_contract' in writer_store.read_json('report_inputs.json').get('inputs', {}).get('article', {}))
                 inputs = article_writing_inputs(report_context=context, documents=documents, binding=binding,
@@ -1272,8 +1291,20 @@ class WritingToolGateway:
                 if not recovering:
                     client = client or (self.client_factory(identity) if self.client_factory else LLMClient.from_env(
                         self.model, budget_ledger=self.ledger, budget_session_id=self.session_id, budget_attempt_id=identity))
-                written = write_whole_article(store=writer_store, inputs=inputs, identity=identity,
-                    client=client, recovering=recovering)
+                result = run_composition_article(store=writer_store, inputs=inputs, identity=identity, client=client)
+                writer_ref = next(row for row in result.artifacts if row.kind == 'report_writer_result')
+                written = writer_store.read_json(writer_ref.path)
+                if request.professional_review is not None:
+                    completed = {'writer_path': writer_ref.path,
+                        'writer_sha256': hashlib.sha256(writer_store.resolve(writer_ref).read_bytes()).hexdigest()}
+                    if owner.exists('professional_result.json'):
+                        if owner.read_json('professional_result.json') != completed:
+                            raise ValueError('Reviewed article producer changed; no replacement')
+                    else:
+                        owner.write_json('professional_result.json', completed)
+                    review = written['independent_review']
+                    if result.status != 'completed':
+                        unresolved.append({'type': 'incomplete_independent_review', 'review_status': review['review_status']})
                 if written['source_notes']:
                     context, _ = apply_report_bibliography(context, documents=documents,
                         notes=written['source_notes'])
@@ -1431,6 +1462,10 @@ class WritingToolGateway:
                 'summary': 'New manuscript.md and references saved. Edit and export this same canonical body; inspect source claims before delivery.'}
             if material_selection is not None:
                 data['data']['material_selection'] = material_selection
+            if request.professional_review is not None:
+                data['data'].update(unresolved=unresolved, independent_review=written['independent_review'],
+                    scope='Professionally inspected article; unresolved findings remain explicit. Not scientific certification.')
+                data['summary'] = 'Canonical manuscript saved; independent review: ' + written['independent_review']['review_status'] + '.'
             if report_binding is not None:
                 data['data'].update(report_binding=report_binding, unresolved=unresolved,
                     constraints_checked=constraints_checked,

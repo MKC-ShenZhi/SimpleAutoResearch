@@ -225,7 +225,16 @@ def completed_composition_writer(*, store: ArtifactStore, binding: dict[str, Any
             raise ValueError('Standalone article has a professional Writer projection')
         if not writer.exists('writer.json'):
             raise ValueError('Prior article has no completed Writer result; no parent recovery')
-        write_whole_article(store=writer, inputs=snapshot['inputs'], identity=identity, recovering=True)
+        result = run_composition_article(store=writer, inputs=snapshot['inputs'], identity=identity)
+        if binding['request'].get('professional_review') is not None:
+            completed = store.read_json('professional_result.json')
+            produced = next(row for row in result.artifacts if row.kind == 'report_writer_result')
+            review_status = writer.read_json(produced.path)['independent_review']['review_status']
+            if result.status != ('failed' if review_status == 'needs_revision' else 'completed'):
+                raise ValueError('Reviewed article status differs from its recovered inspection')
+            if (produced.path != completed['writer_path'] or hashlib.sha256(
+                    writer.resolve(produced).read_bytes()).hexdigest() != completed['writer_sha256']):
+                raise ValueError('Reviewed article differs from its recovered adopted producer')
     elif owner == SECTION_ARTICLE_OWNER:
         if not all(writer.exists(path) for path in ('writer.json', 'sections.json')):
             raise ValueError('Prior section article has no completed Writer result; no parent recovery')
@@ -572,6 +581,23 @@ class ReportWritingRequest:
     emit: Callable[[str], None] | None = None
     method: Literal['article', 'sections'] = 'sections'
     prior_draft: str = ''
+    composition_inputs: dict[str, Any] | None = None
+
+
+def run_composition_article(*, store: ArtifactStore, inputs: dict[str, Any], identity: str,
+                            client: Any = None) -> CapabilityResult:
+    """Adapt native composition to the shared article owner, preserving saved inputs."""
+    from simple_ar.report.templates import load_report_template_bundle
+    config = ReportRuntimeConfig.model_validate(inputs['assembly_config'])
+    article = inputs['article']
+    context = ReportContext(topic=article['title'], report_mode='supplied_materials', goal_markdown=article['goal'],
+        source_handles=article['source_handles'], papers=article['bibliography'],
+        citation_key_map=article['citation_key_map'])
+    template = load_report_template_bundle(report_mode=context.report_mode, config=config)
+    memory = initialize_report_memory(context=context, template=template)
+    return run_report_writing_capability(context=CapabilityContext(store, AttemptManifest(identity)),
+        request=ReportWritingRequest(context, memory, config, template, client, method='article',
+            prior_draft=article.get('prior_draft', ''), composition_inputs=inputs))
 
 
 def _writing_identity(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -961,7 +987,9 @@ def _edit_article(*, store: ArtifactStore, retained: ArtifactStore, written: dic
             identity=f'{written["source_attempt"]}:revision-{event.iteration}',
             client=None if recover_only else request.llm_client,
             report_context=request.report_context, config=config, template=request.template,
-            markdown=candidate[0].draft_markdown, target_words=config.longform.target_words)
+            markdown=candidate[0].draft_markdown, target_words=config.longform.target_words,
+            required_headings=([row['heading'] for row in inputs['article'].get('constraints', {}).get('outline', [])]
+                if request.composition_inputs is not None else ()))
         inspections[event.iteration] = checked_reviews(result, candidate[0].draft_markdown)
         return inspections[event.iteration]
 
@@ -1027,7 +1055,7 @@ def _run_article_writing(*, context: CapabilityContext, request: ReportWritingRe
         config=config, template=request.template,
         sources=tuple(ref for ref in context.inputs if ref != request.resume_ref), prior_draft=request.prior_draft)
     projection_ref = context.store.ref('report_snapshot.json', kind='report_snapshot', schema='report_snapshot.v1')
-    inputs = article_writing_inputs(report_context=report_context, documents=documents, binding=binding,
+    inputs = request.composition_inputs if request.composition_inputs is not None else article_writing_inputs(report_context=report_context, documents=documents, binding=binding,
         config=config, title=report_context.topic,
         goal=report_context.goal_markdown or memory.objective or report_context.topic,
         target_words=config.longform.target_words, prior_draft=request.prior_draft,
@@ -1038,16 +1066,24 @@ def _run_article_writing(*, context: CapabilityContext, request: ReportWritingRe
     written = write_whole_article(store=context.store, inputs=inputs, identity=context.attempt.attempt_id,
         client=request.llm_client, recovering=context.store.exists('report_inputs.json'),
         resume_store=ArtifactStore(context.require_input(request.resume_ref).parent) if request.resume_ref else None)
+    if article_inspection_enabled(config) and 'memory' not in written:
+        written = {**written, 'memory': request.memory.model_dump(mode='json')}
     writer_path, status, diagnostics = 'writer.json', 'completed', ('Whole article drafted without independent writing review or source backtracking.',)
     if article_inspection_enabled(config):
         review_store = _writing_child(context.store, 'review')
         report = inspect_article(store=review_store, identity=written['source_attempt'], client=request.llm_client,
             report_context=report_context, config=config, template=request.template,
             markdown=written['sections'][0]['draft_markdown'], target_words=config.longform.target_words,
+            required_headings=([row['heading'] for row in inputs['article'].get('constraints', {}).get('outline', [])]
+                if request.composition_inputs is not None else ()),
             resume_store=ArtifactStore(retained.root / 'review') if request.resume_ref else None)
         reviewed = {**written, 'independent_review': report}
         reviewed['memory'] = {**written['memory'], 'reviewer_findings': [*written['memory']['reviewer_findings'],
             *(finding for row in report['section_reviews'] for finding in row['findings'])]}
+        # Historical structured zero-round inspections publish a qualified
+        # candidate. Native composition reports unresolved status explicitly.
+        if request.composition_inputs is not None:
+            status = 'failed' if report['review_status'] == 'needs_revision' else 'completed'
         if config.max_review_iterations > 0:
             edited = _edit_article(store=context.store, retained=retained, written=written,
                 inputs=inputs, request=request, initial_review=report)
@@ -1068,5 +1104,6 @@ def _run_article_writing(*, context: CapabilityContext, request: ReportWritingRe
             + (f'bounded to {config.max_review_iterations} candidate round(s), original responses retained.'
                if config.max_review_iterations else 'no automatic correction was requested.'),)
     return CapabilityResult(status=status, artifacts=(
-        context.store.ref('report_inputs.json', kind='article_snapshot', schema=ARTICLE_OWNER), projection_ref,
+        context.store.ref('report_inputs.json', kind='article_snapshot', schema=ARTICLE_OWNER),
+        *((projection_ref,) if request.composition_inputs is None else ()),
         context.store.ref(writer_path, kind='report_writer_result', schema=ARTICLE_OWNER)), diagnostics=diagnostics)

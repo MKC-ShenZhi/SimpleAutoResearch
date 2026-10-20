@@ -35,6 +35,114 @@ from simple_ar.report.schema import (
 from simple_ar.report.writing import ARTICLE_OWNER, ReportWritingRequest, inspect_article, resolve_report_writing_config, resolve_report_writing_resume, run_report_writing_capability, validate_report_writing_config
 
 
+class CompositionArticleOwnerTests(unittest.TestCase):
+    def test_reviewed_composition_feedback_recovery_and_evidence_admission(self):
+        from simple_ar.core.budget import BudgetLedger
+        from simple_ar.tools.workspace import WorkspaceToolGateway
+        from simple_ar.tools.writing import WritingToolGateway
+
+        for rounds, pending in ((0, False), (0, True), (1, True)):
+            with self.subTest(rounds=rounds, pending=pending), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = root / 'values.csv'
+                source.write_text('run,score\nfirst,0.75\n', encoding='utf-8')
+                task = root / 'task'
+                task.mkdir()
+                ledger = BudgetLedger()
+                workspace = WorkspaceToolGateway(task, {'source0': source}, ledger)
+                calls = []
+                drafts = []
+
+                class Client:
+                    def ask_json(self, system, prompt, *, label='', **options):
+                        calls.append((label, options.get('budget_call_id')))
+                        view = json.loads(prompt)
+                        if label == 'composition-article':
+                            drafts.append(view)
+                            return {'draft_markdown': 'Recorded score 0.75. '
+                                + ('One supplied run; uncertainty unmeasured.' if len(drafts) > 1 else 'Limited observation.')}
+                        if label != 'article-independent-review':
+                            raise AssertionError('Unexpected model request: ' + label)
+                        if pending and len(drafts) == 1:
+                            return {'section_reviews': [{'section_id': 'document', 'verdict': 'revise_required',
+                                'findings': [{'finding_id': 'extent', 'type': 'structure', 'severity': 'major',
+                                    'required_action': 'revise', 'message': 'Clarify the observation limits.'}]}]}
+                        return {'section_reviews': [{'section_id': 'document', 'verdict': 'pass'}]}
+
+                gateway = WritingToolGateway(task, workspace, ledger, 'fixture', 'task',
+                    client_factory=lambda _: Client())
+                request = {'goal': 'Explain the recorded observation.', 'title': 'Observation',
+                    'materials': [{'path': 'source0'}],
+                    'professional_review': {'max_revision_rounds': rounds}}
+                produced = gateway.call('compose_document', request, identity='reviewed-native')
+                self.assertEqual(produced.status, 'ok', produced.error)
+                expected = 'needs_revision' if pending and not rounds else 'reviewed'
+                self.assertEqual(produced.data['independent_review']['review_status'], expected)
+                self.assertEqual(bool(produced.data['unresolved']), expected == 'needs_revision')
+                self.assertEqual(len(calls), 4 if pending and rounds else 2)
+                self.assertEqual(calls[0], ('composition-article', 'reviewed-native:article'))
+                parent = task / 'tools/writing/reviewed-native'
+                original = {p: p.read_bytes() for p in parent.rglob('*') if p.is_file()}
+                if pending and rounds:
+                    completed = json.loads((parent / 'professional_result.json').read_text())
+                    adopted = json.loads((parent / 'writer' / completed['writer_path']).read_text())
+                    self.assertIsNotNone(adopted['adopted_revision'])
+                with patch.object(gateway, 'client_factory', side_effect=AssertionError('No replay calls')):
+                    replay = gateway.call('compose_document', request, identity='reviewed-native')
+                self.assertEqual(replay.status, 'ok', replay.error)
+                self.assertEqual(replay.data, produced.data)
+                feedback = {'goal': 'Clarify the limits using the same observations.', 'title': 'Revised observation',
+                    'prior_draft': produced.data['editable_markdown'], 'reuse_prior_inputs': True,
+                    'professional_review': {'max_revision_rounds': 0}}
+                with patch.object(gateway, '_select_materials', side_effect=AssertionError('No reselection')):
+                    revised = gateway.call('compose_document', feedback, identity='feedback-native')
+                self.assertEqual(revised.status, 'ok', revised.error)
+                self.assertIn('0.75', json.dumps(drafts[-1]['source_handles']))
+                self.assertTrue(drafts[-1]['prior_draft'])
+                self.assertEqual({p: p.read_bytes() for p in parent.rglob('*') if p.is_file()}, original)
+                with patch.object(gateway, 'client_factory', side_effect=AssertionError('No admission calls')) as factory:
+                    replay = gateway.call('compose_document', feedback, identity='feedback-native')
+                    self.assertEqual(replay.status, 'ok', replay.error)
+                    with changed_record(parent / 'writer/review/response.json', None):
+                        rejected = gateway.call('compose_document', feedback, identity='broken-review')
+                        self.assertEqual(rejected.status, 'error')
+                    with changed_record(source, b'run,score\nfirst,9.0\n'):
+                        rejected = gateway.call('compose_document', feedback, identity='changed-evidence')
+                        self.assertEqual(rejected.status, 'error')
+                    factory.assert_not_called()
+                self.assertEqual({p: p.read_bytes() for p in parent.rglob('*') if p.is_file()}, original)
+
+    def test_optional_review_preserves_historical_request_shape(self):
+        from pydantic import ValidationError
+        from simple_ar.tools.writing import ComposeRequest
+        request = ComposeRequest(goal='Revise from evidence', title='Article')
+        self.assertNotIn('professional_review', request.model_dump(mode='json'))
+        revised = ComposeRequest(goal=request.goal, title=request.title, prior_draft='draft.md',
+            professional_review={'max_revision_rounds': 1})
+        self.assertEqual(revised.professional_review.max_revision_rounds, 1)
+        with self.assertRaises(ValidationError):
+            ComposeRequest(goal=request.goal, title=request.title,
+                professional_review={'max_revision_rounds': 4})
+
+    def test_native_adapter_keeps_exact_inputs_and_shared_owner(self):
+        from simple_ar.report.writing import run_composition_article
+        config = ReportRuntimeConfig(outline_strategy='template', reviewer='disabled',
+            document_review=False, max_review_iterations=0, allow_source_backtracking=False)
+        inputs = {'binding': {'request': {'goal': 'Original'}},
+            'assembly_config': config.model_dump(mode='json'),
+            'article': {'title': 'Original', 'goal': 'Revise', 'target_words': 0,
+                'source_handles': [], 'bibliography': [], 'citation_key_map': {},
+                'prior_draft': 'Existing draft'}}
+        with tempfile.TemporaryDirectory() as tmp, patch(
+                'simple_ar.report.writing.run_report_writing_capability') as owner:
+            run_composition_article(store=ArtifactStore(Path(tmp)), inputs=inputs, identity='same-call')
+        passed = owner.call_args.kwargs
+        self.assertIs(passed['request'].composition_inputs, inputs)
+        self.assertEqual(passed['request'].prior_draft, 'Existing draft')
+        self.assertEqual(passed['context'].attempt.attempt_id, 'same-call')
+        self.assertEqual(passed['request'].method, 'article')
+
+
 class ReportAuditCapabilityTests(unittest.TestCase):
     @staticmethod
     def report_session(root, identity, *, audit=False):

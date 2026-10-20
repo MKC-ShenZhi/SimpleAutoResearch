@@ -2761,6 +2761,19 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertNotIn('ReportDelivery', json.dumps(legacy.schemas))
 
     def test_versioned_report_declaration_inherits_and_requires_explicit_user_replacement(self):
+        _, _, _, _, reviewed_app, _ = self._native_fixture(report_protocol='canonical_report.v1')
+        reviewed = self._report_intent(reviewed_app, 'reviewed-intent', method='article',
+            professional_review={'max_revision_rounds': 1})
+        controls = reviewed.data['report_requirement']['config']
+        self.assertEqual((controls['reviewer'], controls['document_review'], controls['max_review_iterations']),
+            ('llm', True, 1))
+        reviewed_app.state['requests'].append('Clarify the same report.')
+        inherited = self._report_intent(reviewed_app, 'inherited-review')
+        self.assertEqual(inherited.data['report_requirement'], reviewed.data['report_requirement'])
+        blocked = _call_tool(reviewed_app.gateway, 'update_work_plan', {'report_intent': {
+            'kind': 'report', 'request_index': 1, 'quote': reviewed_app.state['requests'][-1],
+            'professional_review': {'max_revision_rounds': 2}}}, identity='no-hidden-review-expansion')
+        self.assertNotEqual(blocked.status, 'ok')
         _, _, _, _, app, _ = self._native_fixture(report_protocol='canonical_report.v1')
         first = self._report_intent(app, 'intent-first', method='article', formats=['pdf'])
         original = first.data['report_requirement']
@@ -4569,7 +4582,9 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 (True, ['Verification failed; code retained'], 'partial')):
             with self.subTest(failed=failed, unresolved=unresolved):
                 _, _, fake, _, app, _ = self._native_fixture(
-                    mount_inputs=False, max_turns=3 if failed and not unresolved else 2)
+                    # Exercise ordinary multi-action verification. The separate
+                    # last-decision test owns the single terminal contract.
+                    mount_inputs=False, max_turns=3)
                 source = app.workspace.workspace / 'value.txt'
                 source.write_text('before')
                 batch = self._native_message('edit_file', {'path': str(source),
@@ -5683,6 +5698,15 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 assistants = [message for message in messages[2:] if message['role'] == 'assistant']
                 windows = [row for row in context['retained_text_windows'] if row['path'] == str(original_path)]
                 self.assertEqual([row['text'] for row in windows], [original_text])
+                closing_schemas = app._closing_schemas()
+                self.assertLessEqual(estimate_tokens(json.dumps(closing_schemas, ensure_ascii=False)),
+                    estimate_tokens(json.dumps(app.schemas, ensure_ascii=False)))
+                closing_messages = app._messages(client=fake, closing=True, schemas=closing_schemas)
+                closing_context = json.loads(closing_messages[1]['content'])
+                closing_windows = [row for row in closing_context['retained_text_windows']
+                    if row['path'] == str(original_path)]
+                self.assertEqual([row['text'] for row in closing_windows], [original_text])
+                self.assertFalse(closing_context['resources']['context_exceeds_input_target'])
                 for window in windows:
                     self.assertEqual(window['sha256'], hashlib.sha256(original_path.read_bytes()).hexdigest())
                 self.assertEqual(context['requests'], app.state['requests'])
@@ -5971,10 +5995,13 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
     def test_native_cached_closing_contract_survives_load_and_supply_without_replay(self) -> None:
         from simple_ar.integrations.llm import LLMClient, LLMSettings, estimate_tokens
 
-        for mode in ('required', 'read', 'misordered', 'terminal', 'terminal_process', 'false', 'missing_field', 'missing_receipt'):
+        for mode in ('required', 'read', 'misordered', 'batch', 'historical_batch', 'terminal', 'terminal_process', 'question', 'false', 'missing_field', 'missing_receipt'):
             with self.subTest(mode=mode):
                 # Exercise the public creation default, not a test-only opt-in.
                 _, _, _, _, app, _ = self._native_fixture(mount_inputs=False, max_turns=1)
+                if mode == 'question':
+                    app.state['config']['tool_contracts'] = 'on_demand'
+                    app._save()
                 self.assertEqual(app.state['config']['completion_policy'], 'closing_decision.v2')
                 app.supply(supply_id='keep-v2', reason='Retain historical decision contract',
                     changes={'allow_execution': True})
@@ -5993,6 +6020,11 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                         'argv': ['python', '-c', "from pathlib import Path; Path('result.txt').write_text('Cached proposal')"],
                         'timeout_sec': 3, 'delivery': {'summary': 'Explicit output',
                             'artifacts': ['workspace/result.txt']}}, 'finish')
+                elif mode == 'question':
+                    message = self._native_message('ask_user', {'question': 'Authorize reduced scope?'}, 'ask')
+                elif mode in ('batch', 'historical_batch'):
+                    message['tool_calls'] += self._native_message('deliver_result', {
+                        'summary': 'Saved output', 'artifacts': ['workspace/result.txt']}, 'deliver')['tool_calls']
                 client = LLMClient(LLMSettings(api_key='fixture', model='fixture', api_mode='chat',
                     retry_attempts=0, max_output_tokens=512))
                 def bound(attempt_id='', **_):
@@ -6006,15 +6038,31 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     app.run(progress=lambda _: None)
                 self.assertEqual(send.call_count, 1)
                 request = send.call_args.args[1]
-                self.assertEqual(request['tools'], app.schemas)
+                self.assertEqual(request['tools'], app._closing_schemas())
+                contracts = {row['function']['name']: row['function']['parameters'] for row in request['tools']}
+                self.assertTrue({'deliver_result', 'ask_user'} <= contracts.keys())
+                self.assertFalse({'read_file', 'list_directory', 'focus_work', 'load_tools', 'read_history'} & contracts.keys())
+                self.assertFalse({'review_document', 'execute_implementation', 'measure_experiment',
+                    'analyze_measurements'} & contracts.keys())
+                self.assertLessEqual(contracts.keys(), {row['function']['name'] for row in app.schemas})
+                for name, parameters in contracts.items():
+                    if name not in ('deliver_result', 'ask_user'):
+                        self.assertIn('delivery', parameters['required'])
+                        delivery = parameters['properties']['delivery']
+                        self.assertNotIn('default', delivery)
+                        self.assertNotIn({'type': 'null'}, delivery.get('anyOf', []))
                 self.assertTrue(json.loads(request['messages'][1]['content'])[
                     'resources']['decision_budget']['closing_required'])
                 path = 'attempts/native-turn-0001/decision_budget.json'
                 budget = app.session.store.read_json(path)
                 self.assertTrue(budget['closing_required'])
+                self.assertEqual(budget['closing_action_contract'], 'single_terminal.v1')
                 self.assertEqual(budget['estimated_followup_tokens'],
-                    app._decision_tokens(client, request['messages']))
-                if mode == 'missing_receipt':
+                    app._decision_tokens(client, request['messages'], schemas=request['tools']))
+                if mode == 'historical_batch':
+                    budget.pop('closing_action_contract')
+                    app.session.store.write_json(path, budget)
+                elif mode == 'missing_receipt':
                     app.session.store.resolve(path).unlink()
                 elif mode in ('false', 'missing_field'):
                     if mode == 'false':
@@ -6035,10 +6083,10 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                         with patch.object(app, '_client', side_effect=bound):
                             status = app.run(approved_execution=token, progress=lambda _: None)
                 replay.assert_not_called()
-                cancelled = mode in ('required', 'read', 'misordered')
-                self.assertEqual(status['status'], 'completed' if mode in ('terminal', 'terminal_process') else 'paused')
-                self.assertEqual((app.workspace.workspace/'result.txt').exists(), not cancelled)
-                self.assertEqual(app.session.store.exists('delivery.json'), mode in ('terminal', 'terminal_process'))
+                cancelled = mode in ('required', 'read', 'misordered', 'batch')
+                self.assertEqual(status['status'], 'completed' if mode in ('terminal', 'terminal_process', 'historical_batch') else 'paused')
+                self.assertEqual((app.workspace.workspace/'result.txt').exists(), not cancelled and mode != 'question')
+                self.assertEqual(app.session.store.exists('delivery.json'), mode in ('terminal', 'terminal_process', 'historical_batch'))
                 self.assertEqual(app.state['turns'][-1]['remaining'], [])
                 if cancelled:
                     self.assertIn('Final decision requires', status['status_reason'])

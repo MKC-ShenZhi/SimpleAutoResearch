@@ -36,7 +36,7 @@ from simple_ar.tools.sources import SourcePolicy, SourceToolGateway, source_tool
 from simple_ar.tools.visual import VisualToolGateway, visual_tool_specs
 from simple_ar.tools.images import ImageToolGateway, image_tool_specs
 from simple_ar.tools.publication import PublicationToolGateway, publication_tool_specs, ExportRequest, export_input_binding
-from simple_ar.tools.writing import BOUND_REPORT_REVISION, WritingToolGateway, writing_tool_specs
+from simple_ar.tools.writing import BOUND_REPORT_REVISION, ProfessionalReview, WritingToolGateway, writing_tool_specs
 from simple_ar.tools.implementation import ExactCodeTask, ImplementationToolGateway, implementation_tool_specs
 from simple_ar.tools.analysis import AnalysisToolGateway, analysis_tool_specs
 from simple_ar.research.sources import SearchProviderRegistry
@@ -46,12 +46,17 @@ _CORE_COORDINATION = {'focus_work', 'load_tools', 'read_history'}
 _TOOL_CONTRACT_MODES = {'full', 'on_demand', 'outcomes'}
 _DEFERRED_WORKSPACE_TOOLS = {'write_file', 'edit_file', 'run_process'}
 _FINAL_WORK_TOOLS = {'write_file', 'export_report', 'run_process', 'execute_implementation', 'review_document', 'measure_experiment', 'analyze_measurements'}
+# These owners finish locally without another provider request. A delivery
+# field alone does not make professional/model-backed work affordable after
+# the last coordinator call. Keep _FINAL_WORK_TOOLS for saved reply admission.
+_DIRECT_CLOSING_TOOLS = {'write_file', 'export_report', 'run_process', 'deliver_result', 'ask_user'}
 _COMPLETION_POLICIES = {'protected_decision.v1', 'closing_decision.v2'}
 _REPORT_PROTOCOL = 'canonical_report.v1'
 _CLOSING_DECISION = (
     'This is the last affordable decision under the saved resource contract. '
-    'Return one executable action batch ending with exactly one explicit delivery or question. '
-    'You may finish known work and deliver in that batch, including an approved final process '
+    'Choose one supplied closing action: explicit delivery, an indispensable question, or final work '
+    'with required delivery. Ordinary exploratory probes are unavailable. '
+    'You may finish known work in that action, including an approved final process '
     'with delivery; otherwise disclose incomplete work and deliver only existing usable artifacts '
     'or ask an indispensable scope/resource question. A plan, ordinary file write or prose '
     'alone cannot close this request. Do not claim an unexecuted check or old delivery is current. '
@@ -156,6 +161,9 @@ class _ReportIntent(BaseModel):
     kind: Literal['report', 'conversion', 'none']
     formats: list[Literal['markdown', 'tex', 'pdf']] = Field(default_factory=list, max_length=3)
     method: Literal['article', 'sections'] | None = None
+    professional_review: ProfessionalReview | None = Field(default=None,
+        exclude_if=lambda value: value is None,
+        description='Optional independent inspection and bounded correction owned by professional writing. Declare when creating a report obligation; inherited or user-frozen controls remain authoritative. All calls share the task allowance.')
     source: str | None = Field(default=None, description='For conversion only: adopt this existing manuscript, unchanged. Its owner and current bytes are frozen in this receipt.')
     replace: bool = Field(default=False, description='Explicitly change an inherited obligation only on newer user semantics supported by this quote; ordinary omission/clearing does not cancel it.')
 
@@ -434,6 +442,33 @@ class ToolApplication:
         return export_openai_tool_schemas(self.gateway.registry, read_only_only=False,
             policy=self.gateway.policy, names=active)
 
+    def _closing_schemas(self) -> list[dict[str, Any]]:
+        """Offer executable closure before paying for the final decision.
+
+        Selection is not permission or acceptance. Existing domain validation,
+        approval and delivery checks still own every returned action.
+        """
+        # Restrict the active contracts rather than loading deferred specialists:
+        # expanding an on-demand catalog here can evict original input windows.
+        schemas = [row for row in self.schemas if row['function']['name'] in _DIRECT_CLOSING_TOOLS]
+        result = []
+        for original in schemas:
+            schema = json.loads(json.dumps(original))
+            function = schema['function']
+            if function['name'] in _FINAL_WORK_TOOLS:
+                parameters = function['parameters']
+                delivery = parameters.get('properties', {}).get('delivery')
+                if delivery is None:
+                    continue
+                # Preserve the owner's delivery shape and references, removing
+                # only its ordinary-work omission/null alternatives.
+                if 'anyOf' in delivery:
+                    delivery['anyOf'] = [row for row in delivery['anyOf'] if row.get('type') != 'null']
+                delivery.pop('default', None)
+                parameters['required'] = list(dict.fromkeys([*parameters.get('required', []), 'delivery']))
+            result.append(schema)
+        return result
+
     def _specialist_catalog(self) -> dict[str, dict[str, str]]:
         return self._contract_presentation()[1]
 
@@ -559,12 +594,25 @@ class ToolApplication:
                 data['formats'] = list(dict.fromkeys([*old['formats'], *data['formats']]))
                 data['method'] = intent.method or old.get('method')
         requirement = self.state['config'].get('report_requirement')
+        requested_review = intent.professional_review
+        retained_requirement = requirement or (previous['requirement'] if old and not intent.replace else None)
+        if requested_review is not None:
+            if data['kind'] != 'report':
+                raise ValueError('Professional writing review requires a report obligation')
+            if retained_requirement:
+                controls = retained_requirement['config']
+                if (controls['reviewer'] != 'llm' or not controls['document_review']
+                        or controls['max_review_iterations'] != requested_review.max_revision_rounds):
+                    raise ValueError('Professional review cannot replace inherited or user-frozen controls; use newer user semantics and replace for a dynamic obligation')
         if not requirement and data['kind'] == 'conversion':
             requirement = previous['requirement']
         if not requirement and data['kind'] == 'report':
             from simple_ar.tools.writing import freeze_report_requirement
             requirement = (previous['requirement'] if old and not intent.replace else None) or freeze_report_requirement(
-                {'reviewer': 'disabled', 'document_review': False, 'max_review_iterations': 0,
+                {'reviewer': 'llm' if requested_review is not None else 'disabled',
+                 'document_review': requested_review is not None,
+                 'max_review_iterations': requested_review.max_revision_rounds if requested_review is not None else 0,
+                 **({'review_scope': 'document', 'draft_scope': 'document'} if requested_review is not None else {}),
                  'allow_source_backtracking': False, 'allow_llm_fallback': False, 'figures': {'enabled': False}},
                 method=data['method'] or 'article')
         if requirement and data['method'] not in {None, requirement['method']}:
@@ -1407,11 +1455,11 @@ class ToolApplication:
         remaining = self.ledger.remaining('llm_requests')
         return capacity if remaining is None else min(capacity, remaining)
 
-    def _decision_tokens(self, client: Any, messages: list | None = None) -> int:
+    def _decision_tokens(self, client: Any, messages: list | None = None, *, schemas: list | None = None) -> int:
         """Same serialized input/output reservation used by explicit retry."""
         return (estimate_tokens(json.dumps(messages if messages is not None else
                     self._messages(client=client), ensure_ascii=False))
-                + estimate_tokens(json.dumps(self.schemas, ensure_ascii=False))
+                + estimate_tokens(json.dumps(self.schemas if schemas is None else schemas, ensure_ascii=False))
                 + (client.effective_output_limit() or 0))
 
     def _completion_floor(self, client: Any, messages: list | None = None) -> dict[str, int]:
@@ -1435,6 +1483,12 @@ class ToolApplication:
         """A fitting explicit terminal queue needs no later model decision."""
         queued = self.state['turns'][-1].get('remaining', []) if self.state['turns'] else []
         space = self.session.manifest.budget.max_attempts - self.session.manifest.budget.attempts
+        if queued:
+            path = str(Path(self.state['turns'][-1]['reply']).with_name('decision_budget.json'))
+            if (self.session.store.exists(path)
+                    and self.session.store.read_json(path).get('closing_action_contract') == 'single_terminal.v1'
+                    and len(queued) != 1):
+                return False
         return bool(queued and len(queued) <= space and self._terminal_intent(queued[-1])
             and sum(self._terminal_intent(call) for call in queued) == 1)
 
@@ -1501,7 +1555,7 @@ class ToolApplication:
             json.dumps(turns, ensure_ascii=False)) else turns
 
     def _messages(self, *, client: LLMClient | None = None, closing: bool = False,
-                  native_history_start_turn: int | None = None) -> list[dict[str, Any]]:
+                  native_history_start_turn: int | None = None, schemas: list | None = None) -> list[dict[str, Any]]:
         config = self.state["config"]
         if native_history_start_turn is None:
             rebindings = config.get('model_rebindings', [])
@@ -1735,7 +1789,7 @@ class ToolApplication:
                 'guarded by the same gateway; loading is neither execution nor validation.')
         context["resources"]["context_input_target_tokens"] = input_target
         context["resources"]["next_output_token_reservation"] = output_reservation
-        schema_cost = estimate_tokens(json.dumps(self.schemas, ensure_ascii=False))
+        schema_cost = estimate_tokens(json.dumps(self.schemas if schemas is None else schemas, ensure_ascii=False))
         supplied_execution_records: set[str] = set()
         execution_details: set[str] = set()
         def project_archive(cutoff: int) -> None:
@@ -2172,19 +2226,21 @@ class ToolApplication:
             and self.session.manifest.budget.max_attempts - self.session.manifest.budget.attempts > 2
             and (remaining is None or remaining >= 2 * floor['total_tokens']))
         closing = self.state['config'].get('completion_policy') == 'closing_decision.v2' and not protect
+        schemas = self._closing_schemas() if closing else self.schemas
         if closing:
             # Include the closing contract before context trimming/reservation,
             # not as an unbudgeted suffix added to a capacity-fitted request.
-            messages = self._messages(client=client, closing=True)
-            floor = self._completion_floor(client, messages)
+            messages = self._messages(client=client, closing=True, schemas=schemas)
+            floor = {'llm_requests': 1, 'total_tokens': self._decision_tokens(client, messages, schemas=schemas)}
         if floor:
             projection = json.loads(messages[1]['content'])
             context.store.write_json('decision_budget.json', {
                 'estimated_followup_tokens': floor['total_tokens'],
                 'closing_required': closing,
+                **({'closing_action_contract': 'single_terminal.v1'} if closing else {}),
                 'input_projection': {
                     'resources': projection['resources'],
-                    'tool_names': [row['function']['name'] for row in self.schemas],
+                    'tool_names': [row['function']['name'] for row in schemas],
                     'material_supply': projection['material_supply'],
                     'supplied': [{key: row[key] for key in ('path', 'sha256', 'record', 'role', 'evidence_role',
                             'offset_bytes', 'next_offset_bytes', 'version_scope', 'overlap_scope') if key in row}
@@ -2198,7 +2254,7 @@ class ToolApplication:
                 'scope': 'Estimated follow-up reservation, not provider usage or guaranteed future capacity. '
                     'closing_required binds this decision reply and survives approval/recovery.'})
         with self.ledger.protect_remaining(floor if protect else {}):
-            message = client.chat_turn(messages, tools=self.schemas,
+            message = client.chat_turn(messages, tools=schemas,
                 label="native-turn", budget_call_id=context.attempt.attempt_id)
         ref = context.store.write_json("native_result.json", message, kind="native_reply")
         return CapabilityResult(status="completed", artifacts=(ref,))
