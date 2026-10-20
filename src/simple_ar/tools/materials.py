@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import hashlib
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -83,15 +83,16 @@ def observe_text_window(windows: dict, workspace: Any, name: str, arguments: dic
     try:
         locator = data.get('absolute_path') or data.get('path') or arguments.get('path', '')
         path = workspace.resolve(locator)
-        if ((Path(locator).is_absolute() and path != Path(locator))
-                or path.is_relative_to(workspace.root / 'attempts')):
+        if Path(locator).is_absolute() and path != Path(locator):
             return windows
     except (ValueError, KeyError, OSError, RuntimeError):
         return windows
     location, digest = str(path), data.get('sha256')
     windows = {key: value for key, value in windows.items()
         if value['path'] != location or (name == 'read_file' and value['sha256'] == digest)}
-    if not isinstance(digest, str) or len(digest) != 64:
+    if not (isinstance(digest, str) and len(digest) == 64) and not (
+            name == 'read_file' and digest is None and isinstance(data.get('text'), str)
+            and isinstance(data.get('size_bytes'), int) and isinstance(data.get('next_offset_bytes'), int)):
         return windows
     if name == 'read_file':
         reference = {'request': arguments, 'record': record, 'receipt_sha256': receipt_sha256}
@@ -105,6 +106,9 @@ def observe_text_window(windows: dict, workspace: Any, name: str, arguments: dic
     key = json.dumps(arguments, sort_keys=True) if name == 'read_file' else location
     windows[(record, key)] = {
         'path': location, 'sha256': digest, 'reference': reference,
+        'offset_bytes': data.get('offset_bytes', arguments.get('offset_bytes', 0)),
+        'next_offset_bytes': data.get('next_offset_bytes', data.get('size_bytes')),
+        **({'evidence_role': data['evidence_role']} if 'evidence_role' in data else {}),
         'record': record, 'operation': name, 'turn': turn}
     return windows
 
@@ -133,7 +137,15 @@ def current_text_window(workspace: Any, window: dict, *, cache: dict | None = No
     """Project validated reads or authored write context in the historical shape."""
     reference = window['reference']
     if window['operation'] == 'read_file':
-        row = validate_material_observation(workspace, reference, identity='history-observation', cache=cache)
+        if window['sha256'] is None:
+            # A legal bounded read need not certify the entire file. Recheck
+            # precisely its original owner request, without requesting a hash
+            # of an arbitrarily large file or upgrading professional evidence.
+            original = _journal_receipt(workspace, reference)
+            row = read_material_window(workspace, reference['request'],
+                identity='history-observation', expected=original['data'], cache=cache)
+        else:
+            row = validate_material_observation(workspace, reference, identity='history-observation', cache=cache)
         _, start, end, digest = observed_window_key(workspace, FileWindow.model_validate(row['request']), row['data'])
         text = row['data']['text']
         if not text:
@@ -151,19 +163,51 @@ def current_text_window(workspace: Any, window: dict, *, cache: dict | None = No
             raise ValueError('Authored material version changed')
         start, end = 0, len(raw)
     return {key: value for key, value in window.items() if key != 'reference'} | {
-        'sha256': digest, 'offset_bytes': start, 'next_offset_bytes': end, 'text': text}
+        'sha256': digest, 'offset_bytes': start, 'next_offset_bytes': end, 'text': text,
+        **({'version_scope': 'Rechecked original bounded observation only; no full-file version certification.'}
+           if digest is None else {})}
 
 
-def admit_text_window(retained: list[dict], observation: dict) -> list[dict] | None:
-    """Propose coverage replacement; the consumer commits only if capacity fits."""
+def uncovered_text_ranges(observation: dict, retained: Iterable[dict]) -> list[tuple[int, int]]:
+    """Unsupplied intervals of one observed file version, without reading it."""
+    spans = [(observation['offset_bytes'], observation['next_offset_bytes'])]
+    for existing in retained:
+        if (existing['path'] != observation['path'] or existing['sha256'] != observation['sha256']
+                or observation['sha256'] is None and existing.get('record') != observation.get('record')):
+            continue
+        left, right = existing['offset_bytes'], existing['next_offset_bytes']
+        spans = [(a, b) for lo, hi in spans for a, b in
+            ((lo, min(hi, left)), (max(lo, right), hi)) if a < b]
+    return spans
+
+
+def admit_text_window(retained: list[dict], observation: dict, *, pinned: Iterable[dict] = ()) -> list[dict] | None:
+    """Keep whole original decoded observations, never splice raw byte offsets.
+
+    Replacement decoding and mid-character reads have no reversible byte map.
+    Only lossless complete containment is deduplicated; overlap costs are explicit.
+    """
     def contains(outer: dict, inner: dict) -> bool:
         return (outer['path'] == inner['path'] and outer['sha256'] == inner['sha256']
+            and outer.get('evidence_role') == inner.get('evidence_role')
+            and (outer['sha256'] is not None or outer.get('record') == inner.get('record'))
             and outer['offset_bytes'] <= inner['offset_bytes']
-            and inner['next_offset_bytes'] <= outer['next_offset_bytes'])
+            and inner['next_offset_bytes'] <= outer['next_offset_bytes']
+            and '\ufffd' not in outer.get('text', '') and '\ufffd' not in inner.get('text', '')
+            and len(outer.get('text', '').encode('utf-8')) == outer['next_offset_bytes'] - outer['offset_bytes']
+            and len(inner.get('text', '').encode('utf-8')) == inner['next_offset_bytes'] - inner['offset_bytes']
+            and outer['text'].encode('utf-8')[inner['offset_bytes'] - outer['offset_bytes']:
+                inner['next_offset_bytes'] - outer['offset_bytes']] == inner['text'].encode('utf-8'))
 
-    if any(contains(existing, observation) for existing in retained):
+    pinned = list(pinned)
+    if any(contains(existing, observation) for existing in [*retained, *pinned]):
         return None
-    return [existing for existing in retained if not contains(observation, existing)] + [observation]
+    remaining = [existing for existing in retained if not contains(observation, existing)]
+    overlap = any(row['path'] == observation['path'] and row['sha256'] == observation['sha256']
+        and max(row['offset_bytes'], observation['offset_bytes']) <
+            min(row['next_offset_bytes'], observation['next_offset_bytes']) for row in [*remaining, *pinned])
+    return remaining + [{**observation, **({'overlap_scope':
+        'Whole original observation retained; overlapping decoded text may repeat, no byte slicing.'} if overlap else {})}]
 
 
 def journal_material_references(workspace: Any, store: Any, turns: list[dict],

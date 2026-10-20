@@ -30,7 +30,7 @@ from simple_ar.tools.workspace import (WorkspaceToolGateway, workspace_tool_spec
     resolve_source_mount)
 from simple_ar.tools.materials import (
     read_material_window, journal_material_references, observe_text_window,
-    current_text_window, admit_text_window,
+    current_text_window, admit_text_window, uncovered_text_ranges, observed_window_key,
 )
 from simple_ar.tools.sources import SourcePolicy, SourceToolGateway, source_tool_specs
 from simple_ar.tools.visual import VisualToolGateway, visual_tool_specs
@@ -455,7 +455,10 @@ class ToolApplication:
             if deferred:
                 catalog[spec.name] = {'domain': spec.domain}
                 if spec.name not in selected:
-                    catalog[spec.name]['description'] = spec.description
+                    # A directory is a purpose index, not a second copy of
+                    # every loaded contract. Full constraints live in schemas.
+                    purpose = ' '.join(spec.description.split()).split('. ', 1)[0]
+                    catalog[spec.name]['description'] = purpose[:200]
         return active, catalog
 
     def _work_focus(self) -> dict[str, Any]:
@@ -810,7 +813,7 @@ class ToolApplication:
                services: Any | None = None,
                snapshot_sources: bool = False,
                max_snapshot_bytes: int = 16 * 1024 * 1024,
-               tool_contracts: Literal['full', 'on_demand', 'outcomes'] = 'outcomes',
+               tool_contracts: Literal['full', 'on_demand', 'outcomes'] = 'on_demand',
                completion_policy: str = 'closing_decision.v2',
                delivery_files: list[str] | None = None,
                model_catalogs: dict[str, str | None] | None = None,
@@ -1067,7 +1070,7 @@ class ToolApplication:
                services: Any | None = None, snapshot_sources: bool = False,
                max_snapshot_bytes: int = 16 * 1024 * 1024,
                delivery_files: list[str] | None = None,
-               tool_contracts: Literal['full', 'on_demand', 'outcomes'] = 'outcomes',
+               tool_contracts: Literal['full', 'on_demand', 'outcomes'] = 'on_demand',
                completion_policy: str = 'closing_decision.v2') -> ToolApplication:
         config, reused, limits, attempts = cls._configuration(root, goal, model=model, sources=sources,
             allow_execution=allow_execution, allow_network=allow_network, allow_vision=allow_vision,
@@ -1515,6 +1518,7 @@ class ToolApplication:
         progress = []
         latest_execution = latest_failure = latest_tool_failure = None
         text_windows: dict[tuple[str, str], dict[str, Any]] = {}
+        unavailable_reads = []
         source_observations = []
         request_count = 1
         for turn in self.state["turns"]:
@@ -1553,6 +1557,16 @@ class ToolApplication:
                         text_windows = observe_text_window(text_windows, self.workspace, name, arguments, data,
                             record='records/' + item['result'].removeprefix('attempts/'), turn=len(blocks),
                             receipt_sha256=hashlib.sha256(self.session.store.resolve(item['result']).read_bytes()).hexdigest())
+                        # Retired versions belong to the existing history archive,
+                        # not a mandatory growing tombstone list in every decision.
+                        if name == 'read_file' and data.get('text') and not any(
+                                window['record'] == 'records/' + item['result'].removeprefix('attempts/')
+                                for window in text_windows.values()):
+                            unavailable_reads.append({'path': data.get('absolute_path', arguments.get('path')),
+                                'sha256': data.get('sha256'), 'offset_bytes': data.get('offset_bytes', arguments.get('offset_bytes', 0)),
+                                'next_offset_bytes': data.get('next_offset_bytes'), 'turn': len(blocks),
+                                'record': 'records/' + item['result'].removeprefix('attempts/'),
+                                'status': 'unavailable', 'reason': 'Receipt lacks verifiable byte coverage/version.'})
                 outcomes.append(self._history_observation(call, result, item['result']))
                 if result.get('status') != 'ok' or result.get('error'):
                     failure_view = outcomes[-1]
@@ -1580,7 +1594,16 @@ class ToolApplication:
                 view = workspace_observation_view(observations[observation["id"]],
                     record='records/' + observation['result'].removeprefix('attempts/'),
                     directory_path=outcome.get('arguments', {}).get('path'))
-                if explicit_inputs and len(blocks) == focus['turn'] and outcome['tool'] == 'focus_work':
+                if outcome['tool'] == 'read_file' and view.get('status') == 'ok' and (view.get('data') or {}).get('text'):
+                    view = {**view, 'data': {key: value for key, value in view['data'].items() if key != 'text'} | {
+                        'text_supply': 'Current bytes/ranges are in retained_text_windows or work_inputs; '
+                            'material_supply explains current gaps and archived observations. Backend ok is not model supply.'}}
+                if outcome['tool'] == 'find_source_passages' and view.get('status') == 'ok':
+                    data = view.get('data') or {}
+                    view = {**view, 'data': {key: ([{k: v for k, v in row.items() if k != 'text'} for row in value]
+                        if key in {'matches', 'retained_preview'} and isinstance(value, list) else value) for key, value in data.items()} | {
+                            'text_supply': 'Exact current passages are in retained_source_passages; see material_supply.omitted.'}}
+                if outcome['tool'] == 'focus_work' and (view.get('data') or {}).get('inputs'):
                     # This is a receipt view, not changed tool arguments or
                     # substituted source text. Current validated window bytes
                     # and gaps are supplied once by work_inputs below; the raw
@@ -1600,20 +1623,6 @@ class ToolApplication:
             [latest_execution] if latest_execution is not None else [])
         for execution in executions:
             execution['blocks'] = {execution['turn']}
-            # A complete read-back of the same immutable result also supplies
-            # the diagnosis; do not duplicate it in the historical index.
-            for index, block in enumerate(blocks):
-                for message in block:
-                    if message['role'] != 'tool':
-                        continue
-                    data = json.loads(message['content']).get('data', {})
-                    if data.get('absolute_path') != execution['path']:
-                        continue
-                    try:
-                        if json.loads(data.get('text', '')) == execution['result']:
-                            execution['blocks'].add(index)
-                    except (ValueError, TypeError):
-                        pass
         # Count actual serialized history and schemas, not an assumed overhead.
         # Request allowance is a ceiling, not a planned number of future turns.
         # Dividing tokens by that ceiling makes a more permissive allowance
@@ -1631,7 +1640,10 @@ class ToolApplication:
         # result. Earlier decisions explain why a probe ran and what its result
         # changed. Drop complete oldest blocks only when capacity requires it;
         # never splice a call/result or manufacture a new user turn.
-        selected = [] if explicit_inputs else blocks[native_history_start_turn:][-1:]
+        # Material admission owns the working set. Native conversation is a
+        # later, evictable consumer, never an implicit reservation for a large
+        # last read, generated script or reasoning block.
+        selected = []
         vision_spec = self.gateway.registry.get('inspect_images')
         vision_available, vision_reason = (self.gateway.policy.is_allowed(vision_spec)
             if vision_spec is not None else (False, 'inspect_images is not registered for this task.'))
@@ -1724,6 +1736,8 @@ class ToolApplication:
         context["resources"]["context_input_target_tokens"] = input_target
         context["resources"]["next_output_token_reservation"] = output_reservation
         schema_cost = estimate_tokens(json.dumps(self.schemas, ensure_ascii=False))
+        supplied_execution_records: set[str] = set()
+        execution_details: set[str] = set()
         def project_archive(cutoff: int) -> None:
             context['retained_turn_start'] = cutoff
             context['history_archive'] = {'start_turn': 0, 'end_turn': cutoff,
@@ -1734,12 +1748,16 @@ class ToolApplication:
                         observation.get('status') != 'ok' or bool(observation.get('error')))
                     context['history_archive']['nonzero_executions'] += int(
                         observation['observed'].get('returncode', 0) != 0)
-            context['execution_observations'] = [{**execution['observation'],
-                'observed': execution['data']} for execution in executions
-                if not any(index >= cutoff for index in execution['blocks'])]
-            if explicit_inputs:
-                context['latest_tool_failure'] = (latest_tool_failure.copy()
-                    if latest_tool_failure is not None and latest_tool_failure['turn'] < cutoff else None)
+            context['execution_observations'] = [{**execution['observation'], **(
+                {'observed': execution['data']} if execution['path'] in execution_details else
+                {'details_not_supplied': {key: {'offset_bytes': 0, 'next_offset_bytes': len(value.encode('utf-8'))}
+                    for key, value in execution['data'].items() if isinstance(value, str)
+                    and key not in execution['observation'].get('observed', {})}})}
+                for execution in executions
+                if execution['path'] not in supplied_execution_records
+                and not any(index >= cutoff for index in execution['blocks'])]
+            context['latest_tool_failure'] = (latest_tool_failure.copy()
+                if latest_tool_failure is not None and latest_tool_failure['turn'] < cutoff else None)
 
         project_archive(len(blocks) - len(selected))
         context['history_scope'] = (
@@ -1786,6 +1804,13 @@ class ToolApplication:
                 resources['context_exceeds_input_target'] = exceeds
 
         capacity = input_target
+        context['material_supply'] = {'omitted': [], 'native_context': [], 'scope':
+            'Backend success is not model supply. Fresh/working text and write_context are supply roles, not '
+            'evidence authority; evidence_role is preserved only when declared by the original owner. '
+            'Only supplied ranges are present; gaps are not evidence of absence. For capacity gaps select a '
+            'smaller necessary window or replace loaded contracts with load_tools; do not repeat the same read. '
+            'Historical replies/receipts are unchanged; read_history is for operations, not a substitute for this supply.'}
+        current_selection = explicit_inputs
         if explicit_inputs or 'previous_inputs' in focus:
             current_selection = 'inputs' in focus
             context['native_history_scope'] = (
@@ -1820,6 +1845,9 @@ class ToolApplication:
                     observed = read_material_window(self.workspace, row['request'],
                         identity='focus-input-projection', expected=row['data'])
                     window.update(observed, status='supplied' if observed['data']['text'] else 'empty')
+                    if not current_selection:
+                        window['status'] = 'previous_not_selected'
+                        window['data'] = {key: value for key, value in observed['data'].items() if key != 'text'}
                 except (ValueError, OSError, RuntimeError) as error:
                     window['error'] = str(error)
                 context['work_inputs']['windows'].append(window)
@@ -1838,45 +1866,126 @@ class ToolApplication:
                     'still contain earlier bytes; those do not satisfy this selection. '
                     'Select smaller necessary windows with focus_work; '
                     'do not infer missing values or claim complete reading.')
-        # Expand the contiguous native suffix first, within this provider
-        # session. All journal turns above still supply indexes and validated
-        # originals; an explicit rebind never rewrites their replies.
-        for index in range(len(blocks) - len(selected) - 1, native_history_start_turn - 1, -1):
-            selected.insert(0, blocks[index])
-            project_archive(index)
-            if input_cost() > capacity:
-                selected.pop(0)
-                break
-        cutoff = len(blocks) - len(selected)
-        project_archive(cutoff)
+        # One admission order: selected inputs, recent working observations
+        # (reads AND generated editing context), then evictable conversation.
+        # Supply priority never invents or upgrades an evidence role.
+        # Every omission has actual observed coverage, never a silent fallback
+        # to rereading the same receipt or a coordinator-authored answer.
+        omitted = context['material_supply']['omitted']
+        pinned = []
+        focused_paths = set()
+        for row in context.get('work_inputs', {}).get('windows', []):
+            if current_selection:
+                try:
+                    focused_paths.add(str(self.workspace.resolve(row['request']['path'])))
+                except (ValueError, OSError, RuntimeError):
+                    pass  # The selected window already carries its authority failure.
+            if row['status'] in {'supplied', 'empty'}:
+                path, start, end, digest = observed_window_key(self.workspace,
+                    FileWindow.model_validate(row['request']), row['data'])
+                pinned.append({'path': path, 'sha256': digest, 'offset_bytes': start,
+                    'next_offset_bytes': end, 'text': row['data']['text']})
+        def coverage(row: dict) -> dict:
+            return {key: row[key] for key in ('path', 'sha256', 'record', 'offset_bytes', 'next_offset_bytes',
+                'evidence_role', 'role', 'status', 'reason', 'version_scope', 'overlap_scope') if key in row}
 
+        context['material_supply']['archived_observations'] = 0
+        def record_gap(row: dict, *, fresh: bool) -> None:
+            if fresh:
+                omitted.append(row)
+            else:
+                context['material_supply']['archived_observations'] += 1
+        context['material_supply']['archive_scope'] = (
+            'Older unsupplied or retired observations remain only in history_archive/read_history and original records; '
+            'they are not supplied text. Current requested gaps are explicit below. No archive index proves reading.')
+        # Loading contracts or inspecting metadata does not retire the latest
+        # working input. Its missing ranges stay current across those decisions;
+        # earlier work can be archived without accumulating mandatory metadata.
+        working_turn = max((row['turn'] for row in
+            [*text_windows.values(), *source_observations, *unavailable_reads]), default=-1)
+        for row in unavailable_reads:
+            record_gap(coverage(row), fresh=row['turn'] == working_turn)
         candidates = []
         observation_reads: dict = {}
-        read_allowed = self.gateway.policy.is_allowed(self.gateway.registry.get('read_file'))[0]
-        focused_paths = {row.get('data', {}).get('absolute_path')
-            for row in focus.get('inputs', focus.get('previous_inputs', []))} if explicit_inputs else set()
-        for window in sorted(text_windows.values(), key=lambda value: value['turn'], reverse=True) if read_allowed else ():
+        read_allowed, read_reason = self.gateway.policy.is_allowed(self.gateway.registry.get('read_file'))
+        for window in sorted(text_windows.values(), key=lambda value: value['turn'], reverse=True):
+            if explicit_inputs and window['record'] == focus['record']:
+                continue
             if window['path'] in focused_paths:
-                continue  # The selected owner's revalidation above replaces this projection.
-            if window['turn'] >= cutoff:
-                continue
+                continue  # A selected range must not silently expand back to an old whole file.
+            role = ('write_context' if window['operation'] == 'write_file' else
+                'fresh_read' if window['turn'] == len(blocks) - 1 else 'working_read')
             try:
+                if not read_allowed:
+                    raise ValueError(read_reason)
                 observation = current_text_window(self.workspace, window, cache=observation_reads)
-            except (ValueError, TypeError, KeyError, OSError, RuntimeError):
+            except (ValueError, TypeError, KeyError, OSError, RuntimeError) as error:
+                record_gap(coverage(window) | {'role': role, 'status': 'unavailable', 'reason': str(error)},
+                    fresh=window['turn'] == working_turn)
                 continue
-            candidates.append({key: value for key, value in observation.items() if key != 'turn'}
-                | {'_observed_turn': window['turn']})
-        for window in self.sources.retained_passages(source_observations, before_turn=cutoff):
+            candidates.append({key: value for key, value in observation.items() if key != 'turn'} |
+                {'role': role, '_observed_turn': window['turn']})
+        source_windows = self.sources.retained_passages(source_observations, before_turn=len(blocks))
+        for window in source_windows:
             candidates.append({key: value for key, value in window.items() if key != 'turn'}
-                              | {'_observed_turn': window['turn']})
-        # Supplement omitted native history with exact, revalidated originals.
+                | {'role': 'fresh_read' if window['turn'] == len(blocks) - 1 else 'working_read',
+                   '_observed_turn': window['turn']})
+        for row in source_observations:
+            data = row['data']
+            for passage in data.get('matches', data.get('retained_preview', [])):
+                if not any(window['path'] == data.get('document_path') and window['sha256'] == data.get('document_sha256')
+                        and window['passage']['chunk_id'] == passage.get('chunk_id')
+                        and window['passage']['character_start'] <= passage.get('character_start', -1)
+                        and passage.get('character_end', -1) <= window['passage']['character_end'] for window in source_windows):
+                    record_gap({'path': data.get('document_path'), 'record': row['record'],
+                        'sha256': data.get('document_sha256'), 'character_start': passage.get('character_start'),
+                        'character_end': passage.get('character_end'), 'chunk_id': passage.get('chunk_id'),
+                        'status': 'unavailable', 'reason': 'Source owner could not admit this original passage/version.'},
+                        fresh=row['turn'] == working_turn)
+        seen_ranges, pending_material = set(), []
         for candidate in sorted(candidates, key=lambda value: value['_observed_turn'], reverse=True):
             observation = {key: value for key, value in candidate.items() if key != '_observed_turn'}
+            passage = observation.get('passage')
+            key = (observation['path'], observation['sha256'], json.dumps(observation.get('evidence_role'), sort_keys=True),
+                observation['record'] if observation['sha256'] is None else None,
+                (passage['chunk_id'], passage['character_start'], passage['character_end']) if passage else
+                (observation['offset_bytes'], observation['next_offset_bytes']))
+            if key in seen_ranges:
+                continue  # Same observed coverage, not another copy/diagnostic.
+            seen_ranges.add(key)
+            gap = coverage(observation) | {'status': 'capacity_not_supplied',
+                'reason': 'Requested observed range does not fit after higher-priority material and contracts.'}
+            if passage:
+                gap.update({key: passage[key] for key in ('chunk_id', 'character_start', 'character_end')})
+            fresh = candidate['_observed_turn'] == working_turn
+            pending_material.append((observation, gap, fresh))
+            if fresh:
+                omitted.append(gap)
+        # Only current gaps are mandatory. Historical ranges are evictable
+        # with their receipts; long tasks cannot grow a second context ledger.
+        if input_cost() > capacity and explicit_inputs:
+            for window in context['work_inputs']['windows']:
+                if window['status'] in {'supplied', 'empty'}:
+                    window['status'] = 'capacity_not_supplied'
+                    window['data'] = {key: value for key, value in window['data'].items() if key != 'text'}
+            pinned.clear()
+            context['work_inputs']['capacity_action'] = 'Selection plus necessary range diagnostics does not fit; select smaller windows with focus_work.'
+        # Repair diagnostics precede historical material. A successful backend
+        # read cannot evict the failure needed to choose the next operation.
+        for execution in executions:
+            execution_details.add(execution['path'])
+            project_archive(len(blocks))
+            if input_cost() > capacity:
+                execution_details.remove(execution['path'])
+                project_archive(len(blocks))
+        for observation, gap, fresh in pending_material:
+            if fresh:
+                omitted.remove(gap)
             field = 'retained_source_passages' if 'passage' in observation else 'retained_text_windows'
             retained = context[field]
             previous = retained[:]
             if field == 'retained_text_windows':
-                proposed = admit_text_window(retained, observation)
+                proposed = admit_text_window(retained, observation, pinned=pinned)
                 if proposed is None:
                     continue
                 # Only a successfully admitted containing original replaces
@@ -1887,6 +1996,52 @@ class ToolApplication:
                 retained.append(observation)
             if input_cost() > capacity:
                 retained[:] = previous
+                record_gap(gap, fresh=fresh)
+        # Native read/passage views reference the admitted bytes, rather than
+        # copying them. Native write arguments remain exact; if a write block
+        # fits, its authored body replaces the duplicate write_context copy.
+        authored = [row for row in candidates if row['role'] == 'write_context']
+        for execution in executions:
+            for row in context['retained_text_windows']:
+                if row['path'] != execution['path']:
+                    continue
+                try:
+                    if json.loads(row['text']) == execution['result']:
+                        supplied_execution_records.add(execution['path'])
+                except (ValueError, TypeError):
+                    pass
+            project_archive(len(blocks))
+        for index in range(len(blocks) - 1, native_history_start_turn - 1, -1):
+            previous = context['retained_text_windows'][:]
+            previous_native = context['material_supply']['native_context'][:]
+            writes = [row for row in authored if row['_observed_turn'] >= index]
+            context['retained_text_windows'][:] = [row for row in previous
+                if not any(write['path'] == row['path'] and write['sha256'] == row['sha256']
+                    and write['offset_bytes'] <= row['offset_bytes']
+                    and row['next_offset_bytes'] <= write['next_offset_bytes'] for write in writes)]
+            context['material_supply']['native_context'] = [coverage(row) | {'status': 'supplied_native',
+                'role': 'write_context'} for row in writes]
+            selected.insert(0, blocks[index])
+            project_archive(index)
+            if input_cost() > capacity:
+                selected.pop(0)
+                context['retained_text_windows'][:] = previous
+                context['material_supply']['native_context'] = previous_native
+                break
+        cutoff = len(blocks) - len(selected)
+        project_archive(cutoff)
+        # Report only genuinely missing byte intervals, including coverage
+        # supplied by whole original observations, selections or native writes.
+        supplied = [*pinned, *context['retained_text_windows'], *context['material_supply']['native_context']]
+        gaps = []
+        for gap in omitted:
+            if (gap.get('status') == 'capacity_not_supplied' and isinstance(gap.get('offset_bytes'), int)
+                    and isinstance(gap.get('next_offset_bytes'), int)):
+                gaps.extend({**gap, 'offset_bytes': start, 'next_offset_bytes': end}
+                    for start, end in uncovered_text_ranges(gap, supplied))
+            else:
+                gaps.append(gap)
+        omitted[:] = gaps
         recent = []
         for row in reversed(progress[:cutoff]):
             proposed = self._history_view([row] + recent)
@@ -1905,7 +2060,7 @@ class ToolApplication:
                     observation.get('status') != 'ok' or bool(observation.get('error')))
                 context['history_archive']['nonzero_executions'] -= int(
                     observation['observed'].get('returncode', 0) != 0)
-        if input_cost() > capacity and explicit_inputs:
+        if input_cost() > capacity:
             raise ValueError('Current requests, contracts and execution facts exceed the remaining input capacity; no model request sent')
         if getattr(client._settings, 'thinking_mode', '') == 'enabled' and any(
                 message['role'] == 'assistant' and not any(isinstance(message.get(key), str)
@@ -2019,9 +2174,23 @@ class ToolApplication:
             messages = self._messages(client=client, closing=True)
             floor = self._completion_floor(client, messages)
         if floor:
+            projection = json.loads(messages[1]['content'])
             context.store.write_json('decision_budget.json', {
                 'estimated_followup_tokens': floor['total_tokens'],
                 'closing_required': closing,
+                'input_projection': {
+                    'resources': projection['resources'],
+                    'tool_names': [row['function']['name'] for row in self.schemas],
+                    'material_supply': projection['material_supply'],
+                    'supplied': [{key: row[key] for key in ('path', 'sha256', 'record', 'role', 'evidence_role',
+                            'offset_bytes', 'next_offset_bytes', 'version_scope', 'overlap_scope') if key in row}
+                        | ({'passage_range': {key: row['passage'][key] for key in
+                                ('chunk_id', 'character_start', 'character_end') if key in row['passage']}}
+                            if 'passage' in row else {})
+                        for row in [*projection['retained_text_windows'], *projection['retained_source_passages']]],
+                    'work_inputs': [{key: value for key, value in row.items() if key != 'data'} |
+                        {'data': {key: value for key, value in row.get('data', {}).items() if key != 'text'}}
+                        for row in projection.get('work_inputs', {}).get('windows', [])]},
                 'scope': 'Estimated follow-up reservation, not provider usage or guaranteed future capacity. '
                     'closing_required binds this decision reply and survives approval/recovery.'})
         with self.ledger.protect_remaining(floor if protect else {}):

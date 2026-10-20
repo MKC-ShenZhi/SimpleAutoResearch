@@ -94,6 +94,19 @@ class _ImplementationAssertions:
 
 
 class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
+    def _assert_execution_supply(self, row, original):
+        # Every original field is supplied exactly, already indexed as an
+        # argument, or explicitly withheld with measured byte coverage.
+        for key, value in original.items():
+            if key in row['observed']:
+                self.assertEqual(row['observed'][key], value)
+            elif key in row.get('arguments', {}):
+                self.assertEqual(row['arguments'][key], value)
+            else:
+                self.assertIsInstance(value, str)
+                self.assertEqual(row['details_not_supplied'][key], {
+                    'offset_bytes': 0, 'next_offset_bytes': len(value.encode('utf-8'))})
+
     def test_declared_delivery_files_and_explicit_policy_upgrade(self):
         with _temporary_run() as root:
             source = root / 'papers'
@@ -975,7 +988,14 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         # No guessed version for a large historical read without full_digest.
         self._record_parent_material_read(app, paths[0], 'shared-no-version', max_bytes=73)
         app.state['turns'] = [app.state['turns'][-1]]
-        self.assertEqual(both_consumers()[1], [])
+        bounded_seed, bounded_windows = both_consumers()
+        self.assertIsNone(bounded_seed)  # Professional selection still requires a full version.
+        bounded, = bounded_windows
+        self.assertIsNone(bounded['sha256'])
+        self.assertIn('no full-file version certification', bounded['version_scope'])
+        self.assertEqual(bounded['text'], paths[0].read_bytes()[:73].decode('utf-8', errors='replace'))
+        self.assertEqual((bounded['offset_bytes'], bounded['next_offset_bytes']), (0, 73))
+        self.assertNotIn('evidence_role', bounded)
         app.state = state
         loaded = ToolApplication.load(app.session.store.root)
         self.assertEqual(json.loads(loaded._messages(client=fake,
@@ -1913,7 +1933,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         inspected_table = _call_tool(app.gateway, 'inspect_table',
             {'path': 'source0/observations.csv'}, identity='table-shape')
         self.assertEqual(inspected_table.data['row_count'], 2)
-        self.assertIn('analyze_table', {tool['function']['name'] for tool in app.schemas})
+        self.assertIn('analyze_table', app._specialist_catalog())
+        self.assertTrue(app.gateway.policy.is_allowed(app.gateway.registry.get('analyze_table'))[0])
         self.assertNotIn('search_sources', {tool['function']['name'] for tool in app.schemas})
         self.assertNotIn('acquire_source', {tool['function']['name'] for tool in app.schemas})
         project = inputs / 'project'
@@ -4747,13 +4768,225 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 self.assertEqual(fake.chat_turn.call_count, 1)
                 self.assertEqual(restored.ledger.to_dict(), before)
 
-    def test_native_outcomes_default_keeps_owners_and_loads_low_level_contracts(self) -> None:
+    def test_native_default_on_demand_uses_short_catalog_and_replaces_selected_contracts(self):
+        from simple_ar.tools.specs import CommonToolSpec
+        _, _, fake, _, app, _ = self._native_fixture()
+        self.assertEqual(app.state['config']['tool_contracts'], 'on_demand')
+        names = lambda: {row['function']['name'] for row in app.schemas}
+        self.assertNotIn('compose_document', names())
+        self.assertIn('read_file', names())
+        description = 'Do a bounded professional operation. ' + 'Detailed owner constraints. ' * 200
+        app.gateway.registry.register(CommonToolSpec(name='future_owner', domain='future', description=description))
+        self.assertNotIn('future_owner', names())
+        self.assertEqual(app._specialist_catalog()['future_owner']['description'], 'Do a bounded professional operation')
+        permission, ledger = set(app.gateway.policy.allowed_permissions), app.ledger.to_dict()
+        for identity, selection in (('first-contract', ['future_owner']), ('replace-contract', ['compose_document'])):
+            accepted = _call_tool(app.gateway, 'load_tools', {'names': selection}, identity=identity)
+            self.assertEqual(accepted.status, 'ok', accepted.error)
+            app.state['turns'].append(self._record_native_turn(app, 'load_tools', {'names': selection}, accepted.data, identity))
+            if selection == ['future_owner']:
+                self.assertEqual(next(row['function']['description'] for row in app.schemas
+                    if row['function']['name'] == 'future_owner'), description)
+        self.assertIn('compose_document', names())
+        self.assertNotIn('future_owner', names())
+        self.assertEqual(app.gateway.policy.allowed_permissions, permission)
+        self.assertEqual(app.ledger.to_dict(), ledger)
+        fake.chat_turn.assert_not_called()
+        fake.ask_json.assert_not_called()
+
+    def test_native_material_first_projection_carries_originals_across_load_and_write(self):
+        _, inputs, fake, _, app, _ = self._native_fixture()
+        source = inputs / 'observations.txt'
+        text = 'FRESH_ORIGINAL_BOUNDARY\n' + ''.join(
+            f'Observed row {index}: original conditions and units remain source evidence.\n' for index in range(200))
+        source.write_text(text, encoding='utf-8')
+        first = self._record_parent_material_read(app, source, 'material-first-read', max_bytes=64000)
+        first_view = json.loads(app._messages(client=fake)[1]['content'])
+        self.assertEqual(first_view['retained_text_windows'][0]['text'], text)
+        self.assertEqual(first_view['retained_text_windows'][0]['role'], 'fresh_read')
+        selected = _call_tool(app.gateway, 'load_tools', {'names': ['compose_document']}, identity='material-first-load')
+        self.assertEqual(selected.status, 'ok', selected.error)
+        app.state['turns'].append(self._record_native_turn(app, 'load_tools', {'names': ['compose_document']},
+            selected.data, 'material-first-load'))
+        loaded = app._messages(client=fake)
+        target = json.loads(loaded[1]['content'])['resources']['approximate_next_input_tokens'] + estimate_tokens(text) // 4
+        script = app.workspace.workspace / 'draft.py'
+        script.write_text('# GENERATED_CONTEXT_BOUNDARY\n' + '# editing context only\n' * (len(text) // 2), encoding='utf-8')
+        authored = self._record_file_observation(app, script, 'write_file', 'material-first-write')
+        app.state['turns'].append(authored)
+        app._save()
+        receipts, ledger = self._native_receipts(app, app.state['turns']), app.ledger.to_dict()
+        with patch.dict(fake._settings.__dict__, {'context_input_tokens': target}):
+            messages = app._messages(client=fake)
+            view = json.loads(messages[1]['content'])
+            self.assertEqual(next(row['text'] for row in view['retained_text_windows'] if row['path'] == str(source)), text)
+            self.assertEqual(json.dumps(messages).count('FRESH_ORIGINAL_BOUNDARY'), 1)
+            self.assertTrue(any(row['role'] == 'working_read' for row in view['retained_text_windows']))
+            self.assertTrue(any(row.get('role') == 'write_context' for row in view['material_supply']['omitted']))
+            self.assertFalse(view['resources']['context_exceeds_input_target'])
+            self._assert_native_input_accounting(app, messages)
+        # A smaller capacity reports the exact missing range, never a hidden
+        # partial read or a successful receipt mistaken for model supply.
+        with patch.dict(fake._settings.__dict__, {'context_input_tokens': target - estimate_tokens(text)}):
+            try:
+                smaller = json.loads(app._messages(client=fake)[1]['content'])
+            except ValueError as error:
+                self.assertIn('no model request sent', str(error))
+            else:
+                self.assertFalse(any(row['path'] == str(source) for row in smaller['retained_text_windows']))
+                self.assertGreater(smaller['material_supply']['archived_observations'], 0)
+                self.assertIn('not supplied text', smaller['material_supply']['archive_scope'])
+        with patch.object(app.gateway.policy, 'blocked_tools', {'read_file'}):
+            denied = json.loads(app._messages(client=fake)[1]['content'])
+            self.assertFalse(any(row['path'] == str(source) for row in denied['retained_text_windows']))
+            self.assertGreater(denied['material_supply']['archived_observations'], 0)
+        source.write_text(text + 'changed version\n', encoding='utf-8')
+        changed = json.loads(app._messages(client=fake)[1]['content'])
+        self.assertFalse(any(row['path'] == str(source) for row in changed['retained_text_windows']))
+        self.assertGreater(changed['material_supply']['archived_observations'], 0)
+        self.assertEqual(self._native_receipts(app, app.state['turns']), receipts)
+        self.assertEqual(app.ledger.to_dict(), ledger)
+        self.assertEqual(app.state['turns'][0], first)
+        fake.chat_turn.assert_not_called()
+        fake.ask_json.assert_not_called()
+
+    def test_native_material_supply_single_copy_for_focus_overlap_and_native_write(self):
+        _, inputs, fake, _, app, _ = self._native_fixture()
+        path = inputs / 'unicode.txt'
+        text = '甲乙丙丁\n' * 60
+        path.write_text(text, encoding='utf-8')
+        with patch.object(app, '_client', return_value=SimpleNamespace(model='fixture', connection_binding=lambda: {})):
+            args = {'purpose': 'writing', 'goal': 'Use original passages', 'inputs': [
+                {'path': str(path), 'offset_bytes': 104, 'max_bytes': 65}]}
+            focused = _call_tool(app.gateway, 'focus_work', args, identity='single-copy-focus')
+        self.assertEqual(focused.status, 'ok', focused.error)
+        app.state['turns'].append(self._record_native_turn(app, 'focus_work', args, focused.data, 'single-copy-focus'))
+        self._record_parent_material_read(app, path, 'single-copy-wide', max_bytes=64000)
+        messages = app._messages(client=fake)
+        view = json.loads(messages[1]['content'])
+        spans = [(row['data'].get('offset_bytes', row['request'].get('offset_bytes', 0)), row['data']['next_offset_bytes'], row['data']['text'])
+            for row in view['work_inputs']['windows'] if row['status'] == 'supplied']
+        spans += [(row['offset_bytes'], row['next_offset_bytes'], row['text']) for row in view['retained_text_windows']]
+        spans.sort()
+        self.assertEqual(spans, [(104, 169, text.encode()[104:169].decode())])
+        self.assertNotIn('offset_bytes', focused.data['inputs'][0]['data'])
+        self.assertFalse(any(row['path'] == str(path) for row in view['retained_text_windows']))
+        self._assert_native_input_accounting(app, messages)
+        generated = app.workspace.workspace / 'edit.py'
+        generated.write_text('# ONLY_AUTHORED_ONCE\n', encoding='utf-8')
+        app.state['turns'].append(self._record_file_observation(app, generated, 'write_file', 'single-native-write'))
+        messages = app._messages(client=fake)
+        self.assertEqual(json.dumps(messages).count('ONLY_AUTHORED_ONCE'), 1)
+        self.assertTrue(any(row['role'] == 'write_context' for row in
+            json.loads(messages[1]['content'])['material_supply']['native_context']))
+
+    def test_native_window_admission_keeps_lossy_and_split_utf8_observations_whole(self):
+        from simple_ar.tools.materials import admit_text_window
+        _, inputs, fake, _, app, _ = self._native_fixture()
+        path = inputs / 'split.txt'
+        path.write_bytes('甲乙丙丁'.encode() + b'\xff\xfe' + '后文'.encode())
+        originals = []
+        for index, (offset, length) in enumerate(((0, 5), (1, 9), (8, 9))):
+            turn = self._record_parent_material_read(app, path, f'split-{index}',
+                offset_bytes=offset, max_bytes=length)
+            data = app.session.store.read_json(turn['tools'][0]['result'])['data']
+            originals.append((offset, data['next_offset_bytes'], data['text']))
+        messages = app._messages(client=fake)
+        windows = json.loads(messages[1]['content'])['retained_text_windows']
+        self.assertEqual(sorted((row['offset_bytes'], row['next_offset_bytes'], row['text'])
+            for row in windows), sorted(originals))
+        self.assertTrue(any('overlap_scope' in row for row in windows))
+        # Even complete numeric containment cannot deduplicate lossy decoding
+        # by pretending re-encoded text is the original byte buffer.
+        outer = {'path': 'x', 'sha256': 'a' * 64, 'offset_bytes': 0,
+            'next_offset_bytes': 3, 'text': '\ufffd'}
+        inner = {**outer, 'offset_bytes': 1, 'next_offset_bytes': 2}
+        retained = admit_text_window([outer], inner)
+        self.assertEqual([row['text'] for row in retained], ['\ufffd', '\ufffd'])
+        self._assert_native_input_accounting(app, messages)
+        fake.chat_turn.assert_not_called()
+
+    def test_native_large_bounded_observation_does_not_require_full_file_digest(self):
+        _, inputs, fake, _, app, _ = self._native_fixture()
+        path = inputs / 'large.txt'
+        for size in (300000, 65 * 1024 * 1024):
+            with self.subTest(size=size):
+                with path.open('wb') as stream:
+                    stream.write(b'FINITE_ORIGINAL_WINDOW\n' * 1000)
+                    stream.truncate(size)
+                app.state['turns'] = []
+                turn = self._record_parent_material_read(app, path, f'bounded-{size}')
+                data = app.session.store.read_json(turn['tools'][0]['result'])['data']
+                self.assertIsNone(data['sha256'])
+                before = self._native_snapshot(app)
+                with patch.object(app.workspace, 'call', wraps=app.workspace.call) as reads:
+                    messages = app._messages(client=fake)
+                window, = json.loads(messages[1]['content'])['retained_text_windows']
+                self.assertEqual(window['text'], data['text'])
+                self.assertEqual(window['next_offset_bytes'], data['next_offset_bytes'])
+                self.assertIsNone(window['sha256'])
+                self.assertIn('no full-file version', window['version_scope'])
+                self.assertNotIn('evidence_role', window)
+                self.assertTrue(all(not call.args[1].get('full_digest') for call in reads.call_args_list
+                    if call.args[0] == 'read_file'))
+                self._assert_native_snapshot(app, before)
+                self._assert_native_input_accounting(app, messages)
+                path.write_bytes(b'CHANGED_WINDOW')
+                changed = json.loads(app._messages(client=fake)[1]['content'])
+                self.assertEqual(changed['retained_text_windows'], [])
+                self.assertTrue(any(row['status'] == 'unavailable' for row in changed['material_supply']['omitted']))
+        fake.chat_turn.assert_not_called()
+
+    def test_native_old_invalidations_are_archived_not_mandatory_context(self):
+        _, inputs, fake, _, app, _ = self._native_fixture()
+        path = inputs / 'versions.txt'
+        # Distinct retired versions, not repeated references to one receipt.
+        for index in range(1000):
+            path.write_text(f'Observed version {index}\n', encoding='utf-8')
+            self._record_parent_material_read(app, path, f'version-{index}')
+        before = self._native_snapshot(app)
+        messages = app._messages(client=fake)
+        view = json.loads(messages[1]['content'])
+        self.assertEqual([row['text'] for row in view['retained_text_windows']], ['Observed version 999\n'])
+        self.assertEqual(view['material_supply']['omitted'], [])
+        self.assertNotIn('versions.txt', json.dumps(view['material_supply']))
+        self.assertFalse(view['resources']['context_exceeds_input_target'])
+        self._assert_native_snapshot(app, before)
+        self._assert_native_input_accounting(app, messages)
+        fake.chat_turn.assert_not_called()
+
+    def test_native_repair_diagnostics_precede_older_working_material(self):
+        _, inputs, fake, _, app, _ = self._native_fixture(allow_execution=True)
+        path = inputs / 'old-notes.txt'
+        text = 'Original old observation\n' * 1500
+        path.write_text(text, encoding='utf-8')
+        self._record_parent_material_read(app, path, 'repair-old-read', max_bytes=64000)
+        diagnostic = {'returncode': 1, 'stdout': '', 'stderr': 'REPAIR_DIAGNOSTIC\n' * 400,
+            'receipt': 'tools/processes/failed/invocation.json'}
+        app.state['turns'].append(self._record_native_turn(app, 'run_process',
+            {'argv': ['python', 'repair.py']}, diagnostic, 'repair-failure'))
+        complete = json.loads(app._messages(client=fake)[1]['content'])
+        target = complete['resources']['approximate_next_input_tokens'] - estimate_tokens(text) // 2
+        with patch.dict(fake._settings.__dict__, {'context_input_tokens': target}):
+            messages = app._messages(client=fake)
+        view = json.loads(messages[1]['content'])
+        supplied = [row['observed'] for row in view['execution_observations']]
+        supplied += [json.loads(message['content']).get('data', {}) for message in messages[2:]
+            if message['role'] == 'tool']
+        self.assertTrue(any(row.get('stderr') == diagnostic['stderr'] for row in supplied))
+        self.assertFalse(any(row['path'] == str(path) for row in view['retained_text_windows']))
+        gap, = [row for row in view['material_supply']['omitted'] if row['path'] == str(path)]
+        self.assertEqual((gap['offset_bytes'], gap['next_offset_bytes']), (0, len(text.encode())))
+        self._assert_native_input_accounting(app, messages)
+        fake.chat_turn.assert_not_called()
+
+    def test_native_explicit_outcomes_keeps_saved_owners_and_low_level_loading(self) -> None:
         from simple_ar.tools.specs import CommonToolSpec
 
         names = lambda owner: {row['function']['name'] for row in owner.schemas}
         for execution in (False, True):
             with self.subTest(execution=execution):
-                _, _, fake, _, app, _ = self._native_fixture(allow_execution=execution)
+                _, _, fake, _, app, _ = self._native_fixture(allow_execution=execution, tool_contracts='outcomes')
                 self.assertEqual(app.state['config']['tool_contracts'], 'outcomes')
                 self.assertEqual(app.session.store.read_json('actions.json')['config']['tool_contracts'], 'outcomes')
                 self.assertTrue({'compose_document', 'prepare_implementation', 'analyze_table', 'inspect_table',
@@ -4822,9 +5055,10 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertNotIn('run_process', names(app))
         self.assertNotIn('search_sources', app._specialist_catalog())
         for name, entry in app._specialist_catalog().items():
-            self.assertEqual(entry['description'], app.gateway.registry.get(name).description)
+            self.assertTrue(entry['description'])
+            self.assertLessEqual(len(entry['description']), 200)
             self.assertEqual(entry['domain'], app.gateway.registry.get(name).domain)
-        self.assertIn('material_roots', app._specialist_catalog()['compose_document']['description'])
+        self.assertIn('material_roots', app.gateway.registry.get('compose_document').parameters_schema()['properties'])
         self.assertIn('find_source_passages', app._specialist_catalog())
         self.assertIn('analyze_measurements', app._specialist_catalog())
         advertised = sorted(app._specialist_catalog())
@@ -4927,8 +5161,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 root = app.session.store.root
                 preview, _, _, _ = ToolApplication._configuration(root, 'Configuration preview',
                     model=None, sources={}, max_attempts=30)
-                self.assertEqual(preview['tool_contracts'], 'outcomes')
-                if mode in {'full', 'on_demand'}:
+                self.assertEqual(preview['tool_contracts'], 'on_demand')
+                if mode in {'full', 'on_demand', 'outcomes'}:
                     # Exercise the public compatibility override, not a mock
                     # that assumes every new model sees specialist schemas.
                     app = ToolApplication.create(root.parent / f'explicit-{mode}', 'Compatibility control',
@@ -5005,12 +5239,25 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(sum(m['role'] == 'tool' for m in messages), len(resumed.state['turns']))
         for turn, assistant, result in zip(resumed.state['turns'], messages[2::2], messages[3::2]):
             self.assertEqual(result['tool_call_id'], assistant['tool_calls'][0]['id'])
-            self.assertEqual(json.loads(result['content']), resumed.session.store.read_json(turn['tools'][0]['result']))
+            original = resumed.session.store.read_json(turn['tools'][0]['result'])
+            shown = json.loads(result['content'])
+            if original.get('tool_name') == 'read_file' and original.get('data', {}).get('text'):
+                self.assertNotIn('text', shown['data'])
+                self.assertEqual({key: value for key, value in shown['data'].items() if key != 'text_supply'},
+                    {key: value for key, value in original['data'].items() if key != 'text'})
+            else:
+                self.assertEqual(shown, original)
         self.assertEqual(json.loads(messages[4]['tool_calls'][0]['function']['arguments'])['content'], code)
         self.assertEqual(json.loads(messages[-1]['content'])['data']['stderr'], 'Later verification failed')
         self.assertEqual(self._native_observations(json.loads(messages[1]['content'])), [])
         self.assertEqual(json.loads(messages[1]['content'])['history_archive']['end_turn'], 0)
         self.assertEqual(json.loads(messages[1]['content'])['retained_text_windows'], [])
+        native_code, = [row for row in json.loads(messages[1]['content'])['material_supply']['native_context']
+            if row['path'] == str(resumed.workspace.workspace / 'check.py')]
+        self.assertEqual(native_code['role'], 'write_context')
+        self.assertEqual(native_code['status'], 'supplied_native')
+        self.assertEqual(native_code['sha256'], hashlib.sha256(code.encode('utf-8')).hexdigest())
+        self.assertEqual(json.loads(messages[4]['tool_calls'][0]['function']['arguments'])['content'], code)
         self.assertEqual(json.loads(messages[1]['content'])['execution_observations'], [])
         self.assertEqual(resources["context_input_target_tokens"], min(24000, max(0,
             resources['remaining']['total_tokens'])))
@@ -5230,25 +5477,30 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(archived_process['observed']['stderr'], '')
         latest_process = next(row for row in context['execution_observations']
             if row['record'] == 'records/context-execution-result/native_result.json')
-        self.assertEqual(latest_process['observed'], diagnostic)
+        self._assert_execution_supply(latest_process, diagnostic)
         readback_payload = resumed.session.store.read_json('attempts/context-execution-result/native_result.json')
         self.assertEqual(readback_payload['data'], diagnostic)
-        resumed.state['turns'].append(self._record_native_turn(resumed, 'read_file',
-            {'path': 'records/context-execution-result/native_result.json'},
-            {'text': json.dumps(readback_payload), 'absolute_path': str(
-                resumed.session.store.root / 'attempts/context-execution-result/native_result.json')}, 'readback'))
+        resumed.state['turns'].append(self._record_file_observation(resumed,
+            resumed.session.store.root / 'attempts/context-execution-result/native_result.json', 'read_file', 'readback'))
         readback_messages = resumed._messages()
         readback_context = json.loads(readback_messages[1]['content'])
         readback_index = (self._native_observations(readback_context)
             + readback_context.get('execution_observations', []))
-        self.assertFalse(any(row['record'] == 'records/context-execution-result/native_result.json'
-            for row in readback_context['execution_observations']))
+        supplied = [row for row in readback_context['retained_text_windows']
+            if row['path'].endswith('context-execution-result/native_result.json')]
+        self.assertEqual(any(row['record'] == 'records/context-execution-result/native_result.json'
+            for row in readback_context['execution_observations']), not bool(supplied))
         for row in readback_index:
             if row.get('record') == 'records/context-execution-result/native_result.json':
-                self.assertNotIn('stderr', row['observed'])
-        self.assertTrue(any(row.get('tool_call_id') == 'readback'
-            and json.loads(json.loads(row['content'])['data']['text']) == readback_payload
-            for row in readback_messages if row['role'] == 'tool'))
+                if row in readback_context['execution_observations']:
+                    self._assert_execution_supply(row, diagnostic)
+                else:
+                    self.assertNotIn('stderr', row['observed'])
+        if supplied:
+            self.assertEqual(json.loads(supplied[0]['text']), readback_payload)
+        else:
+            self.assertTrue(any(row.get('path', '').endswith('context-execution-result/native_result.json')
+                and row['status'] == 'capacity_not_supplied' for row in readback_context['material_supply']['omitted']))
         resumed.state['turns'].pop()
         self.assertEqual(resumed.workspace.resolve(archived_read['record']).read_text(),
             (resumed.session.store.root / 'attempts/context-view-0-result/native_result.json').read_text())
@@ -5258,18 +5510,10 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertIn('sha256', archived_read['observed'])
         original_limits_for_context = dict(resumed.ledger.limits)
         with patch.dict(resumed.ledger.limits, {'total_tokens': 10000}):
-            bounded = resumed._messages()
-            budget_context = json.loads(bounded[1]['content'])
-            self.assertLess(budget_context['resources']['context_input_target_tokens'], 24000)
-            self.assertTrue(budget_context['resources']['context_exceeds_input_target'])
-            self.assertLessEqual(estimate_tokens(json.dumps(budget_context['earlier_turns'],
-                ensure_ascii=False, separators=(',', ':'))), 2000)
-            self.assertGreater(budget_context['history_archive']['end_turn'], 0)
-            protected = (budget_context['execution_observations']
-                + self._native_observations(budget_context))
-            self.assertEqual(next(row['observed'] for row in protected if row['record'] ==
-                'records/context-execution-result/native_result.json'), diagnostic)
-            self.assertTrue(any(row.get('tool_calls') for row in bounded))
+            # This explicitly saved full catalog cannot fit even its minimum
+            # contract here. It must refuse, not send an oversized request.
+            with self.assertRaisesRegex(ValueError, 'no model request sent'):
+                resumed._messages()
         self.assertEqual(resumed.ledger.limits, original_limits_for_context)
 
     def test_native_history_bounds_indexes_and_supplies_saved_execution_diagnoses(self) -> None:
@@ -5305,25 +5549,27 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         file_records = self._native_receipts(resumed, (file_turn,))
         # A later successful probe cannot replace a failure; complete readback supplies it once.
         failure_payload = resumed.session.store.read_json(failure['tools'][0]['result'])
-        readback = self._record_native_turn(resumed, 'read_file',
-            {'path': 'records/' + failure['tools'][0]['result'].removeprefix('attempts/')},
-            {'text': json.dumps(failure_payload), 'absolute_path': str(
-                resumed.session.store.root / failure['tools'][0]['result'])}, 'failure-readback')
+        readback = self._record_file_observation(resumed,
+            resumed.session.store.root / failure['tools'][0]['result'], 'read_file', 'failure-readback')
         for readback_visible in (False, True):
             with self.subTest(readback=readback_visible), patch.dict(resumed.state, {'turns':
                     [failure, probe] + [saved_turns[1]] * 100 +
-                    ([readback] if readback_visible else [saved_turns[-1]])}), patch.dict(
-                    resumed.ledger.limits, {'total_tokens': 10000}):
+                    ([readback] if readback_visible else [saved_turns[-1]])}):
+                with patch.dict(resumed.ledger.limits, {'total_tokens': 10000}):
+                    with self.assertRaisesRegex(ValueError, 'no model request sent'):
+                        resumed._messages()
                 messages = resumed._messages()
                 context = json.loads(messages[1]['content'])
                 failed_record = 'records/' + failure['tools'][0]['result'].removeprefix('attempts/')
-                if readback_visible:
+                supplied = [row for row in context['retained_text_windows']
+                    if row['path'] == str(resumed.session.store.root / failure['tools'][0]['result'])]
+                if supplied:
                     self.assertFalse(any(row['record'] == failed_record
                         for row in context['execution_observations']))
                 else:
                     failed = next(row for row in context['execution_observations']
                         if row['record'] == failed_record)
-                    self.assertEqual(failed['observed'], diagnostic)
+                    self._assert_execution_supply(failed, diagnostic)
                     self.assertEqual(failed['arguments'], {'argv': failed_argv, 'cwd': failed_cwd})
                 probe_record = 'records/' + probe['tools'][0]['result'].removeprefix('attempts/')
                 latest = next(row for row in context['execution_observations']
@@ -5331,12 +5577,17 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 self.assertEqual(latest['observed'], probe_data)
                 self.assertEqual(latest['arguments'], {'argv': probe_argv, 'cwd': probe_cwd})
                 self._assert_native_input_accounting(resumed, messages)
-                if readback_visible:
-                    self.assertEqual(json.loads(json.loads(messages[-1]['content'])['data']['text']),
-                        failure_payload)
+                if supplied:
+                    self.assertEqual(json.loads(supplied[0]['text']), failure_payload)
+                elif readback_visible:
+                    self.assertTrue(any(row.get('path') == str(resumed.session.store.root / failure['tools'][0]['result'])
+                        and row['status'] == 'capacity_not_supplied' for row in context['material_supply']['omitted']))
         resumed.state['turns'] = [file_turn] + source_turns + [failure, probe] + [saved_turns[1]] * 100 + before_index_stress
+        with patch.dict(resumed.ledger.limits, {'total_tokens': 10000}):
+            with self.assertRaisesRegex(ValueError, 'no model request sent'):
+                resumed._messages()
         with patch.dict(resumed.state['config'], {'max_turns': 200}), patch.dict(
-                resumed.ledger.limits, {'total_tokens': 10000, 'llm_requests': None}):
+                resumed.ledger.limits, {'llm_requests': None}):
             stressed = resumed._messages()
         stress_context, recent, archive, cutoff = self._assert_history_partition(resumed, stressed)
         self.assertLessEqual(estimate_tokens(json.dumps(stress_context['earlier_turns'],
@@ -5352,7 +5603,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             self.assertEqual(row, original)  # The recent page uses the same lossless index.
         indexed = [observation for turn in recovered for observation in turn['observations']]
         self.assertTrue(all('record' in row for row in indexed))
-        self.assertEqual(next(row['observed'] for row in stress_context['execution_observations']
+        self._assert_execution_supply(next(row for row in stress_context['execution_observations']
             if row['record'] == 'records/context-execution-result/native_result.json'), diagnostic)
         observations = {row['record']: row for row in indexed}
         for turn, data in zip(source_turns, (source_data, metadata_data)):
@@ -5423,8 +5674,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 context, recent, archive, cutoff = self._assert_history_partition(app, messages)
                 assistants = [message for message in messages[2:] if message['role'] == 'assistant']
                 windows = [row for row in context['retained_text_windows'] if row['path'] == str(original_path)]
-                self.assertEqual([row['text'] for row in windows],
-                    [] if material in app.state['turns'][cutoff:] else [original_text])
+                self.assertEqual([row['text'] for row in windows], [original_text])
                 for window in windows:
                     self.assertEqual(window['sha256'], hashlib.sha256(original_path.read_bytes()).hexdigest())
                 self.assertEqual(context['requests'], app.state['requests'])
@@ -5447,12 +5697,12 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual([message for message in small_messages if message['role'] == 'assistant'],
             [app.session.store.read_json(turn['reply']) for turn in app.state['turns']])
 
-        # When original turns fit, no supplemental retained copy is needed.
+        # Raw reads have one supplied copy even when the native receipt fits.
         app.state['turns'] = [material] + small + [native]
         messages = app._messages(client=fake)
         context = json.loads(messages[1]['content'])
         self.assertEqual(context['retained_turn_start'], 0)
-        self.assertEqual(context['retained_text_windows'], [])
+        self.assertTrue(context['retained_text_windows'])
         self.assertEqual([message for message in messages if message['role'] == 'assistant'],
             [app.session.store.read_json(turn['reply']) for turn in app.state['turns']])
         self._assert_native_input_accounting(app, messages)
@@ -5941,25 +6191,23 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 self.assertEqual(expanded['earlier_turns'], context['earlier_turns'])
                 self.assertEqual(histories[1], histories[0])
                 windows = context['retained_text_windows']
-                self.assertIn(str(current), [row['path'] for row in windows])
-                self.assertLess([row['path'] for row in windows].index(str(current)),
-                    [row['path'] for row in windows].index(str(prior)))
-                self.assertEqual(next(row['text'] for row in windows if row['path'] == str(current)),
-                    current.read_text())
+                native = context['material_supply']['native_context']
+                self.assertIn(str(current), [row['path'] for row in [*native, *windows]])
+                if any(row['path'] == str(current) for row in windows):
+                    self.assertEqual(next(row['text'] for row in windows if row['path'] == str(current)), current.read_text())
+                else:
+                    self.assertEqual(operation, 'write_file')
+                    self.assertTrue(any(json.loads(call['function']['arguments']).get('content') == current.read_text()
+                        for message in histories[0] for call in message.get('tool_calls', [])))
                 self.assertFalse(context['resources']['context_exceeds_input_target'])
                 for cap, target in ((None, 6000), (1500, 4500), (6000, 0), (8192, 0)):
                     with self.subTest(cap=cap), patch.dict(app.ledger.limits, {'total_tokens': 6000}):
                         fake.effective_output_limit.return_value = cap
                         before = app.ledger.to_dict()
-                        bounded = app._messages()
-                        bounded_context = json.loads(bounded[1]['content'])
-                        self.assertEqual(bounded_context['resources']['context_input_target_tokens'], target)
-                        self.assertEqual(bounded_context['resources']['next_output_token_reservation'], cap or 0)
-                        self.assertEqual(bounded_context['retained_text_windows'], [])
-                        # Necessary execution history survives even a zero target.
-                        self.assertEqual(bounded[2:], histories[0])
-                        self.assertEqual(json.loads(bounded[-1]['content'])['data'],
-                            {'returncode': 1, 'stdout': '', 'stderr': 'verification failed'})
+                        # Minimum contracts/diagnostics do not fit these caps;
+                        # do not dispatch the old oversized native suffix.
+                        with self.assertRaisesRegex(ValueError, 'no model request sent'):
+                            app._messages()
                         self.assertEqual(app.ledger.to_dict(), before)
                 fake.effective_output_limit.return_value = None
                 self.assertEqual(app.session.store.read_json(recent['reply'])['tool_calls'][0]
@@ -6029,14 +6277,18 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     # Feedback makes that selection historical: it must not
                     # keep displacing the next raw read under the same cap.
                     app.state['requests'].append('Revise using the newly read portion')
+                    fresh_read = app.workspace.call('read_file', {'path': str(table), 'max_bytes': 80}, identity='fresh-feedback')
+                    self.assertEqual(fresh_read.status, 'ok', fresh_read.error)
                     later = self._record_native_turn(app, 'read_file', {'path': str(table), 'max_bytes': 80},
-                        {'text': 'LATEST_REQUESTED_PORTION'}, 'read-after-feedback')
+                        fresh_read.data, 'read-after-feedback')
                     later['request_count'] = len(app.state['requests'])
                     app.state['turns'].append(later)
                     with patch.dict(fake._settings.__dict__, {'context_input_tokens': cost - 1000}):
                         fresh = app._messages(client=fake)
                     self.assertFalse(json.loads(fresh[1]['content'])['work_inputs']['current_selection'])
-                    self.assertIn('LATEST_REQUESTED_PORTION', json.dumps(fresh[2:]))
+                    fresh_view = json.loads(fresh[1]['content'])
+                    self.assertTrue(any(row['offset_bytes'] == 0 and row['next_offset_bytes'] >= fresh_read.data['next_offset_bytes']
+                        and row['text'].startswith(fresh_read.data['text']) for row in fresh_view['retained_text_windows']))
                     app.state['turns'].pop()
                     app.state['requests'].pop()
                 self.assertEqual(app.ledger.to_dict(), before)
@@ -6131,7 +6383,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         feedback = view(restored)
         self.assertEqual(feedback['work_focus']['goal'], '')
         self.assertFalse(feedback['work_inputs']['current_selection'])
-        self.assertEqual(feedback['work_inputs']['windows'][0]['data'], selected.data['inputs'][0]['data'])
+        self.assertEqual(feedback['work_inputs']['windows'][0]['data'],
+            {key: value for key, value in selected.data['inputs'][0]['data'].items() if key != 'text'})
         self.assertIn('Now explain limitations', json.dumps(feedback['requests']))
         # Later raw native reads/writes retain exact historical bodies. They
         # cannot undo the current selection's invalidation or capacity refusal.
@@ -6156,7 +6409,10 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         changed_messages = app._messages(client=fake)
         self.assertIn('CURRENT_INPUT', json.dumps(changed_messages[2:]))
         self.assertIn('not revalidated current work inputs', changed_view['native_history_scope'])
-        self.assertEqual(changed_view['retained_text_windows'], [])
+        self.assertFalse(any(row['path'] == str(table) for row in changed_view['retained_text_windows']))
+        unchanged, = changed_view['retained_text_windows']
+        self.assertEqual(unchanged['path'], str(inputs / 'notes.txt'))
+        self.assertEqual(unchanged['text'], 'original source')
         self.assertEqual(seed(refs[0])['observations'], [])
         table.write_bytes(raw)
         for blocked in ('read_file', 'mount'):
@@ -7012,23 +7268,12 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             with patch.object(app, '_client', return_value=client), patch(
                     'simple_ar.integrations.llm._call_openai_sdk') as provider:
                 self.assertEqual(app.run(feedback=feedback, progress=lambda _: None)['status'], 'paused')
-                self.assertIn('budget prevented provider attempt', app.session.manifest.status_reason)
-                messages = app._messages(client=client)
+                self.assertIn('no model request sent', app.session.manifest.status_reason)
+                with self.assertRaisesRegex(ValueError, 'no model request sent'):
+                    app._messages(client=client)
                 provider.assert_not_called()
-            context = json.loads(messages[1]['content'])
-            self._assert_native_input_accounting(app, messages)
-            self.assertEqual(context['resources']['context_input_target_tokens'], 0)
-            self.assertEqual(context['resources']['next_output_token_reservation'], 8192)
-            self.assertTrue(context['resources']['context_exceeds_input_target'])
-            self.assertEqual(context['requests'], ['Create and verify a small tool', feedback])
-            self.assertEqual(messages[-1], {'role': 'user', 'content': feedback})
-            execution = next(row for row in context['execution_observations']
-                if row['tool'] == 'run_process' and row.get('observed', {}).get('returncode') == 0)
-            self.assertEqual(execution['observed']['stdout'], 'done\n')
-            self.assertEqual(execution['arguments']['argv'], ['python', 'check.py'])
-            calls = [call['id'] for row in messages for call in row.get('tool_calls', [])]
-            self.assertEqual(calls, [row['tool_call_id'] for row in messages if row['role'] == 'tool'])
-            self.assertTrue(calls)
+            self.assertEqual(app.state['requests'], ['Create and verify a small tool', feedback])
+            self.assertEqual(self._native_receipts(app, original_turns), records)
             self.assertEqual(app.ledger.to_dict(), before)
             self.assertEqual(client.effective_output_limit(), 8192)
             self.assertEqual(client.model, 'fixture')
@@ -7224,15 +7469,18 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(fallback['retained_text_windows'][0]['offset_bytes'], 1200)
         self.assertFalse(fallback['resources']['context_exceeds_input_target'])
         self._assert_native_input_accounting(resumed, messages)
-        # Intersecting windows that do not contain each other each carry
-        # observed bytes outside the intersection; do not drop or merge either.
+        # Partial overlaps retain whole original observations, not re-encoded
+        # byte slices. The finite duplicate cost is disclosed explicitly.
         overlap = self._record_parent_material_read(resumed, coverage_path, 'coverage-overlap',
             offset_bytes=1300, max_bytes=200)
         resumed.state['turns'] = [small, overlap, padding_view, second_padding] + saved_turns
         messages = resumed._messages()
         overlapping = json.loads(messages[1]['content'])['retained_text_windows']
-        self.assertEqual(sorted((row['offset_bytes'], row['next_offset_bytes'], row['text'])
-            for row in overlapping), [(1200, 1400, full_text[1200:1400]), (1300, 1500, full_text[1300:1500])])
+        spans = sorted((row['offset_bytes'], row['next_offset_bytes'], row['text']) for row in overlapping)
+        self.assertEqual((spans[0][0], spans[-1][1]), (1200, 1500))
+        self.assertEqual(spans, [(1200, 1400, full_text[1200:1400]),
+            (1300, 1500, full_text[1300:1500])])
+        self.assertTrue(any('overlap_scope' in row for row in overlapping))
         self._assert_native_input_accounting(resumed, messages)
         resumed.state['turns'] = [full, small, padding_view, second_padding] + saved_turns
         # Changing even an unread part of the current file rejects both old
@@ -7286,14 +7534,17 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(passages[0]['sha256'], hashlib.sha256(raw_original).hexdigest())
         self.assertEqual(passages[0]['documents'], acquired.data['documents'])
         self.assertTrue(passages[0]['record'].startswith('records/'))
-        # Once all original turns fit, native supply replaces both retained
-        # collections, including the repeated source observation.
+        # Even when history fits, admitted text has one owner-rendered copy;
+        # native read/passage receipts point to that same supplied coverage.
         resumed.state['turns'] = [source_view, workspace_view, source_turn, duplicate_turn] + saved_turns
         messages = resumed._messages()
         native = json.loads(messages[1]['content'])
         self.assertEqual(native['retained_turn_start'], 0)
-        self.assertEqual(native['retained_text_windows'], [])
-        self.assertEqual(native['retained_source_passages'], [])
+        self.assertEqual([row['text'] for row in native['retained_text_windows']].count('1'), 1)
+        self.assertEqual(len(native['retained_source_passages']), 1)
+        self.assertEqual([row['text'] for row in native['retained_text_windows']].count(source_text), 1)
+        self.assertTrue(all('text' not in json.loads(row['content']).get('data', {}) for row in messages
+            if row['role'] == 'tool' and json.loads(row['content']).get('tool_name') == 'read_file'))
         self._assert_native_input_accounting(resumed, messages)
         resumed.state['turns'] = text_turns + [saved_turns[-1]]
         # A later short excerpt cannot erase an earlier observed limitation
@@ -7330,11 +7581,9 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 resumed.state['turns'] = [source_view, source_turn, long_thinking]
                 messages = resumed._messages()
                 context = json.loads(messages[1]['content'])
-                self.assertEqual(context['retained_text_windows'], [])
-                self.assertEqual(context['retained_source_passages'], [])
-                self.assertTrue(context['resources']['context_exceeds_input_target'])
-                self.assertEqual(next(m for m in messages if m['role'] == 'assistant')
-                    ['reasoning_content'], reply['reasoning_content'])
+                self.assertTrue(context['retained_text_windows'])
+                self.assertFalse(context['resources']['context_exceeds_input_target'])
+                self.assertNotIn(reply['reasoning_content'], json.dumps(messages))
                 self.assertEqual(resumed.ledger.to_dict(), before)
         changed = self._record_native_turn(resumed, 'edit_file', {'path': workspace_path}, {
             'absolute_path': workspace_path, 'sha256': '2' * 64}, 'text-change')
@@ -7441,7 +7690,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(resumed.workspace.resolve('source1').read_text(), additional.read_text())
         self.assertIn('User explicitly authorized', resumed.state['requests'][-1])
         self.assertTrue(ToolApplication.load(resumed.session.store.root).state['config']['allow_network'])
-        self.assertIn('search_sources', {tool['function']['name'] for tool in resumed.schemas})
+        self.assertIn('search_sources', resumed._specialist_catalog())
+        self.assertTrue(resumed.gateway.policy.is_allowed(resumed.gateway.registry.get('search_sources'))[0])
         self.assertEqual((resumed.workspace.workspace / 'counter.txt').read_text(), '1')
         self.assertEqual(len(list((resumed.session.store.root / 'tools/processes').glob('*/invocation.json'))), 1)
 
@@ -10493,14 +10743,13 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     self.assertEqual(resources['unknown_usage'], list(owner.ledger.unknown_dimensions()))
                     self.assertEqual(context['vision_inspection']['available'], available)
                     schemas = {row['function']['name']: row['function'] for row in restored.schemas}
-                    self.assertEqual('inspect_images' in schemas, available)
+                    self.assertNotIn('inspect_images', schemas)
                     catalog = restored._specialist_catalog()
-                    self.assertNotIn('inspect_images', catalog)
+                    self.assertEqual('inspect_images' in catalog, available)
                     self.assertEqual(context['available_specialists'], catalog)
                     if available:
                         self.assertEqual(restored.gateway.registry.get('inspect_images').domain, 'visual')
-                        self.assertEqual(schemas['inspect_images']['description'],
-                            restored.gateway.registry.get('inspect_images').description)
+                        self.assertTrue(restored.gateway.policy.is_allowed(restored.gateway.registry.get('inspect_images'))[0])
                     self.assertNotIn('images', restored._specialist_catalog())
                     self.assertIn('generation/edit requests only', resources['semantics']['image_requests'])
                     self.assertIn('inspect_images', resources['semantics']['llm_requests'])
@@ -10665,14 +10914,17 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             with patch.dict(restored.ledger.limits, {'total_tokens': 12000}):
                 ledger_before = restored.ledger.to_dict()
                 with patch.object(restored, '_client', wraps=restored._client) as resolve:
-                    focused_context = json.loads(restored._messages()[1]['content'])
+                    # The professional output reservation leaves less than
+                    # minimum core input here; refusal still resolves it once.
+                    with self.assertRaisesRegex(ValueError, 'no model request sent'):
+                        restored._messages()
                     resolve.assert_called_once_with()
                     resolve.reset_mock()
                     task_context = json.loads(restored._messages(client=fake)[1]['content'])
                     resolve.assert_not_called()
-                for view, cap in ((focused_context, 8192), (task_context, 2000)):
-                    self.assertEqual(view['resources']['next_output_token_reservation'], cap)
-                    self.assertEqual(view['resources']['context_input_target_tokens'], 12000 - cap)
+                self.assertEqual(task_context['resources']['next_output_token_reservation'], 2000)
+                self.assertEqual(task_context['resources']['context_input_target_tokens'], 10000)
+                self.assertFalse(task_context['resources']['context_exceeds_input_target'])
                 self.assertEqual(restored.ledger.to_dict(), ledger_before)
             # Simulate interruption after the domain result was saved but
             # before the native envelope/observation was attached. Recovery
@@ -10790,10 +11042,15 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(app._work_plan(), expected)
         self.assertEqual(app.session.store.read_json(
             app.state['turns'][2]['tools'][0]['result'])['status'], 'blocked')
-        # Use the existing large-observation pattern to evict the native plan reply.
+        # Evict real oversized reasoning, not fake read bodies without byte
+        # owner receipts (which now produce explicit unverifiable-input gaps).
         for number in range(2):
-            app.state['turns'].append(self._record_native_turn(app, 'read_file',
-                {'path': 'workspace/large.txt'}, {'text': 'x' * 64000}, f'plan-eviction-{number}'))
+            turn = self._record_native_turn(app, 'list_directory',
+                {'path': 'workspace'}, {'entries': []}, f'plan-eviction-{number}')
+            reply = app.session.store.read_json(turn['reply'])
+            reply['reasoning_content'] = 'evictable reasoning ' * 20000
+            app.session.store.write_json(turn['reply'], reply)
+            app.state['turns'].append(turn)
         app._save()
         loaded = ToolApplication.load(app.session.store.root)
         messages = loaded._messages(client=fake)
