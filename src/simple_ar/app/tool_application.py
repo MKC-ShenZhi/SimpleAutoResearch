@@ -43,6 +43,8 @@ from simple_ar.research.sources import SearchProviderRegistry
 
 
 _CORE_COORDINATION = {'focus_work', 'load_tools', 'read_history'}
+_TOOL_CONTRACT_MODES = {'full', 'on_demand', 'outcomes'}
+_DEFERRED_WORKSPACE_TOOLS = {'write_file', 'edit_file', 'run_process'}
 _FINAL_WORK_TOOLS = {'write_file', 'export_report', 'run_process', 'execute_implementation', 'review_document', 'measure_experiment', 'analyze_measurements'}
 _COMPLETION_POLICIES = {'protected_decision.v1', 'closing_decision.v2'}
 _CLOSING_DECISION = (
@@ -106,7 +108,7 @@ class _WorkFocus(BaseModel):
     goal: str = Field(default='', max_length=8000)
     tools: list[str] | None = Field(default=None, max_length=20,
         exclude_if=lambda value: value is None,
-        description='Optional exact professional tool names to select together with this work focus, replacing load_tools as a separate step. Empty clears selection; omission preserves it. Selection grants no permission.')
+        description='Optional exact tool names to select together with this work focus, replacing load_tools as a separate step. Empty clears optional selection; omission preserves it. Default contracts remain available. Selection grants no permission.')
     inputs: list[FileWindow] = Field(default_factory=list, max_length=12,
         description='Optional necessary original input windows for this work unit. The owner reads and records actual bytes and identity here; no hashes required. Partial windows cover only their returned range. These inputs take priority over unrelated native history within the same remaining input capacity. If they cannot fit, narrow windows in this action loop; missing bytes are not evidence.')
 
@@ -120,7 +122,7 @@ class _WorkFocus(BaseModel):
 class _ToolSelection(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
     names: list[str] = Field(max_length=20,
-        description='Exact tool names from available_specialists; empty removes specialist contracts. Core workspace/coordination tools remain available.')
+        description='Exact tool names from available_specialists; empty clears optional selection. Default contracts remain available; selection grants no permission.')
 
 
 class _ReadHistory(BaseModel):
@@ -256,7 +258,7 @@ class ToolApplication:
                     or hashlib.sha256(path.read_bytes()).hexdigest() != snapshot['sha256']):
                 raise ValueError('Retained source snapshot changed: ' + alias)
         if (type(config.get('tool_contracts', 'full')) is not str
-                or config.get('tool_contracts', 'full') not in {'full', 'on_demand'}):
+                or config.get('tool_contracts', 'full') not in _TOOL_CONTRACT_MODES):
             raise ValueError('Unknown saved tool-contract mode; do not silently change historical tasks')
         evidence = controller.store.root / "evidence"
         evidence.mkdir(exist_ok=True)
@@ -285,10 +287,10 @@ class ToolApplication:
         registry.register(CommonToolSpec(name='update_work_plan', domain='coordination',
             permission_level='plan', risk_level='low', input_schema=_WorkPlan.model_json_schema(),
             description='Save or replace a concise working plan for this user request. Use after choosing an approach or when observations/feedback change it; may accompany actual work, no extra planning model. The latest plan stays visible across history compaction and resume. Statuses and evidence locators are model-authored intentions/claims, not verified outcomes, approval, execution or delivery. No automatic steps or fixed task pipeline.'))
-        if config.get('tool_contracts') == 'on_demand':
+        if config.get('tool_contracts', 'full') != 'full':
             registry.register(CommonToolSpec(name='load_tools', domain='coordination',
                 permission_level='plan', risk_level='low', input_schema=_ToolSelection.model_json_schema(),
-                description='Choose exact named specialist tool contracts from available_specialists for upcoming model decisions. Replaces the previous specialist selection; core tools remain. No model/network call, execution, new permission or task pipeline. Choices are retained through normal action receipts and resume. This operation does not perform the selected professional work.'))
+                description='Choose exact named tool contracts from available_specialists for upcoming model decisions. Replaces the previous optional selection; default contracts remain. No model/network call, execution, new permission or task pipeline. Choices are retained through normal action receipts and resume. This operation does not perform the selected work.'))
         if config.get("allow_vision", False):
             registry.register_many(visual_tool_specs())
         if config.get("max_images", 0) > 0:
@@ -391,24 +393,31 @@ class ToolApplication:
 
     @property
     def schemas(self) -> list[dict[str, object]]:
-        selected = None
-        if self.state['config'].get('tool_contracts') == 'on_demand':
-            selected = self._tool_selection() | {spec.name for spec in self.gateway.list_specs()
-                if spec.domain == 'workspace' or spec.name in _CORE_COORDINATION}
+        active, _ = self._contract_presentation()
         return export_openai_tool_schemas(self.gateway.registry, read_only_only=False,
-            policy=self.gateway.policy, names=selected)
+            policy=self.gateway.policy, names=active)
 
     def _specialist_catalog(self) -> dict[str, dict[str, str]]:
-        """Index callable names; selected schemas already carry their descriptions."""
+        return self._contract_presentation()[1]
+
+    def _contract_presentation(self) -> tuple[set[str], dict[str, dict[str, str]]]:
+        """One partition for active schemas and the existing loadable directory."""
+        mode = self.state['config'].get('tool_contracts', 'full')
+        selected = self._tool_selection() if mode != 'full' else set()
+        active: set[str] = set()
         catalog: dict[str, dict[str, str]] = {}
-        selected = self._tool_selection()
         for spec in self.gateway.list_specs():
-            if (spec.domain != 'workspace' and spec.name not in _CORE_COORDINATION
-                    and self.gateway.policy.is_allowed(spec)[0]):
+            if not self.gateway.policy.is_allowed(spec)[0]:
+                continue
+            deferred = (spec.name in _DEFERRED_WORKSPACE_TOOLS if mode == 'outcomes' else
+                mode == 'on_demand' and spec.domain != 'workspace' and spec.name not in _CORE_COORDINATION)
+            if not deferred or spec.name in selected:
+                active.add(spec.name)
+            if deferred:
                 catalog[spec.name] = {'domain': spec.domain}
                 if spec.name not in selected:
                     catalog[spec.name]['description'] = spec.description
-        return catalog
+        return active, catalog
 
     def _work_focus(self) -> dict[str, Any]:
         """Project the latest closed decision; no second mutable work state."""
@@ -676,14 +685,14 @@ class ToolApplication:
                services: Any | None = None,
                snapshot_sources: bool = False,
                max_snapshot_bytes: int = 16 * 1024 * 1024,
-               tool_contracts: Literal['full', 'on_demand'] = 'on_demand',
+               tool_contracts: Literal['full', 'on_demand', 'outcomes'] = 'outcomes',
                completion_policy: str = 'closing_decision.v2',
                delivery_files: list[str] | None = None,
                model_catalogs: dict[str, str | None] | None = None,
                retained: bool = False) -> tuple[dict[str, Any], list, dict[str, Any], int]:
         """Validate caller contracts before creation or supply; never execute or persist."""
-        if type(tool_contracts) is not str or tool_contracts not in {'full', 'on_demand'}:
-            raise ValueError('Tool contracts must be full or on_demand')
+        if type(tool_contracts) is not str or tool_contracts not in _TOOL_CONTRACT_MODES:
+            raise ValueError('Tool contracts must be full, on_demand or outcomes')
         if completion_policy not in _COMPLETION_POLICIES:
             raise ValueError('Unsupported completion policy')
         if delivery_files is not None:
@@ -929,7 +938,7 @@ class ToolApplication:
                services: Any | None = None, snapshot_sources: bool = False,
                max_snapshot_bytes: int = 16 * 1024 * 1024,
                delivery_files: list[str] | None = None,
-               tool_contracts: Literal['full', 'on_demand'] = 'on_demand',
+               tool_contracts: Literal['full', 'on_demand', 'outcomes'] = 'outcomes',
                completion_policy: str = 'closing_decision.v2') -> ToolApplication:
         config, reused, limits, attempts = cls._configuration(root, goal, model=model, sources=sources,
             allow_execution=allow_execution, allow_network=allow_network, allow_vision=allow_vision,
@@ -1563,9 +1572,12 @@ class ToolApplication:
             context['research_policy'] = config['research_policy']
         if config.get('table_analysis'):
             context['table_analysis'] = config['table_analysis']
-        if config.get('tool_contracts') == 'on_demand':
+        if config.get('tool_contracts', 'full') != 'full':
             context['available_specialists'] = self._specialist_catalog()
-            context['tool_contracts'] = ('Core tools stay available. Use load_tools with exact name keys from '
+            context['tool_contracts'] = (('Professional owners and workspace reading, copying, delivery and questions '
+                'already have full contracts. The directory offers optional low-level write/edit/process operations '
+                'for special or fallback work; loading adds no authority. ' if config['tool_contracts'] == 'outcomes'
+                else 'Core tools stay available. ') + 'Use load_tools with exact name keys from '
                 'available_specialists to receive their full schemas on the next decision; it replaces '
                 'the previous selection, not permissions. Domain values are categories, not name prefixes. '
                 'Selected tools have descriptions in their active schemas. Choose the needed professional work units '
@@ -2433,6 +2445,16 @@ class ToolApplication:
                         and bool(saved.get('session_interruption_reason')))
                     if not confirmed:
                         raise RuntimeError('Saved interruption does not confirm this native tool failure; inspect before recovery')
+                elif (capability == existing.capability == 'native_tool' and existing.status == 'failed'
+                        and pending.get('kind') == 'tool' and result.status == 'failed'
+                        and result.provenance.get('capability') == 'native_tool'
+                        and not result.artifacts
+                        and all(ref.path == 'capability_result.json' for ref in existing.outputs)
+                        and not any(entry.attempt_id == identity and entry.status in {'reserved', 'unknown'}
+                            for entry in self.ledger.entries)):
+                    function = pending.get('call', {}).get('function', {})
+                    confirmed = self.gateway.can_observe_read_failure(
+                        ToolCall(tool_name=function.get('name', ''), trace_id=identity))
             if not self.session.store.exists(relative):
                 call = pending.get("call", {})
                 if confirmed:
@@ -2441,7 +2463,7 @@ class ToolApplication:
                     ref = self.workspace.locator(str(store.resolve('capability_result.json')))
                     store.write_json('native_result.json', ToolResult(
                         tool_name=call['function']['name'], status='error',
-                        error='; '.join(result.diagnostics) or saved['session_interruption_reason'],
+                        error='; '.join(result.diagnostics) or saved.get('session_interruption_reason') or 'Recorded read-only tool failure',
                         data={'status': result.status, 'diagnostics': list(result.diagnostics)},
                         artifacts=[ref], metadata={'capability_result': ref,
                             'provenance': dict(result.provenance)}).model_dump(mode='json'),

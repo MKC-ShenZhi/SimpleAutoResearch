@@ -1823,6 +1823,28 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             execute.assert_not_called()
         search["path"] = "source0/.env"
         self.assertEqual(standalone.call("search_files", search, identity="search-private").status, "blocked")
+        (standalone.workspace / 'root.py').write_text('print("•")\n', encoding='utf-8')
+        (standalone.workspace / '.env.py').write_text('• secret', encoding='utf-8')
+        private_dir = standalone.workspace / '.ssh'
+        private_dir.mkdir()
+        (private_dir / 'private.py').write_text('• secret', encoding='utf-8')
+        for index, root in enumerate(('.', 'workspace', str(standalone.workspace))):
+            with self.subTest(root_locator=root):
+                self.assertEqual(standalone.resolve(root), standalone.workspace)
+                found = standalone.call('search_files', {'path': root, 'query': '•', 'file_glob': '*.py'},
+                    identity=f'search-workspace-root-{index}')
+                self.assertEqual(found.status, 'ok', found.error)
+                self.assertEqual(found.data['searched_files'], 1)
+                prefix = str(standalone.workspace / 'root.py') if Path(root).is_absolute() else 'workspace/root.py'
+                self.assertIn(prefix + ':1:print("•")', found.data['text'])
+                self.assertNotIn('secret', found.data['text'])
+        accounted = standalone.ledger.to_dict()
+        empty = standalone.call('search_files', {'path': '', 'query': '•'}, identity='search-empty-root')
+        self.assertEqual(empty.status, 'blocked')
+        self.assertIn('authorized path', empty.error)
+        self.assertEqual(standalone.ledger.to_dict(), accounted)
+        self.assertEqual(standalone.process_argv(['python', '.', '', 'workspace', str(standalone.workspace)]),
+            [str(standalone.python), '.', '', str(standalone.workspace), str(standalone.workspace)])
         blocked_root = run_dir / "bounded"
         blocked_root.mkdir()
         limited = WorkspaceToolGateway(blocked_root, {"source0": inputs}, BudgetLedger({"process_invocations": 0}))
@@ -1842,7 +1864,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         inspected_table = _call_tool(app.gateway, 'inspect_table',
             {'path': 'source0/observations.csv'}, identity='table-shape')
         self.assertEqual(inspected_table.data['row_count'], 2)
-        self.assertIn('analyze_table', app._specialist_catalog())
+        self.assertIn('analyze_table', {tool['function']['name'] for tool in app.schemas})
         self.assertNotIn('search_sources', {tool['function']['name'] for tool in app.schemas})
         self.assertNotIn('acquire_source', {tool['function']['name'] for tool in app.schemas})
         project = inputs / 'project'
@@ -2047,6 +2069,75 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, 'Interrupted selection'):
                         select_implementation_files(**arguments)
             self.assertEqual(fake.ask_json.call_count, 2)
+
+    def test_native_failed_read_only_attempt_projects_error_without_replay(self) -> None:
+        from dataclasses import replace
+        from simple_ar.core.capabilities import ArtifactStore
+
+        _, _, fake, _, app, _ = self._native_fixture()
+        fake.chat_turn.side_effect = [self._native_message('search_files',
+            {'path': '.', 'query': '•', 'file_glob': '*.py'}, 'failed-search')]
+        # Exercise the normal capability failure commit, not a fabricated result
+        # or an explicitly confirmed interruption of a running operation.
+        with patch.object(app.workspace, '_search', side_effect=IndexError('tuple index out of range')), \
+                patch('simple_ar.tools.workspace.run_process', side_effect=AssertionError('No process started')):
+            self.assertEqual(app.run(progress=lambda _: None)['status'], 'paused')
+        pending = dict(app.state['pending'])
+        identity = pending['attempt']
+        store = ArtifactStore(app.session.store.root / 'attempts' / identity)
+        envelope = store.resolve('capability_result.json').read_bytes()
+        failed = next(attempt for attempt in app.session.list_attempts() if attempt.attempt_id == identity)
+        self.assertEqual(failed.status, 'failed')
+        self.assertFalse(store.exists('native_result.json'))
+        ledger = app.ledger.to_dict()
+        budget = app.session.manifest.budget.to_dict()
+        spec = app.gateway.registry.get('search_files')
+        guards = (
+            patch.object(app.workspace, 'has_started', return_value=True),
+            patch.dict(app.gateway._domain_gateways, {'workspace': object()}),
+            patch.object(app.session, 'list_attempts', return_value=[replace(failed, status='running')]),
+            patch.object(app.gateway.registry, 'get', return_value=spec.model_copy(update={'permission_level': 'write_patch'})),
+        )
+        with patch.object(app.gateway, 'can_reconcile', return_value=False), \
+                patch.object(app, '_tool', side_effect=AssertionError('No read replay')):
+            for index, guard in enumerate(guards):
+                with self.subTest(unsafe_boundary=index), guard:
+                    with self.assertRaisesRegex(RuntimeError, 'no durable result'):
+                        app._attempt('native_tool', pending)
+                    self.assertFalse(store.exists('native_result.json'))
+            for state in ('reserved', 'unknown'):
+                uncertain = BudgetLedger({'llm_requests': 2})
+                uncertain.reserve('uncertain-read', {'llm_requests': 1}, attempt_id=identity)
+                if state == 'unknown':
+                    uncertain.mark_unknown('uncertain-read', reason='Unknown side effect', retain_reservation=True)
+                before = uncertain.to_dict()
+                with self.subTest(usage=state), patch.object(app, 'ledger', uncertain):
+                    with self.assertRaisesRegex(RuntimeError, 'no durable result'):
+                        app._attempt('native_tool', pending)
+                    self.assertEqual(uncertain.to_dict(), before)
+            relative = app._attempt('native_tool', pending)
+            self.assertEqual(app._attempt('native_tool', pending), relative)
+        observed = store.read_json('native_result.json')
+        self.assertEqual(observed['status'], 'error')
+        self.assertIn('IndexError: tuple index out of range', observed['error'])
+        self.assertEqual(observed['metadata']['capability_result'], f'records/{identity}/capability_result.json')
+        self.assertEqual(store.resolve('capability_result.json').read_bytes(), envelope)
+        self.assertEqual(app.session.manifest.budget.to_dict(), budget)
+        with patch.object(app.gateway, 'call', side_effect=AssertionError('No search replay')):
+            app.run(should_stop=lambda: app.state['pending'] is None, progress=lambda _: None)
+        self.assertIsNone(app.state['pending'])
+        self.assertEqual(app.state['turns'][-1]['tools'], [{'id': 'failed-search', 'result': relative}])
+        self.assertEqual(app.ledger.to_dict(), ledger)
+        self.assertEqual(next(attempt for attempt in app.session.list_attempts()
+            if attempt.attempt_id == identity).status, 'failed')
+        app = ToolApplication.load(app.session.store.root)
+        def next_decision(messages, **options):
+            self.assertIn('IndexError: tuple index out of range', json.dumps(messages))
+            return self._native_message('ask_user', {'question': 'Which scope next?'}, 'next-decision')
+        fake.chat_turn.side_effect = next_decision
+        self.assertEqual(app.run(progress=lambda _: None)['status'], 'paused')
+        self.assertEqual(app.ledger.to_dict(), ledger)
+        self.assertEqual(store.resolve('capability_result.json').read_bytes(), envelope)
 
     def test_native_confirmed_interruption_projects_failure_without_replay(self) -> None:
         from simple_ar.core.capabilities import ArtifactStore
@@ -4318,13 +4409,58 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 self.assertEqual(fake.chat_turn.call_count, 1)
                 self.assertEqual(restored.ledger.to_dict(), before)
 
+    def test_native_outcomes_default_keeps_owners_and_loads_low_level_contracts(self) -> None:
+        from simple_ar.tools.specs import CommonToolSpec
+
+        names = lambda owner: {row['function']['name'] for row in owner.schemas}
+        for execution in (False, True):
+            with self.subTest(execution=execution):
+                _, _, fake, _, app, _ = self._native_fixture(allow_execution=execution)
+                self.assertEqual(app.state['config']['tool_contracts'], 'outcomes')
+                self.assertEqual(app.session.store.read_json('actions.json')['config']['tool_contracts'], 'outcomes')
+                self.assertTrue({'compose_document', 'prepare_implementation', 'analyze_table', 'inspect_table',
+                    'read_file', 'copy_file', 'copy_project', 'deliver_result', 'ask_user', 'focus_work',
+                    'read_history', 'update_work_plan', 'load_tools'}.issubset(names(app)))
+                deferred = {'write_file', 'edit_file'} | ({'run_process'} if execution else set())
+                self.assertEqual(set(app._specialist_catalog()), deferred)
+                self.assertFalse({'write_file', 'edit_file', 'run_process'} & names(app))
+                self.assertEqual('execute_implementation' in names(app), execution)
+                self.assertNotIn('search_sources', names(app))
+                self.assertNotIn('search_sources', app._specialist_catalog())
+                # New professional contracts require no second owner-name list.
+                app.gateway.registry.register(CommonToolSpec(name='future_owner', domain='future',
+                    description='A future professional owner without a presentation whitelist.'))
+                self.assertIn('future_owner', names(app))
+                self.assertNotIn('future_owner', app._specialist_catalog())
+                permissions, ledger = set(app.gateway.policy.allowed_permissions), app.ledger.to_dict()
+                fake.chat_turn.side_effect = [
+                    self._native_message('load_tools', {'names': sorted(deferred)}, 'load-fallback'),
+                    self._native_message('ask_user', {'question': 'Which remaining scope?'}, 'pause-fallback')]
+                self.assertEqual(app.run(progress=lambda _: None)['status'], 'paused')
+                self.assertTrue(deferred.issubset(names(app)))
+                receipts = self._native_receipts(app, app.state['turns'])
+                restored = ToolApplication.load(app.session.store.root)
+                self.assertEqual(restored._tool_selection(), deferred)
+                self.assertTrue(deferred.issubset(names(restored)))
+                self.assertEqual(self._native_receipts(restored, restored.state['turns']), receipts)
+                self.assertEqual(restored.ledger.to_dict(), ledger)
+                self.assertEqual(set(restored.gateway.policy.allowed_permissions), permissions)
+                fake.chat_turn.side_effect = [
+                    self._native_message('load_tools', {'names': []}, 'clear-fallback'),
+                    self._native_message('ask_user', {'question': 'Which outcome next?'}, 'pause-cleared')]
+                self.assertEqual(restored.run(feedback='Continue with professional work.', progress=lambda _: None)['status'], 'paused')
+                self.assertFalse({'write_file', 'edit_file', 'run_process'} & names(restored))
+                self.assertIn('compose_document', names(restored))
+                self.assertEqual(restored._tool_selection(), set())
+                self.assertEqual(restored.ledger.to_dict(), ledger)
+                fake.ask_json.assert_not_called()
+
     def test_native_tool_contract_selection_preserves_authority_and_resume(self) -> None:
-        _, _, fake, _, app, _ = self._native_fixture(allow_execution=False)
+        _, _, fake, _, app, _ = self._native_fixture(allow_execution=False, tool_contracts='on_demand')
         names = lambda owner: {row['function']['name'] for row in owner.schemas}
         original_ledger = app.ledger.to_dict()
         original_permissions = set(app.gateway.policy.allowed_permissions)
-        # Ordinary creation persists the shared default, without a fixture-side
-        # mode override or topic-based specialist selection.
+        # Explicit historical on_demand retains its specialist-loading behavior.
         self.assertEqual(app.state['config']['tool_contracts'], 'on_demand')
         self.assertEqual(app.session.store.read_json('actions.json')['config']['tool_contracts'], 'on_demand')
         self.assertIn('load_tools', names(app))
@@ -4447,18 +4583,18 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             if selection is None:
                 self.assertNotIn('tools', result.data)
         self.assertEqual(focused.ledger.to_dict(), before)
-        for mode in ('on_demand', 'full', None):
+        for mode in ('outcomes', 'on_demand', 'full', None):
             with self.subTest(saved_mode=mode):
                 inputs, fake, app = self._supply_fixture()
                 root = app.session.store.root
                 preview, _, _, _ = ToolApplication._configuration(root, 'Configuration preview',
                     model=None, sources={}, max_attempts=30)
-                self.assertEqual(preview['tool_contracts'], 'on_demand')
-                if mode == 'full':
+                self.assertEqual(preview['tool_contracts'], 'outcomes')
+                if mode in {'full', 'on_demand'}:
                     # Exercise the public compatibility override, not a mock
                     # that assumes every new model sees specialist schemas.
-                    app = ToolApplication.create(root.parent / 'explicit-full', 'Compatibility control',
-                        model=None, sources={'source0': inputs}, max_attempts=30, tool_contracts='full')
+                    app = ToolApplication.create(root.parent / f'explicit-{mode}', 'Compatibility control',
+                        model=None, sources={'source0': inputs}, max_attempts=30, tool_contracts=mode)
                     root = app.session.store.root
                 elif mode is None:
                     app.state['config'].pop('tool_contracts')
@@ -4467,7 +4603,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 app = ToolApplication.load(root)
                 self.assertEqual((root / 'actions.json').read_bytes(), before_bytes)
                 self.assertEqual(app.state['config'].get('tool_contracts'), mode)
-                selected = {'find_source_passages', 'analyze_measurements'} if mode == 'on_demand' else set()
+                selected = ({'find_source_passages', 'analyze_measurements'} if mode == 'on_demand' else
+                    {'edit_file'} if mode == 'outcomes' else set())
                 if selected:
                     app.run(actions=[
                         {'tool_name': 'read_file', 'arguments': {'path': 'source0/notes.txt'}},
@@ -4493,7 +4630,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     self.assertEqual({path: (root / path).read_bytes() for path in receipts}, receipts)
                     schemas = {row['function']['name'] for row in app.schemas}
                     self.assertTrue(selected.issubset(schemas))
-                    self.assertEqual('load_tools' in schemas, mode == 'on_demand')
+                    self.assertEqual('load_tools' in schemas, mode in {'on_demand', 'outcomes'})
                     self.assertEqual('compose_document' in schemas, mode != 'on_demand')
                     files = self._supply_files(app)
                     app.supply(**terms)
@@ -6966,7 +7103,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(resumed.workspace.resolve('source1').read_text(), additional.read_text())
         self.assertIn('User explicitly authorized', resumed.state['requests'][-1])
         self.assertTrue(ToolApplication.load(resumed.session.store.root).state['config']['allow_network'])
-        self.assertIn('search_sources', resumed._specialist_catalog())
+        self.assertIn('search_sources', {tool['function']['name'] for tool in resumed.schemas})
         self.assertEqual((resumed.workspace.workspace / 'counter.txt').read_text(), '1')
         self.assertEqual(len(list((resumed.session.store.root / 'tools/processes').glob('*/invocation.json'))), 1)
 
@@ -10017,13 +10154,14 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     self.assertEqual(resources['remaining']['image_requests'], 0)
                     self.assertEqual(resources['unknown_usage'], list(owner.ledger.unknown_dimensions()))
                     self.assertEqual(context['vision_inspection']['available'], available)
-                    self.assertNotIn('inspect_images', {row['function']['name'] for row in restored.schemas})
+                    schemas = {row['function']['name']: row['function'] for row in restored.schemas}
+                    self.assertEqual('inspect_images' in schemas, available)
                     catalog = restored._specialist_catalog()
-                    self.assertEqual('inspect_images' in catalog, available)
+                    self.assertNotIn('inspect_images', catalog)
                     self.assertEqual(context['available_specialists'], catalog)
                     if available:
-                        self.assertEqual(catalog['inspect_images']['domain'], 'visual')
-                        self.assertEqual(catalog['inspect_images']['description'],
+                        self.assertEqual(restored.gateway.registry.get('inspect_images').domain, 'visual')
+                        self.assertEqual(schemas['inspect_images']['description'],
                             restored.gateway.registry.get('inspect_images').description)
                     self.assertNotIn('images', restored._specialist_catalog())
                     self.assertIn('generation/edit requests only', resources['semantics']['image_requests'])

@@ -754,9 +754,11 @@ class WorkspaceToolGateway:
         return list_project_files(target, request, resolve=self.resolve, listed_path=self._listed_path)
 
     def _listed_path(self, path: Path, requested: str) -> str:
+        if not requested:
+            self.resolve(requested)  # Reject an empty locator through the shared access rule.
         if Path(requested).is_absolute():
             return str(path)
-        alias = PurePosixPath(requested).parts[0]
+        alias = next(iter(PurePosixPath(requested).parts), None)
         if alias not in self.mounts:
             return self.locator(str(path))
         return f"{alias}/{path.relative_to(self.mounts[alias]).as_posix()}"
@@ -784,8 +786,8 @@ class WorkspaceToolGateway:
                 path = Path(directory) / name
                 if path.is_symlink() or not fnmatch.fnmatchcase(name, request.file_glob):
                     continue
-                relative = self._listed_path(path, request.path)
                 try:
+                    relative = self._listed_path(path, request.path)
                     path = self.resolve(relative)
                 except ValueError:
                     continue
@@ -871,8 +873,8 @@ class WorkspaceToolGateway:
 
     def process_argv(self, argv: list[str]) -> list[str]:
         """Bind the task interpreter and whole mount arguments, never source text."""
-        result = [str(self.resolve(value)) if PurePosixPath(value).parts
-                and PurePosixPath(value).parts[0] in self.mounts else value for value in argv]
+        result = [str(self.resolve(value)) if next(iter(PurePosixPath(value).parts), None)
+                in self.mounts else value for value in argv]
         if result and result[0] in {"python", "python3"}:
             result[0] = str(self.python)
         return result

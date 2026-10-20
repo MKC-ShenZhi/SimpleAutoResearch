@@ -424,8 +424,11 @@ class StartTests(unittest.TestCase):
             self.assertEqual(session.store.resolve('session_manifest.json').read_bytes(), retained)
 
     def test_ordinary_preferences_enter_one_native_owner_with_declarations_and_read_only_mounts(self):
+        from inspect import signature
+        from simple_ar.app.tool_application import ToolApplication
         from unittest.mock import MagicMock
         from simple_ar.cli.main import main
+        creation_contract = signature(ToolApplication.create)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             data = root / "measurements.csv"
@@ -472,6 +475,9 @@ class StartTests(unittest.TestCase):
                 process.assert_not_called()
                 self.assertTrue(create.call_args.args[1].startswith(goal + "\n\n"))
                 kwargs = create.call_args.kwargs
+                bound = creation_contract.bind(*create.call_args.args, **kwargs)
+                bound.apply_defaults()
+                self.assertEqual(bound.arguments['tool_contracts'], 'outcomes')
                 self.assertEqual(kwargs["model"], "profile:chosen")
                 self.assertEqual(kwargs["max_turns"], 7)
                 self.assertEqual(kwargs["max_tokens"], 43210)

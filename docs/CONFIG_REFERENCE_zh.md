@@ -24,6 +24,8 @@
 
 直接创建原生任务时，可用 `ToolApplication.create(..., delivery_files=["**/*.md", "**/*.pdf"])` 要求无保留的完成交付包含非空工作区输出。相对路径模式只检查文件存在，不证明科学质量；仍可明确交付未完成项。API 不自动从自然语言推导要求，也不把来源 PDF 算作输出。已有任务可通过调用方 `supply(..., replace_existing=True)` 明确替换 `delivery_files`、`tool_contracts` 或 `completion_policy`；无关补齐保留原策略及账本。
 
+新任务默认使用 `tool_contracts="outcomes"`：代码、写作等专业工具从开始即可使用，助手可自行按需加载直接写文件、编辑和运行进程的工具。用户无需选择工作流或确认工具加载；原有权限和命令审批仍然有效。高级调用者可选 `full` 或 `on_demand`，已有任务保留原模式。
+
 原生任务默认保留 `completion_policy="protected_decision.v1"`：末次响应即使未附交付，合法已接收工作仍可执行并保留。Python 调用方可明确选择 `closing_decision.v2`，在派发前要求末次交付或询问；此严格策略可能拒绝本来有价值的非收尾操作，不能保证任务完成。历史任务保留原策略。
 
 `app.run()` 和只读的 `app.result_snapshot()` 还返回 `retained_work`，列出已有工作区中间成果、最后操作及继续说明。这些文件不代表已验收交付。写作失败可保留候选稿；独立审阅被拒时可保留 `incomplete_review.json` 中逐项校验有效的意见。修改仍须使用原证据并创建新版本，未完成的审阅继续保留为缺项。新写作在登记正式结果前检查 CommonMark 图片引用，导出仍执行完整路径及编译检查。

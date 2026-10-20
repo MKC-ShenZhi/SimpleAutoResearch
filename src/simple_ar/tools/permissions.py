@@ -20,10 +20,10 @@ class ToolPermissionPolicy(BaseModel):
             return False, f"Tool `{spec.name}` is not in allowed_tools."
         if spec.name in self.blocked_tools:
             return False, f"Tool `{spec.name}` is explicitly blocked."
-        permission = PermissionLevel(str(spec.permission_level))
+        permission = PermissionLevel(spec.permission_level)
         if permission not in self.allowed_permissions:
             return False, f"Permission `{permission.value}` is not allowed by policy."
-        if _risk_rank(RiskLevel(str(spec.risk_level))) > _risk_rank(self.max_risk_level):
+        if _risk_rank(RiskLevel(spec.risk_level)) > _risk_rank(self.max_risk_level):
             return False, f"Risk `{spec.risk_level}` exceeds max_risk_level `{self.max_risk_level}`."
         return True, "allowed"
 

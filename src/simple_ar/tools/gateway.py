@@ -62,6 +62,17 @@ class CommonToolGateway:
         started = getattr(owner, "has_started", None)
         return bool(started and started(call.trace_id))
 
+    def can_observe_read_failure(self, call: ToolCall) -> bool:
+        """Prove a read-only owner has no started operation; absence is not proof."""
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', call.trace_id):
+            return False
+        spec = self.registry.get(call.tool_name)
+        if spec is None or spec.permission_level != 'read_only' or not self.policy.is_allowed(spec)[0]:
+            return False
+        owner = self._domain_gateways.get(spec.domain)
+        started = getattr(owner, 'has_started', None)
+        return callable(started) and started(call.trace_id) is False
+
     def session_owner(self, name: str) -> Any | None:
         """Look up a policy-authorized owner of the caller's actual attempt.
 
