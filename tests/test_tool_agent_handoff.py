@@ -101,8 +101,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             (source / 'paper.pdf').write_bytes(b'original paper')
             app = ToolApplication.create(root / 'task', 'Deliver a document and PDF',
                 model=None, sources={'papers': source}, max_attempts=50,
-                delivery_files=['**/*.md', '**/*.pdf'], tool_contracts='full',
-                completion_policy='closing_decision.v2')
+                delivery_files=['**/*.md', '**/*.pdf'], tool_contracts='full')
             self.assertEqual(app.state['config']['completion_policy'], 'closing_decision.v2')
             before = app.ledger.to_dict()
             terms = app.supply(supply_id='upgrade', reason='Use current contracts with the original task',
@@ -111,13 +110,13 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             self.assertEqual(terms['previous_config']['completion_policy'], 'closing_decision.v2')
             self.assertEqual(app.ledger.to_dict(), before)
 
-            config, _, _, _ = ToolApplication._configuration(root / 'config-only', 'Historical default',
+            config, _, _, _ = ToolApplication._configuration(root / 'config-only', 'New task default',
                 model=None, sources={})
-            self.assertEqual(config['completion_policy'], 'protected_decision.v1')
+            self.assertEqual(config['completion_policy'], 'closing_decision.v2')
             for policy in ('protected_decision.v1', None):
                 with self.subTest(historical_policy=policy):
                     historical = ToolApplication.create(root / f'history-{policy}', 'Keep saved policy',
-                        model=None, sources={})
+                        model=None, sources={}, completion_policy='protected_decision.v1')
                     self.assertEqual(historical.state['config']['completion_policy'], 'protected_decision.v1')
                     if policy is None:
                         historical.state['config'].pop('completion_policy')
@@ -5239,10 +5238,10 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
     def test_native_cached_closing_contract_survives_load_and_supply_without_replay(self) -> None:
         from simple_ar.integrations.llm import LLMClient, LLMSettings, estimate_tokens
 
-        for mode in ('required', 'misordered', 'terminal', 'terminal_process', 'false', 'missing_field', 'missing_receipt'):
+        for mode in ('required', 'read', 'misordered', 'terminal', 'terminal_process', 'false', 'missing_field', 'missing_receipt'):
             with self.subTest(mode=mode):
-                _, _, _, _, app, _ = self._native_fixture(mount_inputs=False, max_turns=1,
-                    completion_policy='closing_decision.v2')
+                # Exercise the public creation default, not a test-only opt-in.
+                _, _, _, _, app, _ = self._native_fixture(mount_inputs=False, max_turns=1)
                 self.assertEqual(app.state['config']['completion_policy'], 'closing_decision.v2')
                 app.supply(supply_id='keep-v2', reason='Retain historical decision contract',
                     changes={'allow_execution': True})
@@ -5250,7 +5249,9 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 message = self._native_message('write_file', {'path': 'workspace/result.txt',
                     'content': 'Cached proposal', **({'delivery': {'summary': 'Explicit output',
                         'artifacts': ['workspace/result.txt']}} if mode == 'terminal' else {})}, 'write')
-                if mode == 'misordered':
+                if mode == 'read':
+                    message = self._native_message('read_file', {'path': 'workspace/result.txt'}, 'read')
+                elif mode == 'misordered':
                     message['tool_calls'] = self._native_message('deliver_result', {
                         'summary': 'Premature output', 'artifacts': ['workspace/result.txt']},
                         'premature')['tool_calls'] + message['tool_calls']
@@ -5301,7 +5302,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                         with patch.object(app, '_client', side_effect=bound):
                             status = app.run(approved_execution=token, progress=lambda _: None)
                 replay.assert_not_called()
-                cancelled = mode in ('required', 'misordered')
+                cancelled = mode in ('required', 'read', 'misordered')
                 self.assertEqual(status['status'], 'completed' if mode in ('terminal', 'terminal_process') else 'paused')
                 self.assertEqual((app.workspace.workspace/'result.txt').exists(), not cancelled)
                 self.assertEqual(app.session.store.exists('delivery.json'), mode in ('terminal', 'terminal_process'))

@@ -677,7 +677,7 @@ class ToolApplication:
                snapshot_sources: bool = False,
                max_snapshot_bytes: int = 16 * 1024 * 1024,
                tool_contracts: Literal['full', 'on_demand'] = 'on_demand',
-               completion_policy: str = 'protected_decision.v1',
+               completion_policy: str = 'closing_decision.v2',
                delivery_files: list[str] | None = None,
                model_catalogs: dict[str, str | None] | None = None,
                retained: bool = False) -> tuple[dict[str, Any], list, dict[str, Any], int]:
@@ -930,7 +930,7 @@ class ToolApplication:
                max_snapshot_bytes: int = 16 * 1024 * 1024,
                delivery_files: list[str] | None = None,
                tool_contracts: Literal['full', 'on_demand'] = 'on_demand',
-               completion_policy: str = 'protected_decision.v1') -> ToolApplication:
+               completion_policy: str = 'closing_decision.v2') -> ToolApplication:
         config, reused, limits, attempts = cls._configuration(root, goal, model=model, sources=sources,
             allow_execution=allow_execution, allow_network=allow_network, allow_vision=allow_vision,
             max_turns=max_turns, max_tokens=max_tokens, max_images=max_images, project_python=project_python,
