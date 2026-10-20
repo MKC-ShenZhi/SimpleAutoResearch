@@ -91,7 +91,9 @@ class RevisionContractTests(unittest.TestCase):
                         'memory': request.memory.model_dump(mode='json'),
                         'sections': [section.model_dump(mode='json')],
                         'independent_review': {'review_status': 'needs_revision'}}, kind='report_writer_result')
-                    return CapabilityResult(status='completed', artifacts=(ref,))
+                    # An article with a full response but unresolved independent
+                    # inspection remains a usable candidate, not a lost output.
+                    return CapabilityResult(status='failed' if method == 'article' else 'completed', artifacts=(ref,))
                 arguments = {'goal': requests[0], 'title': 'Supplied material report',
                     'materials': [{'path': 'workspace/input.md'}]}
                 with patch('simple_ar.report.writing.run_report_writing_capability', side_effect=writer) as professional, \

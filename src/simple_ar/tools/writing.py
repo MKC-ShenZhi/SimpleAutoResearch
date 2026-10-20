@@ -1256,9 +1256,18 @@ class WritingToolGateway:
                         input_store=owner), request=ReportWritingRequest(report_context=context, memory=memory,
                             config=config, template=template, llm_client=client, method=requirement['method'],
                             prior_draft=previous, resume_ref=resume))
-                    if result.status != 'completed':
+                    writer_ref = next((row for row in reversed(result.artifacts) if row.kind == 'report_writer_result'), None)
+                    if writer_ref is None:
                         raise ValueError('Professional writing incomplete; retain its checkpoint: ' + '; '.join(result.diagnostics))
-                    writer_ref = next(row for row in reversed(result.artifacts) if row.kind == 'report_writer_result')
+                    candidate = writer_store.read_json(writer_ref)
+                    # An exhausted correction round can still produce a whole,
+                    # independently inspected candidate. Preserve it for feedback;
+                    # unresolved findings below keep publication unaccepted.
+                    if result.status != 'completed' and not (
+                            result.status == 'failed' and requirement['method'] == 'article'
+                            and candidate.get('sections')
+                            and candidate.get('independent_review', {}).get('review_status') == 'needs_revision'):
+                        raise ValueError('Professional writing incomplete; retain its checkpoint: ' + '; '.join(result.diagnostics))
                     completed = {'writer_path': writer_ref.path,
                         'writer_sha256': hashlib.sha256(writer_store.resolve(writer_ref).read_bytes()).hexdigest()}
                     owner.write_json('professional_result.json', completed)

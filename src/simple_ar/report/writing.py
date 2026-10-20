@@ -281,7 +281,13 @@ def completed_composition_writer(*, store: ArtifactStore, binding: dict[str, Any
         result = run_report_writing_capability(context=CapabilityContext(writer if article else _SectionRecoveryStore(writer), AttemptManifest(identity),
             inputs=tuple(ArtifactRef.from_dict(row) for row in frozen['sources']), input_store=store), request=request)
         produced = next(row for row in result.artifacts if row.kind == 'report_writer_result')
-        if result.status != 'completed' or produced.path != completed['writer_path']:
+        # Producer completeness is distinct from acceptance. Whole candidates
+        # with unresolved inspection may seed a correction, never publication.
+        candidate = writer.read_json(produced)
+        qualified = (article and result.status == 'failed' and candidate.get('sections')
+            and candidate.get('independent_review', {}).get('review_status') == 'needs_revision'
+            and store.read_json('result.json').get('data', {}).get('unresolved'))
+        if (result.status != 'completed' and not qualified) or produced.path != completed['writer_path']:
             raise ValueError('Professional Writer did not prove its completed result')
     else:
         raise ValueError('Unknown completed composition producer; explicit input reuse unavailable')
