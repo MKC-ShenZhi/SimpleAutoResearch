@@ -156,6 +156,10 @@ class _Run(BaseModel):
     argv: list[str] = Field(min_length=1, max_length=40)
     cwd: str = "workspace"
     timeout_sec: int = Field(default=60, ge=1, le=300)
+    inputs: list[str] = Field(default_factory=list, max_length=64, exclude_if=lambda value: not value,
+        description='Optional explicit regular-file input artifact locators, including script/data files. Captured before execution; no dependency inference or extra permission. At most 64 MiB total per binding.')
+    outputs: list[str] = Field(default_factory=list, max_length=64, exclude_if=lambda value: not value,
+        description='Optional explicit workspace regular-file output locators. Bytes captured only after success in the process receipt; directories/globs are not expanded. Does not require other commands to declare outputs or certify correctness.')
     delivery: DeliveryRequest | None = Field(default=None, exclude_if=lambda value: value is None,
         description="Optional explicit final delivery after this authorized process succeeds. Select actual output paths, including files produced by the command, and disclose unresolved work. Nonzero exit, stopping or missing artifacts never delivers. Does not certify scientific correctness. Use only as the last action, not instead of inspecting unknown results.")
 
@@ -174,7 +178,7 @@ _TOOLS = {
     "copy_file": (_Copy, "Copy an observed file or generated candidate into the workspace without retransmitting its contents. Source digest must match; read_file with full_digest=true and a small max_bytes obtains a streamed full-file digest up to 64 MiB. Existing destinations require their digest and retain a byte backup through the shared atomic writer. Original sources stay unchanged. Does not execute or certify a repair.", "write_patch"),
     "copy_project": (_CopyProject, "Prepare a writable project copy and optional portable ZIP in one operation, including ordinary source, tests, configuration, documentation and binary assets. Destination must be a new workspace subdirectory. Uses existing conservative code-workspace copying: private/runtime paths, symlinks, caches/build outputs and oversized files are omitted and reported. Total bounds are checked before publishing. Keeps originals unchanged, records copied file and archive hashes, and reconciles the same interrupted operation only when its published files still match. Inspect omissions before claiming a complete deliverable. Not a complete Git clone, dependency install, execution or correctness certificate.", "write_patch"),
     "edit_file": (_Edit, "Replace one or multiple exact unique, non-overlapping spans in a workspace file atomically, with one observed digest and backup. Batch related changes rather than repeating calls.", "write_patch"),
-    "run_process": (_Run, "Execute an argv without a shell in the workspace. Bare python/python3 use the task interpreter; its directory leads the filtered PATH for child commands. Use sys.executable for portable Python children. Requires explicit process authorization, not a sandbox. Optional explicit delivery completes the task after successful final work and binds actual output bytes without another model decision; execution alone is not delivery or verification.", "execution"),
+    "run_process": (_Run, "Execute an argv without a shell in the workspace. Bare python/python3 use the task interpreter; its directory leads the filtered PATH for child commands. Use sys.executable for portable Python children. For requested figure generation or revision, explicitly declare the script and known data in inputs and the generated figure paths in outputs so publication can reject known stale versions. Other commands need not declare outputs. Requires explicit process authorization, not a sandbox. Optional explicit delivery completes the task after successful final work and binds actual output bytes without another model decision; execution alone is not delivery or verification.", "execution"),
     "deliver_result": (DeliveryRequest, "Deliver actual workspace artifacts and optional retained task-evidence references; name unresolved work honestly.", "plan"),
     "ask_user": (_Question, "Ask a concentrated question only when needed to proceed; pause with all work preserved.", "plan"),
 }
@@ -414,6 +418,120 @@ class WorkspaceToolGateway:
             with path.open('rb') as handle:
                 hashes[locator] = hashlib.file_digest(handle, 'sha256').hexdigest()
         return hashes
+
+    def _version_hashes(self, locators: Iterable[str]) -> dict[str, str]:
+        """Bound only declared files, with finite streamed I/O."""
+        hashes, total = {}, 0
+        for locator in locators:
+            path = resolve_mounted_path(self.mounts, locator, discovery=True)
+            if not path.is_file():
+                raise ValueError(f'Declared process artifact is missing: {locator}')
+            digest = hashlib.sha256()
+            with path.open('rb') as handle:
+                while raw := handle.read(65536):
+                    total += len(raw)
+                    if total > _FULL_DIGEST_MAX_BYTES:
+                        raise ValueError('Declared process artifact binding exceeds 64 MiB')
+                    digest.update(raw)
+            hashes[locator] = digest.hexdigest()
+        return hashes
+
+    def process_artifact_binding(self, arguments: dict[str, Any]) -> dict[str, Any] | None:
+        """Read-only approval hook. Absent declarations preserve historical tokens.
+
+        Locators use mount semantics, not command cwd semantics. No execution,
+        directory expansion, argv parsing or authority is implied by this binding.
+        """
+        request = _Run.model_validate(arguments)
+        if not request.inputs and not request.outputs:
+            return None
+        inputs = list(dict.fromkeys(self.locator(str(resolve_mounted_path(self.mounts, value, discovery=True)))
+                                    for value in request.inputs))
+        outputs = list(dict.fromkeys(self.locator(str(resolve_mounted_path(self.mounts, value, write=True, discovery=True)))
+                                     for value in request.outputs))
+        if any(self.resolve(value).exists() and not self.resolve(value).is_file() for value in outputs):
+            raise ValueError('Declared process outputs must be regular files')
+        return {'version': 1, 'request': request.model_dump(exclude_none=True),
+                'inputs': self._version_hashes(inputs), 'outputs': outputs}
+
+    def check_artifact_producers(self, locators: Iterable[str], *, cache: dict | None = None,
+                                 refresh: bool = False) -> None:
+        """Reject known stale declared edges; untracked files remain unverified.
+
+        Inspect only existing process-owner receipts, never workspace contents.
+        The latest declared producer owns each output, including interrupted or
+        failed runs. A later successful explicit run can supersede an older one.
+        """
+        directory = self.root / 'tools' / 'processes'
+        if not directory.is_dir():
+            return
+        if cache is None:
+            cache = {}
+        if refresh:
+            cache.clear()
+        producers = cache.get('producers')
+        if producers is None:
+            producers = self._artifact_producers(directory)
+            cache['producers'] = producers
+        visited = cache.setdefault('checked', set())
+        visiting = set()
+
+        def check(path: Path) -> None:
+            if path in visited or path in visiting or path not in producers:
+                return
+            _, record, binding = producers[path]
+            if record is None:
+                raise ValueError(f'Ambiguous producer timestamps for {path.name}; no current publication')
+            output = record.get('output_binding') or {}
+            if (record.get('status') != 'finished' or record.get('returncode') != 0
+                    or record.get('stop_reason') or output.get('version') != 1
+                    or set(output.get('outputs', {})) != set(binding['outputs'])):
+                raise ValueError(f'Declared producer has no successful output binding: {path.name}; inspect receipt, no replay')
+            for expected in (binding['inputs'], output['outputs']):
+                if self._version_hashes(expected) != expected:
+                    raise ValueError(f'Declared producer inputs/outputs changed for {path.name}; no current publication or automatic rerun')
+            visiting.add(path)
+            try:
+                for locator in binding['inputs']:
+                    check(resolve_mounted_path(self.mounts, locator, discovery=True))
+            finally:
+                visiting.remove(path)
+            visited.add(path)
+
+        for locator in locators:
+            check(resolve_mounted_path(self.mounts, locator, discovery=True))
+
+    def _artifact_producers(self, directory: Path) -> dict:
+        producers, total = {}, 0
+        for count, entry in enumerate(directory.iterdir(), 1):
+            if count > 4096:
+                raise ValueError('Process receipt inventory exceeds 4096 entries')
+            if entry.is_symlink() or entry.is_junction():
+                raise ValueError('Process receipt directory cannot be a link')
+            receipt = entry / 'invocation.json'
+            if not receipt.is_file():
+                continue
+            if receipt.is_symlink():
+                raise ValueError('Process receipt cannot be a link')
+            total += receipt.stat().st_size
+            if total > _FULL_DIGEST_MAX_BYTES:
+                raise ValueError('Process receipt inventory exceeds 64 MiB')
+            record = read_json(receipt)
+            binding = (record.get('input_binding') or {}).get('workspace_artifacts')
+            if binding is None:
+                continue  # Never invent historical dependency coverage.
+            if binding.get('version') != 1:
+                raise ValueError('Unsupported process artifact binding version')
+            order = record.get('started_at', '')
+            for locator in binding['outputs']:
+                path = resolve_mounted_path(self.mounts, locator, write=True, discovery=True)
+                if path not in producers or order > producers[path][0]:
+                    producers[path] = (order, record, binding)
+                elif order == producers[path][0]:
+                    # Wall-clock precision is not a causal ordering guarantee.
+                    # Never let an invocation name break a provenance tie.
+                    producers[path] = (order, None, None)
+        return producers
 
     def bind_inventory(self, project: Path, *, identity: str, material_candidates: bool = False) -> dict:
         # Read-only inventory ownership is also used by legacy generated repair.
@@ -846,11 +964,34 @@ class WorkspaceToolGateway:
             if record["status"] not in {"finished", "stopped"}:
                 raise ValueError("Existing invocation is live or unknown; cannot replay it")
             settle_process_record(record, self.ledger)
+            binding = (record.get('input_binding') or {}).get('workspace_artifacts')
+            if binding is not None:
+                if binding['request'] != request.model_dump(exclude_none=True):
+                    raise ValueError('Retained process artifact request changed; no replay')
+                if self.process_artifact_binding(request.model_dump(exclude_none=True)) != binding:
+                    raise ValueError('Retained process inputs changed; no replay')
+                if record.get('returncode') == 0 and not record.get('stop_reason'):
+                    outputs = record.get('output_binding') or {}
+                    if (outputs.get('version') != 1 or set(outputs.get('outputs', {})) != set(binding['outputs'])
+                            or self._version_hashes(outputs['outputs']) != outputs['outputs']):
+                        raise ValueError('Retained process outputs changed or unbound; no replay')
+            elif request.inputs or request.outputs:
+                raise ValueError('Historical process lacks declared artifact binding; no retroactive binding or replay')
             return {**process_observation(record, output), "receipt": str(receipt.relative_to(self.root))}
         argv = self.process_argv(request.argv)
+        binding = self.process_artifact_binding(request.model_dump(exclude_none=True))
         result = run_process(ProcessSpec(argv=argv, cwd=cwd, timeout_sec=request.timeout_sec,
-            env=self.process_environment(), output_dir=output, invocation_id=identity, tail_bytes=12000, log_bytes=200000),
+            env=self.process_environment(), output_dir=output, invocation_id=identity, tail_bytes=12000, log_bytes=200000,
+            input_binding={'workspace_artifacts': binding} if binding is not None else None),
             budget_ledger=self.ledger)
+        if binding is not None and result.returncode == 0 and not result.stop_reason:
+            from simple_ar.core.artifacts import write_json
+
+            record = read_json(receipt)
+            record['output_binding'] = {'version': 1, 'outputs': self._version_hashes(binding['outputs'])}
+            write_json(receipt, record)
+            if self._version_hashes(binding['inputs']) != binding['inputs']:
+                raise ValueError('Declared inputs changed during process; retain outputs without claiming freshness')
         return {**process_observation(result.record, output), "receipt": str(receipt.relative_to(self.root))}
 
     def _process_delivery(self, request: _Run, identity: str, *, recovering: bool) -> tuple[dict[str, Any], dict[str, str]]:

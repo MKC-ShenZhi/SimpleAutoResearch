@@ -1233,5 +1233,158 @@ class ReportExportTests(unittest.TestCase):
             self.assertEqual(run.call_args.kwargs["env"]["openin_any"], "p")
 
 
+class ProcessArtifactBindingTests(unittest.TestCase):
+    """No subprocesses, renderers, models or external services in these tests."""
+
+    def _run(self, workspace, identity, arguments, writes=None, returncode=0):
+        from types import SimpleNamespace
+        from simple_ar.core.artifacts import write_json
+
+        def execute(spec, **kwargs):
+            for name, raw in (writes or {}).items():
+                workspace.resolve(name, write=True).write_bytes(raw)
+            record = {'status': 'finished', 'returncode': returncode, 'stop_reason': None,
+                'invocation_id': identity, 'started_at': identity, 'streams': {},
+                'output': {'stdout': '', 'stderr': ''}}
+            if spec.input_binding is not None:
+                record['input_binding'] = spec.input_binding
+            write_json(spec.output_dir / 'invocation.json', record)
+            return SimpleNamespace(record=record, returncode=returncode, stop_reason=None)
+
+        with patch('simple_ar.tools.workspace.run_process', side_effect=execute) as runner:
+            result = workspace.call('run_process', arguments, identity=identity)
+            self.assertEqual(runner.call_count, 1)
+        return result
+
+    def test_generic_producer_graph_rejects_stale_sources_and_accepts_explicit_new_run(self):
+        from simple_ar.tools.workspace import WorkspaceToolGateway
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = WorkspaceToolGateway(Path(tmp), {}, None)
+            workspace.resolve('source.any').write_bytes(b'v1')
+            workspace.resolve('unrelated').write_bytes(b'irrelevant')
+            args = {'argv': ['arbitrary-tool'], 'inputs': ['source.any'], 'outputs': ['middle.any']}
+            self.assertTrue(self._run(workspace, 'a', args, {'middle.any': b'intermediate'}).ok)
+            second = {'argv': ['another-tool'], 'inputs': ['middle.any'], 'outputs': ['figure.png']}
+            self.assertTrue(self._run(workspace, 'b', second, {'figure.png': b'old image'}).ok)
+            workspace.resolve('unrelated').write_bytes(b'changed')
+            workspace.check_artifact_producers(['figure.png', 'unrelated'])
+            cache = {}
+            with patch.object(workspace, '_artifact_producers', wraps=workspace._artifact_producers) as receipts, \
+                    patch.object(workspace, '_version_hashes', wraps=workspace._version_hashes) as hashes:
+                workspace.check_artifact_producers(['figure.png'], cache=cache)
+                first = hashes.call_count
+                workspace.check_artifact_producers(['figure.png'], cache=cache)
+                self.assertEqual(receipts.call_count, 1)
+                self.assertEqual(hashes.call_count, first)
+                workspace.check_artifact_producers(['figure.png'], cache=cache, refresh=True)
+                self.assertEqual(receipts.call_count, 2)
+                self.assertGreater(hashes.call_count, first)
+            workspace.resolve('source.any').write_bytes(b'v2')
+            cache = {}
+            for _ in range(2):
+                with self.assertRaisesRegex(ValueError, 'changed'):
+                    workspace.check_artifact_producers(['figure.png'], cache=cache)
+            self.assertTrue(self._run(workspace, 'c', args, {'middle.any': b'new intermediate'}).ok)
+            with self.assertRaisesRegex(ValueError, 'changed'):
+                workspace.check_artifact_producers(['figure.png'])
+            self.assertTrue(self._run(workspace, 'd', second, {'figure.png': b'new image'}).ok)
+            workspace.check_artifact_producers(['figure.png'])
+            workspace.resolve('figure.png').write_bytes(b'tampered')
+            with self.assertRaisesRegex(ValueError, 'changed'):
+                workspace.check_artifact_producers(['figure.png'])
+
+    def test_recovery_preserves_receipt_bytes_and_cannot_backfill_legacy_or_missing_outputs(self):
+        from simple_ar.tools.workspace import WorkspaceToolGateway, validate_workspace_arguments
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = WorkspaceToolGateway(Path(tmp), {}, None)
+            args = {'argv': ['tool'], 'outputs': ['asset.bin']}
+            self.assertTrue(self._run(workspace, 'bound', args, {'asset.bin': b'bytes'}).ok)
+            receipt = Path(tmp) / 'tools/processes/bound/invocation.json'
+            original = receipt.read_bytes()
+            with patch('simple_ar.tools.workspace.run_process') as runner, \
+                    patch('simple_ar.tools.workspace.settle_process_record'):
+                self.assertTrue(workspace.call('run_process', args, identity='bound').ok)
+                workspace.resolve('asset.bin').write_bytes(b'different')
+                self.assertFalse(workspace.call('run_process', args, identity='bound').ok)
+                self.assertFalse(workspace.call('run_process', {'argv': ['other'], 'outputs': ['asset.bin']}, identity='bound').ok)
+                runner.assert_not_called()
+            self.assertEqual(receipt.read_bytes(), original)
+            old = {'argv': ['tool'], 'cwd': 'workspace', 'timeout_sec': 60}
+            self.assertEqual(validate_workspace_arguments('run_process', old).model_dump(exclude_none=True), old)
+            self.assertIsNone(workspace.process_artifact_binding(old))
+            self.assertTrue(self._run(workspace, 'legacy', old).ok)
+            legacy = Path(tmp) / 'tools/processes/legacy/invocation.json'
+            original = legacy.read_bytes()
+            with patch('simple_ar.tools.workspace.run_process') as runner, \
+                    patch('simple_ar.tools.workspace.settle_process_record'):
+                self.assertFalse(workspace.call('run_process', args, identity='legacy').ok)
+                runner.assert_not_called()
+            self.assertEqual(legacy.read_bytes(), original)
+            self.assertFalse(self._run(workspace, 'missing', {'argv': ['tool'], 'outputs': ['absent']}).ok)
+            with self.assertRaisesRegex(ValueError, 'no successful output binding'):
+                workspace.check_artifact_producers(['absent'])
+
+    def test_publication_stops_old_image_when_declared_script_changes_without_rendering(self):
+        from simple_ar.tools.workspace import WorkspaceToolGateway
+        from simple_ar.tools.publication import PublicationToolGateway
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = WorkspaceToolGateway(root, {}, None)
+            workspace.resolve('arbitrary.source').write_bytes(b'original')
+            workspace.resolve('draft.md').write_text('# Draft\n\n![](figure.png)\n', encoding='utf-8')
+            args = {'argv': ['any-producer'], 'inputs': ['arbitrary.source'], 'outputs': ['figure.png']}
+            self.assertTrue(self._run(workspace, 'producer', args, {'figure.png': b'image'}).ok)
+            workspace.resolve('arbitrary.source').write_bytes(b'user edit')
+            gateway = PublicationToolGateway(root, workspace, None)
+            with patch('simple_ar.tools.publication.export_acm_report') as exporter, \
+                    patch('simple_ar.tools.publication.run_process') as runner:
+                result = gateway.call('export_report', {'markdown': 'draft.md', 'compile_pdf': False}, identity='export')
+                self.assertFalse(result.ok)
+                self.assertIn('producer inputs/outputs changed', result.error)
+                exporter.assert_not_called()
+                runner.assert_not_called()
+            self.assertFalse((root / 'tools/publications/export/request.json').exists())
+
+    def test_failed_latest_producer_and_unsafe_declarations_do_not_certify_outputs(self):
+        from simple_ar.tools.workspace import WorkspaceToolGateway
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = WorkspaceToolGateway(Path(tmp), {}, None)
+            args = {'argv': ['tool'], 'outputs': ['asset']}
+            self.assertTrue(self._run(workspace, 'a', args, {'asset': b'image'}).ok)
+            self.assertFalse(self._run(workspace, 'b', args, returncode=1).ok)
+            with self.assertRaisesRegex(ValueError, 'no successful output binding'):
+                workspace.check_artifact_producers(['asset'])
+            with patch('simple_ar.tools.workspace.run_process') as runner:
+                for declaration in ({'inputs': ['missing']}, {'outputs': ['../escape']}, {'outputs': ['workspace']}):
+                    self.assertFalse(workspace.call('run_process', {'argv': ['tool'], **declaration}, identity='bad').ok)
+                runner.assert_not_called()
+
+    def test_tied_timestamps_reject_and_self_mutation_cannot_hide_in_cycle(self):
+        from simple_ar.core.artifacts import read_json, write_json
+        from simple_ar.tools.workspace import WorkspaceToolGateway
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = WorkspaceToolGateway(Path(tmp), {}, None)
+            args = {'argv': ['tool'], 'outputs': ['asset']}
+            self.assertTrue(self._run(workspace, 'z', args, {'asset': b'image'}).ok)
+            self.assertFalse(self._run(workspace, 'a', args, returncode=1).ok)
+            for identity in ('z', 'a'):
+                receipt = Path(tmp) / f'tools/processes/{identity}/invocation.json'
+                record = read_json(receipt)
+                record['started_at'] = '2026-10-20T00:00:00.000000+00:00'
+                write_json(receipt, record)
+            with self.assertRaisesRegex(ValueError, 'Ambiguous producer timestamps'):
+                workspace.check_artifact_producers(['asset'])
+            workspace.resolve('self').write_bytes(b'input')
+            self_args = {'argv': ['tool'], 'inputs': ['self'], 'outputs': ['self']}
+            self.assertFalse(self._run(workspace, 'self', self_args, {'self': b'mutated'}).ok)
+            with self.assertRaisesRegex(ValueError, 'changed'):
+                workspace.check_artifact_producers(['self'])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -267,6 +267,7 @@ class WritingToolGateway:
         self.report_inputs = report_inputs
         self.work_context = work_context
         self.material_observations = material_observations
+        self.professional_inputs = False
 
     def _prior_inputs(self, request: ComposeRequest, identity: str,
                       retained_linkage: dict | None = None) -> tuple[ComposeRequest, dict, dict]:
@@ -363,10 +364,7 @@ class WritingToolGateway:
     def check_delivery(self, data: dict[str, Any]) -> None:
         """Current source bytes, including bounded windows, still own this text."""
         self._check_input_bytes(data['inputs'])
-        receipt = ArtifactStore(self.root / 'tools/writing' / Path(data['version']).name)
-        completed = receipt.read_json('professional_result.json')
-        if hashlib.sha256(receipt.resolve('writer/' + completed['writer_path']).read_bytes()).hexdigest() != completed['writer_sha256']:
-            raise ValueError('Report Writer evidence changed; no completed delivery')
+        self.workspace.check_artifact_producers(row['path'] for row in data['inputs'])
 
     @staticmethod
     def _same_report_content(saved: dict, current: dict, intent: dict | None) -> bool:
@@ -443,6 +441,9 @@ class WritingToolGateway:
                     or self.workspace.artifact_hashes(row['artifacts']) != data.get('artifact_sha256')):
                 continue
             self.check_delivery(data)  # Historical receipts keep their original proof strength.
+            completed = store.read_json('professional_result.json')
+            if hashlib.sha256(store.resolve('writer/' + completed['writer_path']).read_bytes()).hexdigest() != completed['writer_sha256']:
+                raise ValueError('Report Writer evidence changed; no completed delivery')
             return {'manuscript': data['editable_markdown']}
         raise ValueError('Report delivery needs a current canonical composition receipt, intact manuscript and original evidence; deliver an explicit candidate when incomplete')
 
@@ -727,6 +728,17 @@ class WritingToolGateway:
                     ('documents.json', 'writer/report_inputs.json', 'writer/sections.json', 'writer/response.json', 'writer/writer.json', 'review/request.json', 'review/response.json', 'result.json'))):
                 raise ValueError('Retained composition lacks its original request binding; no blind replay')
             original_binding = owner.read_json('request.json') if recovering else None
+            report_binding = self.report_inputs() if self.report_inputs and not inspecting else None
+            professional_inputs = (self.professional_inputs if not recovering else
+                original_binding.get('input_contract') == 'owner.v1')
+            if (professional_inputs and report_binding is not None
+                    and report_binding.get('evidence_contract') == 'materials.v1'):
+                if not recovering and (arguments.get('materials') or arguments.get('sources')):
+                    raise ValueError('Professional writing selects its own evidence; supply material_roots or reuse_prior_inputs, not preselected windows')
+                goal = original_binding['request']['goal'] if recovering else '\n\n'.join(report_binding['requests'])
+                if recovering and 'goal' in arguments and arguments['goal'] != goal:
+                    raise ValueError('Retained professional request changed')
+                arguments = {**arguments, 'goal': goal}
             request = (ReviewRequest if inspecting else ComposeRequest).model_validate(arguments)
             if not recovering and not inspecting and request.writing_method == 'sections' and request.required_headings:
                 remaining = self.ledger.remaining('llm_requests')
@@ -746,7 +758,6 @@ class WritingToolGateway:
             delivery = request.delivery if inspecting else None
             prepared_delivery = self.workspace.resolve_delivery(delivery) if delivery is not None else None
             delivery_inputs = self.workspace.artifact_hashes(prepared_delivery['artifacts']) if prepared_delivery else {}
-            report_binding = self.report_inputs() if self.report_inputs and not inspecting else None
             if request.professional_review is not None and (inspecting or report_binding is not None
                     or request.writing_method == 'sections'):
                 raise ValueError('professional_review requires unbound article composition; frozen report controls remain authoritative')
@@ -783,6 +794,7 @@ class WritingToolGateway:
                     raise ValueError(f'Figure input {locator!r}: existing file required')
                 if path.suffix.lower() not in {'.png', '.jpg', '.jpeg', '.svg', '.pdf'} or path.stat().st_size > 16_000_000:
                     raise ValueError(f'Figure input {locator!r}: PNG/JPEG/SVG/PDF up to 16 MB required')
+                self.workspace.check_artifact_producers([locator])
                 try:
                     return path, path.read_bytes()
                 except OSError:
@@ -1033,6 +1045,8 @@ class WritingToolGateway:
                 if not source['questions']:
                     source.pop('questions')  # Preserve existing explicit-selection receipt identity.
             binding = {'request': canonical_request, 'inputs': bindings}
+            if professional_inputs:
+                binding['input_contract'] = 'owner.v1'
             if reuse_linkage is not None:
                 prior_store = ArtifactStore(self.root / 'tools/writing' / reuse_linkage['owner'])
                 if (any(hashlib.sha256(prior_store.resolve(path).read_bytes()).hexdigest() != digest

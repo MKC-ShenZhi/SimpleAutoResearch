@@ -185,6 +185,8 @@ class PublicationToolGateway:
                 output_root=self.workspace.workspace / 'publications')
             if current['inputs'] != saved.get('inputs'):
                 raise ValueError('Publication authoring inputs changed')
+            self.workspace.check_artifact_producers(str(self.workspace.resolve(saved['markdown']).parent / key)
+                for key, digest in current['inputs'].items() if digest is not None)
             required = {project / 'main.pdf'} if 'pdf' in formats else set()
             if 'pdf' in formats and data['manifest'].get('compiled') is not True:
                 continue
@@ -212,6 +214,9 @@ class PublicationToolGateway:
             saved = owner.read_json('request.json') if owner.exists('request.json') else None
             binding = export_input_binding(source, request, output_root=self.workspace.workspace / 'publications',
                 include_images=saved is None or 'image_binding_version' in saved)
+            producer_cache = {}
+            self.workspace.check_artifact_producers((str(source.parent / key)
+                for key, digest in binding['inputs'].items() if digest is not None), cache=producer_cache)
             report_identity = self.report_source(request.markdown) if self.report_source else None
             if report_identity is not None:
                 binding['report_identity'] = report_identity
@@ -269,6 +274,7 @@ class PublicationToolGateway:
 
                 def validate_asset(path):
                     authorized = self.workspace.resolve(str(path))
+                    self.workspace.check_artifact_producers([str(authorized)], cache=producer_cache)
                     key = authorized.relative_to(source.parent).as_posix()
                     with authorized.open('rb') as file:
                         digest = hashlib.file_digest(file, 'sha256').hexdigest()
@@ -291,6 +297,8 @@ class PublicationToolGateway:
                     manifest = ArtifactStore(output).read_json('export.json')
             if report_identity is not None and self.report_source(request.markdown) != report_identity:
                 raise ValueError('Canonical authoring identity changed during publication')
+            self.workspace.check_artifact_producers((str(source.parent / key)
+                for key, digest in binding['inputs'].items() if digest is not None), cache=producer_cache, refresh=True)
             if self.report_source is not None and export_input_binding(source, request,
                     output_root=self.workspace.workspace / 'publications')['inputs'] != binding['inputs']:
                 raise ValueError('Publication authoring inputs changed during rendering')

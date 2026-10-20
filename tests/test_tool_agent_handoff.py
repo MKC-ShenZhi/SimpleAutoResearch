@@ -56,6 +56,26 @@ def _writing_prompt(fake):
     return json.loads(fake.ask_json.call_args.args[1])
 
 
+class _LegacyArticleFixtureResponses(Mock):
+    """Opt in old full-body fixtures to the explicitly advertised edit protocol."""
+
+    def __call__(self, *args, **kwargs):
+        response = super().__call__(*args, **kwargs)
+        if (not self.__dict__.get('adapt_article_edits', False)
+                or kwargs.get('label') != 'composition-article'
+                or not isinstance(response, dict) or 'draft_markdown' not in response
+                or set(response) - {'draft_markdown', 'source_notes'}
+                or not isinstance(response['draft_markdown'], str) or not response['draft_markdown'].strip()
+                or not isinstance(response.get('source_notes', []), list)):
+            return response
+        view = json.loads(args[1])
+        if view.get('edit_contract', {}).get('version') != 'exact_replacements.v1':
+            return response
+        return {'prior_draft_sha256': view['edit_contract']['prior_draft_sha256'],
+            'replacements': [{'old_text': view['prior_draft'], 'new_text': response['draft_markdown']}],
+            **({'source_notes': response['source_notes']} if 'source_notes' in response else {})}
+
+
 def _call_tool(gateway, name, arguments, *, identity):
     return gateway.call(ToolCall(tool_name=name, arguments=arguments, trace_id=identity))
 
@@ -414,6 +434,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                         completion_policy=None, report_protocol=None):
         run_dir, inputs = self._tool_materials()
         fake = Mock()
+        fake.ask_json = _LegacyArticleFixtureResponses()
         fake.effective_output_limit.return_value = None
         fake._settings = SimpleNamespace(api_mode='chat', context_input_tokens=24000)
         binding = {'profile': 'fixture', 'settings': {'model': 'fixture', 'api_mode': 'chat'}}
@@ -746,6 +767,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         for professional in ('writing', 'implementation'):
             with self.subTest(professional=professional):
                 _, fake, app, materials, table, _, writing_request = self._material_root_fixture()
+                fake.ask_json.adapt_article_edits = professional == 'writing'
                 extra = materials / 'unread-notes.txt'
                 extra.write_text('UNSELECTED_PARENT_OBSERVATION', encoding='utf-8')
                 for index, path in enumerate((table, extra)):
@@ -2804,6 +2826,69 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(app._report_projection()['kind'], 'none')
         self.assertIsNone(app._report_projection()['requirement'])
 
+    def test_professional_material_owner_uses_request_and_selects_originals_without_coordinator_answers(self):
+        _, _, fake, _, app, _ = self._native_fixture(
+            goal='Explain the supplied source without inventing measurements.', report_protocol='canonical_report.v1')
+        app.state['config']['professional_inputs'] = 'owner.v1'
+        app._save()
+        from simple_ar.app.tool_application import ToolApplication
+        app = ToolApplication.load(app.session.store.root)
+        self.enterContext(patch('simple_ar.app.tool_application.LLMClient.for_task', return_value=fake))
+        self._report_intent(app, 'intent')
+        self._accepted_report_tool(app, 'load_tools', {'names': ['compose_document']}, 'load-owner')
+        schema = next(row['function']['parameters'] for row in app.schemas
+            if row['function']['name'] == 'compose_document')
+        self.assertFalse({'goal', 'materials', 'sources'} & schema['properties'].keys())
+        self.assertIn('goal', app.gateway.registry.get('compose_document').input_schema['properties'])
+        headings = app._report_projection()['requirement']['outline']
+        fake.ask_json.side_effect = [
+            {'read_windows': [{'path': 'source0/notes.txt'}]},
+            {'materials': ['source0/notes.txt']},
+            {'draft_markdown': '\n\n'.join('## ' + row['heading'] + '\n\nThe source is supplied, not verified.'
+                for row in headings) or 'The source is supplied, not verified.'}]
+        arguments = {'title': 'Source account'}
+        produced = self._accepted_report_tool(app, 'compose_document', arguments, 'autonomous-writer')
+        request = app.session.store.read_json('tools/writing/autonomous-writer/request.json')
+        self.assertEqual(request['input_contract'], 'owner.v1')
+        self.assertEqual(request['request']['goal'], app.state['requests'][0])
+        self.assertEqual(request['request']['materials'][0]['path'], 'source0/notes.txt')
+        calls = fake.ask_json.call_count
+        replay = _call_tool(app.gateway, 'compose_document', arguments, identity='autonomous-writer')
+        self.assertEqual(replay.status, 'ok', replay.error)
+        self.assertEqual(fake.ask_json.call_count, calls)
+        refused = _call_tool(app.gateway, 'compose_document', {**arguments,
+            'materials': [{'path': 'source0/notes.txt'}]}, identity='caller-cannot-preselect')
+        self.assertNotEqual(refused.status, 'ok')
+        self.assertEqual(fake.ask_json.call_count, calls)
+
+    def test_declared_process_versions_bind_approval_and_require_regeneration(self):
+        _, _, _, _, app, _ = self._native_fixture(mount_inputs=False)
+        script = app.workspace.workspace / 'build.py'
+        script.write_text("from pathlib import Path\nPath('result.txt').write_text('first')\n")
+        arguments = {'argv': ['python', 'build.py'], 'inputs': ['workspace/build.py'],
+            'outputs': ['workspace/result.txt']}
+        call = self._native_message('run_process', arguments, 'build')['tool_calls'][0]
+        first_token = app.approval_token(call)
+        script.write_text("from pathlib import Path\nPath('result.txt').write_text('second')\n")
+        self.assertNotEqual(app.approval_token(call), first_token)
+        result = _call_tool(app.gateway, 'run_process', arguments, identity='built-artifact')
+        self.assertEqual(result.status, 'ok', result.error)
+        app.workspace.check_artifact_producers(['workspace/result.txt'])
+        before = app.ledger.to_dict()
+        again = _call_tool(app.gateway, 'run_process', arguments, identity='built-artifact')
+        self.assertEqual(again.status, 'ok', again.error)
+        self.assertEqual(app.ledger.to_dict(), before)
+        script.write_text("from pathlib import Path\nPath('result.txt').write_text('third')\n")
+        with self.assertRaisesRegex(ValueError, 'changed'):
+            app.workspace.check_artifact_producers(['workspace/result.txt'])
+        rejected = _call_tool(app.gateway, 'run_process', arguments, identity='built-artifact')
+        self.assertNotEqual(rejected.status, 'ok')
+        self.assertEqual(app.ledger.to_dict(), before)
+        rebuilt = _call_tool(app.gateway, 'run_process', arguments, identity='rebuilt-artifact')
+        self.assertEqual(rebuilt.status, 'ok', rebuilt.error)
+        app.workspace.check_artifact_producers(['workspace/result.txt'])
+        self.assertEqual((app.workspace.workspace / 'result.txt').read_text(), 'third')
+
     def test_versioned_report_writer_receives_original_material_and_feedback_creates_new_version(self):
         from simple_ar.tools.workspace import ReportDelivery
         app, fake, inputs, first = self._canonical_report_fixture()
@@ -2815,6 +2900,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(saved['report_binding']['requests'], app.state['requests'])
         claim = ReportDelivery(status='canonical', manuscript=manuscript)
         binding = app._report_inputs()
+        fake.ask_json.adapt_article_edits = True
         # One accepted owner admission: do not load/hash then repeat it through
         # publication_source. The observation remains part of that admission.
         with patch.object(app.workspace, 'artifact_hashes', wraps=app.workspace.artifact_hashes) as hashes:
@@ -2854,6 +2940,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         from simple_ar.tools.workspace import ReportDelivery
         from simple_ar.app.tool_application import _FINAL_WORK_TOOLS
         app, fake, _, written = self._canonical_report_fixture(formats=['pdf'])
+        fake.ask_json.adapt_article_edits = True
         manuscript = written.data['editable_markdown']
         claim = ReportDelivery(status='canonical', manuscript=manuscript)
         published = self._publication_fixture_export(app, manuscript, 'report-pdf-v1')
@@ -3027,6 +3114,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
         requirement = freeze_report_requirement({'outline_strategy': 'template'})
         _, _, fake, _, app, _ = self._native_fixture(allow_execution=False, report_requirement=requirement)
+        fake.ask_json.adapt_article_edits = True
         self.enterContext(patch('simple_ar.app.tool_application.LLMClient.for_task', return_value=fake))
         with self.subTest(history='frozen report without evidence contract'):
             # Historical saved configs did not always carry this field. Absence
@@ -4151,6 +4239,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         requirement = freeze_report_requirement({'outline_strategy': 'template'})
         _, inputs, fake, _, app, _ = self._native_fixture(report_requirement=requirement,
             measurement_command=[sys.executable, '-c', "print('score: 3.5')"])
+        fake.ask_json.adapt_article_edits = True
         self.enterContext(patch('simple_ar.app.tool_application.LLMClient.for_task', return_value=fake))
         manuscripts = []
         def article(system, prompt, **kwargs):
@@ -4243,6 +4332,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         _, inputs, fake, _, app, _ = self._native_fixture(code_task=contract,
             report_requirement=requirement, max_turns=12,
             measurement_command=['python', '-c', "from main import VALUE; print('score: ' + str(VALUE))"])
+        fake.ask_json.adapt_article_edits = True
         self.enterContext(patch('simple_ar.app.tool_application.LLMClient.for_task', return_value=fake))
         (inputs / 'main.py').write_text('VALUE = 1\n')
         (inputs / 'check.py').write_text('assert True\n')
@@ -8911,6 +9001,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
     def test_composition_preserves_selected_originals_bibliography_feedback_and_replay_identity(self) -> None:
         inputs, fake, resumed, original, writing_arguments = self._writing_fixture()
+        fake.ask_json.adapt_article_edits = True
         fake.ask_json.return_value['draft_markdown'] = (
             '# Model article title\n\n## Decision\n\nCancellation propagates to owned sibling tasks [@P1].\n'
             '\n### Limitation\n\nA completed external effect is not undone.\n')
@@ -8935,6 +9026,11 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 patch.object(resumed.writing, 'client_factory', return_value=client), \
                 patch.object(client, 'ask_json', side_effect=article_call):
             composed = self._compose_document(resumed, writing_arguments, 'writing-first')
+        calls = fake.ask_json.call_count
+        publication = resumed.writing.publication_source(composed.data['editable_markdown'], None)
+        self.assertEqual(publication['composition'], composed.data['version'])
+        self.assertEqual(publication['manuscript'], composed.data['editable_markdown'])
+        self.assertEqual(fake.ask_json.call_count, calls)
         self.assertIs(client._settings, settings)
         from simple_ar.research.evidence.bibliography import CITATION_FIELD_VALUE_RULE
         self.assertIn(CITATION_FIELD_VALUE_RULE, fake.ask_json.call_args.args[0])
@@ -8995,8 +9091,12 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         # Recovery must consume those saved bytes, never rewrite or redraft.
         import hashlib
         from simple_ar.report.schema import SourceHandle
+        from simple_ar.report.writing import ARTICLE_SYSTEM
         feedback_owner = ArtifactStore(resumed.session.store.root / 'tools/writing/writing-feedback')
         snapshot = feedback_owner.read_json('writer/report_inputs.json')
+        snapshot.pop('edit_contract')
+        snapshot.pop('response_record_contract')
+        snapshot['system'] = ARTICLE_SYSTEM
         snapshot['inputs']['article']['source_handles'].append(SourceHandle(
             handle='prior_draft', kind='prior_draft', artifact=draft_path, title='Previous version',
             summary=old_body, metadata={'evidence_role': 'prior_draft_not_primary_evidence',
@@ -9006,7 +9106,11 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         written = feedback_owner.read_json('writer/writer.json')
         written['snapshot_id'] = snapshot['snapshot_id']
+        historical_response = fake.ask_json.return_value
+        written['response_sha256'] = hashlib.sha256(json.dumps(
+            historical_response, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         feedback_owner.write_json('writer/report_inputs.json', snapshot)
+        feedback_owner.write_json('writer/response.json', historical_response)
         feedback_owner.write_json('writer/writer.json', written)
         retained = {name: feedback_owner.resolve(name).read_bytes() for name in
                     ('writer/report_inputs.json', 'writer/writer.json', 'writer/response.json')}
@@ -9268,6 +9372,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
     def test_independent_review_uses_current_draft_and_original_evidence_without_writing(self) -> None:
         inputs, fake, app, _, arguments = self._writing_fixture()
+        fake.ask_json.adapt_article_edits = True
         draft = inputs / 'user-draft.md'
         draft.write_text('Cancellation undoes completed external effects.', encoding='utf-8')
         original = draft.read_bytes()
@@ -9758,6 +9863,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
     def test_composition_investigates_renamed_records_tail_and_provenance(self) -> None:
         inputs, fake, app, _, old_table, _, request = self._material_root_fixture()
+        fake.ask_json.adapt_article_edits = True
         root = inputs / 'parcel-19'
         nested = root / 'zeta' / 'branch-7'
         nested.mkdir(parents=True)
@@ -9902,6 +10008,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         from simple_ar.integrations.llm import LLMError
 
         inputs, fake, app, materials, table, figure, request = self._material_root_fixture()
+        fake.ask_json.adapt_article_edits = True
         # The line-cap case must actually change observed bytes, not merely
         # restate an ineffective control on a single-line file.
         table.write_bytes(b'x\n' * 80000)
@@ -10064,6 +10171,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
     def test_composition_material_roots_bind_positive_constraints_and_replay_without_selection(self) -> None:
         _, fake, app, _, table, _, request = self._material_root_fixture()
+        fake.ask_json.adapt_article_edits = True
         prior = Path(request['prior_draft'])
         table.write_bytes(prior.read_bytes())  # Same prose, different explicitly assigned role.
         request = {**request, 'material_roots': [*request['material_roots'], str(prior)]}
@@ -10134,6 +10242,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         from simple_ar.tools.writing import ComposeRequest
 
         _, fake, app, materials, table, figure, request = self._material_root_fixture()
+        fake.ask_json.adapt_article_edits = True
         source = materials / 'original-document.json'
         original = self._original_document()
         original.records[0] = replace(original.records[0], metadata={'kind': 'supporting_material'})
@@ -10287,6 +10396,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         from simple_ar.tools.writing import ComposeRequest
 
         inputs, fake, app, materials, table, figure, request = self._material_root_fixture()
+        fake.ask_json.adapt_article_edits = True
         baseline = table.read_bytes()
         selection = {'materials': [str(table)], 'figures': [str(figure)]}
 

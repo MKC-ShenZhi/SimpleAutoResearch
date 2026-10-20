@@ -341,6 +341,9 @@ class ToolApplication:
             work_context=self._work_context,
             material_observations=self._material_observations,
             report_inputs=self._report_inputs if config.get('report_requirement') or config.get('report_protocol') else None)
+        if config.get('professional_inputs') not in {None, 'owner.v1'}:
+            raise ValueError('Unsupported professional input contract')
+        self.writing.professional_inputs = config.get('professional_inputs') == 'owner.v1'
         scientific = {}
         self.implementation = ImplementationToolGateway(controller.store.root, self.workspace, self.ledger,
             config['model'], controller.manifest.session_id,
@@ -439,8 +442,20 @@ class ToolApplication:
     @property
     def schemas(self) -> list[dict[str, object]]:
         active, _ = self._contract_presentation()
-        return export_openai_tool_schemas(self.gateway.registry, read_only_only=False,
+        schemas = export_openai_tool_schemas(self.gateway.registry, read_only_only=False,
             policy=self.gateway.policy, names=active)
+        obligation = self._report_projection()
+        if (self.writing.professional_inputs and obligation['kind'] == 'report'
+                and obligation['evidence_contract'] == 'materials.v1'):
+            for row in schemas:
+                if row['function']['name'] == 'compose_document':
+                    row['function']['parameters'] = json.loads(json.dumps(row['function']['parameters']))
+                    parameters = row['function']['parameters']
+                    for field in ('goal', 'materials', 'sources'):
+                        parameters.get('properties', {}).pop(field, None)
+                    parameters['required'] = [field for field in parameters.get('required', [])
+                        if field not in {'goal', 'materials', 'sources'}]
+        return schemas
 
     def _closing_schemas(self) -> list[dict[str, Any]]:
         """Offer executable closure before paying for the final decision.
@@ -1119,7 +1134,7 @@ class ToolApplication:
                max_snapshot_bytes: int = 16 * 1024 * 1024,
                delivery_files: list[str] | None = None,
                tool_contracts: Literal['full', 'on_demand', 'outcomes'] = 'on_demand',
-               completion_policy: str = 'closing_decision.v2') -> ToolApplication:
+               completion_policy: str = 'closing_decision.v2', professional_inputs: bool = False) -> ToolApplication:
         config, reused, limits, attempts = cls._configuration(root, goal, model=model, sources=sources,
             allow_execution=allow_execution, allow_network=allow_network, allow_vision=allow_vision,
             max_turns=max_turns, max_tokens=max_tokens, max_images=max_images, project_python=project_python,
@@ -1128,6 +1143,10 @@ class ToolApplication:
             max_attempts=max_attempts, source_operations=source_operations, execution_contract=execution_contract,
             services=services, snapshot_sources=snapshot_sources, max_snapshot_bytes=max_snapshot_bytes,
             tool_contracts=tool_contracts, completion_policy=completion_policy, delivery_files=delivery_files)
+        if type(professional_inputs) is not bool:
+            raise ValueError('professional_inputs must be boolean')
+        if professional_inputs:
+            config['professional_inputs'] = 'owner.v1'
         session = SessionController.create(root, session_id=root.name, topic=goal,
             registry=CapabilityRegistry(), budget=BudgetState(max_attempts=attempts, max_no_progress=6))
         session.manifest.transition_recipe = cls.RECIPE
@@ -1245,6 +1264,8 @@ class ToolApplication:
                 tool_contracts=candidate.get('tool_contracts', 'full'),
                 completion_policy=candidate.get('completion_policy', 'protected_decision.v1'),
                 delivery_files=candidate.get('delivery_files'), model_catalogs=hints)
+            if old.get('professional_inputs') is not None:
+                config['professional_inputs'] = old['professional_inputs']
             for name in fields - {'model', 'sources', 'allow_execution', 'allow_network'}:
                 if not replace_existing and old.get(name) is not None and old[name] != config.get(name):
                     raise ValueError(f'{name} is already frozen; use its existing feedback/revision contract')
@@ -2935,8 +2956,12 @@ class ToolApplication:
                         observed[value] = hashlib.file_digest(handle, "sha256").hexdigest()
             except (OSError, ValueError):
                 continue
-        return hashlib.sha256(json.dumps({"call": call, "files": observed,
-            "argv": argv, "environment": self.workspace.process_environment()}, sort_keys=True).encode()).hexdigest()
+        payload = {"call": call, "files": observed,
+            "argv": argv, "environment": self.workspace.process_environment()}
+        artifacts = self.workspace.process_artifact_binding(arguments)
+        if artifacts is not None:
+            payload['artifacts'] = artifacts
+        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
     def _authorize(self, sources: tuple[Path, ...], *, execution: bool, network: bool, vision: bool) -> str:
         """Explicit caller grants within the existing task, never inferred intent."""

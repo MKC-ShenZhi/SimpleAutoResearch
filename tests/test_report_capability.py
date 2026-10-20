@@ -59,6 +59,11 @@ class CompositionArticleOwnerTests(unittest.TestCase):
                         view = json.loads(prompt)
                         if label == 'composition-article':
                             drafts.append(view)
+                            if 'edit_contract' in view:
+                                return {'prior_draft_sha256': view['edit_contract']['prior_draft_sha256'],
+                                    'replacements': [{'old_text': 'Limited observation.',
+                                        'new_text': 'One supplied run; uncertainty unmeasured.'}]
+                                        if 'Limited observation.' in view['prior_draft'] else []}
                             return {'draft_markdown': 'Recorded score 0.75. '
                                 + ('One supplied run; uncertainty unmeasured.' if len(drafts) > 1 else 'Limited observation.')}
                         if label != 'article-independent-review':
@@ -85,6 +90,10 @@ class CompositionArticleOwnerTests(unittest.TestCase):
                 self.assertEqual(len(calls), 4 if pending and rounds else 2)
                 self.assertEqual(calls[0], ('composition-article', 'reviewed-native:article'))
                 parent = task / 'tools/writing/reviewed-native'
+                snapshot = json.loads((parent / 'writer/report_inputs.json').read_text())
+                self.assertEqual(snapshot['owner'], ARTICLE_OWNER)
+                self.assertEqual(snapshot['source_attempt'], 'reviewed-native')
+                self.assertEqual(snapshot['inputs']['article'], drafts[0])
                 original = {p: p.read_bytes() for p in parent.rglob('*') if p.is_file()}
                 if pending and rounds:
                     completed = json.loads((parent / 'professional_result.json').read_text())
@@ -102,6 +111,13 @@ class CompositionArticleOwnerTests(unittest.TestCase):
                 self.assertEqual(revised.status, 'ok', revised.error)
                 self.assertIn('0.75', json.dumps(drafts[-1]['source_handles']))
                 self.assertTrue(drafts[-1]['prior_draft'])
+                self.assertEqual(drafts[-1]['edit_contract']['version'], 'exact_replacements.v1')
+                feedback_snapshot = json.loads((task / 'tools/writing/feedback-native/writer/report_inputs.json').read_text())
+                self.assertEqual(feedback_snapshot['owner'], ARTICLE_OWNER)
+                self.assertEqual(feedback_snapshot['source_attempt'], 'feedback-native')
+                self.assertEqual(feedback_snapshot['inputs']['article'],
+                    {key: value for key, value in drafts[-1].items() if key != 'edit_contract'})
+                self.assertEqual(drafts[-1]['prior_draft'], workspace.resolve(produced.data['editable_markdown']).read_text())
                 self.assertEqual({p: p.read_bytes() for p in parent.rglob('*') if p.is_file()}, original)
                 with patch.object(gateway, 'client_factory', side_effect=AssertionError('No admission calls')) as factory:
                     replay = gateway.call('compose_document', feedback, identity='feedback-native')
@@ -126,25 +142,6 @@ class CompositionArticleOwnerTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             ComposeRequest(goal=request.goal, title=request.title,
                 professional_review={'max_revision_rounds': 4})
-
-    def test_native_adapter_keeps_exact_inputs_and_shared_owner(self):
-        from simple_ar.report.writing import run_composition_article
-        config = ReportRuntimeConfig(outline_strategy='template', reviewer='disabled',
-            document_review=False, max_review_iterations=0, allow_source_backtracking=False)
-        inputs = {'binding': {'request': {'goal': 'Original'}},
-            'assembly_config': config.model_dump(mode='json'),
-            'article': {'title': 'Original', 'goal': 'Revise', 'target_words': 0,
-                'source_handles': [], 'bibliography': [], 'citation_key_map': {},
-                'prior_draft': 'Existing draft'}}
-        with tempfile.TemporaryDirectory() as tmp, patch(
-                'simple_ar.report.writing.run_report_writing_capability') as owner:
-            run_composition_article(store=ArtifactStore(Path(tmp)), inputs=inputs, identity='same-call')
-        passed = owner.call_args.kwargs
-        self.assertIs(passed['request'].composition_inputs, inputs)
-        self.assertEqual(passed['request'].prior_draft, 'Existing draft')
-        self.assertEqual(passed['context'].attempt.attempt_id, 'same-call')
-        self.assertEqual(passed['request'].method, 'article')
-
 
 class ReportAuditCapabilityTests(unittest.TestCase):
     @staticmethod
@@ -947,7 +944,11 @@ class StructuredArticleWritingTests(unittest.TestCase):
                     feedback = {'goal': 'Clarify the observation limits.', 'title': 'Revised evidence note',
                         'prior_draft': produced.data['editable_markdown'], 'reuse_prior_inputs': True}
                     new_client = Mock()
-                    new_client.ask_json.return_value = {'draft_markdown': 'Recorded 0.75; uncertainty was not measured.'}
+                    def clarify(system, prompt, **options):
+                        view = json.loads(prompt)
+                        return {'prior_draft_sha256': view['edit_contract']['prior_draft_sha256'],
+                            'replacements': []}
+                    new_client.ask_json.side_effect = clarify
                     gateway.client_factory = lambda _: new_client
                     with patch.object(gateway, '_select_materials', side_effect=AssertionError('No reselection')):
                         revised = gateway.call('compose_document', feedback, identity=producer + '-feedback')
@@ -1004,6 +1005,9 @@ class StructuredArticleWritingTests(unittest.TestCase):
             self.assertEqual(article['template_guidance'], request.template.template_markdown)
             self.assertEqual(article['metric_sources'][0]['value'], .75)
             self.assertEqual(article['results']['status'], 'partial')
+            self.assertEqual(store.read_json('report_inputs.json')['edit_contract'], {
+                'version': 'exact_replacements.v1', 'max_replacements': 40, 'max_text_chars': 96_000})
+            self.assertIn('draft_markdown', store.read_json('response.json'))
             self.assertTrue(article['source_handles'][0]['metadata']['evidence_passages_truncated'])
             # The existing structured snapshot is still exact input data, not
             # the sparse composition contract or a new projection version.
@@ -1359,7 +1363,10 @@ class StructuredArticleWritingTests(unittest.TestCase):
                             if len(calls) > 1:
                                 self_outer.assertEqual(view['prior_draft'], initial if len(calls) == 3 else revised)
                                 self_outer.assertIn('not source facts', view['revision_findings']['status'])
-                            return {'draft_markdown': initial if len(calls) == 1 else revised}
+                                return {'prior_draft_sha256': view['edit_contract']['prior_draft_sha256'],
+                                    'replacements': [{'old_text': initial, 'new_text': revised}]
+                                        if view['prior_draft'] == initial else []}
+                            return {'draft_markdown': initial}
                         body = view['sections'][0]['markdown']
                         self_outer.assertFalse(view['historical_findings_to_check'])
                         needs_edit = body == initial and not constrained or body == revised and reject
@@ -1386,6 +1393,11 @@ class StructuredArticleWritingTests(unittest.TestCase):
                 self.assertEqual(store.read_json('writer.json')['sections'][0]['draft_markdown'], initial)
                 self.assertEqual(writer['sections'][0]['draft_markdown'], initial if reject else revised)
                 self.assertEqual(writer['adopted_revision'] is None, reject)
+                revision = store.read_json('review/revision-1/report_inputs.json')
+                self.assertEqual(revision['response_record_contract'], 'atomic_complete.v1')
+                self.assertNotEqual(revision['system'], store.read_json('report_inputs.json')['system'])
+                self.assertEqual(store.read_json('review/revision-1/response.json')['response']['replacements'],
+                    [{'old_text': initial, 'new_text': revised}])
                 ref = result.artifacts[0]
                 target = ArtifactStore(Path(tmp) / 'resumed')
                 recovered = run_report_writing_capability(context=CapabilityContext(target, AttemptManifest('resumed'),
@@ -1409,6 +1421,7 @@ class StructuredArticleWritingTests(unittest.TestCase):
                     self.assertEqual(current, writer)
 
     def test_article_revision_rejects_lost_citations_without_review_or_replay(self):
+        import hashlib
         from simple_ar.literature.verify import CitationError
 
         client = ArticleClient()
@@ -1424,7 +1437,9 @@ class StructuredArticleWritingTests(unittest.TestCase):
                 'findings': [{'finding_id': 'style', 'type': 'style', 'severity': 'major',
                     'required_action': 'revise', 'message': 'Clarify the prose.',
                     'draft_quotes': [{'section_id': 'document', 'quote': 'Supported prose [@P1].'}]}]}]},
-            {'draft_markdown': 'Revised prose lost its attribution.'}]
+            {'prior_draft_sha256': hashlib.sha256(b'Supported prose [@P1].').hexdigest(),
+                'replacements': [{'old_text': 'Supported prose [@P1].',
+                    'new_text': 'Revised prose lost its attribution.'}]}]
         with tempfile.TemporaryDirectory() as tmp, patch.object(client, 'ask_json', side_effect=responses) as model:
             store = ArtifactStore(Path(tmp))
             context = CapabilityContext(store, AttemptManifest('revision-citations'))
@@ -1434,9 +1449,214 @@ class StructuredArticleWritingTests(unittest.TestCase):
             self.assertEqual(recovered.status, 'failed')
             self.assertEqual(model.call_count, 3)
             self.assertEqual(store.read_json('writer.json')['sections'][0]['draft_markdown'], responses[0]['draft_markdown'])
-            self.assertEqual(store.read_json('review/revision-1/response.json'), responses[2])
+            self.assertEqual(store.read_json('review/revision-1/response.json')['response'], responses[2])
             self.assertFalse(store.exists('review/revision-1/writer.json'))
             self.assertFalse(store.exists('review/revision-1/inspection/request.json'))
+
+    def test_prior_article_edits_preserve_exact_body_and_canonical_notes_on_recovery(self):
+        import hashlib
+
+        prior = '# 原稿\n\nAlpha then Beta.\n\nRemove this.\n\n![Exact caption](assets/plot.png)\n'
+        expected = '# 原稿\n\nBeta then Gamma.\n\n![Exact caption](assets/plot.png)\n'
+        notes = [{'paper_id': 'source-a', 'bibliographic_fields': []}]
+        calls = []
+        outer = self
+        class Client:
+            def ask_json(self, system, prompt, **options):
+                view = json.loads(prompt)
+                calls.append(view)
+                outer.assertEqual(view['prior_draft'], prior)
+                outer.assertEqual(view['edit_contract'], {'version': 'exact_replacements.v1',
+                    'max_replacements': 40, 'max_text_chars': 96_000,
+                    'prior_draft_sha256': hashlib.sha256(prior.encode('utf-8')).hexdigest()})
+                outer.assertIn('Recorded value: 0.75.', json.dumps(view['source_handles']))
+                outer.assertIn('Clarify the recorded result', view['goal'])
+                outer.assertNotIn('replacements', view)
+                return {'prior_draft_sha256': view['edit_contract']['prior_draft_sha256'],
+                    'replacements': [{'old_text': 'Remove this.\n\n', 'new_text': ''},
+                        {'old_text': 'Alpha', 'new_text': 'Beta'},
+                        {'old_text': 'Beta', 'new_text': 'Gamma'}], 'source_notes': notes}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ArtifactStore(Path(tmp) / 'first')
+            request = replace(self.request(Client()), prior_draft=prior)
+            request = replace(request, report_context=request.report_context.model_copy(update={
+                'goal_markdown': 'Clarify the recorded result using the supplied observations.'}))
+            result = run_report_writing_capability(context=CapabilityContext(store, AttemptManifest('edit')), request=request)
+            written = store.read_json('writer.json')
+            self.assertEqual(written['sections'][0]['draft_markdown'], expected)
+            self.assertEqual(written['source_notes'], notes)
+            self.assertEqual(written['memory']['outline_planning']['source_notes'], notes)
+            response = store.read_json('response.json')
+            self.assertNotIn('draft_markdown', response['response'])
+            self.assertEqual(written['response_sha256'], response['response_sha256'])
+            original = {p: p.read_bytes() for p in store.root.rglob('*.json')}
+            target = ArtifactStore(Path(tmp) / 'resume')
+            ref = result.artifacts[0]
+            run_report_writing_capability(context=CapabilityContext(target, AttemptManifest('resume'),
+                inputs=(ref,), input_store=store), request=replace(request, resume_ref=ref))
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(target.read_json('writer.json'), written)
+            self.assertEqual(target.read_json('response.json'), response)
+            self.assertEqual({p: p.read_bytes() for p in original}, original)
+
+    def test_article_patch_contract_rejects_invalid_complete_responses_without_retry(self):
+        import hashlib
+        from simple_ar.report.writing import write_whole_article
+
+        prior = 'Alpha Beta Alpha; ababa; unique end.'
+        bound = hashlib.sha256(prior.encode('utf-8')).hexdigest()
+        responses = [
+            {'prior_draft_sha256': '0' * 64, 'replacements': []},
+            {'prior_draft_sha256': bound, 'replacements': [{'old_text': 'missing', 'new_text': 'new'}]},
+            {'prior_draft_sha256': bound, 'replacements': [{'old_text': 'Alpha', 'new_text': 'new'}]},
+            {'prior_draft_sha256': bound, 'replacements': [{'old_text': 'aba', 'new_text': 'new'}]},
+            {'prior_draft_sha256': bound, 'replacements': [
+                {'old_text': 'unique end', 'new_text': 'new'}, {'old_text': 'end.', 'new_text': 'ending'}]},
+            {'draft_markdown': 'A full rewrite is not a patch.'},
+            {'prior_draft_sha256': bound, 'replacements': [{'old_text': 'unique', 'new_text': 'new'}] * 41},
+            {'prior_draft_sha256': bound, 'replacements': [{'old_text': 'unique', 'new_text': 'x' * 96_001}]},
+        ]
+        for index, response in enumerate(responses):
+            with self.subTest(case=index), tempfile.TemporaryDirectory() as tmp:
+                store = ArtifactStore(Path(tmp))
+                inputs = {'article': {'title': 'Bound editing', 'prior_draft': prior}}
+                client = ArticleClient(response)
+                arguments = dict(store=store, inputs=inputs, identity='invalid', client=client)
+                with self.assertRaises(ValueError):
+                    write_whole_article(**arguments)
+                retained = store.read_json('response.json')
+                self.assertEqual(retained['response'], response)
+                self.assertFalse(store.exists('writer.json'))
+                with self.assertRaises(ValueError):
+                    write_whole_article(**arguments, recovering=True)
+                self.assertEqual(len(client.calls), 1)
+                # A response without its atomic receipt cannot authorize recovery.
+                with changed_record(store.resolve('response.json'), response):
+                    with self.assertRaisesRegex(ValueError, 'complete bound record'):
+                        write_whole_article(**arguments, recovering=True)
+                self.assertEqual(store.read_json('response.json'), retained)
+
+    def test_article_patch_interruption_and_historical_fulltext_keep_original_contracts(self):
+        import hashlib
+        from simple_ar.report.writing import ARTICLE_SYSTEM, write_whole_article
+
+        def digest(value):
+            return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+        inputs = {'article': {'title': 'Versioned body', 'prior_draft': 'Original prose.'}}
+        for legacy in (True, False):
+            with self.subTest(legacy=legacy), tempfile.TemporaryDirectory() as tmp:
+                store = ArtifactStore(Path(tmp) / 'first')
+                response = {'draft_markdown': 'Historical complete rewrite.'} if legacy else {
+                    'prior_draft_sha256': hashlib.sha256(b'Original prose.').hexdigest(),
+                    'replacements': [{'old_text': 'Original', 'new_text': 'Revised'}]}
+                client = ArticleClient(response)
+                if legacy:
+                    snapshot = {'owner': ARTICLE_OWNER, 'source_attempt': 'original',
+                        'system': ARTICLE_SYSTEM, 'inputs': inputs}
+                    snapshot['snapshot_id'] = digest(snapshot)
+                    store.write_json('report_inputs.json', snapshot)
+                    store.write_json('response.json', response)
+                else:
+                    write = ArtifactStore.write_json
+                    def interrupt(owner, path, value, **options):
+                        result = write(owner, path, value, **options)
+                        if str(path) == 'response.json':
+                            raise RuntimeError('Complete response retained before validation')
+                        return result
+                    with patch.object(ArtifactStore, 'write_json', interrupt), self.assertRaisesRegex(RuntimeError, 'retained'):
+                        write_whole_article(store=store, inputs=inputs, identity='original', client=client)
+                    self.assertFalse(store.exists('writer.json'))
+                original = {p: p.read_bytes() for p in store.root.iterdir()}
+                target = ArtifactStore(Path(tmp) / 'resume')
+                written = write_whole_article(store=target, inputs=inputs, identity='different',
+                    client=client, resume_store=store)
+                self.assertEqual(written['sections'][0]['draft_markdown'],
+                    response['draft_markdown'] if legacy else 'Revised prose.')
+                self.assertEqual(written['response_sha256'], digest(response))
+                self.assertEqual(written['source_attempt'], 'original')
+                self.assertEqual(len(client.calls), 0 if legacy else 1)
+                for name in ('report_inputs.json', 'response.json'):
+                    self.assertEqual(target.resolve(name).read_bytes(), store.resolve(name).read_bytes())
+                self.assertEqual({p: p.read_bytes() for p in original}, original)
+                with changed_record(store.resolve('response.json'), None):
+                    with self.assertRaisesRegex(ValueError, 'no blind replay'):
+                        write_whole_article(store=store, inputs=inputs, identity='original', client=client, recovering=True)
+                self.assertEqual(len(client.calls), 0 if legacy else 1)
+                if legacy:
+                    # Old initial snapshots also keep full-body correction for a
+                    # not-yet-started editor round, rather than acquiring patches.
+                    from simple_ar.report.writing import _edit_article
+                    calls = []
+                    outer = self
+                    class LegacyClient:
+                        def ask_json(self, system, prompt, *, label='', **options):
+                            calls.append(label)
+                            view = json.JSONDecoder().raw_decode(prompt[prompt.index('{'):])[0]
+                            if label == 'composition-article':
+                                outer.assertNotIn('edit_contract', view)
+                                outer.assertEqual(system, ARTICLE_SYSTEM)
+                                return {'draft_markdown': 'Further historical rewrite.'}
+                            pending = len(calls) == 1
+                            return {'section_reviews': [{'section_id': 'document',
+                                'verdict': 'revise_required' if pending else 'pass',
+                                'findings': [{'finding_id': 'prose', 'type': 'style', 'severity': 'major',
+                                    'required_action': 'revise', 'message': 'Clarify the prose.',
+                                    'draft_quotes': [{'section_id': 'document', 'quote': 'Historical complete rewrite.'}]}]
+                                    if pending else []}]}
+                    request = self.request(LegacyClient())
+                    request = replace(request, config=request.config.model_copy(update={'max_review_iterations': 1}))
+                    report = inspect_article(store=ArtifactStore(store.root / 'review'), identity='original',
+                        client=request.llm_client, report_context=request.report_context,
+                        config=request.config, template=request.template, markdown=response['draft_markdown'])
+                    arguments = dict(store=store, retained=store, inputs=inputs,
+                        written={**written, 'memory': request.memory.model_dump(mode='json')}, initial_review=report)
+                    edited = _edit_article(**arguments, request=request)
+                    self.assertEqual(edited['sections'][0]['draft_markdown'], 'Further historical rewrite.')
+                    self.assertIsNotNone(edited['adopted_revision'])
+                    self.assertEqual(_edit_article(**arguments, request=replace(request, llm_client=None)), edited)
+                    self.assertEqual(calls, ['article-independent-review', 'composition-article', 'article-independent-review'])
+
+    def test_supplied_prior_noop_is_independently_inspected_and_atomically_adopted(self):
+        prior = '# Existing candidate\n\nPreserve spacing.  \n\nConditions unchanged.\n'
+        calls = []
+        outer = self
+        class Client:
+            def ask_json(self, system, prompt, *, label='', **options):
+                calls.append(label)
+                view = json.JSONDecoder().raw_decode(prompt[prompt.index('{'):])[0]
+                if label == 'composition-article':
+                    outer.assertEqual(view['prior_draft'], prior)
+                    return {'prior_draft_sha256': view['edit_contract']['prior_draft_sha256'], 'replacements': []}
+                outer.assertEqual(view['sections'][0]['markdown'], prior)
+                pending = len(calls) == 2
+                return {'section_reviews': [{'section_id': 'document',
+                    'verdict': 'revise_required' if pending else 'pass',
+                    'findings': [{'finding_id': 'clarity', 'type': 'style', 'severity': 'major',
+                        'required_action': 'revise', 'message': 'Check whether clarification is necessary.',
+                        'draft_quotes': [{'section_id': 'document', 'quote': 'Conditions unchanged.'}]}] if pending else []}]}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ArtifactStore(Path(tmp) / 'first')
+            request = self.request(Client())
+            request = replace(request, prior_draft=prior, config=request.config.model_copy(update={
+                'reviewer': 'llm', 'document_review': True, 'review_scope': 'document',
+                'draft_scope': 'document', 'max_review_iterations': 1}))
+            result = run_report_writing_capability(context=CapabilityContext(store, AttemptManifest('noop')), request=request)
+            written = store.read_json(next(ref for ref in result.artifacts if ref.kind == 'report_writer_result'))
+            self.assertEqual(result.status, 'completed')
+            self.assertEqual(written['sections'][0]['draft_markdown'].encode('utf-8'), prior.encode('utf-8'))
+            self.assertIsNotNone(written['adopted_revision'])
+            self.assertEqual(written['independent_review']['review_status'], 'reviewed')
+            self.assertEqual(calls, ['composition-article', 'article-independent-review'] * 2)
+            ref = result.artifacts[0]
+            target = ArtifactStore(Path(tmp) / 'resume')
+            recovered = run_report_writing_capability(context=CapabilityContext(target, AttemptManifest('resume'),
+                inputs=(ref,), input_store=store), request=replace(request, resume_ref=ref, llm_client=None))
+            self.assertEqual(recovered.status, 'completed')
+            self.assertEqual(target.read_json(next(ref for ref in recovered.artifacts if ref.kind == 'report_writer_result')), written)
+            self.assertEqual(len(calls), 4)
 
     def test_article_candidate_and_verification_checkpoints_resume_without_repeating_calls(self):
         for stage in ('drafted', 'completed'):
@@ -1446,7 +1666,11 @@ class StructuredArticleWritingTests(unittest.TestCase):
                     def ask_json(self, system, prompt, *, label='', **options):
                         calls.append(label)
                         if label == 'composition-article':
-                            return {'draft_markdown': 'Initial.' if len(calls) == 1 else 'Revised.'}
+                            if len(calls) == 1:
+                                return {'draft_markdown': 'Initial.'}
+                            view = json.loads(prompt)
+                            return {'prior_draft_sha256': view['edit_contract']['prior_draft_sha256'],
+                                'replacements': [{'old_text': 'Initial.', 'new_text': 'Revised.'}]}
                         view = json.JSONDecoder().raw_decode(prompt[prompt.index('{'):])[0]
                         pending = view['sections'][0]['markdown'] == 'Initial.'
                         return {'section_reviews': [{'section_id': 'document', 'verdict': 'revise_required' if pending else 'pass',
@@ -1510,11 +1734,16 @@ class StructuredArticleWritingTests(unittest.TestCase):
                             context=CapabilityContext(store, AttemptManifest('original')), request=offline)
 
     def test_resume_selection_shares_binding_and_uses_only_completed_article_body_for_revision(self):
+        import hashlib
+
         with tempfile.TemporaryDirectory() as tmp:
             session = ArtifactStore(Path(tmp))
             store = ArtifactStore(session.root / 'attempts' / 'original')
             source = session.write_json('material.json', {'value': .75}, kind='material')
             request = replace(self.request(), prior_draft='Previously accepted prose.')
+            request.llm_client.response = {'prior_draft_sha256': hashlib.sha256(
+                request.prior_draft.encode('utf-8')).hexdigest(), 'replacements': [
+                    {'old_text': 'Previously', 'new_text': 'Still'}]}
             result = run_report_writing_capability(
                 context=CapabilityContext(store, AttemptManifest('original'), inputs=(source,), input_store=session),
                 request=request)

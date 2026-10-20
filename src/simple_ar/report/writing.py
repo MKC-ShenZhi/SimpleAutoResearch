@@ -54,6 +54,46 @@ _ARTICLE_SYSTEM_SHA256 = frozenset({
     'a2a45241449c56ab563da248f633351a61738d6e168b615225c4d394d2a9979e',
     hashlib.sha256(ARTICLE_SYSTEM.encode('utf-8')).hexdigest(),
 })
+ARTICLE_EDIT_SYSTEM = ARTICLE_SYSTEM.replace(
+    'Return {"draft_markdown": "complete article Markdown"}, optionally with source_notes ',
+    'Revise the bound prior_draft using the actual evidence, current body, goal and feedback. '
+    'Choose the necessary edits yourself; supplied feedback is not source evidence. '
+    'Preserve unaffected text exactly. Return one complete JSON response with '
+    'prior_draft_sha256 copied from edit_contract and replacements: '
+    '[{"old_text": "exact unique original span", "new_text": "replacement text"}]. '
+    'Every nonempty old_text must occur exactly once in the original prior_draft; '
+    'spans must not overlap. All edits refer to the original body, not earlier replacements. '
+    'Use an empty replacements list when no change is needed; new_text may be empty for deletion. '
+    'Obey edit_contract.max_replacements and max_text_chars for each old_text/new_text. '
+    'Do not return draft_markdown. Optionally include source_notes ').replace(
+    'Write one complete article answering the supplied goal, title and target length. ',
+    'Edit the supplied prior_draft to answer the supplied goal, title and target length. ')
+ARTICLE_EDIT_CONTRACT = {'version': 'exact_replacements.v1', 'max_replacements': 40, 'max_text_chars': 96_000}
+
+
+def _apply_article_replacements(response: Any, contract: dict[str, Any], prior: str) -> str:
+    """Validate all original-body spans before constructing a complete candidate."""
+    from simple_ar.core.artifacts import replace_exact_spans
+
+    if (not isinstance(response, dict)
+            or set(response) - {'prior_draft_sha256', 'replacements', 'source_notes'}
+            or response.get('prior_draft_sha256') != contract['prior_draft_sha256']
+            or not isinstance(response.get('replacements'), list)
+            or len(response['replacements']) > contract['max_replacements']
+            or not isinstance(response.get('source_notes', []), list)):
+        raise ValueError('Article edit response requires bound replacements; no automatic correction')
+    replacements = []
+    for edit in response['replacements']:
+        if (not isinstance(edit, dict) or set(edit) != {'old_text', 'new_text'}
+                or not isinstance(edit['old_text'], str) or not edit['old_text']
+                or not isinstance(edit['new_text'], str)
+                or max(len(edit['old_text']), len(edit['new_text'])) > contract['max_text_chars']):
+            raise ValueError('Article replacements require bounded nonempty old_text and string new_text')
+        replacements.append((edit['old_text'], edit['new_text']))
+    markdown = replace_exact_spans(prior, replacements) if replacements else prior
+    if not markdown.strip():
+        raise ValueError('Article replacements require a nonempty complete candidate')
+    return markdown
 
 
 def article_writing_inputs(*, report_context: ReportContext, documents: DocumentBundle | None,
@@ -339,13 +379,16 @@ def retained_writing_client(*, store: ArtifactStore, identity: str, client: Any)
 
 def write_whole_article(*, store: Any, inputs: dict[str, Any], identity: str,
                         client: Any = None, recovering: bool = False,
-                        resume_store: ArtifactStore | None = None) -> dict[str, Any]:
+                        resume_store: ArtifactStore | None = None, edit_prior: bool = True) -> dict[str, Any]:
     """One logical article call using shared transport policy; recovery never calls."""
     def digest(value: Any) -> str:
         return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
     source = resume_store or store
     recovering = recovering or resume_store is not None
+    prior = inputs['article'].get('prior_draft', '')
+    edit_contract = {**ARTICLE_EDIT_CONTRACT, **({'prior_draft_sha256':
+        hashlib.sha256(prior.encode('utf-8')).hexdigest()} if prior else {})}
     if recovering:
         if not source.exists('report_inputs.json'):
             raise ValueError('Article input snapshot changed or is unavailable; no blind replay')
@@ -353,12 +396,22 @@ def write_whole_article(*, store: Any, inputs: dict[str, Any], identity: str,
         if resume_store is not None and isinstance(snapshot, dict):
             identity = snapshot.get('source_attempt')
         # Historical requests retain their original prompt, not today's method.
+        editing = isinstance(snapshot, dict) and snapshot.get('system') == ARTICLE_EDIT_SYSTEM
+        expected_keys = {'owner', 'source_attempt', 'system', 'inputs', 'snapshot_id'}
+        if isinstance(snapshot, dict) and 'edit_contract' in snapshot:
+            expected_keys.add('edit_contract')
+        if editing:
+            expected_keys.update({'edit_contract', 'response_record_contract'})
         if (not isinstance(snapshot, dict)
-                or set(snapshot) != {'owner', 'source_attempt', 'system', 'inputs', 'snapshot_id'}
+                or set(snapshot) != expected_keys
                 or snapshot['owner'] != ARTICLE_OWNER or snapshot['source_attempt'] != identity
                 or snapshot['inputs'] != inputs
                 or not isinstance(snapshot['system'], str)
-                or hashlib.sha256(snapshot['system'].encode('utf-8')).hexdigest() not in _ARTICLE_SYSTEM_SHA256
+                or (not editing and hashlib.sha256(snapshot['system'].encode('utf-8')).hexdigest() not in _ARTICLE_SYSTEM_SHA256)
+                or ('edit_contract' in snapshot and snapshot['edit_contract'] != edit_contract)
+                or (not editing and 'edit_contract' in snapshot and bool(prior))
+                or (editing and (not prior or snapshot['edit_contract'] != edit_contract
+                    or snapshot['response_record_contract'] != 'atomic_complete.v1'))
                 or snapshot['snapshot_id'] != digest({key: value for key, value in snapshot.items()
                                                      if key != 'snapshot_id'})):
             raise ValueError('Article input snapshot changed or is unavailable; no blind replay')
@@ -366,24 +419,35 @@ def write_whole_article(*, store: Any, inputs: dict[str, Any], identity: str,
     else:
         if client is None:
             raise ValueError('Report writing requires an LLM client; no offline paper is invented.')
-        snapshot = {'owner': ARTICLE_OWNER, 'source_attempt': identity, 'system': ARTICLE_SYSTEM, 'inputs': inputs}
+        editing = bool(prior) and edit_prior
+        system = ARTICLE_EDIT_SYSTEM if editing else ARTICLE_SYSTEM
+        snapshot = {'owner': ARTICLE_OWNER, 'source_attempt': identity, 'system': system, 'inputs': inputs}
+        if edit_prior:
+            # Freeze correction policy on the first request, even for a full-body initial draft.
+            snapshot['edit_contract'] = edit_contract
+        if editing:
+            snapshot['response_record_contract'] = 'atomic_complete.v1'
         snapshot['snapshot_id'] = digest(snapshot)
         # The shared client owns bounded transport retries, API/JSON compatibility
         # and physical-attempt accounting. Article validation never redrafts.
         output_limit = ({'max_output_tokens': inputs['max_output_tokens']}
                         if inputs.get('max_output_tokens', 0) > 0 else {})
         response = _retained_response(store, 'report_inputs.json', snapshot, lambda: client.ask_json(
-            ARTICLE_SYSTEM, json.dumps(inputs['article'], ensure_ascii=False),
+            system, json.dumps({**inputs['article'], **({'edit_contract': edit_contract} if editing else {})}, ensure_ascii=False),
             label='composition-article', budget_call_id=f'{identity}:article', **output_limit))
     # Persist the original response before any contract or assembly validation.
-    if (not isinstance(response, dict) or 'draft_markdown' not in response
+    if editing:
+        markdown = _apply_article_replacements(response, edit_contract, prior)
+    elif (not isinstance(response, dict) or 'draft_markdown' not in response
             or set(response) - {'draft_markdown', 'source_notes'}
             or not isinstance(response.get('source_notes', []), list)
             or not isinstance(response['draft_markdown'], str) or not response['draft_markdown'].strip()):
         raise ValueError('Article response requires one nonempty draft_markdown; no automatic correction')
+    else:
+        markdown = response['draft_markdown']
     from simple_ar.report.schema import ReportSectionDraft
     section = ReportSectionDraft(section_id='document', heading=inputs['article']['title'],
-        draft_markdown=response['draft_markdown'])
+        draft_markdown=markdown)
     try:
         checked = _check_article_constraints(inputs['article'], section.draft_markdown)
     except ValueError as exc:
@@ -411,7 +475,7 @@ def write_whole_article(*, store: Any, inputs: dict[str, Any], identity: str,
     # Validate all retained/cross-attempt records before copying any. The
     # original identity, system and response move together, never a new request.
     if resume_store is not None:
-        records.update({'report_inputs.json': snapshot, 'response.json': response})
+        records.update({'report_inputs.json': snapshot, 'response.json': source.read_json('response.json')})
     _retain_records(store, (source,) if resume_store is not None else (), records)
     return written
 
@@ -977,6 +1041,7 @@ def _edit_article(*, store: ArtifactStore, retained: ArtifactStore, written: dic
         return write_whole_article(store=revision, inputs=revised_inputs,
             identity=f'{written["source_attempt"]}:revision-{event.iteration}',
             client=None if recover_only else request.llm_client, recovering=revision.exists('report_inputs.json'),
+            edit_prior='edit_contract' in source.read_json('report_inputs.json'),
             resume_store=prior if not revision.exists('report_inputs.json') and prior.exists('report_inputs.json') else None)
 
     def draft(event: ReportIterationRecord, baseline: list[ReportSectionDraft]) -> list[ReportSectionDraft]:
