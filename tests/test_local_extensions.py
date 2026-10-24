@@ -166,6 +166,75 @@ def count_words(arguments, services):
 
 
 class LocalExtensionIntegrationTests(unittest.TestCase):
+    def test_declared_extension_completion_survives_supply_and_terminal_recovery(self):
+        # The core never knows this domain/tool name or its delivery field.
+        # One integrated check owns registration, completion and retained use.
+        from simple_ar.tools.workspace import RetainedDelivery
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = root / 'package'
+            package.mkdir()
+            (package / 'extension.toml').write_text('''[extension]
+id = "research_note"
+version = "1"
+description = "Deliver an explicit research note"
+scope = "Caller-supplied note, no scientific certification"
+
+[[tools]]
+name = "finish_note"
+description = "Return the caller note with its explicit completion"
+implementation = "notes.py"
+function = "finish_note"
+permission_level = "plan"
+completion = {field = "handoff", closing = true}
+[tools.input_schema]
+type = "object"
+required = ["handoff"]
+additionalProperties = false
+[tools.input_schema.properties.handoff]
+type = "object"
+''', encoding='utf-8')
+            (package / 'notes.py').write_text(
+                'def finish_note(arguments, services):\n    return {"handoff": arguments["handoff"]}\n',
+                encoding='utf-8')
+            app = ToolApplication.create(root / 'task', 'Deliver the explicit note', model=None,
+                sources={}, extensions=[package], tool_contracts='full')
+            name = 'research_note__finish_note'
+            frozen = app.state['config']['tool_completions'].copy()
+            self.assertEqual(frozen[name]['field'], 'handoff')
+            self.assertIn(name, [row['function']['name'] for row in app._closing_schemas()])
+            app.supply(supply_id='keep-completion', reason='Retain original completion semantics',
+                changes={'allow_execution': True})
+            self.assertEqual(app.state['config']['tool_completions'], frozen)
+            note = app.workspace.workspace / 'note.txt'
+            note.write_text('Existing note; no new measurement performed', encoding='utf-8')
+            delivery = {'summary': 'Explicit note retained; no new measurement performed',
+                'artifacts': ['workspace/note.txt']}
+            app.run(actions=[{'tool_name': name, 'arguments': {'handoff': delivery}}], progress=lambda _: None)
+            self.assertEqual(app.session.manifest.status, 'completed')
+            before = app.ledger.to_dict()
+            loaded = ToolApplication.load(root / 'task')
+            self.assertTrue(loaded._commit_terminal(lambda _: None))
+            self.assertEqual(loaded.ledger.to_dict(), before)
+            self.assertEqual(RetainedDelivery(root / 'task').reusable_materials(), {'artifacts': [note]})
+            original = note.read_bytes()
+            note.write_text('Changed note cannot inherit delivery acceptance', encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'delivered files changed'):
+                RetainedDelivery(root / 'task').reusable_materials()
+            note.write_bytes(original)
+            # Saved old sessions do not silently acquire extension completion.
+            loaded.state['config'].pop('tool_completions')
+            loaded.state['config'].pop('document_source_contract')
+            loaded._save()
+            loaded.supply(supply_id='legacy-config', reason='An unrelated supply preserves absent contracts',
+                changes={'allow_network': True})
+            self.assertNotIn('tool_completions', loaded.state['config'])
+            self.assertNotIn('document_source_contract', loaded.state['config'])
+            loaded.supply(supply_id='document-source', reason='Explicitly adopt new source handling for subsequent work',
+                changes={'document_source_contract': 'document_source.v1'})
+            self.assertEqual(loaded.state['config']['document_source_contract'], 'document_source.v1')
+            self.assertFalse(loaded._terminal_intent({'function': {'name': name, 'arguments': '{}'}}))
+
     @unittest.skipUnless(shutil.which('rg'), 'Nested search uses the existing ripgrep tool')
     def test_nested_host_searches_have_distinct_recoverable_receipts(self):
         with tempfile.TemporaryDirectory() as temporary:

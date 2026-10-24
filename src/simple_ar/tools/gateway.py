@@ -124,19 +124,27 @@ class CommonToolGateway:
         """
         owner = self.domain_owner(observed.get('tool_name', ''))
         continuation = getattr(owner, 'continuation', None)
-        if continuation is None:
-            return owner, None
         attempt_id = Path(source).parent.name
-        action = (getattr(owner, 'resume_after_budget', continuation) if resume else continuation)(
-            observed, attempt_id)
+        action = None
+        if continuation is not None:
+            action = (getattr(owner, 'resume_after_budget', continuation) if resume else continuation)(
+                observed, attempt_id)
         if action is None and consume_outcome:
-            proposals = [consumer(observed, source)
-                for other in self._domain_gateways.values() if other is not owner
-                and (consumer := getattr(other, 'consume_outcome', None)) is not None]
-            proposals = [proposal for proposal in proposals if proposal is not None]
+            proposals = []
+            seen = {id(owner)}
+            for other in self._domain_gateways.values():
+                if id(other) in seen:
+                    continue
+                seen.add(id(other))
+                consumer = getattr(other, 'consume_outcome', None)
+                # Consumers prove their own evidence and authority. Registration
+                # alone grants neither adoption nor permission to execute.
+                if consumer is not None and (proposal := consumer(observed, source)) is not None:
+                    proposals.append((other, proposal))
             if len(proposals) > 1:
                 return owner, None  # No unique handoff: retain the outcome for coordination.
-            action = next(iter(proposals), None)
+            if proposals:
+                return proposals[0]
         fallback = getattr(owner, 'stop_after_review', None)
         if action is None and fallback is not None:
             action = fallback(observed, attempt_id)

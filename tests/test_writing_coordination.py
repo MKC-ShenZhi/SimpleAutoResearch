@@ -296,6 +296,22 @@ class ProducerDeclarationReviewTests(unittest.TestCase):
 
 
 class WritingCoordinationTests(unittest.TestCase):
+    @staticmethod
+    def _record_native_result(root, identity, result):
+        from simple_ar.core.capabilities import AttemptManifest, CapabilityResult
+        store = ArtifactStore(root / 'attempts' / identity)
+        ref = store.write_json('native_result.json', result.model_dump(mode='json'), kind='native_observation')
+        store.write_attempt_manifest(AttemptManifest(attempt_id=identity, capability='native_tool',
+            status='completed', outputs=(ref,)))
+        store.write_capability_result(CapabilityResult(status='completed', artifacts=(ref,)))
+        session = ArtifactStore(root)
+        saved = session.read_json('session_manifest.json') if session.exists('session_manifest.json') else {
+            'session_id': 'task', 'budget': {'recorded_attempts': []}}
+        if identity not in saved['budget']['recorded_attempts']:
+            saved['budget']['recorded_attempts'].append(identity)
+        session.write_json('session_manifest.json', saved)
+        return store
+
     def _real_workspace(self):
         root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         ledger = BudgetLedger({}, storage_path=root / 'ledger.json')
@@ -382,6 +398,7 @@ class WritingCoordinationTests(unittest.TestCase):
 
     def test_document_work_selects_title_packages_real_materials_and_finishes_via_export(self):
         root, workspace, writing, source, script, table, client, prompts = self._document_work_fixture()
+        writing.document_source_contract = 'document_source.v1'
         # Roles are professional choices, not a PNG/PDF filename convention.
         body, attachment, legacy = source / 'a.png', source / 'b.pdf', source / 'c.svg'
         body.write_bytes(b'\x89PNG\r\n\x1a\nfixture image bytes')
@@ -410,6 +427,10 @@ class WritingCoordinationTests(unittest.TestCase):
         self.assertEqual(result.status, 'ok', result)
         owner = ArtifactStore(root / 'tools/writing/document-unit')
         binding = owner.read_json('request.json')
+        self.assertEqual(binding['work_source']['contract'], 'document_source.v1')
+        self.assertEqual(binding['work_source']['access_roots'], [str(source)])
+        self.assertNotIn('materials', binding['work_source']['intent'])
+        self.assertEqual(owner.read_json('selection-input.json')['work_source'], binding['work_source'])
         self.assertEqual(binding['request']['title'], 'Recorded value and scope')
         self.assertEqual(owner.read_json('selection-input.json')['document_work'], 'document_work.v2')
         self.assertEqual(owner.read_json('selection-input.json')['figure_selection_contract'], 'compose_figure.v1')
@@ -989,16 +1010,16 @@ class WritingCoordinationTests(unittest.TestCase):
         request = ComposeRequest.model_validate(correction)
         current = app._report_inputs()
         prior_directory = str(Path(prior.data['editable_markdown']).parent)
-        self.assertIsNotNone(app.writing._prose_review_revision(request.model_copy(
+        self.assertIsNotNone(app.writing._document_revision_feedback(request.model_copy(
             update={'material_roots': [prior_directory]}), current))
-        self.assertIsNotNone(app.writing._prose_review_revision(request.model_copy(
+        self.assertIsNotNone(app.writing._document_revision_feedback(request.model_copy(
             update={'material_roots': [*request.material_roots, prior_directory]}), current))
         extra = app.session.store.root / 'workspace' / 'new-material'
         extra.mkdir()
-        self.assertIsNone(app.writing._prose_review_revision(request.model_copy(
+        self.assertIsNone(app.writing._document_revision_feedback(request.model_copy(
             update={'material_roots': [str(extra)]}), current))
         with patch.object(app.writing, '_inspection_interrupted', return_value=True):
-            self.assertIsNone(app.writing._prose_review_revision(request, current))
+            self.assertIsNone(app.writing._document_revision_feedback(request, current))
             self.assertFalse(app.writing.can_return_gap(prior.model_dump(mode='json'), 'whole-unit-editorial'))
         self.assertTrue(app.writing._inspection_interrupted({'unresolved': [
             {'type': 'document_revision_unavailable'}]}))
@@ -1017,18 +1038,18 @@ class WritingCoordinationTests(unittest.TestCase):
             'declaration_adoption': {'contract': CLAIM_ADOPTION_V2}}}
         with patch.object(app.writing, 'final_review', return_value=disclosure), patch(
                 'simple_ar.tools.implementation_work._independent_delivery_review'):
-            self.assertIsNotNone(app.writing._prose_review_revision(request, current))
+            self.assertIsNotNone(app.writing._document_revision_feedback(request, current))
             for field in ('defects', 'uninspected'):
                 with self.subTest(blocking_attachment=field):
                     disclosure['delivery_review'][field] = [{'path': 'fixture'}]
-                    self.assertIsNone(app.writing._prose_review_revision(request, current))
+                    self.assertIsNone(app.writing._document_revision_feedback(request, current))
                     disclosure['delivery_review'][field] = []
-        self.assertIsNone(app.writing._prose_review_revision(request,
+        self.assertIsNone(app.writing._document_revision_feedback(request,
             {**current, 'requests': [*current['requests'], 'Include additional original material']}))
         with patch.object(app.writing, 'final_review', return_value={
                 'review_status': 'needs_revision', 'delivery_review': {'status': 'reviewed'},
                 'section_reviews': [{'findings': [{'type': 'evidence_gap', 'required_action': 'verify'}]}]}):
-            self.assertIsNone(app.writing._prose_review_revision(request, current))
+            self.assertIsNone(app.writing._document_revision_feedback(request, current))
         calls = app.writing.client_factory.return_value.ask_json.call_count
         revised = app.writing.call('compose_document', correction, identity='whole-unit-editorial-fixed')
         self.assertEqual(revised.status, 'ok', revised)
@@ -1281,6 +1302,221 @@ class WritingCoordinationTests(unittest.TestCase):
             for row in binding['document_work']['materials']))
         self.assertEqual({path: workspace.resolve(path).read_bytes() for path in original}, original)
         self.assertIsNotNone(writing.continuation(revised.model_dump(mode='json'), 'document-feedback'))
+        # Replay the sparse 0044-style recipe through either public locator.
+        # All producer/evidence proofs read the real saved fixture; no Writer
+        # or selection call is permitted during resolution.
+        self._record_native_result(root, 'document-feedback', revised)
+        writing.document_source_contract = 'document_source.v1'
+        parent = ArtifactStore(root / 'tools/writing/document-feedback')
+        self.assertNotIn('material_roots', parent.read_json('request.json')['request'])
+        frozen = {path: path.read_bytes() for path in (root / 'tools/writing').rglob('*') if path.is_file()}
+        with patch.object(client, 'ask_json', side_effect=AssertionError('No model during source replay')):
+            resolutions = []
+            admissions = {}
+            for key, value in (('prior_result', 'records/document-feedback/native_result.json'),
+                    ('prior_draft', revised.data['editable_markdown'])):
+                intent = {'goal': 'Clarify this same evidence again', key: value}
+                admission = writing._admit_document_source(ArtifactStore(root / 'tools/writing' / key),
+                    intent, None, None, None)
+                admissions[key] = admission
+                resolved = writing._resolve_document_inputs(ComposeRequest.model_validate(intent), key,
+                    report=None, original=None, selection=None, document_work=True,
+                    caller_fields=frozenset(intent), work_source=admission, normalize_arguments=None)
+                self.assertEqual(resolved.recipe.prior_result, '')
+                self.assertEqual(resolved.recipe.prior_draft, revised.data['editable_markdown'])
+                self.assertEqual(writing._document_access_roots(parent, resolved.binding), [str(source)])
+                resolutions.append(resolved)
+            self.assertEqual(resolutions[0].recipe, resolutions[1].recipe)
+            extra = root / 'new-material'
+            extra.mkdir()
+            workspace.mounts['new_material'] = extra
+            intent = {'goal': 'Investigate this changed scope',
+                'prior_draft': revised.data['editable_markdown'], 'material_roots': [str(extra)]}
+            admission = writing._admit_document_source(ArtifactStore(root / 'tools/writing/new-scope'),
+                intent, None, None, None)
+            changed = writing._resolve_document_inputs(ComposeRequest.model_validate(intent), 'new-scope',
+                report=None, original=None, selection=None, document_work=True,
+                caller_fields=frozenset(intent), work_source=admission, normalize_arguments=None)
+            self.assertIsNone(changed.binding)
+            self.assertFalse(changed.recipe.reuse_prior_inputs)
+            self.assertEqual(changed.recipe.material_roots, [str(extra)])
+            self.assertEqual(changed.recipe.materials, [])
+            self.assertEqual({path: path.read_bytes() for path in frozen}, frozen)
+
+    def test_sparse_document_recipe_recovers_scope_only_from_hash_bound_parent(self):
+        root, _, writing, source, _, _, client, _ = self._document_work_fixture()
+        original = ArtifactStore(root / 'tools/writing/native-tool-0039')
+        original.write_json('request.json', {'request': {'material_roots': [str(source)]}})
+        sparse = ArtifactStore(root / 'tools/writing/native-tool-0044')
+        binding = {'request': {'reuse_prior_inputs': True},
+            'revision_feedback': {'contract': 'prior_prose_review.v1'},
+            'prior_input_reuse': {'owner': 'native-tool-0039', 'receipt_sha256': {
+                'request.json': hashlib.sha256(original.resolve('request.json').read_bytes()).hexdigest()}}}
+        sparse.write_json('request.json', binding)
+        before = {path: path.read_bytes() for path in (original.resolve('request.json'), sparse.resolve('request.json'))}
+        with patch.object(client, 'ask_json', side_effect=AssertionError('Source proof must not call a model')):
+            self.assertEqual(writing._document_access_roots(sparse, binding), [str(source)])
+            self.assertIsNone(writing._document_access_roots(sparse, {'request': {}}))
+            self.assertEqual({path: path.read_bytes() for path in before}, before)
+            original.write_json('request.json', {'request': {'material_roots': [str(root)]}})
+            with self.assertRaisesRegex(ValueError, 'scope.*changed'):
+                writing._document_access_roots(sparse, binding)
+        writing.client_factory.assert_not_called()
+
+    def test_noncode_source_gap_investigates_with_bound_feedback_and_work_context(self):
+        root, workspace, writing, source, _, table, client, prompts = self._document_work_fixture()
+        writing.document_source_contract = 'document_source.v1'
+        writing.work_context = Mock(return_value={'user_requests': ['Explain the interview record and its consent scope.']})
+        original_answer = client.ask_json.side_effect
+        supplement = False
+        policy = source / 'consent.txt'
+        policy.write_text('Consent permits reuse of anonymized interview excerpts for this report.', encoding='utf-8')
+
+        def answer(system, prompt, **options):
+            view = json.loads(prompt)
+            if options['label'].startswith('composition-selection'):
+                prompts.append((options['label'], view))
+                self.assertIn('work_context', view)
+                if supplement:
+                    self.assertEqual(view['source_feedback']['review']['review_status'], 'needs_revision')
+                paths = [table, policy] if supplement else [table]
+                observed = {row['request']['path'] for row in view['observations']}
+                missing = [path for path in paths if str(path) not in observed]
+                if missing:
+                    return {'read_windows': [{'path': str(path)} for path in missing]}
+                return {'title': 'Interview record and consent scope', 'materials': [str(path) for path in paths],
+                    'delivery_artifacts': []}
+            if options['label'] == 'article-independent-review' and not supplement:
+                prompts.append((options['label'], view))
+                return {'section_reviews': [{'section_id': 'document', 'verdict': 'revise_required',
+                    'findings': [{'finding_id': 'consent', 'type': 'evidence_gap', 'severity': 'major',
+                        'required_action': 'verify', 'message': 'Find the supplied consent policy before asserting reuse permission.',
+                        'draft_quotes': [{'section_id': 'document', 'quote': view['sections'][0]['markdown']}],
+                        'evidence_quotes': [{'pointer': '/objective'}]}]}]}
+            if options['label'] == 'composition-article' and supplement:
+                self.assertEqual(view['source_feedback']['review']['review_status'], 'needs_revision')
+                self.assertTrue(view['prior_draft'])
+                prompts.append((options['label'], view))
+                return {'prior_draft_sha256': view['edit_contract']['prior_draft_sha256'],
+                    'replacements': [{'old_text': view['prior_draft'], 'new_text':
+                        '## Results\n\nThe record value is 2.5. Consent permits anonymized excerpt reuse for this report.'}]}
+            return original_answer(system, prompt, **options)
+
+        client.ask_json.side_effect = answer
+        prior = writing.call('compose_document', {'goal': 'Explain the interview record',
+            'material_roots': [str(source)], 'professional_review': {'max_revision_rounds': 0}}, identity='source-negative')
+        self.assertEqual(prior.status, 'ok', prior)
+        self.assertEqual(writing.final_review(prior.data)['review_status'], 'needs_revision')
+        self._record_native_result(root, 'source-negative', prior)
+        frozen = {path: path.read_bytes() for path in (root / 'tools/writing/source-negative').rglob('*') if path.is_file()}
+        intent = {'goal': 'Complete the consent evidence within the same supplied materials',
+            'prior_result': 'records/source-negative/native_result.json'}
+        with patch.object(client, 'ask_json', side_effect=AssertionError('Source routing must be model free')):
+            admission = writing._admit_document_source(ArtifactStore(root / 'tools/writing/source-routing'),
+                intent, None, None, None)
+            resolved = writing._resolve_document_inputs(ComposeRequest.model_validate(intent), 'source-routing',
+                report=None, original=None, selection=None, document_work=True,
+                caller_fields=frozenset(intent), work_source=admission, normalize_arguments=None)
+        self.assertFalse(resolved.recipe.reuse_prior_inputs)
+        self.assertEqual(resolved.recipe.prior_draft, prior.data['editable_markdown'])
+        self.assertEqual(resolved.recipe.material_roots, [str(source)])
+        self.assertIsNotNone(resolved.investigation)
+        supplement = True
+        start = len(prompts)
+        result = writing.call('compose_document', intent, identity='source-supplemented')
+        self.assertEqual(result.status, 'ok', result)
+        self.assertTrue(any(label.startswith('composition-selection') for label, _ in prompts[start:]))
+        self.assertEqual(writing.final_review(result.data)['review_status'], 'reviewed')
+        self.assertEqual({path: path.read_bytes() for path in frozen}, frozen)
+        owner = ArtifactStore(root / 'tools/writing/source-supplemented')
+        self.assertEqual(owner.read_json('request.json')['work_source']['diagnosis'], resolved.investigation)
+        self.assertIn(str(policy), {row['path'] for row in owner.read_json('request.json')['request']['materials']})
+        calls = client.ask_json.call_count
+        with patch.object(client, 'ask_json', side_effect=AssertionError('No replayed model work')):
+            replay = writing.call('compose_document', intent, identity='source-supplemented')
+        self.assertEqual(replay.model_dump(mode='json'), result.model_dump(mode='json'))
+        self.assertEqual(client.ask_json.call_count, calls)
+
+    def test_attachment_gap_reaches_actual_producer_consumer_without_rewriting(self):
+        from types import SimpleNamespace
+        from tests.test_professional_work_loop import ProfessionalWorkLoopTests
+        fixture = ProfessionalWorkLoopTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        fixture.responses = [fixture._proposal("from pathlib import Path\nPath('result.txt').write_text('20')\n")]
+        app = fixture._create()
+        fixture._run(app, actions=[fixture._prepare()])
+        _, token = fixture._pending_execution(app)
+        fixture._run(app, approved_execution=token)
+        prepared = fixture._observations(app)[0]
+        candidate = Path(prepared['data']['project_dir'])
+        output = candidate / 'result.txt'
+
+        def answer(system, prompt, **options):
+            view = json.loads(prompt)
+            if options['label'].startswith('composition-selection'):
+                if not view['observations']:
+                    return {'read_windows': [{'path': str(output)}]}
+                return {'title': 'Recorded output check', 'materials': [str(output)],
+                    'delivery_artifacts': [str(output)]}
+            if options['label'] == 'composition-article':
+                return {'draft_markdown': '## Results\n\nThe supplied calculation saved 20.'}
+            self.assertEqual(options['label'], 'article-independent-review')
+            subjects = view['delivery_artifacts']
+            index = next(i for i, row in enumerate(subjects) if row['path'] == str(output))
+            return {'section_reviews': [{'section_id': 'document', 'verdict': 'revise_required',
+                'findings': [{'finding_id': 'wrong-total', 'type': 'consistency', 'severity': 'major',
+                    'required_action': 'revise', 'message': 'sum(range(7)) is 21; the producer saved 20.',
+                    'delivery_targets': [f'/delivery_artifacts/{index}/text'],
+                    'evidence_quotes': [{'pointer': f'/delivery_artifacts/{index}/text'}]}]}]}
+
+        client = SimpleNamespace(ask_json=Mock(side_effect=answer))
+        app.writing.client_factory = Mock(return_value=client)
+        prior = app.writing.call('compose_document', {'goal': 'Check the saved sum',
+            'material_roots': [str(candidate)]}, identity='producer-negative')
+        self.assertEqual(prior.status, 'ok', prior)
+        self.assertTrue(prior.data['delivery_review']['defects'])
+        self._record_native_result(fixture.root, 'producer-negative', prior)
+        ledger = app.ledger.to_dict()
+        processes = fixture._process_receipts()
+        app.writing.document_source_contract = 'document_source.v1'
+        with patch.object(client, 'ask_json', side_effect=AssertionError('Do not rewrite a producer defect')):
+            gap = app.writing.call('compose_document', {'goal': 'Resolve the failed output check',
+                'prior_result': 'records/producer-negative/native_result.json'}, identity='producer-gap')
+            self.assertEqual(gap.status, 'error', gap)
+            self.assertEqual(gap.data['owner_stop_reason'], 'producer_repair_required')
+            self._record_native_result(fixture.root, 'producer-gap', gap)
+            action = app.implementation.consume_outcome(gap.model_dump(mode='json'),
+                'attempts/producer-gap/native_result.json')
+        self.assertEqual(action['tool_name'], 'prepare_implementation', action)
+        self.assertEqual(action['arguments']['repair_review'], 'records/producer-negative/native_result.json')
+        self.assertEqual(app.ledger.to_dict(), ledger)
+        self.assertEqual(fixture._process_receipts(), processes)
+        self.assertFalse((fixture.root / 'tools/writing/producer-gap/request.json').exists())
+        origin = fixture.root / 'tools/writing/producer-negative/result.json'
+        original = origin.read_bytes()
+        origin.write_bytes(original + b'\n')
+        self.assertIsNone(app.implementation.consume_outcome(gap.model_dump(mode='json'),
+            'attempts/producer-gap/native_result.json'))
+
+    def test_admitted_source_failure_retains_owner_before_resolved_request_exists(self):
+        root, _, writing, _, _, _, client, _ = self._document_work_fixture()
+        writing.document_source_contract = 'document_source.v1'
+        arguments = {'goal': 'Continue the saved document', 'prior_result': 'records/missing/native_result.json'}
+        with patch.object(client, 'ask_json', side_effect=AssertionError('No model before source proof')):
+            result = writing.call('compose_document', arguments, identity='source-failed')
+        self.assertEqual(result.status, 'error')
+        self.assertEqual(result.data['owner_stop_reason'], 'owner_state_unresolved')
+        owner = ArtifactStore(root / 'tools/writing/source-failed')
+        self.assertFalse(owner.exists('request.json'))
+        self.assertEqual(owner.read_json('selection-input.json')['work_source']['intent']['prior_result'],
+            arguments['prior_result'])
+        native = self._record_native_result(root, 'source-failed', result)
+        stop = writing.stop_after_review(result.model_dump(mode='json'), 'source-failed')['stop']
+        self.assertEqual(stop['reason'], 'owner_state_unresolved')
+        self.assertEqual(stop['source_sha256'], hashlib.sha256(native.resolve('native_result.json').read_bytes()).hexdigest())
+        self.assertNotIn('new correction', result.data['next_action'])
+        writing.client_factory.assert_not_called()
 
     def test_document_work_continues_failed_article_author_without_selection_or_redrafting(self):
         for stage in ('initial', 'revision', 'revision_checkpoint_lag', 'revision_negative'):
@@ -1360,17 +1596,31 @@ class WritingCoordinationTests(unittest.TestCase):
             event.update(drafts=[], status='started', adopted=False)
             checkpoint['iterations'] = [event]
             old.resolve('writer/review/checkpoint.json').write_text(json.dumps(checkpoint), encoding='utf-8')
-        native = ArtifactStore(root / 'attempts/article-stopped')
-        native.write_json('native_result.json', failed.model_dump(mode='json'))
+        native = self._record_native_result(root, 'article-stopped', failed)
         observed = failed.model_dump(mode='json')
         before_proof = {p: p.read_bytes() for folder in (old.root, native.root, source)
             for p in folder.rglob('*') if p.is_file()}
         before_calls = client.ask_json.call_count
         before_factories = writing.client_factory.call_count
-        # Only native registration is stubbed; all owner, author, source,
-        # manuscript and inspection proofs below consume the real fixtures.
-        registration = 'simple_ar.tools.implementation.ImplementationToolGateway._registered_ref'
-        with patch(registration, return_value=native.ref('native_result.json', kind='native_observation')):
+        writing.document_source_contract = 'document_source.v1'
+        with patch.object(client, 'ask_json', side_effect=AssertionError('No model during candidate resolution')):
+            candidates = []
+            for key, value in (('prior_result', 'records/article-stopped/native_result.json'),
+                    ('prior_draft', 'workspace/manuscripts/article-stopped/manuscript.md')):
+                intent = {key: value}
+                admission = writing._admit_document_source(ArtifactStore(root / 'tools/writing' / key),
+                    intent, None, None, writing.report_inputs())
+                request = ComposeRequest.model_validate({**intent, 'goal': old.read_json('request.json')['request']['goal']})
+                resolved = writing._resolve_document_inputs(request, key, report=writing.report_inputs(),
+                    original=None, selection=None, document_work=True, caller_fields=frozenset(intent),
+                    work_source=admission, normalize_arguments=None)
+                self.assertEqual(resolved.linkage['candidate_contract'], 'retained_article_author.v1')
+                candidates.append(resolved.candidate)
+            self.assertEqual(candidates[0], candidates[1])
+        writing.document_source_contract = None
+        # All native registration, owner, author and input proofs consume the
+        # saved fixtures; no provider is needed for this eligibility replay.
+        with self.subTest(proof='registered native article'):
             self.assertTrue(writing.can_resume_after_budget(observed, 'article-stopped'))
             self.assertIsNone(writing.resume_after_budget({**observed, 'summary': 'changed'}, 'article-stopped'))
             if stage != 'initial':
@@ -1378,7 +1628,7 @@ class WritingCoordinationTests(unittest.TestCase):
                 for resource in ('llm_requests', 'total_tokens'):
                     writing.ledger.limits[resource] = 0
                     before = writing.ledger.to_dict()
-                    with patch('simple_ar.tools.implementation_work.stop_decision',
+                    with patch('simple_ar.tools.writing.stop_decision',
                             side_effect=lambda owner, observation, identity, reason, detail: {'reason': reason}):
                         self.assertEqual(writing.stop_after_review(observed, 'article-stopped'),
                             {'reason': 'shared_budget_exhausted'})
@@ -1447,7 +1697,7 @@ class WritingCoordinationTests(unittest.TestCase):
         tampered = old.read_json('writer/writer.json')
         tampered['sections'][0]['draft_markdown'] = 'Invented replacement author'
         path.write_text(json.dumps(tampered), encoding='utf-8')
-        with patch(registration, return_value=native.ref('native_result.json', kind='native_observation')):
+        with self.subTest(proof='tampered author'):
             self.assertFalse(writing.can_resume_after_budget(observed, 'article-stopped'))
             self.assertIsNone(writing.resume_after_budget(observed, 'article-stopped'))
         rejected = writing.call('compose_document', arguments, identity='article-tampered')
@@ -1490,6 +1740,34 @@ class WritingCoordinationTests(unittest.TestCase):
             replay = writing.call('compose_document', action['arguments'] if stage != 'initial' else arguments,
                 identity='article-continued')
         self.assertEqual(replay.model_dump(mode='json'), accepted.model_dump(mode='json'))
+
+        # A new work order decides from the saved inspection, not from which
+        # public locator happened to be chosen. Completed negative checks may
+        # seed revision, never another check-only adoption.
+        self._record_native_result(root, 'article-continued', accepted)
+        writing.document_source_contract = 'document_source.v1'
+        with patch.object(client, 'ask_json', side_effect=AssertionError('No model during completed source replay')):
+            intent = {'prior_result': 'records/article-continued/native_result.json'}
+            admission = writing._admit_document_source(ArtifactStore(root / 'tools/writing/after-completion'),
+                intent, None, None, writing.report_inputs())
+            resolved = writing._resolve_document_inputs(ComposeRequest.model_validate({**intent,
+                'goal': binding['request']['goal']}), 'after-completion', report=writing.report_inputs(),
+                original=None, selection=None, document_work=True, caller_fields=frozenset(intent),
+                work_source=admission, normalize_arguments=None)
+            if stage == 'revision_negative':
+                self.assertIsNone(resolved.candidate)
+                self.assertTrue(resolved.recipe.reuse_prior_inputs)
+            else:
+                self.assertIsNotNone(resolved.candidate)
+                self.assertEqual(resolved.linkage['candidate_contract'], 'retained_article_author.v1')
+            feedback_report = {**writing.report_inputs(),
+                'requests': [*writing.report_inputs()['requests'], 'Clarify the saved explanation; keep the evidence.']}
+            feedback = writing._resolve_document_inputs(ComposeRequest.model_validate({**intent,
+                'goal': binding['request']['goal']}), 'after-feedback', report=feedback_report,
+                original=None, selection=None, document_work=True, caller_fields=frozenset(intent),
+                work_source=admission, normalize_arguments=None)
+            self.assertIsNone(feedback.candidate)
+            self.assertTrue(feedback.recipe.reuse_prior_inputs)
 
     def test_document_work_continues_failed_section_candidate_before_any_redraft(self):
         from simple_ar.tools.writing import freeze_report_requirement, material_report_binding
@@ -1722,7 +2000,7 @@ class WritingCoordinationTests(unittest.TestCase):
         self.assertTrue(writing.can_return_gap(first.model_dump(mode='json'), 'copy-defect-first'))
         # Stop disposition uses the retained review as well as presentation;
         # only the parent native-observation registration boundary is stubbed.
-        with patch('simple_ar.tools.implementation_work.stop_decision',
+        with patch('simple_ar.tools.writing.stop_decision',
                 side_effect=lambda owner, observation, identity, reason, detail: {'reason': reason}):
             self.assertEqual(writing.stop_after_review(first.model_dump(mode='json'),
                 'copy-defect-first'), {'reason': 'work_gap'})

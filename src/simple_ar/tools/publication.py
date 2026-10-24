@@ -72,6 +72,7 @@ class ExportRequest(BaseModel):
 
 def publication_tool_specs() -> list[CommonToolSpec]:
     return [CommonToolSpec(name="export_report", domain="publication", permission_level="execution",
+        completion={'field': 'delivery', 'closing': True},
         risk_level="medium", input_schema=ExportRequest.model_json_schema(),
         description="Convert canonical workspace Markdown, bibliography and local figures into an editable TeX project using an explicit trusted Pandoc LaTeX template bundle, or ACM by default. Template bytes and companions share existing approval/recovery bindings. No official template discovery, scripts or shell escape; trusted TeX is not sandboxed. Optional finite user-declared checks use Poppler through the same process ledger: all-page count and exact literals in UTF-8 extracted text, separately reported. Literal absence never certifies anonymity; images, metadata and indirect identity are uncovered. Rendering is not scientific, visual or official compliance review. Optional delivery requires every requested check and preview to pass; failure retains the project without revision or recompilation.")]
 

@@ -45,6 +45,11 @@ class ToolRegistry:
             raise ValueError(f"Tool already registered: {spec.name}")
         self._specs[spec.name] = spec
 
+    def completions(self) -> dict[str, dict]:
+        """Freeze actual terminal contracts without a domain-name allowlist."""
+        return {spec.name: spec.completion.model_dump(mode='json')
+            for spec in self.list_specs() if spec.completion is not None}
+
     def register_many(self, specs: Iterable[CommonToolSpec], *, replace: bool = False) -> None:
         for spec in specs:
             self.register(spec, replace=replace)

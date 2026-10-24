@@ -19,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from simple_ar.core.artifacts import read_json, replace_exact_spans
 from simple_ar.core.budget import BudgetError, BudgetLedger
 from simple_ar.core.process import ProcessSpec, process_observation, run_process, settle_process_record
-from simple_ar.tools.specs import CommonToolSpec, ToolResult
+from simple_ar.tools.specs import CommonToolSpec, ToolResult, tool_completion
 
 
 _COPY_MAX_BYTES = 64 * 1024 * 1024
@@ -271,7 +271,10 @@ def workspace_tool_specs() -> list[CommonToolSpec]:
             schema["required"].append("replacements")
         specs.append(CommonToolSpec(name=name, description=description, input_schema=schema,
             permission_level=permission, risk_level="high" if permission == "execution" else "low",
-            domain="workspace"))
+            domain="workspace", completion=(
+                {'kind': 'question', 'closing': True} if name == 'ask_user' else
+                {'closing': True} if name == 'deliver_result' else
+                {'field': 'delivery', 'closing': True} if name in {'write_file', 'run_process'} else None)))
     return specs
 
 
@@ -452,9 +455,9 @@ class RetainedDelivery:
             raise ValueError('Current delivery has no matching terminal observation')
         name = calls[-1]['function']['name']
         data = terminal.get('data') or {}
-        bound = data if name == 'deliver_result' else (data.get('delivery') if name in {
-            'write_file', 'export_report', 'run_process', 'execute_implementation',
-            'review_document', 'measure_experiment', 'analyze_measurements'} else None)
+        completion = tool_completion(name, state['config'].get('tool_completions'))
+        bound = (data.get(completion.field) if completion.field else data
+            ) if completion is not None and completion.kind == 'delivery' else None
         if bound is None or DeliveryRequest.model_validate(bound) != delivery:
             raise ValueError('Saved delivery differs from its terminal observation')
         pinned = terminal.get('metadata', {}).get('delivery_hashes')

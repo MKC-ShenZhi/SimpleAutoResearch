@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import os
@@ -18,6 +18,7 @@ from simple_ar.tools.workspace import DeliveryRequest, FileWindow
 from simple_ar.tools.sources import SourceToolGateway
 from simple_ar.tools.materials import material_inventories, inspect_materials, selected_material_windows, window_key
 from simple_ar.tools.publication import ExportRequest
+from simple_ar.tools.professional_outcomes import accepted_native_result, stop_decision
 
 
 BOUND_REPORT_REVISION = (
@@ -311,6 +312,28 @@ class ReviewRequest(ComposeRequest):
             raise ValueError('publication requires compose_document, not independent inspection')
         return self
 
+
+@dataclass
+class _DocumentInputs:
+    """Resolved owner inputs, never an externally admissible work request."""
+    recipe: ComposeRequest
+    binding: dict | None = None
+    linkage: dict | None = None
+    candidate: dict | None = None
+    feedback: dict | None = None
+    investigation: dict | None = None
+
+
+class _DocumentSourceGap(ValueError):
+    """An existing producer diagnosis cannot be repaired by rewriting prose."""
+    def __init__(self, source_result: str, review: dict, *, producer: bool) -> None:
+        super().__init__(('The original producer must resolve its bound attachment diagnosis at '
+            if producer else 'The supplied attachment requires corrected bytes or complete inspection at ')
+            + source_result + ' before prose work; no new composition was performed')
+        self.source_result, self.review = source_result, review
+        self.reason = 'producer_repair_required' if producer else 'attachment_evidence_unresolved'
+
+
 class _AssemblyStore(ArtifactStore):
     """Reconcile deterministic writes in the existing assembly owner."""
 
@@ -339,6 +362,7 @@ def writing_tool_specs() -> list[CommonToolSpec]:
         risk_level="medium", input_schema=ComposeRequest.model_json_schema(),
         description="Draft or rewrite an article from retained source questions/chunk IDs and/or local materials. Provide material_roots to delegate source/passage, file and figure selection, including the task evidence directory, or supply explicit inputs. Declared original bundles retain their provenance rather than becoming anonymous local text. Selection and writing share the task budget and existing inventory/Writer/assembly owners; native tasks use the configured writing connection when present, otherwise their task connection. A frozen report requirement executes its saved article/section method, adaptive planning and review/revision controls in this attempt. Execution reports automatically supply actual accepted execution evidence. Material reports can automatically select from bound mounted files and accepted source/table artifacts when explicit evidence selection is omitted. Unbound articles can explicitly request professional_review for independent inspection and bounded correction through the existing article owner. No network or execution. Reuse figures and a prior draft when relevant. Produces editable manuscript.md, references and local figure assets; export this same manuscript. Selection is bounded, not exhaustive reading; supplied results and figures are not independently verified."),
         CommonToolSpec(name="review_document", domain="writing", permission_level="write_patch",
+            completion={'field': 'delivery'},
             risk_level="medium", input_schema=ReviewRequest.model_json_schema(),
             description="Independently inspect an existing prior_draft against the goal and retained source/material evidence using the existing document reviewer. Shares composition's evidence selection, version binding and model budget, but never drafts or rewrites the manuscript. Saves review.json with concrete findings, evidence/draft quotes and review_status; needs_revision is not an accepted correction. No search, execution, automatic correction or visual inspection; use inspect_images for rendered figures. Complete responses recover without another call; unknown/rejected responses are not resent.")]
     for spec in specs:
@@ -367,6 +391,8 @@ class WritingToolGateway:
         self.material_observations = material_observations
         self.professional_inputs = False
         self.document_work = False
+        # Set from the task's saved admission version, not from receipt age.
+        self.document_source_contract: str | None = None
         self.joint_delivery = joint_delivery
         self.declaration_adoption_contract = None
         self.producer_completion = None
@@ -393,6 +419,299 @@ class WritingToolGateway:
                     if figure.placement == 'attachment' else figure.path)
             values['figures'] = [figure_role(row) for row in arguments.get('figures', [])]
         return values
+
+    def _admit_document_source(self, owner: ArtifactStore, arguments: dict,
+                               binding: dict | None, selection: dict | None,
+                               report: dict | None) -> dict | None:
+        """One version gate; retain intent before attempting internal resolution.
+
+        The admission shares the existing selection receipt. Investigation later
+        fills that receipt; it is not a second work queue or recovery state.
+        Saved recipes and selections without this field keep their old identity.
+        """
+        saved = binding if binding is not None else selection
+        source = saved.get('work_source') if saved is not None else None
+        if source is None:
+            if (saved is not None or self.document_source_contract is None
+                    or not set(arguments) <= DocumentWorkRequest.model_fields.keys()
+                    or (self.root / 'attempts' / owner.root.name / 'native_result.json').exists()):
+                return None
+            contract = self.document_source_contract
+        else:
+            contract = source['contract']
+        self._check_document_source_contract(contract)
+        intent = DocumentWorkRequest.model_validate(arguments).model_dump(mode='json')
+        if source is not None:
+            if source['intent'] != intent:
+                raise ValueError('Retained document work intent changed')
+            for path in [*(source['access_roots'] or []), *source['investigation_roots']]:
+                self.workspace.resolve_material_root(path)
+            return source
+        roots = intent['material_roots'] or (report or {}).get('selection_paths') or [
+            str(path) for name, path in self.workspace.mounts.items() if name not in {'workspace', 'records'}]
+        roots = [*roots, *(report or {}).get('selection_paths', [])]
+        roots = list(dict.fromkeys(str(self.workspace.resolve_material_root(path)) for path in roots))
+        source = {'contract': contract, 'intent': intent, 'investigation_roots': roots,
+            'access_roots': None if intent.get('prior_result') or intent['prior_draft'] else roots}
+        admission = {'document_work': _DOCUMENT_WORK_CONTRACT, 'work_source': source}
+        owner.write_json('selection-input.json', admission)
+        if self.work_context is not None:
+            from simple_ar.tools.materials import freeze_work_context
+            targets = [*roots, *([intent['prior_draft']] if intent['prior_draft'] else [])]
+            admission['work_context'] = freeze_work_context(self.work_context, list(dict.fromkeys(targets)))
+        owner.write_json('selection-input.json', admission)
+        return source
+
+    @staticmethod
+    def _check_document_source_contract(contract: str) -> None:
+        if contract != 'document_source.v1':
+            raise ValueError('Unknown document source admission contract')
+
+    def _document_investigation(self, request: ComposeRequest, work_source: dict,
+                                 parent: ArtifactStore, binding: dict, review: dict) -> _DocumentInputs:
+        """Keep the diagnosed candidate as context while investigating current roots."""
+        data = parent.read_json('result.json')['data']
+        draft = data['editable_markdown']
+        diagnosis = {'owner': parent.root.name,
+            'receipt_sha256': {name: hashlib.sha256(parent.resolve(name).read_bytes()).hexdigest()
+                for name in ('request.json', 'result.json')},
+            'artifact_sha256': {draft: data['artifact_sha256'][draft]},
+            'review': review}
+        if data.get('review_path'):
+            path = data['review_path']
+            diagnosis['artifact_sha256'][path] = data['artifact_sha256'][path]
+        if self.workspace.artifact_hashes(diagnosis['artifact_sha256']) != diagnosis['artifact_sha256']:
+            raise ValueError('Document investigation candidate or negative diagnosis changed')
+        if 'diagnosis' in work_source and work_source['diagnosis'] != diagnosis:
+            raise ValueError('Retained document investigation diagnosis changed')
+        return _DocumentInputs(request.model_copy(update={'prior_result': '', 'prior_draft': draft,
+            'reuse_prior_inputs': False, 'material_roots': work_source['investigation_roots'],
+            'sources': [], 'materials': []}), investigation=diagnosis)
+
+    def _document_attachment_gap(self, binding: dict, review: dict) -> bool | None:
+        """Only actual attachment findings can name an actual producer owner.
+
+        None means no attachment defect; False means supplied defective bytes
+        without a proven task producer. General requests for more evidence never
+        become implementation repair authority through this classification.
+        """
+        defects = [row for row in review.get('delivery_review', {}).get('defects', [])
+            if row.get('type') == 'delivery_artifact_defect' and row.get('targets')
+            and row.get('finding', {}).get('delivery_targets')]
+        if not defects:
+            return None
+        subjects = {self.workspace.resolve(row['path']): row
+            for row in binding.get('delivery_review', {}).get('artifacts', [])}
+        producer = False
+        for defect in defects:
+            for target in defect.get('targets', []):
+                path = self.workspace.resolve(target['path'])
+                subject = subjects.get(path)
+                if subject is None or target['sha256'] != subject['sha256']:
+                    raise ValueError('Attachment diagnosis differs from its frozen subject')
+                if target.get('producer') is not None:
+                    actual = self.workspace.artifact_provenance([target['path']])[target['path']]
+                    if (actual['sha256'] != target['sha256']
+                            or not self._same_delivery_producer(actual['producer'], target['producer'])
+                            or not self._same_delivery_producer(subject['producer'], target['producer'])):
+                        raise ValueError('Attachment diagnosis has no unchanged actual producer')
+                    producer = True
+        return producer
+
+    def _document_access_roots(self, store: ArtifactStore, binding: dict,
+                               seen: frozenset[str] = frozenset()) -> list[str] | None:
+        """Recover scope from actual frozen provenance, never missing-field defaults."""
+        if store.root.name in seen:
+            raise ValueError('Cyclic document access scope lineage')
+        seen = seen | {store.root.name}
+        if 'work_source' in binding:
+            self._check_document_source_contract(binding['work_source']['contract'])
+            scope = binding['work_source']['access_roots']
+            return list(scope) if scope is not None else None
+        if 'material_roots' in binding['request']:
+            return list(binding['request']['material_roots'])
+        if store.exists('selection-input.json'):
+            selection = store.read_json('selection-input.json')
+            if 'work_source' in selection:
+                self._check_document_source_contract(selection['work_source']['contract'])
+                scope = selection['work_source']['access_roots']
+                return list(scope) if scope is not None else None
+            if 'material_roots' in selection['request']:
+                return list(selection['request']['material_roots'])
+        lineage = binding.get('prior_input_reuse')
+        if lineage is None:
+            return None  # Unknown scope is not unrestricted scope.
+        parent_id = lineage['owner']
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', parent_id):
+            raise ValueError('Invalid document access scope owner')
+        parent = ArtifactStore(self.root / 'tools/writing' / parent_id)
+        expected = lineage['receipt_sha256']
+        if 'request.json' not in expected:
+            raise ValueError('Document access scope has no bound parent request')
+        parent_binding = parent.read_json('request.json')
+        for name in ('request.json', 'selection-input.json'):
+            if (name == 'selection-input.json' and parent.exists(name) and name not in expected
+                    and 'material_roots' not in parent_binding['request'] and 'work_source' not in parent_binding):
+                raise ValueError('Document access scope selection is not hash bound')
+            if name in expected and hashlib.sha256(parent.resolve(name).read_bytes()).hexdigest() != expected[name]:
+                raise ValueError('Document access scope receipts changed')
+        return self._document_access_roots(parent, parent_binding, seen)
+
+    def _resolve_document_inputs(self, request: ComposeRequest, identity: str, *,
+                                 report: dict | None, original: dict | None,
+                                 selection: dict | None, document_work: bool,
+                                 caller_fields: frozenset[str], work_source: dict | None,
+                                 normalize_arguments: Callable[[dict], dict] | None) -> _DocumentInputs:
+        """Resolve a work source once; only the resulting recipe reaches Writer."""
+        result = _DocumentInputs(request)
+        if work_source is not None:
+            # Both caller locator forms identify one actual owner. They do not
+            # instruct the owner to select a different recovery algorithm.
+            parent_id = None
+            observed = None
+            if request.prior_result:
+                value = request.prior_result
+                path = self.workspace.resolve(str(self.root / value) if value.startswith('attempts/') else value)
+                relative = path.relative_to((self.root / 'attempts').resolve())
+                if len(relative.parts) != 2 or relative.name != 'native_result.json':
+                    raise ValueError('Document source requires a native composition receipt')
+                parent_id = relative.parts[0]
+                observed = json.loads(path.read_bytes())
+                accepted_native_result(self.root, self.session_id, observed, parent_id)
+                if observed.get('tool_name') != 'compose_document':
+                    raise ValueError('Document source is not a composition')
+            elif request.prior_draft:
+                path = self.workspace.resolve(request.prior_draft)
+                if path == self.workspace.resolve(f'workspace/manuscripts/{path.parent.name}/manuscript.md'):
+                    parent_id = path.parent.name
+            if parent_id is not None:
+                if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', parent_id) or parent_id == identity:
+                    raise ValueError('Document source requires a distinct same-task owner')
+                parent = ArtifactStore(self.root / 'tools/writing' / parent_id)
+                binding = parent.read_json('request.json')
+                scope = self._document_access_roots(parent, binding)
+                requested = {self.workspace.resolve_material_root(path) for path in request.material_roots}
+                admitted = ({self.workspace.resolve_material_root(path) for path in scope} if scope is not None else set())
+                admitted.add(self.workspace.resolve(f'workspace/manuscripts/{parent_id}'))
+                same_scope = (not requested or scope is not None and requested <= admitted)
+                previous_focus = binding.get('work_source', {}).get('intent', {}).get('material_roots')
+                if requested and previous_focus:
+                    same_scope = same_scope and requested == {
+                        self.workspace.resolve_material_root(path) for path in previous_focus}
+                previous_report = binding.get('report_binding')
+                # A new admitted feedback event can change prose/publication
+                # intent while retaining the exact evidence and Writer controls.
+                # Historical recovery still uses full binding equality below.
+                feedback_fields = {'requests', 'requests_sha256', 'request_count', 'obligation'}
+                same_controls = previous_report == report or (
+                    isinstance(previous_report, dict) and isinstance(report, dict) and
+                    {key: value for key, value in previous_report.items() if key not in feedback_fields} ==
+                    {key: value for key, value in report.items() if key not in feedback_fields})
+                draft = f'workspace/manuscripts/{parent_id}/manuscript.md'
+                if observed is None:
+                    native = ArtifactStore(self.root / 'attempts' / parent_id)
+                    if native.exists('native_result.json'):
+                        observed = native.read_json('native_result.json')
+                        accepted_native_result(self.root, self.session_id, observed, parent_id)
+                    else:
+                        # Canonical draft reuse retains the completed producer
+                        # proof used by exact callers, not a fabricated native result.
+                        _, _, data = self._composition_receipt(parent_id)
+                        observed = {'tool_name': 'compose_document', 'status': 'ok', 'data': data,
+                            'artifacts': parent.read_json('result.json')['artifacts']}
+                if observed.get('tool_name') != 'compose_document':
+                    raise ValueError('Document source native receipt belongs to another operation')
+                data = observed.get('data') or {}
+                interrupted = observed.get('status') != 'ok' or self._inspection_interrupted(data)
+                if observed.get('status') == 'ok':
+                    self._composition_receipt(parent_id, observed)
+                    review = self.final_review(data)
+                    if not same_scope or not same_controls:
+                        # Explicit new scope investigates current permitted
+                        # material. Existing defect history still follows any
+                        # unchanged attachment actually selected for delivery.
+                        return self._document_investigation(request, work_source, parent, binding, review)
+                    attachment = self._document_attachment_gap(binding, review)
+                    if attachment is not None:
+                        gap = _DocumentSourceGap(f'records/{parent_id}/native_result.json', review, producer=attachment)
+                        origin = self._document_investigation(request, work_source, parent, binding, review).investigation
+                        native = ArtifactStore(self.root / 'attempts' / parent_id)
+                        accepted = native.read_json('native_result.json')
+                        _, digest = accepted_native_result(self.root, self.session_id, accepted, parent_id)
+                        admission = ArtifactStore(self.root / 'tools/writing' / identity)
+                        gap.producer_diagnosis = {'contract': 'document_source_gap.v1',
+                            'source_result': gap.source_result, 'source_sha256': digest,
+                            'origin': origin, 'admission_sha256': hashlib.sha256(
+                                admission.resolve('selection-input.json').read_bytes()).hexdigest()}
+                        raise gap
+                    if self._review_needs_material_work(review):
+                        return self._document_investigation(request, work_source, parent, binding, review)
+                elif not same_scope or not same_controls:
+                    result.recipe = request.model_copy(update={'prior_result': '',
+                        'prior_draft': draft if self.workspace.resolve(draft).is_file() else '',
+                        'reuse_prior_inputs': False, 'material_roots': work_source['investigation_roots']})
+                    return result
+                method = (report or {}).get('requirement', {}).get('method')
+                if report is None and binding.get('writing_owner') == 'direct_article.v1':
+                    method = 'article'
+                original_goal = binding.get('work_source', {}).get('intent', {}).get('goal') or binding['request']['goal']
+                feedback_requested = work_source['intent']['goal'] not in {'', original_goal}
+                if isinstance(report, dict) and isinstance(previous_report, dict):
+                    feedback_requested = feedback_requested or report.get('requests') != previous_report.get('requests')
+                if interrupted or (method in {'article', 'sections'}
+                        and (self.root / 'attempts' / parent_id / 'native_result.json').exists() and not data.get('unresolved')
+                        and not feedback_requested):
+                    continued = request.model_copy(update={'prior_result': f'records/{parent_id}/native_result.json',
+                        'prior_draft': '', 'material_roots': [], 'reuse_prior_inputs': False})
+                    (result.recipe, result.binding, result.linkage, result.candidate) = self._continued_document_inputs(
+                        continued, identity, (report or {}).get('requirement'), allow_completed=not interrupted,
+                        allow_standalone=True)
+                    return result
+                _, _, retained = self._composition_receipt(parent_id)
+                review = self.final_review(retained)
+                request = request.model_copy(update={'prior_result': '', 'prior_draft': draft,
+                    'material_roots': [], 'reuse_prior_inputs': True})
+                result.feedback = self._document_revision_feedback(request, previous_report)
+        # Historical source resolution is an adapter: saved request and selection
+        # bytes are replayed without gaining the new admission or scope semantics.
+        if request.prior_result:
+            if not document_work:
+                raise ValueError('prior_result requires professional document-work ownership')
+            (result.recipe, result.binding, result.linkage, result.candidate) = self._continued_document_inputs(
+                request, identity, (report or {}).get('requirement'),
+                inspect_only=original is None or original.get('continued_source_review') == 'inspect_only.v1')
+            return result
+        feedback = original.get('revision_feedback') if original is not None else result.feedback
+        if feedback is not None:
+            if (feedback.get('contract') != 'prior_prose_review.v1'
+                    or (original is not None and work_source is None and request.material_roots != feedback['requested_roots'])
+                    or self.workspace.artifact_hashes([feedback['path']])[feedback['path']] != feedback['sha256']):
+                raise ValueError('Retained prose revision request or original review changed')
+        elif (original is None and selection is None and document_work
+                and not caller_fields.intersection({'materials', 'sources', 'figures', 'title',
+                    'delivery_artifacts', 'reuse_prior_inputs', 'adopt_draft', 'producer_repair'})):
+            feedback = self._document_revision_feedback(request, report)
+        result.feedback = feedback
+        if feedback is not None:
+            request = request.model_copy(update={'material_roots': [], 'reuse_prior_inputs': True})
+        if (document_work and request.prior_draft and not request.reuse_prior_inputs
+                and not (request.material_roots or request.materials or request.sources)):
+            path = self.workspace.resolve(request.prior_draft)
+            if path == self.workspace.resolve(f'workspace/manuscripts/{path.parent.name}/manuscript.md'):
+                request = request.model_copy(update={'reuse_prior_inputs': True})
+        if request.reuse_prior_inputs:
+            request, result.binding, result.linkage = self._prior_inputs(request, identity,
+                original.get('prior_input_reuse') if original is not None else None,
+                normalize_arguments=normalize_arguments)
+            if document_work:
+                inherited = result.binding['request']
+                request = request.model_copy(update={'title': request.title or inherited['title'],
+                    'delivery_artifacts': request.delivery_artifacts if request.delivery_artifacts is not None
+                        else inherited.get('delivery_artifacts') or [],
+                    'figures': request.figures or [ComposeFigure.model_validate(row)
+                        if isinstance(row, dict) else row for row in inherited.get('figures', [])]})
+        result.recipe = request
+        return result
 
     def _prior_inputs(self, request: ComposeRequest, identity: str,
                       retained_linkage: dict | None = None, *,
@@ -486,7 +805,8 @@ class WritingToolGateway:
 
     def _continued_document_inputs(self, request: ComposeRequest, identity: str,
                                   requirement: dict | None, *,
-                                  inspect_only: bool = True) -> tuple[ComposeRequest, dict, dict, dict]:
+                                  inspect_only: bool = True, allow_completed: bool = False,
+                                  allow_standalone: bool = False) -> tuple[ComposeRequest, dict, dict, dict]:
         """Continue an author-complete failed owner, not its failed inspection.
 
         A native receipt locates the fixed same-task owner. The report operation
@@ -514,9 +834,13 @@ class WritingToolGateway:
         if store.root.resolve().parent != (self.root / 'tools/writing').resolve():
             raise ValueError('Stopped composition owner escapes this task')
         binding = store.read_json('request.json')
+        standalone = (allow_standalone and binding.get('writing_owner') == 'direct_article.v1'
+            and binding.get('report_binding') is None and requirement is None)
         method = binding.get('report_binding', {}).get('requirement', {}).get('method')
+        if standalone:
+            method = 'article'
         if method == 'article':
-            source = retained_article_candidate(store, binding)
+            source = retained_article_candidate(store, binding, **({'allow_standalone': True} if standalone else {}))
             names = ['request.json', 'documents.json', *(file.relative_to(store.root).as_posix()
                 for file in (store.root / 'writer').rglob('*.json'))]
             candidate_contract = 'retained_article_author.v1'
@@ -535,22 +859,24 @@ class WritingToolGateway:
         pending_author = (method == 'article' and observed.get('status') == 'ok'
             and observed.get('data', {}).get('unresolved')
             and Path(source['path']).parent != store.root / 'writer')
-        if not failed_author and not pending_author:
+        completed_author = allow_completed and observed.get('status') == 'ok' and not observed.get('data', {}).get('unresolved')
+        if not failed_author and not pending_author and not completed_author:
             raise ValueError('prior_result requires retained failed author work or an unadopted complete revision; '
                 'use prior_draft for completed compositions')
-        if pending_author:
+        if pending_author or completed_author:
             self._composition_receipt(relative.parts[0], observed)
-        if inspect_only and method == 'article':
-            source = retained_article_candidate(store, binding, unchecked_revision=True)
+        if inspect_only and method == 'article' and not completed_author:
+            source = retained_article_candidate(store, binding, unchecked_revision=True,
+                **({'allow_standalone': True} if standalone else {}))
         receipt_hashes = {name: hashlib.sha256(store.resolve(name).read_bytes()).hexdigest() for name in names}
-        if (requirement is None or binding.get('report_binding', {}).get('requirement') != requirement
+        if not standalone and (requirement is None or binding.get('report_binding', {}).get('requirement') != requirement
                 or binding['report_binding'].get('evidence_contract') != 'materials.v1'):
             raise ValueError('Continued author work must retain its original material report controls')
         saved = binding['request']
         resolved = self._resolved_prior_recipe(request, saved)
         inputs = binding['inputs'][:len(resolved.sources) + len(resolved.materials)]
         self._check_input_bytes(inputs)
-        if self.workspace.artifact_hashes(binding['report_binding']['evidence_sha256']) != binding['report_binding']['evidence_sha256']:
+        if not standalone and self.workspace.artifact_hashes(binding['report_binding']['evidence_sha256']) != binding['report_binding']['evidence_sha256']:
             raise ValueError('Stopped professional work evidence changed; request fresh material investigation')
         source_paths = [row['path'] for row in binding['inputs']]
         self.workspace.check_artifact_producers(source_paths)
@@ -566,6 +892,8 @@ class WritingToolGateway:
             'publication': (request.publication if request.publication is not None else
                 CompositionPublication.model_validate(saved['publication']) if saved.get('publication') else None),
             'delivery_artifacts': saved.get('delivery_artifacts') or []})
+        if standalone:
+            resolved = resolved.model_copy(update={'professional_review': ProfessionalReview(max_revision_rounds=0)})
         linkage = {'owner': relative.parts[0], 'receipt_sha256': receipt_hashes,
             'artifact_sha256': versions, 'inputs': inputs, 'candidate_contract': candidate_contract,
             'result_ref': self.workspace.locator(str(path)), 'result_sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
@@ -677,7 +1005,7 @@ class WritingToolGateway:
             'changed_materials': changed_materials, 'changed_chunks': list(dict.fromkeys(changed_chunks))}}
         return resolved.model_copy(update={'sources': sources, 'materials': materials}), evidence, linkage
 
-    def _prose_review_revision(self, request: ComposeRequest, report_binding: dict | None) -> dict | None:
+    def _document_revision_feedback(self, request: ComposeRequest, report_binding: dict | None) -> dict | None:
         """Reuse a proven recipe for a review fix, not a new user request.
 
         Repeated roots are access scope, not an instruction to rediscover the
@@ -701,8 +1029,9 @@ class WritingToolGateway:
         # The same request may point at fewer original access roots and its
         # current manuscript directory. Neither adds new evidence. Any genuinely
         # new root still requires investigation; scope changes are rejected above.
-        admitted_roots = roots(binding['request']['material_roots']) | {path.parent}
-        if request.material_roots and not roots(request.material_roots) <= admitted_roots:
+        scope = self._document_access_roots(store, binding)
+        admitted_roots = roots(scope) | {path.parent} if scope is not None else {path.parent}
+        if request.material_roots and (scope is None or not roots(request.material_roots) <= admitted_roots):
             return None
         review = self.final_review(data)
         if (review.get('review_status') != 'needs_revision'
@@ -989,11 +1318,10 @@ class WritingToolGateway:
         if not composed and (not store.exists('selection-input.json')
                 or store.read_json('selection-input.json').get('document_work') != 'document_work.v2'):
             return None  # Rejected preflight/old selection contracts remain unchanged.
-        from simple_ar.tools.implementation_work import stop_decision
         data = observed.get('data') or {}
         reason, detail = None, None
         if observed.get('status') != 'ok' or observed.get('error'):
-            reason = {'resource_exhausted': 'shared_budget_exhausted',
+            reason = data.get('owner_stop_reason') or {'resource_exhausted': 'shared_budget_exhausted',
                 'accounting_unresolved': 'accounting_unresolved'}.get(data.get('failure_kind'), 'owner_failed')
             detail = data.get('next_action') or observed.get('error') or 'Writing owner did not complete'
         elif (data.get('incomplete') or data.get('unresolved')
@@ -1048,17 +1376,12 @@ class WritingToolGateway:
                     or observed.get('status') == 'error' and data.get('incomplete'))):
             return None
         try:
-            from simple_ar.tools.implementation import ImplementationToolGateway
             from simple_ar.report.writing import retained_article_candidate, article_inspection_enabled, professional_writer_config
             store = ArtifactStore(self.root / 'tools/writing' / attempt_id)
             binding = store.read_json('request.json')
             if observed.get('status') == 'ok':
                 store, binding, data = self._composition_receipt(attempt_id, observed)
-            native = ArtifactStore(self.root / 'attempts' / attempt_id)
-            ref = ImplementationToolGateway._registered_ref(self, native.root / 'native_result.json',
-                kind='native_observation', store_root=native.root)
-            if native.read_json(ref) != observed:
-                return None
+            accepted_native_result(self.root, self.session_id, observed, attempt_id)
             if (binding.get('document_work', {}).get('contract') not in _DOCUMENT_WORK_CONTRACTS
                     or not article_inspection_enabled(professional_writer_config(binding))):
                 return None
@@ -1071,10 +1394,11 @@ class WritingToolGateway:
             current = self.report_inputs() if self.report_inputs else None
             if current != binding.get('report_binding'):
                 return None
-            _, prior, _, candidate = self._continued_document_inputs(
-                ComposeRequest.model_validate(arguments), attempt_id + '-inspection',
-                (current or {}).get('requirement'))
-            if candidate != source or prior != binding:
+            resolved = self._resolve_document_inputs(ComposeRequest.model_validate(arguments),
+                attempt_id + '-inspection', report=current, original=None, selection=None,
+                document_work=True, caller_fields=frozenset(arguments), work_source=None,
+                normalize_arguments=None)
+            if resolved.candidate != source or resolved.binding != binding:
                 return None
             if observed.get('status') == 'ok':
                 self._check_document_copy_review(data)
@@ -1924,7 +2248,9 @@ class WritingToolGateway:
                           task_evidence_roots: Iterable[str] = ()) -> tuple[ComposeRequest, dict]:
         # Existing receipts without the candidate contract retain full-project
         # hashing and its original limits, including interrupted selections.
-        retained = owner.read_json('selection-input.json') if owner.exists('selection-input.json') else None
+        admission = owner.read_json('selection-input.json') if owner.exists('selection-input.json') else None
+        work_source = admission.get('work_source') if admission is not None else None
+        retained = (None if work_source is not None and 'inventories' not in admission else admission)
         # Focused new results do not erase the user's task-bound original
         # evidence. Inventories remain access-checked candidates, not facts or
         # mandatory attachments. Replays use exactly their frozen inventories;
@@ -2004,6 +2330,8 @@ class WritingToolGateway:
             if not selection_request[key]:
                 selection_request.pop(key)  # Preserve existing directory-selection receipt bindings.
         inputs = {'request': selection_request, 'inventories': inventories}
+        if work_source is not None:
+            inputs['work_source'] = work_source
         if figure_contract is not None:
             inputs['figure_selection_contract'] = figure_contract
         from simple_ar.report.review_evidence import CLAIM_ADOPTION_V2
@@ -2030,6 +2358,8 @@ class WritingToolGateway:
         if retained is not None:
             if 'work_context' in retained:
                 inputs['work_context'] = retained['work_context']
+        elif admission is not None and 'work_context' in admission:
+            inputs['work_context'] = admission['work_context']
         elif self.work_context is not None:
             from simple_ar.tools.materials import freeze_work_context
             targets = [*roots, *([request.prior_draft] if request.prior_draft else []),
@@ -2082,6 +2412,8 @@ class WritingToolGateway:
                 prompt['prior_draft'] = inputs['prior_draft']
             if 'work_context' in inputs:
                 prompt['work_context'] = inputs['work_context']
+            if work_source is not None and 'diagnosis' in work_source:
+                prompt['source_feedback'] = work_source['diagnosis']
             prompt = json.dumps(prompt, ensure_ascii=False)
             if len(prompt.encode('utf-8')) > 128000:
                 raise ValueError('Material selection inventory exceeds 128 KB; choose focused roots')
@@ -2349,6 +2681,7 @@ class WritingToolGateway:
         try:
             # Presence (even an explicit empty field) is caller intent. Owner
             # normalization below may add figures/goal, never exact-input intent.
+            caller_arguments = dict(arguments)
             caller_fields = frozenset(arguments)
             if name not in {'compose_document', 'review_document'} or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', identity):
                 raise ValueError('Invalid composition invocation')
@@ -2389,33 +2722,33 @@ class WritingToolGateway:
             request = (ReviewRequest if inspecting else ComposeRequest).model_validate(arguments)
             if inspecting and request.prior_result:
                 raise ValueError('prior_result continues document work with compose_document; inspection does not create a new candidate')
-            reuse_binding, reuse_linkage, continued_source = None, None, None
-            if request.prior_result:
-                if not document_work:
-                    raise ValueError('prior_result requires professional document-work ownership')
-                request, reuse_binding, reuse_linkage, continued_source = self._continued_document_inputs(
-                    request, identity, (report_binding or {}).get('requirement'),
-                    inspect_only=not recovering or original_binding.get('continued_source_review') == 'inspect_only.v1')
-            revision_feedback = original_binding.get('revision_feedback') if recovering else None
-            if revision_feedback is not None:
-                if (revision_feedback.get('contract') != 'prior_prose_review.v1'
-                        or request.material_roots != revision_feedback['requested_roots']
-                        or self.workspace.artifact_hashes([revision_feedback['path']])[revision_feedback['path']]
-                            != revision_feedback['sha256']):
-                    raise ValueError('Retained prose revision request or original review changed')
-            elif (not recovering and selection_binding is None and document_work and not request.prior_result
-                    and not caller_fields.intersection({'materials', 'sources', 'figures', 'title',
-                        'delivery_artifacts', 'reuse_prior_inputs', 'adopt_draft', 'producer_repair'})):
-                revision_feedback = self._prose_review_revision(request, report_binding)
-            if revision_feedback is not None:
-                request = request.model_copy(update={'material_roots': [], 'reuse_prior_inputs': True})
             if document_work and report_binding is None and request.professional_review is None:
                 frozen_request = (original_binding['request'] if recovering else
-                    selection_binding['request'] if selection_binding is not None else None)
+                    selection_binding['request'] if selection_binding is not None and 'request' in selection_binding else None)
                 review = (frozen_request.get('professional_review') if frozen_request is not None else
                     {'max_revision_rounds': 1})
                 if review is not None:
                     request = request.model_copy(update={'professional_review': ProfessionalReview.model_validate(review)})
+            work_source = (self._admit_document_source(owner, caller_arguments, original_binding,
+                selection_binding, report_binding) if document_work else None)
+            failure_kind = ('owner_state_unresolved' if work_source is not None else
+                'review_incomplete' if inspecting else 'composition_incomplete')
+            resolved = self._resolve_document_inputs(request, identity, report=report_binding,
+                original=original_binding, selection=selection_binding, document_work=document_work,
+                caller_fields=caller_fields, work_source=work_source, normalize_arguments=normalize_arguments)
+            request, reuse_binding, reuse_linkage = resolved.recipe, resolved.binding, resolved.linkage
+            continued_source, revision_feedback = resolved.candidate, resolved.feedback
+            if work_source is not None:
+                scope = (self._document_access_roots(ArtifactStore(self.root / 'tools/writing' / reuse_linkage['owner']),
+                    reuse_binding) if reuse_binding is not None else work_source['investigation_roots'])
+                work_source = {**work_source, 'access_roots': scope}
+                if resolved.investigation is not None:
+                    work_source['diagnosis'] = resolved.investigation
+                if not owner.exists('selection-input.json') or 'inventories' not in owner.read_json('selection-input.json'):
+                    admission = owner.read_json('selection-input.json') if owner.exists('selection-input.json') else {
+                        'document_work': document_contract}
+                    owner.write_json('selection-input.json', {**admission, 'work_source': work_source})
+            failure_kind = 'review_incomplete' if inspecting else 'composition_incomplete'
             if not document_work and not request.title:
                 raise ValueError('An explicit nonempty title is required by the historical writing contract')
             if request.finish:
@@ -2426,11 +2759,6 @@ class WritingToolGateway:
                     raise ValueError('finish requires publication options for the declared non-Markdown formats')
                 if 'pdf' in formats and (request.publication is None or not request.publication.compile_pdf):
                     raise ValueError('finish cannot satisfy the declared PDF requirement with compile_pdf=false')
-            if (document_work and request.prior_draft and not request.reuse_prior_inputs
-                    and not (request.material_roots or request.materials or request.sources)):
-                prior = self.workspace.resolve(request.prior_draft)
-                if prior == self.workspace.resolve(f'workspace/manuscripts/{prior.parent.name}/manuscript.md'):
-                    request = request.model_copy(update={'reuse_prior_inputs': True})
             if inspecting and request.producer_repair:
                 raise ValueError('Producer repair resumes composition, not independent-review requests')
             if (not recovering and not inspecting and self.ledger is not None
@@ -2443,18 +2771,6 @@ class WritingToolGateway:
                 prior_path = self.workspace.resolve(request.prior_draft)
                 if any(self.workspace.resolve(window.path) == prior_path for window in request.materials):
                     raise ValueError('The bound prior draft is revision context, not selectable material evidence')
-            if request.reuse_prior_inputs:
-                request, reuse_binding, reuse_linkage = self._prior_inputs(request, identity,
-                    original_binding.get('prior_input_reuse') if recovering else None,
-                    normalize_arguments=normalize_arguments)
-                if document_work:
-                    inherited = reuse_binding['request']
-                    request = request.model_copy(update={
-                        'title': request.title or inherited['title'],
-                        'delivery_artifacts': (request.delivery_artifacts if request.delivery_artifacts is not None
-                            else inherited.get('delivery_artifacts') or []),
-                        'figures': request.figures or [ComposeFigure.model_validate(row)
-                            if isinstance(row, dict) else row for row in inherited.get('figures', [])]})
             if inspecting and request.writing_method is not None:
                 raise ValueError('Independent inspection cannot select a drafting method')
             delivery = request.delivery if inspecting else None
@@ -2484,7 +2800,7 @@ class WritingToolGateway:
                 if self.workspace.artifact_hashes(report_binding['evidence_sha256']) != report_binding['evidence_sha256']:
                     raise ValueError('Material report evidence changed')
                 if not (request.sources or request.materials or request.material_roots):
-                    paths = report_binding['selection_paths']
+                    paths = work_source['access_roots'] if work_source is not None else report_binding['selection_paths']
                     if not paths and not document_work:
                         raise ValueError('A material report requires selected source passages or readable materials')
                     if paths:
@@ -2492,8 +2808,9 @@ class WritingToolGateway:
                             ComposeRequest.model_validate({**request.model_dump(), 'material_roots': paths}))
             if (document_work and not request.reuse_prior_inputs
                     and not (request.material_roots or request.sources or request.materials)):
-                roots = (report_binding or {}).get('selection_paths') or [str(path)
-                    for name, path in self.workspace.mounts.items() if name not in {'workspace', 'records'}]
+                roots = (work_source['access_roots'] if work_source is not None else
+                    (report_binding or {}).get('selection_paths') or [str(path)
+                    for name, path in self.workspace.mounts.items() if name not in {'workspace', 'records'}])
                 if not roots:
                     raise ValueError('Document work requires authorized source/evidence mounts or explicit material_roots')
                 request = request.model_copy(update={'material_roots': list(roots)})
@@ -2570,9 +2887,10 @@ class WritingToolGateway:
                 raise ValueError('Declared delivery subjects require the professional unit ownership contract')
             material_selection, client = None, None
             if request.material_roots:
-                if not owner.exists('selection-input.json') and recovering:
+                selected = owner.exists('selection-input.json') and 'inventories' in owner.read_json('selection-input.json')
+                if not selected and recovering:
                     raise ValueError('Retained composition has no bound material selection')
-                if not owner.exists('selection-input.json'):
+                if not selected:
                     client = self.client_factory(identity) if self.client_factory else LLMClient.from_env(
                         self.model, budget_ledger=self.ledger, budget_session_id=self.session_id,
                         budget_attempt_id=identity)
@@ -2594,7 +2912,7 @@ class WritingToolGateway:
                         declared_inputs=declared_inputs, adopt_units=adopt_units,
                         delivery_subject_contract=subject_contract,
                         task_evidence_roots=(report_binding['selection_paths']
-                            if document_work and material_report else ()),
+                            if document_work and material_report and work_source is None else ()),
                         declared_figures=[{**_figure_spec(figure), 'absolute_path': str(path),
                             'sha256': hashlib.sha256(raw).hexdigest()}
                             for figure in request.figures
@@ -2930,6 +3248,8 @@ class WritingToolGateway:
                 if not source['questions']:
                     source.pop('questions')  # Preserve existing explicit-selection receipt identity.
             binding = {'request': canonical_request, 'inputs': bindings}
+            if work_source is not None:
+                binding['work_source'] = work_source
             if subject_contract is not None:
                 binding['delivery_subject_contract'] = subject_contract
             if document_materials is not None:
@@ -3161,6 +3481,8 @@ class WritingToolGateway:
                     documents_ref=ref, assets=[], selected_evidence=True,
                     include_memory=writing_owner is None or material_report)
             context.goal_markdown = request.goal
+            if work_source is not None and 'diagnosis' in work_source:
+                context.results['source_feedback'] = work_source['diagnosis']
             if revision_feedback is not None:
                 context.results['revision_feedback'] = revision_feedback
             if 'delivery_review' in binding:
@@ -3378,7 +3700,7 @@ class WritingToolGateway:
                     target_words=request.target_words, prior_draft=previous,
                     required_headings=request.required_headings,
                     enforce_citation_contract=citation_contract_enabled)
-                if request.adopt_draft:
+                if binding.get('candidate_source') is not None:
                     inputs['candidate_source'] = binding['candidate_source']
                 if 'work_context' in binding:
                     inputs['article']['work_context'] = binding['work_context']
@@ -3711,10 +4033,17 @@ class WritingToolGateway:
                     retained.append(f'{prefix}/incomplete_review.json')
             return ToolResult(tool_name=name, status='error',
                 artifacts=retained, data={'incomplete': True,
+                    **({'owner_stop_reason': exc.reason, 'source_result': exc.source_result,
+                        'unresolved': [exc.review],
+                        **({'producer_diagnosis': exc.producer_diagnosis} if hasattr(exc, 'producer_diagnosis') else {})}
+                        if isinstance(exc, _DocumentSourceGap) else
+                        {'owner_stop_reason': 'owner_state_unresolved'}
+                        if locals().get('failure_kind') == 'owner_state_unresolved' else {}),
                     **({'retained_candidate': retained_candidate} if retained_candidate else {}),
                     'failure_kind': locals().get('failure_kind', 'review_incomplete' if locals().get('inspecting') else 'composition_incomplete'),
                     **({'uninspected': inspection_gap} if locals().get('failure_kind') == 'inspection_inputs_incomplete' else {}),
-                    'next_action': ('Keep the saved inputs and any prior draft. Provide a completely readable '
+                    'next_action': (str(exc) if isinstance(exc, _DocumentSourceGap) else
+                        'Keep the saved inputs and any prior draft. Provide a completely readable '
                         'representation of the listed attachments, or deliver the available candidate with the '
                         'inspection gap explicit. Rewriting prose cannot resolve unread attachment bytes; '
                         'do not repeat composition or canonical export with the same unchanged inputs.'
@@ -3724,6 +4053,7 @@ class WritingToolGateway:
                         if isinstance(budget_failure, BudgetExceededError) else
                         'Reconcile the original unknown accounting before new physical work; saved material records remain.'
                         if isinstance(budget_failure, BudgetUnknownError) else
-                        'Use retained candidate and original evidence for a new correction; unresolved inspection remains required. Do not repeat the failed request blindly.')},
-                summary='Professional work stopped; retained outputs are incomplete and need correction.',
+                        'Preserve the writing owner, original evidence and candidate. Inspect the retained diagnosis; '
+                        'an internal failure does not authorize a new composition or another candidate-selection attempt.')},
+                summary='Professional work stopped; preserve retained work and inspect its owner disposition.',
                 error=f'Composition unavailable ({type(exc).__name__}: {exc}); preserve source, Writer checkpoint and budget records; no blind retry.')

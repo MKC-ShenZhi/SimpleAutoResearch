@@ -181,6 +181,15 @@ and permission declarations are **not a sandbox**; load only trusted packages.
 Saved tasks verify package identity, so keep selected code and declared resources
 unchanged for continuation. Do not add a private scheduler, billing or recovery layer.
 
+On the development branch, optional common delivery/question contracts are
+frozen for new tasks. Application completion and retained-result readers use
+the same contract, without adding extension names to core closing rules.
+Declarations grant neither permission nor acceptance; closing offers require
+an already visible operation suitable for direct completion. Simple producers
+can hand off to one proven consumer without implementing a work loop. Shared
+stops bind the original receipt and retain the same ledger and recovery.
+See [completion declarations](LOCAL_EXTENSIONS.md#optional-explicit-completion).
+
 See [the loader](../src/simple_ar/tools/extensions.py) and
 [extension tests](../tests/test_local_extensions.py). The extension guide contains
 the focused verification commands and recovery limitations. This is an implemented,

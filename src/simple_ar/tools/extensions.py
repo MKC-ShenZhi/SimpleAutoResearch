@@ -18,7 +18,7 @@ from types import MappingProxyType, ModuleType
 from typing import Any
 from uuid import uuid4
 
-from simple_ar.tools.specs import CommonToolSpec, ToolResult
+from simple_ar.tools.specs import CommonToolSpec, ToolResult, ToolCompletion
 
 
 def _local(root: Path, value: str) -> Path:
@@ -80,7 +80,7 @@ def freeze_extensions(entries: list[Path]) -> list[dict[str, Any]]:
         names = set()
         for tool in tools:
             if not isinstance(tool, dict) or set(tool) - {
-                    'name', 'description', 'implementation', 'function', 'input_schema', 'permission_level'}:
+                    'name', 'description', 'implementation', 'function', 'input_schema', 'permission_level', 'completion'}:
                 raise ValueError('Unknown extension tool field')
             name = tool.get('name', '')
             if (not isinstance(name, str) or not re.fullmatch(r'[a-z][a-z0-9_]{0,23}', name)
@@ -96,6 +96,10 @@ def freeze_extensions(entries: list[Path]) -> list[dict[str, Any]]:
                     or not isinstance(tool.get('input_schema'), dict)):
                 raise ValueError('Extension tool requires description and input_schema')
             _validate_schema(tool['input_schema'])
+            if 'completion' in tool:
+                completion = ToolCompletion.model_validate(tool['completion'])
+                if completion.field and completion.field not in tool['input_schema'].get('properties', {}):
+                    raise ValueError('Completion field must belong to the extension input contract')
             if tool['input_schema'].get('type') != 'object':
                 raise ValueError('Extension input schema must describe an object')
             if _local(path.parent, tool.get('implementation')).suffix != '.py':
@@ -172,7 +176,8 @@ class LocalExtension:
         meta = self.frozen['metadata']
         specs = [CommonToolSpec(name=name, domain=self.domain,
             description=tool['description'], input_schema=deepcopy(tool['input_schema']),
-            permission_level=tool['permission_level'], risk_level='low') for name, tool in self.tools.items()]
+            permission_level=tool['permission_level'], risk_level='low',
+            completion=tool.get('completion')) for name, tool in self.tools.items()]
         if self.frozen['instructions']:
             specs.append(CommonToolSpec(name=self.instruction_name, domain=self.domain,
                 description=f"Load {meta['id']} {meta['version']} skill: {meta['description']}. Scope: {meta['scope']}. Instructions grant no permissions.",

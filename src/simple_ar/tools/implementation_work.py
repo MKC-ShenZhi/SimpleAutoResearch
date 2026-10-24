@@ -8,6 +8,9 @@ from typing import Any
 
 from simple_ar.core.capabilities import ArtifactStore
 from simple_ar.tools.implementation_run import candidate_source, execution_binding
+# Compatibility export for existing domain callers; stop proof and disposition
+# have a single implementation in the common outcome boundary.
+from simple_ar.tools.professional_outcomes import stop_decision
 
 
 PROFESSIONAL_GENERATION = 'professional_decision.v1'
@@ -586,28 +589,72 @@ def review_repair_request(owner: Any, locator: str) -> tuple[dict, dict]:
     return _repair_arguments(owner, saved, observed, locator, 'repair_review')
 
 
+def review_repair_outcome(owner: Any, observed: dict, source: str) -> tuple[dict, dict]:
+    """Accept only a writing source-gap receipt pointing to its admitted diagnosis.
+
+    This unwraps evidence, never an action. The original review repair owner
+    still proves independent inspection, exact producer/version, permissions,
+    accounting and repair lineage before proposing any implementation work.
+    """
+    if observed.get('status') == 'ok':
+        return review_repair_request(owner, 'records/' + source.removeprefix('attempts/'))
+    from simple_ar.tools.professional_outcomes import accepted_native_result
+
+    data = observed.get('data') or {}
+    diagnosis = data.get('producer_diagnosis') or {}
+    if (observed.get('tool_name') != 'compose_document' or observed.get('status') != 'error'
+            or data.get('owner_stop_reason') not in {'producer_repair_required', 'attachment_evidence_unresolved'}
+            or diagnosis.get('contract') != 'document_source_gap.v1'):
+        raise ValueError('Outcome is not a writing producer diagnosis')
+    identity = Path(source).parent.name
+    if Path(source).as_posix() != f'attempts/{identity}/native_result.json':
+        raise ValueError('Producer diagnosis requires its actual native receipt')
+    accepted_native_result(owner.root, owner.session_id, observed, identity)
+    if any(row.attempt_id == identity and row.status in {'reserved', 'unknown'} for row in owner.ledger.entries):
+        raise ValueError('Writing source diagnosis still has unsettled accounting')
+    admitted = ArtifactStore(owner.root / 'tools/writing' / identity)
+    if hashlib.sha256(admitted.resolve('selection-input.json').read_bytes()).hexdigest() != diagnosis['admission_sha256']:
+        raise ValueError('Writing source diagnosis admission changed')
+    work = admitted.read_json('selection-input.json')['work_source']
+    if work.get('contract') != 'document_source.v1':
+        raise ValueError('Producer diagnosis has no admitted document source')
+    origin = diagnosis['origin']
+    prior_id = origin['owner']
+    if (not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', prior_id) or prior_id == identity
+            or diagnosis['source_result'] != f'records/{prior_id}/native_result.json'):
+        raise ValueError('Producer diagnosis has no distinct original composition')
+    intent = work['intent']
+    if intent.get('prior_result'):
+        locator = intent['prior_result']
+        selected = owner.workspace.resolve(str(owner.root / locator) if locator.startswith('attempts/') else locator)
+        if selected != (owner.root / 'attempts' / prior_id / 'native_result.json').resolve():
+            raise ValueError('Producer diagnosis differs from its admitted result source')
+    elif (not intent.get('prior_draft') or owner.workspace.resolve(intent['prior_draft'])
+            != owner.workspace.resolve(f'workspace/manuscripts/{prior_id}/manuscript.md')):
+        raise ValueError('Producer diagnosis differs from its admitted draft source')
+    prior = ArtifactStore(owner.root / 'attempts' / prior_id).read_json('native_result.json')
+    _, digest = accepted_native_result(owner.root, owner.session_id, prior, prior_id)
+    if digest != diagnosis['source_sha256']:
+        raise ValueError('Producer diagnosis original native receipt changed')
+    writing = ArtifactStore(owner.root / 'tools/writing' / prior_id)
+    if set(origin['receipt_sha256']) != {'request.json', 'result.json'} or any(
+            hashlib.sha256(writing.resolve(name).read_bytes()).hexdigest() != value
+            for name, value in origin['receipt_sha256'].items()):
+        raise ValueError('Producer diagnosis original writing receipts changed')
+    saved = writing.read_json('result.json')['data']
+    paths = {saved['editable_markdown']}
+    if saved.get('review_path'):
+        paths.add(saved['review_path'])
+    expected = {path: saved['artifact_sha256'][path] for path in paths}
+    if origin['artifact_sha256'] != expected or owner.workspace.artifact_hashes(expected) != expected:
+        raise ValueError('Producer diagnosis candidate or inspection version changed')
+    return review_repair_request(owner, diagnosis['source_result'])
+
+
 class WorkStopped(ValueError):
     def __init__(self, reason: str, message: str) -> None:
         super().__init__(message)
         self.reason = reason
-
-
-def stop_decision(owner: Any, observed: dict, attempt_id: str, reason: str, detail: str) -> dict:
-    """A pure owner disposition of an accepted result, not another invocation."""
-    from simple_ar.tools.implementation import ImplementationToolGateway
-    store = ArtifactStore(owner.root / 'attempts' / attempt_id)
-    ref = ImplementationToolGateway._registered_ref(owner, store.root / 'native_result.json',
-        kind='native_observation', store_root=store.root)
-    if store.read_json(ref) != observed:
-        raise ValueError('Owner stop requires the exact accepted native observation')
-    data = observed.get('data') or {}
-    return {'stop': {'contract': 'professional_stop.v1', 'owner': observed['tool_name'],
-        'reason': reason, 'detail': detail, 'source_result': f'records/{attempt_id}/native_result.json',
-        'source_sha256': hashlib.sha256(store.resolve(ref).read_bytes()).hexdigest(),
-        'diagnostics': {key: data[key] for key in ('status', 'prepared_result', 'execution_ref',
-            'returncode', 'stop_reason', 'stderr', 'stdout', 'issues', 'unresolved') if key in data},
-        'error': observed.get('error', ''), 'completed': False,
-        'verification': 'Professional work stopped; existing candidates and failures are retained, not certified or replayed.'}}
 
 
 def _failure_signature(saved: dict, candidates: list[Path]) -> tuple | None:

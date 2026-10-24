@@ -110,10 +110,12 @@ class MeasurementAnalysisRequest(BaseModel):
 def scientific_tool_specs() -> list[CommonToolSpec]:
     return [
         CommonToolSpec(name='measure_experiment', domain='scientific',
+            completion={'field': 'delivery'},
             permission_level='execution', risk_level='high',
             input_schema=MeasurementRequest.model_json_schema(),
             description='Measure one explicitly approved argv with the shared finite process budget. Ordinary work uses the task workspace/interpreter; a verified producing candidate uses its actual environment, while a caller-frozen execution contract preserves its exact cwd/argv and inherited environment. Saves canonical results, logs, declared outputs, metric selectors, guard and observed integrity. Protocol fields are declarations, not verified facts. Optional delivery interprets the measured result locally and delivers actual outputs; no unrequested experiment or model call. Interrupted requests are blocked, never replayed.'),
         CommonToolSpec(name='analyze_measurements', domain='scientific',
+            completion={'field': 'delivery'},
             permission_level='write_patch', risk_level='low',
             input_schema=MeasurementAnalysisRequest.model_json_schema(),
             description='Deterministically analyze receipt-verified task measurements and caller-frozen, hash-bound reused baselines: one candidate with optional baseline, or explicit seed/baseline/candidate pairs including missing conditions. Imports retain original measurement identity and disclose their origin, without new process accounting. Existing collection analysis owns protocol grouping and descriptive paired summaries; no inferred pairing, new statistics, process or model call. Saves experiment_set.json for pairs, canonical analysis.json, analysis.md and comparison evidence. Optional delivery includes actual outputs and discloses incomplete/failed evidence; frozen condition coverage is independently enforced.'),

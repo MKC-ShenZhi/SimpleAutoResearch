@@ -231,6 +231,8 @@ def article_writing_inputs(*, report_context: ReportContext, documents: Document
         'bibliography': report_context.papers, 'citation_key_map': report_context.citation_key_map}
     if 'delivery_review' in report_context.results:
         article['delivery_review'] = report_context.results['delivery_review']
+    if 'source_feedback' in report_context.results:
+        article['source_feedback'] = report_context.results['source_feedback']
     if enforce_citation_contract:
         article['citation_contract'] = dict(ARTICLE_CITATION_CONTRACT)
     if prior_draft or not structured:
@@ -1192,7 +1194,8 @@ def professional_writer_config(binding: dict[str, Any]) -> ReportRuntimeConfig:
 
 
 def retained_article_candidate(owner: ArtifactStore, binding: dict[str, Any], *,
-                               unchecked_revision: bool = False) -> dict[str, Any]:
+                               unchecked_revision: bool = False,
+                               allow_standalone: bool = False) -> dict[str, Any]:
     """Prove the latest complete article author, not its failed inspection.
 
     Reuse the actual author parser and response binding in a read-only store.
@@ -1201,17 +1204,31 @@ def retained_article_candidate(owner: ArtifactStore, binding: dict[str, Any], *,
     """
     writer = _CompletedWritingStore(owner.root / 'writer')
     snapshot = writer.read_json('report_inputs.json')
-    if (snapshot.get('owner') != ARTICLE_OWNER
-            or binding.get('writing_owner') != 'professional_report.v1'
-            or binding.get('report_binding', {}).get('requirement', {}).get('method') != 'article'):
+    standalone = allow_standalone and binding.get('writing_owner') == ARTICLE_OWNER
+    if (snapshot.get('owner') != ARTICLE_OWNER or not standalone and (
+            binding.get('writing_owner') != 'professional_report.v1'
+            or binding.get('report_binding', {}).get('requirement', {}).get('method') != 'article')):
         raise ValueError('Retained article must belong to its professional author')
-    frozen = snapshot['inputs']['binding']
-    config = professional_writer_config(binding)
-    documents = owner.ref('documents.json', kind='documents', schema='document_bundle.v1')
-    if (frozen['config'] != config.model_dump(mode='json')
-            or frozen['template'] != binding['report_binding']['requirement']['template']
-            or frozen['sources'] != [documents.to_dict()]):
-        raise ValueError('Retained article controls or documents changed')
+    if standalone:
+        if snapshot['inputs']['binding'] != binding or 'writer_projection' in snapshot['inputs']:
+            raise ValueError('Retained standalone article binding changed')
+        from simple_ar.report.templates import load_report_template_bundle
+        config = ReportRuntimeConfig.model_validate(snapshot['inputs']['assembly_config'])
+        article = snapshot['inputs']['article']
+        context = ReportContext(topic=article['title'], report_mode='supplied_materials', goal_markdown=article['goal'],
+            source_handles=article['source_handles'], papers=article['bibliography'], citation_key_map=article['citation_key_map'])
+        if 'delivery_review' in article:
+            context.results['delivery_review'] = article['delivery_review']
+        frozen = {'context': context.model_dump(mode='json'),
+            'template': load_report_template_bundle(report_mode=context.report_mode, config=config).model_dump(mode='json')}
+    else:
+        frozen = snapshot['inputs']['binding']
+        config = professional_writer_config(binding)
+        documents = owner.ref('documents.json', kind='documents', schema='document_bundle.v1')
+        if (frozen['config'] != config.model_dump(mode='json')
+                or frozen['template'] != binding['report_binding']['requirement']['template']
+                or frozen['sources'] != [documents.to_dict()]):
+            raise ValueError('Retained article controls or documents changed')
     written = write_whole_article(store=writer, inputs=snapshot['inputs'],
         identity=owner.root.name, recovering=True)
     original = written

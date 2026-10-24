@@ -230,6 +230,7 @@ def implementation_tool_specs(*, exact: bool = False) -> list[CommonToolSpec]:
         permission_level='write_patch', risk_level='medium', input_schema=ImplementationRequest.model_json_schema(),
         description='Prepare coherent code from a goal and optional read-only material_roots, without coordinator-selected files or code. Opt into complete_work for owner-managed preparation, approved execution and diagnosed local technical repairs (max_repairs 0-2), all in the existing action turn and shared ledger; every execution still needs exact approval. New units choose text sources during generation; project_path pointing to an unchanged registered candidate reuses complete originals/materials for direct feedback, preserving omitted files and allowing necessary new sources or plan-only fixes. Unfamiliar projects retain investigation. The same generation can propose execution_plan; execute_implementation uses the registered result after explicit approval. Existing files require exact replacements. One complete format correction shares the original budget; transport, unknown-use, truncation and syntax failures are not replayed. Originals stay unchanged; preparation is not execution or scientific/visual verification.'),
         CommonToolSpec(name='execute_implementation', domain='implementation',
+            completion={'field': 'delivery'},
             permission_level='execution', risk_level='high', input_schema=ExecuteImplementationRequest.model_json_schema(),
             description='Execute one registered prepare_implementation execution_plan through the existing approved process owner, interpreter and shared physical ledger. Takes its prepared_result, not hand-written commands or hashes. Pins all generated files, consumed input identities, exact command/environment and expected fresh outputs. Saves real errors for later professional repair, without retries, installation or a second workflow. Source/output changes invalidate success; interrupted unbound outputs are not adopted. Optional delivery finishes after this run succeeds, not after another coordinator decision. Physical execution does not certify scientific correctness or visual quality.')]
 
@@ -256,9 +257,10 @@ class ImplementationToolGateway:
         """Accept an actual joint-review defect for its unique code producer."""
         if observed.get('tool_name') != 'compose_document':
             return None
-        from simple_ar.tools.implementation_work import review_repair_request, WorkStopped, stop_decision
+        from simple_ar.tools.implementation_work import review_repair_outcome, WorkStopped
+        from simple_ar.tools.professional_outcomes import stop_decision
         try:
-            arguments, _ = review_repair_request(self, 'records/' + source.removeprefix('attempts/'))
+            arguments, _ = review_repair_outcome(self, observed, source)
             return {'tool_name': 'prepare_implementation', 'arguments': arguments}
         except WorkStopped as exc:
             return stop_decision(self, observed, Path(source).parent.name, exc.reason, str(exc))
@@ -599,21 +601,8 @@ class ImplementationToolGateway:
         return record, code_task_paths(run).workspace_dir
 
     def _registered_ref(self, record: Path, *, kind: str, store_root: Path | None = None) -> Any:
-        store = ArtifactStore(store_root or record.parent)
-        relative = record.relative_to(store.root).as_posix()
-        attempt = store.read_attempt_manifest()
-        capability = store.read_capability_result()
-        session = ArtifactStore(self.root).read_json('session_manifest.json')
-        if (attempt.attempt_id != store.root.name or attempt.capability != 'native_tool'
-                or attempt.status != 'completed' or capability.status != 'completed'
-                or session['session_id'] != self.session_id
-                or attempt.attempt_id not in session['budget']['recorded_attempts']):
-            raise ValueError('Source is not a completed native_tool attempt in this task')
-        registered = [ref for ref in attempt.outputs if ref.path == relative
-                      and ref.kind == kind and ref.status == 'available' and ref in capability.artifacts]
-        if len(registered) != 1:
-            raise ValueError('Source is not an actual registered output')
-        return registered[0]
+        from simple_ar.tools.professional_outcomes import registered_native_output
+        return registered_native_output(self.root, self.session_id, record, kind=kind, store_root=store_root)
 
     def _check_preparation(self, record: Path, *, allow_pre_design: bool = False) -> tuple[dict[str, Any], Path]:
         """Verify an unedited preparation, not an implementation or a directory hint."""

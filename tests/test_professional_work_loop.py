@@ -80,6 +80,101 @@ print('Saved recorded measurements; no fitting or experiment rerun.')
 '''
 
 
+class ProfessionalOutcomeBoundaryTests(unittest.TestCase):
+    """Read-only adoption and stop proofs, without a model or action scheduler."""
+
+    def setUp(self):
+        from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityResult
+        from simple_ar.tools.gateway import CommonToolGateway
+        from simple_ar.tools.registry import ToolRegistry
+        from simple_ar.tools.specs import CommonToolSpec
+
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.source = 'attempts/inspection/native_result.json'
+        self.owner = SimpleNamespace(root=self.root, session_id='task')
+        self.observed = ToolResult(tool_name='inspect_material', data={'issues': ['retained gap']}).model_dump(mode='json')
+        self.store = ArtifactStore(self.root / 'attempts/inspection')
+        ref = self.store.write_json('native_result.json', self.observed, kind='native_observation')
+        self.store.write_attempt_manifest(AttemptManifest(attempt_id='inspection', capability='native_tool',
+            status='completed', outputs=(ref,)))
+        self.store.write_capability_result(CapabilityResult(status='completed', artifacts=(ref,)))
+        ArtifactStore(self.root).write_json('session_manifest.json', {
+            'session_id': 'task', 'budget': {'recorded_attempts': ['inspection']}})
+        registry = ToolRegistry()
+        registry.register(CommonToolSpec(name='inspect_material', description='Simple producer', domain='inspection'))
+        self.producer = SimpleNamespace()
+        self.consumer = SimpleNamespace(consume_outcome=Mock(return_value={
+            'tool_name': 'prepare_implementation', 'arguments': {'repair_review': 'registered-evidence'}}))
+        self.gateway = CommonToolGateway(self.root, registry=registry,
+            domain_gateways={'inspection': self.producer, 'repair': self.consumer})
+
+    def _action(self, *, consume=True, resume=False):
+        return self.gateway.professional_action(self.observed, self.source,
+            resume=resume, consume_outcome=consume)
+
+    def test_simple_producer_can_hand_off_once_without_acquiring_a_lifecycle(self):
+        self.gateway._domain_gateways['repair_alias'] = self.consumer
+        before = {path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}
+        self.assertEqual(self._action(resume=True),
+            (self.consumer, self.consumer.consume_outcome.return_value))
+        self.consumer.consume_outcome.assert_called_once_with(self.observed, self.source)
+        self.assertEqual({path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}, before)
+        self.consumer.consume_outcome.reset_mock()
+        self.assertEqual(self._action(consume=False), (self.producer, None))
+        self.consumer.consume_outcome.assert_not_called()
+        # Adoption does not register or authorize the proposed operation.
+        self.assertIsNone(self.gateway.registry.get('prepare_implementation'))
+
+    def test_producer_keeps_first_refusal_and_original_resume_hook(self):
+        self.producer.continuation = Mock(return_value={'stop': {'reason': 'original_owner_stop'}})
+        self.producer.resume_after_budget = Mock(return_value={'tool_name': 'inspect_material', 'arguments': {}})
+        self.assertEqual(self._action(), (self.producer, self.producer.continuation.return_value))
+        self.assertEqual(self._action(resume=True), (self.producer, self.producer.resume_after_budget.return_value))
+        self.consumer.consume_outcome.assert_not_called()
+        self.producer.continuation.return_value = None
+        self.assertEqual(self._action(), (self.consumer, self.consumer.consume_outcome.return_value))
+
+    def test_ambiguous_adoption_returns_to_coordination_and_absent_adoption_keeps_fallback(self):
+        fallback = self.producer.stop_after_review = Mock(return_value={'stop': {'reason': 'work_gap'}})
+        other = SimpleNamespace(consume_outcome=Mock(return_value=self.consumer.consume_outcome.return_value))
+        self.gateway._domain_gateways['other'] = other
+        self.assertEqual(self._action(), (self.producer, None))
+        fallback.assert_not_called()  # Even equal proposals from distinct owners are ambiguous.
+        self.consumer.consume_outcome.return_value = other.consume_outcome.return_value = None
+        self.assertEqual(self._action(), (self.producer, fallback.return_value))
+        del self.producer.stop_after_review
+        self.assertEqual(self._action(), (self.producer, None))
+
+    def test_stop_proof_uses_actual_native_registration_and_exact_receipt_version(self):
+        from simple_ar.tools.professional_outcomes import check_professional_stop, stop_decision
+
+        # No code gateway, workspace or ledger is needed to retain a stop.
+        before = {path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}
+        action = stop_decision(self.owner, self.observed, 'inspection', 'work_gap', 'Retain findings')
+        stop = action['stop']
+        self.assertEqual((stop['contract'], stop['owner'], stop['completed']),
+            ('professional_stop.v1', 'inspect_material', False))
+        self.assertEqual(stop['diagnostics'], {'issues': ['retained gap']})
+        check_professional_stop(self.root, 'task', self.source, stop)
+        with self.assertRaisesRegex(ValueError, 'exact accepted native observation'):
+            stop_decision(self.owner, {**self.observed, 'error': 'unaccepted diagnosis'},
+                'inspection', 'owner_failed', 'Do not adopt forged evidence')
+        self.assertEqual({path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}, before)
+        path = self.store.resolve('native_result.json')
+        original = path.read_bytes()
+        # Same parsed observation is still a different version of the raw receipt.
+        path.write_bytes(original + b'\n')
+        with self.assertRaisesRegex(ValueError, 'accepted source'):
+            check_professional_stop(self.root, 'task', self.source, stop)
+        path.write_bytes(original)
+        manifest = self.store.read_attempt_manifest()
+        self.store.write_attempt_manifest(replace(manifest, outputs=()))
+        with self.assertRaisesRegex(ValueError, 'registered output'):
+            check_professional_stop(self.root, 'task', self.source, stop)
+        with self.assertRaisesRegex(ValueError, 'registered output'):
+            stop_decision(self.owner, self.observed, 'inspection', 'work_gap', 'Retain findings')
+
+
 class ProfessionalWorkLoopTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())) / 'task'
@@ -1543,13 +1638,20 @@ class ProfessionalWorkLoopTests(unittest.TestCase):
         receipts, ledger, calls = self._process_receipts(), app.ledger.to_dict(), self.send.call_count
         count = len(app.state['requests'])
         app = self._load()
-        def consume(actual, source, **options):
+        def consume(actual, source):
+            if actual.get('tool_name') != 'execute_implementation':
+                return None
             self.assertEqual(actual, observed)
-            return app.implementation, {'tool_name': 'deliver_result', 'arguments': {
+            # This fixture consumer still proves the accepted source; routing
+            # through the common gateway is not itself adoption authority.
+            from simple_ar.tools.professional_outcomes import accepted_native_result
+            accepted_native_result(self.root, app.session.manifest.session_id,
+                actual, Path(source).parent.name)
+            return {'tool_name': 'deliver_result', 'arguments': {
                 'summary': 'Deliver the already completed output',
                 'artifacts': [str(app.workspace.resolve(actual['data']['cwd']) / 'result.txt')]}}
-        with patch.object(app.gateway, 'professional_action', side_effect=consume):
-            app.run(progress=lambda _: None)
+        app.gateway._domain_gateways['retained_delivery'] = SimpleNamespace(consume_outcome=consume)
+        app.run(progress=lambda _: None)
         self.assertEqual(app.session.manifest.status, 'completed')
         self.assertEqual(self._process_receipts(), receipts)
         self.assertEqual(app.ledger.to_dict(), ledger)

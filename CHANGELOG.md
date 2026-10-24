@@ -8,12 +8,12 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 
 ### Added
 
-- Explicit local Skill and read-only/plan Python tool packages in task TOML, using the common tool registry, permissions, history and interruption recovery. See [setup and trust boundaries](docs/LOCAL_EXTENSIONS.md).
+- Select local Skill and read-only/plan Python tools in task TOML. On the development branch, extensions may declare common delivery/question contracts without editing core tool-name lists; permissions and version checks still apply. See [setup and trust boundaries](docs/LOCAL_EXTENSIONS.md).
 - Native task TOML accepts `from_session` and named `reuse` groups, sharing CLI/UI material admission without inheriting old execution, permissions or budgets.
 
 ### Improved
 
-- Continue inspection of retained drafts, revise by paragraph, and distinguish body figures from separate attachments while preserving originals, failures, usage and historical recovery rules.
+- The development branch unifies document-source resolution and candidate reuse: professional work investigates evidence gaps, while proven attachment defects go to their actual producer. Paragraph revisions, body/attachment roles, originals, failures, accounting and historical recovery remain protected.
 - Keep goals separate from material roles and data meanings through shared CLI/UI declarations. Project edits preserve layout and immutable dependencies; code-only delivery does not require a report.
 - Repairs retain required original materials and distinguish authoring context from delivered execution. Earlier failures remain recorded without blocking a separately verified replacement; unsupported numerical allegations remain unresolved, not proven errors or evidence of improved efficiency.
 - The experimental UI shares configuration preview, material authorization and stop/resume behavior. Complete research interaction remains under acceptance.
@@ -28,7 +28,7 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 
 ### Status
 
-- This batch completed full server regression, real PDF compilation/relocation and read-only historical compatibility checks. Earlier report feedback and two-template results retain their own versions and limits. See [evidence](docs/EVALUATION.md#v210-development-evidence) for scope, cost and human involvement; these do not establish general success rates or lower cost.
+- The preceding candidate completed full server regression, real PDF compilation/relocation and read-only historical compatibility checks. This completion-contract and document-source refactor passed targeted source/installed checks and replay of original failures; real feedback retains its separate outcome. Earlier report feedback and two-template results keep their own versions and limits. See [evidence](docs/EVALUATION.md#v210-development-evidence); these checks do not establish general success rates or lower cost.
 - Checked incremental improvements may be integrated into main while V2.10 development continues on its original branch. Full persistent-project coverage, coordination efficiency and overall slimming remain incomplete.
 
 ## 2026-10-23 — V2.10 development (unreleased)

@@ -27,6 +27,32 @@ the selected package. Tools declare a single Python file and function, called
 as `function(arguments, services) -> dict` with a JSON object result. The
 implementation must be a `.py` source file.
 
+## Optional explicit completion
+
+On the development branch, tools may declare a common delivery or question
+without adding their names to application control code. Ordinary tools need
+no completion declaration. Inside a `[[tools]]` entry, for example:
+
+```toml
+completion = { kind = "delivery", field = "handoff", closing = true }
+```
+
+Declare `handoff` as an object in that tool's input schema. When supplied, it
+contains the common delivery object (`summary`, `artifacts`, and optional
+`unresolved`); return the actual delivery under the same key in result data.
+Omit `field` only when the entire arguments and result data are that object.
+`kind = "question"` instead uses the common `{question = "..."}` shape.
+The application still checks actual outputs, versions and required work.
+
+`closing = true` permits an already visible tool in the last decision. Declare
+it only when the operation can finish without further model work; it neither
+loads a deferred tool nor grants permission, budget or scientific acceptance.
+New tasks retain these completion contracts across supply and resume.
+Historical tasks keep their original rules. Extension permissions remain
+limited to read-only/plan operations.
+
+## Loading and trust
+
 Each implementation file is loaded lazily as a standalone Python module, once
 per extension owner in the current process. Tools using the same resolved file
 share that module. It has `__file__`, `__spec__`, an empty `__package__`, and a

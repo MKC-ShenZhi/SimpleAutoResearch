@@ -25,7 +25,8 @@ from simple_ar.tools.openai_schema import compact_json_schema, export_openai_too
 from simple_ar.tools.permissions import ToolPermissionPolicy
 from simple_ar.tools.registry import ToolRegistry
 from simple_ar.tools.extensions import LocalExtension, freeze_extensions
-from simple_ar.tools.specs import CommonToolSpec, ToolCall, ToolResult
+from simple_ar.tools.specs import CommonToolSpec, ToolCall, ToolResult, ToolCompletion, tool_completion
+from simple_ar.tools.professional_outcomes import check_professional_stop, stop_decision
 from simple_ar.tools.workspace import (WorkspaceToolGateway, workspace_tool_specs,
     DeliveryRequest, FileWindow, validate_workspace_arguments, workspace_observation_view, workspace_history_identity,
     resolve_source_mount)
@@ -46,11 +47,7 @@ from simple_ar.research.sources import SearchProviderRegistry
 _CORE_COORDINATION = {'focus_work', 'load_tools', 'read_history'}
 _TOOL_CONTRACT_MODES = {'full', 'on_demand', 'outcomes'}
 _DEFERRED_WORKSPACE_TOOLS = {'write_file', 'edit_file', 'run_process'}
-_FINAL_WORK_TOOLS = {'write_file', 'export_report', 'run_process', 'execute_implementation', 'review_document', 'measure_experiment', 'analyze_measurements'}
-# These owners finish locally without another provider request. A delivery
-# field alone does not make professional/model-backed work affordable after
-# the last coordinator call. Keep _FINAL_WORK_TOOLS for saved reply admission.
-_DIRECT_CLOSING_TOOLS = {'write_file', 'export_report', 'run_process', 'deliver_result', 'ask_user'}
+# Terminal shape and closing suitability belong to frozen tool contracts.
 _COMPLETION_POLICIES = {'protected_decision.v1', 'closing_decision.v2'}
 _REPORT_PROTOCOL = 'canonical_report.v1'
 _OWNERS = 'owners.v1'
@@ -444,6 +441,9 @@ class ToolApplication:
             raise ValueError('Unsupported professional input contract')
         self.writing.professional_inputs = config.get('professional_inputs') in {'owner.v1', 'owner.v2', 'owner.v3'}
         self.writing.document_work = config.get('professional_inputs') in {'owner.v2', 'owner.v3'}
+        self.writing.document_source_contract = config.get('document_source_contract')
+        if self.writing.document_source_contract not in {None, 'document_source.v1'}:
+            raise ValueError('Unsupported document work source contract')
         self.writing.joint_delivery = config.get('professional_work') in _OUTCOME_WORK
         self.writing.producer_completion = config.get('producer_completion')
         if self.writing.producer_completion not in {None, 'goal_findings.v1'}:
@@ -689,14 +689,16 @@ class ToolApplication:
         """
         # Restrict the active contracts rather than loading deferred specialists:
         # expanding an on-demand catalog here can evict original input windows.
-        schemas = [row for row in self.schemas if row['function']['name'] in _DIRECT_CLOSING_TOOLS]
+        schemas = [row for row in self.schemas
+            if (contract := self._completion(row['function']['name'])) is not None and contract.closing]
         result = []
         for original in schemas:
             schema = json.loads(json.dumps(original))
             function = schema['function']
-            if function['name'] in _FINAL_WORK_TOOLS:
+            contract = self._completion(function['name'])
+            if contract.field:
                 parameters = function['parameters']
-                delivery = parameters.get('properties', {}).get('delivery')
+                delivery = parameters.get('properties', {}).get(contract.field)
                 if delivery is None:
                     continue
                 # Preserve the owner's delivery shape and references, removing
@@ -704,7 +706,7 @@ class ToolApplication:
                 if 'anyOf' in delivery:
                     delivery['anyOf'] = [row for row in delivery['anyOf'] if row.get('type') != 'null']
                 delivery.pop('default', None)
-                parameters['required'] = list(dict.fromkeys([*parameters.get('required', []), 'delivery']))
+                parameters['required'] = list(dict.fromkeys([*parameters.get('required', []), contract.field]))
             result.append(schema)
         return result
 
@@ -1430,6 +1432,7 @@ class ToolApplication:
         if context_protocol is not None:
             config['context_protocol'] = context_protocol
         config['producer_completion'] = 'goal_findings.v1'
+        config['document_source_contract'] = 'document_source.v1'
         session = SessionController.create(root, session_id=root.name, topic=goal,
             registry=CapabilityRegistry(), budget=BudgetState(max_attempts=attempts, max_no_progress=6))
         session.manifest.transition_recipe = cls.RECIPE
@@ -1441,7 +1444,10 @@ class ToolApplication:
         session.manifest.state_refs["actions"] = session.store.ref("actions.json", kind="native_actions")
         session.manifest.budget_ledger_ref = session.store.ref("budget_ledger.json", kind="budget_ledger")
         session.save()
-        return cls(session, services=services)
+        app = cls(session, services=services)
+        app.state['config']['tool_completions'] = app.gateway.registry.completions()
+        app._save()
+        return app
 
     @classmethod
     def load(cls, root: Path, *, services: Any | None = None) -> ToolApplication:
@@ -1469,10 +1475,15 @@ class ToolApplication:
             supply_id, reason = supply_id.strip(), reason.strip()
             fields = {'model', 'sources', 'allow_execution', 'allow_network', 'code_task',
                 'execution_contract', 'research_policy', 'table_analysis', 'report_requirement', 'max_output_tokens',
-                'tool_contracts', 'completion_policy', 'delivery_files'}
+                'tool_contracts', 'completion_policy', 'delivery_files', 'document_source_contract'}
             if set(changes) - fields:
                 raise ValueError('Unsupported supply fields: ' + ', '.join(sorted(set(changes) - fields)))
             supplied = dict(changes)
+            if 'document_source_contract' in supplied:
+                if supplied['document_source_contract'] != 'document_source.v1':
+                    raise ValueError('Unsupported document work source contract')
+                if self.state['pending'] is not None or any(turn['remaining'] for turn in self.state['turns']):
+                    raise ValueError('Finish or explicitly cancel accepted work before changing its document source contract')
             if 'sources' in supplied:
                 if not isinstance(supplied['sources'], dict):
                     raise ValueError('Supply sources must map aliases to read-only paths')
@@ -1554,6 +1565,8 @@ class ToolApplication:
                 config['context_protocol'] = old['context_protocol']
             if 'professional_work' in old:
                 config['professional_work'] = old['professional_work']
+            if candidate.get('document_source_contract') is not None:
+                config['document_source_contract'] = candidate['document_source_contract']
             if 'producer_completion' in old:
                 config['producer_completion'] = old['producer_completion']
             for name in fields - {'model', 'sources', 'allow_execution', 'allow_network'}:
@@ -1578,7 +1591,8 @@ class ToolApplication:
             # Its previous config is journaled below; old decision receipts keep
             # their original closing obligation. Absent historical fields stay
             # absent unless explicitly supplied, including unrelated supplies.
-            for field in ('completion_policy', 'tool_contracts', 'report_protocol'):
+            for field in ('completion_policy', 'tool_contracts', 'report_protocol', 'tool_completions',
+                          'document_source_contract'):
                 if field not in supplied:
                     if field in old:
                         config[field] = old[field]
@@ -1798,11 +1812,7 @@ class ToolApplication:
 
     def _check_professional_stop(self, source: str, stop: dict) -> None:
         """A semantic handoff and a pause require the same source proof."""
-        if (stop.get('contract') != 'professional_stop.v1' or stop.get('completed') is not False
-                or self.workspace.resolve(stop['source_result']) != self.session.store.resolve(source)
-                or hashlib.sha256(self.session.store.resolve(source).read_bytes()).hexdigest()
-                    != stop['source_sha256']):
-            raise ValueError('Professional stop differs from its accepted source observation')
+        check_professional_stop(self.session.store.root, self.session.manifest.session_id, source, stop)
 
     def _pause_professional_stop(self, source: str, action: dict) -> None:
         """Retain an owner's deterministic stop in the existing action journal."""
@@ -1852,10 +1862,7 @@ class ToolApplication:
                     self._save()
                     return True
                 source, resumed_stop = retained['source_result'], True
-                if (self.workspace.resolve(stop['source_result']) != self.session.store.resolve(source)
-                        or hashlib.sha256(self.session.store.resolve(source).read_bytes()).hexdigest()
-                            != stop['source_sha256']):
-                    raise ValueError('Cannot resume a professional stop whose source changed')
+                self._check_professional_stop(source, stop)
         if source is None and not turns[-1]['tools']:
             return False
         source = source or turns[-1]['tools'][-1]['result']
@@ -1865,7 +1872,6 @@ class ToolApplication:
         if owner is None:
             return False
         if action is None and resumed_stop:
-            from simple_ar.tools.implementation_work import stop_decision
             action = stop_decision(owner, observed, Path(source).parent.name, 'owner_state_unresolved',
                 'New resource authorization cannot establish a safe continuation from the original source')
         if action is None:
@@ -1884,13 +1890,11 @@ class ToolApplication:
             return True
         spec = self.gateway.registry.get(action['tool_name'])
         if spec is None or not self.gateway.policy.is_allowed(spec)[0]:
-            from simple_ar.tools.implementation_work import stop_decision
             self._pause_professional_stop(source, stop_decision(owner, observed, Path(source).parent.name,
                 'permission_unavailable', 'The next professional operation is not authorized; no execution occurred'))
             return True
         minimum = self.gateway.continuation_attempts(action['tool_name'], action['arguments'])
         if self.session.manifest.budget.max_attempts - self.session.manifest.budget.attempts < minimum:
-            from simple_ar.tools.implementation_work import stop_decision
             self._pause_professional_stop(source, stop_decision(owner, observed, Path(source).parent.name,
                 'shared_budget_exhausted', 'Original task attempt capacity cannot fit the next professional operation'))
             return True
@@ -3205,6 +3209,10 @@ class ToolApplication:
     def _bind_delivery(self, call: dict, payload: dict, store: ArtifactStore) -> dict:
         """One delivery projection for normal execution and receipt recovery."""
         delivery = self._delivery(call, payload)
+        if (payload.get('status') == 'ok' and self._terminal_intent(call)
+                and self._completion(call['function']['name']).kind == 'delivery' and delivery is None):
+            payload.update(status='blocked', error='Tool omitted its declared delivery; existing outputs are retained, not completed.')
+            return payload
         if payload.get('status') == 'ok' and delivery is not None:
             outputs = tuple(store.require(ArtifactRef.from_dict(row))
                 for row in payload.get('metadata', {}).get('capability_artifacts', []))
@@ -3218,10 +3226,10 @@ class ToolApplication:
                 except (ValueError, OSError, KeyError, RuntimeError) as exc:
                     payload.update(status='blocked', error=str(exc))
                     return payload
-            if call['function']['name'] == 'deliver_result':
+            if not self._completion(call['function']['name']).field:
                 payload['data'] = delivery
             else:
-                payload['data']['delivery'] = delivery
+                payload['data'][self._completion(call['function']['name']).field] = delivery
             hashes = self.workspace.artifact_hashes(delivery['artifacts'])
             retained = payload['metadata'].get('delivery_hashes')
             if retained is not None and hashes != retained:
@@ -3247,25 +3255,32 @@ class ToolApplication:
                 artifacts += (declared,)
         return artifacts
 
-    @staticmethod
-    def _terminal_intent(call: dict[str, Any]) -> bool:
-        name = call['function']['name']
-        if name in {'deliver_result', 'ask_user'}:
-            return True
-        if name in _FINAL_WORK_TOOLS:
-            try:
-                arguments = json.loads(call['function']['arguments'])
-                return isinstance(arguments, dict) and arguments.get('delivery') is not None
-            except (ValueError, TypeError):
-                pass  # Ordinary argument validation produces the observation.
-        return False
+    def _completion(self, name: str) -> ToolCompletion | None:
+        return tool_completion(name, self.state['config'].get('tool_completions'))
 
-    @staticmethod
-    def _delivery(call: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any] | None:
-        name = call['function']['name']
+    def _delivery_arguments(self, call: dict[str, Any]) -> Any:
+        arguments = json.loads(call['function']['arguments'])
+        contract = self._completion(call['function']['name'])
+        return arguments.get(contract.field) if contract and contract.field else arguments
+
+    def _terminal_intent(self, call: dict[str, Any]) -> bool:
+        contract = self._completion(call['function']['name'])
+        if contract is None:
+            return False
+        if not contract.field:
+            return True
+        try:
+            arguments = json.loads(call['function']['arguments'])
+            return isinstance(arguments, dict) and arguments.get(contract.field) is not None
+        except (ValueError, TypeError):
+            return False  # Argument validation owns malformed proposals.
+
+    def _delivery(self, call: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any] | None:
+        contract = self._completion(call['function']['name'])
+        if contract is None or contract.kind != 'delivery':
+            return None
         data = payload.get('data') or {}
-        return data if name == 'deliver_result' else (
-            data.get('delivery') if name in _FINAL_WORK_TOOLS else None)
+        return data.get(contract.field) if contract.field else data
 
     def _validated_code_delivery(self, artifacts: list[str], *, require_current_origin: bool = True) -> dict[str, Any]:
         observations = (self.session.store.read_json(item['result'])
@@ -3546,7 +3561,7 @@ class ToolApplication:
         terminals = [item for item in calls if self._terminal_intent(item)]
         if len(terminals) != 1 or calls[-1]['id'] != call['id']:
             return 'Request exactly one delivery/question as the last action; this terminal action was not executed.'
-        if call['function']['name'] == 'ask_user':
+        if self._completion(call['function']['name']).kind == 'question':
             return ''
         if (self.scientific is not None and self.scientific.execution_contract is not None
                 and not self.implementation.exact):
@@ -3554,8 +3569,7 @@ class ToolApplication:
                 arguments = json.loads(call['function']['arguments'])
                 retained = next((self._delivery(call, self.session.store.read_json(item['result']))
                     for item in turn['tools'] if item['id'] == call['id']), None)
-                request = DeliveryRequest.model_validate(retained or (arguments if call['function']['name'] == 'deliver_result'
-                    else arguments['delivery']))
+                request = DeliveryRequest.model_validate(retained or self._delivery_arguments(call))
                 if not request.unresolved:
                     measurements, analyses = [], []
                     for accepted in self._evidence_turns('scientific'):
@@ -3583,8 +3597,7 @@ class ToolApplication:
                 arguments = json.loads(call['function']['arguments'])
                 retained = next((self._delivery(call, self.session.store.read_json(item['result']))
                     for item in turn['tools'] if item['id'] == call['id']), None)
-                request = DeliveryRequest.model_validate(retained or (arguments if call['function']['name'] == 'deliver_result'
-                    else arguments['delivery']))
+                request = DeliveryRequest.model_validate(retained or self._delivery_arguments(call))
             except (ValueError, TypeError, KeyError):
                 return ''  # The tool's argument validator will reject this proposal.
             try:
@@ -3626,8 +3639,7 @@ class ToolApplication:
         retained_delivery = (self._delivery(call, self.session.store.read_json(terminal['result']))
             if terminal is not None else None)
         arguments = json.loads(call['function']['arguments'])
-        delivery = retained_delivery or (arguments if call['function']['name'] == 'deliver_result'
-            else arguments.get('delivery'))
+        delivery = retained_delivery or self._delivery_arguments(call)
         failed = self.gateway.delivery_issues(observations, proposed=proposed, delivery=delivery)
         for item in turn['tools']:
             observed = self.session.store.read_json(item['result'])
@@ -3646,7 +3658,7 @@ class ToolApplication:
                             and DeliveryRequest.model_validate(retained_delivery).unresolved):
                         return ''  # A domain may force honest partial delivery.
                 arguments = json.loads(call['function']['arguments'])
-                delivery = arguments if call['function']['name'] == 'deliver_result' else arguments['delivery']
+                delivery = self._delivery_arguments(call)
                 if DeliveryRequest.model_validate(delivery).unresolved:
                     return ''
             except (ValueError, TypeError, KeyError):
@@ -3673,7 +3685,7 @@ class ToolApplication:
         terminal_error = self._terminal_error(call)
         if terminal_error:
             raise ValueError(f'Retained terminal observation cannot be committed: {terminal_error}')
-        if call['function']['name'] == 'ask_user':
+        if self._completion(call['function']['name']).kind == 'question':
             data = validate_workspace_arguments('ask_user', payload['data']).model_dump()
             self.session.pause(data['question'])
             progress(data['question'])
@@ -4362,10 +4374,10 @@ class ToolApplication:
                             and ((tokens := self.ledger.remaining('total_tokens')) is None
                                 or tokens >= self._completion_floor(self._client())['total_tokens'])):
                         if turns[-1].get('origin') == 'professional':
-                            from simple_ar.tools.implementation_work import stop_decision
                             source = self.session.store.read_json(turns[-1]['reply'])['source_result']
                             observed = self.session.store.read_json(source)
-                            self._pause_professional_stop(source, stop_decision(self.implementation, observed,
+                            self._pause_professional_stop(source, stop_decision(SimpleNamespace(
+                                root=self.session.store.root, session_id=self.session.manifest.session_id), observed,
                                 Path(source).parent.name, 'shared_budget_exhausted',
                                 'Original task completion reserve blocks further professional work; proposal retained without execution'))
                             return
