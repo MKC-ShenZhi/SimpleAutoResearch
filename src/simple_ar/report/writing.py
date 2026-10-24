@@ -1,6 +1,6 @@
 """Direct article writing and the historical controller-owned section Writer."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from collections.abc import Sequence
 import hashlib
 import json
@@ -742,6 +742,21 @@ def write_whole_article(*, store: Any, inputs: dict[str, Any], identity: str,
     return written
 
 
+def validate_output_outline(outline: Sequence[dict[str, Any]], markdown: str) -> list[str]:
+    """Check the exact ordered output topology and return observed headings."""
+    from simple_ar.report.assembler import (
+        article_section_headings, _heading_title, _strip_heading_number,
+    )
+    observed = article_section_headings(markdown)
+    expected = [_strip_heading_number(_heading_title(row['heading'])).casefold() for row in outline]
+    actual = [heading.casefold() for heading in observed]
+    required = {heading for row, heading in zip(outline, expected) if row['required']}
+    if outline and (len(set(expected)) != len(expected) or len(set(actual)) != len(actual)
+            or not required <= set(actual) or actual != [heading for heading in expected if heading in actual]):
+        raise ValueError('Article violates fixed section structure; original response retained, no automatic correction.')
+    return observed
+
+
 def _check_article_constraints(article: dict[str, Any], markdown: str) -> dict[str, Any] | None:
     """Check requested output, not factual accuracy; never repair prose by deletion."""
     from simple_ar.literature.verify import CitationError
@@ -771,18 +786,8 @@ def _check_article_constraints(article: dict[str, Any], markdown: str) -> dict[s
         if known and not citations:
             raise CitationError('Article requires registered body citations (for example [@P1]); '
                                 'original response retained, no automatic correction.')
-    from simple_ar.report.assembler import (
-        article_section_headings, _heading_title, _strip_heading_number,
-    )
     constraints = article.get('constraints', {'outline': [], 'max_cited_sources': 0})
-    outline = constraints['outline']
-    observed = article_section_headings(markdown)
-    expected = [_strip_heading_number(_heading_title(row['heading'])).casefold() for row in outline]
-    actual = [heading.casefold() for heading in observed]
-    required = {heading for row, heading in zip(outline, expected) if row['required']}
-    if outline and (len(set(expected)) != len(expected) or len(set(actual)) != len(actual)
-            or not required <= set(actual) or actual != [heading for heading in expected if heading in actual]):
-        raise ValueError('Article violates fixed section structure; original response retained, no automatic correction.')
+    observed = validate_output_outline(constraints['outline'], markdown)
     if citations - known:
         raise ValueError('Article constraints contain unknown cited sources; original response retained, no automatic correction.')
     limit = constraints['max_cited_sources']
@@ -1036,6 +1041,93 @@ def _section_feedback_memory(memory: ReportMemory, context: ReportContext,
     return memory
 
 
+def _section_reorganization_body(candidate: dict[str, Any],
+                                 outline: Sequence[dict[str, Any]]) -> str | None:
+    """Only a frozen output contract can require reauthoring proved old prose."""
+    from simple_ar.report.assembler import assemble_report_sections, ReportAssemblyMode
+    from simple_ar.report.schema import ReportSectionDraft
+
+    plans = sorted(candidate['memory']['section_plan'], key=lambda row: row.get('final_order', 0))
+    if not outline:
+        return None
+    by_id = {row['section_id']: row for row in candidate['sections']}
+    body = assemble_report_sections(title=candidate['title'],
+        sections=[ReportSectionDraft.model_validate(by_id[row['section_id']]) for row in plans],
+        assembly_mode=ReportAssemblyMode.SECTION_DRAFTS)
+    try:
+        validate_output_outline(outline, body)
+    except ValueError:
+        return body
+    return body if list(outline) != [
+        {'heading': row['heading'], 'required': row.get('required', True)} for row in plans] else None
+
+
+def _section_reorganization_context(context: ReportContext, body: str, prior_draft: str) -> ReportContext:
+    """Bind proved old prose as context, without importing its plan or checks."""
+    from simple_ar.report.schema import SourceHandle
+
+    retained = [row for row in context.source_handles if row.kind == 'prior_draft']
+    if (prior_draft and prior_draft != body) or (retained and (
+            len(retained) != 1 or retained[0].metadata.get('draft_markdown') != body)):
+        raise ValueError('Reorganized prior_draft differs from the complete retained author body')
+    context = context.model_copy(deep=True)
+    if not retained:
+        if any(row.handle == 'prior_draft' for row in context.source_handles):
+            raise ValueError('Reorganized prior_draft handle conflicts with a current source')
+        context.source_handles.append(SourceHandle(handle='prior_draft', kind='prior_draft',
+            title='Previous version', summary='Earlier prose to revise, not primary evidence.',
+            metadata={'evidence_role': 'prior_draft_not_primary_evidence', 'draft_markdown': body}))
+    return context
+
+
+def _section_reorganization_feedback(context: ReportContext, candidate: dict[str, Any],
+        source: dict[str, Any], input_store: ArtifactStore | None,
+        frozen: dict[str, Any] | None) -> ReportContext:
+    """Project a proved old inspection as opinions before freezing new work."""
+    if frozen is not None and not frozen.get('memory', {}).get('survey_contract', {}).get('revision_feedback_contract'):
+        return context
+    inspection_owners: list[Path] = []
+    prior = None
+    if input_store is not None and input_store.exists('request.json'):
+        binding = input_store.read_json('request.json')
+        if (binding.get('continued_source_review') == 'checked_work.v1'
+                and binding.get('candidate_source') != source):
+            raise ValueError('Reorganization opinions have a different retained author source binding')
+        prior = continued_checked_candidate(input_store, binding, _inspection_owners=inspection_owners)
+    review = (prior['independent_review'] if prior is not None else
+              candidate.get('checked_revision', {}).get('independent_review'))
+    if review is None:
+        return context
+    from simple_ar.report.agent import _final_sequence
+    from simple_ar.report.schema import ReportSectionDraft
+    sections = [row.model_dump(mode='json') for row in _final_sequence(
+        ReportMemory.model_validate(candidate['memory']).section_plan,
+        [ReportSectionDraft.model_validate(row) for row in candidate['sections']])]
+    if prior is not None and {row['section_id']: row for row in prior['sections']} != {
+            row['section_id']: row for row in sections}:
+        raise ValueError('Reorganization opinions concern a different retained author candidate')
+    owner = ArtifactStore(inspection_owners[-1] if prior is not None else Path(source['owner']))
+    validate_document_inspection(owner, owner.read_json('request.json'),
+        {'delivery_review': review.get('delivery_review')}, review_result=review, reviewed_sections=sections)
+    receipt = review['inspection_source']
+    path = str(owner.resolve(receipt['response_path']).resolve())
+    digest = receipt['response_sha256']
+    if frozen is not None:
+        saved = frozen.get('context', {}).get('results', {}).get('revision_feedback', {})
+        if saved.get('path') != path or saved.get('sha256') != digest:
+            return context  # Historical freezes cannot acquire a new opinion contract.
+    context = context.model_copy(deep=True)
+    existing = context.results.get('revision_feedback')
+    if (isinstance(existing, dict) and existing.get('path') == path
+            and existing.get('sha256') == digest and existing.get('section_reviews') == review['section_reviews']):
+        return context
+    context.results['revision_feedback'] = {'contract': 'prior_prose_review.v1',
+        'path': path, 'sha256': digest, 'section_reviews': review['section_reviews'],
+        'scope': 'Original physically proved inspection of the retained author; fallible old opinions, '
+            'not current section selectors, primary evidence, approval or revision allowance.'}
+    return context
+
+
 def run_composition_article(*, store: ArtifactStore, inputs: dict[str, Any], identity: str,
                             client: Any = None, candidate_source: dict[str, Any] | None = None) -> CapabilityResult:
     """Adapt native composition to the shared article owner, preserving saved inputs."""
@@ -1160,10 +1252,13 @@ def run_report_writing_capability(*, context: CapabilityContext, request: Report
     # Early section checkpoints retained only the completed draft prefix.
     # Missing projection metadata preserves that historical contract; it does
     # not opt into feedback delivery or change snapshot compatibility below.
-    frozen_memory = (context.store.read_json('report_inputs.json').get('memory', {})
-        if context.store.exists('report_inputs.json') else
+    frozen_inputs = context.store.read_json('report_inputs.json') if context.store.exists('report_inputs.json') else None
+    if frozen_inputs is None and request.resume_ref is not None:
+        original = (context.input_store or context.store).resolve(request.resume_ref).with_name('report_inputs.json')
+        if original.is_file():
+            frozen_inputs = json.loads(original.read_bytes())
+    frozen_memory = (frozen_inputs.get('memory', {}) if frozen_inputs is not None else
         previous['completed'].get('memory', {}) if request.resume_ref is not None else None)
-    memory = _section_feedback_memory(memory, request.report_context, frozen_memory)
     if not memory.section_plan:
         memory.section_plan = initialize_report_memory(context=request.report_context, template=request.template).section_plan
     output_outline = request.output_outline
@@ -1173,14 +1268,21 @@ def run_report_writing_capability(*, context: CapabilityContext, request: Report
     if not output_outline and request.resume_ref is not None:
         output_outline = previous.get('completed', {}).get('memory', {}).get(
             'outline_planning', {}).get('output_outline', [])
-    memory = _fixed_section_memory(memory, output_outline, request.report_context)
+    if not output_outline:
+        output_outline = memory.outline_planning.get('output_outline', [])
+    reorganizing = False
     if supplied_sections is not None and output_outline:
-        candidate_plan = sorted(supplied_sections['memory']['section_plan'],
-                                key=lambda row: row.get('final_order', 0))
-        if [{'heading': row['heading'], 'required': row.get('required', True)}
-                for row in candidate_plan] != list(output_outline):
-            raise ValueError('Retained author plan differs from the requested output outline; '
-                             'preserve its original checkpoint and revision history')
+        prior_body = _section_reorganization_body(supplied_sections, output_outline)
+        reorganizing = prior_body is not None
+        if reorganizing:
+            request = replace(request, report_context=_section_reorganization_context(
+                request.report_context, prior_body, request.prior_draft))
+            request = replace(request, report_context=_section_reorganization_feedback(
+                request.report_context, supplied_sections, request.candidate_source, context.input_store,
+                frozen_inputs if frozen_inputs is not None else
+                {'memory': frozen_memory} if frozen_memory is not None else None))
+    memory = _section_feedback_memory(memory, request.report_context, frozen_memory)
+    memory = _fixed_section_memory(memory, output_outline, request.report_context)
     snapshot = _writing_binding(report_context=request.report_context, memory=memory,
         config=request.config, template=request.template,
         sources=tuple(ref for ref in context.inputs if ref != request.resume_ref))
@@ -1188,7 +1290,7 @@ def run_report_writing_capability(*, context: CapabilityContext, request: Report
         snapshot['candidate_source'] = request.candidate_source
     identity = _writing_identity(snapshot)
     snapshot["snapshot_id"] = hashlib.sha256(json.dumps(identity, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
-    if (memory.outline_planning.get('output_outline')
+    if (section_candidate or memory.outline_planning.get('output_outline')
             or request.report_context.results.get('revision_feedback') is not None):
         if context.store.exists('report_inputs.json') and context.store.read_json('report_inputs.json') != snapshot:
             raise ValueError('Writer bound inputs changed; retain the original candidate and checkpoint')
@@ -1210,7 +1312,7 @@ def run_report_writing_capability(*, context: CapabilityContext, request: Report
         if compatible:
             completed = previous["completed"]
             reused_ref = request.resume_ref
-    elif section_candidate:
+    elif section_candidate and not reorganizing:
         candidate = supplied_sections
         seeded = ReportMemory.model_validate(candidate['memory'])
         # This current owner's projection contract must reach the actual agent
@@ -1577,7 +1679,8 @@ def section_author_source(owner: ArtifactStore) -> tuple[dict, dict]:
 
 
 def continued_checked_candidate(owner: ArtifactStore, binding: dict, *,
-                                _seen: frozenset[Path] = frozenset()) -> dict | None:
+                                _seen: frozenset[Path] = frozenset(),
+                                _inspection_owners: list[Path] | None = None) -> dict | None:
     """Carry saved negative opinions into a new admitted request, not a new review.
 
     The gateway has admitted the task, current permissions and normal shared
@@ -1621,11 +1724,13 @@ def continued_checked_candidate(owner: ArtifactStore, binding: dict, *,
     if (not native.resolve().is_relative_to((task / 'attempts').resolve())
             or hashlib.sha256(native.read_bytes()).hexdigest() != prior['result_sha256']):
         raise ValueError('Checked work native source changed')
-    return checked_writing_candidate(source, source.read_json('request.json'), _seen=_seen | {root})
+    return checked_writing_candidate(source, source.read_json('request.json'), _seen=_seen | {root},
+                                     _inspection_owners=_inspection_owners)
 
 
 def checked_writing_candidate(owner: ArtifactStore, binding: dict, *,
-                              _seen: frozenset[Path] = frozenset()) -> dict:
+                              _seen: frozenset[Path] = frozenset(),
+                              _inspection_owners: list[Path] | None = None) -> dict:
     """Read the latest complete negative inspection, without assembly or calls.
 
     The adopted Writer stays untouched. A rejected complete proposal is a work
@@ -1638,7 +1743,7 @@ def checked_writing_candidate(owner: ArtifactStore, binding: dict, *,
     snapshot = writer.read_json('report_inputs.json')
     if owner.root.resolve() in _seen:
         raise ValueError('Checked work source contains a cycle')
-    inherited = continued_checked_candidate(owner, binding, _seen=_seen)
+    inherited = continued_checked_candidate(owner, binding, _seen=_seen, _inspection_owners=_inspection_owners)
     article = snapshot.get('owner') == ARTICLE_OWNER
     if article:
         standalone = binding.get('writing_owner') == ARTICLE_OWNER
@@ -1723,6 +1828,8 @@ def checked_writing_candidate(owner: ArtifactStore, binding: dict, *,
         raise ValueError('Work outcome requires a complete negative candidate inspection')
     validate_document_inspection(owner, binding, {'delivery_review': review.get('delivery_review')},
         review_result=review, reviewed_sections=sections)
+    if _inspection_owners is not None:
+        _inspection_owners.append(owner.root.resolve())
     return result
 
 
@@ -1838,11 +1945,20 @@ def retained_section_candidate(source: dict[str, Any], *, _seen: frozenset[Path]
     sections = [by_id[sid] for sid in plans]
     # Verify body production, not merely writer.json's self-reported status.
     authored = set()
+    inherited_author = False
     if inputs.get('candidate_source') is not None:
         parent = retained_section_candidate(inputs['candidate_source'], _seen=ancestry)
-        authored.update((row['section_id'], row['draft_markdown']) for row in parent['sections'])
+        outline = inputs['memory'].get('outline_planning', {}).get('output_outline', [])
+        prior_body = _section_reorganization_body(parent, outline)
+        inherited_author = prior_body is None
+        if inherited_author:
+            authored.update((row['section_id'], row['draft_markdown']) for row in parent['sections'])
+        else:
+            if not any(row.get('kind') == 'prior_draft' for row in inputs['context']['source_handles']):
+                raise ValueError('Reorganized author has no frozen complete prior_draft context')
+            _section_reorganization_context(ReportContext.model_validate(inputs['context']), prior_body, '')
     calls = [name for name in records if name.startswith('writer/model_calls/') and name.endswith('/request.json')]
-    if not calls and inputs.get('candidate_source') is None:
+    if not calls and not inherited_author:
         raise ValueError('Retained candidate has no complete author response records')
     for name in calls:
         call = ArtifactStore(owner.resolve(name).parent)
@@ -1854,7 +1970,7 @@ def retained_section_candidate(source: dict[str, Any], *, _seen: frozenset[Path]
         # inspection operations. All files above remain hash-bound; inspection
         # acceptance is never inherited. Historical professional proof still
         # requires every physical operation's complete atomic response.
-        if native and not author:
+        if native and label in {'report-document-reviewer', 'report-document-verifier'}:
             continue
         response_path = str(Path(name).with_name('response.json')).replace('\\', '/')
         if response_path not in records:
@@ -1890,7 +2006,8 @@ def retained_section_candidate(source: dict[str, Any], *, _seen: frozenset[Path]
         authored.update(parsed)
     if any((row.section_id, row.draft_markdown) not in authored for row in sections):
         raise ValueError('Retained candidate body has no matching complete author response')
-    result = {'sections': [row.model_dump(mode='json') for row in sections],
+    result = {'title': inputs['context']['topic'],
+        'sections': [row.model_dump(mode='json') for row in sections],
         'memory': memory.model_dump(mode='json')}
     # A diagnostic of the saved negative inspection, never adoption authority.
     # Consumers still verify its physical request/response against these sections.
@@ -1983,14 +2100,20 @@ def write_section_article(*, store: ArtifactStore, input_store: ArtifactStore,
         raise ValueError('Frozen section input changed; preserve its snapshot, no blind replay')
     template = (ReportTemplateBundle.model_validate(frozen['template']) if frozen is not None
         else load_report_template_bundle(report_mode=context.report_mode, config=config))
-    memory = initialize_report_memory(context=context, template=template)
-    memory.objective = context.goal_markdown or title
     retained_inputs = store.read_json('report_inputs.json') if store.exists('report_inputs.json') else None
     requested_outline = [{'heading': heading, 'required': True} for heading in required_headings]
     saved_outline = (retained_inputs.get('memory', {}).get('outline_planning', {}).get('output_outline', [])
         if retained_inputs is not None else requested_outline)
     if saved_outline and saved_outline != requested_outline:
         raise ValueError('Frozen section input changed; preserve its output outline, no blind replay')
+    if candidate_source is not None and saved_outline:
+        candidate = retained_section_candidate(candidate_source)
+        prior_body = _section_reorganization_body(candidate, saved_outline)
+        if prior_body is not None:
+            context = _section_reorganization_context(context, prior_body, prior_draft)
+            context = _section_reorganization_feedback(context, candidate, candidate_source, input_store, retained_inputs)
+    memory = initialize_report_memory(context=context, template=template)
+    memory.objective = context.goal_markdown or title
     if retained_inputs is not None and not saved_outline and required_headings:
         # Historical native inputs used this exact projection. Reconstruct it
         # only for their original receipts; new work uses the shared owner.

@@ -1345,6 +1345,15 @@ class WritingToolGateway:
                         'Continue this candidate through an admitted professional request, not by replaying the failed operation.'}
                 visible['unresolved'] = [finding for row in candidate['independent_review']['section_reviews']
                     for finding in row['findings']]
+        elif result.status != 'ok' and receipt_path:
+            try:
+                gap = self._author_completion_gap(result.model_dump(mode='json'), Path(receipt_path).parent.name)
+            except (OSError, ValueError, KeyError, TypeError):
+                gap = None
+            if gap is not None:
+                visible['mechanical_constraints'] = gap
+                visible['retained_candidate'] = {'status': 'author_not_adopted', 'adopted': False,
+                    'prior_result': gap['prior_result'], 'scope': gap['scope']}
         if (match and result.status == 'ok' and data.get('unresolved')
                 and 'retained_candidate' not in visible
                 and (self.root / 'attempts' / match[1] / 'native_result.json').is_file()):
@@ -1527,8 +1536,76 @@ class WritingToolGateway:
     def final_review(self, data: dict) -> dict:
         return read_composition_review(self.workspace, data)
 
+    def _author_completion_gap(self, observed: dict, attempt_id: str) -> dict | None:
+        """A proved, inspected author may still fail the output contract.
+
+        This is working context, never adoption or permission to retry an
+        operation. Check the actual output, not exception text or a caller's
+        description of its failure. Missing author/reviewer responses retain
+        their original stop and accounting semantics.
+        """
+        if observed.get('status') == 'ok' or not observed.get('data', {}).get('incomplete'):
+            return None
+        accepted_native_result(self.root, self.session_id, observed, attempt_id)
+        store = ArtifactStore(self.root / 'tools/writing' / attempt_id)
+        binding = store.read_json('request.json')
+        requirement = binding.get('report_binding', {}).get('requirement')
+        method = (requirement or {}).get('method') or binding['request'].get('writing_method')
+        if method != 'sections':
+            return None
+        request = ComposeRequest(goal=binding['request']['goal'],
+            prior_result=f'records/{attempt_id}/native_result.json')
+        _, _, linkage, source = self._continued_document_inputs(request,
+            attempt_id + '-proof', requirement, inspect_only=False, allow_standalone=True)
+        checkpoint = store.read_json('writer/sections.json')['completed']
+        if not checkpoint.get('document_review_done') or checkpoint.get('pending_draft') is not None:
+            return None
+        # Unlike check-only recovery, this handoff must not outlive an
+        # unfinished inspection operation, even if an older body was reviewed.
+        if any(str(Path(name).with_name('response.json')).replace('\\', '/') not in source['sha256']
+                for name in source['sha256'] if name.startswith('writer/model_calls/') and name.endswith('/request.json')):
+            return None
+        from simple_ar.report.writing import retained_section_candidate, validate_document_inspection, validate_output_outline, _review_pending
+        candidate = retained_section_candidate(source)
+        review = (candidate.get('checked_revision', {}).get('independent_review')
+            or store.read_json('writer/writer.json').get('independent_review'))
+        # Negative content findings already have their own work/repair path.
+        # This port only classifies a separately proved output-contract defect.
+        if (not isinstance(review, dict) or review.get('review_status') != 'reviewed'
+                or self._review_needs_material_work(review)):
+            return None
+        from simple_ar.report.agent import _final_sequence
+        from simple_ar.report.schema import ReportMemory, ReportSectionDraft, ReportSectionReview
+        sections = [row.model_dump(mode='json') for row in _final_sequence(
+            ReportMemory.model_validate(candidate['memory']).section_plan,
+            [ReportSectionDraft.model_validate(row) for row in candidate['sections']])]
+        validate_document_inspection(store, binding, {'delivery_review': review.get('delivery_review')},
+            review_result=review, reviewed_sections=sections)
+        if _review_pending([ReportSectionReview.model_validate(row) for row in review['section_reviews']]):
+            return None
+        outline = (requirement or {}).get('outline') or [
+            {'heading': heading, 'required': True} for heading in binding['request'].get('required_headings', [])]
+        if not outline:
+            return None
+        from simple_ar.report.assembler import assemble_report_sections, ReportAssemblyMode
+        body = assemble_report_sections(title=binding['request']['title'],
+            sections=[ReportSectionDraft.model_validate(row) for row in sections],
+            assembly_mode=ReportAssemblyMode.SECTION_DRAFTS)
+        try:
+            validate_output_outline(outline, body)
+        except ValueError as error:
+            return {'contract': 'author_completion_gap.v1', 'adopted': False,
+                'prior_result': f'records/{attempt_id}/native_result.json',
+                'source_sha256': linkage['result_sha256'], 'output_outline': outline,
+                'diagnostic': str(error),
+                'scope': 'Complete author and original inspection are proved; this output still violates '
+                    'its bound structure. Use the retained body as revision context under the requested '
+                    'structure, then independently inspect the new work. The original failure remains failed; '
+                    'no automatic retry, inherited approval or additional allowance.'}
+        return None
+
     def can_return_gap(self, observed: dict, attempt_id: str) -> bool:
-        """A completed negative inspection can inform the request owner.
+        """Completed inspections and proved output gaps can inform the owner.
 
         This never adopts the draft, retries the Writer or authorizes repairs.
         Unavailable/incomplete responses cannot become a semantic handoff.
@@ -1541,7 +1618,7 @@ class WritingToolGateway:
                 # Read a legacy assembly failure only through its registered
                 # receipt and the saved complete negative author/check proof.
                 if observed.get('data', {}).get('failure_kind') != 'image_reference':
-                    return False
+                    return self._author_completion_gap(observed, attempt_id) is not None
                 accepted_native_result(self.root, self.session_id, observed, attempt_id)
                 from simple_ar.report.writing import checked_writing_candidate
                 store = ArtifactStore(self.root / 'tools/writing' / attempt_id)

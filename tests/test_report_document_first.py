@@ -30,7 +30,9 @@ from tests.report_review_fixtures import (
 class DocumentFirstTests(unittest.TestCase):
     def test_explicit_outline_owns_joint_writing_revision_and_checkpoint_recovery(self):
         from simple_ar.report.assembler import assemble_report_sections, article_section_headings
-        from simple_ar.report.writing import _check_article_constraints
+        from simple_ar.report.writing import (
+            _check_article_constraints, validate_output_outline, retained_writing_client, section_author_source,
+        )
 
         headings = ['Purpose and inputs', 'Findings', 'Interpretation and limits',
                     'Conclusion and follow-up options']
@@ -41,6 +43,9 @@ class DocumentFirstTests(unittest.TestCase):
         labels, views = [], []
 
         class Client:
+            def __init__(inner, extra_heading=False):
+                inner.extra_heading = extra_heading
+
             def ask_json(inner, system, prompt, *, label='', **unused):
                 labels.append(label)
                 view = prompt_payload(prompt)
@@ -49,7 +54,9 @@ class DocumentFirstTests(unittest.TestCase):
                     return {'sections': [{'section_id': row['section']['section_id'],
                         'heading': row['section']['heading'],
                         'draft_markdown': ('Reconciled ' if 'reviser' in label else 'Original ')
-                            + row['section']['heading']} for row in view['sections']]}
+                            + row['section']['heading'] + ('\n\n## Unrequested detail\n\nOld detail.'
+                                if inner.extra_heading and index == 0 else '')
+                        } for index, row in enumerate(view['sections'])]}
                 if label == 'report-document-reviewer':
                     return {'section_reviews': [{'section_id': row['section_id'],
                         'verdict': 'revise_required' if index < 2 else 'pass',
@@ -64,7 +71,14 @@ class DocumentFirstTests(unittest.TestCase):
                 raise AssertionError(label)
 
         with tempfile.TemporaryDirectory() as tmp:
-            store = ArtifactStore(Path(tmp))
+            owner = ArtifactStore(Path(tmp) / 'fixed-outline')
+            store = ArtifactStore(owner.root / 'writer')
+            documents = owner.write_json('documents.json',
+                DocumentBundle([], {}, {}, [], []).to_handoff_dict(),
+                kind='documents', schema='document_bundle.v1')
+            owner.write_json('request.json', {'writing_owner': 'professional_report.v1',
+                'section_response_contract': 'atomic_complete.v2',
+                'report_binding': {'requirement': {'method': 'sections'}}})
             feedback = {'contract': 'prior_prose_review.v1', 'path': str(Path(tmp) / 'old-review.json'),
                 'sha256': 'a' * 64, 'scope': 'Old version opinions, not primary evidence or permission.',
                 'section_reviews': [{'section_id': 'section_1', 'verdict': 'revise_required',
@@ -73,8 +87,10 @@ class DocumentFirstTests(unittest.TestCase):
             kwargs['context'].source_handles.append(SourceHandle(handle='old-body', kind='prior_draft',
                 title='Old body', metadata={'draft_markdown': 'Old conclusion with bounded claims.'}))
             request = ReportWritingRequest(kwargs['context'], kwargs['memory'], kwargs['config'],
-                kwargs['template'], Client(), output_outline=outline)
-            capability = CapabilityContext(store, AttemptManifest('fixed-outline'))
+                kwargs['template'], retained_writing_client(store=store, identity='fixed-outline',
+                    client=Client(), contract='atomic_complete.v2'), output_outline=outline)
+            capability = CapabilityContext(store, AttemptManifest('fixed-outline'),
+                inputs=(documents,), input_store=owner)
             result = run_report_writing_capability(context=capability, request=request)
             self.assertEqual(result.status, 'completed', result.diagnostics)
             written = store.read_json('writer.json')
@@ -110,14 +126,15 @@ class DocumentFirstTests(unittest.TestCase):
             article = {'constraints': {'outline': outline, 'max_cited_sources': 0},
                        'bibliography': [], 'citation_key_map': {}}
             _check_article_constraints(article, body)
+            self.assertEqual(validate_output_outline(outline, body), headings)
             with self.assertRaisesRegex(ValueError, 'fixed section structure'):
                 _check_article_constraints(article, body.replace(headings[-1], 'Conclusion and options'))
-            checkpoint = store.ref('sections.json', kind='report_checkpoint', schema='report_checkpoint.v1')
+            source_checkpoint = owner.ref('writer/sections.json', kind='report_checkpoint', schema='report_checkpoint.v1')
             retained = {path.name: path.read_bytes() for path in store.root.glob('*.json')}
             with patch.object(request.llm_client, 'ask_json', side_effect=AssertionError('No paid request replay')):
                 resumed = run_report_writing_capability(context=CapabilityContext(store,
-                    AttemptManifest('fixed-outline'), inputs=(checkpoint,)),
-                    request=replace(request, resume_ref=checkpoint, output_outline=()))
+                    AttemptManifest('fixed-outline'), inputs=(documents, source_checkpoint), input_store=owner),
+                    request=replace(request, resume_ref=source_checkpoint, output_outline=()))
             self.assertEqual(resumed.status, 'completed', resumed.diagnostics)
             for name in ('report_inputs.json', 'writer.json'):
                 self.assertEqual(store.resolve(name).read_bytes(), retained[name])
@@ -129,6 +146,106 @@ class DocumentFirstTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'inputs changed'):
                 run_report_writing_capability(context=capability, request=replace(request, output_outline=changed))
             self.assertEqual({path.name: path.read_bytes() for path in store.root.glob('*.json')}, retained)
+
+            # The same complete author has two distinct consumers: unchanged
+            # topology starts at inspection; new topology starts at the Writer.
+            candidate_source, _ = section_author_source(owner)
+            candidate_body = assemble_report_sections(title=kwargs['context'].topic,
+                sections=[ReportSectionDraft.model_validate(row) for row in written['sections']])
+            extra_owner = ArtifactStore(Path(tmp) / 'extra-headings')
+            extra_writer = ArtifactStore(extra_owner.root / 'writer')
+            extra_owner.write_json('request.json', owner.read_json('request.json'))
+            extra_documents = extra_owner.write_json('documents.json', owner.read_json('documents.json'),
+                kind='documents', schema='document_bundle.v1')
+            run_report_writing_capability(context=CapabilityContext(extra_writer,
+                AttemptManifest(extra_owner.root.name), inputs=(extra_documents,), input_store=extra_owner),
+                request=replace(request, llm_client=retained_writing_client(store=extra_writer,
+                    identity=extra_owner.root.name, client=Client(extra_heading=True), contract='atomic_complete.v2')))
+            extra_source, extra_candidate = section_author_source(extra_owner)
+            self.assertEqual([row['heading'] for row in extra_candidate['memory']['section_plan']], headings)
+            extra_body = assemble_report_sections(title=extra_candidate['title'],
+                sections=[ReportSectionDraft.model_validate(row) for row in extra_candidate['sections']])
+            # Canonical assembly demotes local H2s; these are not a change to
+            # the output topology and must not restart the complete Writer.
+            self.assertIn('## Unrequested detail', extra_candidate['sections'][0]['draft_markdown'])
+            self.assertIn('### Unrequested detail', extra_body)
+            self.assertEqual(validate_output_outline(outline, extra_body), headings)
+            extra_files = {path.relative_to(extra_owner.root): path.read_bytes()
+                           for path in extra_owner.root.rglob('*') if path.is_file()}
+            original_files = {path.relative_to(owner.root): path.read_bytes()
+                              for path in owner.root.rglob('*') if path.is_file()}
+            for name, regroup, author_source, prior_body, current_outline in (
+                ('continue', False, candidate_source, candidate_body, outline),
+                ('regroup', True, candidate_source, candidate_body, changed),
+                ('body-extra-heading', False, extra_source, extra_body, outline),
+            ):
+                with self.subTest(case=name):
+                    current = ArtifactStore(Path(tmp) / name)
+                    fresh_context = kwargs['context'].model_copy(deep=True)
+                    fresh_context.source_handles = [row for row in fresh_context.source_handles
+                                                    if row.kind != 'prior_draft']
+                    new_request = replace(request, report_context=fresh_context,
+                        candidate_source=author_source, output_outline=current_outline,
+                        llm_client=Client())
+                    views.clear()
+                    labels.clear()
+                    result = run_report_writing_capability(context=CapabilityContext(current,
+                        AttemptManifest(current.root.name)), request=new_request)
+                    self.assertEqual(result.status, 'completed', result.diagnostics)
+                    self.assertEqual(labels[0], 'report-writer-document' if regroup else 'report-document-reviewer')
+                    if not regroup:
+                        self.assertNotIn('report-writer-document', labels)
+                    if name == 'body-extra-heading':
+                        self.assertIn('## Unrequested detail', views[0][1]['sections'][0]['markdown'])
+                    updated = current.read_json('writer.json')
+                    self.assertEqual([row['heading'] for row in updated['sections']],
+                                     [row['heading'] for row in current_outline])
+                    if regroup:
+                        prior = views[0][1]['previous_document']['drafts'][0]['retained_body']
+                        self.assertEqual(prior, prior_body)
+                        self.assertEqual(views[0][1]['review_findings'], [])
+                        self.assertEqual(len([row for row in updated['iterations']
+                            if row['action'] == 'document_joint_revise']), 1)
+                        self.assertEqual(current.read_json('report_inputs.json')['candidate_source'], author_source)
+                        validate_output_outline(current_outline, assemble_report_sections(
+                            title=fresh_context.topic, sections=[ReportSectionDraft.model_validate(row)
+                                for row in updated['sections']]))
+                    saved_checkpoint = current.ref('sections.json', kind='report_checkpoint', schema='report_checkpoint.v1')
+                    before = current.read_json('sections.json')['completed']
+                    with patch.object(new_request.llm_client, 'ask_json', side_effect=AssertionError('No round reset')):
+                        run_report_writing_capability(context=CapabilityContext(current,
+                            AttemptManifest(current.root.name), inputs=(saved_checkpoint,)),
+                            request=replace(new_request, resume_ref=saved_checkpoint, output_outline=()))
+                    self.assertEqual(current.read_json('sections.json')['completed'], before)
+                    if regroup:
+                        frozen = current.read_json('report_inputs.json')
+                        with self.assertRaisesRegex(ValueError, 'prior_draft differs'):
+                            run_report_writing_capability(context=CapabilityContext(current,
+                                AttemptManifest(current.root.name)),
+                                request=replace(new_request, prior_draft='Partial old body'))
+                        self.assertEqual(current.read_json('report_inputs.json'), frozen)
+            # Unknown/incomplete physical work is never made complete by a
+            # valid-looking writer/checkpoint or a new requested outline.
+            for broken in ('author', 'unknown-operation'):
+                with self.subTest(broken=broken):
+                    invalid = ArtifactStore(Path(tmp) / broken / owner.root.name)
+                    for name, content in original_files.items():
+                        target = invalid.resolve(name)
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_bytes(content)
+                    if broken == 'author':
+                        call = next(path for path in (invalid.root / 'writer/model_calls').glob('*/request.json')
+                            if json.loads(path.read_text(encoding='utf-8'))['options']['label'] == 'report-writer-document')
+                        call.with_name('response.json').unlink()
+                    else:
+                        invalid.write_json('writer/model_calls/unknown/request.json',
+                            {'options': {'label': 'unknown-operation'}})
+                    with self.assertRaisesRegex(ValueError, 'incomplete model operation'):
+                        section_author_source(invalid)
+            self.assertEqual({path.relative_to(owner.root): path.read_bytes()
+                              for path in owner.root.rglob('*') if path.is_file()}, original_files)
+            self.assertEqual({path.relative_to(extra_owner.root): path.read_bytes()
+                              for path in extra_owner.root.rglob('*') if path.is_file()}, extra_files)
         self.assertEqual(kwargs['memory'].model_dump(mode='json'), original_memory)
 
     def test_structured_article_explicit_headings_are_not_replaced_by_template(self):
@@ -1952,9 +2069,9 @@ class JointRevisionTests(unittest.TestCase):
                         kwargs['config'], events, adopted_identity=result.independent_review['assembly_identity']))
 
         with tempfile.TemporaryDirectory() as tmp:
-            owner = ArtifactStore(Path(tmp))
+            owner = ArtifactStore(Path(tmp) / 'pending-sections')
             writer = ArtifactStore(owner.root / 'writer')
-            from simple_ar.report.writing import retained_writing_client
+            from simple_ar.report.writing import retained_writing_client, section_author_source
             labels = []
             kwargs, raw_client = self._integrated_delivery_case(owner.root, labels, delivery_defect=True)
             client = retained_writing_client(store=writer, identity='pending-sections',
@@ -1985,6 +2102,97 @@ class JointRevisionTests(unittest.TestCase):
             recovered_payload = writer.read_json(produced)
             self.assertEqual(recovered_payload['pending_candidate'], pending)
             self.assertEqual(recovered_payload['independent_review'], payload['independent_review'])
+
+            # Reorganizing a complete negative candidate keeps its original
+            # physical opinions, without making old IDs current review targets.
+            owner.write_json('request.json', {'writing_owner': 'professional_report.v1',
+                'section_response_contract': 'atomic_complete.v2',
+                'report_binding': {'requirement': {'method': 'sections'}},
+                'delivery_review': kwargs['context'].results['delivery_review']})
+            author_source, authored = section_author_source(owner)
+            old_review = authored['checked_revision']['independent_review']
+            protected = {path: path.read_bytes() for path in owner.root.rglob('*') if path.is_file()}
+            current = ArtifactStore(Path(tmp) / 'reorganized-sections')
+            outline = [{'heading': heading, 'required': True} for heading in ('Observed result', 'Evidence limits')]
+            views = []
+
+            class Reorganizer:
+                def ask_json(inner, system, prompt, *, label='', **unused):
+                    view = prompt_payload(prompt)
+                    views.append((label, view))
+                    if label == 'report-writer-document':
+                        return {'sections': [{'section_id': row['section']['section_id'],
+                            'draft_markdown': 'A bounded explanation of the supplied evidence.'}
+                            for row in view['sections']]}
+                    self.assertEqual(label, 'report-document-reviewer')
+                    return {'section_reviews': [{'section_id': row['section_id'], 'verdict': 'pass'}
+                        for row in view['sections']]}
+
+            fresh = self.inputs()
+            fresh['context'].results['revision_feedback'] = {'contract': 'prior_prose_review.v1',
+                'path': 'an-earlier-review.json', 'sha256': 'a' * 64,
+                'section_reviews': [{'section_id': 'obsolete-id', 'verdict': 'revise_required'}]}
+            new_request = ReportWritingRequest(fresh['context'], fresh['memory'], fresh['config'],
+                fresh['template'], Reorganizer(), output_outline=outline, candidate_source=author_source)
+            from simple_ar.report.writing import _section_reorganization_feedback
+            lineage = ArtifactStore(Path(tmp) / 'different-lineage')
+            lineage.write_json('request.json', {'continued_source_review': 'checked_work.v1',
+                'candidate_source': {**author_source, 'owner': str(Path(tmp) / 'another-author')}})
+            with patch('simple_ar.report.writing.continued_checked_candidate', return_value={
+                    'sections': authored['sections'], 'independent_review': old_review}) as proof:
+                with self.assertRaisesRegex(ValueError, 'different retained author source binding'):
+                    _section_reorganization_feedback(fresh['context'], authored, author_source, lineage, None)
+                proof.assert_not_called()  # Identical prose cannot substitute for exact source identity.
+                historical = _section_reorganization_feedback(fresh['context'], authored, author_source,
+                    lineage, {'memory': {'survey_contract': {}}})
+                self.assertIs(historical, fresh['context'])
+                proof.assert_not_called()
+            result = run_report_writing_capability(context=CapabilityContext(current,
+                AttemptManifest(current.root.name)), request=new_request)
+            self.assertEqual(result.status, 'completed', result.diagnostics)
+            frozen = current.read_json('report_inputs.json')
+            feedback = frozen['context']['results']['revision_feedback']
+            self.assertEqual(feedback['section_reviews'], old_review['section_reviews'])
+            self.assertNotIn('prior_feedback', feedback)
+            self.assertNotIn('obsolete-id', json.dumps(feedback))
+            response = owner.resolve(old_review['inspection_source']['response_path'])
+            self.assertEqual(feedback['path'], str(response.resolve()))
+            self.assertEqual(feedback['sha256'], hashlib.sha256(response.read_bytes()).hexdigest())
+            self.assertEqual([label for label, _ in views], ['report-writer-document', 'report-document-reviewer'])
+            for label, view in views:
+                opinion = (view['prior_document_revision'] if label == 'report-writer-document' else
+                    view['delivery_text_observation']['prior_document_revision'])
+                self.assertEqual(opinion['feedback'], feedback)
+            self.assertEqual(views[0][1]['review_findings'], [])
+            self.assertFalse(views[1][1]['historical_findings_to_check'])
+            from simple_ar.report.agent import _outline_planner_prompt
+            from simple_ar.report.narrative import evidence_outline_context
+            bound_context = ReportContext.model_validate(frozen['context'])
+            bound_memory = ReportMemory.model_validate(frozen['memory'])
+            for view in (evidence_outline_context(bound_context, bound_memory, fresh['config']),
+                prompt_payload(_outline_planner_prompt(context=bound_context, memory=bound_memory,
+                    config=fresh['config'], template=fresh['template']))):
+                self.assertEqual(view['prior_document_revision']['feedback'], feedback)
+            written = current.read_json('writer.json')
+            self.assertEqual([row['heading'] for row in written['sections']], [row['heading'] for row in outline])
+            self.assertEqual(written['memory']['reviewer_findings'], [])
+            saved = current.ref('sections.json', kind='report_checkpoint', schema='report_checkpoint.v1')
+            completed = current.read_json('sections.json')['completed']
+            with patch.object(new_request.llm_client, 'ask_json', side_effect=AssertionError('No replay or allowance reset')):
+                run_report_writing_capability(context=CapabilityContext(current,
+                    AttemptManifest(current.root.name), inputs=(saved,)),
+                    request=replace(new_request, resume_ref=saved, output_outline=()))
+            self.assertEqual(current.read_json('report_inputs.json'), frozen)
+            self.assertEqual(current.read_json('sections.json')['completed'], completed)
+            raw = response.read_bytes()
+            try:
+                response.write_bytes(b'{}')
+                with self.assertRaisesRegex(ValueError, 'record changed'):
+                    run_report_writing_capability(context=CapabilityContext(current,
+                        AttemptManifest(current.root.name)), request=new_request)
+            finally:
+                response.write_bytes(raw)
+            self.assertEqual({path: path.read_bytes() for path in protected}, protected)
 
     def test_integrated_delivery_requires_transport_source_and_legacy_checkpoint_does_not_upgrade(self):
         kwargs = self.inputs()

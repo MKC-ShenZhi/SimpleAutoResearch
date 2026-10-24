@@ -2305,6 +2305,96 @@ class WritingCoordinationTests(unittest.TestCase):
             'A complete section candidate needs its new inspection, not selection or redrafting')
         self.assertIsNotNone(writing.continuation(checked.model_dump(mode='json'), 'section-rechecked'))
 
+    def test_inspected_author_output_gap_can_be_reorganized_without_adopting_failed_work(self):
+        from tests.report_review_fixtures import prompt_payload
+        from simple_ar.tools.writing import freeze_report_requirement, material_report_binding
+        root, workspace, writing, source, _, table, client, prompts = self._document_work_fixture()
+        writing.document_source_contract = 'document_source.v1'
+        select = client.ask_json.side_effect
+        repairing = False
+
+        def answer(system, prompt, **options):
+            label = options['label']
+            if label.startswith('composition-selection-'):
+                self.assertFalse(repairing, 'A complete author keeps its proven material recipe')
+                return select(system, prompt, **options)
+            view = prompt_payload(prompt)
+            prompts.append((label, view))
+            if label.startswith('report-writer-'):
+                previous = view.get('previous_document', {}).get('drafts', [])
+                if repairing:
+                    self.assertTrue(previous, 'Reorganization must retain the proved old body')
+                body = 'The supplied record says value=2.5. No new execution.'
+                if 'sections' in view:
+                    return {'sections': [{'section_id': row['section']['section_id'], 'draft_markdown': body}
+                        for row in view['sections']]}
+                return {'section_id': view['section']['section_id'], 'draft_markdown': body}
+            self.assertIn(label, {'report-document-reviewer', 'report-document-verifier'})
+            return {'section_reviews': [{'section_id': row['section_id'], 'verdict': 'pass', 'findings': []}
+                for row in view['sections']]}
+
+        client.ask_json.side_effect = answer
+        args = {'goal': 'Explain the recorded value and what was not executed',
+            'material_roots': [str(source)], 'writing_method': 'sections',
+            'required_headings': ['Recorded result', 'Execution limits'], 'finish': True}
+        requirement = freeze_report_requirement({'outline_strategy': 'auto',
+            'draft_scope': 'document', 'review_scope': 'document', 'reviewer': 'llm',
+            'document_review': True, 'max_review_iterations': 1,
+            'allow_source_backtracking': False, 'allow_llm_fallback': False,
+            'figures': {'enabled': False}}, method='sections')
+        writing.report_inputs = lambda: material_report_binding(workspace, requirement,
+            mounts=[str(source)], requests=[args['goal']])
+        writing.professional_inputs = True
+        # Reproduce a pre-contract template owner, rather than editing any
+        # saved receipt: all atomic author/reviewer responses freeze normally.
+        def legacy_plan(memory, *_):
+            memory.survey_contract = {**memory.survey_contract, 'outline_strategy': 'template'}
+            return memory
+        with patch('simple_ar.report.writing._fixed_section_memory', side_effect=legacy_plan):
+            failed = writing.call('compose_document', args, identity='output-gap')
+        self.assertEqual(failed.status, 'error', failed)
+        self.assertIn('fixed section structure', failed.error)
+        native = self._record_native_result(root, 'output-gap', failed)
+        observed = failed.model_dump(mode='json')
+        original = ArtifactStore(root / 'tools/writing/output-gap')
+        protected = {p: p.read_bytes() for folder in (original.root, native.root, source)
+            for p in folder.rglob('*') if p.is_file()}
+        ledger = writing.ledger.to_dict()
+        with patch.object(client, 'ask_json', side_effect=AssertionError('A work proof cannot call a model')):
+            self.assertIsNotNone(writing._author_completion_gap(observed, 'output-gap'))
+            self.assertTrue(writing.can_return_gap(observed, 'output-gap'))
+            visible = writing.coordination_result(failed, receipt_path='attempts/output-gap/native_result.json')
+            self.assertEqual(visible['status'], 'error')
+            self.assertEqual(visible['data']['retained_candidate']['status'], 'author_not_adopted')
+            self.assertFalse(visible['data']['mechanical_constraints']['adopted'])
+            changed = {**observed, 'error': 'An invented failure explanation'}
+            self.assertFalse(writing.can_return_gap(changed, 'output-gap'))
+            table.write_bytes(b'changed evidence')
+            self.assertFalse(writing.can_return_gap(observed, 'output-gap'))
+            table.write_bytes(protected[table])
+            response = next((original.root / 'writer/model_calls').glob('*/response.json'))
+            raw = response.read_bytes()
+            response.unlink()
+            self.assertFalse(writing.can_return_gap(observed, 'output-gap'))
+            response.write_bytes(raw)
+            checkpoint_path = original.resolve('writer/sections.json')
+            raw_checkpoint = checkpoint_path.read_bytes()
+            incomplete = json.loads(raw_checkpoint)
+            incomplete['completed']['document_review_done'] = False
+            checkpoint_path.write_text(json.dumps(incomplete), encoding='utf-8')
+            self.assertFalse(writing.can_return_gap(observed, 'output-gap'))
+            checkpoint_path.write_bytes(raw_checkpoint)
+        self.assertEqual(writing.ledger.to_dict(), ledger)
+        repairing = True
+        before = len(prompts)
+        revised = writing.call('compose_document', {'goal': args['goal'],
+            'prior_result': 'records/output-gap/native_result.json', 'finish': True}, identity='output-reorganized')
+        self.assertEqual(revised.status, 'ok', revised)
+        self.assertFalse(any(label.startswith('composition-selection-') for label, _ in prompts[before:]))
+        self.assertEqual(revised.data['constraints_checked']['headings'], args['required_headings'])
+        self.assertIsNotNone(writing.continuation(revised.model_dump(mode='json'), 'output-reorganized'))
+        self.assertEqual({p: p.read_bytes() for p in protected}, protected)
+
     def test_checked_section_revision_continues_as_work_without_waiving_its_findings(self):
         from tests.report_review_fixtures import prompt_payload
         root, workspace, writing, source, _, _, client, prompts = self._document_work_fixture()
