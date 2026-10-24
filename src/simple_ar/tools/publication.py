@@ -286,7 +286,8 @@ class PublicationToolGateway:
                 try:
                     manifest = export_acm_report(source.parent, output, title=request.title or None,
                         body_name=source.name, compile_pdf=request.compile_pdf, render_preview=request.render_preview, runner=render,
-                        validate_asset=validate_asset, caption_owner='markdown',
+                        validate_asset=validate_asset,
+                        caption_owner=(report_identity or {}).get('figure_caption_owner', 'markdown'),
                         **({'citation_style': request.citation_style} if request.citation_style is not None else {}),
                         **({'checks': request.checks.model_dump(exclude_none=True)} if request.checks is not None else {}),
                         **({'template': request.template.model_dump()} if request.template is not None else {}))

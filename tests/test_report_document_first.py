@@ -383,8 +383,10 @@ class DocumentFirstTests(unittest.TestCase):
 
 
     def test_composition_caption_ownership_selection_publication_and_recovery(self):
+        from types import SimpleNamespace
         from unittest.mock import Mock
         from simple_ar.core.budget import BudgetLedger
+        from simple_ar.tools.publication import PublicationToolGateway
         from simple_ar.tools.workspace import WorkspaceToolGateway
         from simple_ar.tools.writing import ComposeRequest, WritingToolGateway
 
@@ -399,14 +401,27 @@ class DocumentFirstTests(unittest.TestCase):
             image.write_bytes(original)
             caption = 'Observed *group counts*; supplied descriptive results. ' + (
                 'Scope and original measurement conditions remain part of the caption. ' * 16)
+            caption = caption.rstrip()
             ledger = BudgetLedger()
             workspace = WorkspaceToolGateway(root, {'source0': sources}, ledger)
             client = Mock()
             request = {'goal': 'Explain the recorded observations.', 'title': 'Group comparison',
-                'figures': [{'path': str(image), 'caption': caption}]}
-            draft = {'draft_markdown': f'## Observations\n\n![{caption}](figures/selected-1.svg)\n\nInterpretation remains limited.'}
+                'figures': [{'path': str(image), 'caption': caption}],
+                'professional_review': {'max_revision_rounds': 0}}
+            draft = {'draft_markdown': '## Observations\n\n![Group comparison](figures/selected-1.svg)'
+                '\n\nInterpretation remains limited.'}
             request['materials'] = [{'path': str(table)}]
-            client.ask_json.return_value = draft
+            review_views = []
+
+            def answer(system, prompt, *, label='', **unused):
+                if label == 'composition-article':
+                    self.assertIn('short descriptive alt text', system)
+                    return draft
+                self.assertEqual(label, 'article-independent-review')
+                review_views.append(json.loads(prompt))
+                return {'section_reviews': [{'section_id': 'document', 'verdict': 'pass', 'findings': []}]}
+
+            client.ask_json.side_effect = answer
             gateway = WritingToolGateway(root, workspace, ledger, 'retained-test-model', 'test',
                 client_factory=lambda identity: client)
             identity = 'caption-composition'
@@ -417,7 +432,7 @@ class DocumentFirstTests(unittest.TestCase):
             self.assertIn('assembly interrupted', interrupted.error)
             owner = root / 'tools/writing' / identity
             binding = json.loads((owner / 'request.json').read_text(encoding='utf-8'))
-            self.assertEqual(binding['figure_caption_contract'], 'pandoc_image.v1')
+            self.assertEqual(binding['figure_caption_contract'], 'assembly_captions.v1')
             self.assertEqual(binding['inputs'][-1]['caption'], caption)
             self.assertEqual(binding['inputs'][-1]['sha256'], hashlib.sha256(original).hexdigest())
             snapshot = json.loads((owner / 'writer/report_inputs.json').read_text(encoding='utf-8'))
@@ -428,16 +443,16 @@ class DocumentFirstTests(unittest.TestCase):
             self.assertFalse((owner / 'writer/sections.json').exists())
             figure = next(row for row in snapshot['inputs']['article']['source_handles'] if row['handle'].startswith('figure:'))
             self.assertEqual(figure['metadata']['caption'], caption)
-            # Metadata binds the supplied caption; summary carries the writer's
-            # embedding instructions. Both describe one publication caption.
-            self.assertIn('alt is the sole publication caption', figure['summary'])
-            self.assertIn('do not repeat it in an adjacent paragraph', figure['summary'])
-            self.assertIn('or assign a figure number', figure['summary'])
-            self.assertTrue(figure['summary'].endswith(caption))
-            prompt = json.loads(client.ask_json.call_args.args[1])
+            # The author places the asset; assembly owns the supplied caption.
+            self.assertEqual(figure['metadata']['caption_owner'], 'assembly')
+            self.assertIn('Assembly inserts the bound caption', figure['summary'])
+            self.assertNotIn(caption, draft['draft_markdown'])
+            self.assertEqual(snapshot['inputs']['article']['provided_figure_captions'],
+                {'figures/selected-1.svg': caption})
+            prompt = json.loads(client.ask_json.call_args_list[0].args[1])
             self.assertEqual([row for row in prompt['source_handles']
                 if row['handle'].startswith('figure:')], [figure])
-            self.assertEqual(client.ask_json.call_count, 1)
+            self.assertEqual(client.ask_json.call_count, 2)
             with patch.object(gateway, 'client_factory', side_effect=AssertionError('no model replay')):
                 composed = gateway.call('compose_document', request, identity=identity)
             self.assertEqual(composed.status, 'ok', composed.error)
@@ -449,8 +464,88 @@ class DocumentFirstTests(unittest.TestCase):
                 {'figures': [{'path': 'figures/selected-1.svg', 'caption': caption}]})
             self.assertIn(str(manifest.relative_to(root)).replace('\\', '/'), composed.artifacts)
             body = manuscript.read_text(encoding='utf-8')
-            self.assertIn(f'![{caption}](figures/selected-1.svg)', body)
-            self.assertEqual(body.count(caption), 1)
+            self.assertIn('![Group comparison](figures/selected-1.svg)', body)
+            self.assertIn('\n\n' + caption.rstrip() + '\n', body)
+            self.assertEqual(body.count(caption.rstrip()), 1)
+            self.assertEqual(len(review_views), 1)
+            self.assertEqual(review_views[0]['sections'][0]['markdown'], draft['draft_markdown'])
+            self.assertEqual(review_views[0]['delivery_text_observation']['markdown'], body)
+            self.assertEqual(review_views[0]['assembly_owned_content'], [{
+                'kind': 'provided_figure_caption', 'path': 'figures/selected-1.svg',
+                'owner': 'assembly', 'markdown': caption,
+                'markdown_token_count': len(caption.split()), 'preview_status': 'declared_preview_available'}])
+            # Consume the real receipt through the native publication gateway;
+            # neither the trusted identity nor the exporter is mocked.
+            source_identity = gateway.publication_source(composed.data['editable_markdown'], None)
+            self.assertEqual(source_identity['figure_caption_owner'], 'manifest')
+            self.assertEqual(source_identity['composition'], composed.data['version'])
+            self.assertEqual(source_identity['artifact_sha256'], composed.data['artifact_sha256'])
+            canonical_bytes = manuscript.read_bytes()
+            caption_inlines = [
+                {'t': 'Str', 'c': 'Observed '},
+                {'t': 'Emph', 'c': [{'t': 'Str', 'c': 'group counts'}]},
+                {'t': 'Str', 'c': caption.rstrip().split('*group counts*', 1)[1]},
+            ]
+            converted = []
+
+            def render(spec, **kwargs):
+                self.assertIs(kwargs['budget_ledger'], ledger)
+                spec.output_dir.mkdir(parents=True, exist_ok=True)
+                if '--format=pdf' in spec.argv:
+                    Path(spec.argv[spec.argv.index('--output') + 1]).write_bytes(b'%PDF-figure-fixture')
+                    text = ''
+                else:
+                    supplied = Path(spec.argv[-1]).read_text(encoding='utf-8')
+                    if '--to=json' in spec.argv:
+                        if supplied == caption:
+                            blocks = [{'t': 'Para', 'c': copy.deepcopy(caption_inlines)}]
+                        else:
+                            self.assertEqual(supplied, body)
+                            blocks = [
+                                {'t': 'Header', 'c': [1, ['', [], []], [
+                                    {'t': 'Str', 'c': 'Group comparison'}]]},
+                                {'t': 'Header', 'c': [2, ['', [], []], [
+                                    {'t': 'Str', 'c': 'Observations'}]]},
+                                {'t': 'Para', 'c': [{'t': 'Image', 'c': [
+                                    ['', [], []], [{'t': 'Str', 'c': 'Group comparison'}],
+                                    ['figures/selected-1.svg', 'fig:']]}]},
+                                {'t': 'Para', 'c': copy.deepcopy(caption_inlines)},
+                                {'t': 'Para', 'c': [{'t': 'Str', 'c': 'Interpretation remains limited.'}]},
+                            ]
+                        text = json.dumps({'pandoc-api-version': [1, 22], 'meta': {}, 'blocks': blocks})
+                    else:
+                        ast = json.loads(supplied)
+                        if '--standalone' not in spec.argv:
+                            converted.append((tuple(spec.argv), copy.deepcopy(ast)))
+                        # Only Pandoc's serialization is a fixture. Caption
+                        # selection and duplicate removal have already run.
+                        text = json.dumps(ast)
+                (spec.output_dir / 'stdout.log').write_text(text, encoding='utf-8')
+                return SimpleNamespace(returncode=0, stop_reason=None,
+                    record={'streams': {key: {'log_bytes_discarded': 0} for key in ('stdout', 'stderr')}})
+
+            publication = PublicationToolGateway(root, workspace, ledger,
+                report_source=lambda path: gateway.publication_source(path, None))
+            export_request = {'markdown': composed.data['editable_markdown'], 'compile_pdf': False}
+            with patch('simple_ar.report.export.shutil.which', side_effect=lambda name: name), \
+                    patch('simple_ar.tools.publication.run_process', side_effect=render) as processes:
+                exported = publication.call('export_report', export_request, identity='caption-export')
+                self.assertEqual(exported.status, 'ok', exported.error)
+                self.assertEqual(exported.data['report_identity'], source_identity)
+                self.assertEqual(exported.data['manifest']['figure_caption_owner'], 'manifest')
+                self.assertEqual(exported.data['manifest']['bound_figure_captions'], ['figures/selected-1.svg'])
+                count = processes.call_count
+                self.assertEqual(publication.call('export_report', export_request,
+                    identity='caption-export').data, exported.data)
+                self.assertEqual(processes.call_count, count)
+            self.assertTrue(any('--to=markdown' in argv for argv, _ in converted))
+            self.assertTrue(any('--to=latex' in argv for argv, _ in converted))
+            for _, ast in converted:
+                blocks = [block for block in ast['blocks'] if block['t'] != 'Header']
+                self.assertEqual(blocks[0]['c'][0]['c'][1], caption_inlines)
+                self.assertEqual(blocks[1:], [{'t': 'Para', 'c': [
+                    {'t': 'Str', 'c': 'Interpretation remains limited.'}]}])
+            self.assertEqual(manuscript.read_bytes(), canonical_bytes)
             self.assertEqual((manuscript.parent / 'figures/selected-1.svg').read_bytes(), original)
             self.assertEqual(image.read_bytes(), original)
             with self.assertRaises(ValueError):
@@ -475,6 +570,36 @@ class DocumentFirstTests(unittest.TestCase):
             changed['figures'][0]['caption'] = 'Changed caption.'
             self.assertEqual(gateway.call('compose_document', changed, identity=identity).status, 'error')
             self.assertEqual(ledger.entries, ())
+            # Retain historical author-owned inputs through the real writer,
+            # then recover them without a client or an assembly caption upgrade.
+            from simple_ar.report.writing import ARTICLE_SYSTEM, provided_caption_bindings, write_whole_article
+            from simple_ar.report.capability import ReportAssemblyRequest, preview_report_document
+            for contract in ('pandoc_image.v1', None):
+                with self.subTest(legacy_caption_contract=contract):
+                    legacy_binding = {'inputs': [{'manuscript_path': 'figures/selected-1.svg', 'caption': caption}]}
+                    if contract is not None:
+                        legacy_binding['figure_caption_contract'] = contract
+                    legacy_inputs = {'binding': legacy_binding, 'article': {'title': 'Group comparison'}}
+                    legacy_body = '![Authored caption](figures/selected-1.svg)\n\nDiscussion stays separate.'
+                    legacy_store = ArtifactStore(root / ('legacy-' + (contract or 'unmarked')))
+                    authored = write_whole_article(store=legacy_store, inputs=legacy_inputs,
+                        identity='legacy', client=Mock(ask_json=Mock(return_value={'draft_markdown': legacy_body})))
+                    self.assertEqual(legacy_store.read_json('report_inputs.json')['system'], ARTICLE_SYSTEM)
+                    retained = {path.relative_to(legacy_store.root): path.read_bytes()
+                        for path in legacy_store.root.rglob('*') if path.is_file()}
+                    recovered = write_whole_article(store=legacy_store, inputs=legacy_inputs,
+                        identity='legacy', recovering=True)
+                    self.assertEqual(recovered, authored)
+                    self.assertEqual({path.relative_to(legacy_store.root): path.read_bytes()
+                        for path in legacy_store.root.rglob('*') if path.is_file()}, retained)
+                    captions = provided_caption_bindings(legacy_binding)
+                    self.assertEqual(captions, {})
+                    preview = preview_report_document(ReportAssemblyRequest(title='Group comparison',
+                        sections=tuple(ReportSectionDraft.model_validate(row) for row in recovered['sections']),
+                        assembly_mode='whole_article', figure_captions=captions))
+                    self.assertIn(legacy_body, preview.report_body_markdown)
+                    self.assertNotIn(caption.rstrip(), preview.report_body_markdown)
+                    self.assertEqual('figure_caption_contract' in legacy_binding, contract is not None)
         # The legacy request still serializes bare paths, not synthetic captions.
         legacy = ComposeRequest.model_validate({'goal': 'Explain', 'title': 'Report', 'figures': ['old.png']})
         self.assertEqual(legacy.model_dump()['figures'], ['old.png'])

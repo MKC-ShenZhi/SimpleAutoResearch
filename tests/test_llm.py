@@ -1793,21 +1793,62 @@ class LLMParsingTests(unittest.TestCase):
 
     def test_with_budget_binds_a_client_copy_to_application_ledger(self) -> None:
         source = LLMClient(
-            LLMSettings(api_key="test-key", api_mode="chat", max_output_tokens=10),
+            LLMSettings(api_key="test-key", api_mode="chat", max_output_tokens=10,
+                        retry_attempts=1),
         )
-        ledger = BudgetLedger({"llm_requests": 1, "total_tokens": 50})
+        ledger = BudgetLedger({"llm_requests": 3, "total_tokens": 1000})
+        limits = dict(ledger.limits)
         client = source.with_budget(ledger, session_id="session-1")
         response = {
-            "choices": [{"message": {"content": "ok"}}],
+            "choices": [{"message": {"content": '{"ok":true}'}}],
             "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
         }
+        messages = [{"role": "user", "content": "user"}]
 
-        with patch("simple_ar.integrations.llm._call_openai_sdk", return_value=response):
-            self.assertEqual(client.ask("system", "user", label="plan"), "ok")
+        with patch("simple_ar.integrations.llm._call_openai_sdk", side_effect=[
+            response, response, TimeoutError("response lost"),
+        ]) as transport:
+            self.assertEqual(client.ask_json("system", "user", label="plan"), {"ok": True})
+            self.assertEqual(transport.call_count, 1)
+            self.assertEqual(ledger.remaining("llm_requests"), 2)
+            self.assertEqual(client.chat_turn(messages, tools=[], label="native")["content"],
+                             '{"ok":true}')
+            self.assertEqual(transport.call_count, 2)
+            self.assertEqual(ledger.remaining("llm_requests"), 1)
+            with self.assertRaises(LLMError):
+                client.chat_turn(messages, tools=[], label="lost")
+            self.assertEqual(transport.call_count, 3)
+            self.assertEqual(ledger.remaining("llm_requests"), 0)
+
+            # Both entry points must stop at the common ledger before transport.
+            accounted = ledger.to_dict()
+            for entry_point, invoke in (
+                ("ask_json", lambda: client.ask_json("system", "user", label="blocked")),
+                ("chat_turn", lambda: client.chat_turn(messages, tools=[], label="blocked")),
+            ):
+                with self.subTest(entry_point=entry_point), self.assertRaises(LLMError) as caught:
+                    invoke()
+                self.assertIsInstance(caught.exception.__cause__, BudgetExceededError)
+                self.assertIn("llm_requests", str(caught.exception.__cause__))
+                self.assertEqual(transport.call_count, 3)
+                self.assertEqual(ledger.to_dict(), accounted)
 
         self.assertIsNot(client, source)
-        self.assertEqual(ledger.entries[0].session_id, "session-1")
-        self.assertEqual(ledger.entries[0].actual["total_tokens"], 5)
+        self.assertEqual(ledger.limits, limits)
+        self.assertEqual([entry.session_id for entry in ledger.entries], ["session-1"] * 3)
+        self.assertEqual([entry.purpose for entry in ledger.entries], ["plan", "native", "lost"])
+        self.assertEqual([entry.status for entry in ledger.entries], ["settled", "settled", "unknown"])
+        for entry in ledger.entries[:2]:
+            self.assertEqual(entry.actual, {"llm_requests": 1, "total_tokens": 5})
+            self.assertEqual(entry.actual_source, "provider")
+        unknown = ledger.entries[2]
+        self.assertEqual(unknown.actual, {"llm_requests": 1})
+        self.assertEqual(unknown.actual_source, "reservation_bound")
+        self.assertEqual(unknown.reserved["llm_requests"], 1)
+        self.assertGreater(unknown.reserved["total_tokens"], 0)
+        self.assertEqual(ledger.unknown_dimensions(), ("total_tokens",))
+        self.assertEqual(ledger.remaining("total_tokens"),
+                         1000 - 10 - unknown.reserved["total_tokens"])
 
     def test_task_client_preserves_provider_and_budget_with_role_model_override(self) -> None:
         observed, local = [], []

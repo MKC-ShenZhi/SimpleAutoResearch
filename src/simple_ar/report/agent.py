@@ -195,9 +195,11 @@ def _section_delivery_assembly(context: ReportContext, memory: ReportMemory,
     if contract.get('contract') != SECTION_DELIVERY_REVIEW_CONTRACT:
         raise ValueError('Unknown section delivery review contract')
     options = contract['assembly']
-    if (set(options) - {'title', 'assembly_mode', 'template_name'}
+    if (set(options) - {'title', 'assembly_mode', 'template_name', 'figure_captions'}
             or options.get('assembly_mode') != 'section_drafts'):
         raise ValueError('Section delivery inspection requires explicit canonical section assembly options')
+    if options.get('figure_captions', {}) != context.results.get('provided_figure_captions', {}):
+        raise ValueError('Section inspection and assembly disagree on provided caption ownership')
     preview = preview_report_document(ReportAssemblyRequest(**options, sections=tuple(sections),
         config=config, document_plan=memory.document_plan, papers=tuple(context.papers),
         citation_key_map=context.citation_key_map))
@@ -972,6 +974,9 @@ def _edit_whole_document(
             ordered = _final_sequence(memory.section_plan, inspected)
             additions = supplied_data_delivery(context, config=config, plan=memory.document_plan,
                 section_ids=[row.section_id for row in ordered])
+            from simple_ar.report.capability import supplied_caption_blocks
+            caption_blocks = supplied_caption_blocks(context,
+                '\n\n'.join(row.draft_markdown for row in ordered))
             delivery = delivery_text_observation(context, memory, ordered, config, additions=additions)
             delivery.update(prior_document_revision(context, memory, include_baseline=True))
             assembly = _section_delivery_assembly(context, memory, ordered, config) if on_delivery_review else None
@@ -1021,7 +1026,7 @@ def _edit_whole_document(
                         metric_summary=_prompt_metrics(memory, detail="summary"),
                         source_evidence=[_prompt_handle_view(row) for row in memory.source_handles if row.kind in {"paper", "material"}],
                         writing_objective=report_objective(context, memory),
-                        assembly_owned_content=additions + _experiment_delivery_view(context, config),
+                        assembly_owned_content=additions + caption_blocks + _experiment_delivery_view(context, config),
                         delivery_text_observation=delivery,
                         delivery_review=context.results['delivery_review'] if assembly is not None else None,
                         delivery_assembly=assembly,

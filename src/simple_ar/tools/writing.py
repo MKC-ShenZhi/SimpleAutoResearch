@@ -2657,6 +2657,9 @@ class WritingToolGateway:
         result = {'composition': data['version'], 'manuscript': data['editable_markdown'],
             'receipt_sha256': hashlib.sha256(store.resolve('result.json').read_bytes()).hexdigest(),
             'artifact_sha256': data['artifact_sha256']}
+        from simple_ar.report.writing import provided_caption_bindings
+        if provided_caption_bindings(request):
+            result['figure_caption_owner'] = 'manifest'
         if adopted is not None and result != adopted:
             raise ValueError('Adopted canonical manuscript identity changed')
         return result
@@ -3180,7 +3183,7 @@ class WritingToolGateway:
 
     def call(self, name: str, arguments: dict[str, Any], *, identity: str) -> ToolResult:
         from simple_ar.integrations.llm import LLMClient
-        from simple_ar.report.capability import ReportAssemblyRequest, run_report_capability
+        from simple_ar.report.capability import ReportAssemblyRequest, run_report_capability, supplied_caption_options
         from simple_ar.report.assembler import ReportAssemblyMode
         from simple_ar.report.projection import build_material_report_inputs, apply_report_bibliography
         from simple_ar.report.schema import ReportContext, ReportRuntimeConfig, ReportSectionPlan, ReportDocumentPlan, SourceHandle, ReportMemory, finding_requires_resolution
@@ -3592,6 +3595,11 @@ class WritingToolGateway:
                 if prior_projection != projection:
                     raise ValueError('Prior resolved source/window projection changed')
             figure_inputs, figure_captions, figure_paths = [], [], set()
+            from simple_ar.report.writing import SUPPLIED_CAPTION_CONTRACT
+            figure_caption_contract = (original_binding.get('figure_caption_contract') if recovering
+                else SUPPLIED_CAPTION_CONTRACT)
+            if figure_caption_contract not in {None, 'pandoc_image.v1', SUPPLIED_CAPTION_CONTRACT}:
+                raise ValueError('Unknown frozen figure caption owner')
             required_figure_paths = []
             adopted_images = {}
             if request.adopt_draft:
@@ -3978,7 +3986,7 @@ class WritingToolGateway:
             if not recovering or 'assembly_mode' in original_binding:
                 binding['assembly_mode'] = assembly_mode.value
             if request.figures and (not recovering or 'figure_caption_contract' in original_binding):
-                binding['figure_caption_contract'] = 'pandoc_image.v1'
+                binding['figure_caption_contract'] = figure_caption_contract
             if not recovering or 'work_result_contract' in original_binding:
                 binding['work_result_contract'] = (original_binding['work_result_contract'] if recovering
                     else 'checked_candidate.v1')
@@ -4132,6 +4140,12 @@ class WritingToolGateway:
                     if target in explicit_captions:
                         summary += ' Use this exact supplied Markdown caption in the alt: ' + explicit_captions[target]
                         metadata['caption'] = explicit_captions[target]
+                elif binding.get('figure_caption_contract') == SUPPLIED_CAPTION_CONTRACT and target in explicit_captions:
+                    summary = (f'Place this supplied image using a standalone Markdown image with a short '
+                        f'description at {target}. Assembly inserts the bound caption from metadata. '
+                        'Do not retype that caption or number the figure; write discussion separately. '
+                        'Supplied caption text is presentation, not independent scientific verification.')
+                    metadata.update(caption=explicit_captions[target], caption_owner='assembly')
                 if (material_selection or {}).get('figure_selection_contract') == _FIGURE_SELECTION_CONTRACT:
                     placement = _figure_spec(supplied).get('placement', 'body')
                     metadata['placement'] = placement
@@ -4151,6 +4165,12 @@ class WritingToolGateway:
             # Older whole-article snapshots also serialized the prior draft as
             # a handle. Preserve that saved input shape on recovery, while new
             # articles send the prior body only once in article.prior_draft.
+            from simple_ar.report.writing import provided_caption_bindings
+            provided_captions = provided_caption_bindings(binding)
+            if provided_captions:
+                from simple_ar.report.assembler import bind_supplied_figure_captions
+                bind_supplied_figure_captions('', provided_captions)  # Reject malformed given captions before authoring.
+                context.results['provided_figure_captions'] = provided_captions
             prior_in_snapshot = (recovering and owner.exists('writer/report_inputs.json')
                 and any(row.get('kind') == 'prior_draft' for row in
                     owner.read_json('writer/report_inputs.json').get('inputs', {}).get(
@@ -4196,7 +4216,8 @@ class WritingToolGateway:
                 if binding.get('section_delivery_review_contract'):
                     context.results['section_delivery_review'] = {
                         'contract': binding['section_delivery_review_contract'],
-                        'assembly': {'title': request.title, 'assembly_mode': 'section_drafts'}}
+                        'assembly': {'title': request.title, 'assembly_mode': 'section_drafts',
+                            **supplied_caption_options(context)}}
                 resume = owner.ref('writer/sections.json', kind='report_checkpoint', schema='report_checkpoint.v1') if writer_store.exists('sections.json') else None
                 # The existing Writer/editor owns drafting, adaptive planning,
                 # revision, prompt caps and interrupted request recovery.
@@ -4300,7 +4321,8 @@ class WritingToolGateway:
                     reviewed_config.longform.target_words = request.target_words
                     context.results['section_delivery_review'] = {
                         'contract': binding['section_delivery_review_contract'],
-                        'assembly': {'title': request.title, 'assembly_mode': 'section_drafts'}}
+                        'assembly': {'title': request.title, 'assembly_mode': 'section_drafts',
+                            **supplied_caption_options(context)}}
                 written = write_section_article(store=writer_store, input_store=owner, documents_ref=ref,
                     identity=identity, report_context=context, title=request.title,
                     target_words=request.target_words, required_headings=request.required_headings,
@@ -4401,6 +4423,7 @@ class WritingToolGateway:
             assembled = run_report_capability(context=CapabilityContext(assembly_store, AttemptManifest(identity)),
                 request=ReportAssemblyRequest(title=request.title, sections=tuple(written['sections']), config=config,
                     assembly_mode=assembly_mode,
+                    **supplied_caption_options(context),
                     document_plan=memory.document_plan if memory is not None else None,
                     papers=tuple(context.papers), citation_key_map=context.citation_key_map), figure_renderer=renderer)
             if assembled.status != 'completed':
@@ -4478,6 +4501,9 @@ class WritingToolGateway:
                     raise ValueError('Supplied and generated figures have conflicting publication paths')
                 assets[target] = raw
             if figure_captions:
+                if provided_captions:
+                    from simple_ar.report.capability import supplied_caption_manifest
+                    figure_captions = supplied_caption_manifest(context)
                 figure_manifest = figure_manifest or {'figures': []}
                 rows = {row['path']: row for row in figure_manifest['figures']}
                 for row in figure_captions:

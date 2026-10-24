@@ -284,6 +284,8 @@ result does not rerun checks; changed files need a new export.
 
 The development exporter budgets figure and caption height together using the actual template layout. Captions that cannot fit, and unsupported composite/nested images, fail explicitly with sources retained. It preserves scientific text, numbering, links and citations; inspect compact figures and table wrapping yourself.
 
+For new development-branch compositions with explicit supplied captions, the author places a standalone image with a short description; assembly adds the supplied caption and publication binds that same text to the figure. An independent check sees the assembled text. Scientific discussion still belongs to the author, and different adjacent prose is retained for review rather than silently deleted. Historical compositions keep their saved caption policy.
+
 Model-based visual inspection additionally needs a configured vision connection
 and explicit `--allow-vision`; rendering alone does not grant it.
 

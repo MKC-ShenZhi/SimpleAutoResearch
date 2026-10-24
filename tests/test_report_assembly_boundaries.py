@@ -3,7 +3,9 @@ import unittest
 import tempfile
 from pathlib import Path
 
-from simple_ar.report.assembler import assemble_report_sections, apply_section_numbering
+from simple_ar.report.assembler import (
+    assemble_report_sections, apply_section_numbering, bind_supplied_figure_captions,
+)
 from simple_ar.report.schema import ReportSectionDraft
 from simple_ar.report.citations import strip_references_section
 from simple_ar.report.capability import ReportAssemblyRequest, assemble_report_document
@@ -13,6 +15,84 @@ from simple_ar.report.schema import ReportRuntimeConfig, ReportDocumentPlan
 
 
 class AssemblyBoundaryTests(unittest.TestCase):
+    def test_supplied_captions_bind_only_exact_standalone_images(self):
+        rich = r'Figure **A**: $x_i^2$ and \(y\), [source](https://example.org/a_(b)) [@paper].'
+        cases = [
+            ('exact', '![Original [alt]](figures/a.png "Title")',
+             {'figures/a.png': 'Caption A.'},
+             '![Original [alt]](figures/a.png "Title")\n\nCaption A.\n\n'),
+            ('reference', '![Original][plot]\n\n[plot]: figures/a.png "Title"\n',
+             {'figures/a.png': 'Caption A.'},
+             '![Original][plot]\n\nCaption A.\n\n[plot]: figures/a.png "Title"\n'),
+            ('paths', '![A](one/a.png)\n\n![B](two/a.png)\n',
+             {'one/a.png': 'First.', 'two/a.png': 'Second.', 'absent.png': 'Absent.'},
+             '![A](one/a.png)\n\nFirst.\n\n![B](two/a.png)\n\nSecond.\n\n'),
+            ('unknown aliases', '![A](a.png)\n\n![B](./figures/a.png)\n\nUnrelated text.',
+             {'figures/a.png': 'Caption A.'},
+             '![A](a.png)\n\n![B](./figures/a.png)\n\nUnrelated text.'),
+            ('fenced literal', '```markdown\n![A](a.png)\n```\n',
+             {'a.png': 'Caption A.'}, '```markdown\n![A](a.png)\n```\n'),
+            ('identical', '![A](a.png)\n\nCaption A.  \n', {'a.png': 'Caption A.'},
+             '![A](a.png)\n\nCaption A.  \n'),
+            ('emphasis', '![A](a.png)\n\n_Caption A._\n', {'a.png': 'Caption A.'},
+             '![A](a.png)\n\n_Caption A._\n'),
+            ('rich', '![A](<figures/a(b).png>)\n', {'figures/a(b).png': rich},
+             '![A](<figures/a(b).png>)\n\n' + rich + '\n\n'),
+            ('rich emphasis', '![A](a.png)\n\n*' + rich + '*\n', {'a.png': rich},
+             '![A](a.png)\n\n*' + rich + '*\n'),
+            ('caption reference', '![A](a.png)\n\n[source]: https://example.org\n',
+             {'a.png': 'See [source].'},
+             '![A](a.png)\n\nSee [source].\n\n[source]: https://example.org\n'),
+            ('multiline caption', '![A](a.png)', {'a.png': 'First line\nsecond line.'},
+             '![A](a.png)\n\nFirst line\nsecond line.\n\n'),
+            ('different prose', '![A](a.png)\n\nFigure 1: Caption A.\n\nOther prose.',
+             {'a.png': 'Caption A.'},
+             '![A](a.png)\n\nCaption A.\n\nFigure 1: Caption A.\n\nOther prose.'),
+            ('next heading', '![A](a.png)\n## Results\n', {'a.png': 'Caption A.'},
+             '![A](a.png)\n\nCaption A.\n\n## Results\n'),
+            ('crlf', '![A](a.png)\r\n\r\nProse.\r\n', {'a.png': 'Caption A.'},
+             '![A](a.png)\r\n\r\nCaption A.\r\n\r\nProse.\r\n'),
+            ('mixed prose', 'See ![A](a.png) here.', {'a.png': 'Caption A.'}, None),
+            ('two images', '![A](a.png) ![B](b.png)', {'a.png': 'Caption A.'}, None),
+            ('linked image', '[![A](a.png)](target)', {'a.png': 'Caption A.'}, None),
+            ('blockquote', '> ![A](a.png)\n', {'a.png': 'Caption A.'}, None),
+            ('list', '- ![A](a.png)\n', {'a.png': 'Caption A.'}, None),
+            ('heading image', '# ![A](a.png)', {'a.png': 'Caption A.'}, None),
+            ('blank caption', '', {'absent.png': ' \n'}, None),
+            ('multiple paragraphs', '![A](a.png)', {'a.png': 'First.\n\nSecond.'}, None),
+            ('heading caption', '![A](a.png)', {'a.png': '# Caption'}, None),
+            ('list caption', '![A](a.png)', {'a.png': '- Caption'}, None),
+            ('fenced caption', '![A](a.png)', {'a.png': '```\nCaption\n```'}, None),
+            ('definition caption', '', {'absent.png': 'Caption\n\n[x]: image.png'}, None),
+        ]
+        for name, body, captions, expected in cases:
+            with self.subTest(name=name):
+                if expected is None:
+                    with self.assertRaises(ValueError):
+                        bind_supplied_figure_captions(body, captions)
+                else:
+                    actual = bind_supplied_figure_captions(body, captions)
+                    self.assertEqual(actual, expected)
+                    self.assertEqual(bind_supplied_figure_captions(actual, captions), expected)
+        # Registered citation aliases in captions and prose share one converter;
+        # an uncited caption is valid when other parts of the article cite sources.
+        from simple_ar.report.capability import supplied_caption_manifest, preview_report_document
+        from simple_ar.report.schema import ReportContext
+        context = ReportContext(topic='Comparison', report_mode='supplied_materials',
+            papers=[{'id': 'source-a', 'title': 'Source A'}],
+            citation_key_map={'P1': 'source-a'}, results={'provided_figure_captions': {
+                'one.png': 'Recorded **observations** [@P1].', 'two.png': 'An uncited caption. '}})
+        normalized = supplied_caption_manifest(context)
+        self.assertEqual(normalized, [{'path': 'one.png', 'caption': 'Recorded **observations** [@source-a].'},
+            {'path': 'two.png', 'caption': 'An uncited caption.'}])
+        preview = preview_report_document(ReportAssemblyRequest(title=context.topic,
+            papers=tuple(context.papers), citation_key_map=context.citation_key_map,
+            figure_captions=context.results['provided_figure_captions'],
+            sections=(ReportSectionDraft(section_id='results', heading='Results',
+                draft_markdown='![A](one.png)\n\n![B](two.png)'),)))
+        for row in normalized:
+            self.assertIn(row['caption'], preview.report_body_markdown)
+
     def test_template_is_not_figure_intent_and_saved_config_keeps_original_contract(self):
         request = ReportAssemblyRequest(title='Report', template_name='survey_long',
             sections=(ReportSectionDraft(section_id='taxonomy', heading='Taxonomy',

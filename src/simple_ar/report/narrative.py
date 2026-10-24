@@ -433,14 +433,18 @@ def delivery_text_observation(
             result["pending_owner_sections"].append(owner.section_id)
         assembled = attach_delivery_block(assembled, block)
     try:
+        from simple_ar.report.capability import supplied_caption_options
         preview = preview_report_document(ReportAssemblyRequest(title=context.topic, sections=assembled,
             config=config, document_plan=memory.document_plan, template_name=memory.template,
             papers=tuple(context.papers), citation_key_map=context.citation_key_map,
-            experiment_context=context if context.report_mode == "experiment" else None))
+            experiment_context=context if context.report_mode == "experiment" else None,
+            **supplied_caption_options(context)))
     except CitationError as exc:
         result["unavailable_reason"] = str(exc)
     else:
         budget = memory.document_plan.length_budget if memory.document_plan else {}
+        if context.results.get('provided_figure_captions'):
+            result['provided_figure_captions'] = context.results['provided_figure_captions']
         body_count = manuscript_body_tokens(preview.report_body_markdown)
         delivery_count = len(preview.report_markdown.split())
         selected_count = document_tokens(preview.report_body_markdown, preview.report_markdown, budget.get("scope", ""))

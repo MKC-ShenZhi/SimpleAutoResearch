@@ -21,6 +21,7 @@ from simple_ar.research.evidence.bibliography import CITATION_FIELD_VALUE_RULE
 ARTICLE_OWNER = 'direct_article.v1'
 ARTICLE_REVIEW_BODY_CONTRACT = 'whole_article_body.v1'
 SECTION_ARTICLE_OWNER = 'section_article.v1'
+SUPPLIED_CAPTION_CONTRACT = 'assembly_captions.v1'
 ARTICLE_CITATION_CONTRACT = {
     'version': 'registered_body.v1',
     'body': 'Attribute source-backed claims inline using [@P1] with citation_key_map, or '
@@ -83,6 +84,42 @@ ARTICLE_PARAGRAPH_EDIT_SYSTEM = ARTICLE_EDIT_SYSTEM.replace(
     'Alternatively an individual edit may use exactly {old_text, new_text} for an exact unique span. '
     'Never mix selector fields in one edit. Targets must be distinct and must not intersect. '
     'All edits refer to the original body, not earlier replacements. ')
+
+
+def provided_caption_bindings(binding: dict[str, Any]) -> dict[str, str]:
+    """The composition's explicit caption owner, not another writing decision."""
+    contract = binding.get('figure_caption_contract')
+    if contract not in {None, 'pandoc_image.v1', SUPPLIED_CAPTION_CONTRACT}:
+        raise ValueError('Unknown frozen figure caption owner')
+    if contract != SUPPLIED_CAPTION_CONTRACT:
+        return {}
+    rows = [row for row in binding['inputs'] if 'manuscript_path' in row and 'caption' in row]
+    captions = {row['manuscript_path']: row['caption'] for row in rows}
+    if len(captions) != len(rows):
+        raise ValueError('Provided figure captions have conflicting presentation owners')
+    return captions
+
+
+def _article_system(inputs: dict, *, editing: bool, edit_contract: dict) -> str:
+    system = ((ARTICLE_EDIT_SYSTEM if edit_contract['version'] == 'exact_replacements.v1'
+        else ARTICLE_PARAGRAPH_EDIT_SYSTEM) if editing else ARTICLE_SYSTEM)
+    if inputs['article'].get('publication_caption_contract') == SUPPLIED_CAPTION_CONTRACT:
+        system = system.replace(
+            'Use supplied figures when relevant as standalone Markdown images, with the exact '
+            'caption when provided in the alt, without adjacent duplicate captions or figure numbers. ',
+            'Use supplied figures as standalone Markdown images with short descriptive alt text. '
+            'Assembly binds the explicit provided_figure_captions as presentation paragraphs; '
+            'do not retype those captions, add a second caption or assign figure numbers. '
+            'Write scientific discussion separately. ')
+    return system
+
+
+def _article_context(article: dict) -> ReportContext:
+    """Reconstruct the same native article evidence for review and replay."""
+    return ReportContext(topic=article['title'], report_mode='supplied_materials',
+        goal_markdown=article['goal'], source_handles=article['source_handles'],
+        papers=article['bibliography'], citation_key_map=article['citation_key_map'],
+        results={key: article[key] for key in ('delivery_review', 'provided_figure_captions') if key in article})
 
 
 def _article_edit_contract(prior: str, saved: Any = None, *, version: str = 'paragraph_replacements.v2') -> dict[str, Any]:
@@ -231,6 +268,9 @@ def article_writing_inputs(*, report_context: ReportContext, documents: Document
         'bibliography': report_context.papers, 'citation_key_map': report_context.citation_key_map}
     if 'delivery_review' in report_context.results:
         article['delivery_review'] = report_context.results['delivery_review']
+    if report_context.results.get('provided_figure_captions'):
+        article['publication_caption_contract'] = SUPPLIED_CAPTION_CONTRACT
+        article['provided_figure_captions'] = report_context.results['provided_figure_captions']
     if 'source_feedback' in report_context.results:
         article['source_feedback'] = report_context.results['source_feedback']
     if enforce_citation_contract:
@@ -403,6 +443,10 @@ def completed_composition_writer(*, store: ArtifactStore, binding: dict[str, Any
     snapshot = writer.read_json('report_inputs.json')
     documents = store.ref('documents.json', kind='documents', schema='document_bundle.v1')
     owner = binding.get('writing_owner')
+    caption_context = (snapshot.get('inputs', {}).get('article', {})
+        if snapshot.get('owner') == ARTICLE_OWNER else snapshot.get('context', {}).get('results', {}))
+    if caption_context.get('provided_figure_captions', {}) != provided_caption_bindings(binding):
+        raise ValueError('Writer caption ownership differs from its bound figure inputs')
     if owner == ARTICLE_OWNER:
         if snapshot.get('inputs', {}).get('binding') != binding:
             raise ValueError('Prior article input binding changed')
@@ -612,10 +656,11 @@ def write_whole_article(*, store: Any, inputs: dict[str, Any], identity: str,
         if resume_store is not None and isinstance(snapshot, dict):
             identity = snapshot.get('source_attempt')
         # Historical requests retain their original prompt, not today's method.
-        editing = isinstance(snapshot, dict) and snapshot.get('system') in (
-            ARTICLE_EDIT_SYSTEM, ARTICLE_PARAGRAPH_EDIT_SYSTEM)
         if isinstance(snapshot, dict) and 'edit_contract' in snapshot:
             edit_contract = _article_edit_contract(prior, snapshot['edit_contract'])
+        editing = isinstance(snapshot, dict) and snapshot.get('system') in (
+            ARTICLE_EDIT_SYSTEM, ARTICLE_PARAGRAPH_EDIT_SYSTEM,
+            _article_system(inputs, editing=True, edit_contract=edit_contract))
         expected_keys = {'owner', 'source_attempt', 'system', 'inputs', 'snapshot_id'}
         if isinstance(snapshot, dict) and 'edit_contract' in snapshot:
             expected_keys.add('edit_contract')
@@ -630,12 +675,14 @@ def write_whole_article(*, store: Any, inputs: dict[str, Any], identity: str,
                 or snapshot['owner'] != ARTICLE_OWNER or snapshot['source_attempt'] != identity
                 or snapshot['inputs'] != inputs
                 or not isinstance(snapshot['system'], str)
-                or (not editing and hashlib.sha256(snapshot['system'].encode('utf-8')).hexdigest() not in _ARTICLE_SYSTEM_SHA256)
+                or (not editing and (
+                    snapshot['system'] != _article_system(inputs, editing=False, edit_contract=edit_contract)
+                    if inputs['article'].get('publication_caption_contract') == SUPPLIED_CAPTION_CONTRACT else
+                    hashlib.sha256(snapshot['system'].encode('utf-8')).hexdigest() not in _ARTICLE_SYSTEM_SHA256))
                 or ('edit_contract' in snapshot and snapshot['edit_contract'] != edit_contract)
                 or (not editing and 'edit_contract' in snapshot and bool(prior))
                 or (editing and (not prior or snapshot['edit_contract'] != edit_contract
-                    or snapshot['system'] != (ARTICLE_EDIT_SYSTEM if edit_contract['version'] == 'exact_replacements.v1'
-                                              else ARTICLE_PARAGRAPH_EDIT_SYSTEM)
+                    or snapshot['system'] != _article_system(inputs, editing=True, edit_contract=edit_contract)
                     or snapshot['response_record_contract'] != 'atomic_complete.v1'))
                 or snapshot['snapshot_id'] != digest({key: value for key, value in snapshot.items()
                                                      if key != 'snapshot_id'})):
@@ -645,8 +692,7 @@ def write_whole_article(*, store: Any, inputs: dict[str, Any], identity: str,
         if client is None:
             raise ValueError('Report writing requires an LLM client; no offline paper is invented.')
         editing = bool(prior) and edit_prior
-        system = ((ARTICLE_EDIT_SYSTEM if edit_contract['version'] == 'exact_replacements.v1'
-                   else ARTICLE_PARAGRAPH_EDIT_SYSTEM) if editing else ARTICLE_SYSTEM)
+        system = _article_system(inputs, editing=editing, edit_contract=edit_contract)
         snapshot = {'owner': ARTICLE_OWNER, 'source_attempt': identity, 'system': system, 'inputs': inputs,
             'prompt_contract': 'article_authoring_evidence.v1'}
         if edit_prior:
@@ -884,10 +930,25 @@ def inspect_article(*, store: ArtifactStore, identity: str, client: Any,
         metric_sources=report_context.metric_sources,
         document_plan=ReportDocumentPlan(title=report_context.topic, sections=[section], status='resolved'))
     if (not any(row.kind in {'paper', 'material'} for row in report_context.source_handles)
-            and not report_context.metric_sources and not report_context.results):
+            and not report_context.metric_sources
+            and not any(key != 'provided_figure_captions' for key in report_context.results)):
         memory.limitations.append('No independent source/material evidence supplied: inspect prose, but do not certify factual claims.')
     review_config = config.model_copy(update={'reviewer': 'llm', 'document_review': True,
         'review_scope': 'document', 'allow_source_backtracking': False, 'max_review_iterations': 0})
+    caption_view = {}
+    if report_context.results.get('provided_figure_captions'):
+        from simple_ar.report.capability import (ReportAssemblyRequest, preview_report_document,
+            supplied_caption_blocks, supplied_caption_options)
+        preview = preview_report_document(ReportAssemblyRequest(title=report_context.topic,
+            sections=(ReportSectionDraft(section_id='document', heading=report_context.topic,
+                draft_markdown=markdown),), config=config, assembly_mode='whole_article',
+            papers=tuple(report_context.papers), citation_key_map=report_context.citation_key_map,
+            **supplied_caption_options(report_context)))
+        caption_view = {'assembly_owned_content': supplied_caption_blocks(report_context, markdown),
+            'delivery_text_observation': {'provided_figure_captions': report_context.results['provided_figure_captions'],
+                'preview_status': 'pre_render_text_preview',
+                'markdown': preview.report_body_markdown,
+                'markdown_token_count': len(preview.report_body_markdown.split())}}
     reviews = review_document(client=RetainedReviewClient(), template=template, memory=memory,
         sections=[ReportSectionDraft(section_id='document', heading=report_context.topic, draft_markdown=markdown)],
         config=review_config, execution_summary=_compact_execution_results(report_context.results),
@@ -901,6 +962,7 @@ def inspect_article(*, store: ArtifactStore, identity: str, client: Any,
         metric_summary=_prompt_metrics(memory, detail='summary'), complete_candidate=True,
         source_evidence=[_prompt_handle_view(row) for row in report_context.source_handles
                          if row.kind in {'paper', 'material'}], label='article-independent-review',
+        **caption_view,
         **({'delivery_review': report_context.results['delivery_review']}
             if 'delivery_review' in report_context.results else {}))
     constraints = None
@@ -1143,11 +1205,7 @@ def run_composition_article(*, store: ArtifactStore, inputs: dict[str, Any], ide
     from simple_ar.report.templates import load_report_template_bundle
     config = ReportRuntimeConfig.model_validate(inputs['assembly_config'])
     article = inputs['article']
-    context = ReportContext(topic=article['title'], report_mode='supplied_materials', goal_markdown=article['goal'],
-        source_handles=article['source_handles'], papers=article['bibliography'],
-        citation_key_map=article['citation_key_map'])
-    if 'delivery_review' in article:
-        context.results['delivery_review'] = article['delivery_review']
+    context = _article_context(article)
     template = load_report_template_bundle(report_mode=context.report_mode, config=config)
     memory = initialize_report_memory(context=context, template=template)
     return run_report_writing_capability(context=CapabilityContext(store, AttemptManifest(identity)),
@@ -1492,10 +1550,7 @@ def retained_article_candidate(owner: ArtifactStore, binding: dict[str, Any], *,
         from simple_ar.report.templates import load_report_template_bundle
         config = ReportRuntimeConfig.model_validate(snapshot['inputs']['assembly_config'])
         article = snapshot['inputs']['article']
-        context = ReportContext(topic=article['title'], report_mode='supplied_materials', goal_markdown=article['goal'],
-            source_handles=article['source_handles'], papers=article['bibliography'], citation_key_map=article['citation_key_map'])
-        if 'delivery_review' in article:
-            context.results['delivery_review'] = article['delivery_review']
+        context = _article_context(article)
         frozen = {'context': context.model_dump(mode='json'),
             'template': load_report_template_bundle(report_mode=context.report_mode, config=config).model_dump(mode='json')}
     else:
@@ -1609,6 +1664,9 @@ def validate_document_inspection(store: ArtifactStore, binding: dict, data: dict
                      'markdown': row['draft_markdown']} for row in reviewed_sections]:
                 return False
             if view.get('task') != 'review_document_coherence':
+                return False
+            captions = provided_caption_bindings(binding)
+            if captions and view.get('delivery_text_observation', {}).get('provided_figure_captions') != captions:
                 return False
             if snapshot is not None and (view.get('delivery_review_contract') != DELIVERY_REVIEW_CONTRACT
                     or restore_delivery_producers(view) != snapshot['artifacts']
@@ -1775,11 +1833,7 @@ def checked_writing_candidate(owner: ArtifactStore, binding: dict, *,
         if standalone:
             from simple_ar.report.templates import load_report_template_bundle
             original = frozen['article']
-            context = ReportContext(topic=original['title'], report_mode='supplied_materials',
-                goal_markdown=original['goal'], source_handles=original['source_handles'],
-                papers=original['bibliography'], citation_key_map=original['citation_key_map'])
-            if 'delivery_review' in original:
-                context.results['delivery_review'] = original['delivery_review']
+            context = _article_context(original)
             template = load_report_template_bundle(report_mode=context.report_mode, config=config)
         else:
             context = ReportContext.model_validate(frozen['binding']['context'])
@@ -1798,10 +1852,12 @@ def checked_writing_candidate(owner: ArtifactStore, binding: dict, *,
                 if standalone else ()))
         from simple_ar.report.capability import ReportAssemblyRequest, preview_report_document
         from simple_ar.report.assembler import ReportAssemblyMode
+        from simple_ar.report.capability import supplied_caption_options
         preview = preview_report_document(ReportAssemblyRequest(title=binding['request']['title'],
             sections=tuple(ReportSectionDraft.model_validate(row) for row in sections),
             assembly_mode=ReportAssemblyMode.WHOLE_ARTICLE, config=config,
-            papers=tuple(context.papers), citation_key_map=context.citation_key_map))
+            papers=tuple(context.papers), citation_key_map=context.citation_key_map,
+            **supplied_caption_options(context)))
         body = preview.report_body_markdown
         identity = {'body_sha256': hashlib.sha256(body.encode('utf-8')).hexdigest(),
             'sections_sha256': hashlib.sha256(json.dumps(sections, sort_keys=True,
@@ -1883,6 +1939,8 @@ def retained_section_candidate(source: dict[str, Any], *, _seen: frozenset[Path]
         if not path.resolve().is_relative_to(owner.root.resolve()) or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
             raise ValueError('Retained section candidate record changed')
     binding, inputs = owner.read_json('request.json'), owner.read_json('writer/report_inputs.json')
+    if inputs['context'].get('results', {}).get('provided_figure_captions', {}) != provided_caption_bindings(binding):
+        raise ValueError('Retained section caption owner differs from its bound inputs')
     written, checkpoint = owner.read_json('writer/writer.json'), owner.read_json('writer/sections.json')
     identity = owner.root.name
     native = binding.get('writing_owner') == SECTION_ARTICLE_OWNER
@@ -1917,7 +1975,9 @@ def retained_section_candidate(source: dict[str, Any], *, _seen: frozenset[Path]
                 or inputs['context'].get('topic') != saved.get('title')
                 or results.get('section_delivery_review') != {
                     'contract': 'section_delivery_review.v1',
-                    'assembly': {'title': saved.get('title'), 'assembly_mode': 'section_drafts'}}
+                    'assembly': {'title': saved.get('title'), 'assembly_mode': 'section_drafts',
+                        **({'figure_captions': results['provided_figure_captions']}
+                            if 'provided_figure_captions' in results else {})}}
                 or not isinstance(binding.get('delivery_review'), dict)
                 or binding['delivery_review'].get('contract') != 'delivery_artifacts.v1'
                 or results.get('delivery_review') != binding['delivery_review']

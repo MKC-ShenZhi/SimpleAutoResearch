@@ -602,7 +602,11 @@ def review_document(
     }
     if author_owns_body:
         view["focus"].append(
-            "The author owns the complete supplied article body, including its tables, image links and captions. "
+            ("The author owns prose, tables and image placement; explicit provided_figure_captions belong to assembly. "
+             "Short image alt text is accessibility text, not a second displayed caption. Inspect the canonical "
+             "preview and declared caption additions; do not require the author to retype a supplied caption. "
+             if (delivery_text_observation or {}).get('provided_figure_captions') else
+             "The author owns the complete supplied article body, including its tables, image links and captions. ") +
             "Assembly preserves that body; source packages alone do not declare duplicate assembly additions. "
             "Review body presentation and supported corrections within edit_scope. Original source data and "
             "measurements, actual image bytes, generated references and explicitly declared assembly blocks remain protected. "
@@ -622,6 +626,11 @@ def review_document(
             "introduced problems as concrete anchored findings. Do not return historical finding_checks."
         )
         view["output_schema"]["section_reviews"][0]["notes"] = "Current-section assessment against the task and evidence."
+    if (delivery_text_observation or {}).get('provided_figure_captions') and not author_owns_body:
+        view['focus'].append('Explicit provided_figure_captions are assembly-owned paragraphs in the '
+            'canonical preview, not independent scientific facts. Short image alt is accessibility text; '
+            'do not demand that the author retype a supplied caption there. Check the actual declared '
+            'caption and preserve authored discussion; source packages alone do not prove duplicated prose.')
     if delivery_text_observation is not None:
         # One count scope for native callers: do not expose the partial
         # section+attachment sum as a competing complete delivery length.

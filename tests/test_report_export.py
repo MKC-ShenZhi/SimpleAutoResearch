@@ -1130,6 +1130,7 @@ class ReportExportTests(unittest.TestCase):
             document["blocks"].append({"t": "Para", "c": [{"t": "Link", "c": [
                 ["", [], []], [{"t": "Str", "c": "Measured source"}], ["../../experiment/results.json", ""],
             ]}]})
+            converted_documents = []
             def convert(argv, **kwargs):
                 if "--to=json" in argv:
                     if kwargs['text'] in {'Recorded comparison.', 'Other caption.'}:
@@ -1137,6 +1138,8 @@ class ReportExportTests(unittest.TestCase):
                             [{'t': 'Str', 'c': kwargs['text']}]}]})
                     return json.dumps(document)
                 data = json.loads(kwargs["text"])
+                if '--standalone' not in argv:
+                    converted_documents.append((tuple(argv), data))
                 if "--to=markdown" in argv:
                     image = data["blocks"][-2]["c"][0]["c"][-1][0]
                     self.assertEqual(data['blocks'][-2]['c'][0]['c'][1], caption)
@@ -1158,6 +1161,19 @@ class ReportExportTests(unittest.TestCase):
                 revised = export_acm_report(source, root / 'canonical', caption_owner='markdown')
                 self.assertEqual(revised['figure_caption_owner'], 'markdown')
                 self.assertEqual(revised['bound_figure_captions'], [])
+                # Legacy Markdown ownership keeps the authored caption even
+                # when the adjacent manifest still records the old wording.
+                # Check both writer inputs, not only the Markdown fixture.
+                revised_documents = converted_documents[-2:]
+                self.assertEqual({arg for argv, _ in revised_documents for arg in argv
+                    if arg.startswith('--to=')}, {'--to=latex', '--to=markdown'})
+                for _, converted in revised_documents:
+                    images = [node for node in _nodes(converted['blocks']) if node.get('t') == 'Image']
+                    self.assertEqual(len(images), 1)
+                    self.assertEqual(images[0]['c'][1], caption)
+                    self.assertEqual(sum(node == {'t': 'Str', 'c': 'Revised canonical comparison.'}
+                        for node in _nodes(converted['blocks'])), 1)
+                    self.assertNotIn('Recorded comparison.', json.dumps(converted['blocks']))
                 self.assertEqual(revised['figure_exports'], result['figure_exports'])
                 self.assertEqual((root / 'canonical' / revised['figure_exports']['original.png']['svg']).read_text(), vector)
                 # Two different declared owners for one path must fail before

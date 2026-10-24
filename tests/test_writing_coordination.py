@@ -2419,11 +2419,12 @@ class WritingCoordinationTests(unittest.TestCase):
         writing.document_source_contract = 'document_source.v1'
         select = client.ask_json.side_effect
         continuing = False
-        # The 0078 structure: the original has one wrongly located image; the
-        # checked rejected proposal fixes its path but still fails its caption.
-        old_scope = '![Wrong caption](outputs/figure/main_figure.png)'
-        revised_scope = '![Still wrong caption](figures/selected-1.png)'
-        final_scope = '![Recorded value and scope.](figures/selected-1.png)'
+        # A checked proposal fixes the asset path but still omits the actual
+        # execution boundary. Presentation ownership must not waive that gap.
+        old_scope = 'This record establishes a general conclusion.\n\n![Overview](outputs/figure/main_figure.png)'
+        revised_scope = 'Only the recorded observation is described.\n\n![Overview](figures/selected-1.png)'
+        final_scope = ('Only the recorded observation is described; no new experiment was run.\n\n'
+            '![Overview](figures/selected-1.png)')
         figure = source / 'main_figure.png'
         figure.write_bytes(b'\x89PNG\r\n\x1a\nfixture image bytes')
 
@@ -2447,8 +2448,9 @@ class WritingCoordinationTests(unittest.TestCase):
                 return {'sections': drafted} if 'sections' in view else drafted[0]
             if label == 'report-document-joint-reviser':
                 if continuing:
-                    self.assertIn(revised_scope, json.dumps(view))
-                    self.assertNotIn(old_scope, json.dumps(view))
+                    bodies = [row['previous_draft']['draft_markdown'] for row in view['sections']]
+                    self.assertIn(revised_scope, bodies)
+                    self.assertNotIn(old_scope, bodies)
                 return {'sections': [{'section_id': row['section']['section_id'],
                     'draft_markdown': (final_scope if continuing else revised_scope)
                         if row['section']['heading'] == 'Scope' else 'The supplied record says value=2.5.'}
@@ -2458,11 +2460,11 @@ class WritingCoordinationTests(unittest.TestCase):
             for row in view['sections']:
                 body = row['markdown']
                 needs = row['heading'] == 'Scope' and body != final_scope
-                finding = {'finding_id': 'F1-figure-exact-caption-and-path' if body == old_scope
-                        else 'findings_figure_caption_exactness', 'type': 'style',
+                finding = {'finding_id': 'F1-record-scope' if body == old_scope
+                        else 'remaining_execution_scope', 'type': 'missing_limitation',
                     'severity': 'major',
                     'required_action': 'revise', 'section_id': row['section_id'],
-                    'message': 'Use the exact supplied figure caption and publication path.',
+                    'message': 'State that the report describes saved observations and no new experiment was run.',
                     'draft_quotes': [{'section_id': row['section_id'], 'quote': body}]}
                 reviews.append({'section_id': row['section_id'],
                     'verdict': 'warning' if needs else 'pass', 'findings': [finding] if needs else []})
@@ -2477,7 +2479,7 @@ class WritingCoordinationTests(unittest.TestCase):
         templates = ArtifactStore(root / 'zero-round-templates')
         templates.write_text('report.md', '# Recorded value and scope\n\n'
             '## Results\nExplain the record.\n\n## Scope\nState the figure and limits.\n')
-        templates.write_text('criteria.md', 'Use the exact supplied figure caption and publication path.\n')
+        templates.write_text('criteria.md', 'Respect the saved observation and execution scope.\n')
         zero_requirement = freeze_report_requirement({'template': str(templates.resolve('report.md')),
             'criteria': str(templates.resolve('criteria.md')), 'outline_strategy': 'template',
             'draft_scope': 'document', 'review_scope': 'document', 'reviewer': 'llm',
@@ -2514,7 +2516,7 @@ class WritingCoordinationTests(unittest.TestCase):
         self.assertIn(revised_scope, workspace.resolve(first.data['editable_markdown']).read_text())
         self.assertFalse(workspace.resolve(first.data['version'] + '/manuscript.md').exists())
         self.assertEqual([row['finding_id'] for row in first.data['unresolved']],
-            ['findings_figure_caption_exactness'])
+            ['remaining_execution_scope'])
         with self.assertRaisesRegex(ValueError, 'Unresolved work'):
             writing.check_delivery(first.data)
         with self.assertRaisesRegex(ValueError, 'unresolved'):
@@ -2543,7 +2545,7 @@ class WritingCoordinationTests(unittest.TestCase):
             self.assertNotIn('retained_candidate', writing.coordination_result(first)['data'])
         # Also admit the saved pre-fix failure shape: no composition result,
         # but a complete checked proposal and a registered native error. This
-        # changes only this fixture, never the real 0078 evidence or ledger.
+        # changes only this fixture, never historical evidence or ledgers.
         owner.resolve('result.json').unlink()
         legacy = ToolResult(tool_name='compose_document', status='error',
             data={'incomplete': True, 'failure_kind': 'image_reference'},
@@ -2627,9 +2629,9 @@ class WritingCoordinationTests(unittest.TestCase):
         select = client.ask_json.side_effect
         figure = source / 'article.png'
         figure.write_bytes(b'\x89PNG\r\n\x1a\nfixture image bytes')
-        original = 'Recorded result.\n\n![Wrong](outputs/figure/main_figure.png)'
-        corrected_path = 'Recorded result.\n\n![Still wrong](figures/selected-1.png)'
-        accepted_body = 'Recorded result.\n\n![Exact caption.](figures/selected-1.png)'
+        original = 'Recorded result without its execution boundary.\n\n![Overview](outputs/figure/main_figure.png)'
+        corrected_path = 'Recorded result without its execution boundary.\n\n![Overview](figures/selected-1.png)'
+        accepted_body = 'Recorded result; no new experiment was run.\n\n![Overview](figures/selected-1.png)'
         accepting = False
 
         def answer(system, prompt, **options):
@@ -2651,19 +2653,19 @@ class WritingCoordinationTests(unittest.TestCase):
             body = view['sections'][0]['markdown']
             return {'section_reviews': [{'section_id': 'document',
                 'verdict': 'pass' if body == accepted_body else 'revise_required',
-                'findings': [] if body == accepted_body else [{'finding_id': 'caption-exactness',
-                    'type': 'style', 'severity': 'major', 'required_action': 'revise',
-                    'message': 'The exact supplied caption is still required.',
+                'findings': [] if body == accepted_body else [{'finding_id': 'execution-boundary',
+                    'type': 'missing_limitation', 'severity': 'major', 'required_action': 'revise',
+                    'message': 'State the boundary between saved evidence and new execution.',
                     'draft_quotes': [{'section_id': 'document', 'quote': body}]}]}]}
 
         client.ask_json.side_effect = answer
-        args = {'goal': 'Explain this saved result with its exact caption', 'material_roots': [str(source)]}
+        args = {'goal': 'Explain this saved result and its execution scope', 'material_roots': [str(source)]}
         with patch('simple_ar.report.capability.run_report_capability',
                 side_effect=AssertionError('Rejected work cannot require publication')):
             first = writing.call('compose_document', args, identity='article-negative')
         self.assertEqual(first.status, 'ok', first)
         self.assertIn(corrected_path, workspace.resolve(first.data['editable_markdown']).read_text())
-        self.assertEqual([row['finding_id'] for row in first.data['unresolved']], ['caption-exactness'])
+        self.assertEqual([row['finding_id'] for row in first.data['unresolved']], ['execution-boundary'])
         self.assertTrue(writing.can_return_gap(first.model_dump(mode='json'), 'article-negative'))
         self.assertIsNone(writing.continuation(first.model_dump(mode='json'), 'article-negative'))
         self._record_native_result(root, 'article-negative', first)
@@ -2671,7 +2673,7 @@ class WritingCoordinationTests(unittest.TestCase):
         saved = {path: path.read_bytes() for path in owner.root.rglob('*') if path.is_file()}
         accepting = True
         start = len(prompts)
-        second = writing.call('compose_document', {'goal': 'Correct the retained caption and deliver',
+        second = writing.call('compose_document', {'goal': 'Correct the retained execution scope and deliver',
             'prior_result': 'records/article-negative/native_result.json', 'finish': True}, identity='article-fixed')
         self.assertEqual(second.status, 'ok', second)
         self.assertEqual([label for label, _ in prompts[start:]], ['composition-article', 'article-independent-review'])

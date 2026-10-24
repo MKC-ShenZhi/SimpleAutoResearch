@@ -22,6 +22,7 @@ from simple_ar.report.assembler import (
     ReportAssemblyMode,
     apply_section_numbering,
     assemble_report_sections,
+    bind_supplied_figure_captions,
     split_report_references,
     validate_whole_article,
 )
@@ -72,6 +73,7 @@ class ReportAssemblyRequest:
     experiment_context: ReportContext | Mapping[str, Any] | None = None
     experiment_inputs: tuple[ArtifactRef, ...] = ()
     assembly_mode: ReportAssemblyMode | str = ReportAssemblyMode.SECTION_DRAFTS
+    figure_captions: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.title.strip():
@@ -90,6 +92,7 @@ class ReportAssemblyRequest:
         object.__setattr__(self, "papers", tuple(dict(paper) for paper in self.papers))
         object.__setattr__(self, "citation_key_map", dict(self.citation_key_map))
         object.__setattr__(self, "analysis_handles", dict(self.analysis_handles))
+        object.__setattr__(self, "figure_captions", dict(self.figure_captions))
         if self.experiment_context is not None and not isinstance(self.experiment_context, ReportContext):
             object.__setattr__(self, "experiment_context", ReportContext.model_validate(self.experiment_context))
         object.__setattr__(self, "experiment_inputs", tuple(self.experiment_inputs))
@@ -210,12 +213,39 @@ def _prepare_assembly_text(
         assembly_mode=request.assembly_mode,
         supplemental_sections=supplemental_sections,
     )
+    report_body = bind_supplied_figure_captions(report_body, request.figure_captions)
     report_body, papers, removed_citations = _prepare_report_citations(
         report_body,
         request.papers,
         request.citation_key_map,
     )
     return report_body, papers, removed_citations, config, document_plan
+
+
+def supplied_caption_options(context: ReportContext) -> dict[str, Any]:
+    """Project the frozen presentation owner into every assembly consumer."""
+    captions = context.results.get('provided_figure_captions')
+    return {'figure_captions': captions} if captions is not None else {}
+
+
+def supplied_caption_manifest(context: ReportContext) -> list[dict[str, str]]:
+    """Use the canonical body's citation normalization for publication too."""
+    return [{'path': path, 'caption': _prepare_report_citations(
+        caption, tuple(context.papers), context.citation_key_map, require_citation=False)[0].strip('\r\n')}
+        for path, caption in supplied_caption_options(context).get('figure_captions', {}).items()]
+
+
+def supplied_caption_blocks(context: ReportContext, markdown: str) -> list[dict[str, Any]]:
+    """Describe actual declared additions, not independent scientific evidence."""
+    from simple_ar.report.export import report_image_targets
+    captions = supplied_caption_options(context).get('figure_captions', {})
+    if not captions:
+        return []
+    present = set(report_image_targets(markdown))
+    return [{'kind': 'provided_figure_caption', 'path': path, 'owner': 'assembly',
+        'markdown': caption, 'markdown_token_count': len(caption.split()),
+        'preview_status': 'declared_preview_available'}
+        for path, caption in captions.items() if path in present]
 
 
 def _display_report_text(report_body: str, papers: list[Paper], config: ReportRuntimeConfig, template_name: str) -> ReportAssemblyResult:
@@ -248,6 +278,7 @@ def _prepare_report_citations(
     report_body: str,
     paper_rows: tuple[Mapping[str, Any], ...],
     citation_key_map: Mapping[str, str],
+    *, require_citation: bool = True,
 ) -> tuple[str, list[Paper], list[str]]:
     """Normalize the writer-facing body against the registered bibliography.
 
@@ -262,7 +293,7 @@ def _prepare_report_citations(
     body = normalize_bare_source_id_citations(body, allowed_ids)
     body, removed = sanitize_report_citations(body, allowed_ids)
     validate_citations(body, allowed_ids)
-    if papers and not find_citation_ids(body):
+    if require_citation and papers and not find_citation_ids(body):
         raise CitationError("Report body did not cite any paper from papers.jsonl")
     return body, papers, removed
 

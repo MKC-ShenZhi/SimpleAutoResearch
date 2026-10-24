@@ -1,10 +1,99 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from enum import Enum
 
+from markdown_it import MarkdownIt
+from markdown_it.token import Token
+
 from simple_ar.report.schema import ReportSectionDraft
+
+
+def _caption_inline_key(tokens: list[Token]) -> tuple:
+    """Compare inline meaning, allowing one presentation-only emphasis wrapper."""
+    tokens = [token for token in tokens if token.type != "text" or token.content]
+    if (len(tokens) >= 2 and tokens[0].type == "em_open"
+            and tokens[-1].type == "em_close"):
+        depth = 0
+        for index, token in enumerate(tokens):
+            depth += token.nesting
+            if depth == 0:
+                if index == len(tokens) - 1:
+                    tokens = tokens[1:-1]
+                break
+
+    def key(token: Token) -> tuple:
+        return (token.type, token.tag, token.nesting, token.content,
+                tuple(sorted(token.attrs.items())),
+                tuple(key(child) for child in token.children or []))
+
+    return tuple(key(token) for token in tokens if token.type != "text" or token.content)
+
+
+def bind_supplied_figure_captions(markdown: str, captions: Mapping[str, str]) -> str:
+    """Place supplied presentation paragraphs without rewriting authored bytes.
+
+    Sources match parsed image destinations exactly. Container and mixed-inline
+    placements are deliberately rejected rather than risking changed structure.
+    Unreferenced attachments need not occur in the article.
+    """
+    if not captions:
+        return markdown
+    parser = MarkdownIt("commonmark")
+    document_environment: dict = {}
+    blocks = parser.parse(markdown, document_environment)
+    supplied = {}
+    for src, caption in captions.items():
+        environment: dict = {}
+        caption_blocks = parser.parse(caption, environment)
+        if (not caption.strip() or len(caption_blocks) != 3
+                or [token.type for token in caption_blocks] !=
+                ["paragraph_open", "inline", "paragraph_close"]
+                or environment.get("references")):
+            raise ValueError(f"Caption for {src!r} must be one normal Markdown paragraph.")
+        resolved = parser.parse(caption, document_environment)
+        supplied[src] = (caption.strip("\r\n"), _caption_inline_key(resolved[1].children or []))
+
+    lines = markdown.splitlines(keepends=True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    newline = "\r\n" if "\r\n" in markdown else "\n"
+    insertions = []
+
+    def managed_images(tokens: list[Token]) -> Iterator[Token]:
+        for token in tokens:
+            if token.type == "image" and token.attrGet("src") in supplied:
+                yield token
+            yield from managed_images(token.children or [])
+
+    for index, inline in enumerate(blocks):
+        if inline.type != "inline":
+            continue
+        images = list(managed_images(inline.children or []))
+        if not images:
+            continue
+        opening = blocks[index - 1] if index else None
+        if (opening is None or opening.type != "paragraph_open" or opening.level != 0
+                or len(inline.children or []) != 1 or inline.children[0].type != "image"
+                or opening.map is None):
+            raise ValueError("Supplied figure caption requires a standalone top-level image paragraph.")
+        caption, expected = supplied[images[0].attrGet("src")]
+        following = blocks[index + 2:index + 5]
+        if (len(following) == 3 and following[0].type == "paragraph_open"
+                and following[0].level == 0 and following[1].type == "inline"
+                and _caption_inline_key(following[1].children or []) == expected):
+            continue
+        end = offsets[opening.map[1]]
+        separator = newline if end and markdown[end - 1] in "\r\n" else newline * 2
+        # Keep all original blank lines, adding a boundary if the next block
+        # starts immediately (for example an ATX heading).
+        trailing = newline if end < len(markdown) and not lines[opening.map[1]].strip() else newline * 2
+        insertions.append((end, separator + caption + trailing))
+    for offset, text in reversed(insertions):
+        markdown = markdown[:offset] + text + markdown[offset:]
+    return markdown
 
 
 class ReportAssemblyMode(str, Enum):
