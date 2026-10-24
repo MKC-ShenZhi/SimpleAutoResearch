@@ -45,6 +45,41 @@ REVISION_PREMISE_RULE = (
     "Preserve any uncertainty when the baseline or evidence is incomplete."
 )
 
+PRIOR_REVIEW_CONTEXT_CONTRACT = 'prior_prose_review_context.v1'
+
+
+def prior_document_revision(context: ReportContext, memory: ReportMemory, *,
+                            include_baseline: bool = False) -> dict[str, Any]:
+    """Project bound old opinions separately from facts and current findings.
+
+    Only a frozen opt-in enables this projection. Historical requests that
+    already contained unused feedback keep their original model inputs.
+    """
+    contract = memory.survey_contract.get('revision_feedback_contract')
+    if contract is None:
+        return {}
+    if contract != PRIOR_REVIEW_CONTEXT_CONTRACT:
+        raise ValueError('Unknown prior prose review context contract; no prompt migration')
+    feedback = context.results.get('revision_feedback')
+    if not isinstance(feedback, dict) or feedback.get('contract') != 'prior_prose_review.v1':
+        raise ValueError('Prior prose review context requires its bound editorial feedback')
+    from copy import deepcopy
+    view = {'contract': contract, 'feedback': deepcopy(feedback),
+        'review_opinions_status': dict(REVIEW_OPINIONS_STATUS),
+        'interpretation_rules': [REVISION_PREMISE_RULE,
+            'The path, sha256, scope, section IDs and quotes belong to the earlier reviewed version. '
+            'They are provenance, not current section selectors, source facts or permission.',
+            'Use previous_document to inspect the old prose. Reorganize retained useful content under '
+            'the current frozen document_plan; never map an old section ID to a new section by ID or position.',
+            'When structure is unchanged, preserve the current frozen plan and unaffected supported prose. '
+            'Old opinions do not authorize changing the current plan.',
+            'Independently check the resulting current prose against the task and actual sources. '
+            'Do not inherit an old verdict, invent a missing old assertion, or clear a concern just because '
+            'its old section ID disappeared. Report supported current defects using current draft anchors.']}
+    if include_baseline:
+        view['previous_document'] = prior_draft_context(context)
+    return {'prior_document_revision': view}
+
 
 def _experiment_delivery_view(context: ReportContext, config: ReportRuntimeConfig) -> list[dict[str, Any]]:
     """Expose the same assembly-owned experiment text, not another draft."""
@@ -261,6 +296,7 @@ def evidence_outline_context(
         ],
         "sources": [_prompt_handle_view(handle) for handle in handles[:40]],
         "previous_document": prior_draft_context(context),
+        **prior_document_revision(context, memory),
         "sources_omitted": max(0, len(handles) - 40),
         "evidence_handle_choices": [handle.handle for handle in handles[:40]],
         "supplied_figures": supplied_figure_sources(context),

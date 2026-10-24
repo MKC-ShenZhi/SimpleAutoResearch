@@ -28,6 +28,215 @@ from tests.report_review_fixtures import (
 
 
 class DocumentFirstTests(unittest.TestCase):
+    def test_explicit_outline_owns_joint_writing_revision_and_checkpoint_recovery(self):
+        from simple_ar.report.assembler import assemble_report_sections, article_section_headings
+        from simple_ar.report.writing import _check_article_constraints
+
+        headings = ['Purpose and inputs', 'Findings', 'Interpretation and limits',
+                    'Conclusion and follow-up options']
+        outline = [{'heading': heading, 'required': True} for heading in headings]
+        kwargs = self.inputs(draft_scope='document')
+        kwargs['config'].outline_strategy = 'adaptive'
+        original_memory = kwargs['memory'].model_dump(mode='json')
+        labels, views = [], []
+
+        class Client:
+            def ask_json(inner, system, prompt, *, label='', **unused):
+                labels.append(label)
+                view = prompt_payload(prompt)
+                views.append((label, copy.deepcopy(view)))
+                if label in {'report-writer-document', 'report-document-joint-reviser'}:
+                    return {'sections': [{'section_id': row['section']['section_id'],
+                        'heading': row['section']['heading'],
+                        'draft_markdown': ('Reconciled ' if 'reviser' in label else 'Original ')
+                            + row['section']['heading']} for row in view['sections']]}
+                if label == 'report-document-reviewer':
+                    return {'section_reviews': [{'section_id': row['section_id'],
+                        'verdict': 'revise_required' if index < 2 else 'pass',
+                        'findings': [{'finding_id': 'repeat-' + row['section_id'],
+                            'type': 'style', 'severity': 'major', 'required_action': 'revise',
+                            'message': 'Reconcile repetition across these sections.',
+                            'draft_quotes': draft_quotes(prompt, row['section_id'])}]
+                            if index < 2 else []} for index, row in enumerate(view['sections'])]}
+                if label == 'report-document-verifier':
+                    return {'section_reviews': [{'section_id': row['section_id'], 'verdict': 'pass'}
+                        for row in view['sections']]}
+                raise AssertionError(label)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ArtifactStore(Path(tmp))
+            feedback = {'contract': 'prior_prose_review.v1', 'path': str(Path(tmp) / 'old-review.json'),
+                'sha256': 'a' * 64, 'scope': 'Old version opinions, not primary evidence or permission.',
+                'section_reviews': [{'section_id': 'section_1', 'verdict': 'revise_required',
+                    'revision_instructions': ['Reorganize the old conclusion under the requested structure.']}]}
+            kwargs['context'].results['revision_feedback'] = feedback
+            kwargs['context'].source_handles.append(SourceHandle(handle='old-body', kind='prior_draft',
+                title='Old body', metadata={'draft_markdown': 'Old conclusion with bounded claims.'}))
+            request = ReportWritingRequest(kwargs['context'], kwargs['memory'], kwargs['config'],
+                kwargs['template'], Client(), output_outline=outline)
+            capability = CapabilityContext(store, AttemptManifest('fixed-outline'))
+            result = run_report_writing_capability(context=capability, request=request)
+            self.assertEqual(result.status, 'completed', result.diagnostics)
+            written = store.read_json('writer.json')
+            self.assertEqual([row['heading'] for row in written['sections']], headings)
+            self.assertEqual([row['heading'] for row in written['memory']['document_plan']['sections']], headings)
+            self.assertTrue(written['sections'][0]['draft_markdown'].startswith('Reconciled '))
+            self.assertEqual(labels, ['report-writer-document', 'report-document-reviewer',
+                                      'report-document-joint-reviser', 'report-document-verifier'])
+            for label, view in views:
+                old_review = (view['delivery_text_observation']['prior_document_revision']
+                    if label in {'report-document-reviewer', 'report-document-verifier'}
+                    else view['prior_document_revision'])
+                self.assertEqual(old_review['feedback'], feedback)
+                self.assertIn('fallible_allegations', old_review['review_opinions_status']['scope'])
+                self.assertNotIn('revision_feedback', view.get('verified_execution_results', {}))
+            self.assertEqual(views[0][1]['review_findings'], [])
+            final_view = views[-1][1]['delivery_text_observation']['prior_document_revision']
+            self.assertEqual(final_view['previous_document']['drafts'][0]['retained_body'],
+                             'Old conclusion with bounded claims.')
+            from simple_ar.report.narrative import evidence_outline_context
+            from simple_ar.report.agent import _outline_planner_prompt, _reviewer_context
+            seed = ReportMemory.model_validate(store.read_json('report_inputs.json')['memory'])
+            for view in (evidence_outline_context(kwargs['context'], seed, kwargs['config']),
+                         prompt_payload(_outline_planner_prompt(context=kwargs['context'], memory=seed,
+                             config=kwargs['config'], template=kwargs['template'])),
+                         _reviewer_context(context=kwargs['context'], memory=seed, config=kwargs['config'],
+                             template=kwargs['template'], section=seed.section_plan[0],
+                             draft=ReportSectionDraft.model_validate(written['sections'][0]))):
+                self.assertEqual(view['prior_document_revision']['feedback'], feedback)
+            body = assemble_report_sections(title='Report', sections=[
+                ReportSectionDraft.model_validate(row) for row in written['sections']])
+            self.assertEqual(article_section_headings(body), headings)
+            article = {'constraints': {'outline': outline, 'max_cited_sources': 0},
+                       'bibliography': [], 'citation_key_map': {}}
+            _check_article_constraints(article, body)
+            with self.assertRaisesRegex(ValueError, 'fixed section structure'):
+                _check_article_constraints(article, body.replace(headings[-1], 'Conclusion and options'))
+            checkpoint = store.ref('sections.json', kind='report_checkpoint', schema='report_checkpoint.v1')
+            retained = {path.name: path.read_bytes() for path in store.root.glob('*.json')}
+            with patch.object(request.llm_client, 'ask_json', side_effect=AssertionError('No paid request replay')):
+                resumed = run_report_writing_capability(context=CapabilityContext(store,
+                    AttemptManifest('fixed-outline'), inputs=(checkpoint,)),
+                    request=replace(request, resume_ref=checkpoint, output_outline=()))
+            self.assertEqual(resumed.status, 'completed', resumed.diagnostics)
+            for name in ('report_inputs.json', 'writer.json'):
+                self.assertEqual(store.resolve(name).read_bytes(), retained[name])
+            before_checkpoint = json.loads(retained['sections.json'])['completed']
+            self.assertEqual(store.read_json('sections.json')['completed'], before_checkpoint)
+            retained = {path.name: path.read_bytes() for path in store.root.glob('*.json')}
+            changed = copy.deepcopy(outline)
+            changed[-1]['heading'] = 'Another conclusion'
+            with self.assertRaisesRegex(ValueError, 'inputs changed'):
+                run_report_writing_capability(context=capability, request=replace(request, output_outline=changed))
+            self.assertEqual({path.name: path.read_bytes() for path in store.root.glob('*.json')}, retained)
+        self.assertEqual(kwargs['memory'].model_dump(mode='json'), original_memory)
+
+    def test_structured_article_explicit_headings_are_not_replaced_by_template(self):
+        from simple_ar.report.writing import article_writing_inputs, _writing_binding
+
+        kwargs = self.inputs()
+        binding = _writing_binding(report_context=kwargs['context'], memory=kwargs['memory'],
+            config=kwargs['config'], template=kwargs['template'], sources=())
+        headings = ['Question', 'Evidence', 'Scope', 'Next decisions']
+        arguments = dict(report_context=kwargs['context'], documents=None,
+            binding=binding, config=kwargs['config'], title='Report', goal='Explain', target_words=0,
+            projection_ref=ArtifactRef('report_snapshot.json', 'report_snapshot', 'report_snapshot.v1'))
+        bound_outline = [{'heading': heading, 'required': True} for heading in headings]
+        self.assertEqual(article_writing_inputs(**arguments, required_headings=headings)[
+            'article']['constraints']['outline'], bound_outline)
+        binding['memory']['outline_planning']['output_outline'] = bound_outline
+        kwargs['config'].outline_strategy = 'auto'
+        self.assertEqual(article_writing_inputs(**arguments)['article']['constraints']['outline'], bound_outline)
+        with self.assertRaisesRegex(ValueError, 'frozen Writer output outline'):
+            article_writing_inputs(**arguments, required_headings=['Different structure'])
+
+    def test_native_sections_bind_feedback_and_fixed_outline_without_recovery_migration(self):
+        from simple_ar.report.writing import write_section_article
+        from simple_ar.report.narrative import PRIOR_REVIEW_CONTEXT_CONTRACT
+
+        kwargs = self.inputs(draft_scope='document')
+        kwargs['config'].outline_strategy = 'adaptive'
+        kwargs['context'].results['revision_feedback'] = {'contract': 'prior_prose_review.v1',
+            'path': 'old-review.json', 'sha256': 'b' * 64, 'scope': 'Old prose opinions.',
+            'section_reviews': [{'section_id': 'old-conclusion', 'verdict': 'revise_required'}]}
+        headings = ['Question', 'Observation', 'Scope', 'Follow-up choices']
+        labels, views = [], []
+        regular = self.client(labels)
+
+        class Client:
+            def ask_json(inner, system, prompt, **options):
+                views.append(prompt_payload(prompt))
+                return regular.ask_json(system, prompt, **options)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            owner = ArtifactStore(Path(tmp))
+            store = ArtifactStore(owner.root / 'writer')
+            documents = owner.write_json('documents.json',
+                DocumentBundle([], {}, {}, [], []).to_handoff_dict(),
+                kind='documents', schema='document_bundle.v1')
+            arguments = dict(store=store, input_store=owner, documents_ref=documents,
+                identity='native-feedback', report_context=kwargs['context'], title='Report',
+                target_words=0, required_headings=headings, max_cited_sources=0,
+                prior_draft='Earlier complete body to reorganize.', review_config=kwargs['config'])
+            written = write_section_article(**arguments, client=Client())
+            self.assertEqual([row['heading'] for row in written['sections']], headings)
+            frozen = store.read_json('report_inputs.json')
+            self.assertEqual(frozen['memory']['survey_contract']['revision_feedback_contract'],
+                             PRIOR_REVIEW_CONTEXT_CONTRACT)
+            self.assertEqual(frozen['memory']['outline_planning']['output_outline'],
+                             [{'heading': heading, 'required': True} for heading in headings])
+            self.assertIn('prior_document_revision', views[0])
+            self.assertIn('prior_document_revision', views[-1]['delivery_text_observation'])
+            retained = {path.relative_to(store.root): path.read_bytes()
+                        for path in store.root.rglob('*') if path.is_file()}
+            recovered = write_section_article(**arguments, recovering=True)
+            self.assertEqual(recovered, written)
+            with self.assertRaisesRegex(ValueError, 'Frozen section input changed'):
+                write_section_article(**{**arguments, 'required_headings': ['Different structure']}, recovering=True)
+            self.assertEqual({path.relative_to(store.root): path.read_bytes()
+                              for path in store.root.rglob('*') if path.is_file()}, retained)
+            self.assertEqual(labels, ['report-writer-document', 'report-document-reviewer'])
+
+    def test_historical_unused_feedback_does_not_change_atomic_requests_on_resume(self):
+        from simple_ar.report.writing import retained_writing_client
+
+        kwargs = self.inputs(draft_scope='document')
+        kwargs['context'].results['revision_feedback'] = {'contract': 'prior_prose_review.v1',
+            'path': 'old-review.json', 'sha256': 'c' * 64, 'scope': 'Old opinions.',
+            'section_reviews': [{'section_id': 'results', 'verdict': 'revise_required'}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ArtifactStore(Path(tmp))
+            labels = []
+            client = retained_writing_client(store=store, identity='historical-feedback',
+                client=self.client(labels), contract='atomic_complete.v2')
+            request = ReportWritingRequest(kwargs['context'], kwargs['memory'], kwargs['config'],
+                kwargs['template'], client)
+            # Build the historical producer that retained the field but never
+            # projected it. Recovery must not upgrade those paid requests.
+            with patch('simple_ar.report.writing._section_feedback_memory',
+                       side_effect=lambda memory, context, frozen_memory: memory):
+                result = run_report_writing_capability(context=CapabilityContext(store,
+                    AttemptManifest('historical-feedback')), request=request)
+            self.assertEqual(result.status, 'completed', result.diagnostics)
+            self.assertNotIn('revision_feedback_contract',
+                             store.read_json('report_inputs.json')['memory']['survey_contract'])
+            calls = {path.relative_to(store.root): path.read_bytes()
+                     for path in store.root.rglob('*') if path.is_file() and 'model_calls' in path.parts}
+            for path in store.resolve('model_calls').glob('*/request.json'):
+                view = prompt_payload(json.loads(path.read_text(encoding='utf-8'))['prompt'])
+                self.assertNotIn('prior_document_revision', view)
+                self.assertNotIn('prior_document_revision', view.get('delivery_text_observation', {}))
+            checkpoint = store.ref('sections.json', kind='report_checkpoint', schema='report_checkpoint.v1')
+            replay = retained_writing_client(store=store, identity='historical-feedback',
+                client=None, contract='atomic_complete.v2')
+            resumed = run_report_writing_capability(context=CapabilityContext(store,
+                AttemptManifest('historical-feedback'), inputs=(checkpoint,)),
+                request=replace(request, llm_client=replay, resume_ref=checkpoint))
+            self.assertEqual(resumed.status, 'completed', resumed.diagnostics)
+            self.assertEqual({path.relative_to(store.root): path.read_bytes()
+                for path in store.root.rglob('*') if path.is_file() and 'model_calls' in path.parts}, calls)
+            self.assertEqual(labels, ['report-writer-document', 'report-document-reviewer'])
+
     def test_composition_caption_ownership_selection_publication_and_recovery(self):
         from unittest.mock import Mock
         from simple_ar.core.budget import BudgetLedger

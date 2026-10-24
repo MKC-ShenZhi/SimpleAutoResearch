@@ -1452,6 +1452,47 @@ class WritingCoordinationTests(unittest.TestCase):
             self.assertEqual(changed.recipe.materials, [])
             self.assertEqual({path: path.read_bytes() for path in frozen}, frozen)
 
+    def test_equivalent_focus_reuses_evidence_for_reorganization_without_changing_old_resolution(self):
+        root, workspace, writing, source, _, table, client, _ = self._document_work_fixture()
+        writing.document_source_contract = 'document_source.v1'
+        goal = 'Explain the saved value and scope'
+        first = writing.call('compose_document', {'goal': goal,
+            'material_roots': [str(source / 'code'), str(source / 'results')]}, identity='focused-first')
+        self.assertEqual(first.status, 'ok', first)
+        self._record_native_result(root, 'focused-first', first)
+        parent = ArtifactStore(root / 'tools/writing/focused-first')
+        frozen = {p: p.read_bytes() for p in parent.root.rglob('*') if p.is_file()}
+        ledger = writing.ledger.to_dict()
+        extra = root / 'extra'
+        extra.mkdir()
+        workspace.mounts['extra'] = extra
+        cases = [([str(source)], False, True), ([str(source)], True, False),
+            ([str(source), str(extra)], False, False), ([str(source / 'code')], False, False)]
+        with patch.object(client, 'ask_json', side_effect=AssertionError('No model during recipe resolution')):
+            for index, (roots, historical, reuse) in enumerate(cases):
+                with self.subTest(roots=roots, historical=historical):
+                    identity = f'reorganized-{index}'
+                    args = {'goal': goal, 'prior_draft': first.data['editable_markdown'],
+                        'material_roots': roots, 'required_headings': ['Evidence', 'Limits']}
+                    source_binding = writing._admit_document_source(ArtifactStore(root / 'tools/writing' / identity),
+                        args, None, None, None)
+                    if historical:
+                        source_binding.pop('resolution_contract')
+                    resolved = writing._resolve_document_inputs(ComposeRequest.model_validate(args), identity,
+                        report=None, original=None, selection=None, document_work=True,
+                        caller_fields=frozenset(args), work_source=source_binding, normalize_arguments=None)
+                    self.assertEqual(resolved.recipe.reuse_prior_inputs, reuse)
+                    self.assertEqual(resolved.recipe.required_headings, ['Evidence', 'Limits'])
+                    if reuse:
+                        self.assertEqual(resolved.linkage['owner'], 'focused-first')
+                        self.assertEqual(resolved.recipe.materials[0].path, str(table))
+                        self.assertIsNone(resolved.candidate)
+                    else:
+                        self.assertIsNone(resolved.binding)
+                        self.assertIsNotNone(resolved.investigation)
+            self.assertEqual({p: p.read_bytes() for p in frozen}, frozen)
+            self.assertEqual(writing.ledger.to_dict(), ledger)
+
     def test_sparse_document_recipe_recovers_scope_only_from_hash_bound_parent(self):
         root, _, writing, source, _, _, client, _ = self._document_work_fixture()
         original = ArtifactStore(root / 'tools/writing/native-tool-0039')

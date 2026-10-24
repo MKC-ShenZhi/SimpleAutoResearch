@@ -577,6 +577,8 @@ class WritingToolGateway:
         self._check_document_source_contract(contract)
         intent = DocumentWorkRequest.model_validate(arguments).model_dump(mode='json')
         if source is not None:
+            if source.get('resolution_contract') not in {None, 'selected_recipe.v1'}:
+                raise ValueError('Unknown document recipe resolution contract')
             if source['intent'] != intent:
                 raise ValueError('Retained document work intent changed')
             for path in [*(source['access_roots'] or []), *source['investigation_roots']]:
@@ -587,7 +589,8 @@ class WritingToolGateway:
         roots = [*roots, *(report or {}).get('selection_paths', [])]
         roots = list(dict.fromkeys(str(self.workspace.resolve_material_root(path)) for path in roots))
         source = {'contract': contract, 'intent': intent, 'investigation_roots': roots,
-            'access_roots': None if intent.get('prior_result') or intent['prior_draft'] else roots}
+            'access_roots': None if intent.get('prior_result') or intent['prior_draft'] else roots,
+            'resolution_contract': 'selected_recipe.v1'}
         from simple_ar.report.review_evidence import SCOPED_DELIVERY_INSPECTION
         admission = {'document_work': _DOCUMENT_WORK_CONTRACT, 'work_source': source,
             'inspection_contract': SCOPED_DELIVERY_INSPECTION}
@@ -747,6 +750,36 @@ class WritingToolGateway:
                     isinstance(previous_report, dict) and isinstance(report, dict) and
                     {key: value for key, value in previous_report.items() if key not in feedback_fields} ==
                     {key: value for key, value in report.items() if key not in feedback_fields})
+                selected_recipe = work_source.get('resolution_contract') == 'selected_recipe.v1'
+                original_goal = binding.get('work_source', {}).get('intent', {}).get('goal') or binding['request']['goal']
+                same_intent = (isinstance(report, dict) and previous_report == report
+                    or report is None and previous_report is None and work_source['intent']['goal'] == original_goal)
+                if selected_recipe and same_intent and scope is not None and requested:
+                    # Directory aliases and enclosing project paths do not make
+                    # the selected evidence new. Every requested root must still
+                    # overlap the old admitted scope, and every retained input
+                    # must remain inside the requested focus. Actual access and
+                    # byte proofs are checked again by the normal recipe reader.
+                    previous_draft = binding['request'].get('prior_draft')
+                    evidence = {self.workspace.resolve_source_record(row['path'])
+                        if index < len(binding['request']['sources']) else self.workspace.resolve(row['path'])
+                        for index, row in enumerate(binding['inputs'])}
+                    # Exported attachment copies are retained delivery bytes,
+                    # not additional source locations for the next investigation.
+                    for copy in binding.get('document_work', {}).get('materials', []):
+                        evidence.discard(self.workspace.resolve(copy['path']))
+                        evidence.add(self.workspace.resolve(copy['source']))
+                    for row in binding['inputs']:
+                        if row.get('manuscript_path'):
+                            evidence.discard(self.workspace.resolve(
+                                f"workspace/manuscripts/{parent_id}/{row['manuscript_path']}"))
+                    if previous_draft:
+                        evidence.discard(self.workspace.resolve(previous_draft))
+                    same_scope = bool(evidence) and all(any(path.is_relative_to(root)
+                        for root in requested) for path in evidence) and all(any(
+                            root.is_relative_to(old) or old.is_relative_to(root)
+                            for old in admitted if old != self.workspace.resolve(
+                                f'workspace/manuscripts/{parent_id}')) for root in requested)
                 draft = f'workspace/manuscripts/{parent_id}/manuscript.md'
                 if observed is None:
                     native = ArtifactStore(self.root / 'attempts' / parent_id)
@@ -797,7 +830,6 @@ class WritingToolGateway:
                     from simple_ar.report.writing import ARTICLE_OWNER, SECTION_ARTICLE_OWNER
                     method = {ARTICLE_OWNER: 'article', SECTION_ARTICLE_OWNER: 'sections'}.get(
                         binding.get('writing_owner'), method)
-                original_goal = binding.get('work_source', {}).get('intent', {}).get('goal') or binding['request']['goal']
                 feedback_requested = work_source['intent']['goal'] not in {'', original_goal}
                 if isinstance(report, dict) and isinstance(previous_report, dict):
                     feedback_requested = feedback_requested or report.get('requests') != previous_report.get('requests')
@@ -806,12 +838,18 @@ class WritingToolGateway:
                     and self._section_author_source(parent)[1].get('checked_revision') is not None)
                 checked_work = (binding.get('work_result_contract') == 'checked_candidate.v1'
                     and data.get('editable_markdown') == f'workspace/manuscripts/{parent_id}/candidate.md')
-                if interrupted or (method in {'article', 'sections'}
+                same_structure = (request.writing_method in (None, binding['request'].get('writing_method'), method)
+                    and (not request.required_headings or request.required_headings ==
+                         binding['request'].get('required_headings', [])))
+                retained_candidate = data.get('retained_candidate', {}).get('markdown')
+                explicit_candidate = request.prior_draft == retained_candidate
+                if selected_recipe and request.prior_draft and retained_candidate:
+                    explicit_candidate = self.workspace.resolve(request.prior_draft) == self.workspace.resolve(retained_candidate)
+                if (not selected_recipe or same_structure) and (interrupted or (method in {'article', 'sections'}
                         and (self.root / 'attempts' / parent_id / 'native_result.json').exists()
                         and (not data.get('unresolved') or checked_section_revision or checked_work)
                         and (not feedback_requested or (request.prior_result
-                            or request.prior_draft == data.get('retained_candidate', {}).get('markdown'))
-                                and (checked_section_revision or checked_work))):
+                            or explicit_candidate) and (checked_section_revision or checked_work)))):
                     continued = request.model_copy(update={'prior_result': f'records/{parent_id}/native_result.json',
                         'prior_draft': '', 'material_roots': [], 'reuse_prior_inputs': False})
                     (result.recipe, result.binding, result.linkage, result.candidate) = self._continued_document_inputs(
@@ -823,7 +861,9 @@ class WritingToolGateway:
                 review = self.final_review(retained)
                 request = request.model_copy(update={'prior_result': '', 'prior_draft': draft,
                     'material_roots': [], 'reuse_prior_inputs': True})
-                result.feedback = self._document_revision_feedback(request, previous_report)
+                result.feedback = (self._bound_revision_feedback(request, parent, binding, retained, review)
+                    if selected_recipe and previous_report == report else
+                    self._document_revision_feedback(request, previous_report))
         # Historical source resolution is an adapter: saved request and selection
         # bytes are replayed without gaining the new admission or scope semantics.
         if request.prior_result:
@@ -1230,6 +1270,11 @@ class WritingToolGateway:
         if request.material_roots and (scope is None or not roots(request.material_roots) <= admitted_roots):
             return None
         review = self.final_review(data)
+        return self._bound_revision_feedback(request, store, binding, data, review)
+
+    def _bound_revision_feedback(self, request: ComposeRequest, store: ArtifactStore,
+                                 binding: dict, data: dict, review: dict) -> dict | None:
+        """One proof for editorial opinions, shared by recipe reuse and exact callers."""
         if (review.get('review_status') != 'needs_revision'
                 or self._review_needs_material_work(review)):
             return None
@@ -3740,6 +3785,14 @@ class WritingToolGateway:
                 binding['work_context'] = freeze_work_context(self.work_context, list(dict.fromkeys(targets)))
             if report_binding is not None:
                 binding['report_binding'] = report_binding
+                if writing_owner == 'professional_report.v1':
+                    output_outline = (report_binding['requirement']['outline'] or [
+                        {'heading': heading, 'required': True} for heading in request.required_headings])
+                    if recovering:
+                        if 'output_outline' in original_binding:
+                            binding['output_outline'] = original_binding['output_outline']
+                    elif output_outline:
+                        binding['output_outline'] = output_outline
             if (writing_owner == 'professional_report.v1'
                     and report_binding['requirement']['method'] == 'sections'
                     and (not recovering or 'section_response_contract' in original_binding)):
@@ -3999,6 +4052,7 @@ class WritingToolGateway:
                         input_store=owner), request=ReportWritingRequest(report_context=context, memory=memory,
                             config=config, template=template, llm_client=client, method=requirement['method'],
                             prior_draft=previous, resume_ref=resume,
+                            output_outline=binding.get('output_outline', ()),
                             candidate_source=binding.get('candidate_source')))
                     writer_ref = next((row for row in reversed(result.artifacts) if row.kind == 'report_writer_result'), None)
                     if writer_ref is None:

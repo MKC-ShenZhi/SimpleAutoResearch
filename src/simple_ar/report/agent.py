@@ -38,6 +38,7 @@ from simple_ar.report.narrative import (
     _prompt_metrics,
     adopted_claims, adopted_memory_notes, budget_document_plan, delivery_text_observation, effective_revision_instructions, evidence_outline_context, narrative_context, pending_document_revisions, _experiment_delivery_view,
     pending_revision_review, revision_context, report_objective, report_tool_context, review_source_evidence, prior_draft_context,
+    prior_document_revision,
 )
 from simple_ar.report.schema import (
     finding_requires_resolution,
@@ -371,6 +372,7 @@ def run_report_agent(
             selection = client.ask_json(WRITER_SYSTEM, _json_prompt({
                 "task": "Identify the reader's decisions and questions, then select necessary source reads before planning an answer; do not draft sections or an outline.",
                 "objective": report_objective(context, current),
+                **prior_document_revision(context, current, include_baseline=True),
                 "sources": [_prompt_handle_view(h, navigation=True) for h in current.source_handles if h.kind != "prior_draft"][:40],
                 "tools": [spec.model_dump(mode="json") for spec in report_tool_specs()],
                 "context_request_schema": ReportToolCall.model_json_schema(),
@@ -959,6 +961,7 @@ def _edit_whole_document(
             additions = supplied_data_delivery(context, config=config, plan=memory.document_plan,
                 section_ids=[row.section_id for row in ordered])
             delivery = delivery_text_observation(context, memory, ordered, config, additions=additions)
+            delivery.update(prior_document_revision(context, memory, include_baseline=True))
             assembly = _section_delivery_assembly(context, memory, ordered, config) if on_delivery_review else None
             def retain_delivery_review(observation: dict[str, Any]) -> None:
                 nonlocal latest_delivery_review
@@ -1892,6 +1895,7 @@ def _outline_planner_prompt(
         },
         "available_source_brief": _outline_source_brief(context),
         "previous_document": prior_draft_context(context),
+        **prior_document_revision(context, memory),
         "synthesis_excerpt": context.synthesis_markdown[:2500],
         "synthesis_status": dict(DERIVED_CONTEXT_STATUS),
         "evidence_summary_excerpt": context.evidence_summary[:2500],
@@ -2390,6 +2394,7 @@ def _writer_payload(
         "objective": report_objective(context, memory),
         "document_plan": document_plan_context(memory),
         "previous_document": prior_draft_context(context),
+        **prior_document_revision(context, memory),
         "source_comparisons": context.source_comparisons,
         "comparison_status": dict(DERIVED_CONTEXT_STATUS),
         "assembly_owned_content": additions,
@@ -2621,6 +2626,7 @@ def _reviewer_context(
         "narrative_context": narrative_context(memory, section, adopted_sections or [], context=context, config=config,
             current_draft=draft, independent_review=True),
         "revision_context": revision_context(revision_review, previous_draft, candidate=draft),
+        **prior_document_revision(context, memory, include_baseline=True),
         "visual_requirements": section_visuals,
         "known_limitations": memory.limitations[:8],
         "experiment_plan": _compact_experiment_plan(context.experiment_plan),
