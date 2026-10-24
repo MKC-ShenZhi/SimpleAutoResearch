@@ -1000,7 +1000,8 @@ def _edit_whole_document(
                 '\n\n'.join(row.draft_markdown for row in ordered))
             delivery = delivery_text_observation(context, memory, ordered, config, additions=additions)
             delivery.update(prior_document_revision(context, memory, include_baseline=True))
-            assembly = _section_delivery_assembly(context, memory, ordered, config) if on_delivery_review else None
+            assembly = _section_delivery_assembly(context, memory, ordered, config,
+                publication=publication_view is not None) if on_delivery_review else None
             def retain_delivery_review(observation: dict[str, Any]) -> None:
                 nonlocal latest_delivery_review
                 # The callback must resolve real persisted request/response files.
@@ -1043,8 +1044,7 @@ def _edit_whole_document(
                         checkpoint()
                         prepared_publication = _prepared_publication(publication_view, {
                             'sections': [row.model_dump(mode='json') for row in ordered],
-                            'assembly': _section_delivery_assembly(context, memory, ordered, config,
-                                publication=True),
+                            'assembly': assembly,
                             'label': review_label + '-format-correction'
                                 if correction is not None else review_label})
                     validated = review_document(client=client, template=template, memory=memory,

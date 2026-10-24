@@ -8,7 +8,7 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 
 ### Fixed
 
-- Prepare publication candidates before independent inspection and adoption, continuing the original writing checkpoint. Assembly owns supplied captions; final export checks the same content, template and citation style. Successful preparation is not final delivery.
+- Inspect the prepared publication view before adoption and reuse a valid view for fresh independent checks of existing drafts. Captions, templates and citation style stay bound to the same version; successful preparation is not final delivery.
 - Keep complete rejected drafts as work candidates for revision or reorganization. A never-dispatched inspection can continue after its original accounting is verified, without redrafting. Failures, unknown requests and historical contracts remain protected.
 - Share source, outline and provenance records across writing, repair and delivery. Prior manuscript directories, derived delivery hints and equivalent attachment copies no longer force reselection; explicitly added materials still require investigation.
 

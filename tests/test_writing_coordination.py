@@ -2684,6 +2684,137 @@ class WritingCoordinationTests(unittest.TestCase):
         self.assertEqual([label for label, _ in prompts],
                          ['composition-selection-1', 'composition-selection-2', 'report-writer-document'])
 
+    def test_review_prepared_reference_revalidates_body_view_and_historical_absence(self):
+        from types import SimpleNamespace
+        from tests.report_review_fixtures import changed_record
+        root, workspace, writing = self._real_workspace()
+        writing.publication_inspection = 'prepared_document.v1'
+        manuscript = 'workspace/manuscripts/retained/manuscript.md'
+        path = workspace.resolve(manuscript, write=True)
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b'## Results\n\nThe supplied record says value=2.5.\n')
+        view_path = workspace.resolve('workspace/publications/retained/publication_view.json', write=True)
+        view_path.parent.mkdir(parents=True)
+        view_path.write_bytes(b'{"schema_version":"publication_view.v1"}\n')
+        prepared = {'contract': 'prepared_publication.v1',
+            'prepared_result': 'records/prepared/native_result.json', 'prepared_result_sha256': 'receipt-hash',
+            'source': {'assembly_identity': {'body_sha256': hashlib.sha256(path.read_bytes()).hexdigest()}},
+            'view_path': workspace.locator(str(view_path)),
+            'view_sha256': hashlib.sha256(view_path.read_bytes()).hexdigest(),
+            'view': json.loads(view_path.read_bytes()), 'adopted': False, 'visual_reviewed': False, 'pages': []}
+        # Publication validation itself is covered by the real cooperative
+        # fixture. This port returns current bytes, never a cached frozen view.
+        def current(ref):
+            self.assertEqual(ref, prepared['prepared_result'])
+            raw = view_path.read_bytes()
+            return {**prepared, 'view': json.loads(raw), 'view_sha256': hashlib.sha256(raw).hexdigest()}
+        writing.prepared_publication = Mock(side_effect=current)
+        owner = ArtifactStore(root / 'tools/writing/retained')
+        owner.write_json('request.json', {'inputs': [], 'publication_inspection_contract': 'prepared_document.v1'})
+        request = owner.write_json('writer/review/format_correction/request.json', {
+            'prompt': json.dumps({'prepared_publication': prepared})})
+        review = {'review_status': 'needs_revision', 'inspection_source': {
+            'request_path': request.path,
+            'request_sha256': hashlib.sha256(owner.resolve(request).read_bytes()).hexdigest()}}
+        review_path = 'workspace/manuscripts/retained/review.json'
+        workspace.resolve(review_path, write=True).write_text(json.dumps(review), encoding='utf-8')
+        artifacts = [manuscript, review_path]
+        data = {'version': 'workspace/manuscripts/retained', 'editable_markdown': manuscript,
+            'inputs': [], 'review_path': review_path, 'artifact_sha256': workspace.artifact_hashes(artifacts)}
+        owner.write_json('result.json', {'artifacts': artifacts, 'data': data})
+        arguments = {'goal': 'Check the prose independently', 'title': 'Fresh check', 'prior_draft': manuscript}
+        client = SimpleNamespace(ask_json=Mock(return_value={'section_reviews': [
+            {'section_id': 'document', 'verdict': 'pass', 'findings': []}]}))
+        writing.client_factory = Mock(return_value=client)
+        with patch('simple_ar.tools.publication.run_process') as process:
+            result = writing.call('review_document', arguments, identity='bound-view')
+            self.assertEqual(result.status, 'ok', result)
+            self.assertEqual(result.data['review_status'], 'reviewed')  # No inherited old verdict.
+            review_owner = ArtifactStore(root / 'tools/writing/bound-view')
+            binding = review_owner.read_json('request.json')
+            self.assertEqual(set(binding['prepared_publication']),
+                {'prepared_result', 'prepared_result_sha256', 'view_path', 'view_sha256'})
+            self.assertEqual(json.loads(review_owner.read_json('review/request.json')['prompt'])['prepared_publication'], prepared)
+            # Bound recovery validates even when the task's admission flag is absent.
+            writing.publication_inspection = None
+            for target, replacement in ((path, path.read_bytes() + b'changed'),
+                    (view_path, view_path.read_bytes() + b' '), (view_path, None),
+                    (owner.resolve(request), None)):
+                with self.subTest(changed=target.name, missing=replacement is None), changed_record(target, replacement):
+                    rejected = writing.call('review_document', arguments, identity='bound-view')
+                    self.assertEqual(rejected.status, 'error', rejected)
+                    with patch.object(writing, 'publication_inspection', 'prepared_document.v1'):
+                        fresh = writing.call('review_document', arguments, identity='changed-view')
+                        self.assertEqual(fresh.status, 'error', fresh)
+            with patch.object(writing, 'prepared_publication', None):
+                self.assertEqual(writing.call('review_document', arguments, identity='bound-view').status, 'error')
+            with changed_record(review_owner.resolve('request.json'),
+                    {key: value for key, value in binding.items() if key != 'prepared_publication'}):
+                rejected = writing.call('review_document', arguments, identity='bound-view')
+                self.assertEqual(rejected.status, 'error', rejected)
+                self.assertIn('lost its publication reference', rejected.error)
+            self.assertEqual(writing.call('review_document', arguments, identity='bound-view'), result)
+            client.ask_json.assert_called_once()
+            process.assert_not_called()
+        # An exact caller body is required independently of the composition hash.
+        with self.assertRaisesRegex(ValueError, 'source assembly body'):
+            writing._review_publication(manuscript, path.read_text() + 'changed', binding)
+        # Historical compositions without a prepared review stay source-only.
+        owner.write_json('request.json', {'inputs': []})
+        historical = {key: value for key, value in data.items() if key != 'review_path'}
+        historical['artifact_sha256'] = workspace.artifact_hashes([manuscript])
+        owner.write_json('result.json', {'artifacts': [manuscript], 'data': historical})
+        writing.publication_inspection = 'prepared_document.v1'
+        writing.prepared_publication.reset_mock()
+        legacy = writing.call('review_document', arguments, identity='historical-view')
+        self.assertEqual(legacy.status, 'ok', legacy)
+        historical_owner = ArtifactStore(root / 'tools/writing/historical-view')
+        self.assertNotIn('prepared_publication', historical_owner.read_json('request.json'))
+        self.assertNotIn('prepared_publication', json.loads(historical_owner.read_json('review/request.json')['prompt']))
+        self.assertIn('not scientific certification or visual inspection', legacy.data['scope'])
+        # Absent fields remain absent on replay, even if a prepared receipt is now available.
+        owner.write_json('request.json', {'inputs': [], 'publication_inspection_contract': 'prepared_document.v1'})
+        owner.write_json('result.json', {'artifacts': artifacts, 'data': data})
+        self.assertEqual(writing.call('review_document', arguments, identity='historical-view'), legacy)
+        external = workspace.resolve('workspace/external.md', write=True)
+        external.write_bytes(path.read_bytes())
+        raw = writing.call('review_document', {**arguments, 'prior_draft': str(external)}, identity='external-view')
+        self.assertEqual(raw.status, 'ok', raw)
+        self.assertNotIn('prepared_publication', ArtifactStore(root / 'tools/writing/external-view').read_json('request.json'))
+        writing.prepared_publication.assert_not_called()
+
+    def _assert_prepared_independent_review(self, root, workspace, writing, completed, inspection, table):
+        """Exercise the consumer against the already proved cooperative fixture."""
+        from types import SimpleNamespace
+        manuscript = workspace.resolve(completed.data['editable_markdown'])
+        preserved = {path: path.read_bytes() for directory in (
+            manuscript.parent, root / 'tools/writing/cooperative-author',
+            workspace.resolve(inspection['view_path']).parent)
+            for path in directory.rglob('*') if path.is_file()}
+        arguments = {'goal': 'Independently check the saved value against the supplied record',
+            'title': 'Fresh scientific check', 'prior_draft': completed.data['editable_markdown'],
+            'materials': [{'path': str(table)}]}
+        client = SimpleNamespace(ask_json=Mock(return_value={'section_reviews': [
+            {'section_id': 'document', 'verdict': 'pass', 'findings': []}]}))
+        with patch.object(writing, 'client_factory', return_value=client), \
+                patch('simple_ar.tools.publication.run_process') as process:
+            result = writing.call('review_document', arguments, identity='fresh-prepared-review')
+            self.assertEqual(result.status, 'ok', result)
+            self.assertEqual(result.data['review_status'], 'reviewed')
+            owner = ArtifactStore(root / 'tools/writing/fresh-prepared-review')
+            self.assertEqual(owner.read_json('request.json')['prepared_publication'],
+                {key: inspection[key] for key in
+                 ('prepared_result', 'prepared_result_sha256', 'view_path', 'view_sha256')})
+            prompt = json.loads(owner.read_json('review/request.json')['prompt'])
+            self.assertEqual(prompt['prepared_publication'], inspection)
+            self.assertEqual(prompt['sections'][0]['markdown'], manuscript.read_bytes().decode('utf-8'))
+            self.assertEqual(prompt['historical_findings_to_check'], [])
+            self.assertIn('not scientific certification or visual inspection', result.data['scope'])
+            self.assertEqual(writing.call('review_document', arguments, identity='fresh-prepared-review'), result)
+            client.ask_json.assert_called_once()
+            process.assert_not_called()
+        self.assertEqual({path: path.read_bytes() for path in preserved}, preserved)
+
     def test_cooperative_publication_prepares_before_review_and_resumes_same_author(self):
         import shutil
         from simple_ar.core.capabilities import AttemptManifest, CapabilityContext
@@ -2705,6 +2836,20 @@ class WritingCoordinationTests(unittest.TestCase):
                 arguments = {'goal': 'Explain the saved value and execution scope',
                     'material_roots': [str(source)], 'professional_review': {'max_revision_rounds': 0},
                     'publication': {'compile_pdf': False, 'citation_style': 'numeric'}, 'finish': True}
+                if outcome == 'reviewed':
+                    figure = workspace.resolve('workspace/recorded.svg', write=True)
+                    figure.write_text('<svg xmlns="http://www.w3.org/2000/svg" width="100" height="40">'
+                        '<text x="5" y="25">value = 2.5</text></svg>', encoding='utf-8')
+                    arguments['figures'] = [{'path': str(figure),
+                        'caption': 'Saved observation: value 2.5; no new execution.'}]
+                    original_answer = client.ask_json.side_effect
+                    def include_figure(system, prompt, **options):
+                        answer = original_answer(system, prompt, **options)
+                        if options['label'] == 'composition-article':
+                            target = next(iter(json.loads(prompt)['provided_figure_captions']))
+                            answer['draft_markdown'] += f'\n\n![Saved observation]({target})'
+                        return answer
+                    client.ask_json.side_effect = include_figure
                 first = writing.call('compose_document', arguments, identity='cooperative-author')
                 self.assertEqual(first.status, 'ok', first)
                 self.assertEqual(first.data['work_status'], 'awaiting_publication_preparation')
@@ -2834,6 +2979,8 @@ class WritingCoordinationTests(unittest.TestCase):
                     self.assertEqual(linkage['result_sha256'], hashlib.sha256(physical.resolve('native_result.json').read_bytes()).hexdigest())
                     self.assertEqual(client.ask_json.call_count, 4)
                     self.assertEqual({path: path.read_bytes() for path in original}, original)
+                    if outcome == 'negative':
+                        self._assert_prepared_independent_review(root, workspace, writing, completed, inspection, table)
                     continue
                 self.assertEqual(completed.status, 'ok', completed)
                 self.assertFalse(completed.data.get('unresolved'))
@@ -2873,6 +3020,7 @@ class WritingCoordinationTests(unittest.TestCase):
                 self.assertIn('delivery', exported.data)
                 self.assertEqual(client.ask_json.call_count, 4)
                 self.assertEqual({path: path.read_bytes() for path in original}, original)
+                self._assert_prepared_independent_review(root, workspace, writing, completed, inspection, table)
 
     def test_checked_article_keeps_rejected_author_and_review_before_publication(self):
         root, workspace, writing, source, _, _, client, prompts = self._document_work_fixture()

@@ -92,6 +92,7 @@ def _resolve_draft_quotes(row: Mapping[str, Any], view: Mapping[str, Any]) -> di
 
 DELIVERY_REVIEW_CONTRACT = 'delivery_artifacts.v1'
 SCOPED_DELIVERY_INSPECTION = 'delivery_inspection.v1'
+PREPARED_PRESENTATION_CONTRACT = 'prepared_presentation.v1'
 _PROFILE_SCOPE = ('Complete bounded-table reader statistics for shape, missingness and raw-value '
     'cardinality of displayed columns, plus bounded examples. This is not full text or a '
     'value-by-value review; values, meanings, units, pairing and statistical conclusions are not verified.')
@@ -435,6 +436,8 @@ def review_evidence_locator(view: Mapping[str, Any], *, max_chars: int = 4000, m
              "producer_declarations", "producer_notes"}
     if view.get('evidence_navigation_contract') == SHARED_PRODUCER_LOCATOR_CONTRACT:
         roots.add('delivery_producers')
+    if view.get('presentation_contract') == PREPARED_PRESENTATION_CONTRACT:
+        roots.add('prepared_publication')
     candidates: dict[str, list[tuple[int, int, str]]] = {}
 
     def walk(value: Any, path: list[str]) -> None:
@@ -563,6 +566,9 @@ def _resolve_pointer(view: Mapping[str, Any], pointer: str, *, allow_empty: bool
 
 def _role(view: Mapping[str, Any], path: list[str]) -> str:
     root, *rest = path
+    if (root == 'prepared_publication' and view.get('presentation_contract') == PREPARED_PRESENTATION_CONTRACT
+            and view[root].get('contract') == 'prepared_publication.v1'):
+        return 'derived_context'
     if root == 'producer_notes' and view.get('producer_completion') == 'goal_findings.v1':
         return 'executor_record' if len(rest) > 1 and rest[1] == 'execution' else 'declaration'
     if root == 'delivery_producers' and view.get('evidence_navigation_contract') == SHARED_PRODUCER_LOCATOR_CONTRACT:

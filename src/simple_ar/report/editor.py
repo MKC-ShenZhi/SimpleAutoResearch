@@ -21,6 +21,7 @@ from simple_ar.report.review_evidence import (
     DRAFT_REFERENCE_CONTRACT, DRAFT_QUOTE_SCHEMA, review_draft_locator,
     COMPARISON_VERIFICATION_CONTRACT,
     EVIDENCE_NAVIGATION_CONTRACTS, SHARED_PRODUCER_LOCATOR_CONTRACT, project_delivery_producers,
+    PREPARED_PRESENTATION_CONTRACT as PUBLICATION_REVIEW_CONTRACT,
 )
 from simple_ar.report.schema import (
     ReportMemory,
@@ -417,6 +418,35 @@ PREPARED_PUBLICATION_FOCUS = (
     'the rendered presentation. Preserve every supported finding, including minor ones. '
     'The prepared view does not certify visual review, adoption or factual correctness.'
 )
+
+def publication_review_payload(view: dict, prepared: dict, *, contract: str | None) -> dict:
+    """One presentation owner; raw author text remains the factual/edit surface.
+
+    None reproduces the first prepared-view contract byte for byte. New reviews
+    retain assembly identities/counts and provenance, not a third full document
+    competing with the actual publication. This projection adopts no findings.
+    """
+    from copy import deepcopy
+    import hashlib
+
+    if contract not in {None, PUBLICATION_REVIEW_CONTRACT}:
+        raise ValueError('Unknown prepared publication review contract')
+    result = deepcopy(view)
+    if contract is not None:
+        result['presentation_contract'] = contract
+        observation = result['delivery_text_observation']
+        observation.pop('markdown', None)
+        assembly = observation.get('canonical_assembly')
+        if assembly is not None:
+            observation['canonical_assembly'] = {key: value for key, value in assembly.items()
+                if key not in {'report_body_markdown', 'report_markdown', 'publication_inputs'}}
+        for row in result['assembly_owned_content']:
+            text = row.pop('markdown', None)
+            if text is not None:
+                row['markdown_sha256'] = hashlib.sha256(text.encode('utf-8')).hexdigest()
+    result['prepared_publication'] = prepared
+    result['focus'].append(PREPARED_PUBLICATION_FOCUS)
+    return result
 
 
 def review_document(
@@ -824,17 +854,20 @@ def review_document(
         'disclosure required for accepted_limitation. Literal {section_id, quote} remains '
         'supported with exact matching. Never mix paragraph with quote or other selectors. '
         'Do not infer absent text, use prior-draft IDs, or treat selection as semantic proof.')
-    if prepared_publication is None:
-        retained_publication = getattr(client, 'prepared_publication_for_review', None)
-        if callable(retained_publication):
-            prepared_publication = retained_publication(view, label)
+    retained_publication = getattr(client, 'prepared_publication_for_review', None)
+    if callable(retained_publication):
+        retained = retained_publication(view, label)
+        if retained is not None:
+            if prepared_publication is not None and prepared_publication != retained:
+                raise ValueError('Prepared publication differs from the frozen inspection')
+            prepared_publication = retained
     if prepared_publication is not None:
         if (not isinstance(prepared_publication, dict)
                 or prepared_publication.get('contract') != 'prepared_publication.v1'
                 or not isinstance(prepared_publication.get('view'), dict)):
             raise ValueError('Document inspection requires the verified prepared publication view')
-        view['prepared_publication'] = prepared_publication
-        view['focus'].append(PREPARED_PUBLICATION_FOCUS)
+        view = publication_review_payload(view, prepared_publication,
+            contract=getattr(client, 'publication_review_contract', PUBLICATION_REVIEW_CONTRACT))
     base_prompt = json.dumps(view, ensure_ascii=False, separators=(",", ":"))
     prompt_limit = config.max_document_review_prompt_chars
     if prompt_limit and len(base_prompt) > prompt_limit:

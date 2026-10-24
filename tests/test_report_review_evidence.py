@@ -744,10 +744,14 @@ class ReviewEvidenceTests(unittest.TestCase):
     def test_delivery_counts_and_assembly_prose_have_derived_not_scientific_ownership(self):
         view = {"length_observation": {"known_delivery_markdown_tokens": 536},
             "narrative_context": {"length_observation": {"adopted_token_count": 423}},
-            "assembly_owned_content": [{"markdown": "Rechecked supplied rows; validity not verified."}]}
+            "assembly_owned_content": [{"markdown": "Rechecked supplied rows; validity not verified."}],
+            "presentation_contract": "prepared_presentation.v1",
+            "prepared_publication": {"contract": "prepared_publication.v1", "view": {
+                "logical_document": {"text": "Rendered caption, not independent measurements."}}}}
         for pointer, quote in (("/length_observation/known_delivery_markdown_tokens", "536"),
                 ("/narrative_context/length_observation/adopted_token_count", "423"),
-                ("/assembly_owned_content/0/markdown", "validity not verified")):
+                ("/assembly_owned_content/0/markdown", "validity not verified"),
+                ("/prepared_publication/view/logical_document/text", "Rendered caption")):
             reference = ReportEvidenceQuote(pointer=pointer, quote=quote, role="derived_context")
             validate_evidence_quotes([reference], view)
             with self.assertRaisesRegex(LLMResponseError, "derived_context"):
@@ -755,16 +759,20 @@ class ReviewEvidenceTests(unittest.TestCase):
 
     def test_derived_delivery_count_supports_style_not_definite_metric_counter_evidence(self):
         from simple_ar.report.review_evidence import validate_finding_anchors
-        view = {"length_observation": {"known_delivery_markdown_tokens": 536}}
-        finding = ReviewerFinding(finding_id="length", section_id="conclusion", type="style", severity="major",
-            required_action="revise", message="Known added content exceeds requested length.",
-            evidence_quotes=[ReportEvidenceQuote(pointer="/length_observation/known_delivery_markdown_tokens", quote="536", role="derived_context")])
-        review = ReportSectionReview(section_id="conclusion", verdict="revise_required", findings=[finding])
-        validate_finding_anchors(review, {"conclusion": "Bounded observations."}, view)
-        finding.type = "metric_mismatch"
-        finding.draft_quotes = [ReportDraftQuote(section_id="conclusion", quote="Bounded observations.")]
-        with self.assertRaisesRegex(LLMResponseError, "non-derived"):
+        for view, pointer in (({"length_observation": {"known_delivery_markdown_tokens": 536}},
+                "/length_observation/known_delivery_markdown_tokens"),
+                ({"presentation_contract": "prepared_presentation.v1", "prepared_publication": {
+                    "contract": "prepared_publication.v1", "view": {"logical_document": {"text": "536"}}}},
+                 "/prepared_publication/view/logical_document/text")):
+            finding = ReviewerFinding(finding_id="length", section_id="conclusion", type="style", severity="major",
+                required_action="revise", message="Presentation needs correction.",
+                evidence_quotes=[ReportEvidenceQuote(pointer=pointer, quote="536", role="derived_context")])
+            review = ReportSectionReview(section_id="conclusion", verdict="revise_required", findings=[finding])
             validate_finding_anchors(review, {"conclusion": "Bounded observations."}, view)
+            finding.type = "metric_mismatch"
+            finding.draft_quotes = [ReportDraftQuote(section_id="conclusion", quote="Bounded observations.")]
+            with self.assertRaisesRegex(LLMResponseError, "non-derived"):
+                validate_finding_anchors(review, {"conclusion": "Bounded observations."}, view)
 
     def test_revision_counts_and_edit_scope_are_derived_not_metric_counter_evidence(self):
         view = {"revision_context": {"length_observation": {"candidate_minus_baseline_tokens": 3}},

@@ -1624,6 +1624,69 @@ class WritingToolGateway:
     def final_review(self, data: dict) -> dict:
         return read_composition_review(self.workspace, data)
 
+    def _composition_publication(self, store: ArtifactStore, binding: dict, data: dict) -> dict | None:
+        """One retained publication proof for fresh checking and final export."""
+        review = self.final_review(data)
+        receipt = review.get('inspection_source') or {}
+        prepared = None
+        if receipt:
+            path = store.resolve(receipt['request_path']).resolve()
+            if (not path.is_relative_to(store.root.resolve())
+                    or hashlib.sha256(path.read_bytes()).hexdigest() != receipt['request_sha256']):
+                raise ValueError('Publication inspection request changed')
+            prepared = json.loads(json.loads(path.read_bytes())['prompt']).get('prepared_publication')
+        if prepared is None:
+            if binding.get('publication_inspection_contract') == 'prepared_document.v1':
+                raise ValueError('Retained publication inspection view is missing')
+            return None
+        if self.prepared_publication is None:
+            raise ValueError('Prepared publication validation is unavailable')
+        current = self.prepared_publication(prepared['prepared_result'])
+        if (current != prepared or hashlib.sha256(self.workspace.resolve(data['editable_markdown']).read_bytes()).hexdigest()
+                != current['source']['assembly_identity']['body_sha256']):
+            raise ValueError('Composition differs from its independently inspected publication')
+        return current
+
+    def _review_publication(self, prior_draft: str, markdown: str,
+                            original: dict | None) -> dict | None:
+        """Read the exact retained inspection view, without adoption or export."""
+        keys = ('prepared_result', 'prepared_result_sha256', 'view_path', 'view_sha256')
+        if original is not None:
+            if 'prepared_publication' not in original:
+                return None  # Historical source-only reviews keep their saved scope.
+            reference = original['prepared_publication']
+            if (not isinstance(reference, dict) or set(reference) != set(keys)
+                    or any(not isinstance(reference[key], str) or not reference[key] for key in keys)):
+                raise ValueError('Invalid retained review publication reference')
+        else:
+            if self.publication_inspection != 'prepared_document.v1':
+                return None
+            reference = None
+        path = self.workspace.resolve(prior_draft)
+        identity = path.parent.name
+        if path not in {self.workspace.resolve(f'workspace/manuscripts/{identity}/{leaf}')
+                for leaf in ('manuscript.md', 'candidate.md')}:
+            if reference is not None:
+                raise ValueError('Bound review publication requires its exact retained manuscript')
+            return None
+        store, binding, data = self._composition_receipt(identity)
+        if path != self.workspace.resolve(data['editable_markdown']):
+            raise ValueError('Review draft differs from its retained composition')
+        if ('independent_review' not in data and 'review_path' not in data
+                and reference is None and binding.get('publication_inspection_contract') is None):
+            return None
+        current = self._composition_publication(store, binding, data)
+        if current is None:
+            if reference is not None:
+                raise ValueError('Retained review publication view is missing')
+            return None
+        if reference is not None and reference != {key: current[key] for key in keys}:
+            raise ValueError('Retained review publication view changed')
+        body_sha = current['source']['assembly_identity']['body_sha256']
+        if hashlib.sha256(markdown.encode('utf-8')).hexdigest() != body_sha:
+            raise ValueError('Review body differs from the prepared source assembly body')
+        return current
+
     def _author_completion_gap(self, observed: dict, attempt_id: str) -> dict | None:
         """A proved, inspected author may still fail the output contract.
 
@@ -2940,15 +3003,7 @@ class WritingToolGateway:
         if provided_caption_bindings(request):
             result['figure_caption_owner'] = 'manifest'
         if request.get('publication_inspection_contract') == 'prepared_document.v1':
-            review = self.final_review(data)
-            receipt = review.get('inspection_source') or {}
-            review_request = store.resolve(receipt['request_path'])
-            if hashlib.sha256(review_request.read_bytes()).hexdigest() != receipt['request_sha256']:
-                raise ValueError('Publication inspection request changed')
-            prepared = json.loads(json.loads(review_request.read_bytes())['prompt'])['prepared_publication']
-            current = self.prepared_publication(prepared['prepared_result'])
-            if current != prepared or current['source']['assembly_identity']['body_sha256'] != hashlib.sha256(path.read_bytes()).hexdigest():
-                raise ValueError('Canonical body differs from its independently inspected publication')
+            current = self._composition_publication(store, request, data)
             result['prepared_publication'] = {key: current[key] for key in
                 ('prepared_result', 'prepared_result_sha256', 'view_path', 'view_sha256')}
             result['publication_options'] = current['source']['publication_options']
@@ -4071,6 +4126,15 @@ class WritingToolGateway:
                 if not source['questions']:
                     source.pop('questions')  # Preserve existing explicit-selection receipt identity.
             binding = {'request': canonical_request, 'inputs': bindings}
+            if (inspecting and recovering and 'prepared_publication' not in original_binding
+                    and owner.exists('review/request.json')
+                    and json.loads(owner.read_json('review/request.json')['prompt']).get('prepared_publication') is not None):
+                raise ValueError('Retained prepared review lost its publication reference')
+            review_publication = (self._review_publication(request.prior_draft, previous, original_binding)
+                if inspecting else None)
+            if review_publication is not None:
+                binding['prepared_publication'] = {key: review_publication[key] for key in
+                    ('prepared_result', 'prepared_result_sha256', 'view_path', 'view_sha256')}
             if work_source is not None:
                 binding['work_source'] = work_source
             if subject_contract is not None:
@@ -4408,7 +4472,8 @@ class WritingToolGateway:
                 report = inspect_article(store=review_store, identity=identity, client=client,
                     report_context=context, config=config, template=template, markdown=previous,
                     target_words=request.target_words, required_headings=request.required_headings,
-                    inspection_root=owner.root)
+                    inspection_root=owner.root,
+                    publication_view=(lambda _: review_publication) if review_publication is not None else None)
                 if delivery_inputs and self.workspace.artifact_hashes(delivery_inputs) != delivery_inputs:
                     raise ValueError('Declared delivery artifacts changed during inspection; no final delivery')
                 output_store = _AssemblyStore(output)

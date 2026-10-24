@@ -568,6 +568,7 @@ def retained_writing_client(*, store: ArtifactStore, identity: str, client: Any,
         raise ValueError('Unknown section response contract')
     class RetainedWritingClient:
         last_inspection_source = None
+        publication_review_contract = 'prepared_presentation.v1'
 
         def prepared_publication_for_review(self, view: dict, label: str) -> dict | None:
             """Recover only an explicit view from a matching complete frozen request.
@@ -575,7 +576,7 @@ def retained_writing_client(*, store: ArtifactStore, identity: str, client: Any,
             The normal ask_json path subsequently checks the entire request and
             its atomic response; this lookup authorizes no transport or retry.
             """
-            from simple_ar.report.editor import PREPARED_PUBLICATION_FOCUS
+            from simple_ar.report.editor import publication_review_payload
             matches = []
             snapshot = store.read_json('report_inputs.json') if store.exists('report_inputs.json') else {}
             for path in (store.root / 'model_calls').glob('*/request.json'):
@@ -586,20 +587,22 @@ def retained_writing_client(*, store: ArtifactStore, identity: str, client: Any,
                         or recorded.get('response_record_contract') != contract):
                     continue
                 frozen = json.loads(recorded['prompt'])
-                prepared = frozen.pop('prepared_publication', None)
+                prepared = frozen.get('prepared_publication')
                 if prepared is None:
                     continue
                 frozen.pop('evidence_locator', None)
-                if frozen.get('focus', [])[-1:] != [PREPARED_PUBLICATION_FOCUS]:
-                    continue
-                frozen['focus'] = frozen['focus'][:-1]
-                if frozen != view:
+                presentation_contract = frozen.get('presentation_contract')
+                expected = publication_review_payload(view, prepared, contract=presentation_contract)
+                if frozen != expected:
                     continue
                 _retained_response(previous, 'request.json', recorded)
-                matches.append(prepared)
+                matches.append((prepared, presentation_contract))
             if matches and any(row != matches[0] for row in matches):
                 raise ValueError('Ambiguous frozen publication inspection; no blind replay')
-            return matches[0] if matches else None
+            if matches:
+                self.publication_review_contract = matches[0][1]
+                return matches[0][0]
+            return None
 
         def ask_json(self, system: str, prompt: str, **options: Any) -> Any:
             self.last_inspection_source = None
@@ -956,6 +959,9 @@ def inspect_article(*, store: ArtifactStore, identity: str, client: Any,
     active = source
 
     class RetainedReviewClient:
+        publication_review_contract = (json.loads(saved['prompt']).get('presentation_contract')
+            if saved is not None else 'prepared_presentation.v1')
+
         def ask_json(self, system: str, prompt: str, **options: Any) -> Any:
             nonlocal active
             correcting = bool(json.loads(prompt)['response_format_correction'])
@@ -1005,11 +1011,12 @@ def inspect_article(*, store: ArtifactStore, identity: str, client: Any,
     if report_context.results.get('provided_figure_captions'):
         from simple_ar.report.capability import (ReportAssemblyRequest, preview_report_document,
             supplied_caption_blocks, supplied_caption_options)
-        preview = preview_report_document(ReportAssemblyRequest(title=report_context.topic,
-            sections=(ReportSectionDraft(section_id='document', heading=report_context.topic,
-                draft_markdown=markdown),), config=config, assembly_mode='whole_article',
-            papers=tuple(report_context.papers), citation_key_map=report_context.citation_key_map,
-            **supplied_caption_options(report_context)))
+        if publication_view is None:
+            preview = preview_report_document(ReportAssemblyRequest(title=report_context.topic,
+                sections=(ReportSectionDraft(section_id='document', heading=report_context.topic,
+                    draft_markdown=markdown),), config=config, assembly_mode='whole_article',
+                papers=tuple(report_context.papers), citation_key_map=report_context.citation_key_map,
+                **supplied_caption_options(report_context)))
         caption_view = {'assembly_owned_content': supplied_caption_blocks(report_context, markdown),
             'delivery_text_observation': {'provided_figure_captions': report_context.results['provided_figure_captions'],
                 'preview_status': 'pre_render_text_preview',

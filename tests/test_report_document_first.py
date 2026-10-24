@@ -67,6 +67,8 @@ class DocumentFirstTests(unittest.TestCase):
                     self.assertNotIn('prepared_publication', view)
                 else:
                     self.assertEqual(view['prepared_publication'], prepared)
+                    self.assertEqual(view['presentation_contract'], 'prepared_presentation.v1')
+                    self.assertEqual(view['sections'][0]['markdown'], body)
                     for name, raw in retained.items():
                         self.assertEqual(store.resolve(name).read_bytes(), raw)
 
@@ -2019,8 +2021,15 @@ class JointRevisionTests(unittest.TestCase):
                     case.assertEqual(view['delivery_review_contract'], 'delivery_artifacts.v1')
                     case.assertEqual(view['delivery_artifacts'][0]['coverage'], 'visual_uninspected')
                     assembly = view['delivery_text_observation']['canonical_assembly']
-                    case.assertEqual(assembly['identity']['body_sha256'], hashlib.sha256(
-                        assembly['report_body_markdown'].encode('utf-8')).hexdigest())
+                    if view.get('presentation_contract') == 'prepared_presentation.v1':
+                        case.assertNotIn('report_body_markdown', assembly)
+                        case.assertNotIn('report_markdown', assembly)
+                        case.assertNotIn('publication_inputs', assembly)
+                        case.assertNotIn('markdown', view['delivery_text_observation'])
+                        case.assertEqual(len(assembly['identity']['body_sha256']), 64)
+                    else:
+                        case.assertEqual(assembly['identity']['body_sha256'], hashlib.sha256(
+                            assembly['report_body_markdown'].encode('utf-8')).hexdigest())
                     if delivery_defect and label == 'report-document-verifier':
                         response = {'section_reviews': [{'section_id': row['section_id'],
                             'verdict': 'revise_required' if row['section_id'] == 'result' else 'pass',
