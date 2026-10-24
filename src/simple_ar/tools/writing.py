@@ -763,6 +763,11 @@ class WritingToolGateway:
                     # must remain inside the requested focus. Actual access and
                     # byte proofs are checked again by the normal recipe reader.
                     previous_draft = binding['request'].get('prior_draft')
+                    # The explicitly bound manuscript directory supplies prior
+                    # prose and delivery copies, not a new primary-evidence
+                    # focus. Explicit files elsewhere still require coverage.
+                    context_root = self.workspace.resolve(f'workspace/manuscripts/{parent_id}')
+                    evidence_focus = requested - {context_root}
                     evidence = {self.workspace.resolve_source_record(row['path'])
                         if index < len(binding['request']['sources']) else self.workspace.resolve(row['path'])
                         for index, row in enumerate(binding['inputs'])}
@@ -777,13 +782,12 @@ class WritingToolGateway:
                                 f"workspace/manuscripts/{parent_id}/{row['manuscript_path']}"))
                     if previous_draft:
                         evidence.discard(self.workspace.resolve(previous_draft))
-                    same_scope = bool(evidence) and all(any(path.is_relative_to(root)
-                        for root in requested) for path in evidence) and all(
+                    same_scope = bool(evidence) and (not evidence_focus or all(any(path.is_relative_to(root)
+                        for root in evidence_focus) for path in evidence) and all(
                         root in admitted or any(path.is_relative_to(root) for path in evidence)
-                        for root in requested) and all(any(
+                        for root in evidence_focus) and all(any(
                             root.is_relative_to(old) or old.is_relative_to(root)
-                            for old in admitted if old != self.workspace.resolve(
-                                f'workspace/manuscripts/{parent_id}')) for root in requested)
+                            for old in admitted if old != context_root) for root in evidence_focus))
                 if frozen_investigation:
                     same_scope = False  # Replay the saved selection decision, not today's eligibility policy.
                 draft = f'workspace/manuscripts/{parent_id}/manuscript.md'

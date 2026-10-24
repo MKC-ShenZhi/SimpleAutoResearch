@@ -1161,6 +1161,24 @@ class ProfessionalWorkLoopTests(unittest.TestCase):
             if negative:
                 self.assertEqual(result['data']['editable_markdown'], result['data']['version']+'/candidate.md')
                 self.assertEqual(written['independent_review']['review_status'], 'needs_revision')
+                # Prior prose/delivery copies are context, not a new evidence
+                # focus. Adding that exact directory must not trigger selection.
+                from simple_ar.tools.writing import ComposeRequest
+                intent = {'goal': 'Apply the current editorial findings without changing the saved result.',
+                    'prior_draft': result['data']['editable_markdown'],
+                    'material_roots': ['inputs', result['data']['version']]}
+                request = ComposeRequest.model_validate(intent)
+                report = app.writing.report_inputs()
+                admission = app.writing._admit_document_source(ArtifactStore(self.root/'tools/writing/feedback-proof'),
+                    intent, None, None, report)
+                for roots in (intent['material_roots'], [result['data']['version']]):
+                    resolved = app.writing._resolve_document_inputs(request.model_copy(update={'material_roots': roots}),
+                        'feedback-proof', report=report, original=None, selection=None, document_work=True,
+                        caller_fields=frozenset(intent), work_source={**admission, 'intent':{**intent,'material_roots':roots}},
+                        normalize_arguments=None)
+                    self.assertIsNone(resolved.investigation)
+                    self.assertIsNotNone(resolved.binding)
+                    self.assertEqual(len(resolved.recipe.materials), 1)
         self.assertEqual(self._process_receipts(), {})
         self.coordinator.assert_not_called()
 
