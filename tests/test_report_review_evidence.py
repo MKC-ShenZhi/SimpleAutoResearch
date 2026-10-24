@@ -240,6 +240,100 @@ class ReviewEvidenceTests(unittest.TestCase):
             with self.assertRaises(LLMResponseError):
                 restore_delivery_producers(bad)
 
+    def test_delivery_producer_default_wire_bytes_remain_unchanged(self):
+        from simple_ar.report.review_evidence import project_delivery_producers
+        artifacts = [{'path': 'a', 'producer': {'owner': '原始'}},
+            {'path': 'b', 'producer': {'owner': '原始'}}, {'path': 'c', 'producer': None},
+            {'path': 'd'}]
+        expected = ('{"delivery_artifacts": [{"path": "a", "producer": {"$ref": "/delivery_producers/0"}}, '
+            '{"path": "b", "producer": {"$ref": "/delivery_producers/0"}}, '
+            '{"path": "c", "producer": {"$ref": "/delivery_producers/1"}}, {"path": "d"}], '
+            '"delivery_producers": [{"owner": "原始"}, null]}').encode('utf-8')
+        for options in ({}, {'producer_table_pointer': '/delivery_producers'}):
+            self.assertEqual(json.dumps(project_delivery_producers(artifacts, **options),
+                ensure_ascii=False).encode('utf-8'), expected)
+
+    def test_document_feedback_roundtrip_keeps_all_fields_and_reduces_repeated_producers(self):
+        from copy import deepcopy
+        from simple_ar.report.review_evidence import project_document_feedback
+        producer = {'owner': 'run/one', 'execution': {'stdout': '完整原始记录\n' * 500},
+            'unknown': {'~/': [None, False, 0, '', {'keep': True}]}}
+        artifacts = [{**self.profile_artifact(), 'path': f'source/{i}.csv', 'producer': deepcopy(producer),
+            'consumers': [{'path': 'report/body', 'unknown': ['preserve']}],
+            'visual_pending': True, 'visual_reviewed': False, 'unknown': {'keep': i}}
+            for i in range(25)]
+        # Equal content/SHA does not erase distinct paths or producer origins.
+        artifacts[1]['producer']['owner'] = 'run/two'
+        artifacts.extend({'path': f'false/{i}', 'producer': value}
+            for i, value in enumerate((None, {}, '', False, 0, True, 1)))
+        artifacts.append({'path': 'without-producer', 'unknown': ['keep']})
+        diagnosis = {'owner': 'writing/original', 'receipt_sha256': {'request.json': 'b' * 64},
+            'artifact_sha256': {'draft.md': 'c' * 64}, 'unknown': {'unverified': True},
+            'review': {'review_status': 'reviewed', 'findings': [],
+                'section_reviews': [{'section_id': 'document', 'findings': []}],
+                'delivery_review': {'status': 'reviewed', 'artifacts': artifacts, 'defects': [],
+                    'uninspected': [], 'unknown': {'keep': [1, 2]}, 'visual_pending': ['source/0.csv']}}}
+        original = deepcopy(diagnosis)
+        before_bytes = json.dumps(diagnosis, ensure_ascii=False).encode('utf-8')
+        projected = project_document_feedback(diagnosis)
+        wire = json.loads(json.dumps({'source_feedback': projected}, ensure_ascii=False))
+        feedback = wire['source_feedback']
+        rows = feedback['review']['delivery_review']['artifacts']
+        self.assertEqual(len(rows), len(artifacts))
+        self.assertEqual(len(feedback['delivery_producers']), 9)
+        self.assertEqual(rows[0]['producer'], rows[2]['producer'])
+        self.assertNotEqual(rows[0]['producer'], rows[1]['producer'])
+        # Expand only the projected producer slots, using the actual outer JSON.
+        restored = deepcopy(feedback)
+        for row, actual in zip(restored['review']['delivery_review']['artifacts'], artifacts):
+            self.assertEqual({k: v for k, v in row.items() if k != 'producer'},
+                {k: v for k, v in actual.items() if k != 'producer'})
+            if 'producer' in row:
+                self.assertEqual(set(row['producer']), {'$ref'})
+                value = wire
+                for part in row['producer']['$ref'].split('/')[1:]:
+                    value = value[int(part)] if isinstance(value, list) else value[part]
+                row['producer'] = deepcopy(value)
+        restored.pop('delivery_producers')
+        self.assertEqual(restored, original)
+        after_bytes = json.dumps({'source_feedback': projected}, ensure_ascii=False).encode('utf-8')
+        self.assertLess(len(after_bytes), len(before_bytes) // 4)
+        self.assertEqual(json.dumps(diagnosis, ensure_ascii=False).encode('utf-8'), before_bytes)
+        projected['delivery_producers'][0]['unknown']['~/'].append('view only')
+        projected['review']['delivery_review']['artifacts'][0]['consumers'][0]['unknown'].append('view only')
+        projected['review']['section_reviews'][0]['findings'].append({'message': 'view only'})
+        projected['unknown']['unverified'] = False
+        self.assertEqual(diagnosis, original)
+
+    def test_document_feedback_preserves_absent_inspection_and_rejects_table_collision(self):
+        from copy import deepcopy
+        from simple_ar.report.review_evidence import project_document_feedback
+        for diagnosis in ({'unknown': []}, {'review': None}, {'review': {}},
+                {'review': {'delivery_review': None}},
+                {'review': {'delivery_review': {'status': 'unknown', 'visual_pending': True}}}):
+            original = deepcopy(diagnosis)
+            view = project_document_feedback(diagnosis)
+            self.assertEqual(view, original)
+            view['view_only'] = True
+            self.assertEqual(diagnosis, original)
+        diagnosis = {'delivery_producers': ['original unknown field'],
+            'review': {'delivery_review': {'artifacts': []}}}
+        original = deepcopy(diagnosis)
+        with self.assertRaisesRegex(ValueError, 'overwrite'):
+            project_document_feedback(diagnosis)
+        self.assertEqual(diagnosis, original)
+
+    def test_document_feedback_rejects_malformed_structure_without_losing_original_fields(self):
+        from copy import deepcopy
+        from simple_ar.report.review_evidence import project_document_feedback
+        for diagnosis in (None, [], {'review': []}, {'review': {'delivery_review': []}},
+                *[{'review': {'delivery_review': {'artifacts': value, 'unknown': 'retain'}}}
+                    for value in (None, {}, 'not rows', [None], ['not an object'])]):
+            original = deepcopy(diagnosis)
+            with self.subTest(diagnosis=diagnosis), self.assertRaises(ValueError):
+                project_document_feedback(diagnosis)
+            self.assertEqual(diagnosis, original)
+
     def test_shared_delivery_view_locator_and_strict_quotes_use_physical_derived_paths(self):
         from simple_ar.report.review_evidence import (
             DELIVERY_REVIEW_CONTRACT, SHARED_PRODUCER_LOCATOR_CONTRACT, LOCATOR_REFERENCE_CONTRACT,

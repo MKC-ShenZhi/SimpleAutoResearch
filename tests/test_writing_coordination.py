@@ -1488,6 +1488,7 @@ class WritingCoordinationTests(unittest.TestCase):
                 self.assertIn('work_context', view)
                 if supplement:
                     self.assertEqual(view['source_feedback']['review']['review_status'], 'needs_revision')
+                    self.assertIn('delivery_producers', view['source_feedback'])
                 paths = [table, policy] if supplement else [table]
                 observed = {row['request']['path'] for row in view['observations']}
                 missing = [path for path in paths if str(path) not in observed]
@@ -1504,6 +1505,7 @@ class WritingCoordinationTests(unittest.TestCase):
                         'evidence_quotes': [{'pointer': '/objective'}]}]}]}
             if options['label'] == 'composition-article' and supplement:
                 self.assertEqual(view['source_feedback']['review']['review_status'], 'needs_revision')
+                self.assertIn('delivery_producers', view['source_feedback'])
                 self.assertTrue(view['prior_draft'])
                 prompts.append((options['label'], view))
                 return {'prior_draft_sha256': view['edit_contract']['prior_draft_sha256'],
@@ -1539,6 +1541,8 @@ class WritingCoordinationTests(unittest.TestCase):
         self.assertEqual({path: path.read_bytes() for path in frozen}, frozen)
         owner = ArtifactStore(root / 'tools/writing/source-supplemented')
         self.assertEqual(owner.read_json('request.json')['work_source']['diagnosis'], resolved.investigation)
+        self.assertEqual(owner.read_json('selection-input.json')['source_feedback_projection'], 'shared_producers.v1')
+        self.assertEqual(owner.read_json('request.json')['source_feedback_projection'], 'shared_producers.v1')
         self.assertIn(str(policy), {row['path'] for row in owner.read_json('request.json')['request']['materials']})
         calls = client.ask_json.call_count
         with patch.object(client, 'ask_json', side_effect=AssertionError('No replayed model work')):
@@ -2408,6 +2412,38 @@ class WritingCoordinationTests(unittest.TestCase):
         self.assertEqual(client.ask_json.call_count, calls)
         self.assertEqual(writing.ledger.to_dict(), ledger)
         prior_bytes = protected
+        # Reconstruct a pre-contract continuation before its Writer operation.
+        # A completed parent check must not silently change that saved request
+        # into a new correction contract during same-identity recovery.
+        legacy_args = {'goal': args['goal'],
+            'prior_result': 'records/checked-first/native_result.json'}
+        continue_inputs = writing._continued_document_inputs
+        with patch.object(writing, '_continued_document_inputs', side_effect=lambda *a, **kw:
+                continue_inputs(*a, **{**kw, 'checked_work_admitted': False})), \
+                patch('simple_ar.report.writing.write_section_article',
+                    side_effect=ValueError('Legacy Writer boundary; no physical request')):
+            historical = writing.call('compose_document', legacy_args, identity='legacy-continued')
+        self.assertIn('Legacy Writer boundary', historical.error)
+        historical_owner = ArtifactStore(root / 'tools/writing/legacy-continued')
+        historical_binding = historical_owner.read_json('request.json')
+        historical_binding.pop('work_result_contract', None)
+        historical_owner.write_json('request.json', historical_binding)
+        self.assertNotIn('continued_source_review', historical_binding)
+        historical_bytes = {p: p.read_bytes() for p in historical_owner.root.rglob('*') if p.is_file()}
+        with patch.object(writing, '_continued_document_inputs', side_effect=lambda *a, **kw:
+                continue_inputs(*a, **{**kw, 'checked_work_admitted': True})), \
+                patch.object(client, 'ask_json', side_effect=AssertionError('No historical model work')):
+            upgraded = writing.call('compose_document', legacy_args, identity='legacy-continued')
+        self.assertIn('Inputs changed', upgraded.error,
+            'Applying the new admission to an old request reproduces the compatibility failure')
+        self.assertEqual({p: p.read_bytes() for p in historical_bytes}, historical_bytes)
+        with patch.object(client, 'ask_json', side_effect=AssertionError('No legacy operation replay')), \
+                patch('simple_ar.report.writing.write_section_article',
+                    side_effect=ValueError('Legacy Writer boundary; no physical request')):
+            recovered = writing.call('compose_document', legacy_args, identity='legacy-continued')
+        self.assertIn('Legacy Writer boundary', recovered.error)
+        self.assertEqual({p: p.read_bytes() for p in historical_bytes}, historical_bytes)
+        self.assertEqual(writing.ledger.to_dict(), ledger)
         continuing = True
         before = len(prompts)
         with patch.object(writing, '_select_materials', side_effect=AssertionError('No reselection')):

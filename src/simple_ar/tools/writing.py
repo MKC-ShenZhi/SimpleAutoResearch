@@ -816,7 +816,8 @@ class WritingToolGateway:
                         'prior_draft': '', 'material_roots': [], 'reuse_prior_inputs': False})
                     (result.recipe, result.binding, result.linkage, result.candidate) = self._continued_document_inputs(
                         continued, identity, (report or {}).get('requirement'), allow_completed=not interrupted,
-                        allow_standalone=True)
+                        allow_standalone=True, checked_work_admitted=(original is None
+                            or original.get('continued_source_review') == 'checked_work.v1'))
                     return result
                 _, _, retained = self._composition_receipt(parent_id)
                 review = self.final_review(retained)
@@ -830,7 +831,9 @@ class WritingToolGateway:
                 raise ValueError('prior_result requires professional document-work ownership')
             (result.recipe, result.binding, result.linkage, result.candidate) = self._continued_document_inputs(
                 request, identity, (report or {}).get('requirement'),
-                inspect_only=original is None or original.get('continued_source_review') == 'inspect_only.v1')
+                inspect_only=original is None or original.get('continued_source_review') == 'inspect_only.v1',
+                checked_work_admitted=(original is None
+                    or original.get('continued_source_review') == 'checked_work.v1'))
             return result
         feedback = original.get('revision_feedback') if original is not None else result.feedback
         if feedback is not None:
@@ -984,7 +987,8 @@ class WritingToolGateway:
     def _continued_document_inputs(self, request: ComposeRequest, identity: str,
                                   requirement: dict | None, *,
                                   inspect_only: bool = True, allow_completed: bool = False,
-                                  allow_standalone: bool = False) -> tuple[ComposeRequest, dict, dict, dict]:
+                                  allow_standalone: bool = False,
+                                  checked_work_admitted: bool = True) -> tuple[ComposeRequest, dict, dict, dict]:
         """Continue an author-complete failed owner, not its failed inspection.
 
         A native receipt locates the fixed same-task owner. The report operation
@@ -1035,7 +1039,9 @@ class WritingToolGateway:
             and observed.get('data', {}).get('incomplete'))
         checked_revision = (section_candidate or {}).get('checked_revision')
         checked_work = None
-        if (observed.get('data', {}).get('failure_kind') == 'image_reference'
+        # A new work order may use the completed negative check. Reconstructing
+        # an old paid request must retain its original check/author source.
+        if checked_work_admitted and (observed.get('data', {}).get('failure_kind') == 'image_reference'
                 or observed.get('status') == 'ok' and binding.get('work_result_contract') == 'checked_candidate.v1'
                     and observed.get('data', {}).get('editable_markdown') ==
                         f"workspace/manuscripts/{relative.parts[0]}/candidate.md"):
@@ -2608,6 +2614,12 @@ class WritingToolGateway:
             inputs['inspection_contract'] = admission['inspection_contract']
         if work_source is not None:
             inputs['work_source'] = work_source
+        feedback_projection = (retained.get('source_feedback_projection') if retained is not None else
+            'shared_producers.v1' if work_source is not None and 'diagnosis' in work_source else None)
+        if feedback_projection not in {None, 'shared_producers.v1'}:
+            raise ValueError('Unknown source feedback projection contract')
+        if feedback_projection is not None:
+            inputs['source_feedback_projection'] = feedback_projection
         if figure_contract is not None:
             inputs['figure_selection_contract'] = figure_contract
         from simple_ar.report.review_evidence import CLAIM_ADOPTION_V2, SCOPED_DELIVERY_INSPECTION
@@ -2689,7 +2701,9 @@ class WritingToolGateway:
             if 'work_context' in inputs:
                 prompt['work_context'] = inputs['work_context']
             if work_source is not None and 'diagnosis' in work_source:
-                prompt['source_feedback'] = work_source['diagnosis']
+                from simple_ar.report.review_evidence import project_document_feedback
+                prompt['source_feedback'] = (project_document_feedback(work_source['diagnosis'])
+                    if feedback_projection is not None else work_source['diagnosis'])
             prompt = json.dumps(prompt, ensure_ascii=False)
             if len(prompt.encode('utf-8')) > 128000:
                 raise ValueError('Material selection inventory exceeds 128 KB; choose focused roots')
@@ -3639,7 +3653,7 @@ class WritingToolGateway:
                         _, _, prior_result = self._composition_receipt(prior_id)
                         if prior_result.get('artifact_sha256', {}).get(request.prior_draft) != prior_binding['sha256']:
                             # Locator spellings may differ; canonical artifact key owns the proof.
-                            canonical = f'workspace/manuscripts/{prior_id}/manuscript.md'
+                            canonical = f'workspace/manuscripts/{prior_id}/{prior_path.name}'
                             if prior_result.get('artifact_sha256', {}).get(canonical) != prior_binding['sha256']:
                                 raise ValueError('Prior joint inspection manuscript differs from its receipt')
                         if reuse_linkage and reuse_linkage.get('producer_repair'):
@@ -3701,6 +3715,13 @@ class WritingToolGateway:
                 binding['prior_input_reuse'] = reuse_linkage
             if revision_feedback is not None:
                 binding['revision_feedback'] = revision_feedback
+            feedback_projection = (original_binding.get('source_feedback_projection') if recovering else
+                owner.read_json('selection-input.json').get('source_feedback_projection')
+                    if owner.exists('selection-input.json') else None)
+            if feedback_projection not in {None, 'shared_producers.v1'}:
+                raise ValueError('Unknown source feedback projection contract')
+            if feedback_projection is not None:
+                binding['source_feedback_projection'] = feedback_projection
             if recovering:
                 if 'work_context' in original_binding:
                     binding['work_context'] = original_binding['work_context']
@@ -3792,7 +3813,10 @@ class WritingToolGateway:
                     include_memory=writing_owner is None or material_report)
             context.goal_markdown = request.goal
             if work_source is not None and 'diagnosis' in work_source:
-                context.results['source_feedback'] = work_source['diagnosis']
+                from simple_ar.report.review_evidence import project_document_feedback
+                context.results['source_feedback'] = (project_document_feedback(work_source['diagnosis'])
+                    if binding.get('source_feedback_projection') == 'shared_producers.v1'
+                    else work_source['diagnosis'])
             if revision_feedback is not None:
                 context.results['revision_feedback'] = revision_feedback
             if 'delivery_review' in binding:

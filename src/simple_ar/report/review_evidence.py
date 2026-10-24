@@ -108,11 +108,13 @@ def declaration_adoption_contract(snapshot: Mapping[str, Any]) -> str:
 DELIVERY_COPY_CONTRACT = 'delivery_copies.v1'
 
 
-def project_delivery_producers(artifacts: list[dict]) -> dict[str, Any]:
+def project_delivery_producers(artifacts: list[dict], *,
+                               producer_table_pointer: str = '/delivery_producers') -> dict[str, Any]:
     """Frozen current_scalar_locator.v2 wire view, local to one request.
 
     Preserve row order and every field except replacing each present producer
-    with {"$ref": "/delivery_producers/N"}. The table holds complete JSON
+    with {"$ref": "<producer_table_pointer>/N"} (default /delivery_producers).
+    The caller places the table at that physical JSON pointer. It holds complete JSON
     records in first-occurrence order, equal by canonical JSON (not file SHA,
     path, role or a partial producer identity). Missing and false producers stay
     distinct. Public pointers address the physical view; no virtual aliases.
@@ -129,9 +131,44 @@ def project_delivery_producers(artifacts: list[dict]) -> dict[str, Any]:
             if key not in indices:
                 indices[key] = len(producers)
                 producers.append(row['producer'])
-            row['producer'] = {'$ref': f'/delivery_producers/{indices[key]}'}
+            row['producer'] = {'$ref': f'{producer_table_pointer}/{indices[key]}'}
         rows.append(row)
     return {'delivery_artifacts': rows, 'delivery_producers': producers}
+
+
+def project_document_feedback(diagnosis: dict) -> dict:
+    """Lossless model view, embedded as {'source_feedback': returned_view}.
+
+    Only delivery artifact producers become references to complete shared JSON
+    records. All other diagnosis fields remain literal, including unknowns and
+    findings. This grants no inspection or adoption authority. Callers own the
+    version gate for saved model snapshots; the original diagnosis is untouched.
+    """
+    view = deepcopy(diagnosis)
+    if not isinstance(view, dict):
+        raise ValueError('Document feedback diagnosis must be an object')
+    review = view.get('review')
+    if review is None:
+        return view
+    if not isinstance(review, dict):
+        raise ValueError('Document feedback review must be an object or null')
+    delivery = review.get('delivery_review')
+    if delivery is None:
+        return view
+    if not isinstance(delivery, dict):
+        raise ValueError('Document feedback delivery review must be an object or null')
+    if 'artifacts' not in delivery:
+        return view
+    if not isinstance(delivery['artifacts'], list) or any(
+            not isinstance(row, dict) for row in delivery['artifacts']):
+        raise ValueError('Document feedback artifacts must be a list of objects')
+    if 'delivery_producers' in view:
+        raise ValueError('Document feedback producer table would overwrite an original field')
+    projection = project_delivery_producers(delivery['artifacts'],
+        producer_table_pointer='/source_feedback/delivery_producers')
+    delivery['artifacts'] = projection['delivery_artifacts']
+    view['delivery_producers'] = projection['delivery_producers']
+    return view
 
 
 def _delivery_producer(view: Mapping[str, Any], row: Mapping[str, Any]) -> Any:
