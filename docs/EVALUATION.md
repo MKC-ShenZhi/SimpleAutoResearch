@@ -59,6 +59,8 @@ These are software checks, not scientific success rates or proof that every plat
 
 ### Development integration checks
 
+The October 24 attachment-inspection candidate separates full file retention from bounded text/table views and preserves historical review contracts. Its installed server checks ran 144 cases (143 passed, one conditional skip), including large-table delivery, unread-candidate retention and producer repair. All 282 packaged files matched the tested source/templates. This was zero-model engineering verification; it does not establish a new real-task success, scientific correctness or lower coordination cost.
+
 The final `eb9e0c8…` installation completed 2,317 full server regression checks (2,306 passed, 11 conditional skips), plus two real TeX caption/relocation checks. All 267 source/resource files and 14 templates matched. This establishes software integration scope, not a rerun or transfer of P1–P3 live tasks to this wheel.
 
 Project-admission checks covered retention of unedited members in ordinary and copied projects, including execution of an approved project exceeding direct process-input bounds while preserving the existing protections. Read-only historical verification on the same final installation confirmed that three saved tasks (completed, paused and partial) loaded, their 640 files and ledgers remained byte-identical, and 76 delivery references were readable. This is not execution continuation of every interrupted state.

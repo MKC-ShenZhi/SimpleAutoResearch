@@ -671,6 +671,14 @@ def write_whole_article(*, store: Any, inputs: dict[str, Any], identity: str,
             article_prompt['attachment_text_scope'] = (
                 'Not supplied to author; independent inspector receives complete frozen attachment text. '
                 'Use selected original evidence for factual writing.')
+            from simple_ar.report.review_evidence import SCOPED_DELIVERY_INSPECTION
+            if review.get('text_admission', {}).get('contract') == SCOPED_DELIVERY_INSPECTION:
+                article_prompt['attachment_text_scope'] = (
+                    'Full attachment text is not repeated for authoring. Supplied table profiles are '
+                    'SHA-bound complete-reader shape/missingness/cardinality statistics with bounded '
+                    'examples, not full-value or scientific verification. Use selected original evidence '
+                    'for other factual claims. The independent inspector receives the actual admitted '
+                    'text/profile views; unsupported content remains uninspected.')
         # The shared client owns bounded transport retries, API/JSON compatibility
         # and physical-attempt accounting. Article validation never redrafts.
         output_limit = ({'max_output_tokens': inputs['max_output_tokens']}

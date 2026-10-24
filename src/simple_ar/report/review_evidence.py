@@ -91,6 +91,10 @@ def _resolve_draft_quotes(row: Mapping[str, Any], view: Mapping[str, Any]) -> di
 
 
 DELIVERY_REVIEW_CONTRACT = 'delivery_artifacts.v1'
+SCOPED_DELIVERY_INSPECTION = 'delivery_inspection.v1'
+_PROFILE_SCOPE = ('Complete bounded-table reader statistics for shape, missingness and raw-value '
+    'cardinality of displayed columns, plus bounded examples. This is not full text or a '
+    'value-by-value review; values, meanings, units, pairing and statistical conclusions are not verified.')
 DECLARATION_ADOPTION_CONTRACT = 'producer_declarations.v1'
 CLAIM_ADOPTION_V2 = 'producer_declarations.v2'
 DECLARATION_ADOPTION_CONTRACTS = {DECLARATION_ADOPTION_CONTRACT, CLAIM_ADOPTION_V2}
@@ -155,6 +159,59 @@ def restore_delivery_producers(view: Mapping[str, Any]) -> list[dict]:
     return rows
 
 
+def delivery_target_pointer(row: Mapping[str, Any], index: int) -> str | None:
+    """Select only the actual frozen inspection view; old rows remain text-only.
+
+    The byte owner binds the profile to the full original SHA. Here we validate
+    that binding and the shared reader's bounded data shape, never reread files
+    or treat a matching digest as scientific verification.
+    """
+    if row.get('coverage') == 'complete' and isinstance(row.get('text'), str):
+        return f'/delivery_artifacts/{index}/text'
+    if (row.get('inspection_contract') != SCOPED_DELIVERY_INSPECTION
+            or row.get('coverage') != 'table_profile'):
+        return None
+    profile = row.get('profile')
+    required = {'source_sha256', 'row_count', 'columns', 'column_summary', 'example_rows',
+        'columns_omitted', 'column_names_truncated', 'cell_values_truncated', 'status'}
+    if not isinstance(profile, dict) or set(profile) != required:
+        return None
+    sha = row.get('sha256')
+    if (not isinstance(sha, str) or not re.fullmatch(r'[0-9a-f]{64}', sha)
+            or profile['source_sha256'] != sha):
+        return None
+    count, columns, summaries, examples = (profile[key] for key in
+        ('row_count', 'columns', 'column_summary', 'example_rows'))
+    if (type(count) is not int or count < 1 or not isinstance(columns, list)
+            or not 1 <= len(columns) <= 40
+            or any(not isinstance(name, str) or len(name) > 200 for name in columns)
+            or not isinstance(summaries, list) or len(summaries) != len(columns)
+            or not isinstance(examples, list) or len(examples) != min(count, 5)
+            or type(profile['columns_omitted']) is not int or profile['columns_omitted'] < 0
+            or (profile['columns_omitted'] > 0 and len(columns) != 40)
+            or type(profile['column_names_truncated']) is not bool
+            or type(profile['cell_values_truncated']) is not bool
+            or not isinstance(profile['status'], str) or not profile['status'].strip()):
+        return None
+    for name, summary in zip(columns, summaries):
+        if (not isinstance(summary, dict)
+                or set(summary) != {'column', 'column_name_truncated', 'missing', 'distinct_nonmissing'}
+                or summary['column'] != name or type(summary['column_name_truncated']) is not bool
+                or (summary['column_name_truncated'] and len(name) != 200)
+                or type(summary['missing']) is not int or not 0 <= summary['missing'] <= count
+                or type(summary['distinct_nonmissing']) is not int
+                or not 0 <= summary['distinct_nonmissing'] <= count - summary['missing']
+                or ((summary['distinct_nonmissing'] == 0) != (summary['missing'] == count))):
+            return None
+    if (profile['column_names_truncated'] != any(s['column_name_truncated'] for s in summaries)
+            or (len(set(columns)) != len(columns) and not profile['column_names_truncated'])
+            or any(not isinstance(example, dict) or set(example) != set(columns)
+                or any(not isinstance(value, str) or len(value) > 200 for value in example.values())
+                for example in examples)):
+        return None
+    return f'/delivery_artifacts/{index}/profile'
+
+
 def delivery_subject_view(row: Mapping[str, Any], *, coverage: bool = False) -> dict:
     """Project frozen subjects, retaining only explicitly bound copy aliases.
 
@@ -164,6 +221,12 @@ def delivery_subject_view(row: Mapping[str, Any], *, coverage: bool = False) -> 
     keys = (('path', 'sha256', 'coverage', 'producer', 'consumers', 'visual_reviewed') if coverage
         else ('path', 'sha256', 'producer', 'consumers'))
     result = {key: row[key] for key in keys if key in row}
+    if coverage and row.get('inspection_contract') == SCOPED_DELIVERY_INSPECTION:
+        result['inspection_contract'] = SCOPED_DELIVERY_INSPECTION
+        if delivery_target_pointer(row, 0) == '/delivery_artifacts/0/profile':
+            result['profile_scope'] = {'scope': _PROFILE_SCOPE,
+                'displayed_column_count': len(row['profile']['columns']), **{key: row['profile'][key]
+                for key in ('row_count', 'columns_omitted', 'column_names_truncated', 'cell_values_truncated')}}
     if 'copies' in row or 'copy_contract' in row:
         if row.get('copy_contract') != DELIVERY_COPY_CONTRACT or not isinstance(row.get('copies'), list):
             raise ValueError('Unknown or incomplete delivery copy contract')
@@ -185,7 +248,13 @@ def attachment_review_blocks_editing(inspection: dict) -> bool:
     if contract is not None and contract not in DECLARATION_ADOPTION_CONTRACTS:
         raise ValueError('Unknown producer declaration adoption contract')
     if contract is None:
-        return inspection.get('status', 'reviewed') != 'reviewed'  # Historical contract unchanged.
+        scoped = (inspection.get('inspection_contract') == SCOPED_DELIVERY_INSPECTION
+            or any(row.get('inspection_contract') == SCOPED_DELIVERY_INSPECTION
+                   for row in inspection.get('artifacts', [])))
+        # Restored historical inspections keep their status-only admission,
+        # including the original missing-status default. New scope is opt-in.
+        return (scoped and bool(inspection.get('defects') or inspection.get('uninspected'))
+            or inspection.get('status', 'reviewed') != 'reviewed')
     return (bool(inspection.get('defects') or inspection.get('uninspected'))
         or inspection.get('status') not in {'reviewed', 'needs_revision'})
 
@@ -195,14 +264,14 @@ def delivery_finding_targets(finding: Any, artifacts: list[dict]) -> list[dict]:
     targets = []
     pointers = getattr(finding, 'delivery_targets', [])
     if len(pointers) != len(set(pointers)):
-        raise LLMResponseError('Delivery defect targets must be distinct current text pointers.')
+        raise LLMResponseError('Delivery defect targets must be distinct current inspection pointers.')
     for pointer in pointers:
-        match = re.fullmatch(r'/delivery_artifacts/(0|[1-9][0-9]*)/text', pointer)
+        match = re.fullmatch(r'/delivery_artifacts/(0|[1-9][0-9]*)/(text|profile)', pointer)
         if match is None or int(match[1]) >= len(artifacts):
-            raise LLMResponseError('Delivery defect target must select an existing frozen attachment text field.')
+            raise LLMResponseError('Delivery defect target must select an existing frozen attachment text or profile view.')
         row = artifacts[int(match[1])]
-        if row.get('coverage') != 'complete' or not isinstance(row.get('text'), str):
-            raise LLMResponseError('Delivery defect target has no completely observed current text.')
+        if delivery_target_pointer(row, int(match[1])) != pointer:
+            raise LLMResponseError('Delivery defect target has no valid current inspection view.')
         targets.append(row)
     return targets
 
@@ -234,8 +303,10 @@ def delivery_review_result(snapshot: dict, reviews: list[ReportSectionReview]) -
         if any(current.get(row['path']) == row['sha256'] for row in previous['targets']):
             if previous not in defects:
                 defects.append(previous)
-    missing = [{key: row[key] for key in ('path', 'sha256', 'coverage')} for row in artifacts
-               if row['coverage'] not in {'complete', 'visual_uninspected'}]
+    missing = [{key: row[key] for key in ('path', 'sha256', 'coverage')} for i, row in enumerate(artifacts)
+               if row['coverage'] != 'visual_uninspected' and not delivery_target_pointer(row, i)
+               and not (row.get('inspection_contract') != SCOPED_DELIVERY_INSPECTION
+                        and row['coverage'] == 'complete')]
     result = {'contract': DELIVERY_REVIEW_CONTRACT,
         'status': 'needs_revision' if defects else 'incomplete' if missing else 'reviewed',
         'artifacts': [delivery_subject_view(row, coverage=True) for row in artifacts],
@@ -243,6 +314,23 @@ def delivery_review_result(snapshot: dict, reviews: list[ReportSectionReview]) -
         'visual_pending': [{key: row[key] for key in ('path', 'sha256')} for row in artifacts
                            if row['coverage'] == 'visual_uninspected'],
         'scope': 'Text attachments and prose only. Figure versions are bound for the separate visual owner; reviewed does not certify images or scientific validity.'}
+    if (snapshot.get('text_admission', {}).get('contract') == SCOPED_DELIVERY_INSPECTION
+            or any(row.get('inspection_contract') == SCOPED_DELIVERY_INSPECTION for row in artifacts)):
+        result['inspection_contract'] = SCOPED_DELIVERY_INSPECTION
+        result['scope_limits'] = [_PROFILE_SCOPE,
+            'Reviewed means inspection of the supplied admissible views is complete; '
+            'unsupported, incomplete or oversized attachments remain uninspected. '
+            'Figure inspection belongs to the separate visual owner.']
+        result['profiled_artifacts'] = [
+            {'path': row['path'], 'sha256': row['sha256'],
+             'reader_coverage': delivery_subject_view(row, coverage=True)['profile_scope'],
+             'unverified': ['all individual values', 'column meanings', 'units', 'pairing',
+                            'independence', 'statistical conclusions']}
+            for i, row in enumerate(artifacts)
+            if delivery_target_pointer(row, i) == f'/delivery_artifacts/{i}/profile']
+        result['scope'] = ('Inspection of supplied full text and SHA-bound table profile views only. '
+            'Reviewed means the supplied views were checked, not all table values or scientific '
+            'conclusions. See scope_limits and profiled_artifacts; figures have a separate visual owner.')
     if snapshot.get('producer_completion') == 'goal_findings.v1':
         result['producer_completion'] = 'goal_findings.v1'
         result['producer_notes'] = snapshot['producer_notes']
@@ -447,6 +535,13 @@ def _role(view: Mapping[str, Any], path: list[str]) -> str:
     if root == 'delivery_artifacts' and view.get('delivery_review_contract') == DELIVERY_REVIEW_CONTRACT:
         if len(rest) == 2 and rest[-1] == 'text':
             return 'producer_output' if _delivery_producer(view, view[root][int(rest[0])]) else 'recorded_material'
+        if (len(rest) >= 3 and rest[1] == 'profile'
+                and delivery_target_pointer(view[root][int(rest[0])], int(rest[0]))
+                    == f'/delivery_artifacts/{rest[0]}/profile'
+                and (rest[2] in {'row_count', 'columns', 'example_rows'}
+                     or (rest[2] == 'column_summary' and len(rest) == 5
+                         and rest[4] in {'column', 'missing', 'distinct_nonmissing'}))):
+            return 'registered_result'
         return 'derived_context'
     if root in {"objective", "experiment_plan", "execution_context"}:
         return "declaration"
@@ -584,7 +679,8 @@ def resolve_review_evidence(response: Mapping[str, Any], view: Mapping[str, Any]
                 # never an established error, permission to patch, or a pass.
                 validate_evidence_quotes(quotes, view)
                 if quotes and not any(quote.role != 'derived_context'
-                        and quote.pointer not in row.get('delivery_targets', []) for quote in quotes):
+                        and not _targets_contain_evidence(row.get('delivery_targets', []), quote.pointer)
+                        for quote in quotes):
                     resolved.update(type='evidence_gap', required_action='verify',
                         message='Unverified metric comparison (no located independent counter-evidence): '
                             + str(row.get('message', '')),
@@ -596,6 +692,10 @@ def resolve_review_evidence(response: Mapping[str, Any], view: Mapping[str, Any]
     return normalized
 
 
+def _targets_contain_evidence(targets: list[str], pointer: str) -> bool:
+    return any(pointer == target or pointer.startswith(target + '/') for target in targets)
+
+
 def validate_finding_anchors(review: ReportSectionReview, drafts: Mapping[str, str | tuple[str, ...]], view: Mapping[str, Any]) -> None:
     for finding in review.findings:
         material_targets = []
@@ -603,8 +703,8 @@ def validate_finding_anchors(review: ReportSectionReview, drafts: Mapping[str, s
             if view.get('delivery_review_contract') != DELIVERY_REVIEW_CONTRACT:
                 raise LLMResponseError('Delivery targets require the current frozen attachment inspection contract.')
             material_targets = delivery_finding_targets(finding, view.get('delivery_artifacts', []))
-            for pointer in finding.delivery_targets:
-                _resolve_pointer(view, pointer)  # Validate actual supplied scalar; no stale or fabricated target.
+            # The central selector validates text scalars and complete profile
+            # objects. Evidence quotations still must select scalar fields.
         for reference in finding.draft_quotes:
             quote = reference.quote.strip()
             if not draft_quote_present(drafts, reference.section_id, quote):
@@ -615,7 +715,8 @@ def validate_finding_anchors(review: ReportSectionReview, drafts: Mapping[str, s
             if not finding.draft_quotes and not material_targets:
                 raise LLMResponseError("Required factual review finding needs a current-draft quotation.")
             if finding.type == "metric_mismatch" and not any(
-                    quote.role != "derived_context" and quote.pointer not in finding.delivery_targets
+                    quote.role != "derived_context"
+                    and not _targets_contain_evidence(finding.delivery_targets, quote.pointer)
                     for quote in finding.evidence_quotes):
                 raise LLMResponseError("A definite metric mismatch needs located non-derived counter-evidence; otherwise request verification rather than assert a mismatch.")
 

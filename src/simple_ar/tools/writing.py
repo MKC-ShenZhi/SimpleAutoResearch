@@ -454,7 +454,9 @@ class WritingToolGateway:
         roots = list(dict.fromkeys(str(self.workspace.resolve_material_root(path)) for path in roots))
         source = {'contract': contract, 'intent': intent, 'investigation_roots': roots,
             'access_roots': None if intent.get('prior_result') or intent['prior_draft'] else roots}
-        admission = {'document_work': _DOCUMENT_WORK_CONTRACT, 'work_source': source}
+        from simple_ar.report.review_evidence import SCOPED_DELIVERY_INSPECTION
+        admission = {'document_work': _DOCUMENT_WORK_CONTRACT, 'work_source': source,
+            'inspection_contract': SCOPED_DELIVERY_INSPECTION}
         owner.write_json('selection-input.json', admission)
         if self.work_context is not None:
             from simple_ar.tools.materials import freeze_work_context
@@ -1532,8 +1534,9 @@ class WritingToolGateway:
                     allowed[self.workspace.resolve(row['path'])] = row['sha256']
         inspection = data.get('delivery_review', {})
         if inspection.get('status') == 'reviewed':
-            for row in inspection['artifacts']:
-                if row['coverage'] == 'complete':
+            from simple_ar.report.review_evidence import delivery_target_pointer
+            for index, row in enumerate(store.read_json('request.json')['delivery_review']['artifacts']):
+                if delivery_target_pointer(row, index) is not None:
                     allowed[self.workspace.resolve(row['path'])] = row['sha256']
                     for copy in row.get('copies', []):
                         allowed[self.workspace.resolve(copy['path'])] = copy['sha256']
@@ -1579,6 +1582,8 @@ class WritingToolGateway:
 
     def _repair_review_history(self, snapshot: dict, previous: dict, repair: dict) -> None:
         """Reference historical diagnoses; inspect only the actual current subjects."""
+        from simple_ar.report.review_evidence import delivery_target_pointer, SCOPED_DELIVERY_INSPECTION
+        scoped = snapshot.get('text_admission', {}).get('contract') == SCOPED_DELIVERY_INSPECTION
         current = {self.workspace.resolve(row['path']): (index, row)
             for index, row in enumerate(snapshot['artifacts'])}
         old_project = self.workspace.resolve(repair['historical_project'])
@@ -1608,8 +1613,11 @@ class WritingToolGateway:
                 index, row = current[path]
                 reference['current_targets'].append({'path': row['path'], 'sha256': row['sha256']})
                 if row['sha256'] == target['sha256']:
+                    pointer = delivery_target_pointer(row, index) if scoped else f'/delivery_artifacts/{index}/text'
+                    if pointer is None:
+                        raise ValueError('Unchanged defective subject has no current inspection view')
                     same.append({key: row[key] for key in ('path', 'sha256', 'producer', 'consumers') if key in row})
-                    pointers.append(f'/delivery_artifacts/{index}/text')
+                    pointers.append(pointer)
             refs.append(reference)
             if same and finding.get('delivery_targets'):
                 # Unchanged defective bytes remain blocking even after relocation.
@@ -1667,15 +1675,15 @@ class WritingToolGateway:
                     continue  # New bytes require the current independent review.
                 copy = matches[0]
                 item = current.get(self.workspace.resolve(copy['path']))
+                from simple_ar.report.review_evidence import delivery_target_pointer, delivery_subject_view
                 if (item is None or item[1]['sha256'] != old['sha256']
-                        or item[1].get('coverage') != 'complete' or not isinstance(item[1].get('text'), str)):
+                        or delivery_target_pointer(item[1], item[0]) is None):
                     raise ValueError('Current defective copy is absent from joint inspection')
                 index, row = item
-                from simple_ar.report.review_evidence import delivery_subject_view
                 subject = delivery_subject_view(row)
                 if subject not in same:
                     same.append(subject)
-                pointers.append(f'/delivery_artifacts/{index}/text')
+                pointers.append(delivery_target_pointer(row, index))
             if not same:
                 continue
             if defect not in prior:
@@ -1850,7 +1858,8 @@ class WritingToolGateway:
         not a file-layout-dependent window limit. Imported subjects keep the
         historical per-file/aggregate policy, also within that whole budget.
         """
-        from simple_ar.report.review_evidence import DELIVERY_REVIEW_CONTRACT, DELIVERY_COPY_CONTRACT
+        from simple_ar.report.review_evidence import (
+            DELIVERY_REVIEW_CONTRACT, DELIVERY_COPY_CONTRACT, SCOPED_DELIVERY_INSPECTION)
         unit_versions = {}
         if producer_units:
             from simple_ar.tools.producer_declarations import professional_units
@@ -1864,9 +1873,10 @@ class WritingToolGateway:
         # One whole-unit text budget, aligned with the code source capability.
         # Different subjects keep their own text/provenance even at equal SHA.
         unit_mode = bool(unit_paths)
-        if text_contract not in {None, 'professional_unit_text.v1', 'professional_unit_text.v2'}:
+        scoped = text_contract == SCOPED_DELIVERY_INSPECTION
+        if text_contract not in {None, 'professional_unit_text.v1', 'professional_unit_text.v2', SCOPED_DELIVERY_INSPECTION}:
             raise ValueError('Unknown joint inspection text admission contract')
-        if text_contract is not None and not unit_mode:
+        if text_contract is not None and not unit_mode and not scoped:
             raise ValueError('Whole-unit text admission requires its frozen producer units')
         admission_contract = text_contract or 'professional_unit_text.v2'
         copy_sources, aliases = {}, {}
@@ -1899,9 +1909,17 @@ class WritingToolGateway:
             raise ValueError('Complete professional unit inspection omits declared original subjects')
         if len(paths) != len(set(paths)):
             raise ValueError('Joint inspection attachments must be unique')
+        if scoped:
+            # Allocate text to subjects without a table view first, then reuse
+            # the reader for tables when needed. Caller ordering must not
+            # decide whether the same complete set fits inspection.
+            paths = sorted(paths, key=lambda locator: (
+                self.workspace.resolve_material_root(locator).suffix.lower() in {'.csv', '.tsv', '.json'},
+                str(self.workspace.resolve_material_root(locator))))
         provenance = getattr(self.workspace, 'artifact_provenance', None)
         versions = provenance(paths) if provenance is not None else {}
-        rows, remaining, external_remaining = [], 256000 if unit_mode else 96000, 96000
+        rows, remaining, external_remaining = [], 256000 if unit_mode or scoped else 96000, 96000
+        profile_remaining = 96000
         for locator in paths:
             path = self.workspace.resolve_material_root(locator)
             if any(row['path'] == str(path) for row in rows):
@@ -1916,8 +1934,17 @@ class WritingToolGateway:
                 raise ValueError('Joint inspection provenance differs from attachment bytes')
             row = {'path': str(path), 'sha256': digest, 'producer': version.get('producer'),
                 'coverage': 'unsupported', 'visual_reviewed': False}
+            if scoped:
+                row['inspection_contract'] = SCOPED_DELIVERY_INSPECTION
             if path.suffix.lower() in {'.png', '.jpg', '.jpeg', '.pdf', '.svg', '.webp'}:
                 row['coverage'] = 'visual_uninspected'
+            elif scoped:
+                from simple_ar.tools.materials import inspect_bound_material
+                row.update(inspect_bound_material(self.workspace, locator, digest,
+                    text_bytes=remaining, profile_bytes=profile_remaining))
+                remaining -= len(row.get('text', '').encode('utf-8'))
+                if 'profile' in row:
+                    profile_remaining -= len(json.dumps(row['profile'], ensure_ascii=False).encode('utf-8'))
             elif path.suffix.lower() in {'.csv', '.tsv', '.json', '.py', '.r', '.jl', '.sh',
                     '.txt', '.md', '.toml', '.yaml', '.yml', '.tex', '.bib'} or (
                         path in unit_paths and admission_contract == 'professional_unit_text.v2'):
@@ -1929,17 +1956,8 @@ class WritingToolGateway:
                     # already-declared complete attachment, not a new window.
                     from simple_ar.tools.materials import read_bound_material_bytes
                     raw = read_bound_material_bytes(self.workspace, locator, digest, max_bytes=remaining)
-                    try:
-                        text = raw.decode('utf-8')
-                    except UnicodeDecodeError:
-                        row['coverage'] = 'incomplete'
-                    else:
-                        binary_controls = (any((ord(char) < 32 and char not in '\t\r\n')
-                            or 127 <= ord(char) < 160 for char in text)
-                            if admission_contract == 'professional_unit_text.v2' else '\x00' in text)
-                        row['coverage'] = 'incomplete' if binary_controls else 'complete'
-                        if row['coverage'] == 'complete':
-                            row['text'] = text
+                    from simple_ar.tools.materials import material_text_view
+                    row.update(material_text_view(raw, reject_controls=admission_contract == 'professional_unit_text.v2'))
                     remaining -= len(raw)
                 elif (unit_mode and path.stat().st_size <= min(32000, external_remaining)
                         and path.stat().st_size > remaining):
@@ -1977,6 +1995,11 @@ class WritingToolGateway:
                         'are bound to the same complete bytes by source/path/SHA256 and size checks. Inspect their '
                         'content through this text and target this subject text for defects. Producer/consumer and '
                         'execution identities belong only to the original, never to its copies.')
+                if scoped:
+                    row['copy_scope'] = ('Original and actual delivery copies are byte-equivalent by '
+                        'source/path/SHA256 and size checks. Inspect the supplied text or table profile '
+                        'within its stated coverage; target that admitted view for defects. Producer '
+                        'and execution identities belong only to the original, never to its copies.')
             if self.workspace.artifact_hashes(expected_copies) != expected_copies:
                 raise ValueError('Delivery copies changed while freezing their equivalent source text')
             self.workspace.check_artifact_producers(expected_copies)
@@ -1984,7 +2007,13 @@ class WritingToolGateway:
                 != self.workspace.resolved_versions({row['path']: row['sha256'] for row in rows})):
             raise ValueError('Joint inspection attachments changed during freezing')
         result = {'contract': DELIVERY_REVIEW_CONTRACT, 'artifacts': rows}
-        if unit_mode:
+        if scoped:
+            result['text_admission'] = {'contract': SCOPED_DELIVERY_INSPECTION,
+                'max_text_bytes': 256000, 'max_profile_bytes': 96000, 'table_reader_max_mb': 20,
+                'scope': 'Original subjects remain version-bound. Full text, complete-table structure statistics, '
+                    'bounded examples and uninspected content have distinct scopes; profiles do not verify every value, '
+                    'statistical conclusions or scientific correctness. Unsupported views stay incomplete.'}
+        elif unit_mode:
             result['text_admission'] = {'contract': admission_contract, 'max_text_bytes': 256000,
                 'scope': 'Complete original unit texts within one total byte limit; external materials retain '
                     '32000-per-file/96000-total admission. Distinct paths retain distinct text and producer roles. '
@@ -2342,11 +2371,13 @@ class WritingToolGateway:
             if not selection_request.get(key):
                 selection_request.pop(key, None)  # Preserve existing directory-selection receipt bindings.
         inputs = {'request': selection_request, 'inventories': inventories}
+        if admission is not None and 'inspection_contract' in admission:
+            inputs['inspection_contract'] = admission['inspection_contract']
         if work_source is not None:
             inputs['work_source'] = work_source
         if figure_contract is not None:
             inputs['figure_selection_contract'] = figure_contract
-        from simple_ar.report.review_evidence import CLAIM_ADOPTION_V2
+        from simple_ar.report.review_evidence import CLAIM_ADOPTION_V2, SCOPED_DELIVERY_INSPECTION
         selection_validation = (retained.get('selection_validation') if retained is not None else
             'observed_windows.v1' if document_work and (self.producer_completion == 'goal_findings.v1'
                 or self.declaration_adoption_contract == CLAIM_ADOPTION_V2) else None)
@@ -2470,7 +2501,17 @@ class WritingToolGateway:
                     'the request omitted it. Preserve an explicit title. Select delivery_artifacts as the '
                     'smallest necessary set of actual inventory files accompanying the article: source code, '
                     'tables and necessary data; never all directories or inferred dependencies. ')
-                if unit_contract is not None:
+                if inputs.get('inspection_contract') == SCOPED_DELIVERY_INSPECTION:
+                    instructions += ('Registered professional units retain their complete proven source/output '
+                        'files; select representative artifacts without enumerating or recopying their members. '
+                        'Preservation is separate from inspection: readable text shares a 256000-byte view, '
+                        'and larger supported tables use version-bound profiles from the existing complete '
+                        'table reader (20 MiB source limit), sharing a separate 96000-byte profile view. '
+                        'Profiles report row/column coverage and bounded examples, not per-value or scientific '
+                        'verification. Unsupported or unobserved attachments remain explicit inspection gaps; '
+                        'they do not prevent saving a useful draft but cannot silently pass formal delivery. '
+                        'Selected original evidence windows are still needed for factual writing. ')
+                elif unit_contract is not None:
                     instructions += ('For a relevant registered complete professional unit, select representative '
                         'artifacts; the controller consumes its entire proven source/output unit without recopying '
                         'or requiring you to enumerate its members or infer dependencies. Original evidence windows '
@@ -2684,6 +2725,7 @@ class WritingToolGateway:
         from simple_ar.report.projection import build_material_report_inputs, apply_report_bibliography
         from simple_ar.report.schema import ReportContext, ReportRuntimeConfig, ReportSectionPlan, ReportDocumentPlan, SourceHandle, ReportMemory, finding_requires_resolution
         from simple_ar.report.templates import load_report_template_bundle, intended_use_guidance
+        from simple_ar.report.review_evidence import SCOPED_DELIVERY_INSPECTION
         from simple_ar.report.writing import (ARTICLE_OWNER, SECTION_ARTICLE_OWNER,
             article_writing_inputs, run_composition_article, write_section_article)
         from simple_ar.research.documents.ingest import DocumentBundle
@@ -3304,15 +3346,21 @@ class WritingToolGateway:
                         admission = original['text_admission']
                         if (not isinstance(admission, dict)
                                 or admission.get('contract') not in {
-                                    'professional_unit_text.v1', 'professional_unit_text.v2'}):
+                                    'professional_unit_text.v1', 'professional_unit_text.v2', SCOPED_DELIVERY_INSPECTION}):
                             raise ValueError('Unknown joint inspection text admission contract')
-                        if not review_units:
+                        if not review_units and admission['contract'] != SCOPED_DELIVERY_INSPECTION:
                             raise ValueError('Whole-unit text admission requires its frozen producer units')
                         text_contract = admission['contract']
                     else:
                         # Never reinterpret a saved window-based inspection,
                         # including earlier unit bindings without this marker.
                         review_units = None
+                elif owner.exists('selection-input.json'):
+                    admission = owner.read_json('selection-input.json').get('inspection_contract')
+                    if admission is not None:
+                        if admission != SCOPED_DELIVERY_INSPECTION:
+                            raise ValueError('Unknown document inspection admission contract')
+                        text_contract = admission
                 snapshot = self._freeze_delivery_review(paths, identity, copies=copies,
                     producer_units=review_units, text_contract=text_contract)
                 completion = (original_binding.get('delivery_review', {}).get('producer_completion')

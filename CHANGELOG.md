@@ -18,6 +18,7 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 - Repairs retain required original materials and distinguish authoring context from delivered execution. Earlier failures remain recorded without blocking a separately verified replacement; unsupported numerical allegations remain unresolved, not proven errors or evidence of improved efficiency.
 - The experimental UI shares configuration preview, material authorization and stop/resume behavior. Complete research interaction remains under acceptance.
 - Multiple attachments from one execution share a complete version check within each inspection, avoiding repeated traversal; new inspections still reject changed inputs and outputs.
+- Separate complete attachment retention from bounded inspection in new document work. Larger supported tables use version-bound reader profiles, with explicit coverage limits; unread files retain gaps without discarding the draft. Proven defects still reach their original producer.
 
 ### Fixed
 

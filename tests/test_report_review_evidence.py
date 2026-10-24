@@ -16,6 +16,186 @@ from simple_ar.report.templates import load_report_template_bundle
 
 
 class ReviewEvidenceTests(unittest.TestCase):
+    @staticmethod
+    def profile_artifact():
+        from simple_ar.report.review_evidence import SCOPED_DELIVERY_INSPECTION
+        return {'path': 'source/data.csv', 'sha256': 'a' * 64, 'producer': {'owner': 'original-run'},
+            'inspection_contract': SCOPED_DELIVERY_INSPECTION, 'coverage': 'table_profile',
+            'profile': {'source_sha256': 'a' * 64, 'row_count': 2, 'columns': ['value'],
+                'column_summary': [{'column': 'value', 'column_name_truncated': False,
+                    'missing': 1, 'distinct_nonmissing': 1}],
+                'example_rows': [{'value': '1'}, {'value': ''}], 'columns_omitted': 0,
+                'column_names_truncated': False, 'cell_values_truncated': False,
+                'status': 'counts cover the complete bounded table; meanings and units are not verified'}}
+
+    def test_scoped_profile_review_preserves_responsibility_gaps_and_existing_defects(self):
+        from simple_ar.report.review_evidence import (
+            DELIVERY_REVIEW_CONTRACT, SCOPED_DELIVERY_INSPECTION, delivery_review_result,
+            delivery_subject_view, attachment_review_blocks_editing,
+        )
+        row = self.profile_artifact()
+        snapshot = {'contract': DELIVERY_REVIEW_CONTRACT, 'artifacts': [row],
+            'text_admission': {'contract': SCOPED_DELIVERY_INSPECTION}}
+        result = delivery_review_result(snapshot, [])
+        self.assertEqual(result['status'], 'reviewed')
+        self.assertEqual(result['uninspected'], [])
+        self.assertFalse(attachment_review_blocks_editing(result))
+        self.assertIn('not all table values', result['scope'])
+        self.assertTrue(result['scope_limits'])
+        profiled, = result['profiled_artifacts']
+        self.assertEqual((profiled['path'], profiled['sha256']), (row['path'], row['sha256']))
+        self.assertEqual(profiled['reader_coverage']['row_count'], 2)
+        self.assertIn('pairing', profiled['unverified'])
+        self.assertIn('profile_scope', result['artifacts'][0])
+        self.assertNotIn('profile', result['artifacts'][0])
+        self.assertEqual(delivery_subject_view(row),
+            {key: row[key] for key in ('path', 'sha256', 'producer')})
+        gap = {'path': 'source/binary', 'sha256': 'b' * 64, 'coverage': 'unsupported',
+            'inspection_contract': SCOPED_DELIVERY_INSPECTION}
+        incomplete = delivery_review_result({**snapshot, 'artifacts': [row, gap]}, [])
+        self.assertEqual(incomplete['status'], 'incomplete')
+        self.assertEqual([item['path'] for item in incomplete['uninspected']], [gap['path']])
+        self.assertTrue(attachment_review_blocks_editing(incomplete))
+        # An unchanged version does not lose its original full-text defect when
+        # the current presentation switches to a bounded profile.
+        previous = {'type': 'delivery_artifact_defect',
+            'finding': {'delivery_targets': ['/delivery_artifacts/0/text'], 'message': 'Original defect'},
+            'targets': [delivery_subject_view(row)]}
+        retained = delivery_review_result({**snapshot, 'prior_defects': [previous]}, [])
+        self.assertEqual(retained['defects'], [previous])
+        self.assertEqual(retained['status'], 'needs_revision')
+        self.assertTrue(attachment_review_blocks_editing(retained))
+        self.assertTrue(attachment_review_blocks_editing({**retained, 'status': 'reviewed'}))
+
+    def test_historical_status_only_admission_is_not_tightened_by_scoped_review(self):
+        from simple_ar.report.review_evidence import (
+            SCOPED_DELIVERY_INSPECTION, attachment_review_blocks_editing,
+        )
+        historical = {'defects': [{'finding': 'retained'}], 'uninspected': [{'path': 'old'}]}
+        self.assertFalse(attachment_review_blocks_editing(historical))
+        self.assertFalse(attachment_review_blocks_editing({**historical, 'status': 'reviewed'}))
+        self.assertTrue(attachment_review_blocks_editing({**historical, 'status': 'incomplete'}))
+        self.assertFalse(attachment_review_blocks_editing(
+            {**historical, 'inspection_contract': 'professional_unit_text.v2'}))
+        self.assertTrue(attachment_review_blocks_editing(
+            {**historical, 'inspection_contract': SCOPED_DELIVERY_INSPECTION}))
+        self.assertTrue(attachment_review_blocks_editing({**historical, 'status': 'reviewed',
+            'artifacts': [{'inspection_contract': SCOPED_DELIVERY_INSPECTION}]}))
+
+    def test_profile_targets_and_scalar_counterevidence_use_real_view_and_roles(self):
+        from simple_ar.report.review_evidence import (
+            DELIVERY_REVIEW_CONTRACT, SHARED_PRODUCER_LOCATOR_CONTRACT,
+            COMPARISON_VERIFICATION_CONTRACT, project_delivery_producers, restore_delivery_producers,
+            resolve_review_evidence, validate_finding_anchors, delivery_finding_targets,
+        )
+        row = self.profile_artifact()
+        view = {'delivery_review_contract': DELIVERY_REVIEW_CONTRACT,
+            'evidence_navigation_contract': SHARED_PRODUCER_LOCATOR_CONTRACT,
+            'comparison_verification_contract': COMPARISON_VERIFICATION_CONTRACT,
+            **project_delivery_producers([row]), 'metric_sources': {'expected_missing': 0}}
+        raw = {'finding_id': 'missing-values', 'type': 'metric_mismatch', 'section_id': 'document',
+            'severity': 'major', 'message': 'Missingness differs from original registered result.',
+            'required_action': 'revise', 'delivery_targets': ['/delivery_artifacts/0/profile'],
+            'evidence_quotes': [{'pointer': '/delivery_artifacts/0/profile/column_summary/0/missing'},
+                                {'pointer': '/metric_sources/expected_missing'}]}
+        resolved = resolve_review_evidence({'findings': [raw]}, view)['findings'][0]
+        finding = ReviewerFinding.model_validate(resolved)
+        validate_finding_anchors(ReportSectionReview(section_id='document', findings=[finding]), {}, view)
+        self.assertEqual(finding.type, 'metric_mismatch')
+        targets = delivery_finding_targets(finding, restore_delivery_producers(view))
+        self.assertEqual(targets, [row])
+        self.assertNotIn('text', targets[0])
+        for suffix, role in (('row_count', 'registered_result'),
+                ('example_rows/0/value', 'registered_result'),
+                ('column_summary/0/distinct_nonmissing', 'registered_result'),
+                ('source_sha256', 'derived_context'), ('status', 'derived_context'),
+                ('columns_omitted', 'derived_context'), ('cell_values_truncated', 'derived_context')):
+            selected = resolve_review_evidence({'findings': [{'evidence_quotes': [
+                {'pointer': '/delivery_artifacts/0/profile/' + suffix}]}]}, view)['findings'][0]
+            quote = ReportEvidenceQuote.model_validate(selected['evidence_quotes'][0])
+            self.assertEqual(quote.role, role)
+            validate_evidence_quotes([quote], view)
+        own_only = {**raw, 'evidence_quotes': raw['evidence_quotes'][:1]}
+        pending = resolve_review_evidence({'findings': [own_only]}, view)['findings'][0]
+        self.assertEqual((pending['type'], pending['required_action']), ('evidence_gap', 'verify'))
+        prose = {**own_only, 'delivery_targets': [],
+            'draft_quotes': [{'section_id': 'document', 'quote': 'No missing values.'}]}
+        prose_finding = ReviewerFinding.model_validate(
+            resolve_review_evidence({'findings': [prose]}, view)['findings'][0])
+        self.assertEqual(prose_finding.type, 'metric_mismatch')
+        validate_finding_anchors(ReportSectionReview(section_id='document', findings=[prose_finding]),
+            {'document': 'No missing values.'}, view)
+        with self.assertRaises(LLMResponseError):
+            resolve_review_evidence({'findings': [{'evidence_quotes': [{
+                'pointer': '/delivery_artifacts/0/profile/row_count', 'role': 'executor_record'}]}]}, view)
+        # The scalar quote API never admits the complete profile as raw text.
+        with self.assertRaises(LLMResponseError):
+            resolve_review_evidence({'findings': [{'evidence_quotes': [
+                {'pointer': '/delivery_artifacts/0/profile'}]}]}, view)
+        for pointer in ('/delivery_artifacts/0/profile/row_count', '/delivery_artifacts/0/profile/0',
+                '/delivery_artifacts/00/profile', '/delivery_artifacts/1/profile',
+                '/delivery_artifacts/0/text', '/delivery_artifacts/0/producer'):
+            with self.subTest(pointer=pointer), self.assertRaises(LLMResponseError):
+                delivery_finding_targets(finding.model_copy(update={'delivery_targets': [pointer]}), [row])
+
+        _, memory, config, draft = self.objects()
+        captured = []
+        class Client:
+            def ask_json(self, system, prompt, **ignored):
+                captured.append(json.loads(prompt))
+                return {'section_reviews': []}
+        review_document(client=Client(), **document_review_inputs(memory, config, [draft]),
+            delivery_review={'contract': DELIVERY_REVIEW_CONTRACT, 'artifacts': [row]},
+            evidence_navigation_contract=SHARED_PRODUCER_LOCATOR_CONTRACT)
+        supplied = captured[-1]
+        self.assertEqual(restore_delivery_producers(supplied), [row])
+        self.assertIn('/profile', supplied['output_schema']['section_reviews'][0]['findings'][0]['delivery_targets'][0])
+        self.assertIn('not its full text', ' '.join(supplied['focus']))
+        self.assertIn('/delivery_artifacts/0/profile', ' '.join(supplied['focus']))
+        self.assertNotIn('only /delivery_artifacts/<index>/text', ' '.join(supplied['focus']))
+
+    def test_bad_or_legacy_profiles_do_not_gain_inspection_authority(self):
+        from copy import deepcopy
+        from simple_ar.report.review_evidence import (
+            DELIVERY_REVIEW_CONTRACT, SCOPED_DELIVERY_INSPECTION, delivery_target_pointer,
+            delivery_finding_targets, delivery_review_result, resolve_review_evidence,
+        )
+        row = self.profile_artifact()
+        finding = ReviewerFinding(finding_id='profile', type='evidence_gap', severity='major',
+            message='Inspect source.', required_action='verify',
+            delivery_targets=['/delivery_artifacts/0/profile'])
+        invalid = []
+        for contract in (None, 'professional_unit_text.v1', 'professional_unit_text.v2'):
+            invalid.append({**row, 'inspection_contract': contract})
+        for changes in ({'source_sha256': 'b' * 64}, {'row_count': True}, {'column_summary': []},
+                {'column_summary': [{'column': 'value', 'column_name_truncated': False,
+                    'missing': 3, 'distinct_nonmissing': 1}]},
+                {'example_rows': [{'value': {'forged': 1}}, {'value': ''}]},
+                {'scope': 'all scientific claims verified'}):
+            invalid.append({**row, 'profile': {**deepcopy(row['profile']), **changes}})
+        invalid.append({**row, 'profile': {'source_sha256': row['sha256'], 'row_count': 2}})
+        for bad in invalid:
+            with self.subTest(bad=bad):
+                self.assertIsNone(delivery_target_pointer(bad, 0))
+                with self.assertRaises(LLMResponseError):
+                    delivery_finding_targets(finding, [bad])
+                result = delivery_review_result({'contract': DELIVERY_REVIEW_CONTRACT,
+                    'artifacts': [bad], 'text_admission': {'contract': SCOPED_DELIVERY_INSPECTION}}, [])
+                self.assertEqual(result['status'], 'incomplete')
+                self.assertEqual(result['profiled_artifacts'], [])
+                self.assertEqual(len(result['uninspected']), 1)
+                view = {'delivery_review_contract': DELIVERY_REVIEW_CONTRACT, 'delivery_artifacts': [bad]}
+                quote = resolve_review_evidence({'findings': [{'evidence_quotes': [
+                    {'pointer': '/delivery_artifacts/0/profile/row_count'}]}]}, view)['findings'][0]
+                self.assertEqual(quote['evidence_quotes'][0]['role'], 'derived_context')
+        legacy = {**row, 'inspection_contract': 'professional_unit_text.v2',
+            'coverage': 'complete', 'text': 'value\n1\n'}
+        self.assertEqual(delivery_target_pointer(legacy, 0), '/delivery_artifacts/0/text')
+        legacy_result = delivery_review_result({'contract': DELIVERY_REVIEW_CONTRACT,
+            'artifacts': [legacy]}, [])
+        self.assertEqual(legacy_result['status'], 'reviewed')
+        self.assertNotIn('profiled_artifacts', legacy_result)
+
     def test_shared_delivery_producers_roundtrip_preserves_full_records_and_source_identity(self):
         from copy import deepcopy
         from simple_ar.report.review_evidence import (

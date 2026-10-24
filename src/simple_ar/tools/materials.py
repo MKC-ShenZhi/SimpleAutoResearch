@@ -38,6 +38,46 @@ def read_bound_material_bytes(workspace: Any, locator: str, digest: str, *, max_
     return raw
 
 
+def material_text_view(raw: bytes, *, reject_controls: bool = True) -> dict:
+    """Describe actual decoded coverage, without replacing unread bytes."""
+    try:
+        text = raw.decode('utf-8')
+    except UnicodeDecodeError:
+        return {'coverage': 'incomplete'}
+    controls = (any((ord(char) < 32 and char not in '\t\r\n') or 127 <= ord(char) < 160
+        for char in text) if reject_controls else '\x00' in text)
+    return {'coverage': 'incomplete'} if controls else {'coverage': 'complete', 'text': text}
+
+
+def inspect_bound_material(workspace: Any, locator: str, digest: str, *,
+                           text_bytes: int, profile_bytes: int) -> dict:
+    """Read a bounded representation; preservation is not a full-value review.
+
+    Large record tables reuse the same complete-table reader as inspect_table.
+    Other content is either read in full or kept explicitly uninspected. The
+    caller retains the original version and checks it again before acceptance.
+    """
+    from simple_ar.result_analysis.table import preview_table_source, TableSourceVersionError
+    path = workspace.resolve_material_root(locator)
+    problem = ''
+    if path.suffix.lower() in {'.csv', '.tsv', '.json'} and path.stat().st_size > min(32000, text_bytes):
+        try:
+            profile = preview_table_source(path, max_mb=20, expected_sha256=digest)
+        except TableSourceVersionError:
+            raise  # A different version is never just an unavailable view.
+        except (ValueError, OSError) as exc:
+            problem = str(exc)[:500]
+        else:
+            if len(json.dumps(profile, ensure_ascii=False).encode('utf-8')) <= profile_bytes:
+                return {'coverage': 'table_profile', 'profile': profile}
+            problem = 'Complete table profile does not fit the remaining bounded inspection view'
+    if path.stat().st_size <= text_bytes:
+        raw = read_bound_material_bytes(workspace, locator, digest, max_bytes=text_bytes)
+        return material_text_view(raw)
+    return {'coverage': 'oversized', 'inspection_gap': problem or
+        'Original retained; no complete text view fits this inspection. A supported reader or narrower verified evidence is needed.'}
+
+
 def freeze_work_context(provider: Callable[[list[str]], dict], targets: list[str]) -> dict[str, Any]:
     """Freeze original task/check receipts, separately from observed materials."""
     context = provider(targets)

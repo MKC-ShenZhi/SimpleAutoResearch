@@ -450,9 +450,13 @@ def review_document(
         raise ValueError('Unknown evidence navigation contract; no method replacement')
     evidence_rules = list(EVIDENCE_QUOTE_RULES)
     if delivery_review is not None:
+        from simple_ar.report.review_evidence import SCOPED_DELIVERY_INSPECTION
+        scoped_inspection = any(row.get('inspection_contract') == SCOPED_DELIVERY_INSPECTION
+            for row in delivery_review['artifacts'])
         evidence_rules[2] = (
             'A required factual finding must quote the current draft OR explicitly name the defective '
-            'attachment text in delivery_targets. Evidence quotes do not identify a repair target. '
+            + ('attachment inspection view' if scoped_inspection else 'attachment text')
+            + ' in delivery_targets. Evidence quotes do not identify a repair target. '
             'A definite metric_mismatch also needs located non-derived counter-evidence distinct from '
             'its accused attachment targets; when unavailable '
             'retain evidence_gap/verify rather than invent a discrepancy.')
@@ -626,7 +630,10 @@ def review_document(
         view["length_observation"]["delivery_count_scope"] = delivery_text_observation.get("preview_status", "unavailable")
         view["length_observation"]["assembly_preview_complete"] = delivery_text_observation.get("preview_status") == "pre_render_text_preview"
     if delivery_review is not None:
-        from simple_ar.report.review_evidence import DELIVERY_REVIEW_CONTRACT, declaration_adoption_contract
+        from simple_ar.report.review_evidence import (
+            DELIVERY_REVIEW_CONTRACT, declaration_adoption_contract,
+            delivery_target_pointer,
+        )
         declaration_adoption_contract(delivery_review)
         if delivery_review.get('contract') != DELIVERY_REVIEW_CONTRACT:
             raise ValueError('Unknown attachment review contract')
@@ -698,6 +705,38 @@ def review_document(
             'Only explicit attachment defects need no manuscript quote. Never supply producer/owner/path/hash '
             'as a target: the controller alone resolves responsibility from the frozen mapping. '
             'Metadata and producer identity are not proof of correctness. Uninspected images are not visual evidence.')
+        if scoped_inspection:
+            # Describe the actual reader view, without changing saved v1/v2 requests.
+            view['focus'] = [text.replace(
+                'only /delivery_artifacts/<index>/text; the controller binds the original frozen subject.',
+                'the admitted /text or /profile view; the controller binds the original frozen subject.')
+                .replace('actual current artifact text', 'actual current artifact inspection view')
+                .replace('delivery_artifacts text as actual deliverables',
+                         'delivery_artifacts inspection views as actual deliverables')
+                .replace('current frozen text pointer', 'current admitted inspection pointer')
+                for text in view['focus']]
+            pointers = [pointer for i, row in enumerate(delivery_review['artifacts'])
+                if (pointer := delivery_target_pointer(row, i)) is not None]
+            view['output_schema']['section_reviews'][0]['findings'][0]['delivery_targets'] = [
+                'Exact admitted /delivery_artifacts/<index>/text or /profile pointer for the accused '
+                'attachment view; select the complete profile object, never its fields or indices. '
+                'Omit or [] for prose defects.']
+            view['focus'].append(
+                'delivery_inspection.v1 admits these current attachment targets: '
+                + json.dumps(pointers) + '. Full-text coverage=complete supplies the entire text. '
+                'coverage=table_profile supplies a bounded profile bound by source_sha256 to the '
+                'whole original file, not its full text. Reader counts describe complete bounded-table '
+                'shape, missingness and raw typed-value cardinality for displayed columns; examples '
+                'and column names are bounded. Inspect columns_omitted and truncation flags. '
+                'This view cannot verify every value, meanings, units, independence, pairing or '
+                'statistical conclusions. Profile counts/examples have registered_result ownership, '
+                'never executor_record; status, SHA and limitations remain derived_context. '
+                'Evidence quotes select actual scalar fields inside the profile; delivery_targets '
+                'select the entire admitted profile to bind its original path, SHA and producer. '
+                'Fields inside an accused profile are not independent counter-evidence against that '
+                'same target. Unsupported/incomplete/oversized rows remain uninspected and prevent '
+                'formal adoption; a complete candidate may still be drafted. Reviewed means checking '
+                'the supplied views, never value-by-value or scientific approval.')
     if prior:
         # This role tests recorded allegations, not the old drafting directions.
         # Keep the original objective, full current prose and evidence intact;

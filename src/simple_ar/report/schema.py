@@ -289,7 +289,7 @@ class ReviewerFinding(ReportModel):
     evidence_quotes: list[ReportEvidenceQuote] = Field(default_factory=list, exclude_if=lambda quotes: not quotes)
     delivery_targets: list[str] = Field(default_factory=list, max_length=32,
         exclude_if=lambda targets: not targets,
-        description='Explicit accused attachment text fields: absolute JSON Pointers into the current frozen delivery_artifacts. Evidence quotations are counter-evidence, not repair targets. Omit for prose-only findings. Producer ownership is controller-resolved, never model-selected.')
+        description='Explicit accused attachment views: absolute JSON Pointers to admitted /text fields or, only under delivery_inspection.v1, complete SHA-bound /profile objects in current frozen delivery_artifacts. Profiles cover reader statistics and bounded examples, not all values or scientific correctness. No child fields or indices as targets. Evidence quotations are counter-evidence, not repair targets. Omit for prose-only findings. Producer ownership is controller-resolved, never model-selected.')
 
 
 # A model may label a factual defect "minor" even when it remains unresolved.

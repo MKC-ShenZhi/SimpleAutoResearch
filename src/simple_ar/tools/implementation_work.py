@@ -501,7 +501,9 @@ def _review_execution(owner: Any, locator: str) -> tuple[dict, dict]:
     _independent_delivery_review(writing, binding, {**data, 'delivery_review': inspection},
         review_result=review, reviewed_sections=candidate['sections'] if candidate else None)
 
-    snapshot = {owner.workspace.resolve(row['path']): row for row in binding['delivery_review']['artifacts']}
+    from simple_ar.report.review_evidence import delivery_target_pointer, SCOPED_DELIVERY_INSPECTION
+    snapshot = {owner.workspace.resolve(row['path']): (index, row)
+        for index, row in enumerate(binding['delivery_review']['artifacts'])}
     producer, targets = None, []
     unit_owners = None
     for defect in inspection['defects']:
@@ -510,25 +512,38 @@ def _review_execution(owner: Any, locator: str) -> tuple[dict, dict]:
         for target in defect['targets']:
             path, digest = target['path'], target['sha256']
             resolved = owner.workspace.resolve(path)
-            frozen = snapshot.get(resolved)
-            if (frozen is None or frozen.get('coverage') != 'complete'
+            current = snapshot.get(resolved)
+            frozen = current[1] if current is not None else None
+            if (frozen is None or delivery_target_pointer(frozen, current[0]) is None
                     or digest != frozen['sha256']
                     or not _same_producer(owner, target.get('producer'), frozen.get('producer'))
                     or len(target.get('consumers', [])) != len(frozen.get('consumers', []))
                     or any(not _same_producer(owner, left, right) for left, right in
                         zip(target.get('consumers', []), frozen.get('consumers', [])))):
                 raise ValueError('Review target differs from the actual frozen inspection subject')
-            from simple_ar.tools.materials import read_bound_material_bytes
+            from simple_ar.tools.materials import read_bound_material_bytes, inspect_bound_material
             admission = binding['delivery_review'].get('text_admission')
             limit = 32000
             if admission is not None:
-                if (admission.get('contract') not in {'professional_unit_text.v1', 'professional_unit_text.v2'}
+                if (admission.get('contract') not in {
+                        'professional_unit_text.v1', 'professional_unit_text.v2', SCOPED_DELIVERY_INSPECTION}
                         or admission.get('max_text_bytes') != 256000):
                     raise ValueError('Unknown frozen review text admission')
                 limit = 256000
-            raw = read_bound_material_bytes(owner.workspace, path, digest, max_bytes=limit)
-            if raw.decode('utf-8') != frozen.get('text'):
-                raise ValueError('Reviewed target text is not the actual complete inspection window')
+            if frozen['coverage'] == 'table_profile':
+                if (not admission or admission.get('contract') != SCOPED_DELIVERY_INSPECTION
+                        or admission.get('max_profile_bytes') != 96000
+                        or admission.get('table_reader_max_mb') != 20):
+                    raise ValueError('Profile repair requires its scoped inspection admission')
+                actual_view = inspect_bound_material(owner.workspace, path, digest,
+                    text_bytes=0, profile_bytes=admission['max_profile_bytes'])
+                if (actual_view.get('coverage') != 'table_profile'
+                        or actual_view.get('profile') != frozen['profile']):
+                    raise ValueError('Reviewed profile differs from the actual bound table view')
+            else:
+                raw = read_bound_material_bytes(owner.workspace, path, digest, max_bytes=limit)
+                if raw.decode('utf-8') != frozen.get('text'):
+                    raise ValueError('Reviewed target text is not the actual complete inspection window')
             actual = owner.workspace.artifact_provenance([path])[path]
             if actual['sha256'] != digest or not _same_producer(owner, actual['producer'], target.get('producer')):
                 raise ValueError('Reviewed artifact bytes or actual provenance changed')

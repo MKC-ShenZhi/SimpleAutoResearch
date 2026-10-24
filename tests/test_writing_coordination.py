@@ -356,6 +356,101 @@ class WritingCoordinationTests(unittest.TestCase):
         writing.client_factory = Mock(return_value=client)
         return root, workspace, writing, source, script, table, client, prompts
 
+    def test_large_table_inspection_preserves_complete_files_and_unread_candidates(self):
+        from simple_ar.report.review_evidence import SCOPED_DELIVERY_INSPECTION
+        for unsupported in (False, True):
+            with self.subTest(unsupported=unsupported):
+                root, workspace, writing, source, _, _, client, _ = self._document_work_fixture()
+                writing.document_source_contract = 'document_source.v1'
+                table = source / 'results' / 'measurements.csv'
+                raw = ('id,value\n' + ''.join(f'{i},{i % 7}\n' for i in range(50000))).encode()
+                self.assertGreater(len(raw), 256000)
+                table.write_bytes(raw)
+                extra = source / 'opaque.txt'
+                extra.write_bytes(b'\x00\xff\x01uninspected original')
+                selected = [str(table), *([str(extra)] if unsupported else [])]
+                inspected = []
+
+                def answer(system, prompt, **options):
+                    view = json.loads(prompt)
+                    label = options['label']
+                    if label == 'composition-selection-1':
+                        return {'read_windows': [{'path': str(table), 'max_bytes': 1000}]}
+                    if label.startswith('composition-selection-'):
+                        self.assertIn('Preservation is separate from inspection', system)
+                        return {'title': 'Supplied table coverage',
+                            'materials': [{'path': str(table), 'max_bytes': 1000}],
+                            'delivery_artifacts': selected}
+                    if label == 'composition-article':
+                        self.assertIn('not full-value or scientific verification', view['attachment_text_scope'])
+                        self.assertEqual(next(row for row in view['delivery_review']['artifacts']
+                            if row['path'] == str(table))['profile']['row_count'], 50000)
+                        return {'draft_markdown': '## Coverage\n\nThe supplied table has 50,000 records. '
+                            'Its column meanings and individual values require separate investigation.'}
+                    if label == 'article-independent-review':
+                        rows = view['delivery_artifacts']
+                        row = next(row for row in rows if row['path'] == str(table))
+                        self.assertEqual(row['coverage'], 'table_profile')
+                        self.assertEqual(row['profile']['row_count'], 50000)
+                        self.assertEqual(row['profile']['columns'], ['id', 'value'])
+                        self.assertEqual(row['profile']['column_summary'][1]['distinct_nonmissing'], 7)
+                        self.assertEqual(row['profile']['source_sha256'], hashlib.sha256(raw).hexdigest())
+                        self.assertEqual(len(row['profile']['example_rows']), 5)
+                        self.assertNotIn('text', row)
+                        inspected.append(rows)
+                        return {'section_reviews': [{'section_id': 'document', 'verdict': 'pass', 'findings': []}]}
+                    self.fail('Unexpected model operation: ' + label)
+
+                client.ask_json.side_effect = answer
+                arguments = {'goal': 'Explain table coverage; retain the complete supplied records',
+                    'material_roots': [str(source)], 'publication': {'compile_pdf': False}, 'finish': True}
+                result = writing.call('compose_document', arguments, identity='scoped-table')
+                self.assertEqual(result.status, 'ok', result)
+                self.assertEqual(len(inspected), 1)
+                owner = ArtifactStore(root / 'tools/writing/scoped-table')
+                snapshot = owner.read_json('request.json')['delivery_review']
+                self.assertEqual(snapshot['text_admission']['contract'], SCOPED_DELIVERY_INSPECTION)
+                self.assertTrue(any(path.endswith('.md') for path in result.artifacts))
+                copies = [row for row in snapshot['artifacts'] if row['path'] in selected]
+                for row in copies:
+                    self.assertEqual(workspace.resolve(row['copies'][0]['path']).read_bytes(),
+                        Path(row['path']).read_bytes())
+                final = writing.final_review(result.data)
+                review = final['delivery_review']
+                self.assertEqual(review['status'], 'incomplete' if unsupported else 'reviewed')
+                self.assertEqual(review['profiled_artifacts'][0]['reader_coverage']['row_count'], 50000)
+                self.assertIn('all individual values', review['profiled_artifacts'][0]['unverified'])
+                self.assertEqual(bool(review['uninspected']), unsupported)
+                observed = result.model_dump(mode='json')
+                self.assertEqual(writing.continuation(observed, 'scoped-table') is not None, not unsupported)
+                calls = client.ask_json.call_count
+                replay = writing.call('compose_document', arguments, identity='scoped-table')
+                self.assertEqual(replay.model_dump(mode='json'), observed)
+                self.assertEqual(client.ask_json.call_count, calls)
+                table.write_bytes(raw + b'50000,0\n')
+                self.assertIsNone(writing.continuation(observed, 'scoped-table'))
+
+    def test_inspection_views_do_not_depend_on_attachment_order_or_reject_reader_formats(self):
+        from simple_ar.report.review_evidence import SCOPED_DELIVERY_INSPECTION, delivery_target_pointer
+        _, _, writing, source, script, _, _, _ = self._document_work_fixture()
+        script.write_text('#' + 'x' * 249998 + '\n', encoding='utf-8')
+        table = source / 'results' / 'small.csv'
+        table.write_text('value\n' + '1\n' * 5000, encoding='utf-8')
+        paths = [str(table), str(script)]
+        first = writing._freeze_delivery_review(paths, 'ordered', text_contract=SCOPED_DELIVERY_INSPECTION)
+        second = writing._freeze_delivery_review(paths[::-1], 'reversed', text_contract=SCOPED_DELIVERY_INSPECTION)
+        self.assertEqual(first, second)
+        self.assertEqual({row['path']: row['coverage'] for row in first['artifacts']},
+            {str(script): 'complete', str(table): 'table_profile'})
+        records = source / 'results' / 'records.json'
+        records.write_text(json.dumps([{'': i, ' ': None} for i in range(2000)]), encoding='utf-8')
+        current = writing._freeze_delivery_review([str(records)], 'json-reader',
+            text_contract=SCOPED_DELIVERY_INSPECTION)
+        row, = current['artifacts']
+        self.assertEqual(row['coverage'], 'table_profile')
+        self.assertEqual(row['profile']['columns'], ['', ' '])
+        self.assertEqual(delivery_target_pointer(row, 0), '/delivery_artifacts/0/profile')
+
     def test_document_focus_keeps_task_evidence_and_replay_keeps_original_scope(self):
         from types import SimpleNamespace
         root, workspace, writing, source, _, table, _, _ = self._document_work_fixture()
@@ -706,6 +801,10 @@ class WritingCoordinationTests(unittest.TestCase):
             services=fixture.services, professional_inputs=True, allow_execution=True,
             report_requirement=requirement, max_turns=10, max_tokens=600000, max_attempts=40,
             process_limits={'process_invocations': 3, 'process_wall_seconds': 30})
+        # Exercise the historical whole-text contract, including its pre-author
+        # rejection and replay behavior. Current scoped inspection has its own
+        # large-table/candidate-preservation acceptance below.
+        app.writing.document_source_contract = None
         self.assertEqual(app.state['config']['professional_work'], 'requests.v1')
         self.assertTrue(app.writing.professional_inputs)
         self.assertEqual(app._report_inputs()['evidence_contract'], 'materials.v1')
@@ -1443,21 +1542,24 @@ class WritingCoordinationTests(unittest.TestCase):
         fixture = ProfessionalWorkLoopTests()
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)
-        fixture.responses = [fixture._proposal("from pathlib import Path\nPath('result.txt').write_text('20')\n")]
+        proposal = fixture._proposal("from pathlib import Path\n"
+            "Path('result.csv').write_text('id,value\\n' + ''.join(f'{i},20\\n' for i in range(50000)))\n")
+        proposal['execution_plan']['outputs'] = ['result.csv']
+        fixture.responses = [proposal]
         app = fixture._create()
         fixture._run(app, actions=[fixture._prepare()])
         _, token = fixture._pending_execution(app)
         fixture._run(app, approved_execution=token)
         prepared = fixture._observations(app)[0]
         candidate = Path(prepared['data']['project_dir'])
-        output = candidate / 'result.txt'
+        output = candidate / 'result.csv'
 
         def answer(system, prompt, **options):
             view = json.loads(prompt)
             if options['label'].startswith('composition-selection'):
                 if not view['observations']:
-                    return {'read_windows': [{'path': str(output)}]}
-                return {'title': 'Recorded output check', 'materials': [str(output)],
+                    return {'read_windows': [{'path': str(output), 'max_bytes': 1000}]}
+                return {'title': 'Recorded output check', 'materials': [{'path': str(output), 'max_bytes': 1000}],
                     'delivery_artifacts': [str(output)]}
             if options['label'] == 'composition-article':
                 return {'draft_markdown': '## Results\n\nThe supplied calculation saved 20.'}
@@ -1467,8 +1569,8 @@ class WritingCoordinationTests(unittest.TestCase):
             return {'section_reviews': [{'section_id': 'document', 'verdict': 'revise_required',
                 'findings': [{'finding_id': 'wrong-total', 'type': 'consistency', 'severity': 'major',
                     'required_action': 'revise', 'message': 'sum(range(7)) is 21; the producer saved 20.',
-                    'delivery_targets': [f'/delivery_artifacts/{index}/text'],
-                    'evidence_quotes': [{'pointer': f'/delivery_artifacts/{index}/text'}]}]}]}
+                    'delivery_targets': [f'/delivery_artifacts/{index}/profile'],
+                    'evidence_quotes': [{'pointer': f'/delivery_artifacts/{index}/profile/example_rows/0/value'}]}]}]}
 
         client = SimpleNamespace(ask_json=Mock(side_effect=answer))
         app.writing.client_factory = Mock(return_value=client)

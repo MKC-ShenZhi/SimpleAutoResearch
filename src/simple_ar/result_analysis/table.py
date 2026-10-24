@@ -7,6 +7,7 @@ changed file. Aggregated values and row-level observations remain distinct.
 from __future__ import annotations
 
 import csv
+import hashlib
 from dataclasses import MISSING, asdict, dataclass, fields
 import io
 import json
@@ -397,12 +398,19 @@ def read_table_source(path: Path, *, max_mb: int) -> tuple[bytes, list[dict]]:
         raise ValueError(f"Invalid delimited table: {exc}") from exc
 
 
-def preview_table_source(path: Path, *, max_mb: int) -> dict:
+class TableSourceVersionError(ValueError):
+    """A table profile cannot attest a different source version."""
+
+
+def preview_table_source(path: Path, *, max_mb: int, expected_sha256: str | None = None) -> dict:
     """Shared bounded shape/examples for dialogue and generated analysis."""
-    _, rows = read_table_source(path, max_mb=max_mb)
+    raw, rows = read_table_source(path, max_mb=max_mb)
+    if expected_sha256 is not None and hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise TableSourceVersionError('Table bytes differ from the bound inspection source')
     columns = list(rows[0])
     shown = columns[:40]
-    return {"row_count": len(rows), "columns": [name[:200] for name in shown],
+    return {**({'source_sha256': expected_sha256} if expected_sha256 is not None else {}),
+        "row_count": len(rows), "columns": [name[:200] for name in shown],
         "column_summary": [{"column": name[:200], "column_name_truncated": len(name) > 200,
             "missing": sum(row[name] is None or (isinstance(row[name], str) and not row[name].strip()) for row in rows),
             "distinct_nonmissing": len({json.dumps(row[name], sort_keys=True, ensure_ascii=False)
