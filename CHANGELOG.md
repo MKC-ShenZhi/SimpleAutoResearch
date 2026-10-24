@@ -13,7 +13,7 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 
 ### Improved
 
-- The development branch unifies document-source resolution and candidate reuse: professional work investigates evidence gaps, while proven attachment defects go to their actual producer. Paragraph revisions, body/attachment roles, originals, failures, accounting and historical recovery remain protected.
+- The development branch unifies document-source resolution and candidate reuse. Professional section documents now use the shared Writer's independent review, corrections and checkpoints through feedback and delivery; document-format requirements remain separate from evidence selection. Evidence gaps stay with professional investigation and proven attachment defects go to their producer. Historical contracts and accounting remain protected.
 - Keep goals separate from material roles and data meanings through shared CLI/UI declarations. Project edits preserve layout and immutable dependencies; code-only delivery does not require a report.
 - Repairs retain required original materials and distinguish authoring context from delivered execution. Earlier failures remain recorded without blocking a separately verified replacement; unsupported numerical allegations remain unresolved, not proven errors or evidence of improved efficiency.
 - The experimental UI shares configuration preview, material authorization and stop/resume behavior. Complete research interaction remains under acceptance.

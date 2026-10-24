@@ -1027,6 +1027,113 @@ class StructuredArticleWritingTests(unittest.TestCase):
                 self.assertEqual(len(list((writer.root / 'model_calls').iterdir())), 2)
                 self.assertNotIn('prior_draft', [row.handle for row in context.source_handles])
 
+    def test_native_section_review_reuses_writer_and_recovers_adopted_checkpoint_read_only(self):
+        from simple_ar.integrations.llm import LLMError
+        from simple_ar.report.writing import (
+            SECTION_ARTICLE_OWNER, completed_composition_writer, write_section_article,
+        )
+        from simple_ar.research.documents.ingest import DocumentBundle
+        from tests.report_review_fixtures import draft_quotes, prompt_payload
+
+        for outcome in ('pass', 'revised', 'inspection-unavailable', 'verification-unavailable'):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as tmp:
+                owner = ArtifactStore(Path(tmp))
+                writer = ArtifactStore(owner.root / 'writer')
+                documents = owner.write_json('documents.json', DocumentBundle([], {}, {}, [], []).to_handoff_dict(),
+                    kind='documents', schema='document_bundle.v1')
+                context = ReportContext(topic='Evidence brief', report_mode='supplied_materials',
+                    goal_markdown='Describe supplied observations and their limitations.', results={
+                        'section_delivery_review': {'contract': 'section_delivery_review.v1',
+                            'assembly': {'title': 'Evidence brief', 'assembly_mode': 'section_drafts'}},
+                        'delivery_review': {'contract': 'delivery_artifacts.v1', 'artifacts': []}})
+                config = ReportRuntimeConfig(draft_scope='auto', review_scope='document',
+                    document_review=True, reviewer='llm', max_review_iterations=1,
+                    allow_source_backtracking=False, outline_strategy='template')
+                original_config = config.model_dump(mode='json')
+                calls = []
+
+                class Client:
+                    def ask_json(self, system, prompt, *, label='', **options):
+                        calls.append(label)
+                        view = prompt_payload(prompt)
+                        if label in {'report-writer-document', 'report-document-joint-reviser'}:
+                            return {'sections': [{'section_id': row['section']['section_id'],
+                                'heading': row['section']['heading'], 'draft_markdown':
+                                ('Revised' if 'reviser' in label else 'Original') + ' bounded observation.'}
+                                for row in view['sections']]}
+                        if label.startswith('report-writer-section_'):
+                            return {**view['section'], 'draft_markdown': 'Original bounded observation.'}
+                        if label in {'report-document-reviewer', 'report-document-verifier'}:
+                            if (outcome == 'inspection-unavailable' and label == 'report-document-reviewer'
+                                    or outcome == 'verification-unavailable' and label == 'report-document-verifier'):
+                                raise LLMError('Unknown inspection response')
+                            revise = outcome != 'pass' and label == 'report-document-reviewer'
+                            return {'section_reviews': [{'section_id': row['section_id'],
+                                'verdict': 'revise_required' if revise else 'pass',
+                                'findings': [{'finding_id': row['section_id'] + '-limits', 'type': 'style',
+                                    'severity': 'major', 'required_action': 'revise',
+                                    'message': 'Clarify the observation limits.',
+                                    'draft_quotes': draft_quotes(prompt, row['section_id'])}] if revise else []}
+                                for row in view['sections']]}
+                        raise AssertionError(label)
+
+                arguments = dict(store=writer, input_store=owner, documents_ref=documents,
+                    identity='reviewed-sections', report_context=context, title='Evidence brief',
+                    target_words=0, required_headings=['Observations', 'Limits'], max_cited_sources=0,
+                    review_config=config)
+                written = write_section_article(**arguments, client=Client())
+                self.assertEqual(config.model_dump(mode='json'), original_config)
+                self.assertIn('memory', written)
+                self.assertEqual(written, writer.read_json('writer.json'))
+                self.assertEqual(calls.count('report-document-reviewer'), 1)
+                binding = {'writing_owner': SECTION_ARTICLE_OWNER,
+                    'section_delivery_review_contract': 'section_delivery_review.v1',
+                    'request': {'title': 'Evidence brief', 'target_words': 0,
+                        'required_headings': ['Observations', 'Limits'],
+                        'professional_review': {'max_revision_rounds': 1}}}
+                original = {path: path.read_bytes() for path in owner.root.rglob('*') if path.is_file()}
+                if outcome.endswith('unavailable'):
+                    self.assertTrue(all(row['draft_markdown'].startswith('Original') for row in written['sections']))
+                    if outcome == 'verification-unavailable':
+                        from simple_ar.report.writing import retained_unchecked_manuscript
+                        self.assertIn('Revised bounded observation.',
+                            retained_unchecked_manuscript(written, title='Evidence brief'))
+                    with self.assertRaisesRegex(ValueError, 'no blind replay'):
+                        write_section_article(**arguments, recovering=True)
+                else:
+                    self.assertEqual(written['independent_review']['review_status'], 'reviewed')
+                    self.assertEqual(write_section_article(**arguments, recovering=True), written)
+                    completed_composition_writer(store=owner, binding=binding, identity='reviewed-sections')
+                    if outcome == 'revised':
+                        self.assertTrue(all(row['draft_markdown'].startswith('Revised') for row in written['sections']))
+                    binding['request']['professional_review']['max_revision_rounds'] = 2
+                    with self.assertRaisesRegex(ValueError, 'frozen configuration'):
+                        completed_composition_writer(store=owner, binding=binding, identity='reviewed-sections')
+                self.assertEqual({path: path.read_bytes() for path in original}, original)
+                with self.assertRaisesRegex(ValueError, 'Frozen section input changed'):
+                    write_section_article(**{**arguments,
+                        'review_config': config.model_copy(update={'max_review_iterations': 2})}, recovering=True)
+                with self.assertRaisesRegex(ValueError, 'Frozen section input changed'):
+                    write_section_article(**{**arguments, 'review_config': None}, recovering=True)
+
+    def test_native_section_review_rejects_unknown_and_non_document_controls_before_writing(self):
+        from simple_ar.report.writing import write_section_article
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ArtifactStore(Path(tmp))
+            config = ReportRuntimeConfig(draft_scope='auto', review_scope='document',
+                document_review=True, max_review_iterations=1)
+            for invalid in (ReportRuntimeConfig(), config.model_copy(update={'reviewer': 'unknown'}),
+                    config.model_copy(update={'unknown_control': True})):
+                with self.subTest(config=invalid), self.assertRaises(ValueError):
+                    write_section_article(store=store, input_store=store,
+                        documents_ref=store.ref('documents.json'), identity='invalid-review',
+                        report_context=ReportContext(topic='Brief', report_mode='supplied_materials'),
+                        title='Brief', target_words=0,
+                        required_headings=['Observations'], max_cited_sources=0,
+                        review_config=invalid, client=Mock())
+            self.assertFalse(store.exists('report_inputs.json'))
+
     def test_native_composition_selects_section_granularity_without_changing_legacy_or_frozen_methods(self):
         from simple_ar.core.budget import BudgetLedger
         from simple_ar.tools.workspace import WorkspaceToolGateway

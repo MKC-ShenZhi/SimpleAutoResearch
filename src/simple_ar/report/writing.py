@@ -420,6 +420,20 @@ def completed_composition_writer(*, store: ArtifactStore, binding: dict[str, Any
             raise ValueError('Prior section article has no completed Writer result; no parent recovery')
         saved = binding['request']
         context = ReportContext.model_validate(snapshot['context'])
+        review_config = None
+        contract = binding.get('section_delivery_review_contract')
+        if contract is not None:
+            review_config = ReportRuntimeConfig.model_validate(snapshot['config'])
+            review = saved.get('professional_review')
+            if (contract != 'section_delivery_review.v1' or not isinstance(review, dict)
+                    or review.get('max_revision_rounds') != review_config.max_review_iterations
+                    or context.results.get('section_delivery_review', {}).get('contract') != contract
+                    or snapshot['config'] != review_config.model_dump(mode='json')):
+                raise ValueError('Native section review binding differs from its frozen configuration')
+        elif snapshot['config'].get('document_review'):
+            raise ValueError('Reviewed native section owner requires its original delivery review binding')
+        if snapshot.get('candidate_source') != binding.get('candidate_source'):
+            raise ValueError('Native section candidate source differs from its frozen binding')
         # write_section_article adds this context itself, using the saved prose.
         context.source_handles = [row for row in context.source_handles if row.kind != 'prior_draft']
         write_section_article(store=writer, input_store=store, documents_ref=documents,
@@ -428,7 +442,8 @@ def completed_composition_writer(*, store: ArtifactStore, binding: dict[str, Any
             max_cited_sources=saved.get('max_cited_sources', 0),
             prior_draft=next((row.get('metadata', {}).get('draft_markdown', '')
                 for row in snapshot['context']['source_handles'] if row['kind'] == 'prior_draft'), ''),
-            recovering=True)
+            recovering=True, review_config=review_config,
+            candidate_source=snapshot.get('candidate_source'))
     elif owner == 'professional_report.v1':
         article = snapshot.get('owner') == ARTICLE_OWNER
         if not article and binding.get('section_response_contract') not in {'atomic_complete.v1', 'atomic_complete.v2'}:
@@ -1335,9 +1350,53 @@ def retained_section_candidate(source: dict[str, Any], *, _seen: frozenset[Path]
     binding, inputs = owner.read_json('request.json'), owner.read_json('writer/report_inputs.json')
     written, checkpoint = owner.read_json('writer/writer.json'), owner.read_json('writer/sections.json')
     identity = owner.root.name
-    if (binding.get('writing_owner') != 'professional_report.v1'
+    native = binding.get('writing_owner') == SECTION_ARTICLE_OWNER
+    if native:
+        saved = binding.get('request', {})
+        review = saved.get('professional_review')
+        work_source = binding.get('work_source', {})
+        config = ReportRuntimeConfig.model_validate(inputs['config'])
+        results = inputs['context'].get('results', {})
+        input_keys = {'context', 'memory', 'config', 'template', 'sources', 'snapshot_id'}
+        if inputs.get('candidate_source') is not None:
+            input_keys.add('candidate_source')
+        if ('report_binding' in binding
+                or set(inputs) != input_keys
+                or binding.get('section_delivery_review_contract') != 'section_delivery_review.v1'
+                or work_source.get('contract') != 'document_source.v1'
+                or not isinstance(work_source.get('intent'), dict)
+                or saved.get('writing_method') != 'sections'
+                or not isinstance(review, dict) or set(review) != {'max_revision_rounds'}
+                or type(review['max_revision_rounds']) is not int
+                or not 0 <= review['max_revision_rounds'] <= 3
+                or config.max_review_iterations != review['max_revision_rounds']
+                or config.model_dump(mode='json') != inputs['config']
+                or config.agent != 'llm' or config.reviewer != 'llm'
+                or not config.document_review or config.review_scope != 'document'
+                or config.draft_scope not in {'document', 'auto'}
+                or config.source_strategy != 'full' or config.allow_llm_fallback
+                or config.allow_source_backtracking or config.figures.enabled
+                or config.longform.target_words != saved.get('target_words')
+                or config.max_cited_sources != saved.get('max_cited_sources', 0)
+                or inputs['context'].get('topic') != saved.get('title')
+                or results.get('section_delivery_review') != {
+                    'contract': 'section_delivery_review.v1',
+                    'assembly': {'title': saved.get('title'), 'assembly_mode': 'section_drafts'}}
+                or not isinstance(binding.get('delivery_review'), dict)
+                or binding['delivery_review'].get('contract') != 'delivery_artifacts.v1'
+                or results.get('delivery_review') != binding['delivery_review']
+                or inputs.get('candidate_source') != binding.get('candidate_source')
+                or inputs.get('sources') != [owner.ref('documents.json',
+                    kind='documents', schema='document_bundle.v1').to_dict()]
+                or checkpoint.get('owner') is not None
+                or checkpoint.get('schema_version') not in {None, 'report_checkpoint.v1'}
+                or checkpoint.get('completed', {}).get('section_delivery_review_contract') != 'section_delivery_review.v1'
+                or checkpoint.get('completed', {}).get('document_review_contract') != 'current_draft.v1'):
+            raise ValueError('Retained native section candidate lacks its original reviewed document-work binding')
+    professional = (binding.get('writing_owner') == 'professional_report.v1'
+        and binding.get('report_binding', {}).get('requirement', {}).get('method') == 'sections')
+    if (not (native or professional)
             or binding.get('section_response_contract') != 'atomic_complete.v2'
-            or binding.get('report_binding', {}).get('requirement', {}).get('method') != 'sections'
             or written.get('schema_version') != 'report_agent_result.v1'
             or checkpoint.get('source_attempt') != identity
             or written.get('snapshot_id') != inputs.get('snapshot_id')
@@ -1372,18 +1431,25 @@ def retained_section_candidate(source: dict[str, Any], *, _seen: frozenset[Path]
     if not calls:
         raise ValueError('Retained candidate has no complete author response records')
     for name in calls:
+        call = ArtifactStore(owner.resolve(name).parent)
+        request = call.read_json('request.json')
+        label = request.get('options', {}).get('label', '')
+        author = label.startswith(('report-writer', 'report-integrator', 'report-reviser',
+            'report-document-reviser', 'report-document-joint-reviser'))
+        # Only the new native contract separates complete authors from failed
+        # inspection operations. All files above remain hash-bound; inspection
+        # acceptance is never inherited. Historical professional proof still
+        # requires every physical operation's complete atomic response.
+        if native and not author:
+            continue
         response_path = str(Path(name).with_name('response.json')).replace('\\', '/')
         if response_path not in records:
             raise ValueError('Retained candidate contains an incomplete model operation; no replay')
-        call = ArtifactStore(owner.resolve(name).parent)
-        request = call.read_json('request.json')
         if (request.get('response_record_contract') != 'atomic_complete.v2'
                 or request.get('input_snapshot') != inputs['snapshot_id']):
             raise ValueError('Retained author response belongs to a different input contract')
         response = _retained_response(call, 'request.json', request)
-        label = request.get('options', {}).get('label', '')
-        if not label.startswith(('report-writer', 'report-integrator', 'report-reviser',
-                'report-document-reviser', 'report-document-joint-reviser')) or not isinstance(response, dict):
+        if not author or not isinstance(response, dict):
             continue
         text = request['prompt']
         payload, _ = json.JSONDecoder().raw_decode(text[text.index('{'):])
@@ -1418,12 +1484,16 @@ def write_section_article(*, store: ArtifactStore, input_store: ArtifactStore,
     documents_ref: ArtifactRef, identity: str, report_context: ReportContext,
     title: str, target_words: int, required_headings: Sequence[str],
     max_cited_sources: int, prior_draft: str = '', client: Any = None,
-    recovering: bool = False) -> dict[str, Any]:
+    recovering: bool = False, review_config: ReportRuntimeConfig | None = None,
+    candidate_source: dict[str, Any] | None = None) -> dict[str, Any]:
     """Native composition over the existing section Writer and checkpoint.
 
     Selection, execution, review and publication remain separate capabilities.
     Recovery consumes complete recorded replies only; it never resends a failed
     or unknown section request, even if current prompt code has changed.
+    None preserves the historical disabled-review snapshot and receipts. An
+    explicit config uses the same Writer's document inspector and joint editor,
+    retaining its full result even when inspection is unavailable.
     """
     from simple_ar.report.schema import ReportSectionPlan, SourceHandle
     from simple_ar.report.templates import load_report_template_bundle
@@ -1438,7 +1508,36 @@ def write_section_article(*, store: ArtifactStore, input_store: ArtifactStore,
         allow_source_backtracking=False, max_review_iterations=0, max_cited_sources=max_cited_sources)
     config.figures.enabled = False
     config.longform.target_words = target_words
-    template = load_report_template_bundle(report_mode=context.report_mode, config=config)
+    if review_config is not None:
+        if (not isinstance(review_config, ReportRuntimeConfig)
+                or any(set(vars(value)) - set(type(value).model_fields)
+                    for value in (review_config, review_config.figures, review_config.longform, review_config.audit))):
+            raise ValueError('Section review requires a resolved ReportRuntimeConfig without unknown controls')
+        config = ReportRuntimeConfig.model_validate(review_config.model_dump(mode='json'))
+        if (config.agent != 'llm' or config.reviewer != 'llm'
+                or not config.document_review or config.review_scope != 'document'
+                or config.draft_scope not in {'document', 'auto'}
+                or config.source_strategy != 'full' or config.allow_llm_fallback
+                or config.max_review_iterations < 0):
+            raise ValueError('Section review requires explicit independent document review and joint correction controls')
+        if config.longform.target_words not in {0, target_words}:
+            raise ValueError('Section review target differs from the native document target')
+        config.longform.target_words = target_words
+        limits = [value for value in (max_cited_sources, config.max_cited_sources) if value]
+        config.max_cited_sources = min(limits) if limits else 0
+        # Native composition supplies its selected assets in context. It does
+        # not authorize the report figure generator or mutate caller controls.
+        config.figures.enabled = False
+    frozen = (store.read_json('report_inputs.json')
+        if review_config is not None and store.exists('report_inputs.json') else None)
+    frozen_keys = {'context', 'memory', 'config', 'template', 'sources', 'snapshot_id'}
+    if candidate_source is not None:
+        frozen_keys.add('candidate_source')
+    if frozen is not None and (set(frozen) != frozen_keys
+            or frozen['config'] != config.model_dump(mode='json')):
+        raise ValueError('Frozen section input changed; preserve its snapshot, no blind replay')
+    template = (ReportTemplateBundle.model_validate(frozen['template']) if frozen is not None
+        else load_report_template_bundle(report_mode=context.report_mode, config=config))
     memory = initialize_report_memory(context=context, template=template)
     memory.objective = context.goal_markdown or title
     if required_headings:
@@ -1446,23 +1545,46 @@ def write_section_article(*, store: ArtifactStore, input_store: ArtifactStore,
             goal=context.goal_markdown, target_words=target_words // len(required_headings),
             evidence_handles=[row.handle for row in context.source_handles], final_order=index,
             draft_order=index) for index, heading in enumerate(required_headings, 1)]
-    if recovering:
-        # This native owner has complete per-call receipts. Reconstruct through
-        # the existing Writer from those producers, rather than trusting prose
-        # in a checkpoint that could bypass the retained-response verifier.
+    if recovering or frozen is not None:
+        # Freeze the original method and all inputs before admitting either
+        # historical producer reconstruction or reviewed checkpoint recovery.
         expected = _writing_binding(report_context=context, memory=memory, config=config,
             template=template, sources=(documents_ref,))
+        if candidate_source is not None:
+            expected['candidate_source'] = candidate_source
         expected['snapshot_id'] = hashlib.sha256(json.dumps(_writing_identity(expected),
             sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         if not store.exists('report_inputs.json') or store.read_json('report_inputs.json') != expected:
             raise ValueError('Frozen section input changed; preserve its snapshot, no blind replay')
+    resume = None
+    if recovering:
+        if review_config is not None:
+            # The adopted joint revision is the saved checkpoint, not the
+            # initial author prefix. Prove every physical operation complete
+            # before the existing section owner can consume that checkpoint.
+            responses = list(store.resolve('model_calls').glob('*/request.json'))
+            if not responses:
+                raise ValueError('Reviewed section producer has no complete response records')
+            for path in responses:
+                call = _writing_child(store, 'model_calls/' + path.parent.name)
+                recorded = call.read_json('request.json')
+                if (recorded.get('response_record_contract') != 'atomic_complete.v2'
+                        or recorded.get('input_snapshot') != expected['snapshot_id']):
+                    raise ValueError('Retained section response differs from its original snapshot contract')
+                _retained_response(call, 'request.json', recorded)
+            if store.exists('sections.json'):
+                resume = input_store.ref(store.resolve('sections.json').relative_to(input_store.root),
+                    kind='report_checkpoint', schema='report_checkpoint.v1')
         store = _SectionRecoveryStore(store)
     result = run_report_writing_capability(context=CapabilityContext(store, AttemptManifest(identity),
-        inputs=(documents_ref,), input_store=input_store),
+        inputs=(documents_ref, *((resume,) if resume else ())), input_store=input_store),
         request=ReportWritingRequest(context, memory, config, template,
-            retained_writing_client(store=store, identity=identity, client=None if recovering else client),
-            method='sections', prior_draft=prior_draft))
-    if result.status != 'completed':
+            retained_writing_client(store=store, identity=identity, client=None if recovering else client,
+                contract='atomic_complete.v2' if review_config is not None else 'atomic_complete.v1'),
+            method='sections', prior_draft=prior_draft, resume_ref=resume,
+            candidate_source=candidate_source))
+    if result.status != 'completed' and (review_config is None
+            or not any(ref.kind == 'report_writer_result' for ref in result.artifacts)):
         raise ValueError('Section writing incomplete; preserve its checkpoint: ' + '; '.join(result.diagnostics))
     writer = next(ref for ref in result.artifacts if ref.kind == 'report_writer_result')
     return store.read_json(writer.path)

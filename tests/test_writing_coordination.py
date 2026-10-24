@@ -2067,6 +2067,76 @@ class WritingCoordinationTests(unittest.TestCase):
         self.assertIsNotNone(writing.continuation(revised.model_dump(mode='json'), 'copy-defect-revised'))
         self.assertEqual({path: path.read_bytes() for path in frozen}, frozen)
 
+    def test_native_section_work_owns_review_delivery_feedback_and_read_only_reuse(self):
+        from simple_ar.report.writing import completed_composition_writer
+        from tests.report_review_fixtures import prompt_payload
+        root, workspace, writing, source, _, _, client, prompts = self._document_work_fixture()
+        writing.document_source_contract = 'document_source.v1'
+        selection_answer = client.ask_json.side_effect
+        edited = False
+
+        def answer(system, prompt, **options):
+            label = options['label']
+            if label.startswith('composition-selection-'):
+                return selection_answer(system, prompt, **options)
+            view = prompt_payload(prompt)
+            prompts.append((label, view))
+            if label.startswith('report-writer-'):
+                def body(section):
+                    return ('The supplied record reports value=2.5.' if section['heading'] == 'Results' else
+                        'The supplied result was not rerun.' if edited else 'No new execution was requested.')
+                if 'sections' in view:
+                    return {'sections': [{'section_id': row['section']['section_id'],
+                        'draft_markdown': body(row['section'])} for row in view['sections']]}
+                return {'section_id': view['section']['section_id'], 'draft_markdown': body(view['section'])}
+            self.assertEqual(label, 'report-document-reviewer',
+                'The shared section owner must inspect the actual assembled document once')
+            self.assertEqual(view['delivery_review_contract'], 'delivery_artifacts.v1')
+            return {'section_reviews': [{'section_id': row['section_id'], 'verdict': 'pass', 'findings': []}
+                for row in view['sections']]}
+
+        client.ask_json.side_effect = answer
+        arguments = {'goal': 'Explain the supplied value and its scope', 'material_roots': [str(source)],
+            'writing_method': 'sections', 'required_headings': ['Results', 'Scope'], 'finish': True}
+        result = writing.call('compose_document', arguments, identity='section-owned')
+        self.assertEqual(result.status, 'ok', result)
+        owner = ArtifactStore(root / 'tools/writing/section-owned')
+        binding = owner.read_json('request.json')
+        self.assertEqual(binding['section_delivery_review_contract'], 'section_delivery_review.v1')
+        self.assertEqual(result.data['independent_review']['review_status'], 'reviewed')
+        self.assertEqual(result.data['delivery_review']['status'], 'reviewed')
+        self.assertEqual([label for label, _ in prompts].count('report-document-reviewer'), 1)
+        self.assertFalse((owner.root / 'delivery-review/request.json').exists(),
+            'No second post-assembly reviewer may repeat the shared Writer review')
+        self.assertEqual(writing.continuation(result.model_dump(mode='json'), 'section-owned')['tool_name'], 'deliver_result')
+        calls = client.ask_json.call_count
+        original = {path: path.read_bytes() for path in owner.root.rglob('*') if path.is_file()}
+        with patch.object(client, 'ask_json', side_effect=AssertionError('No paid work during retained reuse')):
+            completed_composition_writer(store=owner, binding=binding, identity='section-owned')
+            replay = writing.call('compose_document', arguments, identity='section-owned')
+        self.assertEqual(replay.model_dump(mode='json'), result.model_dump(mode='json'))
+        self.assertEqual(client.ask_json.call_count, calls)
+        edited = True
+        changed = writing.call('compose_document', {'goal': 'Make the execution limitation more direct',
+            'prior_draft': result.data['editable_markdown'], 'finish': True}, identity='section-feedback')
+        self.assertEqual(changed.status, 'ok', changed)
+        current = ArtifactStore(root / 'tools/writing/section-feedback')
+        self.assertEqual(current.read_json('request.json')['request']['writing_method'], 'sections')
+        self.assertEqual(current.read_json('request.json')['request']['required_headings'], ['Results', 'Scope'])
+        self.assertEqual([label for label, _ in prompts].count('report-document-reviewer'), 2)
+        self.assertIn('The supplied result was not rerun.', workspace.resolve(changed.data['editable_markdown']).read_text())
+        self.assertNotEqual(changed.data['editable_markdown'], result.data['editable_markdown'])
+        self.assertEqual({path: path.read_bytes() for path in original}, original)
+        self.assertIsNotNone(writing.continuation(changed.model_dump(mode='json'), 'section-feedback'))
+        self._record_native_result(root, 'section-feedback', changed)
+        before = len(prompts)
+        checked = writing.call('compose_document', {'goal': current.read_json('request.json')['request']['goal'],
+            'prior_result': 'records/section-feedback/native_result.json', 'finish': True}, identity='section-rechecked')
+        self.assertEqual(checked.status, 'ok', checked)
+        self.assertEqual([label for label, _ in prompts[before:]], ['report-document-reviewer'],
+            'A complete section candidate needs its new inspection, not selection or redrafting')
+        self.assertIsNotNone(writing.continuation(checked.model_dump(mode='json'), 'section-rechecked'))
+
     def test_document_work_defaults_to_authorized_sources_and_keeps_old_contracts(self):
         root, workspace, writing, _, _, _, client, prompts = self._document_work_fixture()
         result = writing.call('compose_document', {'goal': 'Explain the saved evidence'}, identity='document-defaults')

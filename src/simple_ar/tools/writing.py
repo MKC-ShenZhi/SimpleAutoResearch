@@ -197,6 +197,14 @@ class DocumentWorkRequest(BaseModel):
     prior_result: str = Field(default='', max_length=1000, exclude_if=lambda value: not value,
         description='Continue a same-task compose_document result after an incomplete inspection, using its complete saved article/section author or unadopted complete article revision. The owner proves and reuses its exact evidence and candidate, checks it first, and makes bounded corrections if required. No new investigation, scientific rerun, inherited acceptance or budget reset. Do not combine with a separately selected draft or material recipe.')
     target_words: int = Field(default=0, ge=0, le=20000)
+    writing_method: Literal['article', 'sections'] | None = Field(default=None,
+        exclude_if=lambda value: value is None,
+        description='Optional writing granularity. The owner still investigates, drafts, checks and delivers the document; this does not select an evidence recipe or add budget.')
+    required_headings: list[str] = Field(default_factory=list, max_length=32,
+        exclude_if=lambda value: not value,
+        description='Optional ordered document headings. Subsections remain free; title and references belong to publication.')
+    max_cited_sources: int = Field(default=0, ge=0, exclude_if=lambda value: not value,
+        description='Optional ceiling on distinct body citations; 0 is unbounded. Evidence reading is separate.')
     publication: CompositionPublication | None = Field(default=None,
         exclude_if=lambda value: value is None,
         description='Requested publication options. The owner supplies the actual canonical manuscript after independent acceptance; normal execution approval applies.')
@@ -205,8 +213,15 @@ class DocumentWorkRequest(BaseModel):
 
     @model_validator(mode='after')
     def one_work_source(self) -> 'DocumentWorkRequest':
+        from simple_ar.report.assembler import _heading_title, _strip_heading_number
         if self.prior_result and (self.prior_draft or self.material_roots):
             raise ValueError('Choose a retained work result OR a separately supplied draft/material scope')
+        headings = [_strip_heading_number(_heading_title(heading)).casefold() for heading in self.required_headings]
+        if (any(not heading or len(raw) > 300 or '\n' in raw or '\r' in raw
+                or heading.startswith('#') or heading == 'references'
+                for raw, heading in zip(self.required_headings, headings))
+                or len(headings) != len(set(headings))):
+            raise ValueError('required_headings must be distinct nonempty section titles, without Markdown prefixes or References')
         return self
 
 
@@ -232,9 +247,6 @@ class ComposeRequest(DocumentWorkRequest):
     producer_repair: str = Field(default='', max_length=500, exclude_if=lambda value: not value,
         description='Internal accepted successful implementation execution locator. Reuses the original composition '
             'recipe and replaces only proven repaired producer inputs; requires reuse_prior_inputs. No execution or publication authority.')
-    writing_method: Literal['article', 'sections'] | None = Field(default=None,
-        exclude_if=lambda value: value is None,
-        description="Optional composition granularity, not a task type or model selector. article returns one complete draft; sections uses the existing planned section Writer and complete-response checkpoints for longer work. Omitted keeps the original article/frozen-report method. Does not add review, retries or budget; cannot replace a frozen report method.")
     target_words: int = Field(default=0, ge=0, le=20000)
     professional_review: ProfessionalReview | None = Field(default=None,
         exclude_if=lambda value: value is None,
@@ -245,14 +257,9 @@ class ComposeRequest(DocumentWorkRequest):
     delivery_artifacts: list[str] | None = Field(default=None, max_length=32,
         exclude_if=lambda value: value is None,
         description='Explicit proposed delivery attachments for joint inspection with prose: scripts, tables and figures. Freezes actual permitted content, versions and proven producers. Omit for historical prose-only scope; [] declares no attachments. Unread, oversized and visual-only attachments remain incomplete, never silently certified.')
-    required_headings: list[str] = Field(default_factory=list, max_length=32,
-        description="Optional ordered article-level section titles (case and presentation numbering ignored). Subsections remain free; title and references belong to publication. A missing or reordered heading rejects the retained response, without redrafting.")
-    max_cited_sources: int = Field(default=0, ge=0,
-        description="Hard ceiling on distinct body-cited source identities; 0 means unbounded. Does not limit evidence reading or silently discard citations.")
 
     @model_validator(mode='after')
     def material_input(self) -> 'ComposeRequest':
-        from simple_ar.report.assembler import _heading_title, _strip_heading_number
         if self.prior_result and (self.sources or self.materials or self.figures or self.delivery_artifacts is not None or self.title
                 or self.reuse_prior_inputs or self.adopt_draft or self.producer_repair):
             raise ValueError('prior_result continues its saved author/evidence recipe; do not supply another draft or exact recipe')
@@ -262,12 +269,6 @@ class ComposeRequest(DocumentWorkRequest):
             raise ValueError('Producer repair requires prior input reuse and a new independently inspected composition')
         if self.reuse_prior_inputs and (not self.prior_draft or self.sources or self.materials or self.material_roots):
             raise ValueError('reuse_prior_inputs requires prior_draft and no explicit sources, materials or material_roots; use fresh selection for scope changes')
-        headings = [_strip_heading_number(_heading_title(heading)).casefold() for heading in self.required_headings]
-        if (any(not heading or len(raw) > 300 or '\n' in raw or '\r' in raw
-                or heading.startswith('#') or heading == 'references'
-                for raw, heading in zip(self.required_headings, headings))
-                or len(headings) != len(set(headings))):
-            raise ValueError('required_headings must be distinct nonempty section titles, without Markdown prefixes or References')
         if self.materials and self.material_roots:
             raise ValueError('Choose explicit material windows OR material_roots')
         paths = [_figure_spec(row)['path'] for row in self.figures]
@@ -652,8 +653,10 @@ class WritingToolGateway:
                         'reuse_prior_inputs': False, 'material_roots': work_source['investigation_roots']})
                     return result
                 method = (report or {}).get('requirement', {}).get('method')
-                if report is None and binding.get('writing_owner') == 'direct_article.v1':
-                    method = 'article'
+                if report is None:
+                    from simple_ar.report.writing import ARTICLE_OWNER, SECTION_ARTICLE_OWNER
+                    method = {ARTICLE_OWNER: 'article', SECTION_ARTICLE_OWNER: 'sections'}.get(
+                        binding.get('writing_owner'), method)
                 original_goal = binding.get('work_source', {}).get('intent', {}).get('goal') or binding['request']['goal']
                 feedback_requested = work_source['intent']['goal'] not in {'', original_goal}
                 if isinstance(report, dict) and isinstance(previous_report, dict):
@@ -777,7 +780,8 @@ class WritingToolGateway:
         # delegated selection retains its roots alongside resolved windows.
         # Validate only the existing typed selections; preserve the original
         # binding intact for Writer equality and byte linkage above/below.
-        resolved = self._resolved_prior_recipe(request, saved)
+        resolved = self._resolved_prior_recipe(request, saved,
+            preserve_format=binding.get('work_source', {}).get('contract') == 'document_source.v1')
         sources, materials = resolved.sources, resolved.materials
         linkage = {'owner': prior_id, 'receipt_sha256': hashes, 'artifact_sha256': artifacts,
             'inputs': binding['inputs'][:len(sources) + len(materials)]}
@@ -786,7 +790,8 @@ class WritingToolGateway:
                 normalize_arguments=normalize_arguments)
         return resolved, binding, linkage
 
-    def _resolved_prior_recipe(self, request: ComposeRequest, saved: dict) -> ComposeRequest:
+    def _resolved_prior_recipe(self, request: ComposeRequest, saved: dict, *,
+                               preserve_format: bool = False) -> ComposeRequest:
         """Reuse selected original windows, never draft text as primary evidence."""
         sources = [SelectedSource.model_validate(row) for row in saved['sources']]
         materials = [FileWindow.model_validate(row) for row in saved['materials']]
@@ -796,6 +801,11 @@ class WritingToolGateway:
         # Keep the saved selection representation. The common source/window
         # reader below consumes its resolved IDs and exact observed byte ranges.
         resolved = request.model_copy(update={'sources': sources, 'materials': materials})
+        if preserve_format and request.writing_method is None and saved.get('writing_method') is not None:
+            resolved = resolved.model_copy(update={'writing_method': saved['writing_method']})
+        for field in ('required_headings', 'max_cited_sources'):
+            if preserve_format and field not in request.model_fields_set and saved.get(field):
+                resolved = resolved.model_copy(update={field: saved[field]})
         for window in materials:
             material = self.workspace.resolve(window.path)
             if (material.is_relative_to(self.workspace.resolve('workspace/manuscripts'))
@@ -834,11 +844,12 @@ class WritingToolGateway:
         if store.root.resolve().parent != (self.root / 'tools/writing').resolve():
             raise ValueError('Stopped composition owner escapes this task')
         binding = store.read_json('request.json')
-        standalone = (allow_standalone and binding.get('writing_owner') == 'direct_article.v1'
+        from simple_ar.report.writing import ARTICLE_OWNER, SECTION_ARTICLE_OWNER
+        standalone = (allow_standalone and binding.get('writing_owner') in {ARTICLE_OWNER, SECTION_ARTICLE_OWNER}
             and binding.get('report_binding') is None and requirement is None)
         method = binding.get('report_binding', {}).get('requirement', {}).get('method')
         if standalone:
-            method = 'article'
+            method = 'sections' if binding['writing_owner'] == SECTION_ARTICLE_OWNER else 'article'
         if method == 'article':
             source = retained_article_candidate(store, binding, **({'allow_standalone': True} if standalone else {}))
             names = ['request.json', 'documents.json', *(file.relative_to(store.root).as_posix()
@@ -873,7 +884,8 @@ class WritingToolGateway:
                 or binding['report_binding'].get('evidence_contract') != 'materials.v1'):
             raise ValueError('Continued author work must retain its original material report controls')
         saved = binding['request']
-        resolved = self._resolved_prior_recipe(request, saved)
+        resolved = self._resolved_prior_recipe(request, saved,
+            preserve_format=binding.get('work_source', {}).get('contract') == 'document_source.v1')
         inputs = binding['inputs'][:len(resolved.sources) + len(resolved.materials)]
         self._check_input_bytes(inputs)
         if not standalone and self.workspace.artifact_hashes(binding['report_binding']['evidence_sha256']) != binding['report_binding']['evidence_sha256']:
@@ -892,7 +904,7 @@ class WritingToolGateway:
             'publication': (request.publication if request.publication is not None else
                 CompositionPublication.model_validate(saved['publication']) if saved.get('publication') else None),
             'delivery_artifacts': saved.get('delivery_artifacts') or []})
-        if standalone:
+        if standalone and method == 'article':
             resolved = resolved.model_copy(update={'professional_review': ProfessionalReview(max_revision_rounds=0)})
         linkage = {'owner': relative.parts[0], 'receipt_sha256': receipt_hashes,
             'artifact_sha256': versions, 'inputs': inputs, 'candidate_contract': candidate_contract,
@@ -2327,8 +2339,8 @@ class WritingToolGateway:
                         preview_bindings.append({'path': str(source), 'sha256': after, 'view': view})
         selection_request = request.model_dump()
         for key in ('required_headings', 'max_cited_sources'):
-            if not selection_request[key]:
-                selection_request.pop(key)  # Preserve existing directory-selection receipt bindings.
+            if not selection_request.get(key):
+                selection_request.pop(key, None)  # Preserve existing directory-selection receipt bindings.
         inputs = {'request': selection_request, 'inventories': inventories}
         if work_source is not None:
             inputs['work_source'] = work_source
@@ -2670,7 +2682,7 @@ class WritingToolGateway:
         from simple_ar.report.capability import ReportAssemblyRequest, run_report_capability
         from simple_ar.report.assembler import ReportAssemblyMode
         from simple_ar.report.projection import build_material_report_inputs, apply_report_bibliography
-        from simple_ar.report.schema import ReportContext, ReportRuntimeConfig, ReportSectionPlan, ReportDocumentPlan, SourceHandle, ReportMemory
+        from simple_ar.report.schema import ReportContext, ReportRuntimeConfig, ReportSectionPlan, ReportDocumentPlan, SourceHandle, ReportMemory, finding_requires_resolution
         from simple_ar.report.templates import load_report_template_bundle, intended_use_guidance
         from simple_ar.report.writing import (ARTICLE_OWNER, SECTION_ARTICLE_OWNER,
             article_writing_inputs, run_composition_article, write_section_article)
@@ -2780,9 +2792,12 @@ class WritingToolGateway:
             # to validate only after paid selection. Pin them without changing
             # historical final binding order or treating them as chosen evidence.
             declared_inputs = self.workspace.artifact_hashes(request.delivery_artifacts or [])
+            section_review = (original_binding.get('section_delivery_review_contract') == 'section_delivery_review.v1'
+                if recovering else document_work and work_source is not None
+                    and request.writing_method == 'sections' and report_binding is None)
             if request.professional_review is not None and (inspecting or report_binding is not None
-                    or request.writing_method == 'sections'):
-                raise ValueError('professional_review requires unbound article composition; frozen report controls remain authoritative')
+                    or request.writing_method == 'sections' and not section_review):
+                raise ValueError('professional_review requires unbound document work; frozen report controls remain authoritative')
             if request.adopt_draft:
                 from simple_ar.report.writing import article_inspection_enabled
                 controls = (report_binding or {}).get('requirement')
@@ -3240,8 +3255,8 @@ class WritingToolGateway:
                         'sha256': prior_data['artifact_sha256'][repair_candidate_path]})
             canonical_request = request.model_dump()
             for key in ('required_headings', 'max_cited_sources'):
-                if not canonical_request[key]:
-                    canonical_request.pop(key)  # Historical explicit-input bindings keep their exact shape.
+                if not canonical_request.get(key):
+                    canonical_request.pop(key, None)  # Historical explicit-input bindings keep their exact shape.
             if not request.material_roots:
                 canonical_request.pop('material_roots')  # Existing explicit-input receipt identities remain valid.
             for source in canonical_request['sources']:
@@ -3428,6 +3443,9 @@ class WritingToolGateway:
                         if recovering else 'section_delivery_review.v1')
             if writing_owner is not None:
                 binding['writing_owner'] = writing_owner
+            if section_review and request.professional_review is not None:
+                binding['section_delivery_review_contract'] = 'section_delivery_review.v1'
+                binding['section_response_contract'] = 'atomic_complete.v2'
             # Preserve historical partial publication bytes. Only new work
             # units explicitly bind the completed-article assembly contract.
             if not recovering or 'assembly_mode' in original_binding:
@@ -3617,7 +3635,7 @@ class WritingToolGateway:
             unresolved = []
             if writing_owner == 'professional_report.v1':
                 from simple_ar.report.memory import initialize_report_memory
-                from simple_ar.report.schema import ReportTemplateBundle, finding_requires_resolution
+                from simple_ar.report.schema import ReportTemplateBundle
                 from simple_ar.report.writing import ReportWritingRequest, run_report_writing_capability, professional_writer_config
                 requirement = validate_report_requirement(report_binding['requirement'])
                 config = professional_writer_config(binding)
@@ -3732,13 +3750,43 @@ class WritingToolGateway:
                 if not recovering:
                     client = client or (self.client_factory(identity) if self.client_factory else LLMClient.from_env(
                         self.model, budget_ledger=self.ledger, budget_session_id=self.session_id, budget_attempt_id=identity))
+                reviewed_config = None
+                if binding.get('section_delivery_review_contract'):
+                    reviewed_config = ReportRuntimeConfig(outline_strategy='template' if request.required_headings else 'adaptive',
+                        draft_scope='auto', reviewer='llm', document_review=True, review_scope='document',
+                        allow_source_backtracking=False, allow_llm_fallback=False,
+                        max_review_iterations=request.professional_review.max_revision_rounds,
+                        max_cited_sources=request.max_cited_sources)
+                    reviewed_config.figures.enabled = False
+                    reviewed_config.longform.target_words = request.target_words
+                    context.results['section_delivery_review'] = {
+                        'contract': binding['section_delivery_review_contract'],
+                        'assembly': {'title': request.title, 'assembly_mode': 'section_drafts'}}
                 written = write_section_article(store=writer_store, input_store=owner, documents_ref=ref,
                     identity=identity, report_context=context, title=request.title,
                     target_words=request.target_words, required_headings=request.required_headings,
                     max_cited_sources=request.max_cited_sources, prior_draft=previous,
-                    client=client, recovering=recovering)
+                    client=client, recovering=recovering,
+                    **({'candidate_source': binding['candidate_source']} if binding.get('candidate_source') else {}),
+                    **({'review_config': reviewed_config} if reviewed_config is not None else {}))
                 config = ReportRuntimeConfig.model_validate(writer_store.read_json('report_inputs.json')['config'])
                 memory = ReportMemory.model_validate(written['memory'])
+                if reviewed_config is not None:
+                    if any(row.type in {'document_review_unavailable', 'document_revision_unavailable'}
+                            for row in memory.reviewer_findings):
+                        raise ValueError('Section inspection unavailable; retain the complete author and original '
+                            'failed operation, without another inspection or redrafting')
+                    completed = {'writer_path': 'writer.json',
+                        'writer_sha256': hashlib.sha256(writer_store.resolve('writer.json').read_bytes()).hexdigest()}
+                    if owner.exists('professional_result.json') and owner.read_json('professional_result.json') != completed:
+                        raise ValueError('Reviewed section producer changed; no replacement')
+                    if not owner.exists('professional_result.json'):
+                        owner.write_json('professional_result.json', completed)
+                    unresolved.extend(row.model_dump(mode='json') for row in memory.reviewer_findings
+                        if finding_requires_resolution(row))
+                    if (written.get('independent_review') or {}).get('review_status') != 'reviewed':
+                        unresolved.append({'type': 'incomplete_independent_review',
+                            'review_status': (written.get('independent_review') or {}).get('review_status', 'unavailable')})
                 context, memory = apply_report_bibliography(context, memory, documents=documents,
                     notes=memory.outline_planning.get('source_notes', []))
                 _check_article_constraints({'constraints': {'outline': [
@@ -3819,7 +3867,7 @@ class WritingToolGateway:
                 # The new delivery contract still executes an actual inspection;
                 # do not manufacture acceptance from the presence of a snapshot.
                 from simple_ar.report.writing import inspect_article
-                from simple_ar.report.schema import ReviewerFinding, finding_requires_resolution
+                from simple_ar.report.schema import ReviewerFinding
                 delivery_store = ArtifactStore(owner.root / 'delivery-review')
                 if not delivery_store.exists('request.json'):
                     client = client or (self.client_factory(identity) if self.client_factory else LLMClient.from_env(
@@ -3992,6 +4040,10 @@ class WritingToolGateway:
                             and (locals().get('report_binding') or {}).get('requirement', {}).get('method') == 'article'
                             and writer_store.exists('writer.json')):
                         source = Path(retained_article_candidate(owner, binding)['path'])
+                    elif (locals().get('writing_owner') == SECTION_ARTICLE_OWNER
+                            and (locals().get('binding') or {}).get('section_delivery_review_contract')
+                            and writer_store.exists('writer.json')):
+                        source = writer_store.resolve('writer.json')
                     else:
                         source = None
                     if source is None:
