@@ -568,8 +568,10 @@ class WritingToolGateway:
         """Resolve a work source once; only the resulting recipe reaches Writer."""
         result = _DocumentInputs(request)
         if work_source is not None:
-            # Both caller locator forms identify one actual owner. They do not
-            # instruct the owner to select a different recovery algorithm.
+            # Both locator forms identify an owner. For a complete checked but
+            # unadopted revision, an explicit result keeps that candidate even
+            # when correction wording changes. Completed drafts retain their
+            # ordinary feedback semantics.
             parent_id = None
             observed = None
             if request.prior_result:
@@ -663,13 +665,13 @@ class WritingToolGateway:
                 feedback_requested = work_source['intent']['goal'] not in {'', original_goal}
                 if isinstance(report, dict) and isinstance(previous_report, dict):
                     feedback_requested = feedback_requested or report.get('requests') != previous_report.get('requests')
-                checked_section_revision = (not interrupted and method == 'sections' and not feedback_requested
+                checked_section_revision = (not interrupted and method == 'sections'
                     and bool(data.get('unresolved'))
                     and self._section_author_source(parent)[1].get('checked_revision') is not None)
                 if interrupted or (method in {'article', 'sections'}
                         and (self.root / 'attempts' / parent_id / 'native_result.json').exists()
                         and (not data.get('unresolved') or checked_section_revision)
-                        and not feedback_requested):
+                        and (not feedback_requested or request.prior_result and checked_section_revision)):
                     continued = request.model_copy(update={'prior_result': f'records/{parent_id}/native_result.json',
                         'prior_draft': '', 'material_roots': [], 'reuse_prior_inputs': False})
                     (result.recipe, result.binding, result.linkage, result.candidate) = self._continued_document_inputs(

@@ -2307,7 +2307,7 @@ class WritingCoordinationTests(unittest.TestCase):
         continuing = True
         before = len(prompts)
         with patch.object(writing, '_select_materials', side_effect=AssertionError('No reselection')):
-            second = writing.call('compose_document', {'goal': args['goal'],
+            second = writing.call('compose_document', {'goal': 'Resolve the remaining scope wording and deliver this same report',
                 'prior_result': 'records/checked-first/native_result.json', 'finish': True}, identity='checked-next')
         self.assertEqual(second.status, 'ok', second)
         self.assertEqual([label for label, _ in prompts[before:]],
