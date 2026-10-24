@@ -1277,9 +1277,12 @@ class WritingToolGateway:
         visible = {key: deepcopy(data[key]) for key in (
             'version', 'editable_markdown', 'review_path', 'scope', 'unresolved',
             'constraints_checked', 'review_status', 'section_reviews',
-            'mechanical_constraints', 'independent_review', 'delivery',
+            'mechanical_constraints', 'delivery',
             'delivery_review',
             'incomplete', 'failure_kind', 'next_action', 'retained_candidate', 'pending_candidate') if key in data}
+        review = data.get('independent_review')
+        if isinstance(review, dict) and 'review_status' in review:
+            visible.setdefault('review_status', review['review_status'])
         if match and result.status == 'ok' and data.get('editable_markdown') == f'{version}/candidate.md':
             try:
                 self._composition_receipt(match[1], result.model_dump(mode='json'))
@@ -1334,6 +1337,8 @@ class WritingToolGateway:
         # still validate the linked canonical records, versions and findings.
         outcome = {key: deepcopy(data[key]) for key in
             ('review_status', 'incomplete', 'failure_kind', 'pending_candidate') if key in data}
+        if 'review_status' in visible:
+            outcome['review_status'] = visible['review_status']
         if isinstance(inspection, dict) and 'status' in inspection:
             outcome['delivery_review_status'] = inspection['status']
         if 'unresolved' in data:

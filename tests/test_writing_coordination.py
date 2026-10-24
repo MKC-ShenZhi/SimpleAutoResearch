@@ -3307,14 +3307,18 @@ class WritingCoordinationTests(unittest.TestCase):
                     'producer': {'inputs': {'source': 'x' * 300000}}},
                     {'path': 'image.bin', 'coverage': 'visual_uninspected', 'visual_reviewed': False}],
                 'declaration_adoption': {'producers': ['x' * 300000]}}
+            result.data['independent_review'] = {**review, 'delivery_review': result.data['delivery_review']}
             saved = result.model_dump(mode='json')
             projected = gateway.coordination_result(result)
+            self.assertNotIn('independent_review', projected['data'])
+            self.assertEqual(projected['data']['unresolved'], result.data['unresolved'])
             inspection = projected['data']['delivery_review']
             self.assertEqual(inspection['defects'], saved['data']['delivery_review']['defects'])
             self.assertEqual(inspection['uninspected'], saved['data']['delivery_review']['uninspected'])
             self.assertEqual(inspection['artifact_coverage_counts'], {'complete': 1, 'visual_uninspected': 1})
             self.assertEqual(inspection['visually_reviewed_count'], 0)
             self.assertEqual(projected['outcome'], {'delivery_review_status': 'needs_revision',
+                'review_status': 'needs_revision',
                 'unresolved_count': len(result.data['unresolved']),
                 'pending_candidate': result.data['pending_candidate']})
             self.assertEqual(projected['data']['pending_candidate'], result.data['pending_candidate'])

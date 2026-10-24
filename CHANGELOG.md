@@ -10,7 +10,7 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 
 - Preserve complete, independently checked revisions as work candidates when required corrections remain. A rejected revision no longer depends on publishing an older draft before professional work can continue; only adopted manuscripts qualify for publication.
 - Share writing-result validation with producer repair and delivery consumers, retaining original evidence, failed attempts and usage records. Incomplete inspections and unread attachments keep their separate recovery and coverage limits.
-- Reuse complete provenance records once in new feedback inputs instead of copying them for every attachment. Original review records remain intact, and saved continuation requests retain their original inspection semantics.
+- Reuse complete provenance records once in new feedback inputs instead of copying them for every attachment. Coordination receives current findings without a duplicate full review; original records and historical inspection semantics remain intact.
 
 Full unattended draft, feedback and delivery acceptance remains in progress; this engineering update does not establish general success or lower cost.
 
