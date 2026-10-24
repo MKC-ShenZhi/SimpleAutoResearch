@@ -63,6 +63,7 @@ from simple_ar.report.survey import (
     is_survey_report, route_section_sources,
 )
 from simple_ar.report.tool_gateway import ReportToolGateway, checkpointed_report_reads
+from simple_ar.report.ports import _prepared_publication
 from simple_ar.report.tools import report_tool_specs, validate_report_reads
 from simple_ar.report.templates import BUILTIN_TEMPLATE_NAMES
 
@@ -183,7 +184,8 @@ SECTION_DELIVERY_REVIEW_CONTRACT = 'section_delivery_review.v1'
 
 
 def _section_delivery_assembly(context: ReportContext, memory: ReportMemory,
-                               sections: list[ReportSectionDraft], config: ReportRuntimeConfig) -> dict[str, Any]:
+                               sections: list[ReportSectionDraft], config: ReportRuntimeConfig,
+                               *, publication: bool = False) -> dict[str, Any]:
     """Use the assembly owner's text preparation; never certify future rendering.
 
     The consumer must compare body_sha256 with actual report_body.md and check
@@ -206,13 +208,19 @@ def _section_delivery_assembly(context: ReportContext, memory: ReportMemory,
     def digest(value: Any) -> str:
         return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False,
             separators=(',', ':')).encode('utf-8')).hexdigest()
-    return {'contract': SECTION_DELIVERY_REVIEW_CONTRACT,
+    result = {'contract': SECTION_DELIVERY_REVIEW_CONTRACT,
         'identity': {
             'body_sha256': hashlib.sha256(preview.report_body_markdown.encode('utf-8')).hexdigest(),
             'report_sha256': hashlib.sha256(preview.report_markdown.encode('utf-8')).hexdigest(),
             'sections_sha256': digest([row.model_dump(mode='json') for row in sections]),
             'delivery_snapshot_sha256': digest(context.results['delivery_review'])},
         'report_body_markdown': preview.report_body_markdown, 'report_markdown': preview.report_markdown}
+    if publication:
+        from simple_ar.literature.bibtex import papers_to_bibtex
+        from simple_ar.report.capability import supplied_caption_manifest
+        result['publication_inputs'] = {'references_bib': papers_to_bibtex(preview.cited_papers),
+            'figure_captions': supplied_caption_manifest(context)}
+    return result
 
 
 def run_report_agent(
@@ -229,6 +237,7 @@ def run_report_agent(
     assemble_body: bool = True,
     on_delivery_review: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     evidence_navigation_contract: str | None = SHARED_PRODUCER_LOCATOR_CONTRACT,
+    publication_view: Callable[[dict], dict] | None = None,
 ) -> AgentReportResult | None:
     """Run the bounded Writer/Reviewer loop for the report stage.
 
@@ -255,6 +264,16 @@ def run_report_agent(
         Agent-generated report body and updated memory, or ``None`` when agent
         mode is disabled or a validated agent pass cannot be produced.
     """
+    if publication_view is not None and (
+            config.agent != 'llm' or config.reviewer != 'llm'
+            or not config.document_review or config.review_scope != 'document'
+            or config.draft_scope not in {'document', 'auto'}
+            or context.results.get('section_delivery_review', {}).get('contract')
+                != SECTION_DELIVERY_REVIEW_CONTRACT
+            or (completed_checkpoint is not None
+                and completed_checkpoint.get('document_review_contract') != 'current_draft.v1')):
+        raise ValueError('Publication inspection port supports integrated current-document section review only; '
+            'per-section and historical review configurations are unsupported')
     if client is None or config.agent == "disabled":
         return None
     if not memory.section_plan:
@@ -703,6 +722,7 @@ def run_report_agent(
                 checkpoint=checkpoint, gateway=gateway, all_tool_results=all_tool_results,
                 current_draft_review=review_contract == 'current_draft.v1',
                 on_delivery_review=on_delivery_review if delivery_contract else None,
+                publication_view=publication_view,
             )
         # Final section-review reconciliation also matters when whole-document
         # review is disabled or inapplicable. Persist the memory we return,
@@ -821,6 +841,7 @@ def _edit_whole_document(
     all_tool_results: list[ReportToolResult],
     current_draft_review: bool = False,
     on_delivery_review: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    publication_view: Callable[[dict], dict] | None = None,
 ) -> bool:
     """Correct frozen targets within their configured, recoverable allowance."""
     review_finished = True
@@ -1015,6 +1036,17 @@ def _edit_whole_document(
                         iterations.append(correction_record)
                     checkpoint()
                 try:
+                    prepared_publication = None
+                    if publication_view is not None:
+                        # Persist the author's complete candidate and original
+                        # iteration allowance before intentional suspension.
+                        checkpoint()
+                        prepared_publication = _prepared_publication(publication_view, {
+                            'sections': [row.model_dump(mode='json') for row in ordered],
+                            'assembly': _section_delivery_assembly(context, memory, ordered, config,
+                                publication=True),
+                            'label': review_label + '-format-correction'
+                                if correction is not None else review_label})
                     validated = review_document(client=client, template=template, memory=memory,
                         sections=ordered, config=config,
                         execution_summary=_compact_execution_results(context.results),
@@ -1030,6 +1062,7 @@ def _edit_whole_document(
                         delivery_text_observation=delivery,
                         delivery_review=context.results['delivery_review'] if assembly is not None else None,
                         delivery_assembly=assembly,
+                        prepared_publication=prepared_publication,
                         evidence_navigation_contract=memory.survey_contract.get('evidence_navigation_contract'),
                         on_delivery_review=retain_delivery_review if assembly is not None else None,
                         label=review_label + "-format-correction" if correction is not None else review_label)

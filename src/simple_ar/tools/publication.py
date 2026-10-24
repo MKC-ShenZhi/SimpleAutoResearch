@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -60,9 +61,15 @@ class ExportRequest(BaseModel):
         description="Explicitly render every compiled PDF page with Poppler: at most 12 pages, 120 DPI scaled to a maximum 1600 pixels per dimension. Requires compile_pdf=true. Returns PNG locators for optional inspect_images; rendering is not visual review. Incomplete previews prevent delivery. False preserves historical request bindings.")
     delivery: DeliveryRequest | None = Field(default=None,
         description="Optional explicit final delivery after successful export/compilation. Exported files are added automatically; artifacts selects other already-existing outputs or retained task evidence. Disclose unresolved work. This does not certify scientific or visual quality. Request this operation alone when delivering.")
+    candidate_result: str = Field(default='', max_length=500, exclude_if=lambda value: not value,
+        description='Same-task complete writing-work receipt to prepare for independent publication inspection. '
+            'The writing owner proves candidate provenance and presentation bindings. '
+            'This operation cannot adopt a manuscript or make a final delivery.')
 
     @model_validator(mode="after")
     def validate_preview(self) -> ExportRequest:
+        if self.candidate_result and self.delivery is not None:
+            raise ValueError('Candidate preparation has no final delivery authority')
         if self.render_preview and not self.compile_pdf:
             raise ValueError("render_preview requires compile_pdf=true")
         if self.checks is not None and not self.compile_pdf:
@@ -137,6 +144,10 @@ def export_input_binding(source: Path, request: ExportRequest, *, output_root: P
 
 
 class PublicationToolGateway:
+    @property
+    def context_tools(self) -> set[str]:
+        return {'export_report'} if self.owned_execution else set()
+
     def can_reconcile(self, name: str, identity: str) -> bool:
         return name == 'export_report' and (
             self.workspace.workspace / 'publications' / identity / 'export.json').is_file() and self.has_started(identity)
@@ -145,9 +156,92 @@ class PublicationToolGateway:
         return (self.root / 'tools' / 'publications' / identity / 'request.json').is_file()
 
     def __init__(self, root: Path, workspace: Any, ledger: Any, *,
-                 report_source: Callable[[str], dict | None] | None = None) -> None:
+                 report_source: Callable[[str], dict | None] | None = None,
+                 candidate_source: Callable[[str, str], dict] | None = None,
+                 owned_execution: bool = False) -> None:
         self.root, self.workspace, self.ledger = root, workspace, ledger
         self.report_source = report_source
+        self.candidate_source, self.owned_execution = candidate_source, owned_execution
+
+    def _source_identity(self, request: ExportRequest) -> dict | None:
+        if request.candidate_result:
+            if self.candidate_source is None:
+                raise ValueError('Candidate preparation requires a registered writing-work owner')
+            source = self.candidate_source(request.markdown, request.candidate_result)
+            if source.get('kind') != 'publication_candidate' or source.get('adopted') is not False:
+                raise ValueError('Candidate source must prove explicitly unadopted writing work')
+        else:
+            source = self.report_source(request.markdown) if self.report_source else None
+        if source is not None and 'publication_options' in source:
+            excluded = {'markdown', 'delivery', 'candidate_result'}
+            expected = ExportRequest(markdown='', **source['publication_options']).model_dump(exclude=excluded)
+            if request.model_dump(exclude=excluded) != expected:
+                raise ValueError('Publication options differ from the admitted document work')
+        return source
+
+    def approval_binding(self, arguments: dict, *, identity: str) -> dict:
+        request = ExportRequest.model_validate(arguments)
+        source = self.workspace.resolve(request.markdown, write=True)
+        binding = export_input_binding(source, request,
+            output_root=self.workspace.workspace / 'publications')
+        if request.candidate_result:
+            binding['report_identity'] = self._source_identity(request)
+        return binding
+
+    def execute_tool(self, name: str, context: Any, arguments: dict, *, approval: dict | None = None) -> ToolResult:
+        if name not in self.context_tools or approval is None:
+            return ToolResult(tool_name=name, status='blocked', error='Publication needs bound execution approval')
+        if not self.has_started(context.attempt.attempt_id) and approval.get('binding') != self.approval_binding(
+                arguments, identity=context.attempt.attempt_id):
+            return ToolResult(tool_name=name, status='blocked', error='Publication inputs changed after approval')
+        return self.call(name, arguments, identity=context.attempt.attempt_id)
+
+    def inspection_source(self, result_ref: str, *, session_id: str) -> dict:
+        """Read a proved prepared view; rendering success grants no adoption."""
+        from simple_ar.tools.professional_outcomes import accepted_native_result
+        path = self.workspace.resolve(str(self.root/result_ref) if result_ref.startswith('attempts/') else result_ref)
+        relative = path.relative_to((self.root/'attempts').resolve())
+        if len(relative.parts) != 2 or relative.name != 'native_result.json':
+            raise ValueError('Inspection preparation requires a same-task publication receipt')
+        observed = json.loads(path.read_bytes())
+        _, receipt_sha = accepted_native_result(self.root, session_id, observed, relative.parts[0])
+        data = observed.get('data', {})
+        if (observed.get('tool_name') != 'export_report' or observed.get('status') != 'ok'
+                or observed.get('error') or not data.get('candidate_preparation')):
+            raise ValueError('Publication receipt is not complete candidate preparation')
+        owner = ArtifactStore(self.root/'tools/publications'/relative.parts[0])
+        saved, result = owner.read_json('request.json'), owner.read_json('result.json')
+        request = {key: value for key, value in saved.items()
+            if key not in {'inputs', 'image_binding_version', 'output_binding_version', 'report_identity'}}
+        binding = self.approval_binding(request, identity=relative.parts[0])
+        if binding != {key: value for key, value in saved.items() if key != 'output_binding_version'}:
+            raise ValueError('Prepared publication source or inputs changed')
+        hashes = result['artifact_sha256']
+        if (data.get('artifact_sha256') != hashes or self.workspace.artifact_hashes(hashes) != hashes
+                or data.get('report_identity') != saved.get('report_identity')
+                or result.get('report_identity') != saved.get('report_identity')
+                or data['project'] != f'workspace/publications/{relative.parts[0]}'):
+            raise ValueError('Prepared publication outputs or source identity changed')
+        project = self.workspace.resolve(data['project'])
+        manifest = ArtifactStore(project).read_json('export.json')
+        if manifest != data.get('manifest') or manifest.get('status') not in {'exported', 'compiled'}:
+            raise ValueError('Prepared publication manifest is incomplete or changed')
+        ref = manifest.get('inspection_view', {})
+        if ref.get('path') != 'publication_view.json' or ref.get('schema') != 'publication_view.v1':
+            raise ValueError('Publication has no supported actual inspection view')
+        view_path = project/'publication_view.json'
+        view = json.loads(view_path.read_bytes())
+        if (hashlib.sha256(view_path.read_bytes()).hexdigest() != ref['sha256']
+                or view.get('schema_version') != ref['schema']
+                or view.get('input_body_sha256') != binding['inputs'][Path(saved['markdown']).name]
+                or view.get('source_markdown_sha256') != hashlib.sha256((project/'source.md').read_bytes()).hexdigest()
+                or view.get('caption_owner') != saved['report_identity'].get('figure_caption_owner', 'markdown')):
+            raise ValueError('Prepared inspection view differs from its candidate or actual export')
+        return {'contract': 'prepared_publication.v1', 'prepared_result': self.workspace.locator(str(path)),
+            'prepared_result_sha256': receipt_sha, 'source': saved['report_identity'],
+            'view_path': self.workspace.locator(str(view_path)), 'view_sha256': ref['sha256'],
+            'view': view, 'adopted': False,
+            'pages': data.get('preview_images', []), 'visual_reviewed': False}
 
     def check_report_delivery(self, observations: list[dict], identity: dict | None, artifacts: list[str], *,
                               formats: list[str], manuscript: str | None, proposed: dict | None = None) -> set[Path]:
@@ -158,6 +252,8 @@ class PublicationToolGateway:
         if identity is not None and set(formats) <= {'markdown'}:
             return set()
         if proposed is not None:
+            if proposed.get('candidate_result'):
+                raise ValueError('Candidate preparation cannot satisfy final publication delivery')
             if self.workspace.resolve(proposed['markdown']) != self.workspace.resolve(source):
                 raise ValueError('Proposed publication uses a different authoring version')
             if 'pdf' in formats and not proposed.get('compile_pdf', True):
@@ -166,6 +262,8 @@ class PublicationToolGateway:
         delivered = {self.workspace.resolve(path) for path in artifacts}
         for row in observations:
             data = row.get('data') or {}
+            if data.get('candidate_preparation') or data.get('report_identity', {}).get('kind') == 'publication_candidate':
+                continue
             if row.get('tool_name') != 'export_report' or row.get('status') != 'ok' or not data.get('project'):
                 continue
             project = self.workspace.resolve(data['project'])
@@ -204,6 +302,8 @@ class PublicationToolGateway:
             if name != "export_report" or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,100}", identity):
                 raise ValueError("Invalid publication invocation")
             request = ExportRequest.model_validate(arguments)
+            if request.candidate_result and not self.owned_execution:
+                raise ValueError('This task retains its historical publication execution contract')
             source = self.workspace.resolve(request.markdown, write=True)
             if not source.is_file() or source.suffix.lower() != ".md" or source.stat().st_size > 256000:
                 raise ValueError("Use an existing workspace Markdown file no larger than 256 KiB")
@@ -218,7 +318,7 @@ class PublicationToolGateway:
             producer_cache = {}
             self.workspace.check_artifact_producers((str(source.parent / key)
                 for key, digest in binding['inputs'].items() if digest is not None), cache=producer_cache)
-            report_identity = self.report_source(request.markdown) if self.report_source else None
+            report_identity = self._source_identity(request)
             if report_identity is not None:
                 binding['report_identity'] = report_identity
             if saved is not None:
@@ -246,6 +346,35 @@ class PublicationToolGateway:
                 # Mark new requests before rendering so an interrupted commit
                 # cannot be mistaken for a historical, unbound export.
                 owner.write_json("request.json", {**binding, 'output_binding_version': 1})
+                render_source = source
+                staged_hashes = {}
+                if request.candidate_result:
+                    # Freeze presentation dependencies in this approved operation;
+                    # never repair or enrich an older candidate in place.
+                    staged = owner.root / 'source'
+                    staged.mkdir()
+                    for key, digest in binding['inputs'].items():
+                        if digest is None:
+                            continue
+                        raw = (source.parent / key).read_bytes()
+                        if hashlib.sha256(raw).hexdigest() != digest:
+                            raise ValueError('Candidate input changed while preparing publication')
+                        target = staged / key
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_bytes(raw)
+                        staged_hashes[key] = digest
+                    captions = report_identity.get('provided_figure_captions', {})
+                    if captions:
+                        manifest_path = staged / 'figures/figures_manifest.json'
+                        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+                        existing = json.loads(manifest_path.read_bytes()) if manifest_path.exists() else {'figures': []}
+                        by_path = {row['path']: row for row in existing['figures']}
+                        for path, caption in captions.items():
+                            by_path[path] = {**by_path.get(path, {}), 'path': path, 'caption': caption}
+                        existing['figures'] = list(by_path.values())
+                        manifest_path.write_text(json.dumps(existing, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+                        staged_hashes['figures/figures_manifest.json'] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+                    render_source = staged / source.name
                 count = 0
 
                 def render(argv, *, cwd, text=None, timeout=60, env=None):
@@ -274,6 +403,13 @@ class PublicationToolGateway:
                     return (logs / "stdout.log").read_text(encoding="utf-8", errors="replace")
 
                 def validate_asset(path):
+                    if request.candidate_result:
+                        if not path.resolve().is_relative_to(render_source.parent.resolve()):
+                            raise ReportExportError('Prepared asset escapes its bound source directory')
+                        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                        if staged_hashes.get(path.relative_to(render_source.parent).as_posix()) != digest:
+                            raise ReportExportError('Prepared candidate asset changed during rendering')
+                        return digest
                     authorized = self.workspace.resolve(str(path))
                     self.workspace.check_artifact_producers([str(authorized)], cache=producer_cache)
                     key = authorized.relative_to(source.parent).as_posix()
@@ -284,7 +420,7 @@ class PublicationToolGateway:
                     return digest
 
                 try:
-                    manifest = export_acm_report(source.parent, output, title=request.title or None,
+                    manifest = export_acm_report(render_source.parent, output, title=request.title or None,
                         body_name=source.name, compile_pdf=request.compile_pdf, render_preview=request.render_preview, runner=render,
                         validate_asset=validate_asset,
                         caption_owner=(report_identity or {}).get('figure_caption_owner', 'markdown'),
@@ -297,11 +433,23 @@ class PublicationToolGateway:
                     # A failed preview can still retain accurate compilation
                     # evidence. Return that terminal manifest without delivery.
                     manifest = ArtifactStore(output).read_json('export.json')
-            if report_identity is not None and self.report_source(request.markdown) != report_identity:
+                if request.candidate_result and any(hashlib.sha256((render_source.parent/key).read_bytes()).hexdigest() != digest
+                        for key, digest in staged_hashes.items()):
+                    raise ReportExportError('Prepared candidate inputs changed during publication')
+            if report_identity is not None and self._source_identity(request) != report_identity:
                 raise ValueError('Canonical authoring identity changed during publication')
+            if completed_view := (report_identity or {}).get('prepared_publication'):
+                inspected = self.workspace.resolve(completed_view['view_path'])
+                if hashlib.sha256(inspected.read_bytes()).hexdigest() != completed_view['view_sha256']:
+                    raise ValueError('Independently inspected publication view changed')
+                before, after = json.loads(inspected.read_bytes()), ArtifactStore(output).read_json('publication_view.json')
+                if before != after:
+                    changed = sorted(key for key in set(before) | set(after) if before.get(key) != after.get(key))
+                    raise ValueError('Publication differs from the independently inspected candidate in '
+                        + ', '.join(changed) + '; retain both without delivery')
             self.workspace.check_artifact_producers((str(source.parent / key)
                 for key, digest in binding['inputs'].items() if digest is not None), cache=producer_cache, refresh=True)
-            if self.report_source is not None and export_input_binding(source, request,
+            if (self.report_source is not None or request.candidate_result) and export_input_binding(source, request,
                     output_root=self.workspace.workspace / 'publications')['inputs'] != binding['inputs']:
                 raise ValueError('Publication authoring inputs changed during rendering')
             artifacts = [f"{prefix}/{file}" for file in ("main.tex", "body.tex", "references.bib", "source.md", "export.json", "main.pdf")
@@ -356,6 +504,9 @@ class PublicationToolGateway:
                         'next_action': 'Rendering resource allowance exhausted. Retain the manuscript and failed publication; explicit resource authorization is required before new rendering.'}
                        if manifest.get('failure_kind') == 'resource_exhausted' else {}),
                     **({'report_identity': report_identity} if report_identity is not None else {}),
+                    **({'candidate_preparation': {'source_result': request.candidate_result,
+                        'adopted': False, 'delivery_authority': False}}
+                       if request.candidate_result else {}),
                     **({'artifact_sha256': hashes, 'output_integrity': 'byte_bound'} if hashes is not None else {}),
                     **({'delivery': delivery} if delivery is not None else {}),
                     **({'preview_images': preview_images,

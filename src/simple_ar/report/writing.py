@@ -11,6 +11,7 @@ from typing import Any, Callable, Literal
 from simple_ar.core.capabilities import ArtifactRef, ArtifactStore, AttemptManifest, CapabilityContext, CapabilityResult
 from simple_ar.report.agent import run_report_agent
 from simple_ar.report.memory import initialize_report_memory
+from simple_ar.report.ports import _prepared_publication
 from simple_ar.report.review_evidence import EVIDENCE_NAVIGATION_CONTRACTS, SHARED_PRODUCER_LOCATOR_CONTRACT
 from simple_ar.report.schema import ReportContext, ReportMemory, ReportRuntimeConfig, ReportTemplateBundle, finding_requires_resolution
 from simple_ar.report.tool_gateway import ReportToolGateway
@@ -568,6 +569,38 @@ def retained_writing_client(*, store: ArtifactStore, identity: str, client: Any,
     class RetainedWritingClient:
         last_inspection_source = None
 
+        def prepared_publication_for_review(self, view: dict, label: str) -> dict | None:
+            """Recover only an explicit view from a matching complete frozen request.
+
+            The normal ask_json path subsequently checks the entire request and
+            its atomic response; this lookup authorizes no transport or retry.
+            """
+            from simple_ar.report.editor import PREPARED_PUBLICATION_FOCUS
+            matches = []
+            snapshot = store.read_json('report_inputs.json') if store.exists('report_inputs.json') else {}
+            for path in (store.root / 'model_calls').glob('*/request.json'):
+                previous = _writing_child(store, 'model_calls/' + path.parent.name)
+                recorded = previous.read_json('request.json')
+                if (recorded.get('options', {}).get('label') != label
+                        or recorded.get('input_snapshot') != snapshot.get('snapshot_id')
+                        or recorded.get('response_record_contract') != contract):
+                    continue
+                frozen = json.loads(recorded['prompt'])
+                prepared = frozen.pop('prepared_publication', None)
+                if prepared is None:
+                    continue
+                frozen.pop('evidence_locator', None)
+                if frozen.get('focus', [])[-1:] != [PREPARED_PUBLICATION_FOCUS]:
+                    continue
+                frozen['focus'] = frozen['focus'][:-1]
+                if frozen != view:
+                    continue
+                _retained_response(previous, 'request.json', recorded)
+                matches.append(prepared)
+            if matches and any(row != matches[0] for row in matches):
+                raise ValueError('Ambiguous frozen publication inspection; no blind replay')
+            return matches[0] if matches else None
+
         def ask_json(self, system: str, prompt: str, **options: Any) -> Any:
             self.last_inspection_source = None
             request = {'system': system, 'prompt': prompt, 'options': options,
@@ -847,7 +880,9 @@ def inspect_article(*, store: ArtifactStore, identity: str, client: Any,
                     report_context: ReportContext, config: ReportRuntimeConfig,
                     template: ReportTemplateBundle, markdown: str, target_words: int = 0,
                     required_headings: Sequence[str] = (), resume_store: ArtifactStore | None = None,
-                    inspection_root: Path | None = None) -> dict[str, Any]:
+                    inspection_root: Path | None = None,
+                    publication_view: Callable[[dict], dict] | None = None,
+                    publication_sections: Sequence[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Inspect current prose through the existing independent document reviewer.
 
     Freeze original inspection and at most one format correction, without edits.
@@ -863,6 +898,37 @@ def inspect_article(*, store: ArtifactStore, identity: str, client: Any,
     if not source.exists('request.json') and any(source.exists(name) for name in ('response.json', 'response_error.json', 'response_complete.json')):
         raise ValueError('Review input snapshot is unavailable; no blind replay')
     saved = source.read_json('request.json') if source.exists('request.json') else None
+    prepared_publication = None
+    if publication_view is not None:
+        from simple_ar.report.capability import (
+            ReportAssemblyRequest, preview_report_document, supplied_caption_options)
+        raw_sections = list(publication_sections) if publication_sections is not None else [
+            ReportSectionDraft(section_id='document', heading=report_context.topic,
+                draft_markdown=markdown).model_dump(mode='json')]
+        if (len(raw_sections) != 1 or raw_sections[0]['section_id'] != 'document'
+                or raw_sections[0]['draft_markdown'] != markdown):
+            raise ValueError('Publication candidate differs from the complete inspected article')
+        preview = preview_report_document(ReportAssemblyRequest(title=report_context.topic,
+            sections=tuple(raw_sections), config=config, assembly_mode='whole_article',
+            papers=tuple(report_context.papers), citation_key_map=report_context.citation_key_map,
+            **supplied_caption_options(report_context)))
+        assembly = {'identity': {
+            'body_sha256': hashlib.sha256(preview.report_body_markdown.encode('utf-8')).hexdigest(),
+            'report_sha256': hashlib.sha256(preview.report_markdown.encode('utf-8')).hexdigest(),
+            'sections_sha256': hashlib.sha256(json.dumps(raw_sections, sort_keys=True,
+                ensure_ascii=False, separators=(',', ':')).encode('utf-8')).hexdigest()},
+            'report_body_markdown': preview.report_body_markdown,
+            'report_markdown': preview.report_markdown}
+        from simple_ar.literature.bibtex import papers_to_bibtex
+        from simple_ar.report.capability import supplied_caption_manifest
+        assembly['publication_inputs'] = {'references_bib': papers_to_bibtex(preview.cited_papers),
+            'figure_captions': supplied_caption_manifest(report_context)}
+        prepared_publication = _prepared_publication(publication_view, {'sections': raw_sections, 'assembly': assembly,
+            'label': 'article-independent-review'})
+    elif saved is not None:
+        # Only an explicitly frozen new request can carry this presentation view.
+        # Exact retained-request validation below still binds all reconstructed bytes.
+        prepared_publication = json.loads(saved['prompt']).get('prepared_publication')
     contract = (saved.get('format_correction_contract') if saved is not None
                 else DOCUMENT_FORMAT_CORRECTION_CONTRACT)
     record_contract = saved.get('response_record_contract') if saved is not None else 'atomic_complete.v2'
@@ -954,6 +1020,7 @@ def inspect_article(*, store: ArtifactStore, identity: str, client: Any,
         config=review_config, execution_summary=_compact_execution_results(report_context.results),
         allow_format_correction=contract is not None, on_invalid_response=retain_rejection,
         on_validated_subset=retain_subset,
+        prepared_publication=prepared_publication,
         evidence_reference_contract=evidence_contract,
         comparison_verification_contract=comparison_contract,
         evidence_navigation_contract=navigation_contract,
@@ -1025,6 +1092,7 @@ class ReportWritingRequest:
     composition_inputs: dict[str, Any] | None = None
     candidate_source: dict[str, Any] | None = None
     output_outline: Sequence[dict[str, Any]] = ()
+    publication_view: Callable[[dict], dict] | None = None
 
 
 def _fixed_section_memory(memory: ReportMemory, outline: Sequence[dict[str, Any]],
@@ -1200,7 +1268,8 @@ def _section_reorganization_feedback(context: ReportContext, candidate: dict[str
 
 
 def run_composition_article(*, store: ArtifactStore, inputs: dict[str, Any], identity: str,
-                            client: Any = None, candidate_source: dict[str, Any] | None = None) -> CapabilityResult:
+                            client: Any = None, candidate_source: dict[str, Any] | None = None,
+                            publication_view: Callable[[dict], dict] | None = None) -> CapabilityResult:
     """Adapt native composition to the shared article owner, preserving saved inputs."""
     from simple_ar.report.templates import load_report_template_bundle
     config = ReportRuntimeConfig.model_validate(inputs['assembly_config'])
@@ -1211,6 +1280,7 @@ def run_composition_article(*, store: ArtifactStore, inputs: dict[str, Any], ide
     return run_report_writing_capability(context=CapabilityContext(store, AttemptManifest(identity)),
         request=ReportWritingRequest(context, memory, config, template, client, method='article',
             prior_draft=article.get('prior_draft', ''), composition_inputs=inputs,
+            publication_view=publication_view,
             candidate_source=candidate_source if candidate_source is not None else inputs.get('candidate_source')))
 
 
@@ -1463,6 +1533,7 @@ def run_report_writing_capability(*, context: CapabilityContext, request: Report
                               gateway=ReportToolGateway(request.report_context, documents=documents, output_reader=read_output),
                               emit=request.emit, completed_checkpoint=completed,
                               checkpoint_sink=save_checkpoint, assemble_body=False,
+                              publication_view=request.publication_view,
                               evidence_navigation_contract=memory.survey_contract.get('evidence_navigation_contract'),
                               on_delivery_review=delivery_source
                               if 'section_delivery_review' in request.report_context.results else None)
@@ -1792,7 +1863,10 @@ def continued_checked_candidate(owner: ArtifactStore, binding: dict, *,
     # Native source registration and input access remain the gateway's gate.
     # The bound result digest also belongs to this proof on every replay.
     task = root.parent.parent.parent
-    native = task / 'attempts' / prior['owner'] / 'native_result.json'
+    physical = prior.get('native_owner', prior['owner'])
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', physical):
+        raise ValueError('Invalid checked work native owner')
+    native = task / 'attempts' / physical / 'native_result.json'
     if (not native.resolve().is_relative_to((task / 'attempts').resolve())
             or hashlib.sha256(native.read_bytes()).hexdigest() != prior['result_sha256']):
         raise ValueError('Checked work native source changed')
@@ -2122,7 +2196,9 @@ def write_section_article(*, store: ArtifactStore, input_store: ArtifactStore,
     title: str, target_words: int, required_headings: Sequence[str],
     max_cited_sources: int, prior_draft: str = '', client: Any = None,
     recovering: bool = False, review_config: ReportRuntimeConfig | None = None,
-    candidate_source: dict[str, Any] | None = None) -> dict[str, Any]:
+    candidate_source: dict[str, Any] | None = None,
+    publication_view: Callable[[dict], dict] | None = None,
+    live_continuation: bool = False) -> dict[str, Any]:
     """Native composition over the existing section Writer and checkpoint.
 
     Selection, execution, review and publication remain separate capabilities.
@@ -2131,6 +2207,10 @@ def write_section_article(*, store: ArtifactStore, input_store: ArtifactStore,
     None preserves the historical disabled-review snapshot and receipts. An
     explicit config uses the same Writer's document inspector and joint editor,
     retaining its full result even when inspection is unavailable.
+    publication_view is a runtime lookup, excluded from frozen inputs. The
+    caller must validate the cooperative stage before setting live_continuation;
+    that flag resumes the same checkpoint with the supplied client and original
+    local rounds, while retaining the complete-response/no-blind-retry gate.
     """
     from simple_ar.report.schema import ReportSectionPlan, SourceHandle
     from simple_ar.report.templates import load_report_template_bundle
@@ -2202,7 +2282,7 @@ def write_section_article(*, store: ArtifactStore, input_store: ArtifactStore,
             section.target_words = target_words // len(saved_outline)
     memory = _section_feedback_memory(memory, context,
         retained_inputs.get('memory', {}) if retained_inputs is not None else None)
-    if recovering or frozen is not None:
+    if recovering or live_continuation or frozen is not None:
         # Freeze the original method and all inputs before admitting either
         # historical producer reconstruction or reviewed checkpoint recovery.
         expected = _writing_binding(report_context=context, memory=memory, config=config,
@@ -2213,8 +2293,11 @@ def write_section_article(*, store: ArtifactStore, input_store: ArtifactStore,
             sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         if not store.exists('report_inputs.json') or store.read_json('report_inputs.json') != expected:
             raise ValueError('Frozen section input changed; preserve its snapshot, no blind replay')
+    if live_continuation and (client is None or review_config is None
+            or not store.exists('sections.json') or not store.exists('report_inputs.json')):
+        raise ValueError('Live section continuation requires a client and its frozen reviewed checkpoint')
     resume = None
-    if recovering:
+    if recovering or live_continuation:
         if review_config is not None:
             # The adopted joint revision is the saved checkpoint, not the
             # initial author prefix. Prove every physical operation complete
@@ -2232,13 +2315,16 @@ def write_section_article(*, store: ArtifactStore, input_store: ArtifactStore,
             if store.exists('sections.json'):
                 resume = input_store.ref(store.resolve('sections.json').relative_to(input_store.root),
                     kind='report_checkpoint', schema='report_checkpoint.v1')
-        store = _SectionRecoveryStore(store)
+        if not live_continuation:
+            store = _SectionRecoveryStore(store)
     result = run_report_writing_capability(context=CapabilityContext(store, AttemptManifest(identity),
         inputs=(documents_ref, *((resume,) if resume else ())), input_store=input_store),
         request=ReportWritingRequest(context, memory, config, template,
-            retained_writing_client(store=store, identity=identity, client=None if recovering else client,
+            retained_writing_client(store=store, identity=identity,
+                client=None if recovering and not live_continuation else client,
                 contract='atomic_complete.v2' if review_config is not None else 'atomic_complete.v1'),
             method='sections', prior_draft=prior_draft, resume_ref=resume,
+            publication_view=publication_view,
             candidate_source=candidate_source))
     if result.status != 'completed' and (review_config is None
             or not any(ref.kind == 'report_writer_result' for ref in result.artifacts)):
@@ -2433,6 +2519,8 @@ def _edit_article(*, store: ArtifactStore, retained: ArtifactStore, written: dic
             resume_store=_writing_child(retained, path) if retained.root != store.root else None,
             identity=f'{written["source_attempt"]}:revision-{event.iteration}',
             client=None if recover_only else request.llm_client,
+            publication_view=None if recover_only else request.publication_view,
+            publication_sections=[row.model_dump(mode='json') for row in candidate],
             report_context=request.report_context, config=config, template=request.template,
             markdown=candidate[0].draft_markdown, target_words=config.longform.target_words,
             inspection_root=store.root.parent,
@@ -2575,6 +2663,7 @@ def _run_article_writing(*, context: CapabilityContext, request: ReportWritingRe
             report_context=report_context, config=config, template=request.template,
             markdown=written['sections'][0]['draft_markdown'], target_words=config.longform.target_words,
             inspection_root=context.store.root.parent,
+            publication_view=request.publication_view, publication_sections=written['sections'],
             required_headings=([row['heading'] for row in inputs['article'].get('constraints', {}).get('outline', [])]
                 if request.composition_inputs is not None else ()),
             resume_store=ArtifactStore(retained.root / 'review') if request.resume_ref else None)

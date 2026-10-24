@@ -180,6 +180,8 @@ class CompositionPublication(ExportRequest):
         description='Omit: the writing owner pins the completed canonical manuscript.')
     delivery: None = Field(default=None, exclude=True,
         description='Omit: callers cannot supply delivery here. With finish=true the document-work owner binds canonical delivery after independent acceptance; otherwise export returns outputs for further checks.')
+    candidate_result: Literal[''] = Field(default='', exclude=True,
+        description='Omit: preparation receipts belong to the document owner, not publication preferences.')
 
 
 class DocumentWorkRequest(BaseModel):
@@ -196,6 +198,8 @@ class DocumentWorkRequest(BaseModel):
     prior_draft: str = Field(default='', description='Existing canonical manuscript to revise; valid evidence and materials are reused, not inferred from its prose.')
     prior_result: str = Field(default='', max_length=1000, exclude_if=lambda value: not value,
         description='Continue a same-task compose_document result after an incomplete inspection, using its complete saved article/section author or an independently checked but unadopted complete article/section revision. The owner proves and reuses its exact evidence and candidate, checks it first, and makes bounded corrections if required. Required findings stay unresolved until checked corrections succeed. No new investigation, scientific rerun, inherited acceptance or budget reset. Do not combine with a separately selected draft or material recipe.')
+    resume_work: str = Field(default='', max_length=1000, exclude_if=lambda value: not value,
+        description='Owner-proposed same-task prepared-publication receipt. Resumes the original document checkpoint and remaining revision allowance; does not restart authoring, material selection or budget.')
     target_words: int = Field(default=0, ge=0, le=20000)
     writing_method: Literal['article', 'sections'] | None = Field(default=None,
         exclude_if=lambda value: value is None,
@@ -216,6 +220,8 @@ class DocumentWorkRequest(BaseModel):
         from simple_ar.report.assembler import _heading_title, _strip_heading_number
         if self.prior_result and (self.prior_draft or self.material_roots):
             raise ValueError('Choose a retained work result OR a separately supplied draft/material scope')
+        if self.resume_work and self.model_fields_set - {'resume_work'}:
+            raise ValueError('resume_work continues the exact original work order without overrides')
         headings = [_strip_heading_number(_heading_title(heading)).casefold() for heading in self.required_headings]
         if (any(not heading or len(raw) > 300 or '\n' in raw or '\r' in raw
                 or heading.startswith('#') or heading == 'references'
@@ -358,6 +364,31 @@ class _AssemblyStore(ArtifactStore):
         return super().write_json(path, data, **kwargs)
 
 
+def composition_owner(*, root: Path, workspace: Any, session_id: str, identity: str) -> ArtifactStore:
+    """Resolve an admitted physical continuation, including stopped operations."""
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', identity):
+        raise ValueError('Invalid composition identity')
+    store = ArtifactStore(root/'tools/writing'/identity)
+    if not store.exists('resume.json'):
+        return store
+    link = store.read_json('resume.json')
+    owner = link['owner']
+    if owner == identity or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', owner):
+        raise ValueError('Invalid logical document owner')
+    path = workspace.resolve(link['prepared_result'])
+    prepared = json.loads(path.read_bytes())
+    accepted_native_result(root, session_id, prepared, path.parent.name)
+    source = prepared.get('data', {}).get('report_identity', {})
+    if (hashlib.sha256(path.read_bytes()).hexdigest() != link['prepared_sha256']
+            or source.get('kind') != 'publication_candidate' or source.get('composition') != owner
+            or source.get('receipt_sha256') != link['stage_sha256']):
+        raise ValueError('Continuation publication source changed')
+    result = ArtifactStore(root/'tools/writing'/owner)
+    if result.exists('resume.json') or not result.exists('request.json'):
+        raise ValueError('Continuation must retain one original Writer owner')
+    return result
+
+
 def read_composition_receipt(*, root: Path, workspace: Any, session_id: str, identity: str, observed: dict | None = None) -> tuple[ArtifactStore, dict, dict]:
     """Validate retained composition identity, not its review disposition.
 
@@ -368,6 +399,13 @@ def read_composition_receipt(*, root: Path, workspace: Any, session_id: str, ide
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', identity):
         raise ValueError('Invalid composition identity')
     store = ArtifactStore(root / 'tools/writing' / identity)
+    if store.exists('resume.json'):
+        saved = store.read_json('result.json')
+        if observed is not None and {key: value for key, value in observed.items() if key != 'tool_name'} != saved:
+            raise ValueError('Physical continuation result changed')
+        owner = composition_owner(root=root, workspace=workspace, session_id=session_id, identity=identity)
+        return read_composition_receipt(root=root, workspace=workspace, session_id=session_id,
+            identity=owner.root.name, observed={'tool_name': 'compose_document', **saved})
     binding, saved = store.read_json('request.json'), store.read_json('result.json')
     data = saved['data']
     prefix = f'workspace/manuscripts/{identity}'
@@ -399,8 +437,9 @@ def check_work_receipt(*, root: Path, workspace: Any, session_id: str, store: Ar
     from simple_ar.report.schema import ReviewerFinding, finding_requires_resolution
     if binding.get('continued_source_review') == 'checked_work.v1':
         prior = binding['prior_input_reuse']
-        native = ArtifactStore(root / 'attempts' / prior['owner'])
-        accepted_native_result(root, session_id, native.read_json('native_result.json'), prior['owner'])
+        physical = prior.get('native_owner', prior['owner'])
+        native = ArtifactStore(root / 'attempts' / physical)
+        accepted_native_result(root, session_id, native.read_json('native_result.json'), physical)
     candidate = read_composition_candidate(workspace, data)
     expected = ([finding for row in candidate['independent_review']['section_reviews'] for finding in row['findings']
         if finding_requires_resolution(ReviewerFinding.model_validate(finding))]
@@ -531,9 +570,16 @@ class WritingToolGateway:
         self.joint_delivery = joint_delivery
         self.declaration_adoption_contract = None
         self.producer_completion = None
+        self.publication_inspection = None
+        self.prepared_publication: Callable[[str], dict] | None = None
 
     def finishes_request(self, arguments: dict) -> bool:
         """Describe requested work granularity, never a completed observation."""
+        if self.document_work and arguments.get('resume_work') and self.prepared_publication is not None:
+            prepared = self.prepared_publication(arguments['resume_work'])
+            source = self.workspace.resolve(prepared['source']['source_result'])
+            _, binding = self._publication_stage(json.loads(source.read_bytes()), source.parent.name)
+            return binding['request'].get('finish') is True
         return self.document_work and arguments.get('finish') is True
 
     @staticmethod
@@ -1068,7 +1114,8 @@ class WritingToolGateway:
         if observed.get('tool_name') != 'compose_document':
             raise ValueError('prior_result requires a composition result')
         accepted_native_result(self.root, self.session_id, observed, relative.parts[0])
-        store = ArtifactStore(self.root / 'tools/writing' / relative.parts[0])
+        store = composition_owner(root=self.root, workspace=self.workspace,
+            session_id=self.session_id, identity=relative.parts[0])
         if store.root.resolve().parent != (self.root / 'tools/writing').resolve():
             raise ValueError('Stopped composition owner escapes this task')
         binding = store.read_json('request.json')
@@ -1106,7 +1153,7 @@ class WritingToolGateway:
         if checked_work_admitted and (observed.get('data', {}).get('failure_kind') == 'image_reference'
                 or observed.get('status') == 'ok' and binding.get('work_result_contract') == 'checked_candidate.v1'
                     and observed.get('data', {}).get('editable_markdown') ==
-                        f"workspace/manuscripts/{relative.parts[0]}/candidate.md"):
+                        f"workspace/manuscripts/{store.root.name}/candidate.md"):
             from simple_ar.report.writing import checked_writing_candidate
             checked_work = checked_writing_candidate(store, binding)
         pending_author = (observed.get('status') == 'ok' and (
@@ -1149,9 +1196,11 @@ class WritingToolGateway:
             'delivery_artifacts': saved.get('delivery_artifacts') or []})
         if standalone and method == 'article' and checked_work is None:
             resolved = resolved.model_copy(update={'professional_review': ProfessionalReview(max_revision_rounds=0)})
-        linkage = {'owner': relative.parts[0], 'receipt_sha256': receipt_hashes,
+        linkage = {'owner': store.root.name, 'receipt_sha256': receipt_hashes,
             'artifact_sha256': versions, 'inputs': inputs, 'candidate_contract': candidate_contract,
             'result_ref': self.workspace.locator(str(path)), 'result_sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+        if store.root.name != relative.parts[0]:
+            linkage['native_owner'] = relative.parts[0]
         if checked_work is not None:
             linkage['checked_work'] = True
         return resolved, binding, linkage, source
@@ -1317,7 +1366,8 @@ class WritingToolGateway:
     def can_reconcile(self, name: str, identity: str) -> bool:
         """Allow dispatch to this owner, without certifying a completed article."""
         return name in {'compose_document', 'review_document'} and bool(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', identity)) and (
-            self.root / 'tools' / 'writing' / identity / 'request.json').is_file()
+            (self.root / 'tools' / 'writing' / identity / 'request.json').is_file()
+            or name == 'compose_document' and (self.root / 'tools/writing' / identity / 'resume.json').is_file())
 
     def coordination_result(self, result: ToolResult, *, receipt_path: str | None = None) -> dict[str, Any]:
         """Present an observation, never replace a canonical ToolResult receipt.
@@ -1346,6 +1396,7 @@ class WritingToolGateway:
             'constraints_checked', 'review_status', 'section_reviews',
             'mechanical_constraints', 'delivery',
             'delivery_review',
+            'work_status', 'publication_stage',
             'incomplete', 'failure_kind', 'next_action', 'retained_candidate', 'pending_candidate') if key in data}
         review = data.get('independent_review')
         if isinstance(review, dict) and 'review_status' in review:
@@ -1434,7 +1485,8 @@ class WritingToolGateway:
             store=store, binding=binding, data=data)
 
     def _save_negative_work(self, owner: ArtifactStore, binding: dict, *, prefix: str,
-                            figure_inputs: list, document_materials: dict | None) -> ToolResult:
+                            figure_inputs: list, document_materials: dict | None,
+                            physical_identity: str | None = None) -> ToolResult:
         """Finish checked work before attempting publication of the adopted body."""
         from simple_ar.report.writing import checked_writing_candidate
         from simple_ar.report.schema import ReviewerFinding, finding_requires_resolution
@@ -1472,7 +1524,7 @@ class WritingToolGateway:
             'independent_review': review,
             'retained_candidate': {'status': 'checked_not_adopted', 'adopted': False,
                 'markdown': f'{prefix}/candidate.md', 'review_status': 'needs_revision',
-                'prior_result': f'records/{owner.root.name}/native_result.json'},
+                'prior_result': f'records/{physical_identity or owner.root.name}/native_result.json'},
             'unresolved': [finding for row in review['section_reviews'] for finding in row['findings']
                 if finding_requires_resolution(ReviewerFinding.model_validate(finding))],
             'scope': 'Complete independently checked work with unresolved findings; candidate is not adopted or publication-ready.'}
@@ -1493,6 +1545,18 @@ class WritingToolGateway:
         owner.write_json('result.json', result)
         return ToolResult(tool_name='compose_document', **result)
 
+    @staticmethod
+    def _publication_options(binding: dict) -> dict:
+        """One title/presentation policy for preparation and final publication."""
+        options = CompositionPublication.model_validate(binding['request']['publication']).model_dump(mode='json')
+        if binding.get('document_work', {}).get('contract') in _DOCUMENT_WORK_CONTRACTS:
+            title_contract = binding['document_work'].get('publication_title_contract')
+            if title_contract not in {None, 'canonical_heading.v1'}:
+                raise ValueError('Unknown document publication title contract')
+            if not options['title'] and title_contract != 'canonical_heading.v1':
+                options['title'] = binding['request']['title']
+        return options
+
     def continuation(self, observed: dict, attempt_id: str) -> dict | None:
         """Read retained successful composition; propose export via normal dispatch.
 
@@ -1509,7 +1573,13 @@ class WritingToolGateway:
                 or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', attempt_id)):
             return None
         try:
+            if observed.get('data', {}).get('work_status') == 'awaiting_publication_preparation':
+                stage, _ = self._publication_stage(observed, attempt_id)
+                return {'tool_name': 'export_report', 'arguments': ExportRequest(
+                    markdown=stage['markdown'], candidate_result=f'records/{attempt_id}/native_result.json',
+                    **stage['publication']).model_dump(mode='json')}
             store, binding, data = self._composition_receipt(attempt_id, observed)
+            attempt_id = store.root.name
             options = binding['request'].get('publication')
             if options is None and not binding['request'].get('finish'):
                 return None
@@ -1522,15 +1592,9 @@ class WritingToolGateway:
             if review.get('review_status') != 'reviewed':
                 return None
             arguments = (ExportRequest(markdown=markdown,
-                **CompositionPublication.model_validate(options).model_dump()).model_dump(mode='json')
+                **self._publication_options(binding)).model_dump(mode='json')
                 if options is not None else {})
             if binding.get('document_work', {}).get('contract') in _DOCUMENT_WORK_CONTRACTS:
-                title_contract = binding['document_work'].get('publication_title_contract')
-                if title_contract not in {None, 'canonical_heading.v1'}:
-                    return None
-                if (options is not None and not arguments['title'] and binding['document_work'].get('publication_title_contract')
-                        != 'canonical_heading.v1'):
-                    arguments['title'] = binding['request']['title']
                 if binding['request'].get('finish'):
                     # Inspect the actual retained independent response, not a
                     # status flag, before expressing this unit's final delivery.
@@ -1719,7 +1783,11 @@ class WritingToolGateway:
         if (observed.get('tool_name') != 'compose_document'
                 or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', attempt_id)):
             return None
-        store = ArtifactStore(self.root / 'tools/writing' / attempt_id)
+        try:
+            store = composition_owner(root=self.root, workspace=self.workspace,
+                session_id=self.session_id, identity=attempt_id)
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
         composed = store.exists('request.json')
         if not composed and (not store.exists('selection-input.json')
                 or store.read_json('selection-input.json').get('document_work') != 'document_work.v2'):
@@ -1786,7 +1854,8 @@ class WritingToolGateway:
             return None
         try:
             from simple_ar.report.writing import retained_article_candidate, article_inspection_enabled, professional_writer_config
-            store = ArtifactStore(self.root / 'tools/writing' / attempt_id)
+            store = composition_owner(root=self.root, workspace=self.workspace,
+                session_id=self.session_id, identity=attempt_id)
             binding = store.read_json('request.json')
             if observed.get('status') == 'ok':
                 store, binding, data = self._composition_receipt(attempt_id, observed)
@@ -1875,7 +1944,8 @@ class WritingToolGateway:
         action = self._budget_review_action(observed, attempt_id)
         if action is None:
             return None
-        binding = ArtifactStore(self.root / 'tools/writing' / attempt_id).read_json('request.json')
+        binding = composition_owner(root=self.root, workspace=self.workspace,
+            session_id=self.session_id, identity=attempt_id).read_json('request.json')
         if (binding.get('continued_source_review') is not None
                 or binding.get('report_binding', {}).get('requirement', {}).get('method') != 'sections'):
             return None  # Legacy article stops keep their explicit resource-grant contract.
@@ -2163,6 +2233,12 @@ class WritingToolGateway:
 
     def consume_outcome(self, observed: dict, source: str) -> dict | None:
         """Accept a verified producer revision without repeating material selection."""
+        if (observed.get('tool_name') == 'export_report' and observed.get('status') == 'ok'
+                and observed.get('data', {}).get('candidate_preparation') and self.prepared_publication is not None):
+            prepared = self.prepared_publication(source)
+            if prepared.get('adopted') is not False:
+                raise ValueError('Publication preparation cannot grant adoption')
+            return {'tool_name': 'compose_document', 'arguments': {'resume_work': source}}
         return self.resubmit_after_repair(observed)
 
     def _producer_repair(self, new_execution: dict) -> dict | None:
@@ -2622,10 +2698,213 @@ class WritingToolGateway:
             {key: value for key, value in saved.items() if key not in feedback_only} ==
             {key: value for key, value in current.items() if key not in feedback_only})
 
+    def preparation_source(self, markdown: str, result_ref: str) -> dict:
+        """Prove retained work for rendering, without granting adoption/delivery."""
+        path = self.workspace.resolve(str(self.root / result_ref) if result_ref.startswith('attempts/') else result_ref)
+        relative = path.relative_to((self.root / 'attempts').resolve())
+        if len(relative.parts) != 2 or relative.name != 'native_result.json':
+            raise ValueError('Preparation requires a same-task native writing receipt')
+        observed = json.loads(path.read_bytes())
+        identity = relative.parts[0]
+        accepted_native_result(self.root, self.session_id, observed, identity)
+        if observed.get('data', {}).get('work_status') == 'awaiting_publication_preparation':
+            stage, binding = self._publication_stage(observed, identity)
+            if self.workspace.resolve(markdown) != self.workspace.resolve(stage['markdown']):
+                raise ValueError('Preparation uses a different candidate than the suspended work')
+            return {'kind': 'publication_candidate', 'manuscript': stage['markdown'],
+                'source_result': self.workspace.locator(str(path)),
+                'source_result_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                'composition': stage['owner'], 'receipt_sha256': stage['stage_sha256'],
+                'artifact_sha256': stage['artifact_sha256'], 'adopted': False,
+                'assembly_identity': stage['candidate']['assembly']['identity'],
+                'publication_options': stage['publication'],
+                'figure_caption_owner': 'manifest' if stage['captions'] else 'markdown',
+                **({'provided_figure_captions': {row['path']: row['caption']
+                    for row in stage['captions']}} if stage['captions'] else {})}
+        store, binding, data = self._composition_receipt(identity, observed)
+        if self.workspace.resolve(markdown) != self.workspace.resolve(data['editable_markdown']):
+            raise ValueError('Preparation uses a different candidate than its writing receipt')
+        self._check_input_bytes(binding['inputs'])
+        self.workspace.check_artifact_producers(row['path'] for row in binding['inputs'])
+        from simple_ar.report.writing import provided_caption_bindings
+        from simple_ar.report.capability import supplied_caption_manifest
+        from simple_ar.report.schema import ReportContext
+        snapshot = ArtifactStore(store.root / 'writer').read_json('report_inputs.json')
+        article = snapshot.get('inputs', {}).get('article', {})
+        context = (ReportContext.model_validate(snapshot['context']) if 'context' in snapshot else
+            ReportContext(topic=article['title'], report_mode='supplied_materials',
+                papers=article['bibliography'], citation_key_map=article['citation_key_map'],
+                results={'provided_figure_captions': provided_caption_bindings(binding)}))
+        captions = {row['path']: row['caption'] for row in supplied_caption_manifest(context)}
+        return {'kind': 'publication_candidate', 'manuscript': data['editable_markdown'],
+            'source_result': self.workspace.locator(str(path)), 'source_result_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+            'composition': data['version'], 'receipt_sha256': hashlib.sha256(store.resolve('result.json').read_bytes()).hexdigest(),
+            'artifact_sha256': data['artifact_sha256'], 'adopted': False,
+            **({'figure_caption_owner': 'manifest', 'provided_figure_captions': captions} if captions else {})}
+
+    def _publication_stage(self, observed: dict, identity: str) -> tuple[dict, dict]:
+        """Prove immutable handback; the live Writer checkpoint may later advance."""
+        accepted_native_result(self.root, self.session_id, observed, identity)
+        if (observed.get('tool_name') != 'compose_document' or observed.get('status') != 'ok'
+                or observed.get('error') or observed['data'].get('work_status') != 'awaiting_publication_preparation'):
+            raise ValueError('Not a suspended document inspection')
+        ref = observed['data']['publication_stage']
+        stage_path = self.root/'attempts'/identity/'document_work.json'
+        if ref != self.workspace.locator(str(stage_path)):
+            raise ValueError('Document stage is outside its physical operation')
+        stage = json.loads(stage_path.read_bytes())
+        digest = hashlib.sha256(stage_path.read_bytes()).hexdigest()
+        if (observed['data']['stage_sha256'] != digest
+                or observed.get('artifacts') != list(stage['artifact_sha256'])
+                or self.workspace.artifact_hashes(stage['artifact_sha256']) != stage['artifact_sha256']):
+            raise ValueError('Suspended candidate or stage changed')
+        owner = ArtifactStore(self.root/'tools/writing'/stage['owner'])
+        binding = owner.read_json('request.json')
+        if (binding.get('publication_inspection_contract') != 'prepared_document.v1'
+                or hashlib.sha256(owner.resolve('request.json').read_bytes()).hexdigest() != stage['request_sha256']):
+            raise ValueError('Original document work contract changed')
+        self._check_input_bytes(binding['inputs'])
+        for key, digest in stage['checkpoint_sha256'].items():
+            if hashlib.sha256((self.root/'tools/writing'/identity/'publication_checkpoint'/key).read_bytes()).hexdigest() != digest:
+                raise ValueError('Suspended Writer checkpoint archive changed')
+        return {**stage, 'stage_sha256': observed['data']['stage_sha256']}, binding
+
+    def _suspend_publication(self, *, owner: ArtifactStore, binding: dict, payload: dict,
+                             physical_identity: str, arguments: dict, figure_inputs: list,
+                             prepared: tuple[str, ...]) -> ToolResult:
+        """Hand a complete candidate to normal publication dispatch, not a new editor."""
+        from simple_ar.tools.publication import export_input_binding
+        identity = owner.root.name
+        stage_store = ArtifactStore(self.root/'tools/writing'/physical_identity)
+        operation = ArtifactStore(self.root/'attempts'/physical_identity)
+        output = ArtifactStore(self.workspace.resolve(
+            f'workspace/document_work/{identity}/{physical_identity}', write=True))
+        files = {'candidate.md': payload['assembly']['report_body_markdown'].encode('utf-8'),
+            'references.bib': payload['assembly']['publication_inputs']['references_bib'].encode('utf-8')}
+        captions = payload['assembly']['publication_inputs']['figure_captions']
+        if captions:
+            files['figures/figures_manifest.json'] = (json.dumps({'figures': captions},
+                ensure_ascii=False, indent=2)+'\n').encode('utf-8')
+        files.update({target: raw for _, target, raw in figure_inputs})
+        for key, raw in files.items():
+            target = output.resolve(key)
+            if target.exists() and target.read_bytes() != raw:
+                raise ValueError('Suspended publication candidate changed; no overwrite')
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                target.write_bytes(raw)
+        checkpoint = {}
+        for source in sorted((owner.root/'writer').rglob('*.json')):
+            key = source.relative_to(owner.root/'writer').as_posix()
+            raw = source.read_bytes()
+            target = stage_store.resolve('publication_checkpoint/'+key)
+            if target.exists() and target.read_bytes() != raw:
+                raise ValueError('Saved handback checkpoint changed')
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                target.write_bytes(raw)
+            checkpoint[key] = hashlib.sha256(raw).hexdigest()
+        options = self._publication_options(binding)
+        markdown = self.workspace.locator(str(output.resolve('candidate.md')))
+        request = ExportRequest(markdown=markdown, **options)
+        inputs = export_input_binding(output.resolve('candidate.md'), request)['inputs']
+        artifacts = [self.workspace.locator(str(output.resolve(key))) for key, digest in inputs.items()
+            if digest is not None]
+        work = binding.get('document_work')
+        if work is not None:
+            artifacts.extend(row['path'] for row in work['materials'])
+            artifacts.extend(path for unit in work.get('producer_units', []) for path in unit['files'])
+            artifacts = list(dict.fromkeys(artifacts))
+        hashes = self.workspace.artifact_hashes(artifacts)
+        stage = {'contract': 'prepared_document.v1', 'owner': identity, 'arguments': arguments,
+            'candidate': payload, 'markdown': markdown, 'captions': captions,
+            'artifact_sha256': hashes, 'checkpoint_sha256': checkpoint,
+            'request_sha256': hashlib.sha256(owner.resolve('request.json').read_bytes()).hexdigest(),
+            'prepared': list(prepared), 'publication': options}
+        if operation.exists('document_work.json') and operation.read_json('document_work.json') != stage:
+            raise ValueError('Publication handback changed; preserve its original operation')
+        if not operation.exists('document_work.json'):
+            operation.write_json('document_work.json', stage)
+        return ToolResult(tool_name='compose_document', artifacts=artifacts,
+            data={'work_status': 'awaiting_publication_preparation', 'adopted': False,
+                'publication_stage': self.workspace.locator(str(operation.resolve('document_work.json'))),
+                'stage_sha256': hashlib.sha256(operation.resolve('document_work.json').read_bytes()).hexdigest(),
+                'editable_markdown': markdown, 'artifact_sha256': hashes,
+                **({'document_work': work} if work is not None else {})},
+            summary='Complete candidate saved. Prepare its requested publication before independent inspection; no adoption or final delivery.')
+
+    def _resume_publication(self, arguments: dict, *, identity: str) -> ToolResult:
+        DocumentWorkRequest.model_validate(arguments)
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', identity):
+            raise ValueError('Invalid publication continuation identity')
+        if self.prepared_publication is None:
+            raise ValueError('No registered publication inspection owner')
+        prepared = self.prepared_publication(arguments['resume_work'])
+        source = prepared['source']
+        path = self.workspace.resolve(source['source_result'])
+        observed = json.loads(path.read_bytes())
+        stage, _ = self._publication_stage(observed, path.parent.name)
+        owner = ArtifactStore(self.root/'tools/writing'/stage['owner'])
+        current = ArtifactStore(self.root/'tools/writing'/identity)
+        if identity in {stage['owner'], path.parent.name} or current.exists('request.json'):
+            raise ValueError('Continuation requires its own physical operation, not replacement of an existing owner')
+        link = {'owner': stage['owner'], 'prepared_result': arguments['resume_work'],
+            'prepared_sha256': prepared['prepared_result_sha256'],
+            'stage_sha256': stage['stage_sha256']}
+        if current.exists('resume.json'):
+            if current.read_json('resume.json') != link:
+                raise ValueError('Retained document continuation changed')
+            if current.exists('result.json'):
+                saved = current.read_json('result.json')
+                if saved.get('status', 'ok') == 'ok':
+                    self._composition_receipt(identity, {'tool_name': 'compose_document', **saved})
+                else:
+                    # A crash may precede native observation registration. This
+                    # cache can reconstruct only failure, never retry or adoption.
+                    native = ArtifactStore(self.root/'attempts'/identity)
+                    if (not saved.get('data', {}).get('incomplete') or saved.get('data', {}).get('delivery')
+                            or native.exists('native_result.json') and native.read_json('native_result.json')
+                                != {'tool_name': 'compose_document', **saved}):
+                        raise ValueError('Stopped document continuation differs from its native outcome')
+                return ToolResult(tool_name='compose_document', **saved)
+        else:
+            # Initial admission must match the exact paused checkpoint. A later
+            # same-operation recovery uses the existing Writer's no-blind-retry rules.
+            actual = {file.relative_to(owner.root/'writer').as_posix():
+                hashlib.sha256(file.read_bytes()).hexdigest() for file in (owner.root/'writer').rglob('*.json')}
+            if actual != stage['checkpoint_sha256'] or owner.exists('result.json'):
+                raise ValueError('Document checkpoint already advanced; cannot fork or reset its revision allowance')
+            current.write_json('resume.json', link)
+        refs = tuple(dict.fromkeys([*stage['prepared'], arguments['resume_work']]))
+        result = self.call('compose_document', stage['arguments'], identity=stage['owner'],
+            _continuation={'physical_identity': identity, 'prepared': refs})
+        if result.data.get('work_status') != 'awaiting_publication_preparation':
+            current.write_json('result.json', result.model_dump(mode='json', exclude={'tool_name'}))
+        return result
+
+    def _publication_lookup(self, refs: tuple[str, ...]) -> Callable[[dict], dict | None]:
+        def lookup(payload):
+            for ref in refs:
+                prepared = self.prepared_publication(ref)
+                source = prepared['source']
+                path = self.workspace.resolve(source['source_result'])
+                stage, _ = self._publication_stage(json.loads(path.read_bytes()), path.parent.name)
+                if stage['candidate'] == payload:
+                    return prepared
+            return None
+        return lookup
+
     def publication_source(self, markdown: str, binding: dict | None, *, intent: dict | None = None,
                            adopted: dict | None = None, observation: dict | None = None) -> dict:
         """Prove one canonical authoring version, never infer identity from prose."""
         path = self.workspace.resolve(markdown)
+        candidate_root = self.workspace.workspace/'manuscripts'
+        if path.is_relative_to((self.workspace.workspace/'document_work').resolve()):
+            raise ValueError('Suspended publication candidates require their preparation receipt and cannot be adopted by conversion')
+        if path.is_relative_to(candidate_root.resolve()):
+            parts = path.relative_to(candidate_root.resolve()).parts
+            if len(parts) > 2 and parts[1] == 'preparations':
+                raise ValueError('Suspended publication candidates require their preparation receipt and cannot be adopted by conversion')
         identity = path.parent.name
         if (not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', identity)
                 or path not in {self.workspace.resolve(f'workspace/manuscripts/{identity}/{leaf}')
@@ -2660,6 +2939,19 @@ class WritingToolGateway:
         from simple_ar.report.writing import provided_caption_bindings
         if provided_caption_bindings(request):
             result['figure_caption_owner'] = 'manifest'
+        if request.get('publication_inspection_contract') == 'prepared_document.v1':
+            review = self.final_review(data)
+            receipt = review.get('inspection_source') or {}
+            review_request = store.resolve(receipt['request_path'])
+            if hashlib.sha256(review_request.read_bytes()).hexdigest() != receipt['request_sha256']:
+                raise ValueError('Publication inspection request changed')
+            prepared = json.loads(json.loads(review_request.read_bytes())['prompt'])['prepared_publication']
+            current = self.prepared_publication(prepared['prepared_result'])
+            if current != prepared or current['source']['assembly_identity']['body_sha256'] != hashlib.sha256(path.read_bytes()).hexdigest():
+                raise ValueError('Canonical body differs from its independently inspected publication')
+            result['prepared_publication'] = {key: current[key] for key in
+                ('prepared_result', 'prepared_result_sha256', 'view_path', 'view_sha256')}
+            result['publication_options'] = current['source']['publication_options']
         if adopted is not None and result != adopted:
             raise ValueError('Adopted canonical manuscript identity changed')
         return result
@@ -3181,7 +3473,8 @@ class WritingToolGateway:
             raise ValueError('Document material copies differ from the retained unit')
         return proof
 
-    def call(self, name: str, arguments: dict[str, Any], *, identity: str) -> ToolResult:
+    def call(self, name: str, arguments: dict[str, Any], *, identity: str,
+             _continuation: dict | None = None) -> ToolResult:
         from simple_ar.integrations.llm import LLMClient
         from simple_ar.report.capability import ReportAssemblyRequest, run_report_capability, supplied_caption_options
         from simple_ar.report.assembler import ReportAssemblyMode
@@ -3194,8 +3487,13 @@ class WritingToolGateway:
         from simple_ar.research.documents.ingest import DocumentBundle
         from simple_ar.research.contracts import DocumentRecord, TextChunk
         from simple_ar.research.store.retrieval import rank_source_chunks
+        from simple_ar.report.ports import ReportPublicationRequired
 
         try:
+            if name == 'compose_document' and arguments.get('resume_work'):
+                return self._resume_publication(arguments, identity=identity)
+            physical_identity = (_continuation or {}).get('physical_identity', identity)
+            prepared_refs = tuple((_continuation or {}).get('prepared', ()))
             # Presence (even an explicit empty field) is caller intent. Owner
             # normalization below may add figures/goal, never exact-input intent.
             caller_arguments = dict(arguments)
@@ -3992,6 +4290,16 @@ class WritingToolGateway:
                     else 'checked_candidate.v1')
                 if binding['work_result_contract'] != 'checked_candidate.v1':
                     raise ValueError('Unknown writing work result contract')
+            if recovering and 'publication_inspection_contract' in original_binding:
+                binding['publication_inspection_contract'] = original_binding['publication_inspection_contract']
+            elif (not recovering and not inspecting and self.publication_inspection == 'prepared_document.v1'
+                    and request.publication is not None and (request.professional_review is not None
+                        or writing_owner == 'professional_report.v1'
+                        and report_binding['requirement']['config']['reviewer'] == 'llm'
+                        and report_binding['requirement']['config']['document_review'])):
+                if request.publication.template is not None:
+                    raise ValueError('Prepared document work requires template assets in its candidate bundle; custom-template admission is not yet supported')
+                binding['publication_inspection_contract'] = 'prepared_document.v1'
             if (not recovering and 'work_context' in binding
                     and len(json.dumps(binding, ensure_ascii=False).encode('utf-8')) > 4 * 1024 * 1024):
                 raise ValueError('Composition binding with work context exceeds 4 MiB; narrow related inputs')
@@ -4190,6 +4498,12 @@ class WritingToolGateway:
             # deterministic illustration inferred from article headings.
             config.figures.enabled = False
             writer_store = ArtifactStore(owner.root / 'writer')
+            publication_view = (self._publication_lookup(prepared_refs)
+                if binding.get('publication_inspection_contract') == 'prepared_document.v1' else None)
+            if _continuation is not None:
+                client = self.client_factory(physical_identity) if self.client_factory else LLMClient.from_env(
+                    self.model, budget_ledger=self.ledger, budget_session_id=self.session_id,
+                    budget_attempt_id=physical_identity)
             unresolved = []
             if writing_owner == 'professional_report.v1':
                 from simple_ar.report.memory import initialize_report_memory
@@ -4238,7 +4552,7 @@ class WritingToolGateway:
                             config=config, template=template, llm_client=client, method=requirement['method'],
                             prior_draft=previous, resume_ref=resume,
                             output_outline=binding.get('output_outline', ()),
-                            candidate_source=binding.get('candidate_source')))
+                            candidate_source=binding.get('candidate_source'), publication_view=publication_view))
                     writer_ref = next((row for row in reversed(result.artifacts) if row.kind == 'report_writer_result'), None)
                     if writer_ref is None:
                         raise ValueError('Professional writing incomplete; retain its checkpoint: ' + '; '.join(result.diagnostics))
@@ -4285,7 +4599,8 @@ class WritingToolGateway:
                 if not recovering:
                     client = client or (self.client_factory(identity) if self.client_factory else LLMClient.from_env(
                         self.model, budget_ledger=self.ledger, budget_session_id=self.session_id, budget_attempt_id=identity))
-                result = run_composition_article(store=writer_store, inputs=inputs, identity=identity, client=client)
+                result = run_composition_article(store=writer_store, inputs=inputs, identity=identity, client=client,
+                    publication_view=publication_view)
                 writer_ref = next(row for row in result.artifacts if row.kind == 'report_writer_result')
                 written = writer_store.read_json(writer_ref.path)
                 if request.professional_review is not None:
@@ -4328,6 +4643,7 @@ class WritingToolGateway:
                     target_words=request.target_words, required_headings=request.required_headings,
                     max_cited_sources=request.max_cited_sources, prior_draft=previous,
                     client=client, recovering=recovering,
+                    publication_view=publication_view, live_continuation=_continuation is not None,
                     **({'candidate_source': binding['candidate_source']} if binding.get('candidate_source') else {}),
                     **({'review_config': reviewed_config} if reviewed_config is not None else {}))
                 config = ReportRuntimeConfig.model_validate(writer_store.read_json('report_inputs.json')['config'])
@@ -4389,7 +4705,8 @@ class WritingToolGateway:
                         or written.get('pending_candidate')
                         or binding.get('continued_source_review') == 'checked_work.v1' and unresolved)):
                 return self._save_negative_work(owner, binding, prefix=prefix,
-                    figure_inputs=figure_inputs, document_materials=document_materials)
+                    figure_inputs=figure_inputs, document_materials=document_materials,
+                    physical_identity=physical_identity)
             constraints_checked = None
             if report_binding is not None:
                 from simple_ar.report.assembler import assemble_report_sections
@@ -4599,6 +4916,10 @@ class WritingToolGateway:
                 self._check_document_copy_review(data['data'])
             owner.write_json('result.json', data)
             return ToolResult(tool_name=name, **data)
+        except ReportPublicationRequired as exc:
+            return self._suspend_publication(owner=owner, binding=binding, payload=exc.payload,
+                physical_identity=physical_identity, arguments=caller_arguments,
+                figure_inputs=figure_inputs, prepared=prepared_refs)
         except Exception as exc:
             from simple_ar.core.budget import BudgetExceededError, BudgetUnknownError
             from simple_ar.integrations.llm import LLMError

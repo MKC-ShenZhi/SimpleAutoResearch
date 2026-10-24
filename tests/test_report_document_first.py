@@ -13,6 +13,7 @@ from simple_ar.core.capabilities import ArtifactRef, ArtifactStore, AttemptManif
 from simple_ar.integrations.llm import LLMError, LLMResponseError
 from simple_ar.report.agent import run_report_agent
 from simple_ar.report.editor import edit_joint_document
+from simple_ar.report.ports import ReportPublicationRequired
 from simple_ar.report.schema import (
     ReportContext, ReportMemory, ReportRuntimeConfig, ReportSectionPlan,
     ReportSectionDraft, ReportSectionReview, ReviewerFinding, ReportIterationRecord,
@@ -28,6 +29,47 @@ from tests.report_review_fixtures import (
 
 
 class DocumentFirstTests(unittest.TestCase):
+    def test_article_publication_handback_retains_author_before_inspection(self):
+        from unittest.mock import Mock
+
+        kwargs = self.inputs(count=1, allow_source_backtracking=False, allow_llm_fallback=False)
+        kwargs['config'].max_review_iterations = 0
+        body = '## results\n\nOnly recorded observations are described.'
+        prepared = {'contract': 'prepared_publication.v1',
+                    'view': {'logical_document': {'text': body}}}
+        for publication_view in (None, Mock(return_value=None)):
+            with self.subTest(cooperative=publication_view is not None), tempfile.TemporaryDirectory() as tmp:
+                store = ArtifactStore(Path(tmp))
+                context = CapabilityContext(store, AttemptManifest('article-handback'))
+                client = Mock()
+                client.ask_json.side_effect = lambda system, prompt, **options: (
+                    {'draft_markdown': body} if options['label'] == 'composition-article'
+                    else {'section_reviews': [{'section_id': 'document', 'verdict': 'pass'}]})
+                request = ReportWritingRequest(kwargs['context'], kwargs['memory'], kwargs['config'],
+                    kwargs['template'], client, method='article', publication_view=publication_view)
+                if publication_view is not None:
+                    with self.assertRaises(ReportPublicationRequired) as stopped:
+                        run_report_writing_capability(context=context, request=request)
+                    authored = store.read_json('writer.json')
+                    self.assertEqual(stopped.exception.payload['sections'], authored['sections'])
+                    self.assertEqual(authored['sections'][0]['draft_markdown'], body)
+                    self.assertEqual(client.ask_json.call_count, 1)
+                    self.assertFalse(store.exists('review/request.json'))
+                    retained = {name: store.resolve(name).read_bytes()
+                                for name in ('writer.json', 'report_inputs.json', 'response.json')}
+                    request = replace(request, publication_view=lambda payload: copy.deepcopy(prepared))
+                result = run_report_writing_capability(context=context, request=request)
+                self.assertEqual(result.status, 'completed', result.diagnostics)
+                self.assertEqual([call.kwargs['label'] for call in client.ask_json.call_args_list],
+                                 ['composition-article', 'article-independent-review'])
+                view = json.loads(store.read_json('review/request.json')['prompt'])
+                if publication_view is None:
+                    self.assertNotIn('prepared_publication', view)
+                else:
+                    self.assertEqual(view['prepared_publication'], prepared)
+                    for name, raw in retained.items():
+                        self.assertEqual(store.resolve(name).read_bytes(), raw)
+
     def test_explicit_outline_owns_joint_writing_revision_and_checkpoint_recovery(self):
         from simple_ar.report.assembler import assemble_report_sections, article_section_headings
         from simple_ar.report.writing import (
@@ -1998,6 +2040,57 @@ class JointRevisionTests(unittest.TestCase):
                 return response
 
         return kwargs, RecordedClient()
+
+    def test_section_publication_handbacks_retain_author_and_revision_round(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            labels, saved = [], []
+            kwargs, client = self._integrated_delivery_case(Path(tmp), labels)
+            prepared = {'contract': 'prepared_publication.v1',
+                        'view': {'logical_document': {'text': 'Prepared section presentation'}}}
+            available = set()
+
+            def lookup(payload):
+                return copy.deepcopy(prepared) if payload['label'] in available else None
+
+            with self.assertRaises(ReportPublicationRequired) as stopped:
+                run_report_agent(**kwargs, client=client, publication_view=lookup,
+                    checkpoint_sink=lambda row: saved.append(copy.deepcopy(row)))
+            author = saved[-1]
+            self.assertEqual(labels, ['report-writer-document'])
+            self.assertEqual(stopped.exception.payload['sections'], author['sections'])
+            self.assertEqual([row['draft_markdown'] for row in author['sections']],
+                             ['Original method', 'Original result', 'Original scope'])
+            self.assertFalse(author['document_review_done'])
+            available.add('report-document-reviewer')
+            with self.assertRaises(ReportPublicationRequired) as revised:
+                run_report_agent(**kwargs, client=client, publication_view=lookup,
+                    completed_checkpoint=author,
+                    checkpoint_sink=lambda row: saved.append(copy.deepcopy(row)))
+            checkpoint = saved[-1]
+            self.assertEqual(labels, ['report-writer-document', 'report-document-reviewer',
+                                      'report-document-joint-reviser'])
+            self.assertEqual([row['draft_markdown'] for row in revised.exception.payload['sections']],
+                             ['Reconciled method', 'Reconciled result', 'Original scope'])
+            revisions = [row for row in checkpoint['iterations'] if row['action'] == 'document_joint_revise']
+            self.assertEqual(len(revisions), 1)
+            self.assertEqual(revisions[0]['status'], 'drafted')
+            self.assertFalse(revisions[0]['adopted'])
+            self.assertEqual([row['draft_markdown'] for row in revisions[0]['drafts']],
+                             ['Reconciled method', 'Reconciled result'])
+            available.add('report-document-verifier')
+            result = run_report_agent(**kwargs, client=client, publication_view=lookup,
+                completed_checkpoint=checkpoint)
+            self.assertEqual(labels, ['report-writer-document', 'report-document-reviewer',
+                                      'report-document-joint-reviser', 'report-document-verifier'])
+            self.assertEqual(sum(row.action == 'document_joint_revise' for row in result.iterations), 1)
+            self.assertEqual([row.draft_markdown for row in result.sections],
+                             ['Reconciled method', 'Reconciled result', 'Original scope'])
+            self.assertEqual(kwargs['config'].max_review_iterations, 2)
+            for event in result.iterations:
+                if event.independent_review is not None:
+                    source = event.independent_review['inspection_source']
+                    view = json.loads(Path(source['request_path']).read_text(encoding='utf-8'))
+                    self.assertEqual(view['prepared_publication'], prepared)
 
     def test_integrated_delivery_verdict_matches_adopted_or_rejected_candidate(self):
         from simple_ar.report.agent import _section_delivery_assembly

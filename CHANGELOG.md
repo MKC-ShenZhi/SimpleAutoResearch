@@ -8,11 +8,9 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 
 ### Fixed
 
-- Give explicitly supplied figure captions one presentation owner across writing, inspection and publication. New compositions preserve short image descriptions while assembly inserts the caption; citation handling and export use the same bound text. Historical manuscripts retain their original caption contract.
-- Preserve complete, independently checked revisions as work candidates when required corrections remain. A rejected revision no longer depends on publishing an older draft before professional work can continue; only adopted manuscripts qualify for publication.
-- Share source validation across writing, producer repair and delivery. Complete drafts can supply context for reorganization. A complete section manuscript with a never-dispatched check can continue with inspection alone after its original accounting is verified, without reselection or redrafting. Existing checks, unknown requests and unread attachments retain their recovery limits; failures and usage remain recorded.
-- Share complete provenance records in new feedback and section reviews instead of repeating them per attachment. Coordination receives current findings. Derived delivery hints and the bound manuscript directory no longer masquerade as new evidence scope and force reselection; explicitly added materials still require investigation. Original evidence and frozen historical requests retain their meaning.
-- Bind explicit section structure before writing so templates and final checks use the same outline. Reorganization can retain proven evidence and prior review opinions; equivalent directory paths and exported copies no longer force redundant investigation. Historical structure and recovery contracts remain unchanged.
+- Prepare publication candidates before independent inspection and adoption, continuing the original writing checkpoint. Assembly owns supplied captions; final export checks the same content, template and citation style. Successful preparation is not final delivery.
+- Keep complete rejected drafts as work candidates for revision or reorganization. A never-dispatched inspection can continue after its original accounting is verified, without redrafting. Failures, unknown requests and historical contracts remain protected.
+- Share source, outline and provenance records across writing, repair and delivery. Prior manuscript directories, derived delivery hints and equivalent attachment copies no longer force reselection; explicitly added materials still require investigation.
 
 Full unattended draft, feedback and delivery acceptance remains in progress; this engineering update does not establish general success or lower cost.
 

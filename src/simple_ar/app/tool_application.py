@@ -494,11 +494,20 @@ class ToolApplication:
                 if getattr(self.services, 'search_registry', None) is not None else
                 SearchProviderRegistry()
                 if 'search_registry' in config.get('runtime_dependencies', {}) else None))
+        publication_contract = config.get('publication_preparation')
+        if publication_contract not in {None, 'bound_candidate.v1'}:
+            raise ValueError('Unsupported publication preparation contract')
         self.publication = PublicationToolGateway(controller.store.root, self.workspace, self.ledger,
+            candidate_source=self.writing.preparation_source,
+            owned_execution=publication_contract == 'bound_candidate.v1',
             report_source=(lambda path: self.writing.publication_source(path,
                 self._report_inputs() if self._report_projection()['requirement'] else None,
                 intent=self._report_projection()['intent'], adopted=self._report_projection()['conversion_source']))
                 if config.get('report_protocol') == _REPORT_PROTOCOL else None)
+        if publication_contract == 'bound_candidate.v1':
+            self.writing.publication_inspection = 'prepared_document.v1'
+            self.writing.prepared_publication = lambda ref: self.publication.inspection_source(
+                ref, session_id=controller.manifest.session_id)
         # Contracts and owners enter together; discovery and dispatch consume
         # this same registration, including explicitly selected local packages.
         registry.register_package(source_tool_specs(), self.sources, request_visible=True)
@@ -1433,6 +1442,7 @@ class ToolApplication:
             config['context_protocol'] = context_protocol
         config['producer_completion'] = 'goal_findings.v1'
         config['document_source_contract'] = 'document_source.v1'
+        config['publication_preparation'] = 'bound_candidate.v1'
         session = SessionController.create(root, session_id=root.name, topic=goal,
             registry=CapabilityRegistry(), budget=BudgetState(max_attempts=attempts, max_no_progress=6))
         session.manifest.transition_recipe = cls.RECIPE

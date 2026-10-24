@@ -809,6 +809,9 @@ class WritingCoordinationTests(unittest.TestCase):
         # rejection and replay behavior. Current scoped inspection has its own
         # large-table/candidate-preservation acceptance below.
         app.writing.document_source_contract = None
+        # Preserve this historical unit-binding/recovery contract; the cooperative
+        # publication test owns registered preparation handbacks and physical resume.
+        app.writing.publication_inspection = None
         self.assertEqual(app.state['config']['professional_work'], 'requests.v1')
         self.assertTrue(app.writing.professional_inputs)
         self.assertEqual(app._report_inputs()['evidence_contract'], 'materials.v1')
@@ -2623,6 +2626,254 @@ class WritingCoordinationTests(unittest.TestCase):
                 continued_checked_candidate(current, corrupt)
         self.assertEqual({path: path.read_bytes() for path in prior_bytes}, prior_bytes)
 
+    def test_report_bound_sections_suspend_without_professional_review_override(self):
+        from simple_ar.tools.writing import freeze_report_requirement, material_report_binding
+        from tests.report_review_fixtures import prompt_payload
+
+        root, workspace, writing, source, _, table, client, prompts = self._document_work_fixture()
+        templates = ArtifactStore(root / 'fixture-templates')
+        templates.write_text('sections.md', '# Recorded value and scope\n\n'
+            '## Results\nExplain the saved value.\n\n## Scope\nState the execution limit.\n')
+        templates.write_text('criteria.md', 'Check the saved value and disclose the execution scope.\n')
+        requirement = freeze_report_requirement({'template': str(templates.resolve('sections.md')),
+            'criteria': str(templates.resolve('criteria.md')),
+            'outline_strategy': 'template', 'draft_scope': 'document', 'review_scope': 'document',
+            'reviewer': 'llm', 'document_review': True, 'max_review_iterations': 0,
+            'allow_source_backtracking': False, 'allow_llm_fallback': False,
+            'figures': {'enabled': False}}, method='sections')
+        goal = 'Explain the saved value and execution scope'
+        report = material_report_binding(workspace, requirement, mounts=[str(table)], requests=[goal])
+        writing.report_inputs = lambda: report
+        writing.professional_inputs = True
+        writing.document_source_contract = 'document_source.v1'
+        writing.publication_inspection = 'prepared_document.v1'
+        selection = client.ask_json.side_effect
+
+        def answer(system, prompt, **options):
+            if options['label'].startswith('composition-selection-'):
+                return selection(system, prompt, **options)
+            self.assertEqual(options['label'], 'report-writer-document',
+                             'The report-bound candidate must hand back before inspection')
+            view = prompt_payload(prompt)
+            prompts.append((options['label'], view))
+            return {'sections': [{'section_id': row['section']['section_id'],
+                'draft_markdown': 'The supplied record says value=2.5. No new execution was requested.'}
+                for row in view['sections']]}
+
+        client.ask_json.side_effect = answer
+        result = writing.call('compose_document', {'goal': goal, 'material_roots': [str(source)],
+            'publication': {'compile_pdf': False}}, identity='bound-section-handback')
+        self.assertEqual(result.status, 'ok', result)
+        self.assertEqual(result.data['work_status'], 'awaiting_publication_preparation')
+        self.assertEqual(result.data['publication_stage'], 'records/bound-section-handback/document_work.json')
+        owner = ArtifactStore(root / 'tools/writing/bound-section-handback')
+        binding = owner.read_json('request.json')
+        self.assertEqual(binding['writing_owner'], 'professional_report.v1')
+        self.assertIsNone(binding['request'].get('professional_review'))
+        self.assertEqual(binding['publication_inspection_contract'], 'prepared_document.v1')
+        checkpoint = owner.read_json('writer/sections.json')['completed']
+        self.assertEqual([row['heading'] for row in checkpoint['sections']], ['Results', 'Scope'])
+        self.assertFalse(checkpoint['document_review_done'])
+        stage = json.loads(workspace.resolve(result.data['publication_stage']).read_bytes())
+        self.assertEqual(stage['candidate']['sections'], checkpoint['sections'])
+        self.assertFalse(result.data['adopted'])
+        self._record_native_result(root, 'bound-section-handback', result)
+        action = writing.continuation(result.model_dump(mode='json'), 'bound-section-handback')
+        self.assertIsNotNone(action)
+        self.assertEqual(action['arguments']['candidate_result'], 'records/bound-section-handback/native_result.json')
+        self.assertEqual([label for label, _ in prompts],
+                         ['composition-selection-1', 'composition-selection-2', 'report-writer-document'])
+
+    def test_cooperative_publication_prepares_before_review_and_resumes_same_author(self):
+        import shutil
+        from simple_ar.core.capabilities import AttemptManifest, CapabilityContext
+        from simple_ar.integrations.llm import LLMError
+        from simple_ar.tools.writing import composition_owner
+        from simple_ar.tools.publication import PublicationToolGateway
+        from tests.report_review_fixtures import changed_record
+
+        for outcome in ('reviewed', 'negative', 'stopped'):
+            with self.subTest(outcome=outcome):
+                root, workspace, writing, source, _, table, client, prompts = self._document_work_fixture()
+                writing.client_factory = Mock(wraps=writing.client_factory)
+                writing.document_source_contract = 'document_source.v1'
+                writing.publication_inspection = 'prepared_document.v1'
+                publication = PublicationToolGateway(root, workspace, workspace.ledger,
+                    report_source=lambda path: writing.publication_source(path, None),
+                    candidate_source=writing.preparation_source, owned_execution=True)
+                writing.prepared_publication = lambda ref: publication.inspection_source(ref, session_id='task')
+                arguments = {'goal': 'Explain the saved value and execution scope',
+                    'material_roots': [str(source)], 'professional_review': {'max_revision_rounds': 0},
+                    'publication': {'compile_pdf': False, 'citation_style': 'numeric'}, 'finish': True}
+                first = writing.call('compose_document', arguments, identity='cooperative-author')
+                self.assertEqual(first.status, 'ok', first)
+                self.assertEqual(first.data['work_status'], 'awaiting_publication_preparation')
+                self.assertFalse(first.data['adopted'])
+                self.assertEqual([label for label, _ in prompts],
+                    ['composition-selection-1', 'composition-selection-2', 'composition-article'])
+                self.assertEqual({call.args[0] for call in writing.client_factory.call_args_list},
+                                 {'cooperative-author'})
+                native = self._record_native_result(root, 'cooperative-author', first)
+                observed = first.model_dump(mode='json')
+                action = writing.continuation(observed, 'cooperative-author')
+                self.assertIsNotNone(action)
+                self.assertEqual(action['tool_name'], 'export_report')
+                prepare = action['arguments']
+                self.assertEqual(prepare['candidate_result'], 'records/cooperative-author/native_result.json')
+                self.assertFalse(prepare['compile_pdf'])
+                self.assertIsNone(prepare.get('delivery'))
+                with patch('simple_ar.tools.publication.run_process') as process:
+                    wrong_style = publication.call('export_report', {**prepare, 'citation_style': 'template'},
+                                                   identity='cooperative-wrong-style')
+                self.assertEqual(wrong_style.status, 'error', wrong_style)
+                self.assertIn('Publication options differ', wrong_style.error)
+                process.assert_not_called()
+                owner = ArtifactStore(root / 'tools/writing/cooperative-author')
+                self.assertEqual(first.data['publication_stage'], 'records/cooperative-author/document_work.json')
+                stage_path = workspace.resolve(first.data['publication_stage'])
+                stage = json.loads(stage_path.read_bytes())
+                candidate = workspace.resolve(prepare['markdown'])
+                archive = owner.resolve('publication_checkpoint/' + next(iter(stage['checkpoint_sha256'])))
+                original = {path: path.read_bytes() for path in source.rglob('*') if path.is_file()}
+                original.update({path: path.read_bytes() for path in candidate.parent.rglob('*') if path.is_file()})
+                original.update({path: path.read_bytes() for path in (stage_path, candidate,
+                    native.resolve('native_result.json'), owner.resolve('request.json'),
+                    *owner.resolve('publication_checkpoint').rglob('*.json'))})
+                with self.assertRaisesRegex(ValueError, 'different candidate'):
+                    writing.preparation_source(str(table), prepare['candidate_result'])
+                with self.assertRaisesRegex(ValueError, 'cannot be adopted'):
+                    writing.publication_source(prepare['markdown'], None)
+                for path in (candidate, table, archive):
+                    with self.subTest(changed_handback=path.name), changed_record(path, path.read_bytes() + b' '):
+                        self.assertIsNone(writing.continuation(observed, 'cooperative-author'))
+                        with self.assertRaises(ValueError):
+                            publication.approval_binding(prepare, identity='cooperative-prepared')
+                self.assertEqual(client.ask_json.call_count, 3)
+                if not shutil.which('pandoc'):
+                    self.assertEqual({path: path.read_bytes() for path in original}, original)
+                    return  # Handback checks still run without a renderer.
+
+                context = CapabilityContext(ArtifactStore(root / 'attempts/cooperative-prepared'),
+                    AttemptManifest(attempt_id='cooperative-prepared', capability='native_tool'))
+                self.assertEqual(publication.execute_tool('export_report', context, prepare).status, 'blocked')
+                approval = {'binding': publication.approval_binding(prepare, identity='cooperative-prepared')}
+                prepared = publication.execute_tool('export_report', context, prepare, approval=approval)
+                self.assertEqual(prepared.status, 'ok', prepared)
+                self.assertEqual(prepared.data['candidate_preparation'], {
+                    'source_result': prepare['candidate_result'], 'adopted': False, 'delivery_authority': False})
+                self.assertNotIn('delivery', prepared.data)
+                prepared_native = self._record_native_result(root, 'cooperative-prepared', prepared)
+                prepared_ref = 'records/cooperative-prepared/native_result.json'
+                inspection = writing.prepared_publication(prepared_ref)
+                self.assertFalse(inspection['adopted'])
+                with self.assertRaisesRegex(ValueError, 'cannot satisfy final publication delivery'):
+                    publication.check_report_delivery([prepared.model_dump(mode='json')], inspection['source'],
+                        prepared.artifacts, formats=['tex'], manuscript=prepare['markdown'], proposed=prepare)
+                resume = writing.consume_outcome(prepared.model_dump(mode='json'), prepared_ref)
+                self.assertEqual(resume, {'tool_name': 'compose_document', 'arguments': {'resume_work': prepared_ref}})
+                view_path = workspace.resolve(prepared.data['project']) / 'publication_view.json'
+                for path in (candidate, table, view_path, native.resolve('native_result.json')):
+                    with self.subTest(changed_preparation=path.name), changed_record(path, path.read_bytes() + b' '):
+                        with self.assertRaises(ValueError):
+                            writing.prepared_publication(prepared_ref)
+                # A valid prepared view cannot fork a changed live author checkpoint.
+                live = owner.resolve('writer/' + next(iter(stage['checkpoint_sha256'])))
+                with changed_record(live, live.read_bytes() + b' '):
+                    rejected = writing.call(resume['tool_name'], resume['arguments'], identity='cooperative-bad-resume')
+                    self.assertEqual(rejected.status, 'error', rejected)
+                    self.assertIn('checkpoint already advanced', rejected.error)
+                self.assertEqual(client.ask_json.call_count, 3)
+                original[prepared_native.resolve('native_result.json')] = prepared_native.resolve('native_result.json').read_bytes()
+                regular = client.ask_json.side_effect
+
+                def inspection_answer(system, prompt, **options):
+                    if outcome == 'reviewed' or options['label'] != 'article-independent-review':
+                        return regular(system, prompt, **options)
+                    view = json.loads(prompt)
+                    prompts.append((options['label'], view))
+                    if outcome == 'stopped':
+                        raise LLMError('Inspection transport stopped before a complete response')
+                    return {'section_reviews': [{'section_id': 'document', 'verdict': 'revise_required',
+                        'findings': [{'finding_id': 'clarify-scope', 'type': 'missing_limitation',
+                            'severity': 'major', 'required_action': 'revise', 'message': 'Clarify the scope.',
+                            'draft_quotes': [{'section_id': 'document', 'quote': view['sections'][0]['markdown']}]}]}]}
+
+                client.ask_json.side_effect = inspection_answer
+                bound_clients = writing.client_factory.call_count
+                completed = writing.call(resume['tool_name'], resume['arguments'], identity='cooperative-reviewed')
+                self.assertEqual([call.args[0] for call in writing.client_factory.call_args_list[bound_clients:]],
+                                 ['cooperative-reviewed'])
+                if outcome != 'reviewed':
+                    self.assertEqual(completed.status, 'error' if outcome == 'stopped' else 'ok', completed)
+                    if outcome == 'stopped':
+                        # Recovery can reconstruct this failure before native
+                        # observation persistence, without another inspection.
+                        cached = writing.call(resume['tool_name'], resume['arguments'], identity='cooperative-reviewed')
+                        self.assertEqual(cached, completed)
+                        self.assertEqual(client.ask_json.call_count, 4)
+                    physical = self._record_native_result(root, 'cooperative-reviewed', completed)
+                    reference = 'records/cooperative-reviewed/native_result.json'
+                    stopped = writing.stop_after_review(completed.model_dump(mode='json'), 'cooperative-reviewed')
+                    self.assertIsNotNone(stopped)
+                    self.assertEqual(stopped['stop']['source_result'], reference)
+                    if outcome == 'negative':
+                        self.assertEqual(completed.data['editable_markdown'],
+                                         'workspace/manuscripts/cooperative-author/candidate.md')
+                        self.assertEqual(writing.final_review(completed.data)['review_status'], 'needs_revision')
+                    with changed_record(root / 'tools/writing/cooperative-reviewed/result.json',
+                                        None if outcome == 'stopped' else
+                                        (root / 'tools/writing/cooperative-reviewed/result.json').read_bytes()):
+                        self.assertEqual(composition_owner(root=root, workspace=workspace, session_id='task',
+                            identity='cooperative-reviewed').root, owner.root)
+                        recipe, _, linkage, _ = writing._continued_document_inputs(
+                            ComposeRequest(goal=arguments['goal'], prior_result=reference), 'cooperative-next', None,
+                            inspect_only=False, allow_standalone=True)
+                    self.assertEqual(recipe.prior_result, reference)
+                    self.assertEqual(linkage['owner'], 'cooperative-author')
+                    self.assertEqual(linkage['native_owner'], 'cooperative-reviewed')
+                    self.assertEqual(linkage['result_sha256'], hashlib.sha256(physical.resolve('native_result.json').read_bytes()).hexdigest())
+                    self.assertEqual(client.ask_json.call_count, 4)
+                    self.assertEqual({path: path.read_bytes() for path in original}, original)
+                    continue
+                self.assertEqual(completed.status, 'ok', completed)
+                self.assertFalse(completed.data.get('unresolved'))
+                self.assertEqual(completed.data['editable_markdown'],
+                                 'workspace/manuscripts/cooperative-author/manuscript.md')
+                self.assertEqual(writing.final_review(completed.data)['review_status'], 'reviewed')
+                self.assertEqual([label for label, _ in prompts], ['composition-selection-1',
+                    'composition-selection-2', 'composition-article', 'article-independent-review'])
+                review_view = prompts[-1][1]
+                self.assertEqual(review_view['prepared_publication'], inspection)
+                request_path = owner.resolve('writer/review/request.json')
+                self.assertEqual(json.loads(json.loads(request_path.read_bytes())['prompt'])['prepared_publication'], inspection)
+                self._record_native_result(root, 'cooperative-reviewed', completed)
+                final = writing.continuation(completed.model_dump(mode='json'), 'cooperative-reviewed')
+                self.assertIsNotNone(final)
+                self.assertEqual(final['tool_name'], 'export_report')
+                self.assertFalse(final['arguments'].get('candidate_result'))
+                self.assertEqual(final['arguments']['delivery']['report'], {
+                    'status': 'canonical', 'manuscript': completed.data['editable_markdown']})
+                final_context = CapabilityContext(ArtifactStore(root / 'attempts/cooperative-final'),
+                    AttemptManifest(attempt_id='cooperative-final', capability='native_tool'))
+                stale = workspace.resolve('workspace/document_work/cooperative-author/unrelated/unused.svg', write=True)
+                stale.parent.mkdir(parents=True, exist_ok=True)
+                stale.write_text('<svg xmlns="http://www.w3.org/2000/svg"/>', encoding='utf-8')
+                final_binding = publication.approval_binding(final['arguments'], identity='cooperative-final')
+                self.assertFalse(any('unused.svg' in key for key in final_binding['inputs']))
+                exported = publication.execute_tool(final['tool_name'], final_context, final['arguments'],
+                    approval={'binding': final_binding})
+                self.assertEqual(exported.status, 'ok', exported)
+                self.assertNotIn('candidate_preparation', exported.data)
+                canonical = writing.publication_source(completed.data['editable_markdown'], None)
+                self.assertEqual(exported.data['report_identity'], canonical)
+                self.assertEqual(canonical['prepared_publication'], {key: inspection[key] for key in
+                    ('prepared_result', 'prepared_result_sha256', 'view_path', 'view_sha256')})
+                final_view = workspace.resolve(exported.data['project']) / 'publication_view.json'
+                self.assertEqual(json.loads(final_view.read_bytes()), inspection['view'])
+                self.assertIn('delivery', exported.data)
+                self.assertEqual(client.ask_json.call_count, 4)
+                self.assertEqual({path: path.read_bytes() for path in original}, original)
+
     def test_checked_article_keeps_rejected_author_and_review_before_publication(self):
         root, workspace, writing, source, _, _, client, prompts = self._document_work_fixture()
         writing.document_source_contract = 'document_source.v1'
@@ -2671,6 +2922,30 @@ class WritingCoordinationTests(unittest.TestCase):
         self._record_native_result(root, 'article-negative', first)
         owner = ArtifactStore(root / 'tools/writing/article-negative')
         saved = {path: path.read_bytes() for path in owner.root.rglob('*') if path.is_file()}
+        from pydantic import ValidationError
+        from simple_ar.tools.publication import ExportRequest, PublicationToolGateway
+
+        markdown = first.data['editable_markdown']
+        reference = 'records/article-negative/native_result.json'
+        calls = client.ask_json.call_count
+        identity = writing.preparation_source(markdown, reference)
+        self.assertEqual(identity['kind'], 'publication_candidate')
+        self.assertFalse(identity['adopted'])
+        self.assertEqual(identity['source_result'], reference)
+        native_path = root / 'attempts/article-negative/native_result.json'
+        self.assertEqual(identity['source_result_sha256'], hashlib.sha256(native_path.read_bytes()).hexdigest())
+        with self.assertRaisesRegex(ValidationError, 'no final delivery authority'):
+            ExportRequest.model_validate({'markdown': markdown, 'candidate_result': reference,
+                'delivery': {'summary': 'Deliver candidate'}})
+        with self.assertRaisesRegex(ValueError, 'unresolved writing'):
+            writing.publication_source(markdown, None)
+        publication = PublicationToolGateway(root, workspace, workspace.ledger,
+            candidate_source=writing.preparation_source, owned_execution=True)
+        with self.assertRaisesRegex(ValueError, 'cannot satisfy final publication delivery'):
+            publication.check_report_delivery([], identity, [], formats=['tex'], manuscript=markdown,
+                proposed={'markdown': markdown, 'candidate_result': reference})
+        self.assertEqual(client.ask_json.call_count, calls)
+        self.assertEqual({path: path.read_bytes() for path in saved}, saved)
         accepting = True
         start = len(prompts)
         second = writing.call('compose_document', {'goal': 'Correct the retained execution scope and deliver',

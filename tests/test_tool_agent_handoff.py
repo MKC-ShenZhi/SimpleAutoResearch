@@ -867,7 +867,10 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             manifest = {'status': 'compiled', 'compiled': True}
             write_json(output / 'export.json', manifest)
             return manifest
-        with patch('simple_ar.tools.publication.export_acm_report', side_effect=render):
+        # Isolate historical source/output binding; native approval tests cover
+        # the context-owned execution path without bypassing its attempt gate.
+        with patch('simple_ar.tools.publication.export_acm_report', side_effect=render), \
+                patch.object(app.publication, 'owned_execution', False):
             return self._accepted_report_tool(app, 'export_report', {'markdown': manuscript}, identity)
 
     def _canonical_report_fixture(self, *, requirement=None, formats=None):
@@ -3050,7 +3053,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         image.write_text('<svg xmlns="http://www.w3.org/2000/svg" width="60" height="30"><text x="2" y="20">Plot</text></svg>')
         arguments = {'title': 'Source account', 'figures': [
             {'path': 'workspace/diagram.svg', 'caption': 'Coordinator-invented authoritative caption'}]}
-        produced = self._accepted_report_tool(app, 'compose_document', arguments, 'autonomous-writer')
+        self._accepted_report_tool(app, 'compose_document', arguments, 'autonomous-writer')
         request = app.session.store.read_json('tools/writing/autonomous-writer/request.json')
         self.assertEqual(request['input_contract'], 'owner.v1')
         self.assertEqual(request['request']['goal'], app.state['requests'][0])
@@ -3211,7 +3214,6 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         from simple_ar.core.capabilities import ArtifactStore
         from simple_ar.tools.specs import ToolResult
         from simple_ar.tools.workspace import ReportDelivery
-        from simple_ar.app.tool_application import _FINAL_WORK_TOOLS
         app, fake, _, written = self._canonical_report_fixture(formats=['pdf'])
         fake.ask_json.adapt_article_edits = True
         manuscript = written.data['editable_markdown']
@@ -3231,7 +3233,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         pdf.write_bytes(original_pdf)
         # Every final-work tool, and ordinary delivery, passes the SAME rule at
         # observation binding; unresolved does not waive canonical identities.
-        for name in sorted(_FINAL_WORK_TOOLS | {'deliver_result'}):
+        for name in (spec.name for spec in app.gateway.list_specs()
+                     if (contract := app._completion(spec.name)) is not None and contract.kind == 'delivery'):
             with self.subTest(terminal=name):
                 delivery = {'summary': 'Incomplete report', 'artifacts': [manuscript, 'workspace/unrelated.pdf'],
                     'unresolved': ['Layout not verified'], 'report': claim.model_dump()}
@@ -6377,7 +6380,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 self.assertEqual(restored.ledger.to_dict(), ledger)
 
     def test_native_cached_closing_contract_survives_load_and_supply_without_replay(self) -> None:
-        from simple_ar.integrations.llm import LLMClient, LLMSettings, estimate_tokens
+        from simple_ar.integrations.llm import LLMClient, LLMSettings
 
         for mode in ('required', 'read', 'misordered', 'batch', 'historical_batch', 'terminal', 'terminal_process', 'question', 'false', 'missing_field', 'missing_receipt'):
             with self.subTest(mode=mode):
@@ -6906,7 +6909,6 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
     def test_native_model_continuation_preserves_closed_failure_budget_and_prior_work(self) -> None:
         from contextlib import nullcontext
-        from simple_ar.core.capabilities import ArtifactStore
         from simple_ar.integrations.llm import LLMClient, LLMSettings
         import httpx
 
@@ -7040,7 +7042,6 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         """Use existing history fixtures and real routing/accounting; fake provider IO."""
         import tomllib
         import httpx
-        from simple_ar.core.capabilities import ArtifactStore
         from simple_ar.integrations.llm import LLMClient, LLMSettings
         from simple_ar.integrations.model_profiles import ModelCatalog
 
@@ -9411,7 +9412,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         feedback_owner.resolve('result.json').unlink()
         with patch.object(resumed.writing, 'client_factory',
                           side_effect=AssertionError('Saved feedback must not redraft')):
-            restored = self._compose_document(resumed, {
+            self._compose_document(resumed, {
                 **writing_arguments, 'prior_draft': draft_path,
                 'goal': 'Clarify this previous report using the retained evidence.'}, 'writing-feedback')
         self.assertEqual({name: feedback_owner.resolve(name).read_bytes() for name in retained}, retained)
@@ -13678,7 +13679,7 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
     def test_required_new_files_are_created_by_edit_owner_not_initializer_or_checker(self) -> None:
         from simple_ar.tools.implementation import ImplementationToolGateway
         from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
-        from simple_ar.code_task.runtime.state import code_task_paths, load_code_task_manifest, implementation_file_hashes
+        from simple_ar.code_task.runtime.state import code_task_paths, implementation_file_hashes
         from simple_ar.code_task.execution.runner import run_code_task_benchmark
         from simple_ar.code_task import generate_patch_plan, record_plan_decision
         from simple_ar.code_task.orchestration.verification import verify_implementation

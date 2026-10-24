@@ -589,7 +589,8 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
     pandoc = shutil.which("pandoc")
     if not pandoc:
         raise ReportExportError("Install Pandoc to export a publication project. No model or experiment is required.")
-    source = body_path.read_text(encoding="utf-8")
+    source_bytes = body_path.read_bytes()
+    source = source_bytes.decode('utf-8')
     # Pandoc otherwise expands tabs before parsing literal code. Preserve
     # code bytes here; TeX owns their display width, not source normalization.
     ast = json.loads(run([pandoc, "--preserve-tabs", "--from=markdown-raw_tex-raw_html+tex_math_single_backslash", "--to=json"], cwd=root, text=source))
@@ -618,10 +619,10 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
     # Explicit titles are literal prose, not one unbreakable identifier.
     title_inlines = [{"t": "Space"} if token.isspace() else {"t": "Str", "c": token}
                     for token in re.split(r"(\s+)", title or "") if token]
+    renders_title = not template_files or '$title$' in template_files['template.latex'].read_text(encoding='utf-8')
     if blocks and blocks[0].get("t") == "Header" and blocks[0]["c"][0] == 1:
         # A user template need not render title metadata. Keep the authored
         # heading in that case, just as we retain its authored abstract below.
-        renders_title = not template_files or '$title$' in template_files['template.latex'].read_text(encoding='utf-8')
         header = blocks.pop(0) if renders_title else blocks[0]
         if not title_inlines:
             title_inlines = header["c"][2]
@@ -735,6 +736,23 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
                     node.update(t="Span", c=[node["c"][0], node["c"][1]])
         manifest["external_source_references"] = list(dict.fromkeys(external_sources))
         manifest["external_sources_included"] = False
+        publication_view = {
+            'schema_version': 'publication_view.v1',
+            'input_body_sha256': hashlib.sha256(source_bytes).hexdigest(),
+            'caption_owner': caption_owner,
+            'scope': 'Logical Pandoc document after caption binding and output-local image/link conversion; '
+                     'before TeX-only transformations. No pagination, visual or scientific certification. '
+                     'The source heading is retained; publication title intent is recorded separately.',
+            'title_intent': {'explicit_title': title, 'publication_title': deepcopy(title_inlines),
+                'template_renders_title': renders_title},
+            'image_mapping': {url: {
+                'display': image_targets[url],
+                'files': list(dict.fromkeys([image_targets[url],
+                    f'figures/figure-{index}{path.suffix.lower()}',
+                    *manifest['figure_exports'].get(url, {}).values()]))}
+                for index, (url, path) in enumerate(image_sources.items(), start=1)},
+            'logical_document': source_ast,
+        }
         _prepare_technical_content([title_inlines, blocks, abstract], output)
 
         division = template.get('top_level_division') if template_files else None
@@ -747,6 +765,7 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
         markdown = run([pandoc, "--from=json", "--to=markdown", "--wrap=none"],
                         cwd=output, text=json.dumps(source_ast))
         (output / "source.md").write_text(markdown, encoding="utf-8")
+        publication_view['source_markdown_sha256'] = hashlib.sha256((output / 'source.md').read_bytes()).hexdigest()
         main = (
             "% acmart manuscript demonstration; no conference submission metadata is inferred.\n"
             "\\documentclass[manuscript,screen,nonacm]{acmart}\n"
@@ -835,6 +854,14 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
             text=json.dumps({**ast, 'meta': metadata,
                 'blocks': [{'t': 'RawBlock', 'c': ['latex', r'\input{body.tex}']}]}))
         (output / "main.tex").write_text(main, encoding="utf-8")
+        publication_view['presentation'] = {'citation_style': citation_style,
+            'engine': template.get('engine', 'pdflatex') if template_files else 'pdflatex',
+            'inputs': {key: hashlib.sha256((output/key).read_bytes()).hexdigest() for key in
+                dict.fromkeys(['main.tex', 'body.tex', 'references.bib', 'template.latex', *template_files])}}
+        view_path = output / 'publication_view.json'
+        view_path.write_text(json.dumps(publication_view, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+        manifest['inspection_view'] = {'path': view_path.name,
+            'sha256': hashlib.sha256(view_path.read_bytes()).hexdigest(), 'schema': 'publication_view.v1'}
         readme = (
             "Editable ACM acmart manuscript demonstration, not a conference-specific submission.\n"
             "Edit main.tex/body.tex/references.bib and the figures. The export does not certify research claims.\n"

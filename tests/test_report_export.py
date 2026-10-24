@@ -1126,6 +1126,13 @@ class ReportExportTests(unittest.TestCase):
                     "exports": {"svg": "original.svg"}}]}), encoding="utf-8")
             document = _ast(image="original.png")
             document['blocks'][-1]['c'][0]['c'][1] = [{'t': 'Str', 'c': 'Generic image description'}]
+            # Actual repeated prose is not an adjacent exact caption duplicate.
+            document['blocks'][-1:-1] = [
+                {'t': 'Para', 'c': [{'t': 'Str', 'c': 'Real duplicated discussion.'}]},
+                {'t': 'Para', 'c': [{'t': 'Str', 'c': 'Real duplicated discussion.'}]},
+                {'t': 'Para', 'c': [{'t': 'Code', 'c': [['', [], []], 'literal_identifier']},
+                    {'t': 'Link', 'c': [['', [], []], [{'t': 'Str', 'c': 'Figure download'}], ['original.png', '']]}]},
+            ]
             document['blocks'].append({'t': 'Para', 'c': [{'t': 'Emph', 'c': caption}]})
             document["blocks"].append({"t": "Para", "c": [{"t": "Link", "c": [
                 ["", [], []], [{"t": "Str", "c": "Measured source"}], ["../../experiment/results.json", ""],
@@ -1146,20 +1153,63 @@ class ReportExportTests(unittest.TestCase):
                     self.assertFalse(any(row.get('t') == 'Para' and row.get('c') ==
                         [{'t': 'Emph', 'c': caption}] for row in data['blocks']))
                     self.assertEqual(data["blocks"][-1]["c"][0]["t"], "Span")
-                    return f"![Measured figure]({image})\n"
+                    prose = ' '.join(node['c'] for node in _nodes(data['blocks']) if node.get('t') == 'Str')
+                    return f"{prose}\n![Measured figure]({image})\n"
                 return "converted text"
+            # Hash the original bytes, including CRLF, rather than normalized text.
+            body_path = source / 'report_body.md'
+            body_path.write_bytes(body_path.read_bytes().replace(b'\r\n', b'\n').replace(b'\n', b'\r\n'))
             original_body = (source / 'report_body.md').read_bytes()
-            with patch("simple_ar.report.export.shutil.which", return_value="pandoc"), patch("simple_ar.report.export._run", side_effect=convert):
+            original_inputs = {path: path.read_bytes() for path in (source / 'references.bib',
+                source / 'original.png', source / 'original.svg', source / 'figures/figures_manifest.json')}
+            def assert_view(result, output, owner):
+                receipt = result['inspection_view']
+                raw = (output / receipt['path']).read_bytes()
+                view = json.loads(raw)
+                self.assertEqual(receipt, {'path': 'publication_view.json',
+                    'sha256': hashlib.sha256(raw).hexdigest(), 'schema': 'publication_view.v1'})
+                self.assertEqual(view['schema_version'], receipt['schema'])
+                self.assertEqual(view['input_body_sha256'], hashlib.sha256(original_body).hexdigest())
+                self.assertEqual(view['caption_owner'], owner)
+                self.assertEqual(view['logical_document'], converted_documents[-1][1])
+                self.assertEqual(view['source_markdown_sha256'], hashlib.sha256((output / 'source.md').read_bytes()).hexdigest())
+                nodes = list(_nodes(view['logical_document']))
+                self.assertEqual(sum(node == {'t': 'Str', 'c': 'Real duplicated discussion.'} for node in nodes), 2)
+                self.assertEqual(sum(node == caption[0] for node in nodes), 1)
+                self.assertTrue(any(node.get('t') == 'Code' for node in nodes))
+                self.assertFalse(any(node.get('t') in {'RawInline', 'RawBlock'} for node in nodes))
+                mapping = view['image_mapping']['original.png']
+                self.assertEqual(mapping['display'], 'figures/figure-1.png')
+                self.assertEqual(set(mapping['files']), {'figures/figure-1.png', result['figure_exports']['original.png']['svg']})
+                self.assertTrue(all((output / path).is_file() for path in mapping['files']))
+                self.assertEqual([node['c'][-1][0] for node in nodes if node.get('t') == 'Image'], [mapping['display']])
+                self.assertEqual([node['c'][-1][0] for node in nodes if node.get('t') == 'Link'], [mapping['display']])
+                self.assertIn('Measured source', (output / 'source.md').read_text())
+                self.assertIn('Real duplicated discussion.', (output / 'source.md').read_text())
+                self.assertFalse(result['quality_checked'])
+                self.assertIn('No pagination, visual or scientific certification', view['scope'])
+                return view
+            with patch("simple_ar.report.export.shutil.which", return_value="pandoc"), patch("simple_ar.report.export._run", side_effect=convert) as transport:
                 result = export_acm_report(source, root / "acm")
                 self.assertEqual(result['figure_caption_owner'], 'manifest')
+                self.assertEqual(transport.call_count, 5)
+                view = assert_view(result, root / 'acm', 'manifest')
+                self.assertIsNone(view['title_intent']['explicit_title'])
                 # A later canonical edit must not require editing the recorded
                 # manifest. The same pipeline still exports its vector variant.
                 caption = [{'t': 'Str', 'c': 'Revised canonical comparison.'}]
                 document['blocks'][-3]['c'][0]['c'][1] = caption
                 document['blocks'][-3]['c'][0]['c'][-1][1] = 'fig:'
                 document['blocks'][-2]['c'] = [{'t': 'Emph', 'c': caption}]
-                revised = export_acm_report(source, root / 'canonical', caption_owner='markdown')
+                revised = export_acm_report(source, root / 'canonical', caption_owner='markdown', title='Actual publication title')
                 self.assertEqual(revised['figure_caption_owner'], 'markdown')
+                self.assertEqual(transport.call_count, 10)
+                view = assert_view(revised, root / 'canonical', 'markdown')
+                self.assertEqual(view['title_intent'], {'explicit_title': 'Actual publication title',
+                    'publication_title': [{'t': 'Str', 'c': 'Actual'}, {'t': 'Space'},
+                        {'t': 'Str', 'c': 'publication'}, {'t': 'Space'}, {'t': 'Str', 'c': 'title'}],
+                    'template_renders_title': True})
+                self.assertEqual(view['logical_document']['blocks'][0]['c'][2], [{'t': 'Str', 'c': 'Evidence report'}])
                 self.assertEqual(revised['bound_figure_captions'], [])
                 # Legacy Markdown ownership keeps the authored caption even
                 # when the adjacent manifest still records the old wording.
@@ -1188,6 +1238,7 @@ class ReportExportTests(unittest.TestCase):
                 self.assertFalse((root / 'conflict').exists())
                 manifest_path.write_bytes(original_manifest)
             self.assertEqual((source / 'report_body.md').read_bytes(), original_body)
+            self.assertEqual({path: path.read_bytes() for path in original_inputs}, original_inputs)
             self.assertEqual(result["external_source_references"], ["../../experiment/results.json"])
             self.assertEqual(result['bound_figure_captions'], ['original.png'])
             self.assertFalse(result["external_sources_included"])

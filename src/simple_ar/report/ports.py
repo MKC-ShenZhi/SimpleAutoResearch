@@ -13,6 +13,30 @@ from simple_ar.report.figures import ReportFigureResult, maybe_add_report_figure
 from simple_ar.report.schema import ReportDocumentPlan, ReportFigureConfig
 
 
+class ReportPublicationRequired(Exception):
+    """Suspend inspection until the gateway prepares this exact candidate.
+
+    This is control flow, deliberately outside review/transport error classes.
+    The existing writer checkpoint owns progress; payload owns no new state.
+    """
+
+    def __init__(self, payload: dict):
+        super().__init__('Prepared publication required before document inspection')
+        self.payload = payload
+
+
+def _prepared_publication(publication_view: Callable[[dict], dict], payload: dict) -> dict:
+    """Invoke only the gateway's runtime lookup, never publication or review."""
+    prepared = publication_view(payload)
+    if prepared is None:
+        raise ReportPublicationRequired(payload)
+    if (not isinstance(prepared, dict)
+            or prepared.get('contract') != 'prepared_publication.v1'
+            or not isinstance(prepared.get('view'), dict)):
+        raise TypeError('Publication lookup must return a verified prepared_publication.v1 payload')
+    return prepared
+
+
 @runtime_checkable
 class FigureRenderer(Protocol):
     """Render optional figures into the citation-key body, before references."""
@@ -63,4 +87,4 @@ class DeterministicFigureRenderer:
         )
 
 
-__all__ = ["DeterministicFigureRenderer", "FigureRenderer"]
+__all__ = ["DeterministicFigureRenderer", "FigureRenderer", "ReportPublicationRequired"]

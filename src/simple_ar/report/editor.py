@@ -410,6 +410,15 @@ def _opinion_to_check(finding: ReviewerFinding, handle: str) -> dict[str, Any]:
     return view
 
 
+PREPARED_PUBLICATION_FOCUS = (
+    'Judge presentation, headings, captions, tables, figures and references from '
+    'prepared_publication.view, the actual prepared publication AST metadata. '
+    'Raw section prose supplies author-edit anchors and factual claim text; it is not '
+    'the rendered presentation. Preserve every supported finding, including minor ones. '
+    'The prepared view does not certify visual review, adoption or factual correctness.'
+)
+
+
 def review_document(
     *, client: Any, template: ReportTemplateBundle, memory: ReportMemory,
     sections: list[ReportSectionDraft], config: ReportRuntimeConfig,
@@ -435,6 +444,7 @@ def review_document(
     delivery_assembly: dict[str, Any] | None = None,
     on_delivery_review: Callable[[dict[str, Any]], None] | None = None,
     label: str = "report-document-reviewer",
+    prepared_publication: dict[str, Any] | None = None,
 ) -> list[ReportSectionReview]:
     """Inspect current prose; correct one complete rejected answer under contract.
 
@@ -814,6 +824,17 @@ def review_document(
         'disclosure required for accepted_limitation. Literal {section_id, quote} remains '
         'supported with exact matching. Never mix paragraph with quote or other selectors. '
         'Do not infer absent text, use prior-draft IDs, or treat selection as semantic proof.')
+    if prepared_publication is None:
+        retained_publication = getattr(client, 'prepared_publication_for_review', None)
+        if callable(retained_publication):
+            prepared_publication = retained_publication(view, label)
+    if prepared_publication is not None:
+        if (not isinstance(prepared_publication, dict)
+                or prepared_publication.get('contract') != 'prepared_publication.v1'
+                or not isinstance(prepared_publication.get('view'), dict)):
+            raise ValueError('Document inspection requires the verified prepared publication view')
+        view['prepared_publication'] = prepared_publication
+        view['focus'].append(PREPARED_PUBLICATION_FOCUS)
     base_prompt = json.dumps(view, ensure_ascii=False, separators=(",", ":"))
     prompt_limit = config.max_document_review_prompt_chars
     if prompt_limit and len(base_prompt) > prompt_limit:
@@ -876,6 +897,7 @@ def review_document(
                 assembly_owned_content=assembly_owned_content,
                 delivery_text_observation=delivery_text_observation, delivery_review=delivery_review,
                 delivery_assembly=delivery_assembly, on_delivery_review=on_delivery_review,
+                prepared_publication=prepared_publication,
                 label=label + "-format-correction")
         raise
     # Only a complete validated current-candidate judgment can carry delivery
