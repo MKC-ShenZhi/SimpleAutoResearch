@@ -451,7 +451,7 @@ def delivery_issues(owner: Any, observations: list[dict], *, delivery: dict | No
             # by omitting the report. Only explicit targets at the same bytes
             # carry this obligation; notes and evidence quotes do not accuse files.
             try:
-                from simple_ar.tools.implementation_work import _independent_delivery_review
+                from simple_ar.report.writing import validate_document_inspection
                 from simple_ar.tools.writing import WritingToolGateway
                 delivered = owner.workspace.resolve_delivery(DeliveryRequest.model_validate(delivery))['artifacts']
                 hashes = owner.workspace.artifact_hashes(delivered)
@@ -470,7 +470,7 @@ def delivery_issues(owner: Any, observations: list[dict], *, delivery: dict | No
                         if key not in {'arguments', 'record', 'current_request'}}, identity)
                     if store.read_json('result.json')['data'] != data:
                         raise ValueError('Retained attachment findings differ from the accepted composition')
-                    _independent_delivery_review(store, store.read_json('request.json'), data,
+                    validate_document_inspection(store, store.read_json('request.json'), data,
                         review_result=WritingToolGateway.final_review(owner, data))
                     return ['Delivered attachment bytes retain an independently evidenced required finding; '
                         'repair and inspect the actual candidate, or disclose partial delivery']

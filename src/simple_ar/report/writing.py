@@ -1326,14 +1326,114 @@ def retained_article_candidate(owner: ArtifactStore, binding: dict[str, Any], *,
         'body_sha256': hashlib.sha256(body.encode('utf-8')).hexdigest()}
 
 
+def validate_document_inspection(store: ArtifactStore, binding: dict, data: dict,
+                                 *, review_result: dict, reviewed_sections: list[dict] | None = None) -> None:
+    """Revalidate retained reviewer responses/anchors without a client or writes."""
+    import json
+    from simple_ar.integrations.llm import LLMError
+    from simple_ar.report.editor import replay_document_reviews
+    from simple_ar.report.review_evidence import (DELIVERY_REVIEW_CONTRACT,
+        declaration_adoption_contract, delivery_review_result, restore_delivery_producers)
+    from simple_ar.report.schema import ReportSectionDraft
+
+    snapshot = binding['delivery_review']
+    if snapshot.get('contract') != DELIVERY_REVIEW_CONTRACT:
+        raise ValueError('Unknown independent delivery inspection contract')
+    def matches(review: ArtifactStore) -> bool:
+        request = review.read_json('request.json')
+        if not (request.get('response_record_contract') in {'atomic_complete.v1', 'atomic_complete.v2'}
+                or request.get('format_correction_contract')):
+            return False  # Old unbound responses do not acquire stronger authority.
+        try:
+            view = json.loads(request['prompt'])
+            if ('required_figures' in snapshot and view.get('delivery_text_observation', {}).get(
+                    'required_figures') != snapshot['required_figures']):
+                return False
+            if reviewed_sections is not None and [{key: row[key] for key in (
+                    'section_id', 'heading', 'markdown')} for row in view.get('sections', [])] != [
+                    {'section_id': row['section_id'], 'heading': row['heading'],
+                     'markdown': row['draft_markdown']} for row in reviewed_sections]:
+                return False
+            if (view.get('task') != 'review_document_coherence'
+                    or view.get('delivery_review_contract') != DELIVERY_REVIEW_CONTRACT
+                    or restore_delivery_producers(view) != snapshot['artifacts']
+                    or view.get('producer_declarations') != snapshot.get('producer_declarations')
+                    or view.get('producer_completion') != snapshot.get('producer_completion')
+                    or view.get('producer_notes') != snapshot.get('producer_notes')):
+                return False
+            if ('producer_declarations' in snapshot and view.get('declaration_adoption_contract')
+                    != declaration_adoption_contract(snapshot)):
+                return False  # Never reinterpret a retained review under another adoption contract.
+            response = _retained_response(review, 'request.json', request)
+            if 'inspection_payload_sha256' in review_result:
+                actual = {name: hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False,
+                    separators=(',', ':'), allow_nan=False).encode('utf-8')).hexdigest()
+                    for name, value in (('request', view), ('response', response))}
+                if review_result['inspection_payload_sha256'] != actual:
+                    return False
+            sections = [ReportSectionDraft(section_id=row['section_id'], heading=row['heading'],
+                draft_markdown=row['markdown']) for row in view['sections']]
+            validated = replay_document_reviews(response, sections=sections, evidence_view=view)
+            if ('inspection_payload_sha256' in review_result
+                    and review_result.get('section_reviews') != [row.model_dump(mode='json') for row in validated]):
+                return False
+            return delivery_review_result(snapshot, validated) == data['delivery_review']
+        except LLMError as exc:
+            raise ValueError('Independent delivery response is incomplete or invalid') from exc
+
+    final_review = review_result
+    if 'inspection_source' in final_review:
+        # The writing producer selects the actual final inspection, including a
+        # rejected revision or its format correction. Never guess a revision
+        # number, search directories, or fall back from a broken explicit proof.
+        source = final_review['inspection_source']
+        if not isinstance(source, dict) or set(source) != {
+                'request_path', 'request_sha256', 'response_path', 'response_sha256'}:
+            raise ValueError('Invalid independent inspection source binding')
+        paths = {}
+        for name in ('request', 'response'):
+            locator = source[f'{name}_path']
+            if not isinstance(locator, str) or not locator:
+                raise ValueError('Invalid independent inspection source path')
+            path = (store.root / locator).resolve()
+            if (not path.is_relative_to(store.root.resolve()) or path.name != f'{name}.json'
+                    or not path.is_file()
+                    or hashlib.sha256(path.read_bytes()).hexdigest() != source[f'{name}_sha256']):
+                raise ValueError('Independent inspection source escaped its owner or changed bytes')
+            paths[name] = path
+        if paths['request'].parent != paths['response'].parent:
+            raise ValueError('Independent inspection request and response have different producers')
+        if matches(ArtifactStore(paths['request'].parent)):
+            return
+        raise ValueError('Delivery defects differ from the explicitly bound independent inspection')
+
+    # Historical receipts did not select an inspection explicitly. Retain only
+    # their original two fixed producers; do not discover revision directories.
+    for location in ('writer/review', 'delivery-review'):
+        review = ArtifactStore(store.root / location)
+        if not review.exists('request.json'):
+            continue
+        if review.exists('format_correction/request.json'):
+            review = ArtifactStore(review.root / 'format_correction')
+        if matches(review):
+            return
+    raise ValueError('Delivery defects lack a matching complete independent review receipt')
+
+
+
 def retained_section_candidate(source: dict[str, Any], *, _seen: frozenset[Path] = frozenset()) -> dict[str, Any]:
     """Prove complete saved author text without reusing a review or calling a model.
 
     The gateway owns task/read authority. This port pins its exact saved owner
     records, including complete atomic model replies; it never follows arbitrary
     draft references or treats inspection failure as successful publication.
+    Optional checked_revision exposes only the original independent_review and
+    revision_iteration; physical receipt validation remains the consumer's job.
     """
-    from simple_ar.report.agent import _last_section_proposal, _parse_section_draft, _draft_sequence
+    from simple_ar.report.agent import (
+        _last_section_proposal, _parse_section_draft, _draft_sequence,
+        _final_sequence, _section_delivery_assembly, _matching_section_delivery_review,
+    )
     from simple_ar.report.schema import ReportSectionDraft, ReportIterationRecord
     from simple_ar.integrations.llm import LLMResponseError
     if (not isinstance(source, dict) or set(source) != {'contract', 'owner', 'sha256'}
@@ -1419,7 +1519,7 @@ def retained_section_candidate(source: dict[str, Any], *, _seen: frozenset[Path]
     if not plans or len(plans) != len(memory.section_plan):
         raise ValueError('Retained candidate requires one unambiguous complete section plan')
     sections = [ReportSectionDraft.model_validate(row) for row in written['sections']]
-    proposal, event, _ = _last_section_proposal([
+    proposal, event, verification = _last_section_proposal([
         ReportIterationRecord.model_validate(row) for row in written.get('iterations', [])])
     if event is not None and event.adopted is not True and proposal:
         sections = proposal
@@ -1484,8 +1584,39 @@ def retained_section_candidate(source: dict[str, Any], *, _seen: frozenset[Path]
         authored.update(parsed)
     if any((row.section_id, row.draft_markdown) not in authored for row in sections):
         raise ValueError('Retained candidate body has no matching complete author response')
-    return {'sections': [row.model_dump(mode='json') for row in sections],
+    result = {'sections': [row.model_dump(mode='json') for row in sections],
         'memory': memory.model_dump(mode='json')}
+    # A diagnostic of the saved negative inspection, never adoption authority.
+    # Consumers still verify its physical request/response against these sections.
+    if (event is not None and event.adopted is False and event.status == 'rejected'
+            and event.drafts and verification is not None
+            and verification.status in {'completed', 'failed'}
+            and verification.independent_review
+            and 'section_delivery_review' in inputs['context'].get('results', {})):
+        reviews = verification.section_reviews
+        if (len(reviews) == len(sections) and {row.section_id for row in reviews} == set(plans)
+                and not any(row.context_requests for row in reviews)):
+            from simple_ar.report.review_evidence import delivery_review_result
+            context = ReportContext.model_validate(inputs['context'])
+            config = ReportRuntimeConfig.model_validate(inputs['config'])
+            candidate = _section_delivery_assembly(context, memory,
+                _final_sequence(memory.section_plan, sections), config)
+            adopted = _section_delivery_assembly(context, memory,
+                _final_sequence(memory.section_plan,
+                    [ReportSectionDraft.model_validate(row) for row in written['sections']]), config)
+            review = _matching_section_delivery_review([verification], candidate['identity'])
+            if (candidate['identity']['body_sha256'] != adopted['identity']['body_sha256']
+                    and review and review.get('review_status') == 'needs_revision'
+                    and review.get('section_reviews') == [row.model_dump(mode='json') for row in reviews]
+                    and set(review.get('inspection_source') or {}) == {
+                        'request_path', 'request_sha256', 'response_path', 'response_sha256'}
+                    and set(review.get('inspection_payload_sha256') or {}) == {'request', 'response'}
+                    and review.get('delivery_review', {}).get('status') in {'reviewed', 'needs_revision'}
+                    and not review['delivery_review'].get('uninspected')
+                    and review['delivery_review'] == delivery_review_result(context.results['delivery_review'], reviews)):
+                result['checked_revision'] = {'independent_review': verification.independent_review,
+                    'revision_iteration': event.iteration}
+    return result
 
 
 def write_section_article(*, store: ArtifactStore, input_store: ArtifactStore,

@@ -19,6 +19,7 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 - The experimental UI shares configuration preview, material authorization and stop/resume behavior. Complete research interaction remains under acceptance.
 - Multiple attachments from one execution share a complete version check within each inspection, avoiding repeated traversal; new inspections still reject changed inputs and outputs.
 - Separate complete attachment retention from bounded inspection in new document work. Larger supported tables use version-bound reader profiles, with explicit coverage limits; unread files retain gaps without discarding the draft. Proven defects still reach their original producer.
+- Continue complete checked revisions without returning to an older draft or repeating material selection. Required findings remain blocking; a proved professional handback can return to coordination without a quota refill. Document-inspection receipt validation now belongs to the report layer.
 
 ### Fixed
 

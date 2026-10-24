@@ -1586,7 +1586,7 @@ class JointRevisionTests(unittest.TestCase):
         # and downstream proof consumer together, using the same section case.
         with self.subTest(transport='atomic_complete.v2'), tempfile.TemporaryDirectory() as tmp:
             from simple_ar.report.writing import retained_writing_client, completed_composition_writer
-            from simple_ar.tools.implementation_work import _independent_delivery_review
+            from simple_ar.report.writing import validate_document_inspection
 
             owner = ArtifactStore(Path(tmp))
             writer = ArtifactStore(owner.root / 'writer')
@@ -1612,7 +1612,7 @@ class JointRevisionTests(unittest.TestCase):
             self.assertFalse(Path(source['request_path']).is_absolute())
             transport_request = owner.read_json(source['request_path'])
             self.assertEqual(transport_request['response_record_contract'], 'atomic_complete.v2')
-            _independent_delivery_review(owner,
+            validate_document_inspection(owner,
                 {'delivery_review': kwargs['context'].results['delivery_review']},
                 {'delivery_review': review['delivery_review']}, review_result=review)
             before = list(labels)
@@ -1626,7 +1626,7 @@ class JointRevisionTests(unittest.TestCase):
             self.assertEqual(replayed.status, 'completed', replayed.diagnostics)
             self.assertEqual(writer.read_json(produced)['independent_review'], review)
             self.assertEqual(labels, before)
-            _independent_delivery_review(owner,
+            validate_document_inspection(owner,
                 {'delivery_review': kwargs['context'].results['delivery_review']},
                 {'delivery_review': review['delivery_review']}, review_result=review)
             frozen = writer.read_json('report_inputs.json')

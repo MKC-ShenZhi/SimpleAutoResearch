@@ -1286,7 +1286,7 @@ class ImplementationDecisionTests(unittest.TestCase):
         from simple_ar.report.review_evidence import DELIVERY_REVIEW_CONTRACT, delivery_review_result
         from simple_ar.report.schema import ReportSectionReview
         from simple_ar.report.writing import _retained_response
-        from simple_ar.tools.implementation_work import _independent_delivery_review
+        from simple_ar.report.writing import validate_document_inspection
 
         store = ArtifactStore(self.base / 'writing')
         snapshot = {'contract': DELIVERY_REVIEW_CONTRACT, 'artifacts': []}
@@ -1308,16 +1308,16 @@ class ImplementationDecisionTests(unittest.TestCase):
         data = {'delivery_review': delivery_review_result(snapshot,
             [ReportSectionReview.model_validate(response['section_reviews'][0])])}
         review = {'inspection_source': source}
-        _independent_delivery_review(store, {'delivery_review': snapshot}, data, review_result=review)
+        validate_document_inspection(store, {'delivery_review': snapshot}, data, review_result=review)
         source['response_sha256'] = '0' * 64
         with self.assertRaisesRegex(ValueError, 'changed bytes'):
-            _independent_delivery_review(store, {'delivery_review': snapshot}, data, review_result=review)
+            validate_document_inspection(store, {'delivery_review': snapshot}, data, review_result=review)
         # Even matching file hashes cannot elevate a broken atomic completion.
         receipt.write_json('response.json', {'response': response,
             'request_sha256': '0' * 64, 'response_sha256': '0' * 64})
         source['response_sha256'] = hashlib.sha256(receipt.resolve('response.json').read_bytes()).hexdigest()
         with self.assertRaisesRegex(ValueError, 'complete bound record'):
-            _independent_delivery_review(store, {'delivery_review': snapshot}, data, review_result=review)
+            validate_document_inspection(store, {'delivery_review': snapshot}, data, review_result=review)
 
 
 if __name__ == '__main__':

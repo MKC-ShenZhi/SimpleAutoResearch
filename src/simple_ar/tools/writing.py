@@ -195,7 +195,7 @@ class DocumentWorkRequest(BaseModel):
         description='Authorized material directories; the professional owner investigates and selects necessary evidence and attachments. Omit to use supplied roots or valid prior inputs.')
     prior_draft: str = Field(default='', description='Existing canonical manuscript to revise; valid evidence and materials are reused, not inferred from its prose.')
     prior_result: str = Field(default='', max_length=1000, exclude_if=lambda value: not value,
-        description='Continue a same-task compose_document result after an incomplete inspection, using its complete saved article/section author or unadopted complete article revision. The owner proves and reuses its exact evidence and candidate, checks it first, and makes bounded corrections if required. No new investigation, scientific rerun, inherited acceptance or budget reset. Do not combine with a separately selected draft or material recipe.')
+        description='Continue a same-task compose_document result after an incomplete inspection, using its complete saved article/section author or an independently checked but unadopted complete article/section revision. The owner proves and reuses its exact evidence and candidate, checks it first, and makes bounded corrections if required. Required findings stay unresolved until checked corrections succeed. No new investigation, scientific rerun, inherited acceptance or budget reset. Do not combine with a separately selected draft or material recipe.')
     target_words: int = Field(default=0, ge=0, le=20000)
     writing_method: Literal['article', 'sections'] | None = Field(default=None,
         exclude_if=lambda value: value is None,
@@ -663,8 +663,12 @@ class WritingToolGateway:
                 feedback_requested = work_source['intent']['goal'] not in {'', original_goal}
                 if isinstance(report, dict) and isinstance(previous_report, dict):
                     feedback_requested = feedback_requested or report.get('requests') != previous_report.get('requests')
+                checked_section_revision = (not interrupted and method == 'sections' and not feedback_requested
+                    and bool(data.get('unresolved'))
+                    and self._section_author_source(parent)[1].get('checked_revision') is not None)
                 if interrupted or (method in {'article', 'sections'}
-                        and (self.root / 'attempts' / parent_id / 'native_result.json').exists() and not data.get('unresolved')
+                        and (self.root / 'attempts' / parent_id / 'native_result.json').exists()
+                        and (not data.get('unresolved') or checked_section_revision)
                         and not feedback_requested):
                     continued = request.model_copy(update={'prior_result': f'records/{parent_id}/native_result.json',
                         'prior_draft': '', 'material_roots': [], 'reuse_prior_inputs': False})
@@ -815,6 +819,30 @@ class WritingToolGateway:
                 raise ValueError('Prior draft prose cannot be reused as primary material evidence')
         return resolved
 
+    @staticmethod
+    def _section_author_source(store: ArtifactStore) -> tuple[dict, dict]:
+        """Bind the existing author/checkpoint port once for both consumers."""
+        from simple_ar.report.writing import retained_section_candidate
+        names = ['request.json', 'documents.json', 'writer/report_inputs.json',
+            'writer/sections.json', 'writer/writer.json']
+        names.extend(file.relative_to(store.root).as_posix()
+            for file in (store.root / 'writer/model_calls').rglob('*.json'))
+        source = {'contract': 'retained_sections.v1', 'owner': str(store.root.resolve()),
+            'sha256': {name: hashlib.sha256(store.resolve(name).read_bytes()).hexdigest() for name in names}}
+        candidate = retained_section_candidate(source)
+        if candidate.get('checked_revision') is not None:
+            from simple_ar.report.agent import _final_sequence
+            from simple_ar.report.schema import ReportMemory, ReportSectionDraft
+            from simple_ar.report.writing import validate_document_inspection
+            candidate['sections'] = [row.model_dump(mode='json') for row in _final_sequence(
+                ReportMemory.model_validate(candidate['memory']).section_plan,
+                [ReportSectionDraft.model_validate(row) for row in candidate['sections']])]
+            review = candidate['checked_revision']['independent_review']
+            validate_document_inspection(store, store.read_json('request.json'),
+                {'delivery_review': review['delivery_review']}, review_result=review,
+                reviewed_sections=candidate['sections'])
+        return source, candidate
+
     def _continued_document_inputs(self, request: ComposeRequest, identity: str,
                                   requirement: dict | None, *,
                                   inspect_only: bool = True, allow_completed: bool = False,
@@ -826,7 +854,7 @@ class WritingToolGateway:
         recipe and current permissions/bytes before any paid work. Nothing is
         written into or silently adopted from the stopped owner.
         """
-        from simple_ar.report.writing import retained_section_candidate, retained_article_candidate
+        from simple_ar.report.writing import retained_article_candidate
         value = request.prior_result
         # Native receipts use task-relative ArtifactRefs; tools also expose the
         # read-only records mount. Resolve both through the same access gate.
@@ -852,26 +880,25 @@ class WritingToolGateway:
         method = binding.get('report_binding', {}).get('requirement', {}).get('method')
         if standalone:
             method = 'sections' if binding['writing_owner'] == SECTION_ARTICLE_OWNER else 'article'
+        section_candidate = None
         if method == 'article':
             source = retained_article_candidate(store, binding, **({'allow_standalone': True} if standalone else {}))
             names = ['request.json', 'documents.json', *(file.relative_to(store.root).as_posix()
                 for file in (store.root / 'writer').rglob('*.json'))]
             candidate_contract = 'retained_article_author.v1'
         elif method == 'sections':
-            names = ['request.json', 'documents.json', 'writer/report_inputs.json', 'writer/sections.json', 'writer/writer.json']
-            names.extend(file.relative_to(store.root).as_posix()
-                for file in (store.root / 'writer/model_calls').rglob('*.json'))
-            source = {'contract': 'retained_sections.v1', 'owner': str(store.root.resolve()),
-                'sha256': {name: hashlib.sha256(store.resolve(name).read_bytes()).hexdigest() for name in names}}
-            retained_section_candidate(source)
+            source, section_candidate = self._section_author_source(store)
+            names = list(source['sha256'])
             candidate_contract = source['contract']
         else:
             raise ValueError('Stopped composition has no supported author owner')
         failed_author = (observed.get('status') == 'error' and observed.get('error')
             and observed.get('data', {}).get('incomplete'))
-        pending_author = (method == 'article' and observed.get('status') == 'ok'
-            and observed.get('data', {}).get('unresolved')
-            and Path(source['path']).parent != store.root / 'writer')
+        checked_revision = (section_candidate or {}).get('checked_revision')
+        pending_author = (observed.get('status') == 'ok' and (
+            method == 'article' and observed.get('data', {}).get('unresolved')
+                and Path(source['path']).parent != store.root / 'writer'
+            or method == 'sections' and checked_revision is not None))
         completed_author = allow_completed and observed.get('status') == 'ok' and not observed.get('data', {}).get('unresolved')
         if not failed_author and not pending_author and not completed_author:
             raise ValueError('prior_result requires retained failed author work or an unadopted complete revision; '
@@ -1051,10 +1078,10 @@ class WritingToolGateway:
         if (review.get('review_status') != 'needs_revision'
                 or self._review_needs_material_work(review)):
             return None
-        from simple_ar.tools.implementation_work import _independent_delivery_review
+        from simple_ar.report.writing import validate_document_inspection
         self._check_input_bytes(data['inputs'])
         self._check_document_copy_review(data)
-        _independent_delivery_review(store, binding, data, review_result=review)
+        validate_document_inspection(store, binding, data, review_result=review)
         review_path = self.workspace.resolve(data['review_path'])
         return {'contract': 'prior_prose_review.v1', 'requested_roots': request.material_roots,
             'path': str(review_path), 'sha256': hashlib.sha256(review_path.read_bytes()).hexdigest(),
@@ -1095,6 +1122,24 @@ class WritingToolGateway:
             'mechanical_constraints', 'independent_review', 'delivery',
             'delivery_review',
             'incomplete', 'failure_kind', 'next_action', 'retained_candidate', 'pending_candidate') if key in data}
+        if (match and result.status == 'ok' and data.get('unresolved')
+                and 'retained_candidate' not in visible
+                and (self.root / 'attempts' / match[1] / 'native_result.json').is_file()):
+            try:
+                store, binding, _ = self._composition_receipt(match[1], result.model_dump(mode='json'))
+                if binding.get('section_delivery_review_contract'):
+                    _, candidate = self._section_author_source(store)
+                    if checked := candidate.get('checked_revision'):
+                        visible['retained_candidate'] = {
+                            'status': 'checked_not_adopted', 'adopted': False,
+                            'prior_result': f'records/{match[1]}/native_result.json',
+                            'revision_iteration': checked['revision_iteration'],
+                            'review_status': 'needs_revision',
+                            'scope': 'Complete changed author body with a retained negative inspection; '
+                                'continue through prior_result without selecting or redrafting its original. '
+                                'Required findings remain unresolved; this is not accepted delivery.'}
+            except (OSError, ValueError, KeyError, TypeError):
+                pass  # Invalid or incomplete work gains no continuation claim.
         inspection = data.get('delivery_review')
         if isinstance(inspection, dict) and inspection.get('contract') == 'delivery_artifacts.v1':
             # Execution graphs and full producer inputs remain in the receipt.
@@ -1192,9 +1237,9 @@ class WritingToolGateway:
                 if binding['request'].get('finish'):
                     # Inspect the actual retained independent response, not a
                     # status flag, before expressing this unit's final delivery.
-                    from simple_ar.tools.implementation_work import _independent_delivery_review
+                    from simple_ar.report.writing import validate_document_inspection
                     self.check_delivery(data)
-                    _independent_delivery_review(store, binding, data, review_result=review)
+                    validate_document_inspection(store, binding, data, review_result=review)
                     if data.get('document_work') != binding['document_work']:
                         return None
                     for row in binding['document_work']['materials']:
@@ -1257,18 +1302,26 @@ class WritingToolGateway:
             review = self.repair_review(data)
             if review.get('review_status') != 'needs_revision':
                 return False
+            candidate = self.repair_candidate(data)
+            checked_revision = False
             if binding.get('section_delivery_review_contract') and not self._review_needs_material_work(review):
-                # This owner already inspected the complete delivery and spent
-                # its correction allowance. A new compose identity is not a new
-                # user scope or permission to repeat the same editorial work.
-                return False
+                # A consumed local correction is not a failed investigation.
+                # Return only real progress with its complete negative proof,
+                # never an unchanged draft or an unchecked/unknown response.
+                _, authored = self._section_author_source(store)
+                checked = authored.get('checked_revision')
+                if checked is None:
+                    return False
+                review = checked['independent_review']
+                candidate = authored
+                checked_revision = True
             self._check_input_bytes(data['inputs'])
             self._check_document_copy_review(data)
-            from simple_ar.tools.implementation_work import _independent_delivery_review
-            candidate = self.repair_candidate(data)
-            _independent_delivery_review(store, binding, {**data,
-                'delivery_review': review['delivery_review']}, review_result=review,
-                reviewed_sections=candidate['sections'] if candidate else None)
+            from simple_ar.report.writing import validate_document_inspection
+            if not checked_revision:
+                validate_document_inspection(store, binding, {**data,
+                    'delivery_review': review['delivery_review']}, review_result=review,
+                    reviewed_sections=candidate['sections'] if candidate else None)
             return True
         except (OSError, ValueError, KeyError, TypeError):
             return False
@@ -1448,8 +1501,8 @@ class WritingToolGateway:
             review = self.final_review(data)
             if review.get('review_status') != 'reviewed' or data.get('unresolved') or data.get('incomplete'):
                 raise ValueError('Goal/findings delivery requires a current completed independent review')
-            from simple_ar.tools.implementation_work import _independent_delivery_review
-            _independent_delivery_review(ArtifactStore(self.root / 'tools/writing' / identity),
+            from simple_ar.report.writing import validate_document_inspection
+            validate_document_inspection(ArtifactStore(self.root / 'tools/writing' / identity),
                 binding, data, review_result=review)
         self._check_input_bytes(data['inputs'])
         self._check_document_copy_review(data)

@@ -1136,7 +1136,7 @@ class WritingCoordinationTests(unittest.TestCase):
             'status': 'needs_revision', 'defects': [], 'uninspected': [],
             'declaration_adoption': {'contract': CLAIM_ADOPTION_V2}}}
         with patch.object(app.writing, 'final_review', return_value=disclosure), patch(
-                'simple_ar.tools.implementation_work._independent_delivery_review'):
+                'simple_ar.report.writing.validate_document_inspection'):
             self.assertIsNotNone(app.writing._document_revision_feedback(request, current))
             for field in ('defects', 'uninspected'):
                 with self.subTest(blocking_attachment=field):
@@ -2081,7 +2081,7 @@ class WritingCoordinationTests(unittest.TestCase):
         self.assertEqual(first.status, 'ok', first)
         self.assertEqual(first.data['delivery_review']['status'], 'needs_revision')
         self.assertTrue(writing.can_return_gap(first.model_dump(mode='json'), 'copy-defect-first'))
-        with patch('simple_ar.tools.implementation_work._independent_delivery_review',
+        with patch('simple_ar.report.writing.validate_document_inspection',
                 side_effect=ValueError('Incomplete original response')):
             self.assertFalse(writing.can_return_gap(first.model_dump(mode='json'), 'copy-defect-first'))
         original_defect, = first.data['delivery_review']['defects']
@@ -2238,6 +2238,83 @@ class WritingCoordinationTests(unittest.TestCase):
         self.assertEqual([label for label, _ in prompts[before:]], ['report-document-reviewer'],
             'A complete section candidate needs its new inspection, not selection or redrafting')
         self.assertIsNotNone(writing.continuation(checked.model_dump(mode='json'), 'section-rechecked'))
+
+    def test_checked_section_revision_continues_as_work_without_waiving_its_findings(self):
+        from tests.report_review_fixtures import prompt_payload
+        root, workspace, writing, source, _, _, client, prompts = self._document_work_fixture()
+        writing.document_source_contract = 'document_source.v1'
+        select = client.ask_json.side_effect
+        continuing = False
+        old_scope = 'Ambiguous scope.'
+        revised_scope = 'This is a saved record. No new execution was requested.'
+        final_scope = 'The supplied record was analyzed without a new experiment.'
+
+        def answer(system, prompt, **options):
+            label = options['label']
+            if label.startswith('composition-selection-'):
+                self.assertFalse(continuing, 'Continue the proven recipe without investigating again')
+                return select(system, prompt, **options)
+            view = prompt_payload(prompt)
+            prompts.append((label, view))
+            if label.startswith('report-writer-'):
+                self.assertFalse(continuing, 'A complete improved author body must not be redrafted')
+                rows = view['sections'] if 'sections' in view else [{'section': view['section']}]
+                drafted = [{'section_id': row['section']['section_id'],
+                    'draft_markdown': 'The supplied record says value=2.5.'
+                        if row['section']['heading'] == 'Results' else old_scope}
+                    for row in rows]
+                return {'sections': drafted} if 'sections' in view else drafted[0]
+            if label == 'report-document-joint-reviser':
+                if continuing:
+                    self.assertIn(revised_scope, json.dumps(view))
+                    self.assertNotIn(old_scope, json.dumps(view))
+                return {'sections': [{'section_id': row['section']['section_id'],
+                    'draft_markdown': final_scope if continuing else revised_scope}
+                    for row in view['sections']]}
+            self.assertIn(label, {'report-document-reviewer', 'report-document-verifier'})
+            reviews = []
+            for row in view['sections']:
+                body = row['markdown']
+                needs = row['heading'] == 'Scope' and body != final_scope
+                finding = {'finding_id': 'clarify-scope', 'type': 'style',
+                    'severity': 'major' if body == old_scope else 'minor',
+                    'required_action': 'revise', 'section_id': row['section_id'],
+                    'message': 'Make the scope sentence clearer.',
+                    'draft_quotes': [{'section_id': row['section_id'], 'quote': body}]}
+                reviews.append({'section_id': row['section_id'],
+                    'verdict': 'warning' if needs else 'pass', 'findings': [finding] if needs else []})
+            return {'section_reviews': reviews}
+
+        client.ask_json.side_effect = answer
+        args = {'goal': 'Explain the saved value and execution scope', 'material_roots': [str(source)],
+            'writing_method': 'sections', 'required_headings': ['Results', 'Scope'], 'finish': True}
+        first = writing.call('compose_document', args, identity='checked-first')
+        self.assertEqual(first.status, 'ok', first)
+        self.assertIsNone(writing.continuation(first.model_dump(mode='json'), 'checked-first'))
+        self.assertTrue(writing.can_return_gap(first.model_dump(mode='json'), 'checked-first'))
+        self.assertIn(old_scope, workspace.resolve(first.data['editable_markdown']).read_text())
+        self._record_native_result(root, 'checked-first', first)
+        retained = writing.coordination_result(first)['data']['retained_candidate']
+        self.assertEqual((retained['status'], retained['adopted']), ('checked_not_adopted', False))
+        self.assertEqual(retained['prior_result'], 'records/checked-first/native_result.json')
+        self.assertEqual(retained['review_status'], 'needs_revision')
+        owner = ArtifactStore(root / 'tools/writing/checked-first')
+        prior_bytes = {path: path.read_bytes() for path in owner.root.rglob('*') if path.is_file()}
+        with patch('simple_ar.report.writing.validate_document_inspection',
+                side_effect=ValueError('Changed original inspection')):
+            self.assertFalse(writing.can_return_gap(first.model_dump(mode='json'), 'checked-first'))
+            self.assertNotIn('retained_candidate', writing.coordination_result(first)['data'])
+        continuing = True
+        before = len(prompts)
+        with patch.object(writing, '_select_materials', side_effect=AssertionError('No reselection')):
+            second = writing.call('compose_document', {'goal': args['goal'],
+                'prior_result': 'records/checked-first/native_result.json', 'finish': True}, identity='checked-next')
+        self.assertEqual(second.status, 'ok', second)
+        self.assertEqual([label for label, _ in prompts[before:]],
+            ['report-document-reviewer', 'report-document-joint-reviser', 'report-document-verifier'])
+        self.assertIn(final_scope, workspace.resolve(second.data['editable_markdown']).read_text())
+        self.assertIsNotNone(writing.continuation(second.model_dump(mode='json'), 'checked-next'))
+        self.assertEqual({path: path.read_bytes() for path in prior_bytes}, prior_bytes)
 
     def test_document_work_defaults_to_authorized_sources_and_keeps_old_contracts(self):
         root, workspace, writing, _, _, _, client, prompts = self._document_work_fixture()

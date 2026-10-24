@@ -111,12 +111,12 @@ def delivery_evidence(owner: Any, observations: list[dict], delivery: dict | Non
             raise ValueError('Delivered composition source/version changed before producer selection')
         if binding.get('delivery_review', {}).get('producer_completion') == 'goal_findings.v1':
             from simple_ar.tools.writing import WritingToolGateway
-            from simple_ar.tools.implementation_work import _independent_delivery_review
+            from simple_ar.report.writing import validate_document_inspection
             review = WritingToolGateway.final_review(owner, data)
             if (review.get('review_status') != 'reviewed' or data.get('unresolved') or data.get('incomplete')
                     or data.get('delivery_review', {}).get('status') != 'reviewed'):
                 raise ValueError('Delivered composition requires its current independent review to pass')
-            _independent_delivery_review(store, binding, data, review_result=review)
+            validate_document_inspection(store, binding, data, review_result=review)
         subjects.update(owner.workspace.resolve(row['path'])
             for row in binding.get('delivery_review', {}).get('artifacts', []))
         source_inputs.update(owner.workspace.resolve(row['path']) for row in binding['inputs'])
@@ -379,7 +379,8 @@ def freeze_producer_context(owner: Any, artifacts: list[dict]) -> dict:
 def delivery_adoptions(owner: Any, observations: list[dict], delivery: dict | None,
                        proposed: Any = None) -> list[dict]:
     """Writing owner's proof for the canonical manuscript actually delivered."""
-    from simple_ar.tools.implementation_work import _accepted, _independent_delivery_review
+    from simple_ar.tools.implementation_work import _accepted
+    from simple_ar.report.writing import validate_document_inspection
     if not delivery:
         return []
     from simple_ar.tools.workspace import DeliveryRequest
@@ -440,7 +441,7 @@ def delivery_adoptions(owner: Any, observations: list[dict], delivery: dict | No
                     'obligation', {}).get('formats', ['markdown']),
                 manuscript=report['manuscript'], proposed=publication_proposal)
             owner.check_delivery_set(authoring, delivery['artifacts'], published)
-            _independent_delivery_review(store, binding, data, review_result=review)
+            validate_document_inspection(store, binding, data, review_result=review)
             adoption = data['delivery_review'].get('declaration_adoption', {})
             from simple_ar.report.review_evidence import declaration_adoption_contract
             contract = declaration_adoption_contract(binding['delivery_review'])

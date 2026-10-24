@@ -1791,6 +1791,18 @@ class ToolApplication:
     def _professional_stop_can_resume(self, retained: dict) -> bool:
         known = retained.get('resource_authorizations')
         stop = retained.get('owner_stop') or {}
+        if (self.state['config'].get('professional_work') == _REQUEST_OWNER
+                and stop.get('reason') == 'work_gap'):
+            # A checked negative outcome may return to its request owner without
+            # buying more work. Prove the retained receipt before consulting its
+            # domain owner; this grants no retry, adoption or extra resources.
+            source = retained['source_result']
+            self._check_professional_stop(source, stop)
+            observed = self.session.store.read_json(source)
+            owner = self.gateway.domain_owner(observed.get('tool_name', ''))
+            gap = getattr(owner, 'can_return_gap', None)
+            if gap is not None and gap(observed, Path(source).parent.name):
+                return True
         if (not isinstance(known, list)
                 or not set(self._professional_resource_authorizations()).difference(known)):
             return False
@@ -4317,7 +4329,7 @@ class ToolApplication:
                         # Explicit resume may re-derive the next operation from
                         # a completed professional receipt after a handoff failed.
                         # It never replays that operation. Recorded owner stops
-                        # still require their existing continuation authority.
+                        # require owner-proven handback or resource continuation.
                         completed_outcome = (turns[-1]['tools'] and not turns[-1]['remaining']
                             and not retained.get('owner_stop'))
                         if not completed_outcome and not self._professional_stop_can_resume(retained):

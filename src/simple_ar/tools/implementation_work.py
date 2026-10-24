@@ -360,99 +360,6 @@ def _retained_request(source: dict) -> Any:
     return ImplementationRequest.model_validate(request)
 
 
-def _independent_delivery_review(store: ArtifactStore, binding: dict, data: dict,
-                                 *, review_result: dict, reviewed_sections: list[dict] | None = None) -> None:
-    """Revalidate retained reviewer responses/anchors without a client or writes."""
-    import json
-    from simple_ar.integrations.llm import LLMError
-    from simple_ar.report.editor import replay_document_reviews
-    from simple_ar.report.review_evidence import (DELIVERY_REVIEW_CONTRACT,
-        declaration_adoption_contract, delivery_review_result, restore_delivery_producers)
-    from simple_ar.report.schema import ReportSectionDraft
-    from simple_ar.report.writing import _retained_response
-
-    snapshot = binding['delivery_review']
-    if snapshot.get('contract') != DELIVERY_REVIEW_CONTRACT:
-        raise ValueError('Unknown independent delivery inspection contract')
-    def matches(review: ArtifactStore) -> bool:
-        request = review.read_json('request.json')
-        if not (request.get('response_record_contract') in {'atomic_complete.v1', 'atomic_complete.v2'}
-                or request.get('format_correction_contract')):
-            return False  # Old unbound responses do not acquire stronger authority.
-        try:
-            view = json.loads(request['prompt'])
-            if ('required_figures' in snapshot and view.get('delivery_text_observation', {}).get(
-                    'required_figures') != snapshot['required_figures']):
-                return False
-            if reviewed_sections is not None and [{key: row[key] for key in (
-                    'section_id', 'heading', 'markdown')} for row in view.get('sections', [])] != [
-                    {'section_id': row['section_id'], 'heading': row['heading'],
-                     'markdown': row['draft_markdown']} for row in reviewed_sections]:
-                return False
-            if (view.get('task') != 'review_document_coherence'
-                    or view.get('delivery_review_contract') != DELIVERY_REVIEW_CONTRACT
-                    or restore_delivery_producers(view) != snapshot['artifacts']
-                    or view.get('producer_declarations') != snapshot.get('producer_declarations')
-                    or view.get('producer_completion') != snapshot.get('producer_completion')
-                    or view.get('producer_notes') != snapshot.get('producer_notes')):
-                return False
-            if ('producer_declarations' in snapshot and view.get('declaration_adoption_contract')
-                    != declaration_adoption_contract(snapshot)):
-                return False  # Never reinterpret a retained review under another adoption contract.
-            response = _retained_response(review, 'request.json', request)
-            if 'inspection_payload_sha256' in review_result:
-                actual = {name: hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False,
-                    separators=(',', ':'), allow_nan=False).encode('utf-8')).hexdigest()
-                    for name, value in (('request', view), ('response', response))}
-                if review_result['inspection_payload_sha256'] != actual:
-                    return False
-            sections = [ReportSectionDraft(section_id=row['section_id'], heading=row['heading'],
-                draft_markdown=row['markdown']) for row in view['sections']]
-            validated = replay_document_reviews(response, sections=sections, evidence_view=view)
-            if ('inspection_payload_sha256' in review_result
-                    and review_result.get('section_reviews') != [row.model_dump(mode='json') for row in validated]):
-                return False
-            return delivery_review_result(snapshot, validated) == data['delivery_review']
-        except LLMError as exc:
-            raise ValueError('Independent delivery response is incomplete or invalid') from exc
-
-    final_review = review_result
-    if 'inspection_source' in final_review:
-        # The writing producer selects the actual final inspection, including a
-        # rejected revision or its format correction. Never guess a revision
-        # number, search directories, or fall back from a broken explicit proof.
-        source = final_review['inspection_source']
-        if not isinstance(source, dict) or set(source) != {
-                'request_path', 'request_sha256', 'response_path', 'response_sha256'}:
-            raise ValueError('Invalid independent inspection source binding')
-        paths = {}
-        for name in ('request', 'response'):
-            locator = source[f'{name}_path']
-            if not isinstance(locator, str) or not locator:
-                raise ValueError('Invalid independent inspection source path')
-            path = (store.root / locator).resolve()
-            if (not path.is_relative_to(store.root.resolve()) or path.name != f'{name}.json'
-                    or not path.is_file()
-                    or hashlib.sha256(path.read_bytes()).hexdigest() != source[f'{name}_sha256']):
-                raise ValueError('Independent inspection source escaped its owner or changed bytes')
-            paths[name] = path
-        if paths['request'].parent != paths['response'].parent:
-            raise ValueError('Independent inspection request and response have different producers')
-        if matches(ArtifactStore(paths['request'].parent)):
-            return
-        raise ValueError('Delivery defects differ from the explicitly bound independent inspection')
-
-    # Historical receipts did not select an inspection explicitly. Retain only
-    # their original two fixed producers; do not discover revision directories.
-    for location in ('writer/review', 'delivery-review'):
-        review = ArtifactStore(store.root / location)
-        if not review.exists('request.json'):
-            continue
-        if review.exists('format_correction/request.json'):
-            review = ArtifactStore(review.root / 'format_correction')
-        if matches(review):
-            return
-    raise ValueError('Delivery defects lack a matching complete independent review receipt')
 
 
 def _same_producer(owner: Any, left: dict | None, right: dict | None) -> bool:
@@ -498,7 +405,8 @@ def _review_execution(owner: Any, locator: str) -> tuple[dict, dict]:
             or inspection.get('status') != 'needs_revision' or not inspection.get('defects')):
         raise ValueError('Composition has no independently bound delivery defects')
     candidate = WritingToolGateway.repair_candidate(owner, data)
-    _independent_delivery_review(writing, binding, {**data, 'delivery_review': inspection},
+    from simple_ar.report.writing import validate_document_inspection
+    validate_document_inspection(writing, binding, {**data, 'delivery_review': inspection},
         review_result=review, reviewed_sections=candidate['sections'] if candidate else None)
 
     from simple_ar.report.review_evidence import delivery_target_pointer, SCOPED_DELIVERY_INSPECTION

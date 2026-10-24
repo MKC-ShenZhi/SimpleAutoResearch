@@ -1028,14 +1028,16 @@ class StructuredArticleWritingTests(unittest.TestCase):
                 self.assertNotIn('prior_draft', [row.handle for row in context.source_handles])
 
     def test_native_section_review_reuses_writer_and_recovers_adopted_checkpoint_read_only(self):
+        import hashlib
         from simple_ar.integrations.llm import LLMError
         from simple_ar.report.writing import (
-            SECTION_ARTICLE_OWNER, completed_composition_writer, write_section_article,
+            SECTION_ARTICLE_OWNER, completed_composition_writer, retained_section_candidate, write_section_article,
         )
         from simple_ar.research.documents.ingest import DocumentBundle
         from tests.report_review_fixtures import draft_quotes, prompt_payload
 
-        for outcome in ('pass', 'revised', 'inspection-unavailable', 'verification-unavailable'):
+        for outcome in ('pass', 'revised', 'negative', 'unchanged', 'verification-format',
+                        'inspection-unavailable', 'verification-unavailable'):
             with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as tmp:
                 owner = ArtifactStore(Path(tmp))
                 writer = ArtifactStore(owner.root / 'writer')
@@ -1059,7 +1061,8 @@ class StructuredArticleWritingTests(unittest.TestCase):
                         if label in {'report-writer-document', 'report-document-joint-reviser'}:
                             return {'sections': [{'section_id': row['section']['section_id'],
                                 'heading': row['section']['heading'], 'draft_markdown':
-                                ('Revised' if 'reviser' in label else 'Original') + ' bounded observation.'}
+                                ('Revised' if 'reviser' in label and outcome != 'unchanged' else 'Original')
+                                + ' bounded observation.'}
                                 for row in view['sections']]}
                         if label.startswith('report-writer-section_'):
                             return {**view['section'], 'draft_markdown': 'Original bounded observation.'}
@@ -1067,18 +1070,24 @@ class StructuredArticleWritingTests(unittest.TestCase):
                             if (outcome == 'inspection-unavailable' and label == 'report-document-reviewer'
                                     or outcome == 'verification-unavailable' and label == 'report-document-verifier'):
                                 raise LLMError('Unknown inspection response')
-                            revise = outcome != 'pass' and label == 'report-document-reviewer'
+                            if outcome == 'verification-format' and label.startswith('report-document-verifier'):
+                                return {'section_reviews': 'invalid'}
+                            revise = (outcome != 'pass' and label == 'report-document-reviewer'
+                                or outcome in {'negative', 'unchanged'} and label == 'report-document-verifier')
                             return {'section_reviews': [{'section_id': row['section_id'],
                                 'verdict': 'revise_required' if revise else 'pass',
                                 'findings': [{'finding_id': row['section_id'] + '-limits', 'type': 'style',
-                                    'severity': 'major', 'required_action': 'revise',
+                                    'severity': 'minor' if label == 'report-document-verifier' else 'major',
+                                    'required_action': 'revise',
                                     'message': 'Clarify the observation limits.',
                                     'draft_quotes': draft_quotes(prompt, row['section_id'])}] if revise else []}
                                 for row in view['sections']]}
+                        if label == 'report-document-verifier-format-correction' and outcome == 'verification-format':
+                            return {'section_reviews': 'still invalid'}
                         raise AssertionError(label)
 
                 arguments = dict(store=writer, input_store=owner, documents_ref=documents,
-                    identity='reviewed-sections', report_context=context, title='Evidence brief',
+                    identity=owner.root.name, report_context=context, title='Evidence brief',
                     target_words=0, required_headings=['Observations', 'Limits'], max_cited_sources=0,
                     review_config=config)
                 written = write_section_article(**arguments, client=Client())
@@ -1087,11 +1096,69 @@ class StructuredArticleWritingTests(unittest.TestCase):
                 self.assertEqual(written, writer.read_json('writer.json'))
                 self.assertEqual(calls.count('report-document-reviewer'), 1)
                 binding = {'writing_owner': SECTION_ARTICLE_OWNER,
+                    'section_response_contract': 'atomic_complete.v2',
                     'section_delivery_review_contract': 'section_delivery_review.v1',
+                    'work_source': {'contract': 'document_source.v1', 'intent': {}},
+                    'delivery_review': context.results['delivery_review'],
                     'request': {'title': 'Evidence brief', 'target_words': 0,
+                        'writing_method': 'sections',
                         'required_headings': ['Observations', 'Limits'],
                         'professional_review': {'max_revision_rounds': 1}}}
+                owner.write_json('request.json', binding)
+                names = {'request.json', 'documents.json', 'writer/report_inputs.json',
+                    'writer/sections.json', 'writer/writer.json'} | {
+                    path.relative_to(owner.root).as_posix() for path in writer.resolve('model_calls').rglob('*.json')}
+                source = {'contract': 'retained_sections.v1', 'owner': str(owner.root.resolve()),
+                    'sha256': {name: hashlib.sha256(owner.resolve(name).read_bytes()).hexdigest() for name in names}}
                 original = {path: path.read_bytes() for path in owner.root.rglob('*') if path.is_file()}
+                with patch.object(Client, 'ask_json', side_effect=AssertionError('Read-only candidate proof')):
+                    candidate = retained_section_candidate(source)
+                self.assertEqual('checked_revision' in candidate, outcome == 'negative')
+                if outcome == 'negative':
+                    revision = next(row for row in written['iterations'] if row['action'] == 'document_joint_revise')
+                    verification = next(row for row in written['iterations'] if row['action'] == 'document_joint_verify')
+                    self.assertEqual((revision['status'], revision['adopted']), ('rejected', False))
+                    self.assertEqual(candidate['checked_revision'], {
+                        'independent_review': verification['independent_review'],
+                        'revision_iteration': revision['iteration']})
+                    review = candidate['checked_revision']['independent_review']
+                    self.assertEqual(review['review_status'], 'needs_revision')
+                    self.assertEqual(review['delivery_review']['status'], 'reviewed')
+                    self.assertTrue(all(finding['severity'] == 'minor' and finding['required_action'] == 'revise'
+                        for row in review['section_reviews'] for finding in row['findings']))
+                    self.assertEqual(candidate['sections'], revision['drafts'])
+                    self.assertTrue(all(row['draft_markdown'].startswith('Original') for row in written['sections']))
+                    self.assertEqual(calls.count('report-document-joint-reviser'), 1)
+                    self.assertEqual(calls.count('report-document-verifier'), 1)
+                    # Rebind both saved projections so checkpoint equality and
+                    # byte hashes alone cannot certify incomplete diagnostics.
+                    for fault in ('missing-review', 'wrong-identity', 'partial-receipt',
+                                  'partial-sections', 'unfinished-check'):
+                        with self.subTest(diagnostic=fault):
+                            altered = json.loads(json.dumps(written))
+                            check = next(row for row in altered['iterations']
+                                if row['action'] == 'document_joint_verify')
+                            if fault == 'missing-review':
+                                check.pop('independent_review')
+                            elif fault == 'wrong-identity':
+                                check['independent_review']['assembly_identity']['sections_sha256'] = '0' * 64
+                            elif fault == 'partial-receipt':
+                                check['independent_review']['inspection_source'].pop('response_sha256')
+                            elif fault == 'partial-sections':
+                                check['section_reviews'].pop()
+                            else:
+                                check['status'] = 'started'
+                            checkpoint = writer.read_json('sections.json')
+                            checkpoint['completed']['iterations'] = altered['iterations']
+                            with changed_record(writer.resolve('writer.json'), altered), \
+                                    changed_record(writer.resolve('sections.json'), checkpoint):
+                                rebound = {**source, 'sha256': {name:
+                                    hashlib.sha256(owner.resolve(name).read_bytes()).hexdigest() for name in names}}
+                                with patch.object(Client, 'ask_json', side_effect=AssertionError('No replay')):
+                                    diagnostic = retained_section_candidate(rebound)
+                                self.assertNotIn('checked_revision', diagnostic)
+                                self.assertEqual(diagnostic['sections'], candidate['sections'])
+                self.assertEqual({path: path.read_bytes() for path in original}, original)
                 if outcome.endswith('unavailable'):
                     self.assertTrue(all(row['draft_markdown'].startswith('Original') for row in written['sections']))
                     if outcome == 'verification-unavailable':
@@ -1100,15 +1167,15 @@ class StructuredArticleWritingTests(unittest.TestCase):
                             retained_unchecked_manuscript(written, title='Evidence brief'))
                     with self.assertRaisesRegex(ValueError, 'no blind replay'):
                         write_section_article(**arguments, recovering=True)
-                else:
+                elif outcome in {'pass', 'revised'}:
                     self.assertEqual(written['independent_review']['review_status'], 'reviewed')
                     self.assertEqual(write_section_article(**arguments, recovering=True), written)
-                    completed_composition_writer(store=owner, binding=binding, identity='reviewed-sections')
+                    completed_composition_writer(store=owner, binding=binding, identity=owner.root.name)
                     if outcome == 'revised':
                         self.assertTrue(all(row['draft_markdown'].startswith('Revised') for row in written['sections']))
                     binding['request']['professional_review']['max_revision_rounds'] = 2
                     with self.assertRaisesRegex(ValueError, 'frozen configuration'):
-                        completed_composition_writer(store=owner, binding=binding, identity='reviewed-sections')
+                        completed_composition_writer(store=owner, binding=binding, identity=owner.root.name)
                 self.assertEqual({path: path.read_bytes() for path in original}, original)
                 with self.assertRaisesRegex(ValueError, 'Frozen section input changed'):
                     write_section_article(**{**arguments,

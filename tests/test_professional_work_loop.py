@@ -828,6 +828,106 @@ class ProfessionalWorkLoopTests(unittest.TestCase):
         self.coordinator.assert_not_called()
         self.send.assert_not_called()
 
+    def _paused_noncode_domain_gap(self):
+        from simple_ar.tools.professional_outcomes import stop_decision
+
+        app = self._create(professional_work=None)
+        app.run(actions=[{'tool_name': 'write_file', 'arguments': {
+            'path': 'workspace/retained.txt', 'content': 'Retained negative inspection subject'}}],
+            progress=lambda _: None, should_stop=lambda: bool(self._observations(app)))
+        source = app.state['turns'][-1]['tools'][-1]['result']
+        observed = app.session.store.read_json(source)
+        owner = SimpleNamespace(root=self.root, session_id=app.session.manifest.session_id,
+            can_return_gap=Mock(return_value=True), continuation=Mock(return_value=None),
+            resume_after_budget=Mock(return_value=None), can_resume_after_budget=Mock(return_value=False))
+        action = stop_decision(owner, observed, Path(source).parent.name,
+            'work_gap', 'Complete independent inspection retains required corrections')
+        owner.stop_after_review = Mock(return_value=action)
+        app._pause_professional_stop(source, action)
+        return app, owner, source
+
+    def test_paused_noncode_gap_resumes_to_parent_without_grant_or_owner_replay(self):
+        app, owner, source = self._paused_noncode_domain_gap()
+        journal = app.state['turns'][-1]['reply']
+        original = {name: app.session.store.resolve(name).read_bytes() for name in (source, journal)}
+        ledger_bytes = (self.root / 'budget_ledger.json').read_bytes()
+        ledger, turns, requests = app.ledger.to_dict(), list(app.state['turns']), list(app.state['requests'])
+        app = self._load()  # A real retained pause must pass run()'s resume gate.
+        self.assertEqual(app.session.manifest.status, 'paused')
+        self.assertEqual(app._professional_resource_authorizations(), [])
+        # Only domain semantic eligibility is supplied by the fixture. Native
+        # registration, stop validation, gateway fallback and resume are real.
+        # Neither tool names nor a code/report domain select this behavior.
+        spec = app.gateway.registry.get('write_file')
+        with patch.object(spec, 'domain', 'independent_material_inspection'), \
+                patch.object(app.gateway, '_domain_gateways', {'independent_material_inspection': owner}), \
+                patch.object(app.gateway, 'professional_action', wraps=app.gateway.professional_action) as action, \
+                patch.object(app, '_attempt', side_effect=RuntimeError('Parent coordination boundary')) as attempt:
+            result = app.run(progress=lambda _: None)
+        self.assertIn('Parent coordination boundary', result['status_reason'])
+        self.assertEqual(attempt.call_count, 1)
+        self.assertEqual(attempt.call_args.args[0], 'native_turn')
+        self.assertEqual(app.state['pending']['kind'], 'model')
+        action.assert_called_once_with(json.loads(original[source]), source, resume=True, consume_outcome=True)
+        owner.continuation.assert_not_called()
+        owner.resume_after_budget.assert_called_once_with(json.loads(original[source]), Path(source).parent.name)
+        owner.stop_after_review.assert_called_once_with(json.loads(original[source]), Path(source).parent.name)
+        owner.can_resume_after_budget.assert_not_called()
+        self.assertEqual(app.ledger.to_dict(), ledger)
+        self.assertEqual((self.root / 'budget_ledger.json').read_bytes(), ledger_bytes)
+        self.assertEqual(app.state['turns'], turns)
+        self.assertEqual(app.state['requests'], requests)
+        for name, raw in original.items():
+            self.assertEqual(app.session.store.resolve(name).read_bytes(), raw)
+        self.assertFalse(json.loads(original[journal])['owner_stop']['completed'])
+        self.coordinator.assert_not_called()
+        self.send.assert_not_called()
+
+    def test_paused_gap_refuses_ineligible_modes_reasons_and_invalid_source_proof(self):
+        app, owner, source = self._paused_noncode_domain_gap()
+        journal = app.state['turns'][-1]['reply']
+        original = app.session.store.resolve(journal).read_bytes()
+        source_bytes = app.session.store.resolve(source).read_bytes()
+        ledger_bytes = (self.root / 'budget_ledger.json').read_bytes()
+        ledger, turns = app.ledger.to_dict(), list(app.state['turns'])
+        cases = [('requests.v1', 'work_gap', False),
+            *[(mode, 'work_gap', True) for mode in ('owners.v3', 'outcomes.v2')],
+            *[('requests.v1', reason, True) for reason in ('permission_unavailable',
+                'accounting_unresolved', 'owner_failed', 'owner_state_unresolved', 'shared_budget_exhausted')],
+            ('requests.v1', 'invalid_source', True)]
+        for mode, reason, eligible in cases:
+            with self.subTest(mode=mode, reason=reason, eligible=eligible):
+                app = self._load()
+                app.state['config']['professional_work'] = mode
+                retained = json.loads(original)
+                retained['owner_stop']['reason'] = 'work_gap' if reason == 'invalid_source' else reason
+                if reason == 'invalid_source':
+                    retained['owner_stop']['source_sha256'] = 'changed'
+                app.session.store.write_json(journal, retained, kind='professional_actions')
+                owner.can_return_gap.reset_mock()
+                owner.can_return_gap.return_value = eligible
+                with patch.object(app.gateway, 'domain_owner', return_value=owner), \
+                        patch.object(app.gateway, 'professional_action') as action, \
+                        patch.object(app, '_attempt') as attempt:
+                    status = app.run(progress=lambda _: None)
+                self.assertEqual(status['status'], 'paused', status)
+                self.assertIsNone(app.state['pending'])
+                action.assert_not_called()
+                attempt.assert_not_called()
+                if reason == 'invalid_source':
+                    self.assertIn('accepted source', status['status_reason'])
+                if mode != 'requests.v1' or reason != 'work_gap':
+                    owner.can_return_gap.assert_not_called()
+                self.assertEqual(app.ledger.to_dict(), ledger)
+                self.assertEqual((self.root / 'budget_ledger.json').read_bytes(), ledger_bytes)
+                self.assertEqual(app.state['turns'], turns)
+                self.assertEqual(app.session.store.resolve(source).read_bytes(), source_bytes)
+                app.session.store.resolve(journal).write_bytes(original)
+        owner.resume_after_budget.assert_not_called()
+        owner.can_resume_after_budget.assert_not_called()
+        self.coordinator.assert_not_called()
+        self.send.assert_not_called()
+
     def test_legacy_gap_resume_requires_new_grant_and_original_owner_proof(self):
         app = self._create(professional_work=None)
         app.run(actions=[{'tool_name': 'write_file', 'arguments': {
