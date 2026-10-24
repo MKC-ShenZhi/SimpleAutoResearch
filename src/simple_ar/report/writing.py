@@ -11,7 +11,7 @@ from typing import Any, Callable, Literal
 from simple_ar.core.capabilities import ArtifactRef, ArtifactStore, AttemptManifest, CapabilityContext, CapabilityResult
 from simple_ar.report.agent import run_report_agent
 from simple_ar.report.memory import initialize_report_memory
-from simple_ar.report.review_evidence import SHARED_PRODUCER_LOCATOR_CONTRACT
+from simple_ar.report.review_evidence import EVIDENCE_NAVIGATION_CONTRACTS, SHARED_PRODUCER_LOCATOR_CONTRACT
 from simple_ar.report.schema import ReportContext, ReportMemory, ReportRuntimeConfig, ReportTemplateBundle, finding_requires_resolution
 from simple_ar.report.tool_gateway import ReportToolGateway
 from simple_ar.research.documents.ingest import DocumentBundle
@@ -1024,9 +1024,18 @@ def _fixed_section_memory(memory: ReportMemory, outline: Sequence[dict[str, Any]
 
 def _section_feedback_memory(memory: ReportMemory, context: ReportContext,
                              frozen_memory: dict[str, Any] | None) -> ReportMemory:
-    """Enable old-opinion projection only at the original input freeze."""
+    """Freeze model views once; missing historical markers stay missing."""
     from simple_ar.report.narrative import PRIOR_REVIEW_CONTEXT_CONTRACT, prior_document_revision
 
+    marker = 'evidence_navigation_contract'
+    navigation = (frozen_memory.get('survey_contract', {}).get(marker) if frozen_memory is not None
+                  else SHARED_PRODUCER_LOCATOR_CONTRACT)
+    if navigation not in EVIDENCE_NAVIGATION_CONTRACTS:
+        raise ValueError('Unknown evidence navigation contract')
+    # Reused author memory supplies prose, never the new owner's view version.
+    memory.survey_contract = {key: value for key, value in memory.survey_contract.items() if key != marker}
+    if navigation is not None:
+        memory.survey_contract[marker] = navigation
     marker = 'revision_feedback_contract'
     if frozen_memory is not None:
         contract = frozen_memory.get('survey_contract', {}).get(marker)
@@ -1394,6 +1403,7 @@ def run_report_writing_capability(*, context: CapabilityContext, request: Report
                               gateway=ReportToolGateway(request.report_context, documents=documents, output_reader=read_output),
                               emit=request.emit, completed_checkpoint=completed,
                               checkpoint_sink=save_checkpoint, assemble_body=False,
+                              evidence_navigation_contract=memory.survey_contract.get('evidence_navigation_contract'),
                               on_delivery_review=delivery_source
                               if 'section_delivery_review' in request.report_context.results else None)
     artifacts = (source, checkpoint_ref) if context.store.resolve(checkpoint_ref).is_file() else (source,)

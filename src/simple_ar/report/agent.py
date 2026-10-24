@@ -25,7 +25,7 @@ from simple_ar.report.execution_evidence import report_execution_evidence
 from simple_ar.report.review_evidence import (
     EVIDENCE_QUOTE_RULES, EVIDENCE_QUOTE_SCHEMA, validate_finding_anchors, review_draft_quote_sources,
     review_evidence_locator, resolve_review_evidence,
-    attachment_review_blocks_editing,
+    attachment_review_blocks_editing, EVIDENCE_NAVIGATION_CONTRACTS, SHARED_PRODUCER_LOCATOR_CONTRACT,
 )
 from simple_ar.report.narrative import (
     DERIVED_CONTEXT_STATUS, REVIEW_OPINIONS_STATUS,
@@ -226,6 +226,7 @@ def run_report_agent(
     completed_checkpoint: Mapping[str, Any] | None = None,
     assemble_body: bool = True,
     on_delivery_review: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    evidence_navigation_contract: str | None = SHARED_PRODUCER_LOCATOR_CONTRACT,
 ) -> AgentReportResult | None:
     """Run the bounded Writer/Reviewer loop for the report stage.
 
@@ -244,6 +245,9 @@ def run_report_agent(
         on_delivery_review: Resolve the completed transport receipt for a validated
             delivery observation. Defaults to client.last_inspection_source;
             persistence and filesystem receipt validation stay with the caller.
+        evidence_navigation_contract: New direct-call view. Capability callers
+            supply the frozen memory's version, including historical None.
+            Checkpoint recovery always consumes its own saved memory.
 
     Returns:
         Agent-generated report body and updated memory, or ``None`` when agent
@@ -255,6 +259,14 @@ def run_report_agent(
         return None
 
     current = memory.model_copy(deep=True)
+    # Direct new work freezes the same view as capability inputs. A retained
+    # checkpoint owns its memory, including an absent historical marker.
+    if completed_checkpoint is None:
+        navigation = current.survey_contract.get('evidence_navigation_contract', evidence_navigation_contract)
+        if navigation not in EVIDENCE_NAVIGATION_CONTRACTS:
+            raise ValueError('Unknown evidence navigation contract')
+        if navigation is not None:
+            current.survey_contract = {**current.survey_contract, 'evidence_navigation_contract': navigation}
     sections: list[ReportSectionDraft] = []
     iterations: list[ReportIterationRecord] = []
     all_findings: list[ReviewerFinding] = []
@@ -1013,6 +1025,7 @@ def _edit_whole_document(
                         delivery_text_observation=delivery,
                         delivery_review=context.results['delivery_review'] if assembly is not None else None,
                         delivery_assembly=assembly,
+                        evidence_navigation_contract=memory.survey_contract.get('evidence_navigation_contract'),
                         on_delivery_review=retain_delivery_review if assembly is not None else None,
                         label=review_label + "-format-correction" if correction is not None else review_label)
                     if correction_record is not None:

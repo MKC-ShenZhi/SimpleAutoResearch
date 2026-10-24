@@ -1454,6 +1454,8 @@ class WritingCoordinationTests(unittest.TestCase):
 
     def test_equivalent_focus_reuses_evidence_for_reorganization_without_changing_old_resolution(self):
         root, workspace, writing, source, _, table, client, _ = self._document_work_fixture()
+        extra_file = source / 'code' / 'additional-context.txt'
+        extra_file.write_text('Unselected context that may require new investigation.', encoding='utf-8')
         writing.document_source_contract = 'document_source.v1'
         goal = 'Explain the saved value and scope'
         first = writing.call('compose_document', {'goal': goal,
@@ -1467,7 +1469,8 @@ class WritingCoordinationTests(unittest.TestCase):
         extra.mkdir()
         workspace.mounts['extra'] = extra
         cases = [([str(source)], False, True), ([str(source)], True, False),
-            ([str(source), str(extra)], False, False), ([str(source / 'code')], False, False)]
+            ([str(source), str(extra)], False, False), ([str(source / 'code')], False, False),
+            ([str(source), str(extra_file)], False, False)]
         with patch.object(client, 'ask_json', side_effect=AssertionError('No model during recipe resolution')):
             for index, (roots, historical, reuse) in enumerate(cases):
                 with self.subTest(roots=roots, historical=historical):
@@ -2335,7 +2338,7 @@ class WritingCoordinationTests(unittest.TestCase):
 
         client.ask_json.side_effect = answer
         args = {'goal': 'Explain the recorded value and what was not executed',
-            'material_roots': [str(source)], 'writing_method': 'sections',
+            'material_roots': [str(source / 'code'), str(source / 'results')], 'writing_method': 'sections',
             'required_headings': ['Recorded result', 'Execution limits'], 'finish': True}
         requirement = freeze_report_requirement({'outline_strategy': 'auto',
             'draft_scope': 'document', 'review_scope': 'document', 'reviewer': 'llm',
@@ -2343,7 +2346,7 @@ class WritingCoordinationTests(unittest.TestCase):
             'allow_source_backtracking': False, 'allow_llm_fallback': False,
             'figures': {'enabled': False}}, method='sections')
         writing.report_inputs = lambda: material_report_binding(workspace, requirement,
-            mounts=[str(source)], requests=[args['goal']])
+            mounts=args['material_roots'], requests=[args['goal']])
         writing.professional_inputs = True
         # Reproduce a pre-contract template owner, rather than editing any
         # saved receipt: all atomic author/reviewer responses freeze normally.
@@ -2394,6 +2397,21 @@ class WritingCoordinationTests(unittest.TestCase):
         self.assertEqual(revised.data['constraints_checked']['headings'], args['required_headings'])
         self.assertIsNotNone(writing.continuation(revised.model_dump(mode='json'), 'output-reorganized'))
         self.assertEqual({p: p.read_bytes() for p in protected}, protected)
+        self._record_native_result(root, 'output-reorganized', revised)
+        parent = ArtifactStore(root / 'tools/writing/output-reorganized')
+        report = parent.read_json('request.json')['report_binding']
+        routed = {**report, 'obligation': {'intent': {'kind': 'report', 'request_index': 0}}}
+        intent = {'goal': args['goal'], 'prior_draft': revised.data['editable_markdown'],
+            'material_roots': [str(source)]}
+        with patch.object(client, 'ask_json', side_effect=AssertionError('Routing metadata is not new evidence')):
+            admitted = writing._admit_document_source(ArtifactStore(root / 'tools/writing/routed-work'),
+                intent, None, None, routed)
+            resolved = writing._resolve_document_inputs(ComposeRequest.model_validate(intent), 'routed-work',
+                report=routed, original=None, selection=None, document_work=True,
+                caller_fields=frozenset(intent), work_source=admitted, normalize_arguments=None)
+        self.assertIsNone(resolved.investigation)
+        self.assertEqual(resolved.linkage['owner'], 'output-reorganized')
+        self.assertIsNotNone(resolved.candidate)
 
     def test_checked_section_revision_continues_as_work_without_waiving_its_findings(self):
         from tests.report_review_fixtures import prompt_payload

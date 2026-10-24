@@ -752,8 +752,10 @@ class WritingToolGateway:
                     {key: value for key, value in report.items() if key not in feedback_fields})
                 selected_recipe = work_source.get('resolution_contract') == 'selected_recipe.v1'
                 original_goal = binding.get('work_source', {}).get('intent', {}).get('goal') or binding['request']['goal']
-                same_intent = (isinstance(report, dict) and previous_report == report
+                same_intent = (isinstance(report, dict) and isinstance(previous_report, dict)
+                    and same_controls and previous_report.get('requests') == report.get('requests')
                     or report is None and previous_report is None and work_source['intent']['goal'] == original_goal)
+                frozen_investigation = ('diagnosis' in work_source and (original is not None or selection is not None))
                 if selected_recipe and same_intent and scope is not None and requested:
                     # Directory aliases and enclosing project paths do not make
                     # the selected evidence new. Every requested root must still
@@ -776,10 +778,14 @@ class WritingToolGateway:
                     if previous_draft:
                         evidence.discard(self.workspace.resolve(previous_draft))
                     same_scope = bool(evidence) and all(any(path.is_relative_to(root)
-                        for root in requested) for path in evidence) and all(any(
+                        for root in requested) for path in evidence) and all(
+                        root in admitted or any(path.is_relative_to(root) for path in evidence)
+                        for root in requested) and all(any(
                             root.is_relative_to(old) or old.is_relative_to(root)
                             for old in admitted if old != self.workspace.resolve(
                                 f'workspace/manuscripts/{parent_id}')) for root in requested)
+                if frozen_investigation:
+                    same_scope = False  # Replay the saved selection decision, not today's eligibility policy.
                 draft = f'workspace/manuscripts/{parent_id}/manuscript.md'
                 if observed is None:
                     native = ArtifactStore(self.root / 'attempts' / parent_id)

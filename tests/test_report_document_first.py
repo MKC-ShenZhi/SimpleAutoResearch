@@ -317,42 +317,70 @@ class DocumentFirstTests(unittest.TestCase):
     def test_historical_unused_feedback_does_not_change_atomic_requests_on_resume(self):
         from simple_ar.report.writing import retained_writing_client
 
-        kwargs = self.inputs(draft_scope='document')
-        kwargs['context'].results['revision_feedback'] = {'contract': 'prior_prose_review.v1',
-            'path': 'old-review.json', 'sha256': 'c' * 64, 'scope': 'Old opinions.',
-            'section_reviews': [{'section_id': 'results', 'verdict': 'revise_required'}]}
-        with tempfile.TemporaryDirectory() as tmp:
-            store = ArtifactStore(Path(tmp))
-            labels = []
-            client = retained_writing_client(store=store, identity='historical-feedback',
-                client=self.client(labels), contract='atomic_complete.v2')
-            request = ReportWritingRequest(kwargs['context'], kwargs['memory'], kwargs['config'],
-                kwargs['template'], client)
-            # Build the historical producer that retained the field but never
-            # projected it. Recovery must not upgrade those paid requests.
-            with patch('simple_ar.report.writing._section_feedback_memory',
-                       side_effect=lambda memory, context, frozen_memory: memory):
-                result = run_report_writing_capability(context=CapabilityContext(store,
-                    AttemptManifest('historical-feedback')), request=request)
-            self.assertEqual(result.status, 'completed', result.diagnostics)
-            self.assertNotIn('revision_feedback_contract',
-                             store.read_json('report_inputs.json')['memory']['survey_contract'])
-            calls = {path.relative_to(store.root): path.read_bytes()
-                     for path in store.root.rglob('*') if path.is_file() and 'model_calls' in path.parts}
-            for path in store.resolve('model_calls').glob('*/request.json'):
-                view = prompt_payload(json.loads(path.read_text(encoding='utf-8'))['prompt'])
-                self.assertNotIn('prior_document_revision', view)
-                self.assertNotIn('prior_document_revision', view.get('delivery_text_observation', {}))
-            checkpoint = store.ref('sections.json', kind='report_checkpoint', schema='report_checkpoint.v1')
-            replay = retained_writing_client(store=store, identity='historical-feedback',
-                client=None, contract='atomic_complete.v2')
-            resumed = run_report_writing_capability(context=CapabilityContext(store,
-                AttemptManifest('historical-feedback'), inputs=(checkpoint,)),
-                request=replace(request, llm_client=replay, resume_ref=checkpoint))
-            self.assertEqual(resumed.status, 'completed', resumed.diagnostics)
-            self.assertEqual({path.relative_to(store.root): path.read_bytes()
-                for path in store.root.rglob('*') if path.is_file() and 'model_calls' in path.parts}, calls)
-            self.assertEqual(labels, ['report-writer-document', 'report-document-reviewer'])
+        from simple_ar.report.review_evidence import LOCATOR_REFERENCE_CONTRACT
+
+        for navigation in (None, LOCATOR_REFERENCE_CONTRACT):
+            kwargs = self.inputs(draft_scope='document')
+            kwargs['context'].results['revision_feedback'] = {'contract': 'prior_prose_review.v1',
+                'path': 'old-review.json', 'sha256': 'c' * 64, 'scope': 'Old opinions.',
+                'section_reviews': [{'section_id': 'results', 'verdict': 'revise_required'}]}
+            with tempfile.TemporaryDirectory() as tmp:
+                store = ArtifactStore(Path(tmp))
+                labels = []
+                client = retained_writing_client(store=store, identity='historical-feedback',
+                    client=self.client(labels), contract='atomic_complete.v2')
+                request = ReportWritingRequest(kwargs['context'], kwargs['memory'], kwargs['config'],
+                    kwargs['template'], client)
+                # Build the historical producer that retained the field but never
+                # projected it. Recovery must not upgrade those paid requests.
+                def historical_memory(memory, context, frozen_memory):
+                    if navigation is not None:
+                        memory.survey_contract['evidence_navigation_contract'] = navigation
+                    return memory
+                with patch('simple_ar.report.writing._section_feedback_memory', side_effect=historical_memory):
+                    result = run_report_writing_capability(context=CapabilityContext(store,
+                        AttemptManifest('historical-feedback')), request=request)
+                self.assertEqual(result.status, 'completed', result.diagnostics)
+                self.assertNotIn('revision_feedback_contract',
+                                 store.read_json('report_inputs.json')['memory']['survey_contract'])
+                calls = {path.relative_to(store.root): path.read_bytes()
+                         for path in store.root.rglob('*') if path.is_file() and 'model_calls' in path.parts}
+                for path in store.resolve('model_calls').glob('*/request.json'):
+                    view = prompt_payload(json.loads(path.read_text(encoding='utf-8'))['prompt'])
+                    self.assertNotIn('prior_document_revision', view)
+                    self.assertNotIn('prior_document_revision', view.get('delivery_text_observation', {}))
+                    if view.get('task') == 'review_document_coherence':
+                        self.assertEqual(view.get('evidence_navigation_contract'), navigation)
+                    self.assertNotIn('delivery_producers', view)
+                self.assertEqual(store.read_json('sections.json')['completed']['memory']['survey_contract'].get(
+                    'evidence_navigation_contract'), navigation)
+                checkpoint = store.ref('sections.json', kind='report_checkpoint', schema='report_checkpoint.v1')
+                replay = retained_writing_client(store=store, identity='historical-feedback',
+                    client=None, contract='atomic_complete.v2')
+                resumed = run_report_writing_capability(context=CapabilityContext(store,
+                    AttemptManifest('historical-feedback'), inputs=(checkpoint,)),
+                    request=replace(request, llm_client=replay, resume_ref=checkpoint))
+                self.assertEqual(resumed.status, 'completed', resumed.diagnostics)
+                self.assertEqual({path.relative_to(store.root): path.read_bytes()
+                    for path in store.root.rglob('*') if path.is_file() and 'model_calls' in path.parts}, calls)
+                self.assertEqual(labels, ['report-writer-document', 'report-document-reviewer'])
+                physical = next(path for path in store.resolve('model_calls').glob('*/request.json')
+                    if json.loads(path.read_text(encoding='utf-8'))['options']['label'] == 'report-document-reviewer')
+                saved_request = json.loads(physical.read_bytes())
+                response = physical.with_name('response.json')
+                raw = response.read_bytes()
+                response.unlink()
+                incomplete = {path.relative_to(store.root): path.read_bytes()
+                              for path in store.root.rglob('*') if path.is_file()}
+                try:
+                    with self.assertRaises(ValueError):
+                        replay.ask_json(saved_request['system'], saved_request['prompt'], **saved_request['options'])
+                    self.assertEqual({path.relative_to(store.root): path.read_bytes()
+                                      for path in store.root.rglob('*') if path.is_file()}, incomplete)
+                    self.assertEqual(labels, ['report-writer-document', 'report-document-reviewer'])
+                finally:
+                    response.write_bytes(raw)
+
 
     def test_composition_caption_ownership_selection_publication_and_recovery(self):
         from unittest.mock import Mock
@@ -1918,6 +1946,7 @@ class JointRevisionTests(unittest.TestCase):
         with self.subTest(transport='atomic_complete.v2'), tempfile.TemporaryDirectory() as tmp:
             from simple_ar.report.writing import retained_writing_client, completed_composition_writer
             from simple_ar.report.writing import validate_document_inspection
+            from simple_ar.report.review_evidence import SHARED_PRODUCER_LOCATOR_CONTRACT, restore_delivery_producers
 
             owner = ArtifactStore(Path(tmp))
             writer = ArtifactStore(owner.root / 'writer')
@@ -1926,9 +1955,33 @@ class JointRevisionTests(unittest.TestCase):
                 kind='documents', schema='document_bundle.v1')
             labels = []
             kwargs, _ = self._integrated_delivery_case(owner.root, labels)
+            producer = {'owner': 'analysis', 'execution': {'stdout': 'Original observation\n' * 300},
+                        'unknown_field': [None, False, {'keep': True}]}
+            artifacts = kwargs['context'].results['delivery_review']['artifacts']
+            artifacts[0]['producer'] = copy.deepcopy(producer)
+            artifacts.append({'path': 'observations.txt', 'sha256': 'c' * 64,
+                              'coverage': 'complete', 'text': 'Bounded observations.',
+                              'producer': copy.deepcopy(producer)})
+            original_artifacts = copy.deepcopy(artifacts)
             regular = self.client(labels)
+            review_views = []
+            case = self
+            class CorrectingClient:
+                def ask_json(inner, system, prompt, *, label='', **options):
+                    if label.startswith(('report-document-reviewer', 'report-document-verifier')):
+                        view = prompt_payload(prompt)
+                        review_views.append(copy.deepcopy(view))
+                        case.assertEqual(view['evidence_navigation_contract'], SHARED_PRODUCER_LOCATOR_CONTRACT)
+                        case.assertEqual(restore_delivery_producers(view), original_artifacts)
+                        case.assertEqual(view['delivery_producers'], [producer])
+                        case.assertEqual(view['delivery_artifacts'][0]['producer'],
+                                         view['delivery_artifacts'][1]['producer'])
+                        if label == 'report-document-reviewer':
+                            return {'invalid_envelope': []}
+                    return regular.ask_json(system, prompt,
+                        label=label.removesuffix('-format-correction'), **options)
             client = retained_writing_client(store=writer, identity='integrated-sections',
-                client=regular, contract='atomic_complete.v2')
+                client=CorrectingClient(), contract='atomic_complete.v2')
             request = ReportWritingRequest(kwargs['context'], kwargs['memory'], kwargs['config'],
                 kwargs['template'], client, method='sections')
             result = run_report_writing_capability(context=CapabilityContext(writer,
@@ -1938,11 +1991,16 @@ class JointRevisionTests(unittest.TestCase):
             review = writer.read_json(produced)['independent_review']
             self.assertEqual(review['review_status'], 'reviewed')
             self.assertEqual(labels.count('report-document-verifier'), 1)
+            self.assertEqual(len(review_views), 3)  # Rejected review, correction, candidate verification.
+            self.assertEqual(artifacts, original_artifacts)
+            self.assertEqual(writer.read_json('report_inputs.json')['memory']['survey_contract'][
+                'evidence_navigation_contract'], SHARED_PRODUCER_LOCATOR_CONTRACT)
             source = review['inspection_source']
             self.assertTrue(source['request_path'].startswith('writer/model_calls/'))
             self.assertFalse(Path(source['request_path']).is_absolute())
             transport_request = owner.read_json(source['request_path'])
             self.assertEqual(transport_request['response_record_contract'], 'atomic_complete.v2')
+            self.assertEqual(restore_delivery_producers(json.loads(transport_request['prompt'])), original_artifacts)
             validate_document_inspection(owner,
                 {'delivery_review': kwargs['context'].results['delivery_review']},
                 {'delivery_review': review['delivery_review']}, review_result=review)
@@ -1974,6 +2032,22 @@ class JointRevisionTests(unittest.TestCase):
             self.assertEqual({path.relative_to(writer.root).as_posix(): path.read_bytes()
                               for path in writer.root.rglob('*') if path.is_file()}, retained)
             self.assertEqual(labels, before)
+            # A frozen physical request without a response remains incomplete,
+            # even when its checkpoint and verdict were previously complete.
+            # Proof consumers cannot synthesize a receipt or issue another call.
+            response_path = owner.resolve(source['response_path'])
+            response_bytes = response_path.read_bytes()
+            response_path.unlink()
+            incomplete = {path.relative_to(writer.root).as_posix(): path.read_bytes()
+                          for path in writer.root.rglob('*') if path.is_file()}
+            try:
+                with self.assertRaises(ValueError):
+                    completed_composition_writer(store=owner, binding=binding, identity='integrated-sections')
+                self.assertEqual({path.relative_to(writer.root).as_posix(): path.read_bytes()
+                                  for path in writer.root.rglob('*') if path.is_file()}, incomplete)
+                self.assertEqual(labels, before)
+            finally:
+                response_path.write_bytes(response_bytes)
 
     def test_declared_report_images_require_real_markdown_nodes(self):
         from simple_ar.report.editor import _apply_document_delivery_observations
