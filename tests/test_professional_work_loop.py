@@ -995,6 +995,15 @@ class ProfessionalWorkLoopTests(unittest.TestCase):
         self.send.assert_not_called()
 
     def test_completed_initial_article_resumes_check_and_delivery_without_coordinator(self):
+        self._completed_author_resumes_check_and_delivery('article')
+
+    def test_unstarted_section_inspection_preserves_author_and_original_stop(self):
+        self._completed_author_resumes_check_and_delivery('sections')
+
+    def test_inspection_only_negative_result_cannot_reopen_section_revision_rounds(self):
+        self._completed_author_resumes_check_and_delivery('sections', negative=True)
+
+    def _completed_author_resumes_check_and_delivery(self, method, *, negative=False):
         from simple_ar.tools.writing import freeze_report_requirement
 
         inputs = self.root.parent / 'saved-material'
@@ -1002,20 +1011,34 @@ class ProfessionalWorkLoopTests(unittest.TestCase):
         source = inputs / 'record.txt'
         source.write_text('value=2.5\nscope=saved observation; no new experiment\n', encoding='utf-8')
         original = source.read_bytes()
+        section_config = {}
+        if method == 'sections':
+            template = self.root.parent / 'saved-sections.md'
+            template.write_text('# Saved observation\n\n## Result\nExplain the record.\n\n'
+                '## Scope\nState what was run.\n', encoding='utf-8')
+            criteria = template.with_name('saved-review.md')
+            criteria.write_text('Check the result and execution scope against the saved record.\n', encoding='utf-8')
+            section_config = {'template': str(template), 'criteria': str(criteria), 'outline_strategy': 'template',
+                'max_review_iterations': 2}
         requirement = freeze_report_requirement({'outline_strategy': 'auto',
             'draft_scope': 'document', 'review_scope': 'document', 'reviewer': 'llm',
             'document_review': True, 'max_review_iterations': 0,
             'allow_source_backtracking': False, 'allow_llm_fallback': False,
-            'figures': {'enabled': False}}, method='article')
+            'figures': {'enabled': False}, **section_config}, method=method)
         app = ToolApplication.create(self.root, 'Explain the saved observation without new experiments.',
             model='fixture', sources={'inputs': inputs}, services=self.services,
             professional_inputs=True, allow_execution=False, report_requirement=requirement,
             max_turns=4, max_tokens=600000, max_attempts=40)
+        if method == 'sections':
+            app.state['config']['professional_work'] = 'requests.v1'
+            app._save()
         body = 'The supplied record states value=2.5. This is a saved observation; no new experiment was run.'
+        sections = [{'section_id': 'result', 'draft_markdown': body},
+            {'section_id': 'scope', 'draft_markdown': 'No new experiment was run.'}]
         replies = [
             {'read_windows': [{'path': str(source)}]},
             {'title': 'Saved observation', 'materials': [str(source)], 'delivery_artifacts': []},
-            {'draft_markdown': body},
+            {'sections': sections} if method == 'sections' else {'draft_markdown': body},
         ]
 
         def provider(mode, request, **kwargs):
@@ -1031,41 +1054,97 @@ class ProfessionalWorkLoopTests(unittest.TestCase):
 
         def first_check_unavailable(client, *args, **options):
             nonlocal refused
-            if options.get('label') == 'article-independent-review' and not refused:
+            if options.get('label') == ('report-document-reviewer' if method == 'sections'
+                    else 'article-independent-review') and not refused:
                 from simple_ar.core.budget import BudgetExceededError
                 refused = True
                 # Inject only the pre-provider refusal. The real transport,
                 # author receipts, caller grant and subsequent review remain
                 # in the normal task/ledger path; no fake accepted review.
+                if method == 'sections':
+                    from simple_ar.integrations.llm import LLMError
+                    raise LLMError('Budget refused before provider attempt 1') from BudgetExceededError('Offline capacity')
                 raise BudgetExceededError('Offline pre-provider capacity refusal')
             return native_ask(client, *args, **options)
 
         self.enterContext(patch.object(LLMClient, 'ask_json', first_check_unavailable))
-        stopped = app.run(actions=[{'tool_name': 'compose_document', 'arguments': {
-            'goal': app.state['requests'][0], 'material_roots': ['inputs'], 'finish': True}}],
-            progress=lambda _: None)
+        with patch.object(app.writing, '_unstarted_inspection_action', return_value=None):
+            stopped = app.run(actions=[{'tool_name': 'compose_document', 'arguments': {
+                'goal': app.state['requests'][0], 'material_roots': ['inputs'], 'finish': True}}],
+                progress=lambda _: None)
         self.assertEqual(stopped['status'], 'paused', stopped)
         self.assertEqual(self.send.call_count, 3, self._observations(app))
         self.assertFalse(replies)
         stop = app.session.store.read_json(app.state['turns'][-1]['reply'])
-        self.assertEqual(stop['owner_stop']['reason'], 'shared_budget_exhausted')
+        self.assertEqual(stop['owner_stop']['reason'],
+            'owner_failed' if method == 'sections' else 'shared_budget_exhausted')
         observation = app.session.store.read_json(stop['source_result'])
-        self.assertEqual(observation['data']['failure_kind'], 'resource_exhausted')
+        self.assertEqual(observation['data']['failure_kind'],
+            'composition_incomplete' if method == 'sections' else 'resource_exhausted')
         identity = Path(stop['source_result']).parent.name
         owner = self.root / 'tools/writing' / identity
         protected = {p: p.read_bytes() for p in owner.rglob('*') if p.is_file()}
         protected[self.root / stop['source_result']] = (self.root / stop['source_result']).read_bytes()
         old_ledger = app.ledger.to_dict()
         app = self._load()
-        app.run(progress=lambda _: None)
-        self.assertEqual(app.ledger.to_dict(), old_ledger)
-        self.assertEqual(self.send.call_count, 3)
-        replies.append({'section_reviews': [{'section_id': 'document', 'verdict': 'pass', 'findings': []}]})
-        final = app.run(resource_allowances={'llm_requests': 1, 'total_tokens': 200000},
-            authorization_id='offline-candidate-inspection',
-            authorization_reason='One offline check of completed work; preserve failed review and usage.',
-            progress=lambda _: None)
-        self.assertEqual(final['status'], 'completed', final)
+        if method == 'article':
+            app.run(progress=lambda _: None)
+            self.assertEqual(app.ledger.to_dict(), old_ledger)
+            self.assertEqual(self.send.call_count, 3)
+        else:
+            # Unknown/reserved or an already-attempted physical check cannot
+            # become new work merely because its response file is absent.
+            gateway = app.writing
+            for state in ('reserved', 'unknown', 'settled'):
+                with self.subTest(state=state):
+                    before = gateway.ledger.to_dict()
+                    pending = next(p for p in (owner / 'writer/model_calls').glob('*/request.json')
+                        if json.loads(p.read_bytes())['options']['label'] == 'report-document-reviewer')
+                    gateway.ledger.reserve('pending-check', {'llm_requests': 1}, session_id=gateway.session_id,
+                        attempt_id=identity, logical_call_id=f'{identity}:writing:{pending.parent.name}')
+                    if state == 'unknown':
+                        gateway.ledger.mark_unknown('pending-check', reason='Fixture lost response')
+                    elif state == 'settled':
+                        gateway.ledger.settle('pending-check', {'llm_requests': 1}, actual_source='provider')
+                    self.assertIsNone(gateway.continuation(observation, identity))
+                    gateway.ledger._entries.pop('pending-check')
+                    gateway.ledger.save()
+                    self.assertEqual(gateway.ledger.to_dict(), before)
+            from simple_ar.report.writing import section_author_source
+            from simple_ar.core.capabilities import ArtifactStore
+            with self.assertRaisesRegex(ValueError, 'incomplete model operation'):
+                section_author_source(ArtifactStore(owner))  # Historical v1 stays strict.
+            _, authored = section_author_source(ArtifactStore(owner), author_only=True)
+            gateway._unstarted_section_inspection(ArtifactStore(owner), authored)
+            self.assertIsNotNone(gateway.continuation(observation, identity))
+            pending = next(p for p in (owner / 'writer/model_calls').glob('*/request.json')
+                if json.loads(p.read_bytes())['options']['label'] == 'report-document-reviewer')
+            response = {'section_reviews': [{'section_id': sid, 'verdict': 'pass', 'findings': []}
+                for sid in ('result', 'scope')]}
+            receipt = {'response': response, **{name+'_sha256': hashlib.sha256(json.dumps(value,
+                sort_keys=True, ensure_ascii=False).encode()).hexdigest() for name, value in (
+                    ('request', json.loads(pending.read_bytes())), ('response', response))}}
+            pending.with_name('response.json').write_text(json.dumps(receipt), encoding='utf-8')
+            try:
+                self.assertIsNone(gateway.continuation(observation, identity))
+                self.assertFalse(gateway.can_resume_after_budget(observation, identity))
+            finally:
+                pending.with_name('response.json').unlink()
+        reviews = [{'section_id': sid, 'verdict': 'pass', 'findings': []}
+            for sid in (['result', 'scope'] if method == 'sections' else ['document'])]
+        if negative:
+            reviews[0].update(verdict='revise_required', findings=[{'finding_id': 'style-follow-up',
+                'type': 'style', 'severity': 'minor', 'required_action': 'revise',
+                'section_id': 'result', 'message': 'Explain this observation more clearly.',
+                'draft_quotes': [{'section_id': 'result', 'quote': 'The supplied record states value=2.5.'}]}])
+        replies.append({'section_reviews': reviews})
+        final = (app.run(progress=lambda _: None,
+            should_stop=lambda: negative and self.send.call_count >= 4) if method == 'sections' else
+            app.run(resource_allowances={'llm_requests': 1, 'total_tokens': 200000},
+                authorization_id='offline-candidate-inspection',
+                authorization_reason='One offline check of completed work; preserve failed review and usage.',
+                progress=lambda _: None))
+        self.assertEqual(final['status'], 'paused' if negative else 'completed', final)
         self.assertEqual(self.send.call_count, 4)
         self.assertFalse(replies)
         self.assertEqual(source.read_bytes(), original)
@@ -1074,7 +1153,14 @@ class ProfessionalWorkLoopTests(unittest.TestCase):
         result = next(row for row in reversed(self._observations(app)) if row['tool_name'] == 'compose_document')
         current = self.root / 'tools/writing' / Path(result['data']['version']).name
         self.assertEqual(json.loads((current / 'request.json').read_bytes())['continued_source_review'], 'inspect_only.v1')
-        self.assertEqual(json.loads((current / 'writer/writer.json').read_bytes())['sections'][0]['draft_markdown'], body)
+        written = json.loads((current / 'writer/writer.json').read_bytes())
+        self.assertEqual(written['sections'][0]['draft_markdown'], body)
+        if method == 'sections':
+            self.assertEqual(json.loads((current / 'writer/report_inputs.json').read_bytes())['config']['max_review_iterations'], 0)
+            self.assertFalse(any(row['action'] in {'draft', 'document_joint_revise'} for row in written['iterations']))
+            if negative:
+                self.assertEqual(result['data']['editable_markdown'], result['data']['version']+'/candidate.md')
+                self.assertEqual(written['independent_review']['review_status'], 'needs_revision')
         self.assertEqual(self._process_receipts(), {})
         self.coordinator.assert_not_called()
 

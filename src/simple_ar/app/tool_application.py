@@ -1805,6 +1805,13 @@ class ToolApplication:
             gap = getattr(owner, 'can_return_gap', None)
             if gap is not None and gap(observed, Path(source).parent.name):
                 return True
+            # A domain may prove a distinct, never-dispatched operation from
+            # completed work. Its proposal still goes through the same journal,
+            # permissions and budget; a saved failure is never replayed here.
+            continuation = getattr(owner, 'continuation', None)
+            action = continuation(observed, Path(source).parent.name) if continuation is not None else None
+            if isinstance(action, dict) and action.get('tool_name') and 'stop' not in action:
+                return True
         if (not isinstance(known, list)
                 or not set(self._professional_resource_authorizations()).difference(known)):
             return False

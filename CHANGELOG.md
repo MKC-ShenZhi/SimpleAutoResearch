@@ -9,7 +9,7 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 ### Fixed
 
 - Preserve complete, independently checked revisions as work candidates when required corrections remain. A rejected revision no longer depends on publishing an older draft before professional work can continue; only adopted manuscripts qualify for publication.
-- Share source validation across writing, producer repair and delivery. A complete draft with incompatible structure can supply context for reorganization and fresh inspection while its original failure and usage remain recorded. Incomplete inspections, unknown requests and unread attachments retain their separate recovery limits.
+- Share source validation across writing, producer repair and delivery. Complete drafts can supply context for reorganization. A complete section manuscript with a never-dispatched check can continue with inspection alone after its original accounting is verified, without reselection or redrafting. Existing checks, unknown requests and unread attachments retain their recovery limits; failures and usage remain recorded.
 - Share complete provenance records in new feedback and section reviews instead of repeating them per attachment. Coordination receives current findings without a duplicate full review. Derived delivery hints no longer force source reselection; original evidence and frozen historical requests retain their meaning.
 - Bind explicit section structure before writing so templates and final checks use the same outline. Reorganization can retain proven evidence and prior review opinions; equivalent directory paths and exported copies no longer force redundant investigation. Historical structure and recovery contracts remain unchanged.
 

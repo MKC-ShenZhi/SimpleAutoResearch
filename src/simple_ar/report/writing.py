@@ -1227,7 +1227,7 @@ def run_report_writing_capability(*, context: CapabilityContext, request: Report
     if request.method not in {'article', 'sections'}:
         raise ValueError('Report writing method must be article or sections.')
     section_candidate = (isinstance(request.candidate_source, dict)
-        and request.candidate_source.get('contract') == 'retained_sections.v1')
+        and request.candidate_source.get('contract') in {'retained_sections.v1', 'retained_section_author.v1'})
     if request.candidate_source is not None and not section_candidate and (
             request.method != 'article' or not article_inspection_enabled(request.config)):
         raise ValueError('Supplied candidate adoption requires article method and enabled independent document inspection')
@@ -1284,6 +1284,8 @@ def run_report_writing_capability(*, context: CapabilityContext, request: Report
         prior_body = _section_reorganization_body(supplied_sections, output_outline)
         reorganizing = prior_body is not None
         if reorganizing:
+            if request.candidate_source['contract'] == 'retained_section_author.v1':
+                raise ValueError('Inspection-only author cannot change its original section structure')
             request = replace(request, report_context=_section_reorganization_context(
                 request.report_context, prior_body, request.prior_draft))
             request = replace(request, report_context=_section_reorganization_feedback(
@@ -1460,9 +1462,10 @@ def professional_writer_config(binding: dict[str, Any]) -> ReportRuntimeConfig:
             raise ValueError('Checked-work continuation requires its original source proof')
     elif inspection is not None:
         if (inspection != 'inspect_only.v1'
-                or binding.get('prior_input_reuse', {}).get('candidate_contract') != 'retained_article_author.v1'
+                or binding.get('prior_input_reuse', {}).get('candidate_contract') not in {
+                    'retained_article_author.v1', 'retained_section_author.v1'}
                 or not binding.get('candidate_source') or not saved.get('prior_result')):
-            raise ValueError('Invalid continued article inspection contract')
+            raise ValueError('Invalid continued author inspection contract')
         config.max_review_iterations = 0
     return config
 
@@ -1677,13 +1680,14 @@ def validate_document_inspection(store: ArtifactStore, binding: dict, data: dict
 
 
 
-def section_author_source(owner: ArtifactStore) -> tuple[dict, dict]:
+def section_author_source(owner: ArtifactStore, *, author_only: bool = False) -> tuple[dict, dict]:
     """The same complete section-author proof for work and source consumers."""
     names = ['request.json', 'documents.json', 'writer/report_inputs.json',
         'writer/sections.json', 'writer/writer.json']
     names.extend(file.relative_to(owner.root).as_posix()
         for file in (owner.root / 'writer/model_calls').rglob('*.json'))
-    source = {'contract': 'retained_sections.v1', 'owner': str(owner.root.resolve()),
+    source = {'contract': 'retained_section_author.v1' if author_only else 'retained_sections.v1',
+        'owner': str(owner.root.resolve()),
         'sha256': {name: hashlib.sha256(owner.resolve(name).read_bytes()).hexdigest() for name in names}}
     return source, retained_section_candidate(source)
 
@@ -1859,7 +1863,8 @@ def retained_section_candidate(source: dict[str, Any], *, _seen: frozenset[Path]
     from simple_ar.report.schema import ReportSectionDraft, ReportIterationRecord
     from simple_ar.integrations.llm import LLMResponseError
     if (not isinstance(source, dict) or set(source) != {'contract', 'owner', 'sha256'}
-            or source['contract'] != 'retained_sections.v1' or not Path(source['owner']).is_absolute()
+            or source['contract'] not in {'retained_sections.v1', 'retained_section_author.v1'}
+            or not Path(source['owner']).is_absolute()
             or not isinstance(source['sha256'], dict)):
         raise ValueError('Retained section candidate requires an exact saved owner binding')
     owner = ArtifactStore(Path(source['owner']))
@@ -1976,11 +1981,11 @@ def retained_section_candidate(source: dict[str, Any], *, _seen: frozenset[Path]
         label = request.get('options', {}).get('label', '')
         author = label.startswith(('report-writer', 'report-integrator', 'report-reviser',
             'report-document-reviser', 'report-document-joint-reviser'))
-        # Only the new native contract separates complete authors from failed
-        # inspection operations. All files above remain hash-bound; inspection
-        # acceptance is never inherited. Historical professional proof still
-        # requires every physical operation's complete atomic response.
-        if native and label in {'report-document-reviewer', 'report-document-verifier'}:
+        # Author-only evidence has its own role. Historical professional v1
+        # proof still requires every operation's complete atomic response.
+        # Both pin all saved bytes and neither inherits inspection acceptance.
+        if (native or source['contract'] == 'retained_section_author.v1') and label in {
+                'report-document-reviewer', 'report-document-verifier'}:
             continue
         response_path = str(Path(name).with_name('response.json')).replace('\\', '/')
         if response_path not in records:

@@ -861,7 +861,9 @@ class WritingToolGateway:
                     (result.recipe, result.binding, result.linkage, result.candidate) = self._continued_document_inputs(
                         continued, identity, (report or {}).get('requirement'), allow_completed=not interrupted,
                         allow_standalone=True, checked_work_admitted=(original is None
-                            or original.get('continued_source_review') == 'checked_work.v1'))
+                            or original.get('continued_source_review') == 'checked_work.v1'),
+                        author_only=original is None or original.get('candidate_source', {}).get('contract')
+                            == 'retained_section_author.v1')
                     return result
                 _, _, retained = self._composition_receipt(parent_id)
                 review = self.final_review(retained)
@@ -879,7 +881,9 @@ class WritingToolGateway:
                 request, identity, (report or {}).get('requirement'),
                 inspect_only=original is None or original.get('continued_source_review') == 'inspect_only.v1',
                 checked_work_admitted=(original is None
-                    or original.get('continued_source_review') == 'checked_work.v1'))
+                    or original.get('continued_source_review') == 'checked_work.v1'),
+                author_only=original is None or original.get('candidate_source', {}).get('contract')
+                    == 'retained_section_author.v1')
             return result
         feedback = original.get('revision_feedback') if original is not None else result.feedback
         if feedback is not None:
@@ -1013,10 +1017,10 @@ class WritingToolGateway:
         return resolved
 
     @staticmethod
-    def _section_author_source(store: ArtifactStore) -> tuple[dict, dict]:
+    def _section_author_source(store: ArtifactStore, *, author_only: bool = False) -> tuple[dict, dict]:
         """Bind the existing author/checkpoint port once for both consumers."""
         from simple_ar.report.writing import section_author_source
-        source, candidate = section_author_source(store)
+        source, candidate = section_author_source(store, author_only=author_only)
         if candidate.get('checked_revision') is not None:
             from simple_ar.report.agent import _final_sequence
             from simple_ar.report.schema import ReportMemory, ReportSectionDraft
@@ -1034,7 +1038,8 @@ class WritingToolGateway:
                                   requirement: dict | None, *,
                                   inspect_only: bool = True, allow_completed: bool = False,
                                   allow_standalone: bool = False,
-                                  checked_work_admitted: bool = True) -> tuple[ComposeRequest, dict, dict, dict]:
+                                  checked_work_admitted: bool = True,
+                                  author_only: bool = False) -> tuple[ComposeRequest, dict, dict, dict]:
         """Continue an author-complete failed owner, not its failed inspection.
 
         A native receipt locates the fixed same-task owner. The report operation
@@ -1076,7 +1081,14 @@ class WritingToolGateway:
                 for file in (store.root / 'writer').rglob('*.json'))]
             candidate_contract = 'retained_article_author.v1'
         elif method == 'sections':
-            source, section_candidate = self._section_author_source(store)
+            pending_inspection = any(not path.with_name('response.json').exists()
+                and json.loads(path.read_bytes()).get('options', {}).get('label') in {
+                    'report-document-reviewer', 'report-document-verifier'}
+                for path in (store.root / 'writer/model_calls').glob('*/request.json'))
+            source, section_candidate = self._section_author_source(store,
+                author_only=author_only and pending_inspection)
+            if source['contract'] == 'retained_section_author.v1':
+                self._unstarted_section_inspection(store, section_candidate)
             names = list(source['sha256'])
             candidate_contract = source['contract']
         else:
@@ -1126,7 +1138,7 @@ class WritingToolGateway:
             'target_words': request.target_words or saved['target_words'],
             **({'max_cited_sources': saved.get('max_cited_sources', 0),
                 'required_headings': saved.get('required_headings', [])}
-                if inspect_only and method == 'article' else {}),
+                if inspect_only and (method == 'article' or candidate_contract == 'retained_section_author.v1') else {}),
             'figures': [ComposeFigure.model_validate(row) if isinstance(row, dict) else row for row in saved['figures']],
             'publication': (request.publication if request.publication is not None else
                 CompositionPublication.model_validate(saved['publication']) if saved.get('publication') else None),
@@ -1486,6 +1498,8 @@ class WritingToolGateway:
         Document-work finish binds delivery to the export proposal; composition
         itself never becomes a terminal delivery observation.
         """
+        if observed.get('status') == 'error':
+            return self._unstarted_inspection_action(observed, attempt_id)
         if (observed.get('tool_name') != 'compose_document' or observed.get('status') != 'ok'
                 or observed.get('error')
                 or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', attempt_id)):
@@ -1776,7 +1790,11 @@ class WritingToolGateway:
             if (binding.get('document_work', {}).get('contract') not in _DOCUMENT_WORK_CONTRACTS
                     or not article_inspection_enabled(professional_writer_config(binding))):
                 return None
-            source = retained_article_candidate(store, binding, unchecked_revision=True)
+            if binding.get('report_binding', {}).get('requirement', {}).get('method') == 'sections':
+                source, candidate = self._section_author_source(store, author_only=True)
+                self._unstarted_section_inspection(store, candidate)
+            else:
+                source = retained_article_candidate(store, binding, unchecked_revision=True)
             saved = binding['request']
             arguments = {'prior_result': f'records/{attempt_id}/native_result.json',
                 'goal': saved['goal'], 'finish': saved.get('finish', False)}
@@ -1800,6 +1818,64 @@ class WritingToolGateway:
     def can_resume_after_budget(self, observed: dict, attempt_id: str) -> bool:
         """Pure eligibility proof; an explicit new grant is checked by the app."""
         return self.resume_after_budget(observed, attempt_id) is not None
+
+    def _unstarted_section_inspection(self, store: ArtifactStore, candidate: dict) -> None:
+        """Prove a never-dispatched check, not merely a missing response.
+
+        Atomic author calls must have matching settled provider accounting.
+        The exact pending inspection must have no reservation in either ledger.
+        Any completed check of this body wins over a stale checkpoint. This
+        reads the existing journal only; it cannot release or replay a call.
+        """
+        if self._review_capacity() is None:
+            raise ValueError('Pending inspection has unresolved or unavailable accounting')
+        entries = [entry for ledger in (self.ledger, getattr(self.workspace, 'ledger', None))
+            if ledger is not None for entry in ledger.entries]
+        expected = {row['section_id']: {'section_id': row['section_id'],
+            'heading': row['heading'], 'markdown': row['draft_markdown']} for row in candidate['sections']}
+        pending, accounted_author = 0, False
+        for path in (store.root / 'writer/model_calls').glob('*/request.json'):
+            request = json.loads(path.read_bytes())
+            label = request.get('options', {}).get('label', '')
+            logical = request.get('options', {}).get('budget_call_id',
+                f'{store.root.name}:writing:{path.parent.name}')
+            calls = [entry for entry in entries if entry.logical_call_id == logical]
+            if label.startswith(('report-writer', 'report-integrator', 'report-reviser',
+                    'report-document-reviser', 'report-document-joint-reviser')):
+                accounted_author = accounted_author or any(entry.status == 'settled'
+                    and entry.session_id == self.session_id and entry.attempt_id == store.root.name
+                    and entry.actual_source == 'provider' and entry.actual.get('llm_requests', 0) >= 1
+                    for entry in calls)
+            elif label in {'report-document-reviewer', 'report-document-verifier'}:
+                payload, _ = json.JSONDecoder().raw_decode(request['prompt'][request['prompt'].index('{'):])
+                rows = payload.get('sections', [])
+                matches = (len(rows) == len(expected)
+                    and {row['section_id']: {key: row[key] for key in (
+                        'section_id', 'heading', 'markdown')} for row in rows} == expected)
+                if path.with_name('response.json').exists():
+                    if matches:
+                        raise ValueError('Complete response already exists for this candidate inspection')
+                else:
+                    if (not matches or calls or request.get('response_record_contract') != 'atomic_complete.v2'
+                            or request.get('input_snapshot') != store.read_json('writer/report_inputs.json')['snapshot_id']):
+                        raise ValueError('Pending inspection is not a proved unstarted check of this author')
+                    pending += 1
+        if pending != 1 or not accounted_author:
+            raise ValueError('Inspection continuation requires one unstarted check and accounted complete author')
+
+    def _unstarted_inspection_action(self, observed: dict, attempt_id: str) -> dict | None:
+        """Continue proved author work once; failed check-only work stays stopped."""
+        if (not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', attempt_id)
+                or self._review_capacity() is not True):
+            return None
+        action = self._budget_review_action(observed, attempt_id)
+        if action is None:
+            return None
+        binding = ArtifactStore(self.root / 'tools/writing' / attempt_id).read_json('request.json')
+        if (binding.get('continued_source_review') is not None
+                or binding.get('report_binding', {}).get('requirement', {}).get('method') != 'sections'):
+            return None  # Legacy article stops keep their explicit resource-grant contract.
+        return action
 
     def resume_after_budget(self, observed: dict, attempt_id: str) -> dict | None:
         """Propose inspection only after the app grants additional resources."""
@@ -3828,9 +3904,10 @@ class WritingToolGateway:
                 binding['candidate_source'] = continued_source
                 if reuse_linkage.get('checked_work'):
                     binding['continued_source_review'] = 'checked_work.v1'
-                if reuse_linkage['candidate_contract'] == 'retained_article_author.v1':
+                if reuse_linkage['candidate_contract'] in {'retained_article_author.v1', 'retained_section_author.v1'}:
                     if not reuse_linkage.get('checked_work') and (not recovering or 'continued_source_review' in original_binding):
                         binding['continued_source_review'] = 'inspect_only.v1'
+                if reuse_linkage['candidate_contract'] == 'retained_article_author.v1':
                     from simple_ar.report.review_evidence import _resolve_pointer
                     _, previous = _resolve_pointer(json.loads(Path(continued_source['path']).read_bytes()),
                         continued_source['pointer'])
