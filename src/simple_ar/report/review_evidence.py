@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import re
+from copy import deepcopy
 from collections.abc import Mapping
 from typing import Any
 
@@ -16,6 +17,248 @@ from simple_ar.report.schema import (
 )
 
 GAP_EVIDENCE_CONTRACT = "empty_gap_observation.v1"
+DRAFT_REFERENCE_CONTRACT = "current_draft_paragraphs.v1"
+COMPARISON_VERIFICATION_CONTRACT = "unproven_comparison_requires_verification.v1"
+LOCATOR_REFERENCE_CONTRACT = "current_scalar_locator.v1"
+SHARED_PRODUCER_LOCATOR_CONTRACT = "current_scalar_locator.v2"
+EVIDENCE_NAVIGATION_CONTRACTS = (None, LOCATOR_REFERENCE_CONTRACT, SHARED_PRODUCER_LOCATOR_CONTRACT)
+DRAFT_QUOTE_SCHEMA = {"section_id": "current supplied section id", "paragraph": "pN from draft_locator"}
+
+
+def draft_paragraph_spans(markdown: str) -> list[tuple[int, int]]:
+    """Offsets of the stripped v1 paragraphs in the untouched current body."""
+    spans = []
+    start = 0
+    for boundary in [*re.finditer(r"\r?\n[ \t]*\r?\n", markdown), None]:
+        end = boundary.start() if boundary is not None else len(markdown)
+        part = markdown[start:end]
+        if part.strip():
+            spans.append((start + len(part) - len(part.lstrip()),
+                          end - len(part) + len(part.rstrip())))
+        start = boundary.end() if boundary is not None else end
+    return spans
+
+
+def _draft_paragraphs(view: Mapping[str, Any]) -> dict[str, list[str]]:
+    """v1: nonempty, stripped blank-line-separated Markdown spans, numbered from 1.
+
+    Only the frozen request's full current sections own these identities. Never
+    number historical quotations, plans, headings or bounded neighbor windows.
+    """
+    return {row["section_id"]: [row.get("markdown", "")[start:end] for start, end in
+            draft_paragraph_spans(row.get("markdown", ""))]
+            for row in view.get("sections", [])}
+
+
+def review_draft_locator(view: Mapping[str, Any]) -> dict[str, Any]:
+    """Bounded navigation only; exact text remains in the supplied sections."""
+    return {sid: {"paragraph_count": len(parts),
+                  "previews": {f"p{i}": part[:80] for i, part in enumerate(parts[:24], 1)},
+                  "omitted_preview_count": max(0, len(parts) - 24)}
+            for sid, parts in _draft_paragraphs(view).items()}
+
+
+def _resolve_draft_quotes(row: Mapping[str, Any], view: Mapping[str, Any]) -> dict[str, Any]:
+    if "draft_reference_contract" not in view:
+        return dict(row)  # Frozen old requests retain their original semantics.
+    if view["draft_reference_contract"] != DRAFT_REFERENCE_CONTRACT:
+        raise LLMResponseError("Unknown current draft reference contract.")
+    quotes = row.get("draft_quotes")
+    if not isinstance(quotes, list):
+        return dict(row)  # Existing schema owns malformed/missing lists.
+    paragraphs = _draft_paragraphs(view)
+    resolved = []
+    for reference in quotes:
+        if not isinstance(reference, Mapping):
+            resolved.append(reference)
+            continue
+        keys = set(reference)
+        if "paragraph" not in reference:
+            if keys - {"section_id", "quote"}:
+                raise LLMResponseError("Unknown draft quotation selector.")
+            resolved.append(reference)  # Literal quotations are never repaired.
+            continue
+        if keys != {"section_id", "paragraph"}:
+            raise LLMResponseError("Draft paragraph selection cannot mix quotation or other selectors.")
+        selector = reference["paragraph"]
+        match = re.fullmatch(r"p([1-9][0-9]*)", selector) if isinstance(selector, str) else None
+        sid = reference["section_id"]
+        parts = paragraphs.get(sid, []) if isinstance(sid, str) else []
+        if not match or int(match[1]) > len(parts):
+            raise LLMResponseError("Draft paragraph must select an existing current section paragraph.")
+        resolved.append({"section_id": sid, "quote": parts[int(match[1]) - 1]})
+    return {**row, "draft_quotes": resolved}
+
+
+DELIVERY_REVIEW_CONTRACT = 'delivery_artifacts.v1'
+DECLARATION_ADOPTION_CONTRACT = 'producer_declarations.v1'
+CLAIM_ADOPTION_V2 = 'producer_declarations.v2'
+DECLARATION_ADOPTION_CONTRACTS = {DECLARATION_ADOPTION_CONTRACT, CLAIM_ADOPTION_V2}
+
+
+def declaration_adoption_contract(snapshot: Mapping[str, Any]) -> str:
+    contract = snapshot.get('declaration_adoption_contract', DECLARATION_ADOPTION_CONTRACT)
+    if contract not in DECLARATION_ADOPTION_CONTRACTS:
+        raise ValueError('Unknown producer declaration adoption contract')
+    return contract
+DELIVERY_COPY_CONTRACT = 'delivery_copies.v1'
+
+
+def project_delivery_producers(artifacts: list[dict]) -> dict[str, Any]:
+    """Frozen current_scalar_locator.v2 wire view, local to one request.
+
+    Preserve row order and every field except replacing each present producer
+    with {"$ref": "/delivery_producers/N"}. The table holds complete JSON
+    records in first-occurrence order, equal by canonical JSON (not file SHA,
+    path, role or a partial producer identity). Missing and false producers stay
+    distinct. Public pointers address the physical view; no virtual aliases.
+    This is presentation only, never a replacement for frozen repair subjects.
+    """
+    producers: list[Any] = []
+    indices: dict[str, int] = {}
+    rows = []
+    for artifact in artifacts:
+        row = deepcopy(artifact)
+        if 'producer' in row:
+            key = json.dumps(row['producer'], sort_keys=True, ensure_ascii=False, separators=(',', ':'),
+                             allow_nan=False)
+            if key not in indices:
+                indices[key] = len(producers)
+                producers.append(row['producer'])
+            row['producer'] = {'$ref': f'/delivery_producers/{indices[key]}'}
+        rows.append(row)
+    return {'delivery_artifacts': rows, 'delivery_producers': producers}
+
+
+def _delivery_producer(view: Mapping[str, Any], row: Mapping[str, Any]) -> Any:
+    if (view.get('evidence_navigation_contract') != SHARED_PRODUCER_LOCATOR_CONTRACT
+            or 'producer' not in row):
+        return row.get('producer')
+    reference = row['producer']
+    pointer = reference.get('$ref') if isinstance(reference, Mapping) else None
+    match = re.fullmatch(r'/delivery_producers/(0|[1-9][0-9]*)', pointer) if isinstance(pointer, str) else None
+    producers = view.get('delivery_producers')
+    if (not match or set(reference) != {'$ref'} or not isinstance(producers, list)
+            or int(match[1]) >= len(producers)):
+        raise LLMResponseError('Invalid current delivery producer reference; no identity was repaired.')
+    return producers[int(match[1])]
+
+
+def restore_delivery_producers(view: Mapping[str, Any]) -> list[dict]:
+    """Losslessly expand v2 rows; legacy requests retain their literal records."""
+    rows = []
+    for artifact in view.get('delivery_artifacts', []):
+        row = deepcopy(artifact)
+        if 'producer' in row:
+            row['producer'] = deepcopy(_delivery_producer(view, artifact))
+        rows.append(row)
+    return rows
+
+
+def delivery_subject_view(row: Mapping[str, Any], *, coverage: bool = False) -> dict:
+    """Project frozen subjects, retaining only explicitly bound copy aliases.
+
+    An alias shares the inspected bytes, never the original's producer role.
+    Filesystem/version admission belongs to the writing byte owner.
+    """
+    keys = (('path', 'sha256', 'coverage', 'producer', 'consumers', 'visual_reviewed') if coverage
+        else ('path', 'sha256', 'producer', 'consumers'))
+    result = {key: row[key] for key in keys if key in row}
+    if 'copies' in row or 'copy_contract' in row:
+        if row.get('copy_contract') != DELIVERY_COPY_CONTRACT or not isinstance(row.get('copies'), list):
+            raise ValueError('Unknown or incomplete delivery copy contract')
+        seen = {row['path']}
+        for copy in row['copies']:
+            if (not isinstance(copy, dict) or set(copy) != {'path', 'sha256'}
+                    or not isinstance(copy['path'], str) or not copy['path']
+                    or copy['path'] in seen or copy['sha256'] != row['sha256']):
+                raise ValueError('Delivery copy differs from its inspected source version')
+            seen.add(copy['path'])
+        result.update(copy_contract=DELIVERY_COPY_CONTRACT, copies=row['copies'],
+            copy_scope=row.get('copy_scope', 'Byte-equivalent delivery copies; producer and execution roles belong only to the original subject.'))
+    return result
+
+
+def attachment_review_blocks_editing(inspection: dict) -> bool:
+    """Prose may fix disclosure, never bad/unobserved attachment bytes."""
+    contract = inspection.get('declaration_adoption', {}).get('contract')
+    if contract is not None and contract not in DECLARATION_ADOPTION_CONTRACTS:
+        raise ValueError('Unknown producer declaration adoption contract')
+    if contract is None:
+        return inspection.get('status', 'reviewed') != 'reviewed'  # Historical contract unchanged.
+    return (bool(inspection.get('defects') or inspection.get('uninspected'))
+        or inspection.get('status') not in {'reviewed', 'needs_revision'})
+
+
+def delivery_finding_targets(finding: Any, artifacts: list[dict]) -> list[dict]:
+    """Resolve explicit accused subjects, never infer them from evidence quotes."""
+    targets = []
+    pointers = getattr(finding, 'delivery_targets', [])
+    if len(pointers) != len(set(pointers)):
+        raise LLMResponseError('Delivery defect targets must be distinct current text pointers.')
+    for pointer in pointers:
+        match = re.fullmatch(r'/delivery_artifacts/(0|[1-9][0-9]*)/text', pointer)
+        if match is None or int(match[1]) >= len(artifacts):
+            raise LLMResponseError('Delivery defect target must select an existing frozen attachment text field.')
+        row = artifacts[int(match[1])]
+        if row.get('coverage') != 'complete' or not isinstance(row.get('text'), str):
+            raise LLMResponseError('Delivery defect target has no completely observed current text.')
+        targets.append(row)
+    return targets
+
+
+def delivery_review_result(snapshot: dict, reviews: list[ReportSectionReview]) -> dict:
+    """Bind validated findings to the exact frozen attachment versions."""
+    contract = declaration_adoption_contract(snapshot)
+    artifacts = snapshot['artifacts']
+    defects = []
+    for review in reviews:
+        for finding in review.findings:
+            targets = delivery_finding_targets(finding, artifacts)
+            if targets and finding_requires_resolution(finding):
+                defects.append({'type': 'delivery_artifact_defect',
+                    'finding': finding.model_dump(mode='json'),
+                    'targets': [delivery_subject_view(row) for row in targets]})
+    current = {row['path']: row['sha256'] for row in artifacts}
+    for row in artifacts:
+        projected = delivery_subject_view(row)
+        for copy in projected.get('copies', []):
+            if copy['path'] in current and current[copy['path']] != copy['sha256']:
+                raise ValueError('Delivery aliases disagree on a file version')
+            current[copy['path']] = copy['sha256']
+    for previous in snapshot.get('prior_defects', []):
+        if not previous.get('finding', {}).get('delivery_targets'):
+            continue  # Old inferred defects never gain explicit-target repair authority.
+        # A different manuscript or an omitted reviewer opinion cannot repair
+        # unchanged defective attachment bytes. New versions need a new review.
+        if any(current.get(row['path']) == row['sha256'] for row in previous['targets']):
+            if previous not in defects:
+                defects.append(previous)
+    missing = [{key: row[key] for key in ('path', 'sha256', 'coverage')} for row in artifacts
+               if row['coverage'] not in {'complete', 'visual_uninspected'}]
+    result = {'contract': DELIVERY_REVIEW_CONTRACT,
+        'status': 'needs_revision' if defects else 'incomplete' if missing else 'reviewed',
+        'artifacts': [delivery_subject_view(row, coverage=True) for row in artifacts],
+        'defects': defects, 'uninspected': missing,
+        'visual_pending': [{key: row[key] for key in ('path', 'sha256')} for row in artifacts
+                           if row['coverage'] == 'visual_uninspected'],
+        'scope': 'Text attachments and prose only. Figure versions are bound for the separate visual owner; reviewed does not certify images or scientific validity.'}
+    if snapshot.get('producer_completion') == 'goal_findings.v1':
+        result['producer_completion'] = 'goal_findings.v1'
+        result['producer_notes'] = snapshot['producer_notes']
+    if 'prior_defect_refs' in snapshot:
+        result['prior_defect_refs'] = snapshot['prior_defect_refs']
+    if 'producer_declarations' in snapshot:
+        groups = snapshot['producer_declarations']
+        ids = [row['id'] for group in groups for row in group['declarations']]
+        checks = [check.model_dump(mode='json') for review in reviews for check in review.producer_claim_checks]
+        result['declaration_adoption'] = {'contract': contract,
+            'producers': groups, 'checks': checks}
+        if any(row['status'] == 'unresolved_work' for row in checks):
+            result['status'] = 'needs_revision'
+        elif (len(checks) != len(ids) or {row['declaration_id'] for row in checks} != set(ids)):
+            result['status'] = 'incomplete'
+    return result
 
 
 def _allows_empty_gap(view: Mapping[str, Any], kind: str, action: str | None) -> bool:
@@ -63,7 +306,10 @@ def review_evidence_locator(view: Mapping[str, Any], *, max_chars: int = 4000, m
     roots = {"objective", "experiment_plan", "execution_context", "execution_evidence", "metric_sources",
              "verified_execution_results", "source_evidence", "allowed_sources", "supplementary_evidence",
              "extra_tool_context", "length_observation", "delivery_text_observation", "assembly_owned_content",
-             "narrative_context", "edit_scope", "document_length_budget", "revision_context"}
+             "narrative_context", "edit_scope", "document_length_budget", "revision_context", "delivery_artifacts",
+             "producer_declarations", "producer_notes"}
+    if view.get('evidence_navigation_contract') == SHARED_PRODUCER_LOCATOR_CONTRACT:
+        roots.add('delivery_producers')
     candidates: dict[str, list[tuple[int, int, str]]] = {}
 
     def walk(value: Any, path: list[str]) -> None:
@@ -192,6 +438,16 @@ def _resolve_pointer(view: Mapping[str, Any], pointer: str, *, allow_empty: bool
 
 def _role(view: Mapping[str, Any], path: list[str]) -> str:
     root, *rest = path
+    if root == 'producer_notes' and view.get('producer_completion') == 'goal_findings.v1':
+        return 'executor_record' if len(rest) > 1 and rest[1] == 'execution' else 'declaration'
+    if root == 'delivery_producers' and view.get('evidence_navigation_contract') == SHARED_PRODUCER_LOCATOR_CONTRACT:
+        return 'derived_context'
+    if root == 'producer_declarations' and view.get('declaration_adoption_contract') in DECLARATION_ADOPTION_CONTRACTS:
+        return 'executor_record' if len(rest) > 1 and rest[1] == 'execution' else 'declaration'
+    if root == 'delivery_artifacts' and view.get('delivery_review_contract') == DELIVERY_REVIEW_CONTRACT:
+        if len(rest) == 2 and rest[-1] == 'text':
+            return 'producer_output' if _delivery_producer(view, view[root][int(rest[0])]) else 'recorded_material'
+        return 'derived_context'
     if root in {"objective", "experiment_plan", "execution_context"}:
         return "declaration"
     if root in {"length_observation", "edit_scope", "document_length_budget", "narrative_context", "assembly_owned_content", "delivery_text_observation"}:
@@ -254,13 +510,24 @@ def resolve_review_evidence(response: Mapping[str, Any], view: Mapping[str, Any]
     Persisting the actual value prevents restoration from silently rebinding a
     field reference. An optional model quote remains a strict quotation.
     """
+    if 'declaration_adoption_contract' in view:
+        declaration_adoption_contract(view)
+    if ('draft_reference_contract' in view
+            and view['draft_reference_contract'] != DRAFT_REFERENCE_CONTRACT):
+        raise LLMResponseError("Unknown current draft reference contract.")
+    if view.get('comparison_verification_contract') not in (None, COMPARISON_VERIFICATION_CONTRACT):
+        raise LLMResponseError('Unknown comparison verification contract.')
+    if view.get('evidence_navigation_contract') not in EVIDENCE_NAVIGATION_CONTRACTS:
+        raise LLMResponseError('Unknown evidence navigation contract.')
     normalized = dict(response)
-    for collection in ("findings", "finding_checks"):
+    for collection in ("findings", "finding_checks", "producer_claim_checks"):
         rows = response.get(collection)
         if not isinstance(rows, list):
             continue  # The existing schema owns malformed review structures.
         normalized_rows = []
         for row in rows:
+            if isinstance(row, Mapping):
+                row = _resolve_draft_quotes(row, view)
             if not isinstance(row, Mapping) or not isinstance(row.get("evidence_quotes"), list):
                 normalized_rows.append(row)
                 continue
@@ -308,13 +575,36 @@ def resolve_review_evidence(response: Mapping[str, Any], view: Mapping[str, Any]
                     selected.update(quote=value if isinstance(value, str) else json.dumps(value, ensure_ascii=False),
                                     mode="field_reference")
                 references.append(selected)
-            normalized_rows.append({**row, "evidence_quotes": references})
+            resolved = {**row, "evidence_quotes": references}
+            if (collection == 'findings' and row.get('type') == 'metric_mismatch'
+                    and view.get('comparison_verification_contract') == COMPARISON_VERIFICATION_CONTRACT):
+                quotes = [ReportEvidenceQuote.model_validate(item) for item in references]
+                # An invalid pointer/quotation still fails. A valid located
+                # allegation without counter-evidence is work to investigate,
+                # never an established error, permission to patch, or a pass.
+                validate_evidence_quotes(quotes, view)
+                if quotes and not any(quote.role != 'derived_context'
+                        and quote.pointer not in row.get('delivery_targets', []) for quote in quotes):
+                    resolved.update(type='evidence_gap', required_action='verify',
+                        message='Unverified metric comparison (no located independent counter-evidence): '
+                            + str(row.get('message', '')),
+                        suggested_action='Investigate the retained allegation against original records and '
+                            'actual producer outputs. Do not accept it as fact, dismiss it, or merely '
+                            'qualify the prose without checking. ' + str(row.get('suggested_action', '')))
+            normalized_rows.append(resolved)
         normalized[collection] = normalized_rows
     return normalized
 
 
 def validate_finding_anchors(review: ReportSectionReview, drafts: Mapping[str, str | tuple[str, ...]], view: Mapping[str, Any]) -> None:
     for finding in review.findings:
+        material_targets = []
+        if finding.delivery_targets:
+            if view.get('delivery_review_contract') != DELIVERY_REVIEW_CONTRACT:
+                raise LLMResponseError('Delivery targets require the current frozen attachment inspection contract.')
+            material_targets = delivery_finding_targets(finding, view.get('delivery_artifacts', []))
+            for pointer in finding.delivery_targets:
+                _resolve_pointer(view, pointer)  # Validate actual supplied scalar; no stale or fabricated target.
         for reference in finding.draft_quotes:
             quote = reference.quote.strip()
             if not draft_quote_present(drafts, reference.section_id, quote):
@@ -322,8 +612,52 @@ def validate_finding_anchors(review: ReportSectionReview, drafts: Mapping[str, s
         validate_evidence_quotes(finding.evidence_quotes, view, allow_empty=
             _allows_empty_gap(view, finding.type, finding.required_action))
         if finding_requires_resolution(finding) and finding.type in {*FACTUAL_REVIEW_FINDING_TYPES, "evidence_gap"}:
-            if not finding.draft_quotes:
+            if not finding.draft_quotes and not material_targets:
                 raise LLMResponseError("Required factual review finding needs a current-draft quotation.")
             if finding.type == "metric_mismatch" and not any(
-                    quote.role != "derived_context" for quote in finding.evidence_quotes):
+                    quote.role != "derived_context" and quote.pointer not in finding.delivery_targets
+                    for quote in finding.evidence_quotes):
                 raise LLMResponseError("A definite metric mismatch needs located non-derived counter-evidence; otherwise request verification rather than assert a mismatch.")
+
+
+def validate_producer_claim_checks(reviews: list[ReportSectionReview], drafts: Mapping,
+                                   view: Mapping[str, Any], *, complete: bool = True) -> None:
+    if view.get('producer_completion') == 'goal_findings.v1':
+        if 'producer_declarations' not in view:
+            if any(review.producer_claim_checks for review in reviews):
+                raise LLMResponseError('Goal/findings review does not accept declaration adoption checks.')
+            return
+        # Imported historical producers retain their own explicit v1/v2 gate.
+    groups = view.get('producer_declarations', [])
+    contract = declaration_adoption_contract(view)
+    declarations = {row['id']: (index, row) for index, group in enumerate(groups)
+                    for row in group['declarations']}
+    if contract == CLAIM_ADOPTION_V2 and len(declarations) != sum(len(group['declarations']) for group in groups):
+        raise LLMResponseError('Producer declaration identities must be unique.')
+    seen = set()
+    for review in reviews:
+        for check in review.producer_claim_checks:
+            if (view.get('declaration_adoption_contract') not in DECLARATION_ADOPTION_CONTRACTS
+                    or check.declaration_id not in declarations or check.declaration_id in seen):
+                raise LLMResponseError('Producer declaration check targets an unknown or repeated original statement.')
+            seen.add(check.declaration_id)
+            index, statement = declarations[check.declaration_id]
+            for quote in check.draft_quotes:
+                if not draft_quote_present(drafts, quote.section_id, quote.quote):
+                    raise LLMResponseError('Producer declaration adoption quotes text absent from the current manuscript.')
+            validate_evidence_quotes(check.evidence_quotes, view)
+            if not check.explanation.strip():
+                raise LLMResponseError('Producer declaration adoption requires an evidence-based explanation.')
+            if check.status == 'accepted_limitation' and not check.draft_quotes:
+                raise LLMResponseError('Adopting a research limitation requires its disclosure in the current manuscript.')
+            if contract == DECLARATION_ADOPTION_CONTRACT and not any(quote.pointer.startswith(f'/producer_declarations/{index}/execution/')
+                       and quote.role == 'executor_record' for quote in check.evidence_quotes):
+                raise LLMResponseError('Producer declaration check must locate facts from its own execution, not another producer.')
+            if (contract == CLAIM_ADOPTION_V2 and check.status == 'satisfied_by_execution'
+                    and not any(quote.role == 'executor_record' for quote in check.evidence_quotes)):
+                raise LLMResponseError('Execution satisfaction requires actual supplied executor-record support.')
+            if check.status == 'unresolved_work' and (review.verdict not in {'revise_required', 'fail'}
+                    or not any(finding_requires_resolution(row) for row in review.findings)):
+                raise LLMResponseError('Unfinished producer work requires an actionable finding in the same independent review.')
+    if complete and set(declarations) != seen:
+        raise LLMResponseError('Independent joint review must check every original producer declaration; missing checks never mean adoption.')

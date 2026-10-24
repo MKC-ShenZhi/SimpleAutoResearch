@@ -214,6 +214,7 @@ class ResearchApplicationTests(unittest.TestCase):
                 self.assertEqual(app.budget_ledger.remaining("process_invocations"), 0)
 
     def test_article_writer_recovers_then_refreshes_with_prior_draft_and_retained_ledger(self):
+        import hashlib
         from simple_ar.report.writing import ARTICLE_OWNER, write_whole_article
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -270,14 +271,22 @@ class ResearchApplicationTests(unittest.TestCase):
             self.assertEqual(restored.controller.manifest.state_refs["report"], initial_ref)
             restored.request_report(refresh=True)
             def revise(system, prompt, **kwargs):
-                self.assertEqual(json.loads(prompt)["prior_draft"], article)
-                return {"draft_markdown": article.replace("## Observations", "## Decision note")}
+                inputs = json.loads(prompt)
+                self.assertEqual(inputs["prior_draft"], article)
+                self.assertEqual(inputs["edit_contract"]["version"], "paragraph_replacements.v2")
+                self.assertEqual(inputs["edit_contract"]["prior_draft_sha256"],
+                    hashlib.sha256(article.encode("utf-8")).hexdigest())
+                return {"prior_draft_sha256": inputs["edit_contract"]["prior_draft_sha256"],
+                    "replacements": [{"old_text": "## Observations", "new_text": "## Decision note"}]}
             with patch.object(LLMClient, "ask_json", side_effect=revise) as model:
                 refreshed = restored.advance(max_actions=3)
             self.assertEqual(model.call_count, 1)
             self.assertEqual(refreshed.status, "completed", refreshed.status_reason)
             self.assertNotEqual(refreshed.state_refs["report"], initial_ref)
             self.assertEqual(restored.controller.store.read_text(initial_ref), report)
+            self.assertIn(article.replace("## Observations", "## Decision note"),
+                restored.controller.store.read_text(refreshed.state_refs["report"]))
+            self.assertEqual(restored.budget_ledger.to_dict(), json.loads(ledger))
 
     def test_writing_preserves_paper_material_roles_and_missing_text(self):
         with tempfile.TemporaryDirectory() as tmp:

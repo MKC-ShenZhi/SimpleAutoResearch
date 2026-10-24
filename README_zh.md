@@ -128,6 +128,8 @@ uv run simple-ar research-session --config examples/data-curves/research.toml
 
 ## 适用范围与审阅
 
+V2.10 继续在 `feat/v2.10-project-research-assistant` 开发；经过检查的阶段性改进可整合进 main，不代表整个里程碑关包。上面的 main 快速开始和公开案例仍有效；[开发证据与限制](docs/EVALUATION_zh.md#v210-开发证据)分别说明安装工程核查、较早的报告反馈、材料复用与给定模板转换，不与上述公开案例混用。
+
 项目目前为**源码可见预览**，原生 `start` 入口仍属实验性功能。当前重点是 Python 科研代码、常见表格数据、范围明确的调研与有限复现，以及有材料依据的报告。复杂环境准备、长篇调研、精细出版排版和稳定效率仍需改善。
 
 来源原件只读挂载，你审阅命令提案并批准执行；任务工作区不是操作系统沙箱。科学解释与交付证据仍由你核验，执行或 PDF 编译成功本身不证明科学结论正确。模型、服务、数据和环境影响结果与成本；案例的具体条件见[成果展示](docs/showcase/README_zh.md)。
@@ -141,6 +143,7 @@ uv run simple-ar research-session --config examples/data-curves/research.toml
 | 查询命令、批准与恢复 | [CLI 参考](docs/CLI_REFERENCE_zh.md) |
 | 配置命名模型、路由和任务字段 | [配置参考](docs/CONFIG_REFERENCE_zh.md) |
 | 查看展示成果及其条件 | [成果展示](docs/showcase/README_zh.md) |
+| 核对开发证据、预算与未解决限制 | [效果证据与边界](docs/EVALUATION_zh.md) |
 | 理解代码与开发流程 | [开发指南](docs/DEVELOPMENT_zh.md) |
 | 了解近期变化 | [更新记录](CHANGELOG_zh.md) |
 

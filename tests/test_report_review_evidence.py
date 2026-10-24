@@ -16,6 +16,169 @@ from simple_ar.report.templates import load_report_template_bundle
 
 
 class ReviewEvidenceTests(unittest.TestCase):
+    def test_shared_delivery_producers_roundtrip_preserves_full_records_and_source_identity(self):
+        from copy import deepcopy
+        from simple_ar.report.review_evidence import (
+            SHARED_PRODUCER_LOCATOR_CONTRACT, project_delivery_producers, restore_delivery_producers,
+        )
+        producer = {'owner': 'run/one', 'nested': {'~/': ['完整原记录', None, False, 0]},
+            'execution': {'stdout': 'original scientific text\n' * 500}, 'unknown_field': {'keep': True}}
+        artifacts = [
+            {'path': 'source/a.csv', 'sha256': 'same', 'text': 'α,1\n', 'producer': producer,
+             'coverage': 'complete', 'consumers': [{'path': 'consumer/a'}], 'extra': [1, 2],
+             'copy_contract': 'delivery_copies.v1', 'copies': [{'path': 'copy/a.csv', 'sha256': 'same'}]},
+            {'path': 'source/b.csv', 'sha256': 'same', 'text': 'α,1\n', 'producer': deepcopy(producer),
+             'coverage': 'complete'},
+            {'path': 'source/c.csv', 'sha256': 'same', 'text': 'α,1\n',
+             'producer': {**producer, 'owner': 'run/two'}, 'coverage': 'complete'},
+            *[{'path': f'false/{i}', 'producer': value} for i, value in enumerate((None, {}, '', False, 0, True, 1))],
+            {'path': 'no-producer', 'text': 'still supplied'},
+        ]
+        original = deepcopy(artifacts)
+        projection = project_delivery_producers(artifacts)
+        view = {'evidence_navigation_contract': SHARED_PRODUCER_LOCATOR_CONTRACT, **projection}
+        # Roundtrip crosses the actual JSON boundary, not Python aliases.
+        self.assertEqual(restore_delivery_producers(json.loads(json.dumps(view))), original)
+        self.assertEqual(artifacts, original)
+        self.assertEqual(len(projection['delivery_artifacts']), len(artifacts))
+        self.assertEqual(len(projection['delivery_producers']), 9)
+        self.assertEqual(projection['delivery_artifacts'][0]['producer'],
+            projection['delivery_artifacts'][1]['producer'])
+        self.assertNotEqual(projection['delivery_artifacts'][1]['producer'],
+            projection['delivery_artifacts'][2]['producer'])
+        for actual, frozen in zip(projection['delivery_artifacts'], original):
+            self.assertEqual({k: v for k, v in actual.items() if k != 'producer'},
+                {k: v for k, v in frozen.items() if k != 'producer'})
+        self.assertEqual(projection['delivery_producers'][0], producer)
+        self.assertLess(len(json.dumps(projection)), len(json.dumps(artifacts)))
+        projection['delivery_producers'][0]['nested']['~/'].append('view-only mutation')
+        self.assertEqual(artifacts, original)
+        for reference in ({'$ref': '/delivery_producers/999'}, {'$ref': '/delivery_producers/00'},
+                {'$ref': '/delivery_producers/-1'}, {'$ref': '/delivery_producers/0', 'extra': True},
+                producer):
+            bad = {**view, 'delivery_artifacts': [{'producer': reference}]}
+            with self.assertRaises(LLMResponseError):
+                restore_delivery_producers(bad)
+
+    def test_shared_delivery_view_locator_and_strict_quotes_use_physical_derived_paths(self):
+        from simple_ar.report.review_evidence import (
+            DELIVERY_REVIEW_CONTRACT, SHARED_PRODUCER_LOCATOR_CONTRACT, LOCATOR_REFERENCE_CONTRACT,
+            COMPARISON_VERIFICATION_CONTRACT, restore_delivery_producers, resolve_review_evidence,
+            validate_finding_anchors,
+        )
+        _, memory, config, draft = self.objects()
+        producer = {'owner': 'actual-run', 'execution': {'~/': 'Original full record.'}}
+        artifacts = [{'path': f'input/{i}', 'sha256': 'same', 'coverage': 'complete',
+            'text': 'Complete scientific body.\n' * 200, 'producer': value}
+            for i, value in enumerate((producer, producer, {}, None))]
+        captured = []
+        class Client:
+            def ask_json(self, system, prompt, **ignored):
+                captured.append(json.loads(prompt))
+                return {'section_reviews': []}
+        common = dict(client=Client(), **document_review_inputs(memory, config, [draft],
+            source_evidence=[{'handle': 'paper:original', 'metadata': {
+                'evidence_passages': [{'text': 'Full original passage.\n' * 100}]}}],
+            metric_summary={'count': 4}, execution_evidence={'execution_records': [{'cwd': '/actual'}]}),
+            delivery_review={'contract': DELIVERY_REVIEW_CONTRACT, 'artifacts': artifacts})
+        for contract in (None, LOCATOR_REFERENCE_CONTRACT, SHARED_PRODUCER_LOCATOR_CONTRACT):
+            review_document(**common, evidence_navigation_contract=contract,
+                comparison_verification_contract=COMPARISON_VERIFICATION_CONTRACT)
+            view = captured[-1]
+            self.assertEqual(restore_delivery_producers(view), artifacts)
+            if contract != SHARED_PRODUCER_LOCATOR_CONTRACT:
+                self.assertEqual(view['delivery_artifacts'], artifacts)
+                self.assertNotIn('delivery_producers', view)
+        view = captured[-1]
+        for key in ('sections', 'source_evidence', 'metric_sources', 'execution_evidence',
+                'verified_execution_results', 'delivery_text_observation', 'output_schema'):
+            self.assertEqual(view[key], captured[1][key])
+        self.assertEqual(view['source_evidence'][0]['metadata']['evidence_passages'][0]['text'],
+            'Full original passage.\n' * 100)
+        self.assertEqual(len(view['delivery_producers']), 3)
+        self.assertEqual(view['sections'][0]['markdown'], draft.draft_markdown)
+        self.assertIn('anchor', view['output_schema']['section_reviews'][0]['findings'][0]['evidence_quotes'][0])
+        locator = review_evidence_locator(view, max_chars=20000, max_entries=500)
+        self.assertEqual(locator['coverage'], 'complete')
+        view['evidence_locator'] = locator
+        for role, group in locator['pointers_by_role'].items():
+            for anchor, pointer in group.items():
+                raw = {'findings': [{'evidence_quotes': [{'anchor': anchor}]}]}
+                resolved = resolve_review_evidence(raw, view)['findings'][0]['evidence_quotes'][0]
+                quote = ReportEvidenceQuote.model_validate(resolved)
+                self.assertEqual(quote.pointer, pointer)
+                self.assertEqual(quote.role, role)
+                validate_evidence_quotes([quote], view)
+                if pointer.startswith('/delivery_producers/') or pointer.endswith('/producer/$ref'):
+                    self.assertEqual(role, 'derived_context')
+        groups = locator['pointers_by_role']
+        self.assertIn('/delivery_artifacts/0/text', groups['producer_output'].values())
+        for i in (2, 3):
+            self.assertIn(f'/delivery_artifacts/{i}/text', groups['recorded_material'].values())
+        pointer = '/delivery_producers/0/execution/~0~1'
+        self.assertIn(pointer, groups['derived_context'].values())
+        finding = {'finding_id': 'metadata-only', 'section_id': 'setup', 'type': 'metric_mismatch',
+            'severity': 'major', 'message': 'An allegation.', 'required_action': 'revise',
+            'draft_quotes': [{'section_id': 'setup', 'paragraph': 'p1'}],
+            'evidence_quotes': [{'pointer': pointer}, {'pointer': '/delivery_artifacts/0/producer/$ref'}]}
+        resolved = resolve_review_evidence({'findings': [finding]}, view)['findings'][0]
+        self.assertEqual((resolved['type'], resolved['required_action']), ('evidence_gap', 'verify'))
+        for target in ('/delivery_producers/0/owner', '/delivery_artifacts/0/producer/$ref',
+                '/delivery_artifacts/00/text', '/delivery_artifacts/99/text'):
+            review = ReportSectionReview(section_id='setup', findings=[ReviewerFinding.model_validate(
+                {**resolved, 'delivery_targets': [target]})])
+            with self.assertRaises(LLMResponseError):
+                validate_finding_anchors(review, {'setup': draft.draft_markdown}, view)
+        for bad in ({'anchor': 'derived_context:99999'},
+                {'pointer': '/delivery_artifacts/0/producer/execution/~0~1'},
+                {'pointer': '/delivery_producers/00/owner'},
+                {'pointer': '/delivery_producers/0/absent'},
+                {'pointer': pointer, 'quote': 'Fabricated record.', 'role': 'derived_context'},
+                {'pointer': pointer, 'quote': 'Original full record.', 'role': 'executor_record'}):
+            with self.subTest(reference=bad), self.assertRaises(LLMResponseError):
+                resolve_review_evidence({'findings': [{**finding, 'evidence_quotes': [bad]}]}, view)
+
+    def test_unproven_comparison_becomes_pending_verification_never_a_pass_or_repaired_quote(self):
+        from copy import deepcopy
+        from simple_ar.report.review_evidence import (
+            COMPARISON_VERIFICATION_CONTRACT, DELIVERY_REVIEW_CONTRACT,
+            resolve_review_evidence, validate_finding_anchors, delivery_review_result,
+        )
+        from simple_ar.report.schema import finding_requires_resolution
+        artifact = {'path': 'outputs/counts.json', 'sha256': 'a' * 64,
+            'producer': 'actual-run', 'coverage': 'complete', 'text': '{"count":4,"sum":8}'}
+        view = {'delivery_review_contract': DELIVERY_REVIEW_CONTRACT,
+            'delivery_artifacts': [artifact], 'metric_sources': {'count': 4}}
+        finding = {'finding_id': 'alleged-count', 'type': 'metric_mismatch',
+            'severity': 'major', 'section_id': 'document', 'message': 'Output counts may disagree.',
+            'required_action': 'revise', 'delivery_targets': ['/delivery_artifacts/0/text'],
+            'evidence_quotes': [{'pointer': '/delivery_artifacts/0/text'}]}
+        raw = {'findings': [finding]}
+        original = deepcopy(raw)
+        legacy = ReviewerFinding.model_validate(resolve_review_evidence(raw, view)['findings'][0])
+        with self.assertRaisesRegex(LLMResponseError, 'counter-evidence'):
+            validate_finding_anchors(ReportSectionReview(section_id='document', findings=[legacy]), {}, view)
+        view['comparison_verification_contract'] = COMPARISON_VERIFICATION_CONTRACT
+        qualified = ReviewerFinding.model_validate(resolve_review_evidence(raw, view)['findings'][0])
+        self.assertEqual((qualified.type, qualified.required_action), ('evidence_gap', 'verify'))
+        self.assertIn('Unverified metric comparison', qualified.message)
+        self.assertTrue(finding_requires_resolution(qualified))
+        review = ReportSectionReview(section_id='document', verdict='revise_required', findings=[qualified])
+        validate_finding_anchors(review, {}, view)
+        delivery = delivery_review_result({'contract': DELIVERY_REVIEW_CONTRACT, 'artifacts': [artifact]}, [review])
+        self.assertEqual(delivery['status'], 'needs_revision')
+        self.assertEqual(len(delivery['defects']), 1)
+        self.assertEqual(raw, original)
+        supported = deepcopy(raw)
+        supported['findings'][0]['evidence_quotes'].append({'pointer': '/metric_sources/count'})
+        self.assertEqual(resolve_review_evidence(supported, view)['findings'][0]['type'], 'metric_mismatch')
+        for reference in ({'pointer': '/delivery_artifacts/4/text'},
+                {'pointer': '/delivery_artifacts/0/text', 'quote': 'Invented source text', 'role': 'producer_output'}):
+            invalid = deepcopy(raw)
+            invalid['findings'][0]['evidence_quotes'] = [reference]
+            with self.assertRaises(LLMResponseError):
+                resolve_review_evidence(invalid, view)
+
     def test_default_document_capacity_keeps_large_evidence_and_client_budget_ownership(self):
         context, memory, config, draft = self.objects()
         captured = []
@@ -187,6 +350,29 @@ class ReviewEvidenceTests(unittest.TestCase):
         self.assertEqual(document["source_evidence"][0]["metadata"]["bibliography"], passage["metadata"]["bibliography"])
         self.assertEqual(json.dumps(passage), original)
         self.assertEqual(memory.source_handles[0].metadata, passage["metadata"])
+        from simple_ar.report.review_evidence import LOCATOR_REFERENCE_CONTRACT, resolve_review_evidence
+        review_document(client=Client(), template=template, memory=memory, sections=[draft], config=config,
+            execution_summary={}, metric_summary={}, source_evidence=[passage],
+            evidence_navigation_contract=LOCATOR_REFERENCE_CONTRACT)
+        current = captured[-1]
+        self.assertNotIn('evidence_navigation_contract', document)
+        self.assertEqual(current['evidence_navigation_contract'], LOCATOR_REFERENCE_CONTRACT)
+        self.assertIn('anchor', current['output_schema']['section_reviews'][0]['findings'][0]['evidence_quotes'][0])
+        anchor = next(iter(current['evidence_locator']['pointers_by_role']['recorded_material']))
+        original_reply = {'findings': [{'evidence_quotes': [{'anchor': anchor}]}]}
+        normalized = resolve_review_evidence(original_reply, current)
+        quote = ReportEvidenceQuote.model_validate(normalized['findings'][0]['evidence_quotes'][0])
+        self.assertEqual(quote.pointer, current['evidence_locator']['pointers_by_role']['recorded_material'][anchor])
+        self.assertEqual(quote.quote, 'Actual retained result.')
+        self.assertEqual(quote.role, 'recorded_material')
+        validate_evidence_quotes([quote], current)
+        self.assertEqual(original_reply, {'findings': [{'evidence_quotes': [{'anchor': anchor}]}]})
+        for bad in ({'anchor': 'recorded_material:999'}, {'anchor': anchor, 'pointer': '/missing'},
+                    {'pointer': '/metric_sources/wrong~escape'}):
+            with self.assertRaises(LLMResponseError):
+                resolve_review_evidence({'findings': [{'evidence_quotes': [bad]}]}, current)
+        with self.assertRaisesRegex(LLMResponseError, 'navigation contract'):
+            resolve_review_evidence(original_reply, {**current, 'evidence_navigation_contract': 'unknown'})
 
     def test_locator_does_not_cut_evidence_or_reject_an_existing_near_limit_request(self):
         context, memory, config, draft = self.objects()

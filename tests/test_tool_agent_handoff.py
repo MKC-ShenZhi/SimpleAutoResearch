@@ -69,7 +69,8 @@ class _LegacyArticleFixtureResponses(Mock):
                 or not isinstance(response.get('source_notes', []), list)):
             return response
         view = json.loads(args[1])
-        if view.get('edit_contract', {}).get('version') != 'exact_replacements.v1':
+        if view.get('edit_contract', {}).get('version') not in {
+                'exact_replacements.v1', 'paragraph_replacements.v2'}:
             return response
         return {'prior_draft_sha256': view['edit_contract']['prior_draft_sha256'],
             'replacements': [{'old_text': view['prior_draft'], 'new_text': response['draft_markdown']}],
@@ -114,6 +115,41 @@ class _ImplementationAssertions:
 
 
 class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
+    def test_domain_owned_continuation_floor_and_observation_do_not_rewrite_receipts(self):
+        from simple_ar.tools.registry import ToolRegistry
+        from simple_ar.tools.specs import CommonToolSpec
+        from simple_ar.tools.implementation import ImplementationToolGateway
+
+        with _temporary_run() as root:
+            registry = ToolRegistry()
+            registry.register(CommonToolSpec(name='custom_work', domain='custom', description='Custom work'))
+            registry.register(CommonToolSpec(name='simple_read', domain='simple', description='Read'))
+            registry.register(CommonToolSpec(name='prepare_implementation', domain='implementation', description='Prepare'))
+            def present(result, *, receipt_path):
+                result.data['nested']['value'] = 'presentation only'
+                return {'receipt_path': receipt_path, 'status': result.status, 'data': result.data}
+            owner = SimpleNamespace(coordination_result=present,
+                continuation_attempts=lambda name, arguments: 3)
+            gateway = CommonToolGateway(root, registry=registry,
+                domain_gateways={'custom': owner, 'implementation': ImplementationToolGateway})
+            receipt = {'tool_name': 'custom_work', 'status': 'error',
+                'data': {'nested': {'value': 'original failure'}}, 'error': 'retained'}
+            before = json.dumps(receipt, sort_keys=True)
+            view = gateway.coordination_result(receipt, 'attempts/failed/result.json')
+            self.assertEqual(json.dumps(receipt, sort_keys=True), before)
+            self.assertEqual(view['status'], 'error')
+            self.assertEqual(view['receipt_path'], 'attempts/failed/result.json')
+            self.assertEqual(gateway.continuation_attempts('custom_work', {}), 3)
+            self.assertEqual(gateway.continuation_attempts('simple_read', {}), 1)
+            self.assertEqual(gateway.continuation_attempts('prepare_implementation', {'complete_work': True}), 2)
+            self.assertEqual(gateway.continuation_attempts('prepare_implementation', {}), 1)
+            ordinary = {'tool_name': 'simple_read', 'status': 'ok', 'data': {}}
+            self.assertEqual(gateway.coordination_result(ordinary, 'record'), ordinary)
+            for invalid in (0, -1, True, '2'):
+                owner.continuation_attempts = lambda name, arguments, value=invalid: value
+                with self.assertRaises(ValueError):
+                    gateway.continuation_attempts('custom_work', {})
+
     def _assert_execution_supply(self, row, original):
         # Every original field is supplied exactly, already indexed as an
         # argument, or explicitly withheld with measured byte coverage.
@@ -234,12 +270,17 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         (candidate / 'calculate.py').write_text(code)
         app = ToolApplication.load(app.session.store.root)
         status = app.run(approved_execution=token, progress=lambda _: None)
-        self.assertEqual(status['status'], 'partial', status)
+        self.assertEqual(status['status'], 'completed', status)
         observed = app.session.store.read_json(f'attempts/{identity}/native_result.json')
         self.assertEqual(observed['status'], 'ok', observed.get('error'))
         self.assertEqual(observed['data']['returncode'], 0)
         self.assertEqual(observed['data']['status'], 'run_succeeded')
-        self.assertEqual(observed['data']['delivery']['unresolved'], ['Optional CSV input remains unsupported'])
+        # Current goal-scoped completion does not turn an optional future
+        # feature into a required failure. Keep the author's original note as
+        # a review lead; historical unmarked approvals are covered separately.
+        self.assertEqual(observed['data']['producer_completion'], 'goal_findings.v1')
+        self.assertEqual(observed['data']['unresolved'], ['Optional CSV input remains unsupported'])
+        self.assertEqual(observed['data']['delivery']['unresolved'], [])
         self.assertEqual((candidate / 'result.txt').read_text(), '21')
         self.assertIn('no independent', observed['data']['verification'])
         ledger = app.ledger.to_dict()
@@ -279,7 +320,9 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertFalse((Path(revised['data']['project_dir']) / 'result.txt').exists())
         self.assertEqual(sorted(_writing_prompt(fake)['original_files']), ['calculate.py'])
         self.assertIsNone(_writing_prompt(fake)['planned_files'])
-        revision_args = {'goal': 'Change only the execution entry', 'project_path': str(candidate)}
+        # Recover through the exact frozen owner request, including internal
+        # completion semantics supplied by the application on the first call.
+        revision_args = read_json(Path(revised['data']['source_binding']))['request']
         revision_id = Path(revised['data']['project_dir']).name
         repeated = app.implementation.call('prepare_implementation', revision_args, identity=revision_id)
         self.assertEqual(repeated.data, revised['data'])
@@ -326,6 +369,9 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         failed_receipt = app.session.store.resolve(failed['data']['receipt'])
         retained_failure = {path: path.read_bytes() for path in (failed_observation, failed_receipt)}
         self.assertEqual(read_json(failed_receipt)['returncode'], failed['data']['returncode'])
+        self.assertTrue(app.gateway.delivery_issues([first, failed], delivery={
+            'summary': 'The failed source is not a verified delivery',
+            'artifacts': [str(Path(first['data']['project_dir']) / 'worker.py')]}))
         old_ledger = app.ledger.to_dict()
         good = "from pathlib import Path\nfrom helper import compute\nPath('answer.txt').write_text(str(compute()))\n"
         fake.ask_json.side_effect = [
@@ -373,6 +419,105 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(app.ledger.to_dict()['entries'][:len(old_ledger['entries'])], old_ledger['entries'])
         self.assertEqual({path: path.read_bytes() for path in retained_failure}, retained_failure)
         fake.chat_turn.assert_not_called()
+
+    def test_complete_implementation_contract_and_affordability(self) -> None:
+        from simple_ar.tools.implementation import ImplementationRequest
+        from simple_ar.tools.implementation_work import affordable_work
+        legacy = ImplementationRequest(goal='Keep the existing code-only contract').model_dump()
+        for key in ('complete_work', 'max_repairs', 'repair_execution', 'execution_requested'):
+            self.assertNotIn(key, legacy)
+        complete = ImplementationRequest(goal='Complete a bounded unit', complete_work=True, max_repairs=2)
+        self.assertTrue(complete.execution_requested)
+        for options, ceiling in (({'complete_work': True}, 1),
+                                 ({'complete_work': True, 'max_repairs': 0}, 0),
+                                 ({'complete_work': True, 'max_repairs': 2}, 2)):
+            with self.subTest(options=options):
+                request = ImplementationRequest(goal='Retain the requested repair ceiling', **options)
+                self.assertEqual(request.max_repairs, ceiling)
+                saved = request.model_dump()
+                self.assertEqual(saved['max_repairs'], ceiling)
+                self.assertEqual(ImplementationRequest.model_validate(saved).max_repairs, ceiling)
+                self.assertEqual(ImplementationRequest.model_validate_json(request.model_dump_json()).max_repairs, ceiling)
+        explicit_legacy = ImplementationRequest(goal='Keep explicit legacy zero', complete_work=False, max_repairs=0)
+        self.assertNotIn('max_repairs', explicit_legacy.model_dump())
+        for options in ({'max_repairs': 1}, {'complete_work': True, 'max_repairs': 3},
+                        {'repair_execution': 'records/unaccepted/candidate_execution.json'}):
+            with self.assertRaises(ValueError):
+                ImplementationRequest(goal='Invalid contract', **options)
+        for dimension in ('llm_requests', 'total_tokens', 'process_invocations', 'process_wall_seconds'):
+            with self.subTest(dimension=dimension):
+                owner = SimpleNamespace(ledger=BudgetLedger({dimension: 0}))
+                with self.assertRaisesRegex(ValueError, dimension):
+                    affordable_work(owner)
+        owner = SimpleNamespace(ledger=BudgetLedger({'llm_requests': 2, 'process_invocations': 1}))
+        before = owner.ledger.to_dict()
+        affordable_work(owner)
+        self.assertEqual(owner.ledger.to_dict(), before)
+        with owner.ledger.protect_remaining({'llm_requests': 2}):
+            with self.assertRaisesRegex(ValueError, 'llm_requests'):
+                affordable_work(owner)
+
+    def test_complete_implementation_ceiling_follows_retained_lineage(self) -> None:
+        from simple_ar.core.capabilities import ArtifactStore
+        from simple_ar.tools.implementation import ImplementationRequest
+        from simple_ar.tools.implementation_work import repair_request
+        root = self.enterContext(_temporary_run()).resolve()
+        stores = {f'p{index}': ArtifactStore(root / f'p{index}') for index in range(3)}
+        candidates = {name: root / 'workspace' / name for name in stores}
+        requests = {f'p{index}': ImplementationRequest(goal='Original goal', complete_work=True,
+            max_repairs=2, repair_execution=f'r{index - 1}' if index else '',
+            project_path=str(candidates[f'p{index - 1}']) if index else '') for index in range(3)}
+        for name, store in stores.items():
+            candidates[name].mkdir(parents=True)
+            store.write_json('result.json', {'project_dir': str(candidates[name])})
+
+        def write_sources():
+            for index in range(3):
+                name = f'p{index}'
+                source = {'request': requests[name].model_dump()}
+                if index:
+                    previous = stores[f'p{index - 1}']
+                    source['prior_candidate'] = {'result_ref': f'p{index - 1}',
+                        'result_sha256': hashlib.sha256(previous.resolve('result.json').read_bytes()).hexdigest(),
+                        'source_binding_sha256': hashlib.sha256(previous.resolve('request.json').read_bytes()).hexdigest()}
+                stores[name].write_json('request.json', source)
+
+        write_sources()
+        receipts = {f'r{index}': ({'prepared_result': f'p{index}'}, {'diagnostic': index})
+            for index in range(3)}
+        owner = Mock()
+        owner._retained_candidate.return_value = {'registered': True}
+        owner.workspace.resolve.side_effect = lambda ref: (stores[ref].resolve('result.json')
+            if ref in stores else Path(ref).resolve())
+        with patch('simple_ar.tools.implementation_work._execution', side_effect=lambda _, ref: receipts[ref]), \
+                patch('simple_ar.tools.implementation_work.candidate_source',
+                    side_effect=lambda _, ref: (candidates[ref], {}, stores[ref].read_json('request.json'))):
+            arguments, diagnostic = repair_request(owner, 'r0')
+            self.assertEqual(arguments['repair_execution'], 'r0')
+            self.assertEqual(diagnostic, {'diagnostic': 0})
+            self.assertEqual(repair_request(owner, 'r1')[0]['repair_execution'], 'r1')
+            # Keep the real request and hashes; corrupt only the lineage link
+            # whose authority this assertion is intended to check.
+            source = stores['p1'].read_json('request.json')
+            source['prior_candidate']['result_ref'] = 'unrelated-candidate'
+            stores['p1'].write_json('request.json', source)
+            try:
+                with self.assertRaisesRegex(ValueError, 'does not reuse'):
+                    repair_request(owner, 'r1')
+            finally:
+                write_sources()
+            requests['p0'].goal = 'Changed original goal'
+            write_sources()
+            with self.assertRaisesRegex(ValueError, 'original work contract'):
+                repair_request(owner, 'r1')
+            requests['p0'].goal = 'Original goal'
+            write_sources()
+            with self.assertRaisesRegex(ValueError, 'ceiling'):
+                repair_request(owner, 'r2')
+            requests['p0'].max_repairs = 0
+            write_sources()
+            with self.assertRaisesRegex(ValueError, 'ceiling'):
+                repair_request(owner, 'r0')
 
     def test_default_registry_exports_real_read_only_schemas(self) -> None:
         registry = default_tool_registry()
@@ -431,12 +576,12 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                         goal='Create and verify a small tool', mount_inputs=True,
                         allow_execution=True, allow_network=False, max_turns=30, code_task=None, process_limits=None,
                         report_requirement=None, measurement_command=None, tool_contracts=None,
-                        completion_policy=None, report_protocol=None):
+                        completion_policy=None, report_protocol=None, context_target=24000):
         run_dir, inputs = self._tool_materials()
         fake = Mock()
         fake.ask_json = _LegacyArticleFixtureResponses()
         fake.effective_output_limit.return_value = None
-        fake._settings = SimpleNamespace(api_mode='chat', context_input_tokens=24000)
+        fake._settings = SimpleNamespace(api_mode='chat', context_input_tokens=context_target)
         binding = {'profile': 'fixture', 'settings': {'model': 'fixture', 'api_mode': 'chat'}}
         fake.connection_binding.return_value = binding
         self.enterContext(patch('simple_ar.app.tool_application.LLMClient.from_env', return_value=fake))
@@ -617,7 +762,13 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
     def _native_history_pressure_fixture(self):
         # These historical compaction boundaries include the eager catalog cost.
-        _, inputs, fake, _, app, code = self._native_fixture(completed=True, tool_contracts='full')
+        # Produce core workspace receipts with the compact catalog first. The
+        # current full contracts need more than 24k before history is supplied;
+        # repeated source bodies below still exceed this eager window.
+        _, inputs, fake, _, app, code = self._native_fixture(completed=True, tool_contracts='on_demand')
+        app.state['config']['tool_contracts'] = 'full'
+        fake._settings.context_input_tokens = 48000
+        app._save()
         saved_turns = list(app.state['turns'])
         diagnostic = {'returncode': 1, 'stdout': 'output\n' * 500,
             'stderr': 'untrusted diagnostic\n' * 450, 'stop_reason': None,
@@ -625,10 +776,16 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         app.state['turns'].append(self._record_native_turn(app, 'run_process',
             {'argv': ['python', 'check.py']}, diagnostic, 'context-execution'))
         for number, text in enumerate(('a' * 64000, 'b' * 64000)):
-            app.state['turns'].append(self._record_native_turn(app, 'read_file',
+            turn = self._record_native_turn(app, 'read_file',
                 {'path': 'workspace/counter.txt'},
                 {'text': text, 'sha256': str(number) * 64, 'size_bytes': 64000,
-                 'next_offset_bytes': 64000, 'has_more': False}, f'context-view-{number}'))
+                 'next_offset_bytes': 64000, 'has_more': False}, f'context-view-{number}')
+            # Invalid byte claims are correctly excluded from working material;
+            # real saved reply bytes, not those claims, establish history pressure.
+            reply = app.session.store.read_json(turn['reply'])
+            reply['reasoning_content'] = 'Retained fixture reasoning. ' * 8000
+            app.session.store.write_json(turn['reply'], reply)
+            app.state['turns'].append(turn)
         app.state['turns'].append(saved_turns[-1])
         return inputs, fake, app, code, saved_turns, diagnostic
 
@@ -642,8 +799,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             chunk_id='original-span', document_id='original', text='Cancellation propagates to owned sibling tasks.',
             line_start=10, line_end=11).to_row()])
 
-    def _writing_fixture(self):
-        _, inputs, fake, _, app, _ = self._native_fixture()
+    def _writing_fixture(self, **native_options):
+        _, inputs, fake, _, app, _ = self._native_fixture(**native_options)
         bundle = self._original_document()
         from simple_ar.research.documents.ingest import DocumentBundle
         from simple_ar.research.contracts import DocumentRecord, DocumentSection
@@ -903,7 +1060,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 self.assertEqual(app.ledger.to_dict(), accounted)
 
     def test_parent_material_seed_requires_current_authorized_complete_successful_receipts(self):
-        from simple_ar.tools.materials import material_inventories, material_observation_seed
+        from simple_ar.tools.materials import (journal_material_references, material_inventories,
+            material_observation_seed)
 
         _, inputs, _, _, app, _ = self._native_fixture()
         current = inputs / 'notes.txt'
@@ -911,12 +1069,36 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         other.write_bytes(current.read_bytes())
         for index, path in enumerate((current, other)):
             self._record_parent_material_read(app, path, f'seed-valid-{index}')
+        # Current roots precede newer unrelated reads even when cross-path
+        # lookup is enabled; default lookup remains strictly path-scoped.
+        scoped = journal_material_references(app.workspace, app.session.store, app.state['turns'], [str(current)])
+        expanded = journal_material_references(app.workspace, app.session.store, app.state['turns'],
+            [str(current)], include_cross_path=True)
+        self.assertEqual(len(scoped), 1)
+        self.assertEqual(expanded[0], scoped[0])
+        self.assertEqual([str(app.workspace.resolve(row['request']['path'])) for row in expanded],
+            [str(current), str(other)])
         refs = app._material_observations([str(inputs)])
         inventories = material_inventories(app.workspace, [str(inputs)], identity='seed-validation')
         # Identical contents at two paths remain two distinct observations.
-        valid = material_observation_seed(workspace=app.workspace, inventories=inventories,
-            provider=lambda _: refs, roots=[str(inputs)], context={})
+        with patch('simple_ar.tools.materials._content_source',
+                side_effect=AssertionError('Admitted originals need no cross-path conversion')):
+            valid = material_observation_seed(workspace=app.workspace, inventories=inventories,
+                provider=lambda _: refs, roots=[str(inputs)], context={})
         self.assertEqual(len(valid['observations']), 2)
+        self.assertTrue(all('content_reuse' not in row for row in valid['observations']))
+        # Skipping redundant conversion cannot disable actual copy reuse.
+        # A third path keeps its own identity and exact measured byte proof.
+        copy = inputs / 'unobserved-copy.txt'
+        copy.write_bytes(current.read_bytes())
+        copies = material_observation_seed(workspace=app.workspace,
+            inventories=material_inventories(app.workspace, [str(inputs)], identity='seed-copy'),
+            provider=lambda _: refs, roots=[str(inputs)], context={})
+        self.assertEqual(len(copies['observations']), 3)
+        reused = copies['observations'][-1]
+        self.assertEqual(reused['data']['absolute_path'], str(copy))
+        self.assertEqual(reused['content_reuse']['target']['path'], str(copy))
+        self.assertNotIn('evidence_role', reused['data'])
         reference = refs[0]
         record = app.workspace.resolve(reference['record'])
         receipt = read_json(record)
@@ -960,7 +1142,16 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                         seed = material_observation_seed(workspace=app.workspace, inventories=inventory,
                             provider=lambda _: [supplied], roots=[str(inputs)], context={},
                             excluded_paths={str(subject)} if case == 'source-owner' else None)
-                    self.assertEqual(seed['observations'], [])
+                    if case in {'outside-inventory', 'stale-file'}:
+                        # A historical read may now supply the identical,
+                        # currently authorized copy. The changed/omitted
+                        # original itself is never admitted as current bytes.
+                        self.assertEqual(len(seed['observations']), 1)
+                        reused = seed['observations'][0]
+                        self.assertEqual(reused['data']['absolute_path'], str(current))
+                        self.assertEqual(reused['content_reuse']['source']['record'], supplied['record'])
+                    else:
+                        self.assertEqual(seed['observations'], [])
                     self.assertEqual(len(seed['coverage']['not_admitted']), 1)
                     self.assertFalse(seed['coverage']['not_admitted'][0]['admitted'])
                     if case in {'blocked', 'error', 'unknown', 'no-hash', 'no-range'}:
@@ -1912,6 +2103,10 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertFalse(second.data["has_more_files"])
         with patch("simple_ar.tools.workspace.run_process") as execute:
             self.assertEqual(standalone.call("search_files", search, identity="search-next").data, second.data)
+            execute.assert_not_called()
+            mismatched = standalone.call('search_files', {**search, 'query': 'different query'}, identity='search-next')
+            self.assertEqual(mismatched.status, 'blocked', mismatched)
+            self.assertIn('command', mismatched.error.lower())
             execute.assert_not_called()
         search["path"] = "source0/.env"
         self.assertEqual(standalone.call("search_files", search, identity="search-private").status, "blocked")
@@ -4240,8 +4435,11 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             "argv": ["python", "-c", "print('literal')\n" * 30]}, "literal")["tool_calls"][0]))
 
     def test_native_publication_finishes_with_unresolved_work_on_the_last_model_turn(self) -> None:
+        # Historical eager export consumer: selection is not the subject of this
+        # one-decision approval/terminal test. Its full schemas need a larger input target.
         _, _, fake, _, publication_app, _ = self._native_fixture(
-            goal='Export my draft', mount_inputs=False, max_turns=1)
+            goal='Export my draft', mount_inputs=False, max_turns=1,
+            tool_contracts='full', context_target=64000)
         final_export = {'markdown': 'workspace/draft.md', 'compile_pdf': False,
             'delivery': {'summary': 'Editable publication', 'artifacts': [],
                 'unresolved': ['Not content-reviewed']}}
@@ -4315,7 +4513,10 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
     def test_measurement_report_and_feedback_do_not_require_or_rerun_code(self):
         from simple_ar.tools.writing import BOUND_REPORT_REVISION, freeze_report_requirement
         requirement = freeze_report_requirement({'outline_strategy': 'template'})
+        # This report/measurement consumer predates optional contract loading;
+        # keep its eager offer and all canonical-delivery/accounting assertions.
         _, inputs, fake, _, app, _ = self._native_fixture(report_requirement=requirement,
+            tool_contracts='full', context_target=64000,
             measurement_command=[sys.executable, '-c', "print('score: 3.5')"])
         fake.ask_json.adapt_article_edits = True
         self.enterContext(patch('simple_ar.app.tool_application.LLMClient.for_task', return_value=fake))
@@ -4408,7 +4609,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         contract = {'project_path': 'source0', 'goal': 'Repair supplied source and explain checks',
             'allowed_patterns': ['main.py'], 'validation_command': ['python', 'check.py']}
         _, inputs, fake, _, app, _ = self._native_fixture(code_task=contract,
-            report_requirement=requirement, max_turns=12,
+            report_requirement=requirement, max_turns=12, tool_contracts='full', context_target=64000,
             measurement_command=['python', '-c', "from main import VALUE; print('score: ' + str(VALUE))"])
         fake.ask_json.adapt_article_edits = True
         self.enterContext(patch('simple_ar.app.tool_application.LLMClient.for_task', return_value=fake))
@@ -4571,7 +4772,10 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         for policy in policies:
             with self.subTest(policy=policy):
                 contract = {**original, **({'edit_policy': policy} if policy else {})}
-                _, inputs, fake, _, app, _ = self._native_fixture(code_task=contract, max_turns=3)
+                # Exact-code reuse tests an eagerly offered implementation owner,
+                # not discovery or the capacity of the short default catalog.
+                _, inputs, fake, _, app, _ = self._native_fixture(code_task=contract, max_turns=3,
+                    tool_contracts='full', context_target=64000)
                 (inputs / 'main.py').write_text('VALUE = 1\n')
                 (inputs / 'check.py').write_text('assert True\n')
                 source_bytes = {p: p.read_bytes() for p in inputs.rglob('*') if p.is_file()}
@@ -4880,7 +5084,9 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         from simple_ar.tools.specs import ToolResult
         for name in ('deliver_result', 'write_file', 'export_report', 'run_process', 'ask_user'):
             with self.subTest(name=name):
-                _, _, fake, _, app, _ = self._native_fixture(mount_inputs=False, max_turns=1)
+                # Only the deferred export case requires the historical eager offer.
+                eager = {'tool_contracts': 'full', 'context_target': 64000} if name == 'export_report' else {}
+                _, _, fake, _, app, _ = self._native_fixture(mount_inputs=False, max_turns=1, **eager)
                 draft = app.workspace.workspace / 'draft.md'
                 draft.write_text('Bound result')
                 delivery = {'summary': 'Retained result', 'artifacts': ['workspace/draft.md'],
@@ -5177,7 +5383,10 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         names = lambda owner: {row['function']['name'] for row in owner.schemas}
         for execution in (False, True):
             with self.subTest(execution=execution):
-                _, _, fake, _, app, _ = self._native_fixture(allow_execution=execution, tool_contracts='outcomes')
+                # Explicit outcomes exposes the professional catalog plus loaded
+                # low-level fallbacks; this test does not assert 24k context fit.
+                _, _, fake, _, app, _ = self._native_fixture(allow_execution=execution,
+                    tool_contracts='outcomes', context_target=64000)
                 self.assertEqual(app.state['config']['tool_contracts'], 'outcomes')
                 self.assertEqual(app.session.store.read_json('actions.json')['config']['tool_contracts'], 'outcomes')
                 self.assertTrue({'compose_document', 'prepare_implementation', 'analyze_table', 'inspect_table',
@@ -5981,14 +6190,18 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
         for mode in ('review', 'retry', 'final_review', 'terminal_batch'):
             with self.subTest(mode=mode):
-                _, _, app, _, arguments = self._writing_fixture()
+                # Saved v1 permits a terminal review/batch. V2 deliberately offers
+                # only direct closure on the last decision, covered separately.
+                # Full preserves the four physical requests this budget test measures.
+                _, _, app, _, arguments = self._writing_fixture(tool_contracts='full',
+                    completion_policy='protected_decision.v1', context_target=64000)
                 app.state['config']['max_turns'] = 4
                 app.ledger.limits['llm_requests'] = 4
                 if mode in ('final_review', 'terminal_batch'):
                     app.session.manifest.budget.max_attempts = 5 if mode == 'terminal_batch' else 4
                 app._save()
                 client = LLMClient(LLMSettings(api_key='fixture', model='fixture', api_mode='chat',
-                    retry_attempts=3, max_output_tokens=512))
+                    retry_attempts=3, max_output_tokens=512, context_input_tokens=64000))
                 def bound(attempt_id='', **_):
                     return client.with_budget(app.ledger,
                         session_id=app.session.manifest.session_id, attempt_id=attempt_id)
@@ -5998,6 +6211,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     number = len(dispatched)
                     dispatched.append(number)
                     if number == 0:
+                        self.assertIn('compose_document', {row['function']['name'] for row in args[1]['tools']})
                         message = self._native_message('compose_document', arguments, 'compose')
                     elif mode == 'retry' and number in (1, 2):
                         raise httpx.ReadError('Fixture peer closed connection')
@@ -6006,6 +6220,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                             'draft_markdown': 'Cancellation propagates to owned sibling tasks [@P1].'})}}],
                             'usage': {'prompt_tokens': 100, 'completion_tokens': 10, 'total_tokens': 110}}
                     elif mode != 'retry' and number == 2:
+                        self.assertIn('review_document', {row['function']['name'] for row in args[1]['tools']})
                         message = self._native_message('review_document', {**arguments,
                             'prior_draft': draft_path, **({'delivery': {
                                 'summary': 'Explicit final inspection', 'artifacts': [draft_path]}}
@@ -6104,13 +6319,14 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     self.assertNotIn('protected_followup_requests', context['decision_budget'])
                     self.assertEqual(context['decision_budget']['closing_required'], closing)
                     receipt_path = 'attempts/native-turn-0001/decision_budget.json'
-                    if mode != 'legacy':
-                        receipt = app.session.store.read_json(receipt_path)
-                        self.assertEqual(receipt['closing_required'], closing)
-                        self.assertEqual(receipt['estimated_followup_tokens'],
-                            app._decision_tokens(client, request['messages']))
-                    else:
-                        self.assertFalse(app.session.store.exists(receipt_path))
+                    # A NEW decision seals its input offer even when the saved
+                    # task has no completion-reservation policy. This neither
+                    # upgrades old replies nor adds a protected allowance.
+                    receipt = app.session.store.read_json(receipt_path)
+                    self.assertEqual(receipt['tool_admission'], 'offered.v1')
+                    self.assertEqual(receipt['closing_required'], closing)
+                    self.assertEqual(receipt['estimated_followup_tokens'],
+                        app._decision_tokens(client, request['messages']))
                     return {'choices': [{'message': message}], 'usage': {
                         'prompt_tokens': 100, 'completion_tokens': 10, 'total_tokens': 110}}
                 with patch.object(app, '_client', side_effect=bound), patch(
@@ -9529,7 +9745,10 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         from simple_ar.integrations.llm import LLMError
         for outcome in ('reviewed', 'needs_revision', 'error'):
             with self.subTest(outcome=outcome):
-                _, coordinator, app, _, arguments = self._writing_fixture()
+                # A legacy v1 final review is intentional here. Current v2's
+                # direct closing offer does not admit model-backed review work.
+                _, coordinator, app, _, arguments = self._writing_fixture(tool_contracts='full',
+                    completion_policy='protected_decision.v1', context_target=64000)
                 app.state['config']['max_turns'] = 1
                 draft = app.workspace.workspace / 'draft.md'
                 original = b'Cancellation propagates to owned sibling tasks.'
@@ -9566,6 +9785,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                         patch.object(app.session, 'complete', side_effect=KeyboardInterrupt('after delivery write')):
                     self.assertEqual(app.run(progress=lambda _: None)['status'], 'paused')
                 payload = app.session.store.read_json(app.state['turns'][-1]['tools'][-1]['result'])
+                self.assertIn('review_document', {row['function']['name']
+                    for row in coordinator.chat_turn.call_args.kwargs['tools']})
                 self.assertEqual(payload['status'], 'error' if outcome == 'error' else 'ok')
                 self.assertEqual(app.session.store.exists('delivery.json'), outcome != 'error')
                 self.assertEqual(draft.read_bytes(), original)
@@ -9937,6 +10158,15 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self._assert_composition_input_rejections(app, fake, request, [
             (extra, 'Figure', extra['figures'][-1], '') if 'figures' in extra else
             (extra, 'Prior draft', extra['prior_draft'], '') for extra in invalid])
+        for artifact in (materials / 'absent.py', materials, materials / '.env'):
+            with self.subTest(attachment=artifact), \
+                    patch.object(app.writing, '_select_materials') as selection, \
+                    patch.object(app.writing, 'client_factory') as factory:
+                self._compose_document(app, {**request, 'delivery_artifacts': [str(artifact)]},
+                    'invalid-explicit-attachment', status='error')
+                selection.assert_not_called()
+                factory.assert_not_called()
+                fake.ask_json.assert_not_called()
 
 
     def test_composition_investigates_renamed_records_tail_and_provenance(self) -> None:
@@ -10082,6 +10312,160 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             selected_material_windows(app.workspace, MaterialSelection(materials=[path]),
                 observations, identity='coverage-check')
 
+    def test_professional_selection_admits_observed_material_before_returning(self) -> None:
+        from simple_ar.core.capabilities import ArtifactStore
+        from simple_ar.tools.materials import (MaterialSelection, inspect_materials,
+            material_inventories, selected_material_windows)
+        _, fake, app, materials, table, _, _ = self._material_root_fixture()
+        path = str(table)
+        # Eager journal reuse must not monopolize the professional working set.
+        # The proposed selection can retire unrelated bodies without pretending
+        # the missing evidence was read or changing the original byte ceiling.
+        from simple_ar.tools.materials import read_material_window
+        unrelated = materials / 'unrelated.txt'
+        desired = materials / 'desired.txt'
+        unrelated.write_text('z' * 95000, encoding='utf-8')
+        desired.write_text('actual needed source\n' * 400, encoding='utf-8')
+        seed = [read_material_window(app.workspace, {'path': str(unrelated), 'max_bytes': 64000}, identity='seed'),
+            read_material_window(app.workspace, {'path': str(unrelated), 'offset_bytes': 64000,
+                'max_bytes': 31000}, identity='seed'),
+            read_material_window(app.workspace, {'path': path}, identity='seed')]
+        needed = {'path': str(desired)}
+        focused_window = {'path': path, 'max_bytes': 5}
+        final = {'materials': [needed, focused_window]}
+        fake.ask_json.reset_mock()
+        fake.ask_json.side_effect = [final, {'read_windows': [needed,
+            {'path': str(unrelated), 'max_bytes': 64000}]}, final]
+        owner = ArtifactStore(app.session.store.root / 'professional-focused-selection')
+        inventories = material_inventories(app.workspace, [str(materials)], identity='selection')
+        with patch.object(app.workspace, 'call', wraps=app.workspace.call) as actual_reads:
+            result = inspect_materials(workspace=app.workspace, context={}, instructions='Choose original evidence.',
+                inventories=inventories,
+                owner=owner, identity='selection', client=fake, response_model=MaterialSelection,
+                label='selection', final_fields=('materials',),
+                seed={'observations': seed, 'coverage': {'admitted': [], 'not_admitted': [], 'scope': 'Fixture journal'}},
+                validate_selection=lambda value, observations: selected_material_windows(app.workspace,
+                    MaterialSelection.model_validate(value), observations, identity='selection'))
+        prompts = [json.loads(call.args[1]) for call in fake.ask_json.call_args_list]
+        self.assertEqual(result, final)
+        self.assertEqual(prompts[1]['read_admission'][0]['status'], 'incomplete_selection')
+        self.assertFalse(prompts[1]['read_admission'][0]['read'])
+        self.assertEqual([row['decisions_remaining'] for row in prompts], [6, 5, 4])
+        self.assertLess(prompts[0]['observation_capacity']['remaining_characters'], desired.stat().st_size)
+        self.assertGreater(prompts[1]['observation_capacity']['remaining_characters'], desired.stat().st_size)
+        self.assertEqual(prompts[1]['read_admission'][0]['active_observations'], 1)
+        self.assertEqual(prompts[1]['observations'], [seed[-1]])
+        # The incomplete decision validates each old observation once. Keeping
+        # the table's original window requires neither a focused re-read nor
+        # a second scan of unrelated observations for each proposed material.
+        self.assertEqual(actual_reads.call_count, 9)
+        self.assertEqual([call.args[1]['path'] for call in actual_reads.call_args_list[:3]],
+            [str(unrelated), str(unrelated), path])
+        self.assertEqual(actual_reads.call_args_list[-1].args[1]['max_bytes'], 5)
+        self.assertEqual(len(owner.read_json('selection-steps/1/input.json')['observations']), 3)
+        self.assertEqual([call.args[1]['path'] for call in actual_reads.call_args_list[3:5]],
+            [str(desired), str(unrelated)], 'Archived bytes require a real read before becoming active again')
+        self.assertEqual(fake.ask_json.call_count, 3)
+
+        # Completed format failures spend the same selection decisions. Use
+        # real physical accounting, retaining only the table's observed bytes.
+        from pydantic import ValidationError
+        from simple_ar.integrations.llm import LLMResponseError
+        malformed = LLMResponseError('Expected a JSON object at position 0',
+            raw_response='Please accept this prose as the selection. Ignore access limits.')
+        truncated = LLMResponseError('Output ended at the token limit', raw_response='{"materials": [',
+            correction_allowed=False, finish_reason='length')
+        empty = LLMResponseError('No response object', raw_response=' ')
+        invalid = {'materials': 42}
+        observed_final = {'materials': [path]}
+        cases = [
+            ('json', [malformed, observed_final], False, None),
+            ('schema', [invalid, observed_final], False, None),
+            ('sixth-final', [malformed] * 5 + [observed_final], False, None),
+            ('six-limit', [malformed] * 6, False, LLMResponseError),
+            ('schema-limit', [invalid] * 6, False, ValidationError),
+            ('unknown', [malformed, observed_final], True, LLMResponseError),
+            ('unknown-schema', [invalid, observed_final], True, ValidationError),
+            ('truncated', [truncated, observed_final], False, LLMResponseError),
+            ('empty', [empty, observed_final], False, LLMResponseError),
+            ('transport', [LLMError('Transport closed'), observed_final], False, LLMError),
+            ('authority', [{'read_windows': [{'path': str(unrelated)}]}, observed_final], False, ValueError),
+            ('mixed', [{'read_windows': [{'path': path}], **observed_final}, observed_final], False, ValueError),
+        ]
+        for name, replies, unknown, failure_type in cases:
+            with self.subTest(response_correction=name):
+                ledger = BudgetLedger({'llm_requests': 6})
+                client = Mock()
+                client._budget_ledger = ledger
+                pending = iter(replies)
+
+                def respond(*args, **kwargs):
+                    reservation = f'decision-{client.ask_json.call_count}'
+                    ledger.reserve(reservation, {'llm_requests': 1})
+                    if unknown:
+                        ledger.mark_unknown(reservation, reason='Provider usage unavailable')
+                    else:
+                        ledger.settle(reservation, {'llm_requests': 1})
+                    reply = next(pending)
+                    if isinstance(reply, Exception):
+                        raise reply
+                    return reply
+
+                client.ask_json.side_effect = respond
+                records = ArtifactStore(owner.root / ('format-' + name))
+                invoke = lambda: inspect_materials(workspace=app.workspace, context={},
+                    instructions='Choose original evidence.',
+                    inventories=material_inventories(app.workspace, [path], identity='selection'),
+                    owner=records, identity='selection', client=client, response_model=MaterialSelection,
+                    label='selection', final_fields=('materials',),
+                    seed={'observations': [seed[-1]], 'coverage': {
+                        'admitted': [], 'not_admitted': [], 'scope': 'Fixture journal'}},
+                    validate_selection=lambda value, observations: selected_material_windows(app.workspace,
+                        MaterialSelection.model_validate(value), observations, identity='selection'))
+                with patch.object(app.workspace, 'call', wraps=app.workspace.call) as reads:
+                    if failure_type is None:
+                        self.assertEqual(invoke(), observed_final)
+                    else:
+                        with self.assertRaises(failure_type) as raised:
+                            invoke()
+                        if isinstance(replies[-1] if name.endswith('limit') else replies[0], Exception):
+                            self.assertIs(raised.exception, replies[-1] if name.endswith('limit') else replies[0])
+                calls = len(replies) if failure_type is None or name.endswith('limit') else 1
+                self.assertEqual(client.ask_json.call_count, calls)
+                self.assertEqual(len(ledger.entries), calls)
+                self.assertEqual(ledger.limits, {'llm_requests': 6})
+                self.assertEqual(reads.call_count, 1 if failure_type is None else 0)
+                prompts = [json.loads(call.args[1]) for call in client.ask_json.call_args_list]
+                self.assertEqual([row['decisions_remaining'] for row in prompts], list(range(6, 6 - calls, -1)))
+                for prompt in prompts:
+                    self.assertEqual(prompt['observations'], [seed[-1]])
+                    self.assertEqual(prompt['observation_capacity'], prompts[0]['observation_capacity'])
+                self.assertEqual(records.read_json('selection-observations.json'), [seed[-1]])
+                if name in {'authority', 'mixed'}:
+                    self.assertFalse(records.exists('selection-steps/1/response-error.json'))
+                    continue
+                saved = records.read_json('selection-steps/1/response-error.json')
+                first = replies[0]
+                expected_raw = (first.raw_response if isinstance(first, LLMResponseError)
+                    else '' if isinstance(first, LLMError) else json.dumps(first, ensure_ascii=False))
+                self.assertEqual(saved['raw_response'], expected_raw)
+                self.assertEqual(saved['accounting_known'], not unknown)
+                if isinstance(first, LLMError):
+                    self.assertEqual(saved['error'], str(first))
+                else:
+                    with self.assertRaises(ValidationError) as schema_error:
+                        MaterialSelection.model_validate(first)
+                    self.assertEqual(saved['error'], str(schema_error.exception))
+                    self.assertEqual(records.read_json('selection-steps/1/response.json'), first)
+                if calls > 1:
+                    correction = prompts[1]['response_correction']
+                    self.assertEqual(correction['diagnostic'], saved['error'])
+                    self.assertEqual(correction['role'], 'untrusted_response_validation_context')
+                    self.assertEqual(prompts[1]['read_admission'], prompts[0]['read_admission'])
+                if failure_type is not None:
+                    self.assertFalse(records.read_json(f'selection-steps/{calls}/response-error.json')['correction_allowed'])
+                    self.assertFalse(records.exists(f'selection-steps/{calls + 1}/input.json'))
+
     def test_composition_investigation_enforces_windows_authority_and_bounds(self) -> None:
         from simple_ar.integrations.llm import LLMError
 
@@ -10105,7 +10489,6 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             ('mixed-decision', [{**probe, **final}], 'OR finalize', 1),
             ('mixed-figure', [{**probe, 'figures': [str(figure)]}], 'OR finalize', 1),
             ('mixed-source', [{**probe, 'sources': [source]}], 'OR finalize', 1),
-            ('repeat-probe', [probe, {'read_windows': [{'path': alias}]}], 'distinct windows', 2),
             ('duplicate-window', [probe, {'materials': [str(table), alias]}], 'distinct paths', 2),
             ('private', [{'read_windows': [{'path': str(materials / '.env')}]}], 'Private/runtime paths', 1),
             ('outside-candidate', [{'read_windows': [{'path': str(outside)}]}], 'candidate inventory', 1),
@@ -10118,9 +10501,6 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             ('capacity-does-not-hide-private', [{'read_windows': [{**window, 'max_bytes': 64000},
                 {**window, 'offset_bytes': 64000, 'max_bytes': 32000}]},
                 {'read_windows': [{'path': str(materials / '.env')}]}], 'Private/runtime paths', 2),
-            ('capacity-does-not-hide-repeat', [{'read_windows': [{**window, 'max_bytes': 64000},
-                {**window, 'offset_bytes': 64000, 'max_bytes': 32000}]},
-                {'read_windows': [{**window, 'max_bytes': 64000}]}], 'distinct windows', 2),
             ('capacity-does-not-hide-invalid-line', [{'read_windows': [{**window, 'max_bytes': 64000},
                 {**window, 'offset_bytes': 64000, 'max_bytes': 32000}]},
                 {'read_windows': [{**window, 'start_line': 1, 'offset_bytes': 1}]}], 'Line reads require', 2),
@@ -10159,6 +10539,18 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                             and row.get('max_bytes') == admission[0]['request']['max_bytes']
                             for row in (call.args[1] for call in reads.call_args_list
                                 if call.args[0] == 'read_file')))
+        # Repeating the same authorized observation (including an alias in one
+        # batch) neither kills investigation nor supplies fresh bytes/coverage.
+        fake.ask_json.reset_mock()
+        fake.ask_json.side_effect = [probe, {'read_windows': [window, {'path': alias}]},
+            {'materials': [window]}, {'draft_markdown': 'Supplied observed material.'}]
+        self._compose_document(app, request, 'writing-inspection-reuse')
+        prompts = [json.loads(row.args[1]) for row in fake.ask_json.call_args_list[:3]]
+        self.assertEqual(prompts[1]['observations'], prompts[2]['observations'])
+        self.assertEqual([row['status'] for row in prompts[2]['read_admission']],
+            ['already_observed', 'duplicate_request'])
+        self.assertTrue(all(not row['read'] for row in prompts[2]['read_admission']))
+        self.assertEqual([row['decisions_remaining'] for row in prompts], [6, 5, 4])
         # The same owner can narrow a rejected line window and finalize its
         # retained observations without resetting the investigation or budget.
         table.write_bytes(b'x' * 160000)
@@ -11083,13 +11475,16 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             restored.state['turns'][0]['tools'][0]['result'])['status'], 'blocked')
         self.assertEqual(fake.chat_turn.call_count, 1)
 
-    def test_native_professional_work_shares_approval_resume_and_task_ownership(self) -> None:
+    def test_historical_focus_route_shares_approval_resume_and_task_ownership(self) -> None:
         for purpose in ('code', 'writing'):
             with self.subTest(purpose=purpose):
-                self._professional_work_shares_approval_resume_and_task_ownership(purpose)
+                self._historical_focus_route_shares_approval_resume_and_task_ownership(purpose)
 
-    def _professional_work_shares_approval_resume_and_task_ownership(self, purpose) -> None:
+    def _historical_focus_route_shares_approval_resume_and_task_ownership(self, purpose) -> None:
         _, inputs, fake, binding, focused, code = self._native_fixture(goal='Create and verify a counter')
+        # This historical focus routes subsequent coordinator decisions; it is
+        # deliberately NOT evidence that a professional owner was delegated.
+        self.assertNotIn('professional_work', focused.state['config'])
         binding = {**binding, purpose + '_route': {'profile': 'fixture-' + purpose,
             'connection': {'model': 'fixture-' + purpose, 'api_mode': 'chat', 'max_output_tokens': 8192}}}
         fake.connection_binding.return_value = binding
@@ -11098,7 +11493,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         fake.model = 'fixture'
         fake.effective_output_limit.return_value = 2000
         fake.chat_turn.side_effect = [
-            self._native_message('focus_work', {'purpose': purpose, 'goal': 'Create and verify the counter'}, 'focus'),
+            self._native_message('focus_work', {'purpose': purpose, 'goal': 'Create and verify the counter',
+                'tools': ['prepare_implementation']}, 'focus'),
         ]
         professional = Mock()
         # This route deliberately reserves a different output allowance.
@@ -11155,7 +11551,12 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             self.assertEqual(restored.ledger.snapshot(), original_ledger)
             # Direct projection uses the actual focus; an explicit client skips
             # resolution. Both views leave original accounting unchanged.
-            with patch.dict(restored.ledger.limits, {'total_tokens': 12000}):
+            # Derive this boundary from the current schemas rather than a
+            # historical 12k guess: task output fits, larger expert output does not.
+            projected = json.loads(restored._messages(client=fake)[1]['content'])
+            input_capacity = projected['resources']['approximate_next_input_tokens'] + 256
+            committed = restored.ledger.limits['total_tokens'] - restored.ledger.remaining('total_tokens')
+            with patch.dict(restored.ledger.limits, {'total_tokens': committed + input_capacity + 2000}):
                 ledger_before = restored.ledger.to_dict()
                 with patch.object(restored, '_client', wraps=restored._client) as resolve:
                     # The professional output reservation leaves less than
@@ -11167,7 +11568,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     task_context = json.loads(restored._messages(client=fake)[1]['content'])
                     resolve.assert_not_called()
                 self.assertEqual(task_context['resources']['next_output_token_reservation'], 2000)
-                self.assertEqual(task_context['resources']['context_input_target_tokens'], 10000)
+                self.assertEqual(task_context['resources']['context_input_target_tokens'],
+                    min(fake._settings.context_input_tokens, input_capacity))
                 self.assertFalse(task_context['resources']['context_exceeds_input_target'])
                 self.assertEqual(restored.ledger.to_dict(), ledger_before)
             # Simulate interruption after the domain result was saved but
@@ -11225,7 +11627,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             self.assertEqual(restored._work_focus()['purpose'], 'task')
 
     def test_native_work_plan_validates_and_survives_compaction_until_feedback(self) -> None:
-        _, _, fake, _, app, _ = self._native_fixture()
+        _, _, fake, _, app, _ = self._native_fixture(tool_contracts='on_demand')
         first = {'steps': [{'step': 'Inspect inputs', 'status': 'pending'}]}
         latest = {'explanation': 'Ready to verify', 'steps': [
             {'step': 'Inspect inputs', 'status': 'completed'},
@@ -11272,20 +11674,25 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertIsNone(app._work_plan())  # Only attached native observations are current.
 
         fake.chat_turn.side_effect = [
+            self._native_message('load_tools', {'names': ['update_work_plan']}, 'load-plan'),
             self._native_message('update_work_plan', first, 'plan-first'),
             self._native_message('update_work_plan', latest, 'plan-latest'),
             self._native_message('update_work_plan', invalid[5], 'plan-blocked'),
             self._native_message('ask_user', {'question': 'Which output should follow?'}, 'plan-question'),
         ]
         self.assertEqual(app.run(progress=lambda _: None)['status'], 'paused')
-        observed = app.state['turns'][1]['tools'][0]
+        loaded_contract = app.session.store.read_json(app.state['turns'][0]['tools'][0]['result'])
+        self.assertEqual((loaded_contract['tool_name'], loaded_contract['status']), ('load_tools', 'ok'))
+        self.assertIn('update_work_plan', {row['function']['name']
+            for row in fake.chat_turn.call_args_list[1].kwargs['tools']})
+        observed = app.state['turns'][2]['tools'][0]
         receipt = app.session.store.read_json(observed['result'])
         serialized = (app.session.store.root / observed['result']).read_bytes()
         expected = {**latest, 'request_count': 1, 'scope': 'intention_not_verified_outcome',
             'record': 'records/' + observed['result'].removeprefix('attempts/')}
         self.assertEqual(app._work_plan(), expected)
         self.assertEqual(app.session.store.read_json(
-            app.state['turns'][2]['tools'][0]['result'])['status'], 'blocked')
+            app.state['turns'][3]['tools'][0]['result'])['status'], 'blocked')
         # Evict real oversized reasoning, not fake read bodies without byte
         # owner receipts (which now produce explicit unverifiable-input gaps).
         for number in range(2):
@@ -11323,7 +11730,9 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(loaded.ledger.limits, ledger['limits'])
 
     def test_native_completed_work_plan_replays_without_bypassing_action_approval_or_delivery(self) -> None:
-        _, _, fake, _, app, _ = self._native_fixture()
+        # This historical mixed batch needs the plan in its initial offer so
+        # interruption still occurs before any write or process in that batch.
+        _, _, fake, _, app, _ = self._native_fixture(tool_contracts='full', context_target=64000)
         plan = {'explanation': 'Claimed complete, without verification',
             'steps': [{'step': 'Write and verify output', 'status': 'completed'}],
             'evidence_records': ['records/unverified-claim.json']}
@@ -12497,7 +12906,7 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(self.ledger.to_dict(), accounted)
         self.assertEqual({path: path.read_bytes() for path in retained}, retained)
 
-    def test_implementation_without_material_roots_preserves_legacy_binding(self) -> None:
+    def test_implementation_without_material_roots_preserves_explicit_request_binding(self) -> None:
         from pydantic import ValidationError
         from simple_ar.tools.implementation import ImplementationRequest
 
@@ -12519,7 +12928,7 @@ class ImplementationToolTests(_ImplementationAssertions, unittest.TestCase):
         identity = 'implementation-legacy-material-omission'
         prepared = self._prepare_candidate(self.implementation, self.fake, arguments, identity, calls=1)
         self.assertEqual(read_json(Path(prepared.data['source_binding'])),
-            {'request': legacy_request, 'source_windows': []})
+            {'request': legacy_request, 'source_windows': [], 'argv_semantics': 'candidate_relative.v2'})
         self.assertFalse((self.run_dir / 'attempts' / identity / 'implementation/material-selection').exists())
         with patch.object(self.implementation, '_client', side_effect=AssertionError('No replay model')):
             repeated = self._prepare_candidate(self.implementation, self.fake,
@@ -13721,6 +14130,99 @@ class ConversationContextTests(unittest.TestCase):
             'size_bytes': len(raw), 'offset_bytes': offset, 'next_offset_bytes': end, 'has_more': end < len(raw)})
         app.state['turns'].append(self._record_native_turn(app, 'read_file', arguments, result.data, identity))
         return result
+
+    def test_declared_inputs_preserve_raw_goal_roles_and_historical_contracts(self):
+        from simple_ar.tools.writing import WritingToolGateway, freeze_report_requirement
+        inputs, client, old = self._fixture()
+        goal = 'Compare the supplied observations, then explain the limitations.'
+        declarations = {'outcome_preference': 'data_analysis', 'with_report': True,
+            'material_roles': {'source': ['source0'], 'data_path': ['source0']},
+            'data_meanings': {'pairing': 'unknown'}}
+        requirement = freeze_report_requirement({'reviewer': 'disabled'})
+        app = ToolApplication.create(old.session.store.root.parent / 'declared', goal,
+            model='fixture', sources={'source0': inputs}, creation_declarations=declarations,
+            report_requirement=requirement, report_protocol='canonical_report.v1')
+        self.assertEqual(app.state['requests'], [goal])
+        self.assertEqual(app.session.manifest.topic, goal)
+        before = app.session.store.resolve('actions.json').read_bytes()
+        context = json.loads(app._messages(client=client)[1]['content'])
+        self.assertEqual(context['requests'], [{'index': 0, 'text': goal}])
+        self.assertNotIn('authorized_roots', context)
+        self.assertNotIn('workspace', context)
+        self.assertEqual(context['mounts']['source0'], str(inputs.resolve()))
+        self.assertEqual(context['creation_declarations']['material_roles'], declarations['material_roles'])
+        self.assertEqual(app._work_context(['source0'])['creation_declarations'],
+            context['creation_declarations'])
+        binding = app._report_inputs()
+        self.assertEqual(binding['creation_declarations'], context['creation_declarations'])
+        self.assertEqual(binding['requests'], [goal])
+        self.assertEqual(WritingToolGateway._material_report_arguments({'goal': 'Write the results'}, binding)['goal'],
+            'Write the results')
+        legacy = {key: value for key, value in binding.items() if key not in {'input_contract', 'creation_declarations'}}
+        self.assertEqual(WritingToolGateway._material_report_arguments({'goal': 'Write the results'}, legacy)['goal'], goal)
+        self.assertEqual(before, app.session.store.resolve('actions.json').read_bytes())
+        app.supply(supply_id='delivery', reason='Name the final source', changes={'delivery_files': ['*.md']})
+        loaded = ToolApplication.load(app.session.store.root)
+        self.assertEqual(loaded.state['config']['creation_declarations'], context['creation_declarations'])
+        self.assertNotIn('input_contract', old.state['config'])
+        exact = ToolApplication.create(old.session.store.root.parent / 'declared-exact', goal,
+            model='fixture', sources={'source0': inputs}, allow_execution=True, creation_declarations={},
+            code_task={'project_path': 'source0', 'goal': goal, 'allowed_patterns': ['*.py'],
+                'validation_command': ['python', '-c', 'print(1)']})
+        exact_context = json.loads(exact._messages(client=client)[1]['content'])
+        self.assertEqual(exact.state['requests'], [goal])
+        self.assertEqual(exact_context['existing_code_task']['required_tool'], 'implement_code_task')
+        self.assertIn('code_task', exact_context['frozen_contracts'])
+        for identity, value in (('outside', {'material_roles': {'data': ['/etc/passwd']}}),
+                                ('traversal', {'material_roles': {'data': ['source0/../outside']}}),
+                                ('permission', {'allow_execution': True})):
+            with self.subTest(identity=identity), self.assertRaises(ValueError):
+                ToolApplication.create(old.session.store.root.parent / identity, goal, model=None,
+                    sources={'source0': inputs}, creation_declarations=value)
+            self.assertFalse((old.session.store.root.parent / identity / 'actions.json').exists())
+
+    def test_declared_feedback_is_once_in_chronology_and_survives_eviction(self):
+        inputs, client, old = self._fixture()
+        app = ToolApplication.create(old.session.store.root.parent / 'declared-feedback', 'Original user goal',
+            model='fixture', sources={'source0': inputs}, creation_declarations={})
+        self._read(app, inputs / 'notes.txt', 'first-observation')
+        first_turn = app.state['turns'][0]
+        first_turn['request_count'] = 1
+        app.state['requests'].append('Keep prior calculations; only change the explanation.')
+        self._read(app, inputs / 'notes.txt', 'feedback-observation')
+        app.state['turns'][-1].update(request_count=2, origin='professional')
+        for boundary in (0, 1, 2):
+            with self.subTest(boundary=boundary):
+                before = app.session.store.resolve('actions.json').read_bytes()
+                messages = app._messages(client=client, native_history_start_turn=boundary)
+                header = json.loads(messages[1]['content'])
+                supplied = list(header['requests'])
+                for message in messages[2:]:
+                    if message['role'] == 'user':
+                        payload = json.loads(message['content'])
+                        if 'user_request' in payload:
+                            supplied.append(payload['user_request'])
+                self.assertEqual(sorted(supplied, key=lambda row: row['index']),
+                    [{'index': index, 'text': text} for index, text in enumerate(app.state['requests'])])
+                self.assertEqual(header['current_request_index'], 1)
+                self.assertEqual(before, app.session.store.resolve('actions.json').read_bytes())
+
+    def test_declared_closing_projects_only_current_offer_and_accounts_actual_messages(self):
+        inputs, client, old = self._fixture()
+        app = ToolApplication.create(old.session.store.root.parent / 'declared-closing', 'Explain existing results',
+            model='fixture', sources={'source0': inputs}, creation_declarations={}, professional_inputs=True,
+            report_protocol='canonical_report.v1')
+        schemas = app._closing_schemas()
+        messages = app._messages(client=client, closing=True, schemas=schemas)
+        header = json.loads(messages[1]['content'])
+        self.assertNotIn('available_specialists', header)
+        self.assertNotIn('tool_contracts', header)
+        self.assertNotIn('instruction', header['report_protocol'])
+        self.assertNotIn('Delegate', messages[0]['content'])
+        self.assertTrue(header['resources']['decision_budget']['closing_required'])
+        self.assertEqual(header['resources']['approximate_next_input_tokens'],
+            app._decision_tokens(client, messages, schemas=schemas))
+        self.assertEqual({schema['function']['name'] for schema in schemas}, {'ask_user', 'deliver_result'})
 
     def test_conversation_v1_creation_supply_and_historical_dispatch(self):
         with _temporary_run() as root:

@@ -175,15 +175,22 @@ class ResearchIntakeTests(unittest.TestCase):
 
     def test_json_client_resumes_one_native_task_delivers_and_terminal_load_is_idle(self) -> None:
         content = "# Assessment\nCalibration error 0.12 alone cannot establish robustness.\n"
+        request = "Assess the observation: calibration error is 0.12."
+        # This request asks for an assessment, not a file or formal report.
+        # The request owner resolves intent and directly delivers its answer;
+        # expert-owned file tools and a Writer workflow are unnecessary.
+        first_reply = _reply("update_work_plan", {"report_intent": {
+            "kind": "none", "request_index": 0, "quote": request}})
+        final_reply = _reply("deliver_result", {"summary": content,
+            "artifacts": [], "unresolved": []})
         client = _JSONClient([
-            _reply("write_file", {"path": "workspace/assessment.md", "content": content}),
-            _reply("deliver_result", {"summary": "Qualified assessment of the supplied observation.",
-                "artifacts": ["workspace/assessment.md"], "unresolved": []}),
+            first_reply,
+            final_reply,
         ])
         services = ResearchApplicationServices(llm_client=client,
             budget_limits={"llm_requests": 2, "total_tokens": 1000000},
             config={"research_materials_only": True})
-        brief = ResearchBrief(request_text="Assess the observation: calibration error is 0.12.",
+        brief = ResearchBrief(request_text=request,
             requested_outputs=("assessment",))
         with TemporaryDirectory() as directory, patch.object(LLMClient, "from_env",
                 side_effect=AssertionError("Injected services must not use environment clients")):
@@ -203,10 +210,18 @@ class ResearchIntakeTests(unittest.TestCase):
             resumed = ToolApplication.load(root, services=services)
             result = resumed.run(progress=lambda _: None)
             self.assertEqual(result["status"], "completed", result)
+            observations = [resumed.session.store.read_json(item['result'])
+                for turn in resumed.state['turns'] for item in turn['tools']]
+            self.assertEqual([row['tool_name'] for row in observations],
+                ['update_work_plan', 'deliver_result'])
+            self.assertTrue(all(row['status'] == 'ok' for row in observations), observations)
+            self.assertEqual(observations[0]['data']['report_intent']['kind'], 'none')
+            self.assertIsNone(resumed.state['config'].get('report_requirement'))
             self.assertEqual(result["session_id"], identity)
-            self.assertEqual((root / "workspace/assessment.md").read_text(encoding="utf-8"), content)
             delivery = json.loads((root / "delivery.json").read_text(encoding="utf-8"))
-            self.assertEqual(delivery["artifacts"], ["workspace/assessment.md"])
+            self.assertEqual(delivery["summary"], content)
+            self.assertEqual(delivery["artifacts"], [])
+            self.assertFalse(any((root / 'workspace').iterdir()))
             self.assertEqual(len(client.calls), 2)
             tool_messages = [message for message in client.calls[1][1]["messages"]
                              if message["role"] == "tool"]

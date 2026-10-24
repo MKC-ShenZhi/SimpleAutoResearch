@@ -137,7 +137,8 @@ def add_start_parser(subparsers: argparse._SubParsersAction) -> None:
     native.add_argument("--decision-guidance", default=None, help="Facts or direction for a revise response; not execution authorization.")
     native.add_argument("--max-turns", type=int, default=30, help="Native task: model request allowance, retained across feedback/resume.")
     native.add_argument("--max-tokens", type=int, default=600000, help="Native task: shared model token allowance, retained across feedback/resume.")
-    parser.set_defaults(_native_start_destinations={action.dest for action in native._group_actions},
+    parser.set_defaults(_native_start_destinations={action.dest for action in native._group_actions} | {'extensions'},
+        extensions=[],
         _shared_start_destinations={'goal', 'model', 'output_root', 'prepare_only', 'yes', 'project_python'},
         _data_declaration_destinations={'value_column', 'group_column', 'observation_unit', 'value_unit',
             'data_attribution', 'paired_baseline', 'x_column', 'x_unit', 'data_association',
@@ -145,8 +146,8 @@ def add_start_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--guided", action="store_true", help="Choose an outcome preference for the native task; explicit protocol controls retain structured compatibility.")
     parser.add_argument("--kind", choices=tuple(FUNCTION_LABELS), help="Starting preference for native creation, or explicit structured protocol. Does not grant execution or network access.")
     parser.add_argument("--from-session", type=Path, help="Reuse registered results or a validated project from an existing session.")
-    parser.add_argument("--reuse", action="append", default=[], choices=("data_analysis", "report", "summary", "code_analysis", "code_project"),
-                        help="Result to reuse as writing material; repeatable. code_project also supports isolated code/figure revision or repeating a saved reproduction protocol. Inspect with results SESSION.")
+    parser.add_argument("--reuse", action="append", default=[],
+                        help="Registered result name shown by results SESSION; repeatable. Materials can serve any goal. code_project retains its saved edit scope and checker.")
     parser.add_argument("--chat", action="store_true", help="Opt-in model-assisted technical setup for explicit structured protocols, not the ordinary native preference entry. Requires a terminal and model connection.")
     parser.add_argument("--resume-setup", type=Path, help="Resume a saved natural-language setup directory, retaining replies and setup model accounting; not execution recovery.")
     parser.add_argument("--with-report", action="store_true", help="Data analysis: also write and review a report from the saved analysis and figures in the same session; requires a model. Default: analysis only, no task API calls.")
@@ -232,17 +233,37 @@ def migrate_new_start(args: argparse.Namespace) -> bool:
     the sole task/configuration/authorization/ledger owner. Explicit unsupported
     controls are rejected before any model selection or session creation.
     """
+    # On an existing task, material aliases are added access through the same
+    # confirmation/journal as --source. They must not start a new preference or
+    # reinterpret feedback as a creation goal.
+    material_aliases = {'project', 'document', 'material', 'data_file', 'data_path'}
+    if args.resume_task and not (args.kind or args.guided or args.chat or args.resume_setup
+                                 or args.scripted or args.from_session or args.reuse):
+        from simple_ar.cli.parser import build_parser
+        defaults = build_parser().parse_args(['start'])
+        supplied = set(getattr(args, '_explicit_start_destinations', ()))
+        supplied.update(name for name, value in vars(defaults).items()
+                        if not name.startswith('_') and getattr(args, name, value) != value)
+        if supplied & material_aliases:
+            unsupported = supplied - (args._native_start_destinations
+                | args._shared_start_destinations | material_aliases)
+            if unsupported:
+                raise ValueError('Resume cannot preserve these structured controls: '
+                                 + ', '.join(sorted(unsupported)))
+            roles = _native_material_roles(args)
+            args.source = list(dict.fromkeys(Path(value) for values in roles.values() for value in values))
+            return True
     reuse_inputs = bool(args.from_session or args.reuse)
-    registered_origin = None
+    registered_origin = getattr(args, '_reuse_origin', None)
     if reuse_inputs and "code_project" in args.reuse:
-        if args.kind == 'reproduction' or args.chat or args.resume_setup or hasattr(args, '_setup_state'):
+        if args.chat or args.resume_setup or hasattr(args, '_setup_state'):
             return False  # Scientific/confirmed technical protocols keep their original owner.
         registered_origin = {'session': str(args.from_session.resolve()) if args.from_session else None,
                              'results': list(args.reuse)}
-        reuse_session_materials(args)
+        reuse_session_materials(args, native=True)
+        if getattr(args, '_material_authorize', None) is None:
+            args.source.extend(path.parent for path in args.material)
         reuse_inputs = False
-    elif reuse_inputs and args.kind not in {None, "writing"}:
-        return False
     if hasattr(args, '_reuse_edit_policy') and args.kind == 'reproduction':
         return False
     if args.chat or args.resume_setup or hasattr(args, "_setup_state"):
@@ -250,15 +271,15 @@ def migrate_new_start(args: argparse.Namespace) -> bool:
             raise ValueError("Native creation cannot preserve chat/resume_setup structured controls; use ordinary preferences or an explicit supported protocol.")
         return False  # Technical setup retains its confirmed structured protocol.
     if args.kind is None:
-        if reuse_inputs:
-            args.kind = "writing"
-        elif not args.guided:
+        if not args.guided:
             if args.scripted:
                 raise ValueError("--scripted requires --kind data_analysis.")
-            return False  # Bare start and plain requests already use native main.
+            if not (reuse_inputs or args.project or args.document or args.material
+                    or args.data_file or args.data_path or args.with_report):
+                return False  # Bare start and plain requests already use native main.
         if args.resume_task:
             raise ValueError("Creation preferences cannot change a saved task; use --resume-task without --guided.")
-        if args.kind is None:
+        if args.guided and args.kind is None:
             _select_start_preference(args, interactive=sys.stdin.isatty())
     scripted = args.scripted
     figure = args.kind == "figure"
@@ -289,6 +310,9 @@ def migrate_new_start(args: argparse.Namespace) -> bool:
     table_protocol = args.kind == "data_analysis" and not scripted and bool(
         explicit & {"value_column", "x_column", "paired_baseline"})
     if protocol_controls or table_protocol:
+        if registered_origin and not hasattr(args, '_reuse_edit_policy'):
+            raise ValueError('Native project reuse accepts goals and materials, not frozen execution controls: '
+                             + ', '.join(sorted(protocol_controls or explicit & {'value_column', 'x_column', 'paired_baseline'})))
         if hasattr(args, '_reuse_edit_policy'):
             return False  # Explicit extra controls still require the confirmed structured protocol.
         if not (figure or scripted or exact_code):
@@ -300,12 +324,13 @@ def migrate_new_start(args: argparse.Namespace) -> bool:
     if reuse_inputs:
         reuse_origin = {"session": str(args.from_session.resolve()) if args.from_session else None,
                         "results": list(args.reuse)}
-        reuse_session_materials(args)
+        reuse_session_materials(args, native=True)
         # Mount complete registered result packages, not just their JSON index
         # or Markdown body. Their source data/figures must remain available to
         # the common inventory and writing owners. Never mount the whole old
         # session or import its execution state/allowances into a new task.
-        args.source.extend(path.parent for path in args.material)
+        if getattr(args, '_material_authorize', None) is None:
+            args.source.extend(path.parent for path in args.material)
     if args.goal and args.request:
         raise ValueError("Use either the positional request or --goal, not both.")
     goal = args.request if args.request is not None else args.goal
@@ -319,15 +344,7 @@ def migrate_new_start(args: argparse.Namespace) -> bool:
         while value := input("Material path / 材料路径（可留空）: ").strip():
             args.source.append(Path(value))
     from simple_ar.tools.workspace import resolve_source_mount
-    roles = {}
-    for name, values in (("source", args.source), ("document", args.document), ("material", args.material),
-                         ("project", [args.project] if args.project is not None else []), ("data_path", args.data_path),
-                         ("data_file", [args.data_file] if args.data_file is not None else [])):
-        for value in values:
-            if isinstance(value, str) and value.startswith(("http://", "https://")):
-                raise ValueError("--document requires local mounted material for native creation; put public URLs in the goal and authorize --allow-network separately.")
-            path = resolve_source_mount(Path(value))
-            roles.setdefault(name, []).append(str(path))
+    roles = _native_material_roles(args)
     sources = list(dict.fromkeys(Path(value)
         for name in ("source", "document", "material", "data_path", "project", "data_file")
         for value in roles.get(name, ())))
@@ -350,18 +367,8 @@ def migrate_new_start(args: argparse.Namespace) -> bool:
             timeout_sec=args.timeout_sec or 300,
             **({'edit_policy': policy} if policy is not None else {})).model_dump()
         args.allow_execution = True
-    if args.project is not None and not args.project.expanduser().resolve().is_dir():
-        raise ValueError("--project must be a read-only project directory.")
     from simple_ar.research.documents.ingest import analysis_material_paths
     analysis_material_paths(path.expanduser().resolve() for path in args.material if path.is_file())
-    if args.kind == "writing":
-        from simple_ar.research.documents.ports import SUPPORTED_DOCUMENT_SUFFIXES, SUPPORTED_MATERIAL_SUFFIXES
-        if set(path.expanduser().resolve() for path in args.document) & set(path.expanduser().resolve() for path in args.material):
-            raise ValueError("Each writing file must have one role; do not repeat papers as material.")
-        if any(path.is_file() and path.suffix.lower() not in suffixes
-               for paths, suffixes in ((args.document, SUPPORTED_DOCUMENT_SUFFIXES), (args.material, SUPPORTED_MATERIAL_SUFFIXES))
-               for path in paths):
-            raise ValueError("Writing material must be text/HTML/PDF/JSON or a validated analysis package; use read-only --source for other investigation inputs.")
     if args.data_file is not None:
         data = args.data_file.expanduser().absolute()
         from simple_ar.result_analysis.script_project import MAX_DATA_BYTES
@@ -369,35 +376,21 @@ def migrate_new_start(args: argparse.Namespace) -> bool:
             raise ValueError("Creation --data-file must be a regular file of at most 20 MiB; use --source for larger bounded investigation.")
     declarations = {name: getattr(args, name) for name in sorted(args._data_declaration_destinations)
                     if name in explicit or getattr(args, name) != getattr(defaults, name)}
-    additions = []
+    payload = {}
     if roles:
-        additions.append("Supplied material roles (user declarations, not independently verified evidence):\n"
-                         + json.dumps(roles, ensure_ascii=False))
+        payload['material_roles'] = {name: [_creation_source_locator(Path(value), sources)
+            for value in values] for name, values in roles.items()}
     if declarations:
-        additions.append("User-declared data meanings and requested presentation (preserve exactly; clarify unsupported scientific assumptions):\n"
-                         + json.dumps(declarations, ensure_ascii=False))
-    delivery = {
-        "survey": "Compare relevant sources and conditions, answer the question and deliver an evidence-based report. Distinguish original sources from supplied unverified notes.",
-        "writing": "Deliver an editable draft grounded in supplied materials; distinguish observations from independently verified evidence and preserve unresolved gaps.",
-        "bug_fix": "Investigate the supplied project and requested fix; deliver revised source and an explanation with actual validation status. Preserve supplied evaluation/checker files.",
-        "code": "Deliver source addressing the goal, a usable entry and an explanation with actual validation status.",
-        "reproduction": "Investigate the supplied paper/project/data and clarify necessary measurement conditions. Deliver reproducible source and an honest account of actual checks and remaining gaps; preparation or short checks do not establish a published conclusion.",
-        "figure": "Deliver an editable method figure, its code/layout source, PNG preview, vector SVG and explanation. Verify actual exports before delivery. Distinguish conceptual relationships from measured evidence; do not invent data.",
-        "data_analysis": "Deliver analysis source or a rebuildable analysis package, actually computed results and explanation, with figures when useful to the goal. Inspect data meanings and units; never infer pairing from row order. Record assumptions, missing/excluded rows and provenance; verify actual outputs before delivery. File readability does not establish statistical correctness.",
-    }
-    additions.append("Requested outcome preference (not an access grant): " + delivery[args.kind])
-    if exact_code:
-        additions.append('Exact implementation contract: use implement_code_task for the scoped repair and declared independent validation. '
-            'Its current source identity and bounded repair require approval through the existing execution gate. '
-            'The frozen edit scope and protected checkers cannot be replaced by generic candidate generation.\n'
-            + json.dumps(args._code_task, ensure_ascii=False))
+        payload['data_meanings'] = declarations
+    if args.kind is not None:
+        payload['outcome_preference'] = args.kind
     if args.with_report:
-        additions.append("Include a report based on the actual materials and results.")
+        payload['with_report'] = True
     if reuse_origin:
-        additions.append("Reuse registered prior results in this new task, not their execution state or budget:\n"
-                         + json.dumps({**reuse_origin, "prior_drafts": getattr(args, "_reuse_report_drafts", [])}, ensure_ascii=False)
-                         + "\nPrior prose is editable material, not primary evidence. Inspect the mounted result packages and original-source identities; do not rerun valid measurements merely to rewrite or plot them.")
-    additions.append("All mounted materials, including data and supplied evaluation/checker files, are read-only. Keep new source and outputs in the task workspace. No installation or destructive action is authorized by this creation preference; commands need separate approval.")
+        payload['reuse_origin'] = {**reuse_origin, 'prior_drafts': [
+            _creation_source_locator(Path(path).resolve(), sources)
+            for path in getattr(args, '_reuse_report_drafts', [])]}
+    args._creation_declarations = payload
     if interactive and not args.yes and not args.prepare_only and not (args.allow_network or args.allow_execution):
         print_line("If needed for your goal, authorize public source acquisition or process proposals. Each process command still needs its own approval; this is not an OS sandbox.")
         access = input("Access / 所需访问 [none / network / process / both; default none]: ").strip().lower()
@@ -405,11 +398,42 @@ def migrate_new_start(args: argparse.Namespace) -> bool:
             raise ValueError("Choose none, network, process or both; no access was granted.")
         args.allow_network = access in {"network", "both"}
         args.allow_execution = access in {"process", "both"}
-    args.request = goal + "\n\n" + "\n\n".join(additions)
+    args.request = goal
     args.goal = None
     args.source = sources
     print_line("Ordinary preferences use the native task owner. Materials remain read-only; --allow-execution permits proposals only, and --yes accepts the summary only.")
     return True
+
+
+def _creation_source_locator(path: Path, sources: list[Path]) -> str:
+    """Name an already admitted source without changing its access boundary."""
+    if path in sources:
+        return f'source{sources.index(path)}'
+    locators = [f'source{index}/{path.relative_to(source).as_posix()}'
+                for index, source in enumerate(sources)
+                if source.is_dir() and path.is_relative_to(source)]
+    if not locators:
+        raise ValueError('Creation declaration requires an existing source mount')
+    return min(locators, key=lambda value: (len(value), value))
+
+
+def _native_material_roles(args: argparse.Namespace) -> dict[str, list[str]]:
+    """Resolve creation and feedback aliases through the common mount guard."""
+    from simple_ar.tools.workspace import resolve_source_mount
+    roles: dict[str, list[str]] = {}
+    for name, values in (("source", args.source), ("document", args.document), ("material", args.material),
+                         ("project", [args.project] if args.project is not None else []), ("data_path", args.data_path),
+                         ("data_file", [args.data_file] if args.data_file is not None else [])):
+        for value in values:
+            if isinstance(value, str) and value.startswith(("http://", "https://")):
+                raise ValueError("--document requires local mounted material for native creation; put public URLs in the goal and authorize --allow-network separately.")
+            path = resolve_source_mount(Path(value))
+            if name == 'project' and not path.is_dir():
+                raise ValueError('--project must be a read-only project directory.')
+            if name == 'data_file' and not path.is_file():
+                raise ValueError('--data-file must be a regular file.')
+            roles.setdefault(name, []).append(str(path))
+    return roles
 
 
 def _quote(value: str) -> str:
@@ -421,6 +445,8 @@ def native_creation_options(args: argparse.Namespace) -> dict:
     """One projection of native creation access, frozen contracts and budgets."""
     from simple_ar.cli.task_options import native_process_limits
     return dict(model=args.model or None, report_protocol='canonical_report.v1', professional_inputs=True,
+        creation_declarations=getattr(args, '_creation_declarations', {}),
+        extensions=getattr(args, 'extensions', []),
         context_protocol='conversation.v1',
         sources={f'source{index}': path for index, path in enumerate(args.source)},
         allow_execution=args.allow_execution, allow_network=args.allow_network, allow_vision=args.allow_vision,
@@ -876,14 +902,11 @@ def _reproduction_options(args: argparse.Namespace, *, interactive: bool) -> dic
             "process_invocations": invocations, "process_wall_seconds": timeout * invocations}
 
 
-def _session_project(session) -> tuple[Path, dict, dict] | None:
-    """Resolve a validated owned workspace and its original scope/verification."""
+def _session_project(session) -> tuple[Path, dict | None, dict] | None:
+    """Resolve an owner-proved project and its optional exact contract."""
     from simple_ar.app.tool_application import ToolApplication
     if session.manifest.transition_recipe == ToolApplication.RECIPE:
-        try:
-            return ToolApplication.load(session.store.root).reusable_code_project()
-        except (OSError, ValueError, KeyError, TypeError):
-            return None  # Portable deliveries may outlive their executable task state.
+        return ToolApplication.load(session.store.root).reusable_code_project()
     from simple_ar.code_task.runtime.state import code_task_paths, load_code_task_manifest
     ref = session.manifest.state_refs.get("implementation")
     if ref is None or ref.status != "available":
@@ -912,9 +935,16 @@ def _session_project(session) -> tuple[Path, dict, dict] | None:
     return workspace, manifest, policy
 
 
-def session_materials(root: Path) -> dict[str, list[Path]]:
+def session_materials(root: Path, *, authorize=None, include_project: bool = True) -> dict[str, list[Path]]:
     """Resolve current registered deliveries, not arbitrary historical files."""
     root = root.resolve()
+    if authorize is not None:
+        # UI reuse uses the same artifact owner and admits each exact path
+        # before reads; executable project assembly needs broader authority.
+        from simple_ar.tools.workspace import RetainedDelivery
+        available = RetainedDelivery(root, authorize=authorize).reusable_materials()
+        available.pop('code_project', None)
+        return available
     from simple_ar.core.capabilities import CapabilityRegistry
     from simple_ar.core.session import SessionController
     session = SessionController.load(root, registry=CapabilityRegistry())
@@ -924,8 +954,18 @@ def session_materials(root: Path) -> dict[str, list[Path]]:
         # current completion while the revised task is active or paused.
         if session.manifest.status not in {"completed", "partial"}:
             return {}
-        available = ToolApplication.load(root).reusable_materials()
-        project = _session_project(session)
+        from simple_ar.tools.workspace import RetainedDelivery
+        available = RetainedDelivery(root).reusable_materials()
+        available.pop('code_project', None)  # Only the implementation owner's project proof can offer this name.
+        if not include_project:
+            return available
+        try:
+            project = _session_project(session)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            # Portable files retain their own proof even when the complete
+            # executable project is ambiguous, unavailable or changed.
+            print_line(f'code_project unavailable: {exc}')
+            project = None
         if project is not None:
             available['code_project'] = [project[0]]
         return available
@@ -991,7 +1031,7 @@ def session_materials(root: Path) -> dict[str, list[Path]]:
     return available
 
 
-def reuse_session_materials(args: argparse.Namespace) -> None:
+def reuse_session_materials(args: argparse.Namespace, *, native: bool = False) -> None:
     root = getattr(args, "from_session", None)
     selected = getattr(args, "reuse", [])
     if root is None:
@@ -1000,12 +1040,17 @@ def reuse_session_materials(args: argparse.Namespace) -> None:
         return
     root = root.resolve()
     if not selected:
-        raise ValueError("Select --reuse data_analysis, code_analysis, code_project, report or summary; inspect with results SESSION.")
+        raise ValueError("Select registered result names with --reuse; inspect with results SESSION.")
+    args._reuse_origin = {'session': str(root), 'results': list(selected)}
+    def materials():
+        return session_materials(root, authorize=getattr(args, '_material_authorize', None),
+                                 include_project='code_project' in selected)
+
     if "code_project" in selected:
-        if selected != ["code_project"] or args.kind not in {None, "bug_fix", "figure", "data_analysis", "reproduction"}:
-            raise ValueError("Reuse one code_project independently for code/figure revision; use code_analysis for writing.")
+        if getattr(args, '_material_authorize', None) is not None:
+            raise ValueError('code_project proof requires executable-owner assembly unavailable in UI retained-material grants; use portable delivery groups or the original CLI')
         if args.project or args.validate or args.allow:
-            raise ValueError("Project reuse retains its registered scope and verification; do not override them in the same selection.")
+            raise ValueError("Select code_project or an explicit project/scope/checker; do not override the selected project's proof in the same request.")
         from simple_ar.core.capabilities import CapabilityRegistry
         from simple_ar.core.session import SessionController
         session = SessionController.load(root, registry=CapabilityRegistry())
@@ -1013,6 +1058,18 @@ def reuse_session_materials(args: argparse.Namespace) -> None:
         if project is None:
             raise ValueError("No current reusable code_project; complete and validate the original project first.")
         workspace, manifest, policy = project
+        if manifest is None:
+            if not native:
+                raise ValueError('Native project reuse requires ordinary start without --chat or a structured execution protocol')
+            available = materials()
+            _append_reused_materials(args, root, [name for name in selected if name != 'code_project'], available)
+            args.project = workspace
+            args.from_session, args.reuse = None, []
+            print_line('Reuse the delivered native project as read-only material. New work uses its own budgets, interpreter and permissions; saved execution is not replayed.')
+            return
+        if ((not native or args.kind == 'reproduction') and selected != ["code_project"]
+                or args.kind not in {None, "code", "bug_fix", "figure", "data_analysis", "reproduction"}):
+            raise ValueError("Reuse one code_project independently for code/figure revision; use code_analysis for writing.")
         reproduction = args.kind == "reproduction"
         if reproduction:
             if any((args.run_argv is not None, args.cwd, args.hypothesis, args.dataset,
@@ -1054,7 +1111,10 @@ def reuse_session_materials(args: argparse.Namespace) -> None:
         args.allow = list(manifest["edit_scope"]["allowed_patterns"])
         args._reuse_protected = list(manifest["edit_scope"].get("protected_patterns", []))
         args._reuse_edit_policy = policy
-        args._analysis_project = "code_analysis" in session_materials(root)
+        available = materials()
+        args._analysis_project = "code_analysis" in available
+        if native:
+            _append_reused_materials(args, root, [name for name in selected if name != 'code_project'], available)
         python = manifest.get("environment", {}).get("policy", {}).get("python_executable")
         if reproduction:
             python = execution.get("code_task", {}).get("python_executable") or python
@@ -1066,8 +1126,8 @@ def reuse_session_materials(args: argparse.Namespace) -> None:
         print_line("Reuse a validated project in a new isolated task with its registered edit scope and checker." +
                    (" Repeat the saved reproduction protocol; no environment installation is requested." if reproduction else ""))
         return
-    if args.kind == "survey":
-        available = session_materials(root)
+    if args.kind == "survey" and not native:
+        available = materials()
         if selected != ["report"] or "report" not in available:
             raise ValueError("Survey follow-up reuses --reuse report's source bundle, not its prose or analysis results.")
         bundles = [path for path in available["report"] if path.suffix == ".json"
@@ -1100,19 +1160,28 @@ def reuse_session_materials(args: argparse.Namespace) -> None:
         args.sources = args.sources or "search"
         args.from_session, args.reuse = None, []
         return
-    if args.kind not in {None, "writing"}:
+    if not native and args.kind not in {None, "writing"}:
         raise ValueError("Registered deliveries currently enter writing; use their source data for a new analysis.")
-    available = session_materials(root)
+    _append_reused_materials(args, root, selected, materials())
+    if not native:
+        args.kind = "writing"
+    args.from_session = None
+    args.reuse = []
+
+
+def _append_reused_materials(args: argparse.Namespace, root: Path, selected: list[str],
+                             available: dict[str, list[Path]]) -> None:
+    """Import declared result groups for both scoped code and material goals."""
     for name in selected:
         if name not in available:
             raise ValueError(f"No current reusable {name} delivery in {root}.")
+        preflight = getattr(args, '_material_preflight', None)
+        if preflight is not None:
+            preflight(available[name])
         args.material.extend(available[name])
         if name == "report":
             args._reuse_report_drafts = [str(available[name][0])]
     args.material = list(dict.fromkeys(args.material))
-    args.kind = "writing"
-    args.from_session = None
-    args.reuse = []
 
 
 def prepare_start(args: argparse.Namespace, *, for_execution: bool = False) -> Path | argparse.Namespace | None:

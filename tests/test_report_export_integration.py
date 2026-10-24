@@ -9,7 +9,7 @@ import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 
-from simple_ar.report.export import ReportExportError, export_acm_report, _nodes, _run
+from simple_ar.report.export import ReportExportError, export_acm_report, _compile, _nodes, _run
 
 
 IDENTIFIER = 'Za71c9' * 32
@@ -25,6 +25,184 @@ TECHNICAL_BODY = ('\n`' + INLINE_COMMAND + '`\n\nInline identifier `' + IDENTIFI
     all(shutil.which(name) for name in ("pandoc", "rsvg-convert", "pdflatex", "bibtex")),
     "Opt-in integration requires Pandoc, librsvg and acmart-equipped TeX")
 class PortableExportIntegrationTests(unittest.TestCase):
+    @unittest.skipUnless(all(shutil.which(name) for name in ('pdftotext', 'pdfinfo', 'pdftoppm')),
+        'Caption pagination checks require Poppler')
+    def test_caption_page_budget_preserves_native_text_and_clean_rebuild(self):
+        from pypdf import PdfReader
+
+        # Enough prose to exceed the retired 20% caption allowance at ordinary
+        # font sizes. The tenth figure also exercises a wider number label.
+        caption = ('Longmarker. Measured $x_i^2$ and [data portal](https://example.org/data) '
+            'with evidence [@p1]. ' + ' '.join(
+                f'Observation {index:03d} preserves measured data and uncertainty.'
+                for index in range(1, 37)) + ' Captionendmarker.')
+        for layout in ('builtin', 'supplied'):
+            with self.subTest(layout=layout), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = root / 'input'
+                source.mkdir()
+                body = '# Caption allocation\n\n## Results\n\nNative text and figures.\n\n'
+                body += '\n\n'.join(f'![Small fixture {index}.](tiny.svg)' for index in range(1, 10))
+                body += '\n\n![' + caption + '](portrait.svg){#fig:long}\n\n![Shortmarker.](tiny.svg)\n'
+                (source / 'report_body.md').write_text(body, encoding='utf-8')
+                bibliography = '@misc{p1, author={Example, A}, year={2024}, title={Caption evidence}}\n'
+                (source / 'references.bib').write_text(bibliography, encoding='utf-8')
+                for filename, width, height in (('tiny.svg', 32, 48), ('portrait.svg', 2400, 4800)):
+                    (source / filename).write_text(
+                        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">'
+                        f'<rect x="1" y="1" width="{width - 2}" height="{height - 2}" '
+                        'fill="white" stroke="black"/></svg>', encoding='utf-8')
+                options = {}
+                if layout == 'supplied':
+                    # Deliberately different page area, body/caption fonts and
+                    # spacing; all are set AFTER the renderer's preamble hook.
+                    (source / 'layout.latex').write_text(
+                        '\\documentclass[12pt]{article}\n'
+                        '$for(header-includes)$\n$header-includes$\n$endfor$\n'
+                        '\\usepackage[paperwidth=7in,paperheight=9in,margin=.75in]{geometry}\n'
+                        '\\usepackage{natbib,hyperref,amsmath,caption}\n'
+                        '\\captionsetup{font=small,skip=14pt}\n'
+                        '\\title{$title$}\n\\begin{document}\n\\maketitle\n$body$\n'
+                        '\\bibliographystyle{plainnat}\n\\bibliography{references}\n'
+                        '\\end{document}\n', encoding='utf-8')
+                    options['template'] = {'path': 'layout.latex'}
+                output = root / 'export'
+                qa_root = os.environ.get('SAR_TEST_EXPORT_QA_DIR')
+                retained = None
+                if qa_root:
+                    Path(qa_root).mkdir(parents=True, exist_ok=True)
+                    retained = Path(tempfile.mkdtemp(prefix='caption-' + layout + '-', dir=qa_root))
+
+                def render(argv, **kwargs):
+                    rendered = _run(argv, **kwargs)
+                    if retained and '--from=json' in argv and '--to=latex' in argv and '--standalone' not in argv:
+                        # Retain the actual writer protocol even if pagination
+                        # subsequently rejects it; never repair its TeX in QA.
+                        (retained / 'actual-pandoc-body.tex').write_text(rendered, encoding='utf-8')
+                    return rendered
+
+                result = export_acm_report(source, output, compile_pdf=True, render_preview=True,
+                    caption_owner='markdown', runner=render, **options)
+                if retained:
+                    shutil.copytree(output, retained / 'project')
+                    print('P3 caption evidence:', retained / 'project', flush=True)
+                self.assertTrue(result['compiled'], result)
+                self.assertFalse(any('Float too large' in warning or 'Overfull \\vbox' in warning
+                    or 'undefined citation' in warning.lower() for warning in result['compile_warnings']), result)
+                self.assertEqual((source / 'report_body.md').read_text(encoding='utf-8'), body)
+                self.assertEqual((output / 'references.bib').read_text(encoding='utf-8'), bibliography)
+                rendered = (output / 'body.tex').read_text(encoding='utf-8')
+                self.assertEqual(rendered.count(r'\sarfigurecontent'), 11)
+                # Modern writers also carry caption text in image alt keys.
+                self.assertEqual(rendered.count(r'\caption'), 11)
+
+                def check_pdf(project):
+                    text = subprocess.check_output(['pdftotext', str(project / 'main.pdf'), '-'], text=True)
+                    normalized = ' '.join(text.split())
+                    self.assertEqual(normalized.count('Longmarker.'), 1)
+                    self.assertEqual(normalized.count('Captionendmarker.'), 1)
+                    self.assertIn('data portal', normalized)
+                    self.assertNotIn('[?]', normalized)
+                    self.assertRegex(normalized, r'(?:Figure|Fig\.)\s*10[.:]')
+                    for index in range(1, 37):
+                        self.assertRegex(normalized, r'Observation\s+' + f'{index:03d}')
+                    bbox = subprocess.check_output(['pdftotext', '-bbox', str(project / 'main.pdf'), '-'], text=True)
+                    ns = '{http://www.w3.org/1999/xhtml}'
+                    pages = list(ET.fromstring(bbox).iter(ns + 'page'))
+                    marked = {marker: [(page, word) for page in pages for word in page.iter(ns + 'word')
+                        if word.text == marker] for marker in ('Longmarker.', 'Captionendmarker.', 'Shortmarker.')}
+                    self.assertTrue(all(len(matches) == 1 for matches in marked.values()), marked)
+                    start_page, start = marked['Longmarker.'][0]
+                    end_page, end = marked['Captionendmarker.'][0]
+                    self.assertIs(start_page, end_page, 'Caption must travel with its figure on one page')
+                    self.assertGreater(float(end.attrib['yMax']), float(start.attrib['yMin']))
+                    self.assertGreater(float(end.attrib['yMax']) - float(start.attrib['yMin']),
+                        .2 * float(start_page.attrib['height']),
+                        'Fixture must exceed the retired fixed caption allowance')
+                    _, short = marked['Shortmarker.'][0]
+                    long_font = float(start.attrib['yMax']) - float(start.attrib['yMin'])
+                    short_font = float(short.attrib['yMax']) - float(short.attrib['yMin'])
+                    self.assertAlmostEqual(long_font, short_font, delta=.15,
+                        msg='Long caption must retain the template caption font')
+                    for page in pages:
+                        for word in page.iter(ns + 'word'):
+                            self.assertGreaterEqual(float(word.attrib['yMin']), 0)
+                            self.assertLessEqual(float(word.attrib['yMax']), float(page.attrib['height']))
+                    # The custom layout's bottom text boundary is known, unlike
+                    # a paper-edge-only check that can miss footer collisions.
+                    if layout == 'supplied':
+                        self.assertLessEqual(float(end.attrib['yMax']), 9 * 72 - .75 * 72 + 1)
+                    reader = PdfReader(project / 'main.pdf')
+                    actions = [annotation.get_object().get('/A') for page in reader.pages
+                        for annotation in page.get('/Annots', [])]
+                    links = [action.get_object().get('/URI') for action in actions if action is not None]
+                    self.assertIn('https://example.org/data', links)
+                    auxiliary = (project / 'main.aux').read_text(encoding='utf-8')
+                    self.assertRegex(auxiliary, r'\\newlabel\{fig:long\}\{\{10\}')
+                    self.assertEqual(auxiliary.count(r'\newlabel{fig:long}'), 1)
+
+                check_pdf(output)
+                # Rebuild from delivered editable inputs only; the original
+                # manuscript and every first-build auxiliary are unavailable.
+                moved = root / 'relocated'
+                moved.mkdir()
+                for filename in ('main.tex', 'body.tex', 'references.bib', 'template.latex', 'source.md'):
+                    shutil.copyfile(output / filename, moved / filename)
+                shutil.copytree(output / 'figures', moved / 'figures')
+                source.rename(root / 'withheld-input')
+                rebuilt = _compile(moved, True)
+                self.assertTrue(rebuilt['compiled'], rebuilt)
+                check_pdf(moved)
+
+    def test_caption_that_exceeds_page_fails_with_editable_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'input'
+            source.mkdir()
+            caption = ' '.join('Measured values retain their uncertainty and original interpretation.'
+                for _ in range(300))
+            (source / 'report_body.md').write_text('# Oversize caption\n\n![' + caption + '](plot.svg)\n',
+                encoding='utf-8')
+            (source / 'plot.svg').write_text('<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">'
+                '<rect width="100" height="100" fill="black"/></svg>', encoding='utf-8')
+            result = export_acm_report(source, root / 'export', compile_pdf=True, caption_owner='markdown')
+            self.assertFalse(result['compiled'], result)
+            self.assertEqual(result['status'], 'compile_failed')
+            self.assertIn('Figure caption cannot fit on one page', result['compile_note'])
+            self.assertIn('Figure caption cannot fit on one page', (root / 'export/build.log').read_text())
+            self.assertIn('original interpretation', ' '.join((root / 'export/body.tex').read_text().split()))
+            self.assertTrue((root / 'export/main.tex').is_file())
+
+    def _assert_fixture_table_layout(self, pages):
+        """Check cell wrapping spatially, not just token survival on a page."""
+        ns = '{http://www.w3.org/1999/xhtml}'
+        rows = [
+            ['Case one', 'Short input', 'Notes saved', 'Check open', 'Local file', 'Plain text', 'Read notes'],
+            ['Case two', 'Full input', 'Notes ready', 'Check done', 'Local data', 'Saved text', 'Keep notes'],
+        ]
+        anchors = [(page, word) for page in pages for word in page.iter(ns + 'word') if word.text == 'Case']
+        self.assertEqual(len(anchors), 2, 'Both fixture row labels must survive')
+        # This two-row fixture is short enough to fit together. A split here
+        # needs layout inspection rather than silently dropping spatial QA.
+        self.assertIs(anchors[0][0], anchors[1][0], 'Small fixture table unexpectedly split across pages')
+        tops = [float(word.attrib['yMin']) for _, word in anchors]
+        row_height = tops[1] - tops[0]
+        self.assertGreater(row_height, 0)
+        for (page, _), top, expected in zip(anchors, tops, rows, strict=True):
+            words = [word for word in page.iter(ns + 'word')
+                     if top - 1 <= float(word.attrib['yMin']) < top + row_height - 1]
+            cells = []
+            for phrase in expected:
+                selected = []
+                for token in phrase.split():
+                    matches = [word for word in words if word.text == token]
+                    self.assertEqual(len(matches), 1, f'Missing/duplicated table token {token!r} in row {expected[0]}')
+                    selected.append(matches[0])
+                cells.append((min(float(w.attrib['xMin']) for w in selected),
+                              max(float(w.attrib['xMax']) for w in selected)))
+            for left, right in zip(cells, cells[1:]):
+                self.assertLess(left[1], right[0], 'Adjacent table cell text overlaps or columns changed order')
+
     @unittest.skipUnless(all(shutil.which(name) for name in ('pdfinfo', 'pdftoppm', 'pdftotext')),
         'Supplied-template previews require Poppler')
     def test_supplied_article_and_titlepage_templates_compile_and_preview(self):
@@ -32,7 +210,7 @@ class PortableExportIntegrationTests(unittest.TestCase):
         # the current Greek/Latin helper. Optional XeLaTeX never gates them.
         layouts = [
             ('article', 'pdflatex', None, '\\documentclass{article}\n\\usepackage[T1]{fontenc}\n',
-             '\\maketitle\n\\begin{abstract}$abstract$\\end{abstract}\n'),
+             '\\maketitle\n$if(abstract)$\\begin{abstract}$abstract$\\end{abstract}$endif$\n'),
             ('titlepage', 'pdflatex', 'chapter', '\\documentclass{report}\n\\usepackage[T1]{fontenc}\n',
              '\\begin{titlepage}\\centering\\Huge $title$\\end{titlepage}\n'),
         ]
@@ -96,7 +274,7 @@ class PortableExportIntegrationTests(unittest.TestCase):
                 self.assertFalse((root / 'missing-image').exists())
                 (source / 'withheld.svg').rename(image)
                 output = root / 'publication'
-                reader_tables, writer_tables = [], []
+                reader_tables, writer_tables, latex_documents = [], [], []
 
                 def columns(node):
                     if len(node['c']) == 5:
@@ -108,7 +286,9 @@ class PortableExportIntegrationTests(unittest.TestCase):
                     # Observe the real Pandoc reader and writer contract; no
                     # TeX substitution or synthetic table conversion here.
                     if '--from=json' in argv and '--to=latex' in argv:
-                        writer_tables.extend(columns(node) for node in _nodes(json.loads(kwargs['text']))
+                        document = json.loads(kwargs['text'])
+                        latex_documents.append(document)
+                        writer_tables.extend(columns(node) for node in _nodes(document)
                             if node.get('t') == 'Table')
                     rendered = _run(argv, **kwargs)
                     if '--to=json' in argv:
@@ -119,7 +299,19 @@ class PortableExportIntegrationTests(unittest.TestCase):
                 result = export_acm_report(source, output, template=options,
                     compile_pdf=True, render_preview=True, caption_owner='markdown', runner=render,
                     checks={'max_pages': 12, 'forbidden_identifiers': ['Résumé', 'Unlisted Person']})
+                # Optional server evidence survives TemporaryDirectory cleanup,
+                # including any later assertion failure. No rendering is added.
+                qa_root = os.environ.get('SAR_TEST_EXPORT_QA_DIR')
+                qa_evidence = None
+                if qa_root:
+                    Path(qa_root).mkdir(parents=True, exist_ok=True)
+                    qa_evidence = Path(tempfile.mkdtemp(prefix=name + '-', dir=qa_root))
+                    shutil.copytree(output, qa_evidence / 'project')
+                    print('P3 layout evidence:', qa_evidence / 'project', flush=True)
                 self.assertTrue(result['compiled'], result)
+                self.assertEqual(len(latex_documents), 2)  # body and standalone only
+                self.assertEqual(latex_documents[-1]['meta']['title']['t'], 'MetaInlines')
+                self.assertNotIn('abstract', latex_documents[-1]['meta'])  # supplied layout keeps authored body
                 self.assertTrue(result['pdf_preview']['rendered'], result)
                 self.assertFalse(result['quality_checked'])
                 self.assertEqual(result['compliance']['anonymity'], 'unverified')
@@ -136,10 +328,13 @@ class PortableExportIntegrationTests(unittest.TestCase):
                 # widths also remain authoritative. Check actual page bounds,
                 # not a requirement that every compiler warning disappear.
                 bbox = subprocess.check_output(['pdftotext', '-bbox', str(output / 'main.pdf'), '-'], text=True)
+                if qa_evidence:
+                    (qa_evidence / 'original-bbox.xhtml').write_text(bbox, encoding='utf-8')
                 pages = list(ET.fromstring(bbox).iter('{http://www.w3.org/1999/xhtml}page'))
                 self.assertTrue(pages)
                 self.assertEqual(checked['max_pages']['page_count'], len(pages))
                 self.assertTrue(any(list(page.iter('{http://www.w3.org/1999/xhtml}word')) for page in pages))
+                self._assert_fixture_table_layout(pages)
                 for page in pages:
                     width, height = float(page.attrib['width']), float(page.attrib['height'])
                     for word in page.iter('{http://www.w3.org/1999/xhtml}word'):
@@ -169,6 +364,12 @@ class PortableExportIntegrationTests(unittest.TestCase):
                 self.assertEqual((output / 'template.latex').read_bytes(), template.read_bytes())
                 self.assertEqual((output / 'code/block-1.txt').read_bytes(), LITERAL_CODE.encode('utf-8'))
                 main = (output / 'main.tex').read_text(encoding='utf-8')
+                # Supplied layouts retain the authored Abstract section. Their
+                # optional abstract slot is empty and must emit no second heading.
+                self.assertNotIn(r'\begin{abstract}', main)
+                self.assertEqual((output / 'body.tex').read_text(encoding='utf-8').count('{Abstract}'), 1)
+                pdf_text = (output / checked['forbidden_identifiers']['evidence']).read_text(encoding='utf-8')
+                self.assertEqual(len(re.findall(r'\bAbstract\b', pdf_text)), 1)
                 self.assertNotIn('acmart', main)
                 self.assertIn('\\input{body.tex}', main)
                 if division:
@@ -178,6 +379,26 @@ class PortableExportIntegrationTests(unittest.TestCase):
                 self.assertEqual(main.count(r'\def\sarmaxwidth'), 1)
                 self.assertIn(r'\setkeys{Gin}{width=\sarmaxwidth,height=\sarmaxheight,keepaspectratio}', main)
                 self.assertEqual('\\DeclareUnicodeCharacter{03B1}' in main, engine == 'pdflatex')
+                # Exercise relocation within this same template conversion,
+                # rather than creating another layout/conversion matrix.
+                source.rename(root / 'withheld-input')
+                moved = root / 'relocated-publication'
+                output.rename(moved)
+                for filename in ('main.pdf', 'main.aux', 'main.bbl', 'main.blg', 'main.out', 'main.log', 'main.toc'):
+                    (moved / filename).unlink(missing_ok=True)
+                rebuilt = _compile(moved, True, engine=engine)
+                self.assertTrue(rebuilt['compiled'], rebuilt)
+                self.assertFalse(any('undefined citation' in warning.lower() or 'Missing character:' in warning
+                    for warning in rebuilt['compile_warnings']), rebuilt)
+                moved_text = subprocess.check_output(['pdftotext', str(moved / 'main.pdf'), '-'], text=True)
+                for retained in ('fixture.', 'Results', 'Case one'):
+                    self.assertIn(retained, ' '.join(moved_text.split()))
+                moved_bbox = subprocess.check_output(['pdftotext', '-bbox', str(moved / 'main.pdf'), '-'], text=True)
+                if qa_evidence:
+                    (qa_evidence / 'rebuilt-bbox.xhtml').write_text(moved_bbox, encoding='utf-8')
+                    shutil.copy2(moved / 'main.pdf', qa_evidence / 'rebuilt-main.pdf')
+                    shutil.copy2(moved / 'build.log', qa_evidence / 'rebuilt-build.log')
+                self._assert_fixture_table_layout(list(ET.fromstring(moved_bbox).iter('{http://www.w3.org/1999/xhtml}page')))
 
     @unittest.skipUnless(all(shutil.which(name) for name in ('pdfinfo', 'pdftoppm')),
         'PDF preview integration requires Poppler')
@@ -188,14 +409,18 @@ class PortableExportIntegrationTests(unittest.TestCase):
             root = Path(tmp)
             original = root / 'input'
             original.mkdir()
-            body = '# Canonical body\n\n## Result ' + IDENTIFIER + '\n\nBounded renderer fixture.\n' + TECHNICAL_BODY
+            body = '# Canonical body\n\n## Abstract\n\nMetadata β ≤ Γ fixture.\n\n## Result ' + IDENTIFIER + '\n\nBounded renderer fixture.\n' + TECHNICAL_BODY
             (original / 'report_body.md').write_text(body, encoding='utf-8')
             output = root / 'export'
             manifest = export_acm_report(original, output,
-                title='A descriptive title with ordinary spaces and a technical identifier ' + IDENTIFIER,
+                title='A descriptive Ω title with ordinary spaces and a technical identifier ' + IDENTIFIER,
                 compile_pdf=True, render_preview=True)
             self.assertEqual(manifest['status'], 'compiled', manifest)
             self.assertTrue(manifest['compiled'])
+            main = (output / 'main.tex').read_text(encoding='utf-8')
+            # Ω appears only in the explicit title, not the source Markdown.
+            for code in ('03A9', '03B2', '2264', '0393'):
+                self.assertIn('\\DeclareUnicodeCharacter{' + code + '}', main)
             self.assertFalse(any('Overfull \\hbox' in row for row in manifest['compile_warnings']), manifest)
             self.assertTrue(manifest['pdf_preview']['rendered'])
             self.assertFalse(manifest['quality_checked'])
@@ -238,7 +463,7 @@ class PortableExportIntegrationTests(unittest.TestCase):
                         '<text x="20" y="50" font-size="20">Portability fixture, not research data</text>'
                         '<path d="M20 130 L360 70" stroke="blue" fill="none"/></svg>', encoding="utf-8")
                     (original / "report_body.md").write_text(
-                        '# Portable export α check\n\n## Abstract\n\nRenderer integration fixture, β ≤ Γ.\n\n'
+                        '# Portable export α check\n\n## Abstract\n\nRenderer integration fixture, β ≤ Γ [@' + key + '].\n\n'
                         '## Result\n\nFixture citation [@' + key + ']. Inline math \\(1-\\alpha\\). Bare α, ∞ and 3 µm; `δ_parameter`.\n\n'
                         '![Fixture plot](plot.svg)\n\n[External evidence](../measurements.json).\n'
                         + TECHNICAL_BODY, encoding="utf-8")
@@ -258,7 +483,17 @@ class PortableExportIntegrationTests(unittest.TestCase):
                     # The old managed entry point keeps its default; direct
                     # canonical publication explicitly owns its revised caption.
                     options = {} if case == 'legacy' else {'caption_owner': 'markdown'}
-                    manifest = export_acm_report(original, exported, compile_pdf=True, **options)
+                    latex_documents = []
+                    def render(argv, **kwargs):
+                        if '--from=json' in argv and '--to=latex' in argv:
+                            latex_documents.append(json.loads(kwargs['text']))
+                        return _run(argv, **kwargs)
+                    manifest = export_acm_report(original, exported, compile_pdf=True, runner=render, **options)
+                    self.assertEqual(len(latex_documents), 2)
+                    metadata = latex_documents[-1]['meta']
+                    self.assertEqual(metadata['title']['t'], 'MetaInlines')
+                    self.assertEqual(metadata['abstract']['t'], 'MetaBlocks')
+                    self.assertTrue(any(node.get('t') == 'Cite' for node in _nodes(metadata['abstract'])))
                     expected_caption = 'Superseded recorded plot' if case == 'legacy' else 'Fixture plot'
                     other_caption = 'Fixture plot' if case == 'legacy' else 'Superseded recorded plot'
                     self.assertEqual(manifest['figure_caption_owner'], 'manifest' if case == 'legacy' else 'markdown')

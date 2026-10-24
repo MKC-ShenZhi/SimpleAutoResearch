@@ -1,6 +1,8 @@
 """Validated execution proposals; execution and approval belong to the caller."""
 from __future__ import annotations
 
+from pathlib import Path
+
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from simple_ar.code_task.generation.common import safe_relative_path
@@ -41,6 +43,48 @@ class ImplementationRunPlan(BaseModel):
     def validate_planned_paths(self, planned: list[str]) -> None:
         """Reject output files that would replace or contain generated files."""
         self._check_conflicts(self.outputs, planned)
+
+    def validate_command_identity(self, *, candidate_root: Path, source_binding: dict,
+                                  candidate_paths: list[str]) -> None:
+        """Keep directly named copied members in this candidate's identity.
+
+        This is a literal argv contract, not interpreter parsing or dependency
+        discovery. Uncopied external materials and executables remain legal.
+        Older preparations retain their originally approved path semantics.
+        """
+        semantics = source_binding.get('argv_semantics')
+        if semantics in {None, 'candidate_relative.v1'}:
+            return
+        if semantics != 'candidate_relative.v2':
+            raise ValueError('Unknown retained command path semantics')
+        copied = {}
+        prior = source_binding.get('prior_candidate', {})
+        inventory = prior.get('inventory', {})
+        root = prior.get('project_root') or inventory.get('project_path')
+        if root:
+            for name in candidate_paths:
+                path = str(Path(root) / name)
+                if path in inventory.get('file_hashes', {}):
+                    copied[Path(path).resolve()] = name
+        snapshot = source_binding.get('project_snapshot', {})
+        if snapshot.get('contract') == 'ordinary_project.v1':
+            for name in snapshot['files']:
+                copied[(Path(snapshot['project_root']) / name).resolve()] = name
+        for bindings in (source_binding.get('original_files', {}),
+                         source_binding.get('preserved_files', {}),
+                         prior.get('preserved_files', {})):
+            for name, binding in bindings.items():
+                copied[Path(binding['path']).resolve()] = name
+        candidate_root = candidate_root.resolve()
+        for argument in self.argv:
+            value = argument.split('=', 1)[1] if argument.startswith('-') and '=' in argument else argument
+            try:
+                path = (candidate_root / value).resolve()
+            except (OSError, ValueError):
+                continue  # Inline text need not be a filesystem path.
+            if path in copied and path != (candidate_root / copied[path]).resolve():
+                raise ValueError('Execution argv references a copied source member outside this candidate: '
+                    f'{argument!r}; use candidate-relative {copied[path]!r}')
 
     @staticmethod
     def _check_conflicts(outputs: list[str], paths: list[str], *, same_set: bool = False) -> None:

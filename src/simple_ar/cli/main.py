@@ -2598,10 +2598,8 @@ def _run_native_start(args: argparse.Namespace) -> None:
             if args.approve_execution:
                 raise ValueError("Confirm resource authorization separately from --approve-execution")
         if args.resume_task:
-            if getattr(args, 'max_processes', None) is not None or getattr(args, 'max_process_seconds', None) is not None:
-                raise ValueError('Resume retains saved process limits; use explicit --authorize-remaining for resource changes')
-            if args.max_images or args.project_python:
-                raise ValueError("Resume keeps the saved image allowance and interpreter; it cannot silently change them")
+            from simple_ar.cli.task_options import validate_resume_options
+            validate_resume_options(args)
             app = ToolApplication.load(args.resume_task.resolve())
             if args.supply_task:
                 if (args.request or args.goal or args.retry_model or args.approve_execution or decision

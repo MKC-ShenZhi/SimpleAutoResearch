@@ -1062,6 +1062,70 @@ class JointRevisionTests(unittest.TestCase):
         self.assertEqual(initial.requested_findings, [old])
         self.assertIn(old, result.reviewer_findings)
 
+    def test_current_review_prompt_selects_paragraph_and_persists_exact_text(self):
+        from simple_ar.report.review_evidence import DRAFT_REFERENCE_CONTRACT
+        kwargs, labels = self.inputs(), []
+        client = self.client(labels, current_pass=True)
+        original_ask = client.ask_json
+
+        def ask(system, prompt, *, label='', **options):
+            if label == 'report-document-reviewer':
+                labels.append(label)
+                view = prompt_payload(prompt)
+                self.assertEqual(view['draft_reference_contract'], DRAFT_REFERENCE_CONTRACT)
+                self.assertEqual(view['draft_locator']['scope']['previews'], {'p1': 'Original scope'})
+                schema = view['output_schema']['section_reviews'][0]['findings'][0]['draft_quotes'][0]
+                self.assertEqual(set(schema), {'section_id', 'paragraph'})
+                return {'section_reviews': [{'section_id': sid, 'verdict': 'warning' if sid == 'scope' else 'pass',
+                    'findings': [{'finding_id': 'selected-current-text', 'type': 'style', 'severity': 'minor',
+                        'required_action': 'advisory', 'message': 'A bounded style observation.',
+                        'draft_quotes': [{'section_id': 'scope', 'paragraph': 'p1'}]}] if sid == 'scope' else []}
+                    for sid in ('method', 'result', 'scope')]}
+            return original_ask(system, prompt, label=label, **options)
+
+        client.ask_json = ask
+        result = run_report_agent(**kwargs, client=client)
+        initial = next(row for row in result.iterations if row.action == 'document_current_review')
+        finding = next(f for row in initial.section_reviews for f in row.findings
+            if f.finding_id == 'selected-current-text')
+        self.assertEqual(finding.draft_quotes[0].model_dump(mode='json'),
+            {'section_id': 'scope', 'quote': 'Original scope'})
+        self.assertEqual(labels, ['report-writer-document', 'report-document-reviewer'])
+
+    def test_retained_unchecked_manuscript_uses_saved_candidate_after_unavailable_verifier(self):
+        from simple_ar.report.writing import retained_unchecked_manuscript
+        kwargs, labels = self.inputs(), []
+        client = self.client(labels)
+        original_ask = client.ask_json
+
+        def ask(system, prompt, *, label='', **options):
+            if label == 'report-document-verifier':
+                labels.append(label)
+                raise LLMError('Verifier unavailable after saving candidate')
+            return original_ask(system, prompt, label=label, **options)
+
+        client.ask_json = ask
+        result = run_report_agent(**kwargs, client=client)
+        payload = result.model_dump(mode='json')
+        before = copy.deepcopy(payload)
+        manuscript = retained_unchecked_manuscript(payload, title='Unchecked candidate')
+        self.assertIn('Reconciled method', manuscript)
+        self.assertIn('Reconciled result', manuscript)
+        self.assertIn('Original scope', manuscript)
+        self.assertNotIn('Original method', manuscript)
+        self.assertNotIn('Original result', manuscript)
+        self.assertEqual(payload, before)
+        self.assertEqual([row.draft_markdown for row in result.sections],
+            ['Original method', 'Original result', 'Original scope'])
+        self.assertFalse(any(row.adopted is True for row in result.iterations
+            if row.action == 'document_joint_revise'))
+        self.assertTrue(any(row.status == 'drafted' and row.drafts for row in result.iterations
+            if row.action == 'document_joint_revise'))
+        self.assertTrue(any(row.type in {'document_review_unavailable', 'document_revision_unavailable'}
+            for row in result.memory.reviewer_findings))
+        self.assertFalse(any(row.status == 'completed' for row in result.iterations
+            if row.action == 'document_joint_verify'))
+
     def test_failed_or_incomplete_current_review_keeps_old_opinion_and_original(self):
         for failure in ('transport', 'missing_section', 'context_request', 'partial'):
             with self.subTest(failure=failure):
@@ -1373,6 +1437,358 @@ class JointRevisionTests(unittest.TestCase):
                     checkpoint=lambda: None, draft=draft, inspect=inspect)
                 self.assertEqual(sections[0].draft_markdown, 'Original')
                 self.assertEqual(calls, [] if legacy else ['draft', 'inspect'])
+
+
+    def test_integrated_length_replay_preserves_editorial_block_and_attachment_proof(self):
+        from simple_ar.report.editor import review_document, replay_document_reviews, _validate_document_reviews
+        from simple_ar.report.review_evidence import delivery_review_result
+
+        kwargs = self.inputs()
+        sections = [ReportSectionDraft(section_id=row.section_id, heading=row.heading,
+            draft_markdown='Current bounded account.') for row in kwargs['memory'].section_plan]
+        response = {'section_reviews': [{'section_id': row.section_id, 'verdict': 'pass'} for row in sections]}
+        views, observations = [], []
+
+        class Client:
+            def ask_json(self, system, prompt, **options):
+                views.append(json.loads(prompt))
+                return response
+
+        snapshot = {'contract': 'delivery_artifacts.v1', 'artifacts': []}
+        live = review_document(client=Client(), template=kwargs['template'], memory=kwargs['memory'],
+            sections=sections, config=kwargs['config'], execution_summary={}, metric_summary={},
+            complete_candidate=True, delivery_review=snapshot, delivery_assembly={'identity': {}},
+            delivery_text_observation={'preview_status': 'pre_render_text_preview',
+                'length_check': {'status': 'above_range', 'markdown_token_count': 1200,
+                    'scope': 'whole_document', 'min_words': 700, 'max_words': 900}},
+            on_delivery_review=observations.append)
+        replay = replay_document_reviews(response, sections=sections, evidence_view=views[0])
+        self.assertEqual(replay, live)
+        self.assertEqual(observations[0]['review_status'], 'needs_revision')
+        self.assertTrue(any(finding.finding_id == 'canonical-delivery-length'
+            for row in replay for finding in row.findings))
+        raw = _validate_document_reviews(response, sections=sections, prior_by_key={}, evidence_view=views[0])
+        self.assertEqual(delivery_review_result(snapshot, raw), delivery_review_result(snapshot, replay))
+        legacy_view = copy.deepcopy(views[0])
+        legacy_view['delivery_text_observation'].pop('review_postprocessing')
+        self.assertEqual(replay_document_reviews(response, sections=sections, evidence_view=legacy_view), raw)
+
+    def _integrated_delivery_case(self, root, labels, *, reject=False, delivery_defect=False):
+        kwargs = self.inputs()
+        kwargs['context'].results.update(
+            section_delivery_review={'contract': 'section_delivery_review.v1',
+                'assembly': {'title': kwargs['context'].topic, 'assembly_mode': 'section_drafts',
+                             'template_name': ''}},
+            delivery_review={'contract': 'delivery_artifacts.v1', 'artifacts': [
+                {'path': 'figure.svg', 'sha256': 'a' * 64, 'coverage': 'visual_uninspected'}]})
+        if delivery_defect:
+            kwargs['context'].results['delivery_review']['artifacts'].append({
+                'path': 'analysis.py', 'sha256': 'b' * 64, 'coverage': 'complete',
+                'text': 'raise RuntimeError("unfinished analysis")', 'producer': 'analysis'})
+        regular = self.client(labels, reject=reject)
+        case = self
+
+        class RecordedClient:
+            last_inspection_source = None
+
+            def ask_json(inner, system, prompt, *, label='', **options):
+                response = regular.ask_json(system, prompt, label=label, **options)
+                if label in {'report-document-reviewer', 'report-document-verifier'}:
+                    view = prompt_payload(prompt)
+                    case.assertEqual(view['delivery_review_contract'], 'delivery_artifacts.v1')
+                    case.assertEqual(view['delivery_artifacts'][0]['coverage'], 'visual_uninspected')
+                    assembly = view['delivery_text_observation']['canonical_assembly']
+                    case.assertEqual(assembly['identity']['body_sha256'], hashlib.sha256(
+                        assembly['report_body_markdown'].encode('utf-8')).hexdigest())
+                    if delivery_defect and label == 'report-document-verifier':
+                        response = {'section_reviews': [{'section_id': row['section_id'],
+                            'verdict': 'revise_required' if row['section_id'] == 'result' else 'pass',
+                            'findings': [{'finding_id': 'unfinished-analysis', 'type': 'factual',
+                                'severity': 'major', 'required_action': 'revise',
+                                'message': 'The delivered analysis script always raises instead of computing.',
+                                'delivery_targets': ['/delivery_artifacts/1/text']}]
+                                if row['section_id'] == 'result' else []}
+                            for row in view['sections']]}
+                    source = {}
+                    for name, value in (('request', view), ('response', response)):
+                        path = root / f'{len(labels)}-{name}.json'
+                        path.write_text(json.dumps(value, ensure_ascii=False), encoding='utf-8')
+                        source[name + '_path'] = str(path)
+                        source[name + '_sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+                    inner.last_inspection_source = source
+                return response
+
+        return kwargs, RecordedClient()
+
+    def test_integrated_delivery_verdict_matches_adopted_or_rejected_candidate(self):
+        from simple_ar.report.agent import _section_delivery_assembly
+
+        for reject in (False, True):
+            with self.subTest(reject=reject), tempfile.TemporaryDirectory() as tmp:
+                labels, saved = [], []
+                kwargs, client = self._integrated_delivery_case(Path(tmp), labels, reject=reject)
+                result = run_report_agent(**kwargs, client=client, checkpoint_sink=saved.append)
+                self.assertIsNone(result.pending_candidate)
+                self.assertNotIn('pending_candidate', result.model_dump(mode='json'))
+                review = result.independent_review
+                self.assertIsNotNone(review)
+                self.assertEqual(review['assembly_identity'], _section_delivery_assembly(
+                    kwargs['context'], result.memory, result.sections, kwargs['config'])['identity'])
+                self.assertEqual(review['review_status'], 'needs_revision' if reject else 'reviewed')
+                self.assertEqual(len(review['delivery_review']['visual_pending']), 1)
+                source = review['inspection_source']
+                for name in ('request', 'response'):
+                    self.assertEqual(source[name + '_sha256'], hashlib.sha256(
+                        Path(source[name + '_path']).read_bytes()).hexdigest())
+                request = json.loads(Path(source['request_path']).read_text(encoding='utf-8'))
+                for name in ('request', 'response'):
+                    payload = json.loads(Path(source[name + '_path']).read_text(encoding='utf-8'))
+                    self.assertEqual(review['inspection_payload_sha256'][name], hashlib.sha256(
+                        json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(',', ':'),
+                                   allow_nan=False).encode('utf-8')).hexdigest())
+                self.assertEqual([row['markdown'] for row in request['sections']],
+                                 [row.draft_markdown for row in result.sections])
+                retained = [row for row in result.iterations if row.independent_review is not None]
+                self.assertEqual(len(retained), 3 if reject else 2)
+                self.assertEqual(retained[0].action, 'document_current_review')
+                self.assertTrue(all(row.action == 'document_joint_verify' for row in retained[1:]))
+                self.assertEqual(labels.count('report-document-reviewer'), 1)
+                self.assertEqual(labels.count('report-document-verifier'), 2 if reject else 1)
+                self.assertEqual(labels.count('report-document-joint-reviser'), 2 if reject else 1)
+                for index, event in enumerate(result.iterations):
+                    if event.action == 'document_joint_revise':
+                        self.assertEqual(result.iterations[index + 1].action, 'document_joint_verify')
+                self.assertNotEqual(retained[0].independent_review['assembly_identity'],
+                                    retained[1].independent_review['assembly_identity'])
+                self.assertEqual(saved[-1]['section_delivery_review_contract'], 'section_delivery_review.v1')
+                before = list(labels)
+                with patch.object(client, 'ask_json', side_effect=AssertionError('No completed review replay')):
+                    resumed = run_report_agent(**kwargs, client=client, completed_checkpoint=saved[-1])
+                self.assertEqual(resumed.independent_review, review)
+                self.assertEqual(labels, before)
+                if not reject:
+                    interrupted_labels, interrupted_saved = [], []
+                    fresh, recorded = self._integrated_delivery_case(Path(tmp), interrupted_labels)
+                    stop = interrupt_checkpoint(interrupted_saved, lambda row: any(
+                        event['action'] == 'document_joint_verify' for event in row['iterations']))
+                    with self.assertRaises(CheckpointStop):
+                        run_report_agent(**fresh, client=recorded, checkpoint_sink=stop)
+                    with patch.object(recorded, 'ask_json', side_effect=AssertionError('Saved verification must not replay')):
+                        recovered = run_report_agent(**fresh, client=recorded,
+                            completed_checkpoint=interrupted_saved[-1])
+                    self.assertEqual(recovered.independent_review['review_status'], 'reviewed')
+                    self.assertEqual(recovered.independent_review['inspection_source'],
+                        next(event['independent_review']['inspection_source']
+                            for event in reversed(interrupted_saved[-1]['iterations'])
+                            if event['action'] == 'document_joint_verify'))
+
+        # Exercise the real receipt producer, capability normalization callback
+        # and downstream proof consumer together, using the same section case.
+        with self.subTest(transport='atomic_complete.v2'), tempfile.TemporaryDirectory() as tmp:
+            from simple_ar.report.writing import retained_writing_client, completed_composition_writer
+            from simple_ar.tools.implementation_work import _independent_delivery_review
+
+            owner = ArtifactStore(Path(tmp))
+            writer = ArtifactStore(owner.root / 'writer')
+            documents = owner.write_json('documents.json',
+                DocumentBundle([], {}, {}, [], []).to_handoff_dict(),
+                kind='documents', schema='document_bundle.v1')
+            labels = []
+            kwargs, _ = self._integrated_delivery_case(owner.root, labels)
+            regular = self.client(labels)
+            client = retained_writing_client(store=writer, identity='integrated-sections',
+                client=regular, contract='atomic_complete.v2')
+            request = ReportWritingRequest(kwargs['context'], kwargs['memory'], kwargs['config'],
+                kwargs['template'], client, method='sections')
+            result = run_report_writing_capability(context=CapabilityContext(writer,
+                AttemptManifest('integrated-sections'), inputs=(documents,), input_store=owner), request=request)
+            self.assertEqual(result.status, 'completed', result.diagnostics)
+            produced = next(row for row in result.artifacts if row.kind == 'report_writer_result')
+            review = writer.read_json(produced)['independent_review']
+            self.assertEqual(review['review_status'], 'reviewed')
+            self.assertEqual(labels.count('report-document-verifier'), 1)
+            source = review['inspection_source']
+            self.assertTrue(source['request_path'].startswith('writer/model_calls/'))
+            self.assertFalse(Path(source['request_path']).is_absolute())
+            transport_request = owner.read_json(source['request_path'])
+            self.assertEqual(transport_request['response_record_contract'], 'atomic_complete.v2')
+            _independent_delivery_review(owner,
+                {'delivery_review': kwargs['context'].results['delivery_review']},
+                {'delivery_review': review['delivery_review']}, review_result=review)
+            before = list(labels)
+            checkpoint = owner.ref('writer/sections.json', kind='report_checkpoint', schema='report_checkpoint.v1')
+            replay_client = retained_writing_client(store=writer, identity='integrated-sections',
+                client=None, contract='atomic_complete.v2')
+            with patch.object(regular, 'ask_json', side_effect=AssertionError('No completion API replay')):
+                replayed = run_report_writing_capability(context=CapabilityContext(writer,
+                    AttemptManifest('integrated-sections'), inputs=(documents, checkpoint), input_store=owner),
+                    request=replace(request, llm_client=replay_client, resume_ref=checkpoint))
+            self.assertEqual(replayed.status, 'completed', replayed.diagnostics)
+            self.assertEqual(writer.read_json(produced)['independent_review'], review)
+            self.assertEqual(labels, before)
+            _independent_delivery_review(owner,
+                {'delivery_review': kwargs['context'].results['delivery_review']},
+                {'delivery_review': review['delivery_review']}, review_result=review)
+            frozen = writer.read_json('report_inputs.json')
+            binding = {'writing_owner': 'professional_report.v1', 'section_response_contract': 'atomic_complete.v2',
+                'request': {'target_words': 0, 'max_cited_sources': kwargs['config'].max_cited_sources},
+                'report_binding': {'requirement': {'method': 'sections',
+                    'config': frozen['config'], 'template': frozen['template']}}}
+            owner.write_json('professional_result.json', {'writer_path': produced.path,
+                'writer_sha256': hashlib.sha256(writer.resolve(produced).read_bytes()).hexdigest()})
+            retained = {path.relative_to(writer.root).as_posix(): path.read_bytes()
+                        for path in writer.root.rglob('*') if path.is_file()}
+            with patch.object(regular, 'ask_json', side_effect=AssertionError('No completed producer API replay')):
+                completed_composition_writer(store=owner, binding=binding, identity='integrated-sections')
+            self.assertEqual({path.relative_to(writer.root).as_posix(): path.read_bytes()
+                              for path in writer.root.rglob('*') if path.is_file()}, retained)
+            self.assertEqual(labels, before)
+
+    def test_declared_report_images_require_real_markdown_nodes(self):
+        from simple_ar.report.editor import _apply_document_delivery_observations
+        from simple_ar.report.schema import ReportSectionDraft, ReportSectionReview
+        observed = {'required_figures': ['figures/main plot.png']}
+        def inspect(body):
+            sections = [ReportSectionDraft(section_id='results', heading='Results', draft_markdown=body)]
+            return _apply_document_delivery_observations([
+                ReportSectionReview(section_id='results', verdict='pass')], sections=sections,
+                observed=observed, joint_revision=True)
+        for body in ('See Figure 1.', '```markdown\n![main](figures/main%20plot.png)\n```',
+                     '[Download](figures/main%20plot.png)'):
+            self.assertTrue(any(f.finding_id == 'required-report-figures'
+                for row in inspect(body) for f in row.findings))
+        self.assertFalse(any(row.findings for row in inspect(
+            '![Measured comparison][plot]\n\n[plot]: <figures/main plot.png>')))
+        self.assertFalse(any(row.findings for row in inspect(
+            '![Measured comparison](figures/main%20plot.png)')))
+
+    def test_pending_delivery_candidate_preserves_negative_proof_and_recovery(self):
+        from simple_ar.report.agent import _pending_section_delivery_candidate
+
+        for stop_at in ('drafted', 'verified', None):
+            with self.subTest(stop_at=stop_at), tempfile.TemporaryDirectory() as tmp:
+                labels, saved = [], []
+                kwargs, client = self._integrated_delivery_case(Path(tmp), labels, delivery_defect=True)
+                if stop_at:
+                    def should_stop(row):
+                        return any(event['action'] == ('document_joint_revise' if stop_at == 'drafted'
+                            else 'document_joint_verify') and event['status'] == (
+                                'drafted' if stop_at == 'drafted' else 'failed') for event in row['iterations'])
+                    with self.assertRaises(CheckpointStop):
+                        run_report_agent(**kwargs, client=client,
+                            checkpoint_sink=interrupt_checkpoint(saved, should_stop))
+                    if stop_at == 'drafted':
+                        checkpoint = saved[-1]
+                        self.assertIsNone(_pending_section_delivery_candidate(kwargs['context'],
+                            ReportMemory.model_validate(checkpoint['memory']), kwargs['config'],
+                            [ReportIterationRecord.model_validate(row) for row in checkpoint['iterations']],
+                            adopted_identity={}))
+                        result = run_report_agent(**kwargs, client=client,
+                            completed_checkpoint=checkpoint, checkpoint_sink=saved.append)
+                    else:
+                        with patch.object(client, 'ask_json', side_effect=AssertionError('Reuse saved negative proof')):
+                            result = run_report_agent(**kwargs, client=client,
+                                completed_checkpoint=saved[-1], checkpoint_sink=saved.append)
+                else:
+                    result = run_report_agent(**kwargs, client=client, checkpoint_sink=saved.append)
+                pending = result.pending_candidate
+                self.assertIsNotNone(pending)
+                self.assertEqual([row['draft_markdown'] for row in pending['sections']],
+                    ['Reconciled method', 'Reconciled result', 'Original scope'])
+                self.assertEqual([row.draft_markdown for row in result.sections],
+                    ['Original method', 'Original result', 'Original scope'])
+                review = pending['independent_review']
+                self.assertEqual(review['review_status'], 'needs_revision')
+                self.assertEqual(pending['assembly_identity'], review['assembly_identity'])
+                self.assertEqual(hashlib.sha256(pending['report_body_markdown'].encode('utf-8')).hexdigest(),
+                    review['assembly_identity']['body_sha256'])
+                self.assertNotEqual(review['assembly_identity'], result.independent_review['assembly_identity'])
+                self.assertFalse(result.independent_review['delivery_review']['defects'])
+                self.assertEqual(review['delivery_review']['defects'][0]['targets'][0]['path'], 'analysis.py')
+                proposal = next(row for row in result.iterations if row.iteration == pending['revision_iteration'])
+                verification = next(row for row in result.iterations if row.iteration == pending['verification_iteration'])
+                self.assertEqual((proposal.status, proposal.adopted), ('rejected', False))
+                self.assertEqual(review, verification.independent_review)
+                source = review['inspection_source']
+                request = json.loads(Path(source['request_path']).read_text(encoding='utf-8'))
+                self.assertEqual([row['markdown'] for row in request['sections']],
+                    [row['draft_markdown'] for row in pending['sections']])
+                self.assertEqual(request['delivery_text_observation']['canonical_assembly']['report_body_markdown'],
+                    pending['report_body_markdown'])
+                for name in ('request', 'response'):
+                    self.assertEqual(source[name + '_sha256'], hashlib.sha256(
+                        Path(source[name + '_path']).read_bytes()).hexdigest())
+                with patch.object(client, 'ask_json', side_effect=AssertionError('No completed inspection replay')):
+                    recovered = run_report_agent(**kwargs, client=client, completed_checkpoint=saved[-1])
+                self.assertEqual(recovered.pending_candidate, pending)
+                self.assertEqual(recovered.independent_review, result.independent_review)
+                # Incomplete or mismatched saved proof must not opt into producer repair.
+                for change in ('receipt', 'coverage', 'identity', 'defects'):
+                    events = copy.deepcopy(result.iterations)
+                    check = next(row for row in events if row.iteration == verification.iteration)
+                    if change == 'receipt':
+                        check.independent_review.pop('inspection_source')
+                    elif change == 'coverage':
+                        check.section_reviews.pop()
+                    elif change == 'identity':
+                        check.independent_review['assembly_identity']['body_sha256'] = '0' * 64
+                    else:
+                        check.independent_review['delivery_review']['defects'] = []
+                    self.assertIsNone(_pending_section_delivery_candidate(kwargs['context'], result.memory,
+                        kwargs['config'], events, adopted_identity=result.independent_review['assembly_identity']))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            owner = ArtifactStore(Path(tmp))
+            writer = ArtifactStore(owner.root / 'writer')
+            from simple_ar.report.writing import retained_writing_client
+            labels = []
+            kwargs, raw_client = self._integrated_delivery_case(owner.root, labels, delivery_defect=True)
+            client = retained_writing_client(store=writer, identity='pending-sections',
+                client=raw_client, contract='atomic_complete.v2')
+            documents = owner.write_json('documents.json', DocumentBundle([], {}, {}, [], []).to_handoff_dict(),
+                kind='documents', schema='document_bundle.v1')
+            outcome = run_report_writing_capability(context=CapabilityContext(writer,
+                AttemptManifest('pending-sections'), inputs=(documents,), input_store=owner),
+                request=ReportWritingRequest(kwargs['context'], kwargs['memory'], kwargs['config'],
+                    kwargs['template'], client, method='sections'))
+            self.assertEqual(outcome.status, 'completed', outcome.diagnostics)
+            produced = next(row for row in outcome.artifacts if row.kind == 'report_writer_result')
+            payload = writer.read_json(produced)
+            pending = payload['pending_candidate']
+            self.assertTrue(pending['independent_review']['delivery_review']['defects'])
+            self.assertNotEqual(pending['independent_review'], payload['independent_review'])
+            self.assertTrue(pending['independent_review']['inspection_source']['request_path'].startswith(
+                'writer/model_calls/'))
+            checkpoint = owner.ref('writer/sections.json', kind='report_checkpoint', schema='report_checkpoint.v1')
+            replay_client = retained_writing_client(store=writer, identity='pending-sections',
+                client=None, contract='atomic_complete.v2')
+            with patch.object(raw_client, 'ask_json', side_effect=AssertionError('No capability recovery API replay')):
+                replayed = run_report_writing_capability(context=CapabilityContext(writer,
+                    AttemptManifest('pending-sections'), inputs=(documents, checkpoint), input_store=owner),
+                    request=ReportWritingRequest(kwargs['context'], kwargs['memory'], kwargs['config'],
+                        kwargs['template'], replay_client, method='sections', resume_ref=checkpoint))
+            self.assertEqual(replayed.status, 'completed', replayed.diagnostics)
+            recovered_payload = writer.read_json(produced)
+            self.assertEqual(recovered_payload['pending_candidate'], pending)
+            self.assertEqual(recovered_payload['independent_review'], payload['independent_review'])
+
+    def test_integrated_delivery_requires_transport_source_and_legacy_checkpoint_does_not_upgrade(self):
+        kwargs = self.inputs()
+        saved, labels = [], []
+        legacy = run_report_agent(**kwargs, client=self.client(labels), checkpoint_sink=saved.append)
+        checkpoint = copy.deepcopy(saved[-1])
+        with tempfile.TemporaryDirectory() as tmp:
+            integrated, client = self._integrated_delivery_case(Path(tmp), [])
+            with patch.object(client, 'ask_json', side_effect=AssertionError('Legacy completion must not replay')):
+                resumed = run_report_agent(**integrated, client=client, completed_checkpoint=checkpoint)
+            self.assertIsNone(resumed.independent_review)
+            self.assertEqual(resumed.sections, legacy.sections)
+            self.assertNotIn('independent_review', resumed.model_dump(mode='json'))
+            self.assertNotIn('pending_candidate', resumed.model_dump(mode='json'))
+            missing = run_report_agent(**integrated, client=self.client([]))
+            self.assertIsNone(missing.independent_review)
+            self.assertTrue(any(row.type == 'document_review_unavailable'
+                                for row in missing.memory.reviewer_findings))
 
 
 if __name__ == "__main__":

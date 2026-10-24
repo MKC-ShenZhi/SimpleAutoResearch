@@ -154,10 +154,14 @@ class _Edit(_Path):
 class _Run(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     argv: list[str] = Field(min_length=1, max_length=40)
+    literal_argv: bool = Field(default=False, exclude_if=lambda value: not value,
+        description='Use literal OS arguments relative to cwd, without mount-alias expansion. Bare python/python3 still selects the task interpreter. Does not add authority or sandboxing.')
     cwd: str = "workspace"
     timeout_sec: int = Field(default=60, ge=1, le=300)
     inputs: list[str] = Field(default_factory=list, max_length=64, exclude_if=lambda value: not value,
         description='Optional explicit regular-file input artifact locators, including script/data files. Captured before execution; no dependency inference or extra permission. At most 64 MiB total per binding.')
+    input_snapshot: dict[str, str] | None = Field(default=None, exclude_if=lambda value: value is None,
+        description='Internal reference to an approved implementation execution owner; not an additional input or authority grant.')
     outputs: list[str] = Field(default_factory=list, max_length=64, exclude_if=lambda value: not value,
         description='Optional explicit workspace regular-file output locators. Bytes captured only after success in the process receipt; directories/globs are not expanded. Does not require other commands to declare outputs or certify correctness.')
     delivery: DeliveryRequest | None = Field(default=None, exclude_if=lambda value: value is None,
@@ -203,7 +207,7 @@ def resolve_source_mount(value: Path) -> Path:
 
 
 def resolve_mounted_path(mounts: dict[str, Path], value: str, *, write: bool = False,
-                         discovery: bool = False) -> Path:
+                         discovery: bool = False, authorize: Any = None) -> Path:
     """Shared access rule for tools and read-only delivery navigation."""
     native = Path(value)
     rel = PurePosixPath(value)
@@ -230,6 +234,8 @@ def resolve_mounted_path(mounts: dict[str, Path], value: str, *, write: bool = F
         raise ValueError("Path is outside the authorized mounts or writable workspace")
     if any(_private_name(part) for part in parts):
         raise ValueError("Private/runtime paths are not exposed to task tools")
+    if authorize is not None:
+        authorize(base.joinpath(*parts))
     if discovery:
         # Exact roots must obey the same exclusions as directory discovery.
         # Check the lexical chain before resolve() can erase an in-mount link.
@@ -252,6 +258,10 @@ def workspace_tool_specs() -> list[CommonToolSpec]:
     specs = []
     for name, (model, description, permission) in _TOOLS.items():
         schema = model.model_json_schema()
+        if name == 'run_process':
+            # Professional execution supplies this owner reference internally.
+            # Ordinary commands retain their explicit file-list contract.
+            schema['properties'].pop('input_snapshot')
         if name == "edit_file":
             # Advertise one spelling; saved calls still use the unchanged
             # _Edit validator, without rewriting queued arguments or receipts.
@@ -358,6 +368,134 @@ def workspace_observation_view(result: dict, *, record: str, directory_path: str
         return result
 
 
+class RetainedDelivery:
+    """Read the existing delivery and provenance without assembling executable owners.
+
+    The optional admission callback runs before every record/artifact read. Saved
+    source mounts describe paths only; unused sources and extensions are never
+    opened, imported, or required to exist. No state is created or repaired.
+    """
+
+    def __init__(self, root: Path, *, authorize: Any = None) -> None:
+        self.root = root.absolute()
+        self.authorize = authorize
+        self.manifest = self.record('session_manifest.json')
+        if self.manifest['transition_recipe'] != 'native-tools-v1':
+            raise ValueError('Retained delivery reader requires a native-tool session')
+        self.state = self.record('actions.json')
+        self.mounts = {name: Path(path).absolute()
+            for name, path in self.state['config']['sources'].items()}
+        if 'workspace' in self.mounts:
+            raise ValueError('Sources cannot replace the writable workspace mount')
+        self.mounts.update(workspace=self.root / 'workspace', evidence=self.root / 'evidence',
+                           records=self.root / 'attempts')
+
+    def admit(self, path: Path) -> Path:
+        if self.authorize is not None:
+            self.authorize(path)
+        if any(_private_name(part) for part in path.parts):
+            raise ValueError('Private/runtime paths are not exposed to retained material reads')
+        return path
+
+    def record(self, locator: str) -> dict:
+        path = resolve_mounted_path({'workspace': self.root}, locator, discovery=True,
+                                    authorize=self.admit)
+        return read_json(path)
+
+    def resolve(self, locator: str) -> Path:
+        # Admission precedes even discovery/stat of an external material.
+        return resolve_mounted_path(self.mounts, locator, discovery=True, authorize=self.admit)
+
+    def hashes(self, locators: Iterable[str]) -> dict[str, str]:
+        paths = {value: self.resolve(value) for value in locators}
+        hashes = {}
+        for value, path in paths.items():
+            if not path.is_file():
+                raise ValueError(f'Retained artifact is missing: {value}')
+            with path.open('rb') as handle:
+                hashes[value] = hashlib.file_digest(handle, 'sha256').hexdigest()
+        return hashes
+
+    def reusable_materials(self) -> dict[str, list[Path]]:
+        state = self.state
+        if (self.manifest['status'] not in {'completed', 'partial'} or state['pending'] is not None
+                or not state['turns'] or state['turns'][-1]['remaining']
+                or not state['turns'][-1]['tools']
+                or state['turns'][-1].get('request_count', 1) != len(state['requests'])):
+            return {}
+        delivery = DeliveryRequest.model_validate(self.record('delivery.json'))
+        delivered = delivery.artifacts  # Saved deliveries already contain the expanded snapshot.
+        paths = {self.resolve(value) for value in delivered}
+        # External deliverables still require original controller registration.
+        external = {p for p in paths if not any(p.is_relative_to(self.mounts[name])
+            for name in ('workspace', 'evidence'))}
+        if external:
+            registered = []
+            for path in sorted((self.root / 'attempts').iterdir()):
+                if not (path / 'attempt_manifest.json').is_file():
+                    continue
+                attempt = self.record(f'attempts/{path.name}/attempt_manifest.json')
+                if attempt['status'] == 'completed':
+                    for ref in attempt['outputs']:
+                        if ref['status'] == 'available' and ref['kind'] not in {
+                                'native_reply', 'native_result', 'native_observation', 'caller_actions'}:
+                            registered.append(resolve_mounted_path({'workspace': path}, ref['path'],
+                                discovery=True, authorize=self.admit))
+            if any(not any(p == output or p.is_relative_to(output) and output.is_dir()
+                           for output in registered) for p in external):
+                raise ValueError('Delivery references an unregistered external artifact')
+        turn = state['turns'][-1]
+        calls = self.record(turn['reply']).get('tool_calls') or []
+        observed = turn['tools'][-1]
+        terminal = self.record(observed['result'])
+        if not calls or calls[-1]['id'] != observed['id'] or terminal.get('status') != 'ok':
+            raise ValueError('Current delivery has no matching terminal observation')
+        name = calls[-1]['function']['name']
+        data = terminal.get('data') or {}
+        bound = data if name == 'deliver_result' else (data.get('delivery') if name in {
+            'write_file', 'export_report', 'run_process', 'execute_implementation',
+            'review_document', 'measure_experiment', 'analyze_measurements'} else None)
+        if bound is None or DeliveryRequest.model_validate(bound) != delivery:
+            raise ValueError('Saved delivery differs from its terminal observation')
+        pinned = terminal.get('metadata', {}).get('delivery_hashes')
+        actual = self.hashes(delivered)
+        if pinned is not None and pinned != actual:
+            raise ValueError('Current delivered files changed; retained results cannot certify their replacements')
+        available = {'artifacts': list(dict.fromkeys(self.resolve(value) for value in delivered))} if paths else {}
+        for turn in state['turns']:
+            for item in turn['tools']:
+                row = self.record(item['result'])
+                if row.get('status') != 'ok':
+                    continue
+                groups = row.get('metadata', {}).get('reusable_materials', {})
+                if not groups:
+                    continue
+                # Historical groups unrelated to the delivery do not require old inputs.
+                try:
+                    owned = {self.resolve(value) for value in row.get('artifacts', [])}
+                    candidates = {name: locators for name, locators in groups.items() if locators
+                        and {self.resolve(value) for value in locators} <= paths & owned}
+                except (OSError, ValueError):
+                    # An unrelated historical group may no longer be readable.
+                    # It cannot supply a named role, but current pinned files
+                    # retain their independent artifact proof above.
+                    continue
+                if not candidates:
+                    continue
+                hashes = row['data']['artifact_sha256']
+                try:
+                    unchanged = self.hashes(hashes) == hashes
+                except (OSError, ValueError):
+                    continue
+                if not unchanged:
+                    continue
+                for name, locators in candidates.items():
+                    available[name] = [self.resolve(value) for value in locators]
+        if self.record('session_manifest.json') != self.manifest or self.record('actions.json') != state:
+            raise ValueError('Task changed during retained delivery inspection')
+        return available
+
+
 class WorkspaceToolGateway:
     def has_started(self, identity: str) -> bool:
         return (self.root / 'tools' / 'processes' / identity / 'invocation.json').is_file()
@@ -408,6 +546,16 @@ class WorkspaceToolGateway:
                     for name, root in self.mounts.items() if path.is_relative_to(root)),
                    key=lambda locator: (len(locator), locator))
 
+    def resolved_versions(self, versions: dict[str, str]) -> dict[Path, str]:
+        """Normalize authorized aliases; never read bytes or transfer roles."""
+        result = {}
+        for locator, digest in versions.items():
+            path = self.resolve(locator)
+            if path in result and result[path] != digest:
+                raise ValueError('Conflicting hashes for aliases of the same artifact')
+            result[path] = digest
+        return result
+
     def artifact_hashes(self, locators: Iterable[str]) -> dict[str, str]:
         """Bind current authorized files without loading whole artifacts into memory."""
         hashes = {}
@@ -436,23 +584,43 @@ class WorkspaceToolGateway:
             hashes[locator] = digest.hexdigest()
         return hashes
 
-    def process_artifact_binding(self, arguments: dict[str, Any]) -> dict[str, Any] | None:
+    def process_artifact_binding(self, arguments: dict[str, Any], *, identity: str | None = None) -> dict[str, Any] | None:
         """Read-only approval hook. Absent declarations preserve historical tokens.
 
         Locators use mount semantics, not command cwd semantics. No execution,
         directory expansion, argv parsing or authority is implied by this binding.
         """
         request = _Run.model_validate(arguments)
-        if not request.inputs and not request.outputs:
+        if not request.inputs and not request.outputs and request.input_snapshot is None:
             return None
-        inputs = list(dict.fromkeys(self.locator(str(resolve_mounted_path(self.mounts, value, discovery=True)))
-                                    for value in request.inputs))
+        if request.input_snapshot is not None:
+            if request.inputs:
+                raise ValueError('Use an approved implementation snapshot or direct process inputs, not both')
+            from simple_ar.tools.implementation_run import resolve_execution_snapshot
+
+            versions = resolve_execution_snapshot(self, request.input_snapshot,
+                process=request.model_dump(exclude_none=True), identity=identity)
+            inputs = {self.locator(path): digest for path, digest in versions.items()}
+        else:
+            inputs = list(dict.fromkeys(self.locator(str(resolve_mounted_path(self.mounts, value, discovery=True)))
+                                        for value in request.inputs))
+            inputs = self._version_hashes(inputs)
         outputs = list(dict.fromkeys(self.locator(str(resolve_mounted_path(self.mounts, value, write=True, discovery=True)))
                                      for value in request.outputs))
         if any(self.resolve(value).exists() and not self.resolve(value).is_file() for value in outputs):
             raise ValueError('Declared process outputs must be regular files')
         return {'version': 1, 'request': request.model_dump(exclude_none=True),
-                'inputs': self._version_hashes(inputs), 'outputs': outputs}
+                'inputs': inputs, 'outputs': outputs,
+                **({'input_snapshot': request.input_snapshot} if request.input_snapshot is not None else {})}
+
+    def _check_process_inputs(self, binding: dict[str, Any], *, identity: str | None = None) -> None:
+        """Recheck the owning declaration, without inventing historical coverage."""
+        if binding.get('input_snapshot') is not None:
+            current = self.process_artifact_binding(binding['request'], identity=identity)
+            if current != binding:
+                raise ValueError('Approved implementation snapshot changed')
+        elif self._version_hashes(binding['inputs']) != binding['inputs']:
+            raise ValueError('Declared producer inputs/outputs changed; no current publication or automatic rerun')
 
     def check_artifact_producers(self, locators: Iterable[str], *, cache: dict | None = None,
                                  refresh: bool = False) -> None:
@@ -475,6 +643,10 @@ class WorkspaceToolGateway:
             cache['producers'] = producers
         visited = cache.setdefault('checked', set())
         visiting = set()
+        # One receipt can own many outputs. Reuse its completed validation only
+        # within this call, by object identity rather than invocation_id. Keep
+        # the caller's path cache and path-based cycle handling unchanged.
+        checked_records = set()
 
         def check(path: Path) -> None:
             if path in visited or path in visiting or path not in producers:
@@ -482,24 +654,65 @@ class WorkspaceToolGateway:
             _, record, binding = producers[path]
             if record is None:
                 raise ValueError(f'Ambiguous producer timestamps for {path.name}; no current publication')
+            owner = (id(record), id(binding))
+            if owner in checked_records:
+                visited.add(path)
+                return
+            if record.get('output_binding_error'):
+                raise ValueError(f"Declared producer has no successful output binding for {path.name}: {record['output_binding_error']}; no replay")
             output = record.get('output_binding') or {}
             if (record.get('status') != 'finished' or record.get('returncode') != 0
                     or record.get('stop_reason') or output.get('version') != 1
                     or set(output.get('outputs', {})) != set(binding['outputs'])):
                 raise ValueError(f'Declared producer has no successful output binding: {path.name}; inspect receipt, no replay')
-            for expected in (binding['inputs'], output['outputs']):
-                if self._version_hashes(expected) != expected:
-                    raise ValueError(f'Declared producer inputs/outputs changed for {path.name}; no current publication or automatic rerun')
+            self._check_process_inputs(binding, identity=record['invocation_id'])
+            if self._version_hashes(output['outputs']) != output['outputs']:
+                raise ValueError(f'Declared producer outputs changed for {path.name}; no current publication or automatic rerun')
             visiting.add(path)
             try:
                 for locator in binding['inputs']:
                     check(resolve_mounted_path(self.mounts, locator, discovery=True))
             finally:
                 visiting.remove(path)
+            checked_records.add(owner)
             visited.add(path)
 
         for locator in locators:
             check(resolve_mounted_path(self.mounts, locator, discovery=True))
+
+    def artifact_provenance(self, locators: Iterable[str]) -> dict[str, dict[str, Any]]:
+        """Resolve existing process ownership, not inferred file relationships.
+
+        This is a read-only projection of the same receipts used for freshness
+        checks. Untracked inputs remain untracked; content review cannot turn
+        them into executed or verified results.
+        """
+        names = list(dict.fromkeys(locators))
+        hashes = self.artifact_hashes(names)
+        cache: dict[str, Any] = {}
+        self.check_artifact_producers(names, cache=cache)
+        producers = cache.get('producers', {})
+        result = {}
+        for name in names:
+            row: dict[str, Any] = {'path': name, 'sha256': hashes[name], 'producer': None}
+            entry = producers.get(self.resolve(name))
+            if entry is not None:
+                _, record, binding = entry
+                identity = record['invocation_id']
+                if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', identity):
+                    raise ValueError('Invalid registered producer identity')
+                receipt = self.root / 'tools' / 'processes' / identity / 'invocation.json'
+                if read_json(receipt) != record:
+                    raise ValueError('Producer changed during provenance inspection')
+                row['producer'] = {
+                    'invocation_id': identity,
+                    'receipt': str(receipt.relative_to(self.root)),
+                    'receipt_sha256': hashlib.sha256(receipt.read_bytes()).hexdigest(),
+                    'inputs': dict(binding['inputs']),
+                    'outputs': dict(record['output_binding']['outputs']),
+                }
+            result[name] = row
+        return result
 
     def _artifact_producers(self, directory: Path) -> dict:
         producers, total = {}, 0
@@ -533,7 +746,8 @@ class WorkspaceToolGateway:
                     producers[path] = (order, None, None)
         return producers
 
-    def bind_inventory(self, project: Path, *, identity: str, material_candidates: bool = False) -> dict:
+    def bind_inventory(self, project: Path, *, identity: str,
+                       material_candidates: bool | Literal['implementation'] = False) -> dict:
         # Read-only inventory ownership is also used by legacy generated repair.
         def page(offset: int) -> dict:
             observed = self.call('list_directory', {'path': str(project),
@@ -587,6 +801,10 @@ class WorkspaceToolGateway:
             elif name == "run_process":
                 recovering = (self.root / "tools" / "processes" / identity / "invocation.json").exists()
                 data = self._run(model, identity)
+                if data.get('output_binding_error'):
+                    return ToolResult(tool_name=name, status='error', data=data,
+                        error=data['output_binding_error'],
+                        summary='Process completed but its declared artifacts could not be bound; receipt retained, no delivery or replay.')
                 if model.delivery is not None:
                     if data.get('returncode') != 0 or data.get('stop_reason'):
                         return ToolResult(tool_name=name, status='blocked', data=data,
@@ -781,6 +999,52 @@ class WorkspaceToolGateway:
             "retry": "Snapshot only. Retry must explicitly supply the matching expected_sha256; any subsequent change is still rejected.",
         }, error="File write precondition failed: " + reason)
 
+    def copy_registered_project(self, source: Path, candidate: Path,
+                                files: dict[str, str]) -> None:
+        """Materialize exact registered members using the existing copy owner.
+
+        This is an internal publication operation, not filesystem discovery or
+        a new public grant. Registered membership replaces incidental source
+        discovery; mounted private/link/environment rules and copy bounds still
+        apply. The existing materializer remains the sole byte-copy writer.
+        """
+        from simple_ar.code_task.workspace.copy import CopyReport, _CopySelection, _materialize_selection
+        from simple_ar.code_task.generation.run_plan import ImplementationRunPlan
+
+        ImplementationRunPlan.validate_outputs(list(files))
+        source = self.resolve(str(source))
+        destination = candidate.absolute()
+        candidate = self.resolve(str(candidate), write=True)
+        if (candidate == self.workspace or candidate.is_relative_to(source) or source.is_relative_to(candidate)
+                or candidate != destination or not source.is_dir()
+                or candidate.exists() and any(candidate.iterdir())):
+            raise ValueError('Registered project copy requires a source and empty publication candidate')
+        if not files or len(files) > 4096:
+            raise ValueError('Registered project exceeds existing workspace copy bounds')
+        selected = tuple((self.resolve_material_root(str(source / name)), Path(name)) for name in files)
+        sizes = [path.stat().st_size for path, _ in selected]
+        if any(size > 64 * 1024 * 1024 for size in sizes) or sum(sizes) > 128 * 1024 * 1024:
+            raise ValueError('Registered project exceeds existing workspace copy bounds')
+        expected = {str(source / name): digest for name, digest in files.items()}
+        if self.artifact_hashes(expected) != expected:
+            raise ValueError('Registered project inputs changed before copying')
+        def allowed(path: Path) -> bool:
+            try:
+                return (self.resolve_material_root(str(path)) == path
+                    and path.relative_to(source).as_posix() in files)
+            except (ValueError, OSError, RuntimeError):
+                return False
+
+        for name in files:
+            self.resolve(str(candidate / name), write=True)
+        _materialize_selection(_CopySelection(source, candidate, selected, CopyReport(0, 0, 0, ()),
+            max_file_bytes=64 * 1024 * 1024, max_total_bytes=128 * 1024 * 1024, path_allowed=allowed))
+        actual = self.bind_inventory(candidate, identity='registered-project-copy')['file_hashes']
+        if actual != {str(candidate / name): digest for name, digest in files.items()}:
+            raise ValueError('Registered project copy omitted or changed members; candidate was not published')
+        if self.artifact_hashes(expected) != expected:
+            raise ValueError('Registered project inputs changed during copying')
+
     def _copy_project(self, request: _CopyProject, identity: str) -> ToolResult:
         from simple_ar.code_task.generation.common import generation_candidate
         from simple_ar.code_task.workspace.copy import copy_code_workspace
@@ -957,29 +1221,35 @@ class WorkspaceToolGateway:
 
     def _run(self, request: _Run, identity: str) -> dict[str, Any]:
         cwd = self.resolve(request.cwd, write=True)
+        argv = self.process_argv(request.argv, resolve_mounts=not request.literal_argv)
         output = self.root / "tools" / "processes" / identity
         receipt = output / "invocation.json"
         if receipt.exists():
             record = read_json(receipt)
             if record["status"] not in {"finished", "stopped"}:
                 raise ValueError("Existing invocation is live or unknown; cannot replay it")
+            # Even historical searches without artifact declarations retain
+            # their actual command. An attempt identity is not a query cache.
+            if (record.get('invocation_id') != identity or record.get('argv') != argv
+                    or record.get('cwd') != str(cwd.resolve()) or record.get('timeout_sec') != request.timeout_sec):
+                raise ValueError('Retained process command changed; no reconciliation or replay')
             settle_process_record(record, self.ledger)
             binding = (record.get('input_binding') or {}).get('workspace_artifacts')
             if binding is not None:
                 if binding['request'] != request.model_dump(exclude_none=True):
                     raise ValueError('Retained process artifact request changed; no replay')
-                if self.process_artifact_binding(request.model_dump(exclude_none=True)) != binding:
+                if self.process_artifact_binding(request.model_dump(exclude_none=True), identity=identity) != binding:
                     raise ValueError('Retained process inputs changed; no replay')
-                if record.get('returncode') == 0 and not record.get('stop_reason'):
+                if record.get('returncode') == 0 and not record.get('stop_reason') and not record.get('output_binding_error'):
                     outputs = record.get('output_binding') or {}
                     if (outputs.get('version') != 1 or set(outputs.get('outputs', {})) != set(binding['outputs'])
                             or self._version_hashes(outputs['outputs']) != outputs['outputs']):
                         raise ValueError('Retained process outputs changed or unbound; no replay')
-            elif request.inputs or request.outputs:
+            elif request.inputs or request.outputs or request.input_snapshot is not None:
                 raise ValueError('Historical process lacks declared artifact binding; no retroactive binding or replay')
-            return {**process_observation(record, output), "receipt": str(receipt.relative_to(self.root))}
-        argv = self.process_argv(request.argv)
-        binding = self.process_artifact_binding(request.model_dump(exclude_none=True))
+            return {**process_observation(record, output), "receipt": str(receipt.relative_to(self.root)),
+                **({'output_binding_error': record['output_binding_error']} if record.get('output_binding_error') else {})}
+        binding = self.process_artifact_binding(request.model_dump(exclude_none=True), identity=identity)
         result = run_process(ProcessSpec(argv=argv, cwd=cwd, timeout_sec=request.timeout_sec,
             env=self.process_environment(), output_dir=output, invocation_id=identity, tail_bytes=12000, log_bytes=200000,
             input_binding={'workspace_artifacts': binding} if binding is not None else None),
@@ -988,10 +1258,19 @@ class WorkspaceToolGateway:
             from simple_ar.core.artifacts import write_json
 
             record = read_json(receipt)
-            record['output_binding'] = {'version': 1, 'outputs': self._version_hashes(binding['outputs'])}
+            phase = 'outputs'
+            try:
+                record['output_binding'] = {'version': 1, 'outputs': self._version_hashes(binding['outputs'])}
+                phase = 'inputs'
+                self._check_process_inputs(binding, identity=identity)
+            except (OSError, ValueError) as exc:
+                record.pop('output_binding', None)
+                record['output_binding_error'] = str(exc)
+                record['output_binding_error_kind'] = phase
             write_json(receipt, record)
-            if self._version_hashes(binding['inputs']) != binding['inputs']:
-                raise ValueError('Declared inputs changed during process; retain outputs without claiming freshness')
+            if record.get('output_binding_error'):
+                return {**process_observation(record, output), "receipt": str(receipt.relative_to(self.root)),
+                    'output_binding_error': record['output_binding_error']}
         return {**process_observation(result.record, output), "receipt": str(receipt.relative_to(self.root))}
 
     def _process_delivery(self, request: _Run, identity: str, *, recovering: bool) -> tuple[dict[str, Any], dict[str, str]]:
@@ -1020,9 +1299,9 @@ class WorkspaceToolGateway:
         write_json(record, {'request': binding, 'delivery': delivery, 'artifact_sha256': hashes})
         return delivery, hashes
 
-    def process_argv(self, argv: list[str]) -> list[str]:
+    def process_argv(self, argv: list[str], *, resolve_mounts: bool = True) -> list[str]:
         """Bind the task interpreter and whole mount arguments, never source text."""
-        result = [str(self.resolve(value)) if next(iter(PurePosixPath(value).parts), None)
+        result = [str(self.resolve(value)) if resolve_mounts and next(iter(PurePosixPath(value).parts), None)
                 in self.mounts else value for value in argv]
         if result and result[0] in {"python", "python3"}:
             result[0] = str(self.python)
@@ -1040,7 +1319,9 @@ class WorkspaceToolGateway:
 
 
 def bind_project_inventory(project: Path, *, resolve: Any, list_page: Any = None,
-                           material_candidates: bool = False) -> dict:
+                            material_candidates: bool | Literal['implementation'] = False) -> dict:
+    if material_candidates not in (False, True, 'implementation'):
+        raise ValueError('Unknown candidate inventory consumer')
     # Mounted pagination owns discovery/private exclusions. Code and legacy
     # receipts bind every visible file; writing filters before hash/read.
     rows, omitted, offset, total = [], [], 0, 0
@@ -1060,9 +1341,9 @@ def bind_project_inventory(project: Path, *, resolve: Any, list_page: Any = None
                     '.zip', '.tar', '.gz', '.bz2', '.xz', '.7z', '.rar', '.exe', '.dll',
                     '.so', '.dylib', '.o', '.obj', '.a', '.lib', '.mp4', '.mp3', '.wav',
                     '.gif', '.webp', '.tif', '.tiff', '.bmp', '.woff', '.woff2'}
-                reason = ('unsupported_format' if suffix in binary else
+                reason = ('unsupported_format' if material_candidates is True and suffix in binary else
                     'consumer_size_limit' if row['size_bytes'] > (
-                        16_000_000 if suffix in figures else _FULL_DIGEST_MAX_BYTES) else '')
+                        16_000_000 if material_candidates is True and suffix in figures else _FULL_DIGEST_MAX_BYTES) else '')
                 if reason:
                     omitted.append({**row, 'reason': reason})
                     continue
@@ -1078,6 +1359,13 @@ def bind_project_inventory(project: Path, *, resolve: Any, list_page: Any = None
             raise ValueError('Project inventory did not advance')
         offset = inventory['next_offset']
     if material_candidates:
+        if material_candidates == 'implementation':
+            return {'project_path': str(project), 'inventory_policy': 'implementation_candidates.v1',
+                'candidate_files': {row['path']: row['size_bytes'] for row in rows}, 'omitted_files': omitted,
+                'inventory_scope': 'Authorized file metadata, including binary dependencies, not observed '
+                    'text or verified results. Files above 64 MiB, private/runtime paths, symlinks and '
+                    'environments are omitted. Reading and byte-preserving copies have separate '
+                    'admission and digest checks; listing grants no new access or authority.'}
         return {'project_path': str(project), 'inventory_policy': 'writing_candidates.v1',
             'candidate_files': {row['path']: row['size_bytes'] for row in rows}, 'omitted_files': omitted,
             'inventory_scope': 'Bounded authorized candidate paths/sizes, not a complete content inventory. '

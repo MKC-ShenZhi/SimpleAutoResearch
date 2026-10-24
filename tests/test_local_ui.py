@@ -19,7 +19,7 @@ from simple_ar.core.budget import BudgetLedger
 from simple_ar.integrations.llm import LLMClient
 from simple_ar.research.documents.ingest import DocumentBundle
 from simple_ar.tools.sources import SourceToolGateway
-from simple_ar.ui import Workspace, bounded, native_arguments, native_creation_options, server
+from simple_ar.ui import Workspace, bounded, native_arguments, server
 
 
 def call(name, arguments, identity='test-call'):
@@ -27,6 +27,194 @@ def call(name, arguments, identity='test-call'):
 
 
 class LocalWorkspaceTests(unittest.TestCase):
+    def test_delivery_validity_is_independent_of_http_file_visibility(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            tasks = base / 'tasks'
+            package = base / 'extension'
+            shutil.copytree(Path(__file__).resolve().parents[1] / 'examples/local_extension', package)
+            unused = base / 'unused.txt'
+            unused.write_text('Old raw source', encoding='utf-8')
+            app = ToolApplication.create(tasks / 'retained', 'Deliver saved local files', model=None,
+                sources={'source0': unused}, extensions=[package])
+            app.run(actions=[
+                call('write_file', {'path': 'workspace/report.txt', 'content': 'Visible output'}),
+                call('write_file', {'path': 'workspace/execution.log', 'content': 'Retained process evidence'}),
+                call('deliver_result', {'summary': 'Saved outputs', 'artifacts': [
+                    'workspace/report.txt', 'workspace/execution.log'], 'unresolved': []}),
+            ], progress=lambda _: None)
+            # Historical dependencies are outside UI grants and can disappear.
+            unused.unlink()
+            descriptor = package / 'extension.toml'
+            descriptor.write_bytes(descriptor.read_bytes() + b'\n# changed\n')
+            workspace = Workspace(tasks, [], tasks)
+            root = tasks / 'retained'
+            records = {p: p.read_bytes() for p in root.rglob('*.json')}
+            visible = workspace.delivery('retained')
+            self.assertTrue(visible['current'])
+            descriptor.unlink()
+            with patch.object(ToolApplication, 'load', side_effect=AssertionError('No executable assembly')):
+                self.assertTrue(workspace.delivery('retained')['current'])
+            self.assertEqual(visible['unavailable_file_count'], 1)
+            self.assertEqual({row['path'] for row in visible['files']}, {'report.txt'})
+            with self.assertRaisesRegex(ValueError, 'cannot be served'):
+                workspace.file('retained', 'workspace', 'execution.log')
+            self.assertEqual({p: p.read_bytes() for p in records}, records)
+            # Hidden from HTTP does not mean exempt from native version checks.
+            log = root / 'workspace/execution.log'
+            original = log.read_bytes()
+            log.write_bytes(b'Untracked replacement')
+            self.assertFalse(workspace.delivery('retained')['current'])
+            log.write_bytes(original)
+            self.assertTrue(workspace.delivery('retained')['current'])
+            # Exact artifact admission precedes hashing in from_session reuse.
+            from simple_ar.cli.start import reuse_session_materials
+            from simple_ar.tools.workspace import RetainedDelivery
+            args = native_arguments()
+            args.from_session, args.reuse = root, ['artifacts']
+            denied = root / 'workspace/report.txt'
+            admitted = []
+
+            def admit(path):
+                admitted.append(path)
+                if path == denied:
+                    raise ValueError('Exact selected material denied')
+                return workspace.read(path)
+
+            args._material_authorize = admit
+            args._material_preflight = workspace.material_grants
+            with patch.object(RetainedDelivery, 'hashes', side_effect=AssertionError('Grant before hash')):
+                with self.assertRaisesRegex(ValueError, 'Exact selected material denied'):
+                    reuse_session_materials(args, native=True)
+            self.assertIn(denied, admitted)
+            args._material_authorize = workspace.read
+            with patch.object(ToolApplication, 'load', side_effect=AssertionError('No executable assembly')):
+                reuse_session_materials(args, native=True)
+            self.assertEqual(set(args.material), {denied, log})
+            # The actual UI configuration entry wires the same admission into
+            # migration, despite missing historical sources and extensions.
+            config = tasks / 'reuse.toml'
+            config.write_text('[task]\nrequest="Use portable outputs"\nmodel="profile:fixture"\n'
+                + 'from_session=' + json.dumps(str(root)) + '\nreuse=["artifacts"]\n', encoding='utf-8')
+            catalog = Mock()
+            catalog.select.return_value = ('fixture', Mock())
+            with patch('simple_ar.ui.load_model_catalog', return_value=catalog), \
+                    patch.object(workspace, 'profiles', return_value=[{'selector': 'profile:fixture'}]), \
+                    patch.object(workspace, 'connection', return_value=({}, 'fixture-binding')), \
+                    patch.object(workspace, 'validate_sources', side_effect=AssertionError('No old dependencies')), \
+                    patch.object(ToolApplication, 'load', side_effect=AssertionError('No executable assembly')):
+                migrated, _ = workspace.creation_inputs({'task_config': str(config)})
+            self.assertEqual(set(migrated.source), {denied, log})
+            self.assertIsNone(migrated.from_session)
+
+    def test_browser_drafts_are_task_scoped_and_dispatch_is_never_replayed(self):
+        # Execute the shipped state/action helpers without a browser or model.
+        # Full DOM, polling and page rendering remain browser acceptance work.
+        node = shutil.which('node')
+        if node is None:
+            self.skipTest('Node is required for browser state regression')
+        from simple_ar import ui
+        source = (Path(ui.__file__).parent / 'ui_assets/app.js').read_text(encoding='utf-8')
+        helpers = source[source.index('let selected ='):source.index('const pretty =')]
+        dispatch = source[source.index('async function action('):source.index('function confirmationControls()')]
+        creation = source[source.index("$('createForm').onsubmit ="):source.index("$('resume').onclick =")]
+        mode = source[source.index('function creationMode()'):source.index('async function refresh()')]
+        script = r"""
+const assert = require('node:assert/strict');
+const elements = new Map();
+const $ = id => {
+  if (!elements.has(id)) elements.set(id, {value: '', checked: false, hidden: false,
+    type: ['network', 'execution'].includes(id) ? 'checkbox' : 'text',
+    replaceChildren() { this.value = ''; }});
+  return elements.get(id);
+};
+const storage = new Map();
+const sessionStorage = {setItem: (key, value) => storage.set(key, value)};
+let messages = [], requests = [], finish, finishRefresh;
+let reviews = [];
+function reviewAction(title, op, extra, facts) { reviews.push({title, op, extra, facts}); }
+function notice(message) { messages.push(message); }
+function confirmationControls() {}
+async function refresh() {
+  await new Promise(resolve => { finishRefresh = resolve; });
+  throw Error('read unavailable');
+}
+function json(path, data) {
+  requests.push(data);
+  return new Promise(resolve => { finish = resolve; });
+}
+""" + helpers + dispatch + creation + mode + r"""
+(async () => {
+  viewKey = 'workspace-one';
+  $('goal').value = 'Keep my research question';
+  $('materials').value = '/approved/materials';
+  $('taskConfig').value = '/approved/task.toml';
+  $('network').checked = true;
+  selectTask('alpha');
+  $('feedback').value = 'Revise the figure and caption';
+  $('switchReason').value = 'Existing authorization';
+  $('mount').value = 'source0'; folder = 'measurements';
+  previewTarget = {mount: 'workspace', path: 'figures/plot.png', name: 'plot.png'};
+  selectTask('beta');
+  assert.equal($('feedback').value, '');
+  assert.equal(folder, '');
+  $('feedback').value = 'Other project feedback';
+  selectTask('alpha');
+  assert.equal($('feedback').value, 'Revise the figure and caption');
+  assert.equal(folder, 'measurements');
+  assert.equal($('mount').value, ''); // Rebound only after owner snapshot.
+  assert.equal(view.tasks.alpha.mount, 'source0');
+  assert.equal(previewTarget.path, 'figures/plot.png');
+  assert.equal(view.tasks.beta.feedback, 'Other project feedback');
+  assert.equal(view.create.goal, 'Keep my research question');
+  assert.equal(view.create.network, true);
+  assert.equal(view.create.taskConfig, '/approved/task.toml');
+  assert.equal(requests.length, 0); // Selecting/recovering a view never runs work.
+  const saved = JSON.parse(storage.get(viewKey));
+  view = saved;
+  selectTask(view.selected, false);
+  assert.equal($('feedback').value, 'Revise the figure and caption');
+  const first = action('feedback', {feedback: $('feedback').value});
+  await action('feedback', {feedback: 'double click'});
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].task, 'alpha');
+  selectTask('beta');
+  finish({task: 'alpha', message: 'accepted'});
+  await new Promise(resolve => setImmediate(resolve));
+  await action('resume');
+  assert.equal(requests.length, 1); // Still locked while awaiting owner state.
+  finishRefresh();
+  assert.equal((await first).task, 'alpha');
+  assert.equal(selected, 'beta'); // A late reply cannot redirect the user.
+  assert.equal(requests.length, 1); // Failed refresh never repeats dispatch.
+  assert.ok(messages.some(text => text.includes('服务器已接受操作')));
+  assert.equal(actionSending, false);
+  assert.equal(view.tasks.alpha.feedback, 'Revise the figure and caption');
+  selected = '';
+  $('taskConfig').value = '/approved/task.toml';
+  creationMode();
+  assert.equal($('plainCreation').disabled, true);
+  const previewing = $('createForm').onsubmit({preventDefault() {}});
+  assert.equal(requests.length, 2);
+  assert.deepEqual(requests[1], {op: 'preview_create', task_config: '/approved/task.toml'});
+  await $('createForm').onsubmit({preventDefault() {}});
+  assert.equal(requests.length, 2);
+  $('taskConfig').value = '/edited/task.toml';
+  finish({preview_id: 'owner-seal', goal: 'Effective goal', extensions: [], access: {}, limits: {}});
+  await previewing;
+  assert.equal(reviews.length, 1);
+  assert.deepEqual(reviews[0].extra, {task_config: '/approved/task.toml', preview_id: 'owner-seal', confirmed: true});
+  assert.match(Object.values(reviews[0].facts).join(' '), /宿主机 OS 权限/);
+  assert.equal(requests.length, 2); // Preview itself never dispatches creation.
+  $('taskConfig').value = '';
+  creationMode();
+  assert.equal($('plainCreation').disabled, false);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+"""
+        result = subprocess.run([node, '-e', script], capture_output=True, text=True,
+            encoding='utf-8', timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_text_only_recipient_rendering_keeps_task_loading_available(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -81,7 +269,9 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
             client._budget_ledger = None
             client.ask_json.return_value = {'summary': 'Candidate only', 'unresolved': [],
                 'files': [{'path': 'worker.py', 'content': 'print("candidate")\n'}],
-                'execution_plan': {'argv': ['python', 'source0/runner.py'],
+                # New plans use OS argv in the candidate cwd. External inputs
+                # use their observed absolute location, not task-mount syntax.
+                'execution_plan': {'argv': ['python', str(runner)],
                     'outputs': ['result.txt'], 'timeout_sec': 7}}
             app.implementation.client_factory = lambda _: client
             with patch.object(LLMClient, '_complete_request', side_effect=AssertionError('No provider traffic')), \
@@ -389,11 +579,16 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary).resolve()
             catalog = base / 'models.toml'
-            catalog_text = 'version = 1\n[routes]\ndefault = "a"\ncode = "code"\nwriting = "writing"\n'
+            catalog_text = ('version = 1\n[routes]\ndefault = "a"\ncode = "code"\nwriting = "writing"\n'
+                            'vision = "vision"\nimage = "image"\n')
             for name in ('a', 'b', 'code', 'writing'):
                 catalog_text += (f'\n[profiles.{name}]\napi = "openai_chat"\n'
                     f'base_url = "https://{name}.invalid/v1"\nmodel = "fake-{name}"\n'
                     'api_key_env = "SAR_UI_TEST_KEY"\ncapabilities = ["text", "code"]\n')
+            catalog_text += ('\n[profiles.vision]\napi="openai_chat"\nbase_url="https://vision.invalid/v1"\n'
+                'model="fake-vision"\napi_key_env="SAR_UI_TEST_KEY"\ncapabilities=["vision"]\n'
+                '\n[profiles.image]\napi="openai_images"\nbase_url="https://image.invalid/v1"\n'
+                'model="fake-image"\napi_key_env="SAR_UI_TEST_KEY"\ncapabilities=["image_generate"]\n')
             catalog.write_text(catalog_text, encoding='utf-8')
             project = base / 'project'
             project.mkdir()
@@ -407,9 +602,12 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                     entered.set()
                     if not release.wait(10):
                         raise AssertionError('Test did not release model boundary')
-                    tool, arguments = 'write_file', {'path': 'workspace/result.txt', 'content': 'same task'}
+                    tool, arguments = 'update_work_plan', {'steps': [
+                        {'step': 'Inspect the authorized evidence for the requested outcome', 'status': 'in_progress'}]}
                 else:
                     tool, arguments = 'ask_user', {'question': 'Inspect this retained result'}
+                self.assertIn(tool, {row['function']['name'] for row in kwargs['tools']},
+                    'UI transport fixture must obey the actual current function contract')
                 return {'role': 'assistant', 'content': None, 'tool_calls': [
                     {'id': 'fake-' + str(len(calls)), 'type': 'function',
                      'function': {'name': tool, 'arguments': json.dumps(arguments)}}]}
@@ -434,17 +632,17 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                     return status, json.loads(raw)
 
                 try:
-                    metadata = request('/api/meta')[1]
+                    status, metadata = request('/api/meta')
+                    self.assertEqual(status, 200, metadata)
                     profiles = metadata['profiles']
                     defaults = metadata['creation_defaults']
                     args = native_arguments()
                     self.assertEqual(defaults['max_turns'], args.max_turns)
                     self.assertEqual(defaults['max_tokens'], args.max_tokens)
                     self.assertEqual(defaults['allow_execution'], args.allow_execution)
-                    options = native_creation_options(args)
-                    options.update(model=None, sources={})
                     _, _, owner_limits, _ = ToolApplication._configuration(workspace.tasks,
-                        'Configuration preview', **options)
+                        'Configuration preview', model=None, sources={},
+                        max_turns=args.max_turns, max_tokens=args.max_tokens)
                     for field in ('process_invocations', 'process_wall_seconds'):
                         self.assertEqual(defaults[field], owner_limits[field])
                         self.assertGreater(defaults[field], 0)
@@ -470,6 +668,16 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                         network=False, execution=False)
                     self.assertEqual(request('/api/action', create | {'confirmed': False})[0], 400)
                     self.assertEqual(request('/api/action', create | {'max_tokens': -1})[0], 400)
+                    self.assertEqual(request('/api/action', create)[0], 400)  # No legacy confirmation bypass.
+                    status, preview = request('/api/action', create | {'op': 'preview_create'})
+                    self.assertEqual(status, 200, preview)
+                    self.assertEqual(list(workspace.tasks.iterdir()), [])
+                    self.assertEqual(preview['limits']['process_invocations'], 0)
+                    self.assertEqual(preview['access']['allow_execution'], False)
+                    self.assertEqual(preview['goal'], create['goal'])
+                    self.assertEqual(preview['creation_declarations'], {})
+                    create['preview_id'] = preview['preview_id']
+                    self.assertEqual(request('/api/action', create | {'network': True})[0], 400)
                     status, result = request('/api/action', create)
                     self.assertEqual(status, 200, result)
                     name = result['task']
@@ -482,6 +690,137 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                     self.assertEqual(actual_limits['total_tokens'], create['max_tokens'])
                     self.assertEqual(actual_limits['process_invocations'], 0)
                     self.assertEqual(actual_limits['process_wall_seconds'], 0)
+                    # The TOML consumer shares CLI interpretation, including
+                    # relative material roles and trusted extension identities.
+                    from simple_ar.cli.start import migrate_new_start, native_creation_options
+                    from simple_ar.cli.task_options import apply_task_config
+                    from simple_ar.cli.parser import build_parser
+                    package = project / 'extension'
+                    package.mkdir()
+                    descriptor = package / 'extension.toml'
+                    descriptor_text = ('[extension]\nid="ui_notes"\nversion="1"\n'
+                        'description="Trusted notes"\nscope="Research"\ninstructions="notes.txt"\n'
+                        '[[tools]]\nname="inspect"\ndescription="Inspect notes"\n'
+                        'implementation="tool.py"\nfunction="inspect"\npermission_level="read_only"\n'
+                        '[tools.input_schema]\ntype="object"\n')
+                    descriptor.write_text(descriptor_text, encoding='utf-8')
+                    (package / 'notes.txt').write_text('Preserve source provenance.', encoding='utf-8')
+                    (package / 'tool.py').write_text('raise AssertionError("must not import at creation")\n', encoding='utf-8')
+                    (project / 'notes.txt').write_text('Unverified notes', encoding='utf-8')
+                    config_path = project / 'task.toml'
+                    config_text = ('[task]\nrequest="Reuse these notes"\nmodel="route:default"\n'
+                        'kind="writing"\nmaterial=["notes.txt"]\nproject="."\nextensions=["extension"]\n'
+                        'allow_network=true\nallow_execution=false\nallow_vision=true\nmax_images=1\nmax_turns=4\nmax_tokens=2000\n'
+                        'max_processes=2\nmax_process_seconds=12.5\n')
+                    config_path.write_text(config_text, encoding='utf-8')
+                    config_input = dict(op='preview_create', task_config=str(config_path))
+                    status, config_preview = request('/api/action', config_input)
+                    self.assertEqual(status, 200, config_preview)
+                    self.assertEqual(config_preview['model'], 'profile:a')
+                    self.assertTrue(config_preview['access']['allow_vision'])
+                    self.assertEqual(config_preview['limits']['image_requests'], 1)
+                    self.assertEqual(config_preview['recipients']['vision']['base_url'], 'https://vision.invalid/v1')
+                    self.assertEqual(config_preview['recipients']['image']['base_url'], 'https://image.invalid/v1')
+                    self.assertEqual(config_preview['sources'], {'source0': str(project / 'notes.txt'), 'source1': str(project)})
+                    self.assertEqual(config_preview['goal'], 'Reuse these notes')
+                    self.assertEqual(config_preview['creation_declarations'], {
+                        'outcome_preference': 'writing',
+                        'material_roles': {'material': ['source0'], 'project': ['source1']}})
+                    self.assertEqual(config_preview['extensions'][0]['tools'][0]['permission_level'], 'read_only')
+                    self.assertEqual(set(config_preview['extensions'][0]['files']), {'tool.py', 'notes.txt'})
+                    cli = build_parser().parse_args(['start', '--task-config', str(config_path), '--yes', '--prepare-only'])
+                    cli._explicit_start_destinations = {'task_config', 'yes', 'prepare_only'}
+                    apply_task_config(cli)
+                    migrate_new_start(cli)
+                    cli.model = 'profile:a'  # Same named route selection; no provider invocation.
+                    options = native_creation_options(cli)
+                    projected = {k: v for k, v in options.items() if k not in {'professional_inputs', 'context_protocol'}}
+                    expected, _, expected_limits, _ = ToolApplication._configuration(workspace.tasks, cli.request, **projected)
+                    self.assertEqual(config_preview['goal'], cli.request)
+                    self.assertEqual(config_preview['creation_declarations'], expected['creation_declarations'])
+                    self.assertEqual(config_preview['limits'], expected_limits)
+                    config_create = config_input | dict(op='create', confirmed=True, preview_id=config_preview['preview_id'])
+                    config_path.write_text(config_text.replace('allow_execution=false', 'allow_execution=true'), encoding='utf-8')
+                    self.assertEqual(request('/api/action', config_create)[0], 400)
+                    config_path.write_text(config_text, encoding='utf-8')
+                    (package / 'tool.py').write_text('raise AssertionError("changed code")\n', encoding='utf-8')
+                    self.assertEqual(request('/api/action', config_create)[0], 400)
+                    (package / 'tool.py').write_text('raise AssertionError("must not import at creation")\n', encoding='utf-8')
+                    catalog.write_text(catalog_text.replace('https://writing.invalid', 'https://new-writing.invalid'), encoding='utf-8')
+                    self.assertEqual(request('/api/action', config_create)[0], 400)
+                    catalog.write_text(catalog_text.replace('https://image.invalid', 'https://new-image.invalid'), encoding='utf-8')
+                    self.assertEqual(request('/api/action', config_create)[0], 400)
+                    catalog.write_text(catalog_text, encoding='utf-8')
+                    original_projection = ToolApplication._configuration
+
+                    def changed_projection(*args, **kwargs):
+                        result = original_projection(*args, **kwargs)
+                        result[0]['allow_network'] = False
+                        return result
+
+                    # Even a change at create()'s final owner projection is
+                    # rejected before its session/ledger can be persisted.
+                    with patch.object(ToolApplication, '_configuration', side_effect=changed_projection):
+                        self.assertEqual(request('/api/action', config_create)[0], 400)
+
+                    def changed_declarations(*args, **kwargs):
+                        result = original_projection(*args, **kwargs)
+                        result[0]['creation_declarations'] = {**result[0]['creation_declarations'],
+                            'with_report': True}
+                        return result
+
+                    with patch.object(ToolApplication, '_configuration', side_effect=changed_declarations):
+                        self.assertEqual(request('/api/action', config_create)[0], 400)
+                    self.assertEqual(len(list(workspace.tasks.iterdir())), 1)
+                    status, configured = request('/api/action', config_create)
+                    self.assertEqual(status, 200, configured)
+                    configured_root = workspace.task(configured['task'])
+                    saved_config = json.loads((configured_root / 'actions.json').read_text())['config']
+                    self.assertEqual({key: saved_config[key] for key in expected}, expected)
+                    self.assertTrue(saved_config['professional_inputs'])
+                    self.assertTrue(saved_config['professional_work'])
+                    self.assertEqual(saved_config['input_contract'], 'declared_inputs.v1')
+                    self.assertEqual(saved_config['creation_declarations'], config_preview['creation_declarations'])
+                    self.assertEqual(json.loads((configured_root / 'actions.json').read_text())['requests'],
+                                     ['Reuse these notes'])
+                    self.assertEqual(saved_config['context_protocol'], options['context_protocol'])
+                    self.assertEqual(json.loads((configured_root / 'budget_ledger.json').read_text())['limits'], expected_limits)
+                    self.assertEqual(calls, [])
+                    # Neither a config path nor a descriptor reference grants
+                    # additional host reads. Narrow file grants stay narrow.
+                    narrow = Workspace(project, [], base / 'narrow-tasks')
+                    outside = base / 'outside.toml'
+                    outside.write_text(config_text, encoding='utf-8')
+                    with self.assertRaises(ValueError):
+                        narrow.preview_creation({'task_config': str(outside)})
+                    limited = Workspace(project / 'extension', [config_path, project / 'notes.txt'], base / 'limited-tasks')
+                    # The project alias in TOML is outside these narrow grants.
+                    with self.assertRaises(ValueError):
+                        limited.preview_creation({'task_config': str(config_path)})
+                    analysis = project / 'analysis.json'
+                    analysis.write_text(json.dumps({'schema_version': 'table_analysis.v1',
+                        'source': {'path': 'notes.txt'}}), encoding='utf-8')
+                    config_path.write_text('[task]\nrequest="Inspect analysis"\nmaterial=["analysis.json"]\n', encoding='utf-8')
+                    attachment_limited = Workspace(package, [config_path, analysis], base / 'attachment-tasks')
+                    with patch('simple_ar.result_analysis.table.load_analysis_package',
+                               side_effect=AssertionError('Must reject the attachment before the package owner reads it')):
+                        with self.assertRaises(ValueError):
+                            attachment_limited.preview_creation({'task_config': str(config_path)})
+                    config_path.write_text(config_text + 'output_root="../ungranted-output"\n', encoding='utf-8')
+                    self.assertEqual(request('/api/action', config_input)[0], 400)
+                    config_path.write_text(config_text, encoding='utf-8')
+                    outside_session = base / 'ungranted-session'
+                    outside_session.mkdir()
+                    config_path.write_text('[task]\nrequest="Reuse a project"\nfrom_session='
+                        + json.dumps(str(outside_session)) + '\nreuse=["code_project"]\n', encoding='utf-8')
+                    with patch('simple_ar.ui.migrate_new_start',
+                            side_effect=AssertionError('Reject ungranted sessions before their owner reads them')):
+                        with self.assertRaises(ValueError):
+                            workspace.preview_creation({'task_config': str(config_path)})
+                    config_path.write_text(config_text, encoding='utf-8')
+                    descriptor.write_text(descriptor_text.replace('notes.txt', '../../outside.toml'), encoding='utf-8')
+                    self.assertEqual(request('/api/action', config_input)[0], 400)
+                    descriptor.write_text(descriptor_text, encoding='utf-8')
                     switch = dict(op='switch', task=name, model='profile:b', binding_id=b['binding_id'],
                                   confirmed=True, switch_id='ui-switch', reason='Explicit recipient change')
                     self.assertEqual(request('/api/action', switch | {'confirmed': False})[0], 400)
@@ -508,6 +847,7 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                     self.assertTrue(entered.wait(10))
                     live = request('/api/task?task=' + name)[1]
                     self.assertTrue(live['worker_live'])
+                    self.assertEqual(live['local_workers'], [name])
                     self.assertEqual(live['pending']['kind'], 'model')
                     self.assertEqual(live['activity'], [])
                     self.assertEqual(request('/api/action', dict(op='stop', task=name))[0], 200)
@@ -518,13 +858,16 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                     paused = request('/api/task?task=' + name)[1]
                     self.assertEqual(paused['manifest']['status_reason'], 'Caller requested boundary stop')
                     self.assertFalse(paused['worker_live'])
+                    self.assertEqual(paused['local_workers'], [])
                     self.assertEqual(paused['queued_actions'], 1)
                     self.assertEqual(paused['activity'], [])
-                    self.assertFalse((root / 'workspace/result.txt').exists())
+                    self.assertEqual(json.loads((root / 'actions.json').read_text())['turns'][0]['tools'], [])
                     self.assertEqual(request('/api/action', dict(op='resume', task=name))[0], 200)
                     workspace.workers[name][0].join(10)
                     self.assertFalse(workspace.workers[name][0].is_alive())
-                    self.assertEqual((root / 'workspace/result.txt').read_text(), 'same task')
+                    adopted = ToolApplication.load(root)._work_plan()
+                    self.assertEqual(adopted['steps'], [
+                        {'step': 'Inspect the authorized evidence for the requested outcome', 'status': 'in_progress'}])
                     self.assertEqual(len(json.loads((root / 'actions.json').read_text())['requests']), 1)
                     self.assertEqual(request('/api/task?task=' + name)[1]['manifest']['session_id'], name)
                 finally:

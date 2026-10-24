@@ -128,6 +128,8 @@ This needs no model key and plots supplied demonstration coordinates. It checks 
 
 ## Scope and review
 
+V2.10 continues on `feat/v2.10-project-research-assistant`; checked improvements can be integrated into main in stages without closing the whole milestone. The main-branch quick start and public cases above remain valid. [Development evidence and limits](docs/EVALUATION.md#v210-development-evidence) distinguish installed engineering checks from earlier report feedback, material reuse and supplied-template conversion, and from the public cases above.
+
 SimpleAutoResearch is a **source-visible preview**, and the native `start` entry is experimental. Current work focuses on Python research code, common tabular data, bounded investigations and reproductions, and reports grounded in available materials. Complex environment preparation, long surveys, precise publication layout and consistent efficiency still need improvement.
 
 Source originals are mounted read-only. You review command proposals and approve execution; a task workspace is not an operating-system sandbox. You remain responsible for scientific interpretation and the delivered evidence: successful execution or PDF compilation alone does not establish scientific correctness. Model choice, services, data and environment affect outcomes and cost. Case-specific details are in the [showcase](docs/showcase/README.md).
@@ -141,6 +143,7 @@ Source originals are mounted read-only. You review command proposals and approve
 | Look up commands, approvals and recovery | [CLI reference](docs/CLI_REFERENCE.md) |
 | Configure named models, routes and task fields | [Configuration reference](docs/CONFIG_REFERENCE.md) |
 | Inspect showcased outputs and their conditions | [Showcase](docs/showcase/README.md) |
+| Check development evidence, budgets and remaining limits | [Evidence and boundaries](docs/EVALUATION.md) |
 | Understand the code and development workflow | [Development](docs/DEVELOPMENT.md) |
 | See what changed | [Changelog](CHANGELOG.md) |
 

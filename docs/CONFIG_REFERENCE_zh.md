@@ -13,6 +13,7 @@
 | 表格字段与统计变换 | [已有数据](#已有数据的描述分析) |
 | 决定与追加额度 | [续接](#研究会话补齐条件与续接) |
 | 项目、解释器、模型和编辑预算 | [CodeTask 字段](#codetask-toml-字段参考) |
+| Python 创建、原生控制与可信服务 | [Python API](#python-创建任务) |
 
 ## 引导设置
 
@@ -20,80 +21,22 @@
 
 结构化优先级为默认值 → TOML → 明确 CLI，CLI 列表替换文件列表。研究路径相对 TOML 所在目录解析，命令 argv 保持字面含义；协议保护路径相对执行 cwd。CodeTask 使用独立的[加载规则](#加载规则)。原生追加访问或资源须走明确续接参数。
 
-### Python 创建任务
+### V2.10 任务声明（开发分支）
 
-直接创建原生任务时，可用 `ToolApplication.create(..., delivery_files=["**/*.md", "**/*.pdf"])` 要求无保留的完成交付包含非空工作区输出。相对路径模式只检查文件存在，不证明科学质量；仍可明确交付未完成项。API 不自动从自然语言推导要求，也不把来源 PDF 算作输出。已有任务可通过调用方 `supply(..., replace_existing=True)` 明确替换 `delivery_files`、`tool_contracts` 或 `completion_policy`；无关补齐保留原策略及账本。
+V2.10仍在 `feat/v2.10-project-research-assistant` 上开发，经过检查的改进可在整个里程碑完成前整合进main。实际核查范围见[开发证据与限制](EVALUATION_zh.md#v210-开发证据)。
 
-新任务默认使用 `tool_contracts="on_demand"`：先提供普通工作区工具和简短能力目录，助手按当前工作加载必要的完整专业契约，为材料而非所有工具参数保留输入空间。用户无需选择工作流或确认工具加载；权限和命令审批仍然有效。高级调用者可选 `full` 或 `outcomes`，已有任务保留显式保存的模式。
+开发分支将用户原话与材料角色、数据含义、成果偏好分别保存；CLI和界面确认相同的有效声明，不把自动生成的路径清单追加成用户要求。偏好帮助选择交付，不限制可用能力；材料声明不是已核实事实，也不增加访问或执行权限。未设置`--with-report`不表示禁止按自然语言要求写报告。历史会话保留原输入规则。
 
-新任务采用 `context_protocol="conversation.v1"`：真实助手/工具消息保留读取正文和写入参数，必要时按完整轮次移出最旧对话。最近一个完整轮次不会因稍超 `context_input_tokens` 软目标而被丢弃；超出情况会记录，实际请求仍须符合剩余总 token 额度。有界归档索引链接原记录，不把已移出正文冒充仍在供给。历史观察不是当前文件读取或已验证事实。缺少该标记的已有任务及 Python 显式 `context_protocol=None` 保留原投影。
+V2.10开发分支的原生`[task]`配置支持`extensions = ["../my-skill"]`。
+明确选择的受信任本地扩展沿共同工具注册和任务记录运行；v1 接受方法说明包及声明只读／计划操作的 Python 工具。
+可信 Python 拥有宿主进程的操作系统权限，可直接访问文件、进程及网络；声明和宿主服务限制不是沙箱。只加载可信包。设置方法及边界见[本地扩展说明](LOCAL_EXTENSIONS.md)。
 
-新建原生任务默认采用 `completion_policy="closing_decision.v2"`。最后一次可负担的决策调用前，契约限制为直接交付、询问，或已加载且必须附带交付的末次操作；需要再次调用模型的操作不提供。新的末次响应只接收一个终结动作，已保存响应保留原准入合同。未完成项须明确说明；这不保证任务完成或科学质量。历史策略，包括缺字段及显式 `protected_decision.v1`，保留原行为。
+基于已有成果新建任务时，原生`[task]`还可配置`from_session = "../saved-task"`及
+`reuse = ["artifacts"]`（也可选`simple-ar results`列出的成果组）。会话路径相对配置文件，
+组名不是路径；只复用经字节核验的材料，不继承原权限、额度或执行状态。
+继续同一任务应使用`--resume-task`。
 
-整篇专业写作可在声明边界内检查和修订自己的稿件：`compose_document.professional_review={"max_revision_rounds":1}` 表示独立检查后最多修订一轮；零表示只检查，省略保留原起草行为。初稿和反馈共用写作所有者、依据核验与任务预算；反馈可复用完整旧稿的原始输入，不重新选材。未解决问题明确保留，并阻止作为已接受稿件出版。原生报告在创建义务时通过 `update_work_plan.report_intent` 声明可选的 `professional_review`，继承及用户冻结的设置优先。检查针对所供依据和正文，不认证科学正确性或视觉效果。
-
-新的 CLI/UI 任务及 `create_research_task` 使用版本化报告合同。助手在同一正常行动批次中理解交付要求，不增加单独分类调用；写作取得原始材料及实际结果，出版和交付必须对应采用的正文与图文版本。明确标注的候选只能作为部分成果，不是已完成科研报告。转换已有文章时采用其当前版本，不必重写正文。这些关联证明来源与版本一致，不认证科学正确性。
-
-Python 直接调用可用 `ToolApplication.create(..., report_protocol="canonical_report.v1")` 启用；省略时保留原低层 API 合同。已有任务不静默升级，调用方冻结的写作及执行要求也不能被助手的计划降低。
-
-新的 CLI/UI 及 `create_research_task` 材料报告由写作模块调查选材，直接取得保存的用户请求和授权材料目录，不再接受协调层代写的目标或预选原文窗口。Python 调用方可在上述报告协议下设置 `professional_inputs=True`。显式专家调用及已存请求保留原输入合同。新的整篇反馈与有界修订返回绑定原稿版本的精确替换；无需修改时可用空替换列表采用完整候选。原始响应与旧稿保持不变。
-
-`run_process` 可声明文件 `inputs` 和工作区 `outputs`，各最多64项，每份绑定最多64 MiB。审批绑定输入，成功运行记录输出字节；写作与出版拒绝输入或输出已变化的已声明生产结果，不静默沿用旧图，须用新调用明确重新生成。它不推测依赖、不覆盖未声明文件、不增加执行权限，也不证明科学正确性；历史运行不追溯绑定。
-
-`compose_document.adopt_draft=true` 可检查并采用已有 `prior_draft`，省去重新起草请求。须已启用整篇写作及独立专业审阅，不能替换冻结设置；正文有单独来源回执，不伪造模型响应。与 `reuse_prior_inputs` 配合时，完整的同任务生产者提供原始写作正文和依据；外部稿件不因此取得输入复用权限。未通过检查不能作为已接受稿件出版，授权修正仍复用精确替换编辑器。
-
-新的专业选材报告只接收已有图像路径，不接收协调层编写的权威图注。写作模块依据实际材料和原始请求编写、协调图注；绑定报告展示已冻结的审阅设置，不再提供与其冲突的 `professional_review` 选项。写作及代码模块在选材前取得相关原始反馈，历史调用仍沿用原上下文。以上均不等于视觉或科学认证。
-
-`app.run()` 和只读的 `app.result_snapshot()` 还返回 `retained_work`，列出已有工作区中间成果、最后操作及继续说明。这些文件不代表已验收交付。写作失败可保留候选稿；独立审阅被拒时可保留 `incomplete_review.json` 中逐项校验有效的意见。修改仍须使用原证据并创建新版本，未完成的审阅继续保留为缺项。新写作在登记正式结果前检查 CommonMark 图片引用，导出仍执行完整路径及编译检查。
-
-新的普通 `run_process` 调用在进程非零退出或停止时返回错误，保留退出码和日志，不改写历史观察。非法执行提案返回专业所有者的具体前置校验原因，不执行提案。明确分节计划若连每节一次请求都无法容纳，会在付费选材前拒绝；这一最低检查不保证余下工作一定能完成。
-
-结构化调研、材料写作、表格和声明执行可与 CLI 共用创建所有者：
-
-```python
-from pathlib import Path
-from simple_ar.app.research_intake import create_research_task
-from simple_ar.app.tool_application import ToolApplication
-from simple_ar.research.workflow_contracts import ResearchBrief
-
-app = create_research_task(
-    ResearchBrief(request_text="解释材料中的证据及其限制。",
-        requested_outputs=("summary",),
-        asset_requests=({"locator": "notes.md", "role": "material"},)),
-    root=Path("runs/evidence-note"), model="route:default",
-)
-app.run(progress=print)
-restored = ToolApplication.load(Path("runs/evidence-note"))
-```
-
-创建只校验输入，不调用模型或进程。不传 `model` 时由调用方提供动作，后续可明确补齐条件；声明报告只是保留交付义务，不授权调用模型。`ResearchApplicationServices` 提供研究设置及有限预算。声明命令或条件集合写入 `services.config["execution"]`；可选 `code_task` 复用原 CodeTask 默认值、编辑边界和独立验证器。路径相对 `input_base_dir`，不是任务输出目录；显式零额度保持为零。来源别名、环境及已核外部基线快照与 CLI 共用编译，不再另设 Python 执行语义。
-
-`create_research_task(..., allow_vision=True)` 可明确授权图像检查；该关键字默认 `False`，只接受布尔值，不从任务文字或材料推导授权。检查仍要求既有所有者校验命名 vision 路由及连接/哈希，并计入 `services.budget_limits` 对应的同一模型请求和 token 账本；注入文本客户端本身不提供 vision 授权。此参数不授权来源联网或图像生成，不改变旧任务权限及 `ToolApplication` 返回类型。
-
-例如，下面只创建调用方测量任务，不执行程序：
-
-```python
-from simple_ar.app.research_application import ResearchApplicationServices
-
-services = ResearchApplicationServices(input_base_dir=Path.cwd(), config={
-    "execution": {"command": ["python", "experiment.py"], "cwd": ".", "timeout_sec": 120,
-        "result_schema": {"primary_metric": "score", "required_metrics": ["score"]}}},
-    budget_limits={"process_invocations": 1, "process_wall_seconds": 120})
-app = create_research_task(ResearchBrief(request_text="测量所提供的程序。",
-    requested_outputs=("experiments",)), root=Path("runs/measurement"), services=services)
-```
-
-执行仍须单独批准实际提案。`execution_confirmation=True` 另要求接受调用方冻结协议，不是进程权限。CodeTask 的 `allowed_patterns` 未填或为空时保留原默认源码范围及强制保护，并非“禁止编辑”；要缩小范围请给明确 glob。
-
-需要研究且未声明比较控制时，创建保留开放设计，不默认补 `baseline_policy="skip"`。接受后的设计进入同一科学所有者；精确代码任务分别绑定未改源码基线和已实现候选，不能扩大编辑范围、替换环境，或给空项目虚构源码基线。没有模型或命令时，结构化实验请求可先保存材料，暂停等待[明确补齐条件](CLI_REFERENCE_zh.md)；收集材料不等于实验或报告完成。首次绑定模型须在原账本明确追加正数请求和token额度。
-
-所有结构化 CLI 新任务使用共同创建所有者；不支持的声明在创建前报错，不回退另一应用。`create_session`/`ResearchApplication.create` 是显式兼容 API，保留原 `view`/`advance` 及历史运行合同，不再作为新 CLI 任务的后端。旧运行和基线产生来源血缘不能用目录副本或裸结果替代。
-
-可信 Python 集成可通过 services 注入文本客户端、独立审阅客户端和 `SearchProviderRegistry`。客户端须实现 `with_budget` 及 `ask_json` 或 `chat_turn`，绑定任务实际账本、会话与 attempt。继续服务工作前，用 `ToolApplication.load(path, services=services)` 恢复依赖。持久化只保留类型/模型身份和 provider 名称，不保存密钥或可执行对象；缺失依赖不会回退环境客户端或内置检索器。自定义实现由调用方信任，不是安全沙箱，也不独立验证实现身份。需跨 CLI/重启使用时，优先命名连接；`model="env"` 表示配置的默认模型，不是名为 env 的服务商模型。
-
-`snapshot_sources=True` 只复制明确选中的普通文件，每个受 `max_snapshot_bytes` 限制（默认 16 MiB），不复制整个目录；哈希绑定保留字节。旧 v1 导入共用这些副本，保留父任务关系与原文件，历史预算标为 `unknown_not_imported`，不导入或清零。新任务沿 `start --resume-task` 继续，原任务仍按原合同恢复。
-
-### 命名模型连接
+## 命名模型连接
 
 一次读取一份模型 TOML，不合并多份文件。普通选择使用明确路径、`SIMPLE_AR_MODELS_CONFIG`，再查找 `~/.config/simple-ar/models.toml`。新原生任务还为已授权的消费者记录实际所选文件的绝对位置；续接时明确参数/当前环境优先，其次是仍存在的原定位，再查用户目录。不扫描项目目录发现配置。`models --config PATH` 只检查该文件，不会替后续命令启用它。
 
@@ -603,3 +546,82 @@ Greenfield 设置 kind="greenfield"。没有脚手架时省略 code_root，并�
 测试、benchmark、`.env`、秘密和凭据路径的内置保护始终保留。用户设置的 `protected_patterns` 追加保护，不替换默认规则。工作计划或当前批次的目标文件还会进一步缩小可编辑范围。
 
 上下文选择、规划、编辑提案和修复均遵守范围。应用提案前再次检查工作区路径、范围、唯一精确的旧文本匹配和预算。空 `old` 只用于创建尚不存在且允许的文件，不能覆盖已有文件；新建文件沿用快照和失败回滚机制。
+
+## Python 创建任务
+
+结构化调研、写作、表格和声明执行使用 `create_research_task`，与 CLI 共用输入校验，返回 `ToolApplication`；创建本身不调用模型或进程。直接集成原生任务可用 `ToolApplication.create`。
+
+### 创建、执行与恢复
+
+```python
+from pathlib import Path
+from simple_ar.app.research_intake import create_research_task
+from simple_ar.app.tool_application import ToolApplication
+from simple_ar.research.workflow_contracts import ResearchBrief
+
+app = create_research_task(
+    ResearchBrief(request_text="解释材料中的证据及其限制。",
+        requested_outputs=("summary",),
+        asset_requests=({"locator": "notes.md", "role": "material"},)),
+    root=Path("runs/evidence-note"), model="route:default",
+)
+app.run(progress=print)
+restored = ToolApplication.load(Path("runs/evidence-note"))
+```
+
+路径相对 `ResearchApplicationServices.input_base_dir`，不是任务输出目录。Services 提供研究设置和有限的 `budget_limits`，显式零额度保持为零。不传 `model` 时由调用方提供动作，后续可明确补齐。请求报告保留交付义务，不授权模型调用。来源别名、环境及已核外部基线与 CLI 共用输入编译。
+
+```python
+from simple_ar.app.research_application import ResearchApplicationServices
+
+services = ResearchApplicationServices(input_base_dir=Path.cwd(), config={
+    "execution": {"command": ["python", "experiment.py"], "cwd": ".", "timeout_sec": 120,
+        "result_schema": {"primary_metric": "score", "required_metrics": ["score"]}}},
+    budget_limits={"process_invocations": 1, "process_wall_seconds": 120})
+app = create_research_task(ResearchBrief(request_text="测量所提供的程序。",
+    requested_outputs=("experiments",)), root=Path("runs/measurement"), services=services)
+```
+
+声明命令或条件集合放入 `services.config["execution"]`。可选 `code_task` 保留 CodeTask 默认值、编辑边界和独立验证。执行须单独批准实际提案；`execution_confirmation=True` 另要求接受冻结协议。CodeTask 的 `allowed_patterns` 未填或为空时保留默认源码范围及强制保护，要缩小范围请给明确 glob。
+
+需要研究而未声明比较控制时，设计保持开放，不隐含 `baseline_policy="skip"`。接受的设计分别绑定未改源码基线和实现候选，不能扩大范围、替换环境或给空项目虚构基线。无模型的实验任务可以先保存材料并暂停等待[明确补齐条件](CLI_REFERENCE_zh.md#原生任务恢复)，无论是否已声明命令；收集材料不等于完成。首次绑定模型须在原账本明确追加正数请求和 token 额度。
+
+### 原生控制与兼容性
+
+以下控制描述当前开发实现。已有任务沿用保存的合同，创建默认值不会迁移旧会话。
+
+| API 设置 | 行为 |
+| --- | --- |
+| `delivery_files=["**/*.md", "**/*.pdf"]` | 无保留的完成交付须有非空工作区输出。相对模式只查存在，不认证质量，来源 PDF 不算输出；要求须明确声明，不从文字推导，仍可明确交付部分成果。 |
+| `tool_contracts="on_demand"`（默认） | 先提供工作区工具和简短能力目录，按需加载专业契约，用户无需选工作流或批准加载。权限及命令审批仍适用；高级选项为 `full`、`outcomes`。 |
+| `context_protocol="conversation.v1"`（默认） | 保留真实读取正文和写入参数，按完整轮次移出最旧对话。最近完整轮次可超过 `context_input_tokens` 软目标，记录超出并遵守剩余总额度。有界归档索引链接原记录；归档正文不算当前上下文，旧观察不算新读取。缺标记或显式 `None` 保留原投影。 |
+| `completion_policy="closing_decision.v2"`（默认） | 最后可负担决策只提供交付、询问或已加载且须附交付的末次操作，不提供需再调用模型的操作；新末次响应只有一个终结动作。已保存响应保留原准入合同；缺字段和旧策略（含 `protected_decision.v1`）保留原行为，未完成项须明确。 |
+| `report_protocol="canonical_report.v1"` | CLI/UI 及 `create_research_task` 使用版本化报告合同；直接 `ToolApplication.create` 须显式启用，省略保留原低层合同。 |
+| `professional_inputs=True` | 配合报告协议，由写作模块从保存的请求和授权目录选材。CLI/UI 及 `create_research_task` 材料报告使用此行为，显式专家调用及已存请求保留原输入合同。 |
+| `create_research_task(..., allow_vision=True)` | 严格布尔值，默认 `False`；须有命名 vision 路由及连接，共用 `services.budget_limits`。文字或注入文本客户端不授权视觉检查；不授予来源联网、图像生成，不改旧权限或返回类型。 |
+| `supply(..., replace_existing=True)` | 调用方可明确替换 `delivery_files`、`tool_contracts` 或 `completion_policy`；无关补齐保留策略及账本。 |
+
+工具加载与末次决策不保证完成、科学质量或特定成本。为长报告定额度前，先看[任务预算与证据](EVALUATION_zh.md#v210-开发证据)。
+
+### 写作、输出绑定与保留成果
+
+| 操作／字段 | 合同 |
+| --- | --- |
+| 报告写作与交付 | 在正常行动批次理解交付要求，不额外分类调用。使用原材料和实际结果，出版采用的正文及匹配图文；转换已有文章可直接采用当前版本，无须重写。候选仍为部分成果，计划不能降低冻结的写作或执行要求。 |
+| `compose_document.professional_review={"max_revision_rounds":1}` | 独立检查后最多修订一轮；零表示只查不改，省略保留原起草行为。原生报告在创建义务时通过 `update_work_plan.report_intent` 声明；继承及冻结设置优先，展示原设置而非冲突选项。 |
+| 反馈与图形输入 | 写作模块在选材前取得原始反馈，从实际材料和请求编写图注；图形输入是已有路径，不是协调层代写的权威图注。代码调查也取得相关原始反馈；初稿和反馈共用写作模块、依据检查与预算。 |
+| 整篇纠正 | 精确替换绑定稿件版本；空列表可采用无需改动的有效候选。保留原响应及旧版本，完整旧写作输入可供反馈复用；未解决的必需意见阻止作为已接受稿件出版。 |
+| `compose_document.adopt_draft=true` | 检查并采用 `prior_draft`，省去起草调用；须已启用整篇写作和独立专业审阅。正文有独立来源回执，不伪造模型响应；`reuse_prior_inputs` 须有完整同任务生产记录，外部稿件不获此权限。冻结控制和精确替换纠正仍适用。 |
+| `run_process.inputs` / `outputs` | 可选文件输入和工作区输出，各最多 64 项，每份绑定最多 64 MiB。审批绑定输入，成功执行记录输出字节；已声明生产结果的输入或输出变化时，写作和出版拒绝复用，须新调用重建。不推测依赖、不覆盖未声明文件、不增权限、不追溯绑定。 |
+| 进程失败／前置校验 | 非零退出或停止返回错误及退出码、日志；非法提案返回专业模块诊断，不执行。历史观察保持不变。 |
+| `app.run()` / `app.result_snapshot()` | 返回 `retained_work`：中间工作区文件、最后操作及继续说明，不代表已验收交付。写作失败可保留候选；检查被拒可在 `incomplete_review.json` 保留逐项有效意见。用原证据创建新修订，未完成检查仍是缺项。 |
+
+写作在登记规范稿前检查 CommonMark 图片引用，导出保留路径和编译检查。明确分节计划若连每节一次调用都无法承担，会在付费选材前拒绝，但此下限不保证完成。来源、算术和正文检查不认证视觉或科学正确性。
+
+### 可信服务、快照与兼容 API
+
+Services 可注入文本客户端、独立审阅客户端和 `SearchProviderRegistry`。客户端须实现 `with_budget` 及 `ask_json` 或 `chat_turn`，绑定实际账本、会话与 attempt。继续服务工作前用 `ToolApplication.load(path, services=services)` 恢复依赖。持久化只保留类型／模型身份和 provider 名，不保存密钥或可执行对象；缺依赖报错，不回退环境客户端或内置检索器。自定义实现由调用方信任，不是沙箱，也不独立验证身份。跨 CLI／重启优先用命名连接，`model="env"` 选择配置的默认模型。
+
+`snapshot_sources=True` 只保留选中的普通文件，逐个受 `max_snapshot_bytes`（默认 16 MiB）限制，以哈希绑定字节，不复制整个目录。旧 v1 导入使用这些副本，保留父任务关系及原件，历史预算记为 `unknown_not_imported`，不导入或清零。新任务沿 `start --resume-task` 继续，原任务仍按自己的合同恢复。
+
+新结构化 CLI 任务使用共同创建 API，不支持的声明在创建前报错。`create_session` / `ResearchApplication.create` 是显式兼容 API，保留原 `view` / `advance` 和历史运行合同。旧运行采用及产生基线的源码血缘须有原记录，目录副本或裸结果不能替代。

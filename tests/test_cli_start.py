@@ -18,6 +18,262 @@ from simple_ar.code_task.runtime.config import load_code_task_init_options, load
 
 
 class StartTests(unittest.TestCase):
+    def _native_project_delivery(self, root, *, execute=False, planned=False, projects=1, deliver_count=None,
+                                external_input=None):
+        from simple_ar.app.tool_application import ToolApplication
+        from unittest.mock import Mock
+        app = ToolApplication.create(root, 'Prepare code and retain actual results', model=None,
+            sources={'source0': external_input} if external_input is not None else {},
+            allow_execution=execute, allow_network=True, project_python=Path(sys.executable),
+            max_turns=10, max_tokens=10000, max_attempts=30)
+        fake = Mock()
+        fake.effective_output_limit.return_value = None
+        app.implementation.client_factory = lambda _: fake
+        prepared = []
+        for index in range(projects):
+            fake.ask_json.return_value = {'summary': 'Prepared source', 'unresolved': [],
+                'files': [{'path': 'compute.py', 'content':
+                    "from pathlib import Path\nPath('result.txt').write_text('computed')\n"}],
+                **({'execution_plan': {'argv': ['python', 'compute.py'], 'outputs': ['result.txt'],
+                                       'timeout_sec': 3}} if execute or planned else {})}
+            status = app.run(actions=[{'tool_name': 'prepare_implementation', 'arguments': {
+                'goal': f'Prepare independent code unit {index}', 'complete_work': False,
+                **({'source_windows': [{'path': 'source0', 'max_bytes': 64000}]}
+                   if external_input is not None else {})}},
+                {'tool_name': 'ask_user', 'arguments': {'question': 'Await explicit delivery'}}])
+            self.assertEqual(status['status'], 'paused', status)
+            observed = app.session.store.read_json(app.state['turns'][-1]['tools'][0]['result'])
+            self.assertEqual(observed['status'], 'ok', observed.get('error'))
+            prepared.append(observed)
+        artifacts = [path for row in prepared[:deliver_count] for path in row['artifacts']]
+        if execute:
+            for row in prepared:
+                status = app.run(actions=[{'tool_name': 'execute_implementation', 'arguments': {
+                    'prepared_result': row['data']['prepared_result']}}], approve=lambda *_: True)
+                artifacts.append(str(Path(row['data']['project_dir']) / 'result.txt'))
+        status = app.run(actions=[{'tool_name': 'deliver_result', 'arguments': {
+            'summary': 'Source and actual retained outputs; no quality certification', 'artifacts': artifacts}}])
+        self.assertEqual(status['status'], 'completed', status)
+        return app, prepared
+
+    def test_native_project_reuse_proves_source_and_cli_inherits_no_authority(self):
+        from simple_ar.app.tool_application import ToolApplication
+        from simple_ar.cli.start import native_creation_options, session_materials
+        with tempfile.TemporaryDirectory() as directory:
+            app, prepared = self._native_project_delivery(Path(directory) / 'old')
+            root = app.session.store.root
+            candidate = Path(prepared[0]['data']['project_dir'])
+            before = {path: path.read_bytes() for path in root.rglob('*') if path.is_file()}
+            self.assertEqual(app.reusable_code_project(), (candidate, None, {}))
+            self.assertEqual(ToolApplication.load(root).reusable_code_project(), (candidate, None, {}))
+            self.assertEqual(session_materials(root, include_project=True)['code_project'], [candidate])
+            for kind in (None, 'code', 'writing', 'reproduction'):
+                argv = ['start', '--from-session', str(root), '--reuse', 'code_project', '--reuse', 'artifacts',
+                    '--goal', 'Use current source and saved results to explain the requested changes', '--prepare-only']
+                if kind:
+                    argv.extend(['--kind', kind])
+                args = build_parser().parse_args(argv)
+                with self.subTest(kind=kind), patch('sys.stdin.isatty', return_value=False), \
+                        patch('simple_ar.cli.main._run_native_start') as run:
+                    prepare_start(args)
+                run.assert_called_once_with(args)
+                options = native_creation_options(args)
+                self.assertEqual(args.kind, kind)
+                self.assertIn(candidate, options['sources'].values())
+                self.assertIsNone(options['code_task'])
+                self.assertIsNone(options['execution_contract'])
+                self.assertIsNone(options['project_python'])
+                self.assertFalse(options['allow_execution'])
+                self.assertFalse(options['allow_network'])
+                self.assertEqual(options['max_turns'], 30)
+                self.assertEqual(options['max_tokens'], 600000)
+                self.assertIsNone(options['process_limits'])
+                self.assertEqual(args.allow, [])
+                self.assertIsNone(args.validate)
+                self.assertFalse(hasattr(args, '_reuse_edit_policy'))
+            frozen = build_parser().parse_args(['start', '--kind', 'reproduction', '--from-session', str(root),
+                '--reuse', 'code_project', '--goal', 'Continue from this source', '--environment', 'current'])
+            frozen._explicit_start_destinations = {'environment'}
+            with self.assertRaisesRegex(ValueError, 'not frozen execution controls'):
+                prepare_start(frozen)
+            self.assertEqual({path: path.read_bytes() for path in root.rglob('*') if path.is_file()}, before)
+            # Unregistered additions must not silently join the project offering.
+            extra = candidate / 'unregistered.py'
+            extra.write_text('UNREGISTERED = True\n', encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'inventory'):
+                app.reusable_code_project()
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertNotIn('code_project', session_materials(root, include_project=True))
+            self.assertIn('code_project unavailable', output.getvalue())
+            # A proposed command does not require execution to reuse source as
+            # material, and cannot turn absent outputs into measured results.
+            planned, rows = self._native_project_delivery(Path(directory) / 'planned', planned=True)
+            project = Path(rows[0]['data']['project_dir'])
+            self.assertEqual(planned.reusable_code_project(), (project, None, {}))
+            self.assertFalse((project / 'result.txt').exists())
+            # Absolute owner paths are a retained contract, not a relocation
+            # map. Copying the old task must not silently rewrite its receipts.
+            import shutil
+            moved = Path(directory) / 'moved'
+            shutil.copytree(planned.session.store.root, moved)
+            saved = {path: path.read_bytes() for path in moved.rglob('*') if path.is_file()}
+            with self.assertRaisesRegex(ValueError, 'task-root relocation is unsupported'):
+                ToolApplication.load(moved).implementation.reusable_project(
+                    planned.session.store.read_json('delivery.json'))
+            self.assertEqual({path: path.read_bytes() for path in moved.rglob('*') if path.is_file()}, saved)
+
+    def test_native_project_reuse_rejects_ambiguity_and_unsettled_preparation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app, _ = self._native_project_delivery(root / 'multiple', projects=2)
+            with self.assertRaisesRegex(ValueError, 'Ambiguous.*multiple native projects'):
+                app.reusable_code_project()
+            args = build_parser().parse_args(['start', '--from-session', str(app.session.store.root),
+                '--reuse', 'code_project', '--goal', 'Continue one project', '--prepare-only'])
+            with patch('sys.stdin.isatty', return_value=False), self.assertRaisesRegex(ValueError, 'Ambiguous'):
+                prepare_start(args)
+            # A newer, unrelated preparation is not a reason to switch projects.
+            selected, rows = self._native_project_delivery(root / 'selected', projects=2, deliver_count=1)
+            self.assertEqual(selected.reusable_code_project(), (Path(rows[0]['data']['project_dir']), None, {}))
+            app, prepared = self._native_project_delivery(root / 'unsettled')
+            identity = app.workspace.resolve(prepared[0]['data']['prepared_result']).parent.parent.name
+            app.ledger.reserve('unsettled-source', {'llm_requests': 1}, attempt_id=identity)
+            app.ledger.mark_unknown('unsettled-source', reason='Retain unknown usage')
+            ledger = app.ledger.to_dict()
+            with self.assertRaisesRegex(ValueError, 'unsettled'):
+                app.reusable_code_project()
+            self.assertEqual(app.ledger.to_dict(), ledger)
+
+    def test_native_project_reuse_accepts_snapshot_without_recertifying_old_execution(self):
+        from simple_ar.core.capabilities import ArtifactStore
+        from simple_ar.tools.implementation_work import _execution
+        from simple_ar.cli.start import native_creation_options
+        with tempfile.TemporaryDirectory() as directory:
+            external = Path(directory) / 'external-notes.txt'
+            external.write_text('Original source conditions', encoding='utf-8')
+            app, prepared = self._native_project_delivery(Path(directory) / 'executed', execute=True,
+                                                         external_input=external)
+            candidate = Path(prepared[0]['data']['project_dir'])
+            self.assertEqual(app.reusable_code_project(), (candidate, None, {}))
+            self.assertIsNone(app.reusable_execution())  # Never an inherited exact measurement protocol.
+            (candidate / 'result.txt').write_text('changed output', encoding='utf-8')
+            self.assertIsNone(app.reusable_code_project())  # Terminal delivery bytes changed.
+            (candidate / 'result.txt').write_text('computed', encoding='utf-8')
+            self.assertEqual(app.reusable_code_project(), (candidate, None, {}))
+            execution = next(row for row in reversed(app.session.list_attempts())
+                if ArtifactStore(app.session.store.root / 'attempts' / row.attempt_id).exists('candidate_execution.json'))
+            store = ArtifactStore(app.session.store.root / 'attempts' / execution.attempt_id)
+            locator = f'records/{execution.attempt_id}/candidate_execution.json'
+            observed = store.read_json('native_result.json')
+            ledger = app.ledger.to_dict()
+            before = {path: path.read_bytes() for path in app.session.store.root.rglob('*') if path.is_file()}
+            external.write_text('Revised external conditions', encoding='utf-8')
+            self.assertEqual(app.reusable_code_project(), (candidate, None, {}))
+            with self.assertRaisesRegex(ValueError, 'inputs changed'):
+                _execution(app.implementation, locator, successful=True)
+            self.assertTrue(app.implementation.delivery_issues([observed]))
+            external.unlink()
+            self.assertEqual(app.reusable_code_project(), (candidate, None, {}))
+            with self.assertRaises((OSError, ValueError)):
+                _execution(app.implementation, locator, successful=True)
+            args = build_parser().parse_args(['start', '--from-session', str(app.session.store.root),
+                '--reuse', 'code_project', '--goal', 'Revise this retained source', '--prepare-only'])
+            with patch('sys.stdin.isatty', return_value=False), patch('simple_ar.cli.main._run_native_start'):
+                prepare_start(args)
+            options = native_creation_options(args)
+            self.assertIsNone(options['execution_contract'])
+            self.assertIsNone(options['code_task'])
+            self.assertIsNone(options['project_python'])
+            self.assertFalse(options['allow_execution'])
+            self.assertFalse(options['allow_network'])
+            self.assertEqual(options['max_turns'], 30)
+            self.assertEqual(options['max_tokens'], 600000)
+            self.assertEqual(app.ledger.to_dict(), ledger)
+            self.assertEqual({path: path.read_bytes() for path in app.session.store.root.rglob('*') if path.is_file()}, before)
+
+    def test_goal_material_aliases_share_creation_and_feedback_mounts(self):
+        from simple_ar.cli.main import main
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            project = root / 'project'
+            project.mkdir()
+            note = root / 'observations.md'
+            note.write_text('Existing observations', encoding='utf-8')
+            data = root / 'samples.csv'
+            data.write_text('x,y\n1,2\n', encoding='utf-8')
+            for inputs, expected in (
+                    ([], []),
+                    (['--project', str(project)], [project]),
+                    (['--material', str(note), '--data-file', str(data)], [note, data]),
+                    (['--document', str(root)], [root])):
+                for resume in (False, True):
+                    goal = 'Use available results, implement what is needed, and explain limitations'
+                    argv = ['start', goal, *inputs, '--prepare-only']
+                    if resume:
+                        argv += ['--resume-task', str(root / 'saved')]
+                    with self.subTest(inputs=inputs, resume=resume), \
+                            patch('sys.stdin.isatty', return_value=False), \
+                            patch('simple_ar.cli.main._run_native_start') as run, \
+                            patch('simple_ar.cli.intake_dialogue.discuss_start', side_effect=AssertionError('duplicate intake')):
+                        main(argv)
+                    adapted = run.call_args.args[0]
+                    self.assertEqual(adapted.source, expected)
+                    self.assertIsNone(adapted.kind)
+                    self.assertEqual(adapted.request, goal)
+                    if resume:
+                        self.assertEqual(adapted.request, goal)
+                    self.assertFalse(adapted.allow_execution)
+                    self.assertFalse(adapted.allow_network)
+
+    def test_creation_declarations_keep_multiple_roles_and_overlapping_mounts(self):
+        from simple_ar.cli.start import migrate_new_start, native_creation_options
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            project = root / 'project'
+            project.mkdir()
+            note = project / 'notes.md'
+            note.write_text('Supplied notes, not verified evidence.', encoding='utf-8')
+            goal = '  Keep my words.\nSupplied material roles: this is user text.  '
+            args = build_parser().parse_args(['start', goal, '--kind', 'writing',
+                '--source', str(root), '--source', str(project),
+                '--document', str(note), '--material', str(note), '--project', str(project),
+                '--with-report', '--prepare-only'])
+            with patch('sys.stdin.isatty', return_value=False), patch('simple_ar.cli.start.print_line'):
+                self.assertTrue(migrate_new_start(args))
+            options = native_creation_options(args)
+            self.assertEqual(args.request, goal)
+            self.assertEqual(options['sources'], {'source0': root, 'source1': project, 'source2': note})
+            self.assertEqual(options['creation_declarations'], {
+                'outcome_preference': 'writing', 'with_report': True,
+                'material_roles': {'source': ['source0', 'source1'], 'document': ['source2'],
+                                   'material': ['source2'], 'project': ['source1']}})
+            self.assertFalse(options['allow_execution'])
+            self.assertFalse(options['allow_network'])
+
+    def test_prior_draft_locator_prefers_exact_source_then_shortest_valid_locator(self):
+        from simple_ar.cli.start import _creation_source_locator, migrate_new_start
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            package = root / 'package'
+            package.mkdir()
+            draft = package / 'draft.md'
+            draft.write_text('Prior prose.', encoding='utf-8')
+            self.assertEqual(_creation_source_locator(draft, [root, package, draft]), 'source2')
+            self.assertEqual(_creation_source_locator(draft, [root, package]), 'source1/draft.md')
+            with self.assertRaisesRegex(ValueError, 'existing source mount'):
+                _creation_source_locator(root / 'unmounted.md', [package, draft])
+            args = build_parser().parse_args(['start', 'Revise the supplied draft', '--kind', 'writing',
+                '--source', str(root), '--source', str(package), '--prepare-only'])
+            args._reuse_origin = {'session': str(root / 'original-session'), 'results': ['report']}
+            args._reuse_report_drafts = [str(draft)]
+            with patch('sys.stdin.isatty', return_value=False), patch('simple_ar.cli.start.print_line'):
+                self.assertTrue(migrate_new_start(args))
+            self.assertEqual(args._creation_declarations['reuse_origin'], {
+                'session': str(root / 'original-session'), 'results': ['report'],
+                'prior_drafts': ['source1/draft.md']})
+            self.assertEqual(args.source, [root, package])
+            self.assertEqual(args.request, 'Revise the supplied draft')
+
     def test_native_prepared_approval_prints_bound_command_before_confirmation(self):
         import hashlib
         from unittest.mock import MagicMock
@@ -160,6 +416,22 @@ class StartTests(unittest.TestCase):
             native_creation_options(args)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
+            from simple_ar.cli.task_options import apply_task_config, validate_resume_options
+            config = root / 'reuse.toml'
+            config.write_text('[task]\nfrom_session="saved"\nreuse=["report", "artifacts"]\n', encoding='utf-8')
+            configured = build_parser().parse_args(['start', '--task-config', str(config)])
+            configured._explicit_start_destinations = {'task_config'}
+            apply_task_config(configured)
+            self.assertEqual(configured.from_session, root / 'saved')
+            self.assertEqual(configured.reuse, ['report', 'artifacts'])
+            configured.resume_task = root / 'old-task'
+            with self.assertRaisesRegex(ValueError, 'from_session|reuse'):
+                validate_resume_options(configured)
+            config.write_text('[task]\nreuse=["report", "report"]\n', encoding='utf-8')
+            configured = build_parser().parse_args(['start', '--task-config', str(config)])
+            configured._explicit_start_destinations = {'task_config'}
+            with self.assertRaisesRegex(ValueError, 'distinct nonempty'):
+                apply_task_config(configured)
             outside = ToolApplication.create(root / 'outside', 'Outside goal', model=None, sources={})
             project = root / 'project'
             project.mkdir()
@@ -425,6 +697,21 @@ class StartTests(unittest.TestCase):
             native.assert_called_once_with(revised)
             self.assertIn('"path": "outputs/<filename>"', revised._code_task['goal'])
             self.assertIn('Explain my existing figure', revised._code_task['goal'])
+            summary = session.store.write_text('notes/summary.md', 'Existing observations to explain alongside the code.')
+            session.manifest.state_refs['summary'] = summary
+            session.save()
+            combined = build_parser().parse_args(['start', '--kind', 'code', '--from-session', str(session.store.root),
+                '--reuse', 'code_project', '--reuse', 'summary', '--goal', 'Revise code using saved observations',
+                '--prepare-only'])
+            with patch('sys.stdin.isatty', return_value=False), patch('simple_ar.cli.main._run_native_start') as native:
+                self.assertIsNone(prepare_start(combined))
+            self.assertIn(session.store.resolve(summary).resolve(), combined.source)
+            self.assertEqual(combined._code_task['allowed_patterns'], ['main.py'])
+            self.assertIn('gold/**', combined._code_task['protected_patterns'])
+            self.assertEqual(combined.request, 'Revise code using saved observations')
+            self.assertEqual(combined._creation_declarations['reuse_origin'], {
+                'session': str(session.store.root.resolve()), 'results': ['code_project', 'summary'],
+                'prior_drafts': []})
             conflict = build_parser().parse_args(['start', '--from-session', str(session.store.root), '--reuse', 'code_project', '--allow', '**'])
             with self.assertRaisesRegex(ValueError, 'do not override'):
                 reuse_session_materials(conflict)
@@ -512,7 +799,7 @@ class StartTests(unittest.TestCase):
                 selection.assert_called_once()
                 app.run.assert_not_called()
                 process.assert_not_called()
-                self.assertTrue(create.call_args.args[1].startswith(goal + "\n\n"))
+                self.assertEqual(create.call_args.args[1], goal)
                 kwargs = create.call_args.kwargs
                 bound = creation_contract.bind(*create.call_args.args, **kwargs)
                 bound.apply_defaults()
@@ -531,16 +818,18 @@ class StartTests(unittest.TestCase):
                     expected_sources.append(data.resolve())
                 self.assertEqual(list(kwargs["sources"].values()), expected_sources)
                 self.assertEqual(list(kwargs["sources"].values()).count(notes.resolve()), 1)
-                self.assertIn("document", create.call_args.args[1])
-                self.assertIn("material", create.call_args.args[1])
-                self.assertIn("outcome preference (not an access grant)", create.call_args.args[1])
+                declarations = kwargs['creation_declarations']
+                self.assertEqual(declarations['material_roles']['document'], ['source1'])
+                self.assertEqual(declarations['material_roles']['material'], ['source2'])
+                self.assertEqual(declarations['outcome_preference'], kind)
+                self.assertEqual(declarations.get('with_report', False), kind == 'data_analysis')
                 if kind in {"bug_fix", "reproduction", "code"}:
                     self.assertIn(project.resolve(), kwargs["sources"].values())
-                    self.assertIn('"project"', create.call_args.args[1])
+                    self.assertEqual(declarations['material_roles']['project'], ['source4'])
                 if kind != "code":
-                    self.assertIn("one supplied summary", create.call_args.args[1])
-                    self.assertIn("User's dataset v2", create.call_args.args[1])
-                    self.assertIn('"data_mode": "values"', create.call_args.args[1])
+                    self.assertEqual(declarations['data_meanings']['observation_unit'], 'one supplied summary')
+                    self.assertEqual(declarations['data_meanings']['data_attribution'], "User's dataset v2")
+                    self.assertEqual(declarations['data_meanings']['data_mode'], 'values')
                 self.assertFalse(list(root.rglob("code_task.toml")))
                 self.assertFalse(list(root.rglob("verify_delivery.py")))
             self.assertEqual({path: path.read_bytes() for path in originals}, originals)
@@ -566,7 +855,8 @@ class StartTests(unittest.TestCase):
                     main(["start", "--guided", "--goal", goal, "--max-turns", "7", "--prepare-only"])
                 adapted = native.call_args.args[0]
                 self.assertEqual(adapted.kind, kind)
-                self.assertTrue(adapted.request.startswith(goal + "\n\n"))
+                self.assertEqual(adapted.request, goal)
+                self.assertEqual(adapted._creation_declarations['outcome_preference'], kind)
                 self.assertFalse(adapted.allow_execution)
                 self.assertFalse(adapted.allow_network)
                 self.assertEqual(adapted.source, [notes.resolve()])
@@ -577,7 +867,7 @@ class StartTests(unittest.TestCase):
                 with patch("sys.stdin.isatty", return_value=False), \
                         patch("simple_ar.cli.main._run_native_start") as native:
                     self.assertIsNone(prepare_start(args))
-                self.assertTrue(native.call_args.args[0].request.startswith(goal + "\n\n"))
+                self.assertEqual(native.call_args.args[0].request, goal)
             # Bare start already owns the native default; preferences do not change it.
             for argv in (["start"], ["start", goal], ["start", "--goal", goal]):
                 with patch("simple_ar.cli.main._run_native_start") as native, \
@@ -585,6 +875,8 @@ class StartTests(unittest.TestCase):
                     main(argv)
                 native.assert_called_once()
                 self.assertIsNone(native.call_args.args[0].kind)
+                from simple_ar.cli.start import native_creation_options
+                self.assertEqual(native_creation_options(native.call_args.args[0])['creation_declarations'], {})
 
     def test_creation_rejects_unmapped_controls_and_unsafe_data_before_calls(self):
         from simple_ar.cli.main import main
@@ -687,8 +979,10 @@ class StartTests(unittest.TestCase):
                  patch("simple_ar.cli.main._run_native_start") as native:
                 self.assertIsNone(prepare_start(native_args))
             native.assert_called_once_with(native_args)
-            self.assertIn("Prior prose is editable material, not primary evidence", native_args.request)
-            self.assertIn(str(files[0]), native_args.request)
+            self.assertEqual(native_args.request, 'Reorganize from the existing results')
+            self.assertEqual(native_args._creation_declarations['reuse_origin'], {
+                'session': str(session.store.root.resolve()), 'results': ['report'],
+                'prior_drafts': [f'source{native_args.source.index(files[0])}']})
             self.assertIn(files[0].parent, native_args.source)
             self.assertIn(session.store.resolve(current_documents).resolve(), native_args.source)
             self.assertEqual((session.store.root / "session_manifest.json").read_bytes(), original)
@@ -708,6 +1002,7 @@ class StartTests(unittest.TestCase):
             self.assertEqual(draft['documents'][0]['metadata']['evidence_role'], 'prior_draft_not_primary_evidence')
             followup = self.prepare("--kind", "survey", "--from-session", str(session.store.root),
                 "--reuse", "report", "--goal", "Investigate a new question using relevant original sources",
+                "--sources", "search",
                 "--output-root", str(root / "followup"), "--prepare-only")
             followup_defaults = research_defaults(["research-session", "--config", str(followup)])
             self.assertEqual(followup_defaults["task_kind"], "survey")
@@ -736,17 +1031,50 @@ class StartTests(unittest.TestCase):
                 'summary': 'A short note', 'artifacts': ['workspace/note.md'],
                 'unresolved': ['Raw data unavailable']}}])
             self.assertEqual(session_materials(native.store.root), {"artifacts": [native.store.root / "workspace/note.md"]})
+            for preference in (None, 'code', 'data_analysis', 'figure', 'survey'):
+                argv = ['start', 'Use the saved observations to prepare the requested source and explanation',
+                        '--from-session', str(native.store.root), '--reuse', 'artifacts', '--prepare-only']
+                if preference:
+                    argv += ['--kind', preference]
+                with self.subTest(reuse_preference=preference), patch('sys.stdin.isatty', return_value=False), \
+                        patch('simple_ar.cli.main._run_native_start') as run:
+                    main(argv)
+                adapted = run.call_args.args[0]
+                self.assertEqual(adapted.kind, preference)
+                self.assertIn(native.store.root / 'workspace/note.md', adapted.source)
+                self.assertEqual(adapted.request,
+                    'Use the saved observations to prepare the requested source and explanation')
+                self.assertEqual(adapted._creation_declarations['reuse_origin'], {
+                    'session': str(native.store.root.resolve()), 'results': ['artifacts'], 'prior_drafts': []})
+                self.assertFalse(adapted.allow_execution)
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 main(["results", str(native.store.root)])
             self.assertIn("--resume-task", output.getvalue())
             self.assertIn("Raw data unavailable", output.getvalue())
             self.assertNotIn("--kind writing", output.getvalue())
-            native.manifest.status = "paused"
-            native.save()
-            self.assertEqual(session_materials(native.store.root), {})
+            for status in ('running', 'paused'):
+                native.manifest.status = status
+                native.save()
+                self.assertEqual(session_materials(native.store.root), {})
             native.manifest.status = "partial"
             native.save()
+            # Completion alone cannot make a pending or older request current.
+            saved_state = native.store.read_json('actions.json')
+            for change in ({'pending': {'attempt': 'unsettled'}},
+                           {'requests': [*saved_state['requests'], 'New request']}):
+                native.store.write_json('actions.json', {**saved_state, **change})
+                self.assertEqual(session_materials(native.store.root, include_project=False), {})
+            native.store.write_json('actions.json', saved_state)
+            with patch.object(ToolApplication, 'load', side_effect=AssertionError('No executable assembly')):
+                self.assertEqual(session_materials(native.store.root, include_project=False),
+                                 {'artifacts': [native.store.root / 'workspace/note.md']})
+            note = native.store.root / 'workspace/note.md'
+            original_note = note.read_bytes()
+            note.write_bytes(b'Changed delivery')
+            with self.assertRaisesRegex(ValueError, 'delivered files changed'):
+                session_materials(native.store.root, include_project=False)
+            note.write_bytes(original_note)
             for invalid in ("workspace/../session_manifest.json", "workspace/.env", "source0/note.md", "workspace/missing.md"):
                 native.store.write_json("delivery.json", {"summary": "Invalid", "artifacts": [invalid], "unresolved": []})
                 with self.assertRaises(ValueError):
@@ -1000,7 +1328,7 @@ class StartTests(unittest.TestCase):
             material.write_text("Notes", encoding="utf-8")
             invalid = root / 'invalid.json'
             invalid.write_text('{"unfinished":', encoding='utf-8')
-            for extra in (["--sources", "search"], ["--document", str(material)], ["--fulltext"],
+            for extra in (["--sources", "search"], ["--fulltext"],
                           ["--command", "python", "run.py"], ["--material", str(invalid)]):
                 with self.subTest(extra=extra), self.assertRaises(ValueError):
                     self.prepare("--kind", "writing", "--goal", "Write from material", "--material", str(material),
@@ -1063,14 +1391,16 @@ class StartTests(unittest.TestCase):
                 self.assertTrue(migrate_new_start(args))
             self.assertEqual(args._code_task["project_path"], "source1")
             self.assertEqual(args.source, [data.resolve(), project.resolve()])
-            self.assertIn('"data_path": [', args.request)
-            self.assertIn(json.dumps(str(data.resolve()), ensure_ascii=False), args.request)
+            self.assertEqual(args.request, 'Fix the rounding error')
+            self.assertEqual(args._creation_declarations, {
+                'outcome_preference': 'bug_fix',
+                'material_roles': {'project': ['source1'], 'data_path': ['source0']}})
             self.assertEqual(args._code_task["allowed_patterns"], ["src/**"])
             self.assertEqual(args._code_task["validation_command"], ["python", "tests/check.py"])
             self.assertEqual(args._code_task["timeout_sec"], 45)
             self.assertTrue(args.allow_execution)
             self.assertEqual(args.project_python, interpreter)
-            self.assertIn("implement_code_task", args.request)
+            self.assertEqual(args._code_task['goal'], args.request)
             self.assertEqual(list(project.iterdir()), [data])
             self.assertEqual(data.read_text(encoding="utf-8"), "value\n7\n")
             with patch("simple_ar.cli.main._run_native_start") as native, patch("sys.stdin.isatty", return_value=False):
@@ -1331,7 +1661,10 @@ class StartTests(unittest.TestCase):
                 self.assertIn("'total_tokens': 100", summary)
                 self.assertIn('Original cumulative usage is not cleared', summary)
                 self.assertIn('New remaining is not a total historical limit', summary)
-                main([*resources, '--yes', '--max-tokens', '9000', '--max-turns', '99'])
+                with self.assertRaisesRegex(SystemExit, 'retains saved creation settings'):
+                    main([*resources, '--yes', '--max-tokens', '9000', '--max-turns', '99'])
+                app.run.assert_not_called()
+                main([*resources, '--yes'])
             forwarded = app.run.call_args.kwargs
             self.assertEqual(forwarded['resource_allowances'],
                 {'llm_requests': 3, 'total_tokens': 500, 'process_wall_seconds': 2.5})
@@ -1353,6 +1686,12 @@ class StartTests(unittest.TestCase):
                 app.run.assert_called_once()
             app.run.reset_mock()
             for argv, message in (
+                (['start', '--resume-task', 'saved-task', '--max-turns', '30'], 'retains saved creation settings'),
+                (['start', '--resume-task', 'saved-task', '--max-tokens', '600000'], 'retains saved creation settings'),
+                (['start', '--resume-task', 'saved-task', '--max-processes', '0'], 'retains saved creation settings'),
+                (['start', '--resume-task', 'saved-task', '--max-process-seconds', '0'], 'retains saved creation settings'),
+                (['start', '--resume-task', 'saved-task', '--max-images', '0'], 'retains saved creation settings'),
+                (['start', '--resume-task', 'saved-task', '--output-root', 'elsewhere'], 'retains saved creation settings'),
                 ([*resources, '--yes', '--approve-execution', 'old-command'], 'separately'),
                 (['start', '--authorize-remaining', 'total_tokens=500'], '--resume-task'),
                 (['start', '--resume-task', 'saved-task', '--authorization-id', 'orphan'], 'require --authorize-remaining'),
@@ -1367,8 +1706,7 @@ class StartTests(unittest.TestCase):
                 with self.subTest(argv=argv), self.assertRaisesRegex(SystemExit, message):
                     main(argv)
                 app.run.assert_not_called()
-            main(['start', '--resume-task', 'saved-task', '--max-tokens', '9000', '--max-turns', '99',
-                '--approve-execution', 'old-command'])
+            main(['start', '--resume-task', 'saved-task', '--approve-execution', 'old-command'])
             self.assertIsNone(app.run.call_args.kwargs['resource_allowances'])
             self.assertEqual(app.run.call_args.kwargs['approved_execution'], 'old-command')
             self.assertFalse(app.run.call_args.kwargs['retry_model'])

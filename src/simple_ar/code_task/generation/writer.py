@@ -5,7 +5,9 @@ import copy
 import hashlib
 import json
 import mimetypes
+import os
 import re
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -57,7 +59,8 @@ _IMPLEMENTATION_BODY = (
     'For Python use the supplied task interpreter and explicit portable input/output paths. '
     'A plan is a proposal only: do not automatically run commands, install '
     'dependencies, access the network or claim independent scientific verification. The plan may be '
-    'omitted only when execution_requested is false. Do not add prerequisites, scaffolding or copied assets. '
+    'omitted only when execution_requested is false. Do not add prerequisites or scaffolding; '
+    'copy data only through an explicitly supported owner preserve mapping, never by rewriting it as content. '
     'The calling task will review and execute separately; runnable candidate is not verified success.'
 )
 IMPLEMENTATION_SYSTEM = (_IMPLEMENTATION_HEADER
@@ -89,18 +92,36 @@ def write_implementation_unit(
     execution_observations: list[dict[str, Any]] | None = None,
     retry_attempts: int = 2,
     validate_destination: Callable[[str], Any] | None = None,
+    investigation: Any = None,
+    preserved_files: dict | None = None,
+    preserve_workspace: Any = None,
+    candidate_admission: bool = False,
+    dependency_advice: dict[str, Any] | None = None,
+    command_source_binding: dict | None = None,
 ) -> dict[str, Any]:
     """Generate related files as one scoped unit, without legacy stage planning.
 
     This prepares a new candidate only. Source selection and authority belong to
     the caller; execution, independent verification and delivery remain outside.
     No compulsory main.py, metric schema or fallback scaffold. One complete
-    response-contract rejection may be corrected within the same allowance;
-    transport, unknown-use and syntax failures are not replayed by this owner.
+    response-contract rejection may be corrected within the same allowance on
+    the historical non-investigation path;
+    Transport and unknown-use failures are not replayed. Only the marked
+    investigation path can diagnose read, contract and syntax defects within its decision ceiling.
     execution_requested requires a validated plan before candidate publication,
     without authorizing execution.
     """
-    original_files = original_files or {}
+    original_files = original_files if original_files is not None else {}
+    dependency_observation = None
+    if candidate_admission:
+        from simple_ar.code_task.generation.dependencies import build_dependency_advice, dependency_observation_view
+
+        advice = dependency_advice if dependency_advice is not None else build_dependency_advice(
+            goal, python_executable=task_python or None)
+        if os.path.abspath(advice.get('target_python_executable', '')) != os.path.abspath(task_python or sys.executable):
+            raise ValueError('Dependency observation belongs to a different task interpreter')
+        dependency_observation = dependency_observation_view(advice)
+        write_json(artifact_dir / 'dependency_observation.json', advice)
     planned = [safe_relative_path(row['path']) for row in files] if files is not None else None
     if (not goal.strip() or (planned is not None and (not planned or len(planned) > 12
             or any(not p for p in planned) or len(set(planned)) != len(planned)))
@@ -108,10 +129,67 @@ def write_implementation_unit(
         raise ValueError('Implementation requires distinct safe relative output paths')
     system = ((FEEDBACK_IMPLEMENTATION_SYSTEM if original_files else DIRECT_IMPLEMENTATION_SYSTEM)
         if planned is None else IMPLEMENTATION_SYSTEM)
+    if investigation is not None:
+        system = (_IMPLEMENTATION_HEADER +
+            'You own investigation and implementation in the same decision flow. '
+            'Use actual inventories, supplied windows and original_files. Either return '
+            '{read_windows: [FileWindow objects]} alone to acquire necessary authorized text, '
+            'or return the candidate immediately with summary, unresolved, files and execution_plan. '
+            'There is no material-selection or file-selection finalization step. At most six decisions '
+            'share this task budget. Completed read or candidate contract/admission failures become '
+            'actual diagnostics for a later decision within those same six calls, not another retry allowance. '
+            'FileWindow uses path, offset_bytes, max_bytes (1-64000), optional start_line/max_lines; '
+            'continue at next_offset_bytes for unread tails. Windows do not establish full coverage; '
+            'never infer unseen contents from inventory. For every existing_project_paths entry use '
+            'exact replacements, never content; the owner checks complete current originals. Optional '
+            'preserve_files accepts existing project-relative UTF-8 dependency paths, or '
+            '{source: exact authorized inventory locator, path: candidate-relative destination} mappings '
+            '(a dictionary of source locator to destination is equivalent) '
+            'for byte-for-byte copies of individual files up to 256000 bytes. Do not retransmit their '
+            'contents or supply hashes. Copied data is immutable, not editable original_files; '
+            'retained preserve mappings survive feedback automatically and cannot be overwritten. '
+            + ('The owner retains all admitted project members independently of the edit set. '
+                'Choose at most 12 editable source files and additional bounded preserve mappings. '
+                if investigation.registered_project is not None else
+                'Include required untouched imports/configuration; no recursive environment, dataset or '
+                'runtime-output copying. Unmentioned original_files remain unchanged. Choose at most 12 '
+                'total source files including preserved dependencies. ')
+            + 'Explicit requested_files remain '
+            'required candidate paths. Never combine read_windows and candidate fields. ' + _IMPLEMENTATION_BODY)
+        if investigation.working_set:
+            system += (' The professional_working_set.v1 contract separates active presentation from '
+                'the immutable actual-read ledger. To make room for fresh investigation, return '
+                '{focus_observations: [exact active observation_ref strings], read_windows: [FileWindow objects]} '
+                'or {focus_observations: [exact active observation_ref strings]} alone. This keeps whole '
+                'named active observations and required current-request windows, retiring the other active '
+                'bodies only from presentation. An empty focus list keeps required windows only. '
+                'Never provide hashes, roles, edited text or invented refs as focus authority. '
+                'Retired reads remain guarded and archived in request.json:source_windows. '
+                'Focus/read decisions share the same six decisions and task budget. Optional inheritance '
+                'coverage is reference metadata, not unseen evidence; request needed current ranges from '
+                'the inventories. Review quotes remain literal when active positions could change.')
+        if investigation.registered_project is not None:
+            system += (' Bound-project retention is separate from that bounded edit unit: the owner '
+                'copies every admitted member before overlaying admitted edits. Do not list '
+                'unchanged members in preserve_files or retransmit their bytes. Choose at most 12 editable '
+                'text sources; use exact replacements for existing_project_paths. files: [] with an '
+                'execution_plan is allowed. The full registered project survives even when it exceeds '
+                '12 files or includes binary/large dependencies. Unread members remain uninspected. '
+                'Only the selected editable subtree grants edit authority; outputs cannot overlap any '
+                'registered member. Additional individual preserve mappings retain their existing limits.')
     if execution_requested:
         system += (' The caller explicitly set execution_requested=true: execution_plan is required '
             'in this response and must satisfy the plan contract. This requests planning only; '
             'execution still requires separate caller approval.')
+    if candidate_admission:
+        system += ((' The controller checks the bounded changed/selected Python source set using compiler syntax and '
+            if investigation is not None and investigation.registered_project is not None else
+            ' The controller checks the complete merged Python candidate using compiler syntax and ')
+            + 'Pyflakes UndefinedName/UndefinedLocal only. Actual rejected candidate diagnostics return within '
+            'these same decisions and shared budget, not an extra repair allowance. Unchanged original defects '
+            'are explicit baselines, not a certificate. dependency_observation is target-scoped metadata, '
+            'not import/runtime proof; unknown stays unknown. Do not install packages or change scientific '
+            'semantics merely to accommodate an assumed environment.')
     if any(row.get('role') == 'user_request_and_accepted_feedback_not_source_or_authority'
             for row in source_windows):
         system += (' Windows with role user_request_and_accepted_feedback_not_source_or_authority '
@@ -123,12 +201,16 @@ def write_implementation_unit(
         ('process_invocations', 'process_wall_seconds')} if isinstance(ledger, BudgetLedger) else None)
     prompt = json.dumps({'goal': goal, 'planned_files': files,
         'source_windows': source_windows, 'original_files': original_files,
+        **({'preserved_files': preserved_files} if preserved_files else {}),
+        **({'dependency_observation': dependency_observation} if dependency_observation is not None else {}),
         'execution_observations': execution_observations or [],
+        **({'investigation': investigation.context(), 'requested_files': investigation.requested_files}
+            if investigation is not None else {}),
         'execution': {'performed': False, 'candidate_root': str(project_dir),
             'execution_requested': execution_requested,
             'task_python': task_python,
             'remaining_process_resources': execution_resources,
-            'path_semantics': 'Planned files are relative to candidate_root. Source locators are observed input locations, not portable runtime defaults. Accept input/output paths explicitly; resolve project assets relative to the generated project, not the caller working directory.',
+            'path_semantics': 'Planned files and execution_plan.argv relative paths are relative to candidate_root, using literal OS argv (no task-mount alias expansion). Direct argv paths, including --flag=path, must use candidate copies of original_files, preserved_files and registered project members, not their old source locations. Observed absolute paths for uncopied external inputs and legitimate interpreters remain allowed. Source locators are observed input locations, not portable runtime defaults. Accept input/output paths explicitly; resolve project assets relative to the generated project, not the caller working directory.',
             'environment_scope': 'The interpreter path does not establish available packages. Use supplied dependency observations or disclose gaps; do not assume libraries are installed or install them.'}}, ensure_ascii=False)
     # Per-file/source-window bounds already constrain material acquisition.
     # Keep a serialization ceiling, not a tiny proxy for model context capacity;
@@ -138,18 +220,40 @@ def write_implementation_unit(
     contents, response, _ = _generate_implementation_contents(
         client=client, system=system, prompt=prompt, planned=planned,
         original_files=original_files, artifact_dir=artifact_dir, retry_attempts=retry_attempts,
-        validate_destination=validate_destination, execution_requested=execution_requested)
+        validate_destination=validate_destination, execution_requested=execution_requested,
+        investigation=investigation, preserved_files=preserved_files,
+        candidate_admission=candidate_admission, preserve_workspace=preserve_workspace,
+        command_source_binding=command_source_binding, candidate_root=project_dir)
     unresolved = response.get('unresolved', [])
     execution_plan = (ImplementationRunPlan.model_validate(response['execution_plan']).model_dump()
         if 'execution_plan' in response else None)
     generated = []
     with generation_candidate(project_dir) as candidate:
+        registered = investigation.registered_files if investigation is not None else {}
+        if registered:
+            investigation.validate()
+            investigation.workspace.copy_registered_project(investigation.project, candidate, registered)
+            generated.extend({'path': path, 'sha256': digest} for path, digest in registered.items()
+                if path not in contents)
         for path, content in contents.items():
             target = candidate / path
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(content.encode('utf-8'))
             generated.append({'path': path, 'sha256': hashlib.sha256(content.encode()).hexdigest(),
                 'line_count': len(content.splitlines())})
+        copies = investigation.preserved_files if investigation is not None else preserved_files
+        if copies:
+            from simple_ar.code_task.generation.selection import publish_preserved_files
+
+            generated.extend(publish_preserved_files(
+                investigation.workspace if investigation is not None else preserve_workspace,
+                copies, candidate, validate_destination))
+        if investigation is not None:
+            investigation.validate()
+        if registered:
+            expected = {str(candidate / row['path']): row['sha256'] for row in generated}
+            if investigation.workspace.bind_inventory(candidate, identity='implementation-publication')['file_hashes'] != expected:
+                raise ValueError('Merged registered project inventory differs from admitted publication')
     result = {'project_dir': str(project_dir), 'files': generated,
         'summary': str(response.get('summary', '')), 'unresolved': unresolved,
         'verification': ('Changed/new Python syntax checked only; retained originals preserved; '
@@ -157,6 +261,19 @@ def write_implementation_unit(
             'Python syntax checked only; no imports, commands or scientific validation.')}
     if execution_plan is not None:
         result['execution_plan'] = execution_plan
+    if candidate_admission:
+        raw = (artifact_dir / 'candidate_validation.json').read_bytes()
+        admission = json.loads(raw)
+        result['candidate_admission'] = {'contract': admission['contract'], 'status': admission['status'],
+            'report': str(artifact_dir / 'candidate_validation.json'), 'sha256': hashlib.sha256(raw).hexdigest(),
+            'candidate_sha256': admission['candidate_sha256']}
+        result['verification'] = ('Merged Python compiler syntax and Pyflakes UndefinedName/UndefinedLocal '
+            'checked; byte-identical original defects are reported baselines. No imports, execution, '
+            'dependency installation or scientific validation.')
+    if registered:
+        result['verification'] = ('Bounded selected/changed text sources checked under the requested admission '
+            'contract; remaining registered project members retained by byte identity and left uninspected. '
+            'No imports, execution, dependency installation or scientific validation.')
     return result
 
 
@@ -177,13 +294,16 @@ def _decode_implementation_response(
     artifact_dir: Path | None, attempt: int,
     validate_destination: Callable[[str], Any] | None = None,
     execution_requested: bool = False,
+    preserved_files: dict | None = None,
+    candidate_admission: bool = False,
+    registered_paths: list[str] | None = None,
 ) -> tuple[dict[str, str], dict[str, str]]:
     modes: dict[str, str] = {}
     rows = response.get('files')
     if (not isinstance(rows, list) or (len(rows) != len(planned) if planned is not None
-            else legacy or not (0 if original_files else 1) <= len(rows) <= 12)):
+            else legacy or not (0 if original_files or preserved_files or registered_paths else 1) <= len(rows) <= 12)):
         raise ValueError('Generated file set does not match the requested unit; retained proposal was not published')
-    if planned is None and original_files and not rows and 'execution_plan' not in response:
+    if planned is None and (original_files or preserved_files or registered_paths) and not rows and 'execution_plan' not in response:
         raise ValueError('Plan-only feedback requires an execution_plan')
     contents = {}
     for row in rows:
@@ -224,7 +344,7 @@ def _decode_implementation_response(
                     validation=validation, content=content, summary=str(response.get('summary', '')))
                 raise ValueError(_file_validation_feedback(validation))
             modes[path] = 'llm_repaired' if content != candidate else 'llm'
-        elif not retained_original and Path(path).suffix == '.py':
+        elif not candidate_admission and not retained_original and Path(path).suffix == '.py':
             ast.parse(content, filename=path)
         contents[path] = content
     if planned is None and not legacy:
@@ -246,9 +366,14 @@ def _decode_implementation_response(
         raise ValueError('Unresolved gaps must be a list of strings')
     if not legacy and execution_requested and 'execution_plan' not in response:
         raise ValueError('execution_requested requires a validated execution_plan')
+    if preserved_files:
+        ImplementationRunPlan.validate_outputs(list(preserved_files))
+        ImplementationRunPlan._check_conflicts(list(preserved_files), list(contents))
+        if len(contents) + len(preserved_files) > 12:
+            raise ValueError('Candidate including preserved dependencies exceeds 12 files')
     if not legacy and 'execution_plan' in response:
         plan = ImplementationRunPlan.model_validate(response['execution_plan'])
-        plan.validate_planned_paths(list(contents))
+        plan.validate_planned_paths([*contents, *(preserved_files or {}), *(registered_paths or [])])
 
     return contents, modes
 
@@ -262,33 +387,122 @@ def _generate_implementation_contents(
     message_callback: Callable[[str], None] | None = None,
     validate_destination: Callable[[str], Any] | None = None,
     execution_requested: bool = False,
+    investigation: Any = None,
+    preserved_files: dict | None = None,
+    candidate_admission: bool = False,
+    preserve_workspace: Any = None,
+    command_source_binding: dict | None = None,
+    candidate_root: Path | None = None,
 ) -> tuple[dict[str, str], dict[str, Any], dict[str, str]]:
-    """Bound completed format corrections; provider retries belong to LLMClient."""
+    """Professional diagnostics share six decisions; historical correction limits stay local."""
     feedback = ''
     response: dict[str, Any] = {}
     if not legacy:
         retry_attempts = min(retry_attempts, 2)
-    for attempt in range(1, retry_attempts + 1):
+    decisions = 6 if investigation is not None else retry_attempts
+    validation_observations = []
+    from simple_ar.code_task.generation.validation import CandidateAdmissionError, check_candidate_sources
+    for attempt in range(1, decisions + 1):
         response = {}
         response_received = False
+        candidate_originals = original_files or {}
+        candidate_preserved = preserved_files
         accounting_before = response_accounting_snapshot(client)
         try:
+            if investigation is not None:
+                context = json.loads(prompt)
+                context.update(source_windows=investigation.windows, original_files=investigation.originals,
+                    investigation=investigation.context())
+                ledger = getattr(client, '_budget_ledger', None)
+                remaining = ledger.remaining('llm_requests') if isinstance(ledger, BudgetLedger) else None
+                available = decisions - attempt + 1
+                context['investigation']['decisions_remaining'] = min(available, int(remaining)) if remaining is not None else available
+                context['validation_observations'] = validation_observations
+                prompt = json.dumps(context, ensure_ascii=False)
+                if len(prompt.encode('utf-8')) > 4 * 1024 * 1024:
+                    raise ValueError('Implementation decision context exceeds 4 MiB')
+                write_json(artifact_dir / 'decision-steps' / str(attempt) / 'input.json', context)
             response = run_json_agent_step(client=client, system=system,
                 prompt=prompt + ('\nValidation feedback: ' + feedback if feedback else ''),
                 label=label, stage=label if legacy else 'implementation', attempt_index=attempt, retry_attempts=1,
                 max_output_tokens=max_output_tokens, artifact_dir=artifact_dir,
                 feedback=[feedback] if feedback else [], message_callback=message_callback)
             response_received = True
+            if investigation is not None:
+                write_json(artifact_dir / 'decision-steps' / str(attempt) / 'response.json', response)
+                if not response_accounting_known(client, accounting_before):
+                    raise LLMError('Professional response has unknown or reserved physical usage; no continuation or replay')
             if artifact_dir is not None:
                 write_json(artifact_dir / 'proposal.json', response)
                 write_agent_step_artifact(artifact_dir, stage=label if legacy else 'implementation',
                     attempt_index=attempt, value={'response': response})
             if legacy and _response_self_reports_defect(response):
                 raise ValueError('The response reports unresolved defects; return corrected runnable files.')
+            if investigation is not None:
+                if 'read_windows' in response or (investigation.working_set and 'focus_observations' in response):
+                    allowed = {'read_windows', 'focus_observations'} if investigation.working_set else {'read_windows'}
+                    if not set(response) <= allowed:
+                        raise ValueError('Read necessary windows OR return the candidate, not both')
+                    if 'focus_observations' in response:
+                        investigation.focus(response['focus_observations'])
+                    if 'read_windows' in response:
+                        investigation.read(response['read_windows'])
+                    write_json(artifact_dir / 'decision-steps' / str(attempt) / 'observations.json', investigation.observations)
+                    feedback = ''
+                    continue
+                candidate_originals, candidate_preserved = investigation.bind_response(response, commit=False)
+                required = {row['path'] for row in json.loads(prompt).get('requested_files') or []}
+                returned = {row.get('path') for row in response.get('files', []) if isinstance(row, dict)}
+                if required - (returned | set(candidate_originals)):
+                    raise ValueError('Candidate omits explicit requested files')
+            elif not legacy and response.get('preserve_files'):
+                raise ValueError('New preserve selections require the authorized investigation owner')
             contents, modes = _decode_implementation_response(response, planned=planned,
-                original_files=original_files or {}, legacy=legacy,
+                original_files=candidate_originals, legacy=legacy,
                 artifact_dir=artifact_dir, attempt=attempt, validate_destination=validate_destination,
-                execution_requested=execution_requested)
+                execution_requested=execution_requested,
+                preserved_files=candidate_preserved,
+                candidate_admission=candidate_admission,
+                registered_paths=list(investigation.registered_files) if investigation is not None else None)
+            if not legacy and command_source_binding is not None and 'execution_plan' in response:
+                if candidate_root is None:
+                    raise ValueError('Command identity validation requires the candidate root')
+                ImplementationRunPlan.model_validate(response['execution_plan']).validate_command_identity(
+                    candidate_root=candidate_root,
+                    source_binding={**command_source_binding, 'original_files': candidate_originals,
+                        'preserved_files': candidate_preserved or {}},
+                    candidate_paths=[*contents, *(candidate_preserved or {}),
+                        *(investigation.registered_files if investigation is not None else {})])
+            if candidate_admission:
+                from simple_ar.code_task.generation.selection import preserved_file_bytes
+
+                copies = candidate_preserved or {}
+                hashes = {path: hashlib.sha256(text.encode('utf-8')).hexdigest() for path, text in contents.items()}
+                hashes.update({path: row['sha256'] for path, row in copies.items()})
+                registered = investigation.registered_files if investigation is not None else {}
+                hashes = {**registered, **hashes}
+                sources = dict(contents)
+                originals = {path: row['text'] for path, row in candidate_originals.items()}
+                for path, binding in copies.items():
+                    if Path(path).suffix.lower() == '.py':
+                        sources[path] = preserved_file_bytes(
+                            investigation.workspace if investigation is not None else preserve_workspace, binding)
+                        originals[path] = sources[path]
+                report = check_candidate_sources(sources, originals=originals, file_hashes=hashes)
+                if registered:
+                    report['retained_uninspected_paths'] = sorted(set(registered) - set(sources))
+                    report['scope'] += (' Registered project members outside the bounded source set '
+                        'are retained by byte identity, not syntax/name inspected.')
+                write_json(artifact_dir / 'candidate_validation.json', report)
+                if investigation is not None:
+                    write_json(artifact_dir / 'decision-steps' / str(attempt) / 'validation.json', report)
+                if report['status'] != 'accepted':
+                    raise CandidateAdmissionError(report)
+            if investigation is not None:
+                if investigation.registered_project is not None:
+                    investigation.originals.clear()
+                investigation.originals.update(candidate_originals)
+                investigation.preserved_files = candidate_preserved
             return contents, response, modes
         except (LLMResponseError, ValueError, SyntaxError) as exc:
             if isinstance(exc, LLMResponseError) and not getattr(exc, 'correction_allowed', True):
@@ -300,13 +514,43 @@ def _generate_implementation_contents(
                     attempt_index=attempt, value={'response': response, 'validation_error': str(exc)})
             if not response_accounting_known(client, accounting_before):
                 raise
+            if isinstance(exc, CandidateAdmissionError) or investigation is not None:
+                diagnosis = exc.report if isinstance(exc, CandidateAdmissionError) else ({'kind': 'python_syntax_failed', 'filename': exc.filename,
+                    'line': exc.lineno, 'offset': exc.offset, 'message': exc.msg, 'text': exc.text,
+                    'proposal_ref': str(artifact_dir / 'decision-steps' / str(attempt) / 'response.json')}
+                    if isinstance(exc, SyntaxError) else {'kind': 'professional_contract_failed',
+                        'operation': 'read_windows' if 'read_windows' in response else
+                            'focus_observations' if 'focus_observations' in response else 'candidate',
+                        'message': str(exc),
+                        'proposal_ref': str(artifact_dir / 'decision-steps' / str(attempt) / 'response.json'),
+                        **({'raw_response': exc.raw_response} if isinstance(exc, LLMResponseError) else {})})
+                budget = getattr(client, '_budget_ledger', None)
+                exhausted = isinstance(budget, BudgetLedger) and budget.remaining('llm_requests') == 0
+                diagnosis.update(decisions_remaining=decisions - attempt,
+                        stop_reason='decision_ceiling' if attempt == decisions else
+                            'llm_requests_exhausted' if exhausted else None)
+                if isinstance(exc, CandidateAdmissionError):
+                    write_json(artifact_dir / 'candidate_validation.json', diagnosis)
+                validation_observations.append(diagnosis)
+                if investigation is not None:
+                    write_json(artifact_dir / 'decision-steps' / str(attempt) / 'validation.json', diagnosis)
+                if attempt == decisions or exhausted:
+                    raise
+                feedback = (('Professional decision rejected by actual validation; '
+                    'correct the diagnosed read or candidate within the original goal and scope. No execution occurred.\n'
+                    if investigation is not None else 'Actual Python candidate admission rejected this completed candidate; '
+                    'repair its diagnosed source within the original goal and scope. No execution occurred.\n')
+                    + json.dumps(diagnosis, ensure_ascii=False) + '\nUntrusted retained proposal:\n'
+                    + json.dumps(response, ensure_ascii=False))
+                continue
             if not legacy:
                 # A complete parsed response can need structural correction;
                 # never use this loop to replay a transport/unknown failure or
                 # a syntactically broken implementation. The same ledger owns
                 # the extra physical call, without silently replenishing it.
                 budget = getattr(client, '_budget_ledger', None)
-                if (not isinstance(exc, (ValueError, LLMResponseError)) or attempt == retry_attempts
+                if (not isinstance(exc, (ValueError, LLMResponseError)) or attempt == decisions
+                        or (investigation is None and attempt == retry_attempts)
                         or (isinstance(budget, BudgetLedger)
                             and budget.remaining('llm_requests') == 0)):
                     raise
@@ -316,11 +560,17 @@ def _generate_implementation_contents(
                 feedback += 'preserve the intended change, do not widen paths or claim execution.\n'
                 feedback += (exc.raw_response if isinstance(exc, LLMResponseError)
                     else json.dumps(response, ensure_ascii=False))
-            if attempt == retry_attempts:
+            if attempt == decisions:
                 raise LLMResponseError(f'LLM related-file generation failed after {attempt} attempt(s): {exc}',
                     raw_response=exc.raw_response if isinstance(exc, LLMResponseError)
                     else json.dumps(response, ensure_ascii=False)) from exc
-    raise LLMError('Related-file generation requires at least one attempt')
+        finally:
+            if investigation is not None and command_source_binding is not None:
+                # Persist even partial/capacity-refused reads and failed
+                # decisions. Focus must never erase approval/recovery guards.
+                from simple_ar.core.capabilities import ArtifactStore
+                investigation.retain_binding(command_source_binding, ArtifactStore(artifact_dir))
+    raise LLMError('Implementation decision limit reached without a candidate; retained work is not replayed')
 
 
 def write_generated_project(

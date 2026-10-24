@@ -55,8 +55,18 @@ def _experiment_delivery_view(context: ReportContext, config: ReportRuntimeConfi
             for row in _append_verified_experiment_evidence((), context, config)]
 
 
-def report_edit_scope(section_ids: Sequence[str]) -> dict[str, Any]:
+def report_edit_scope(section_ids: Sequence[str], *, author_owns_body: bool = False) -> dict[str, Any]:
     """Describe the actual existing Writer/assembly boundary, not new powers."""
+    if author_owns_body:
+        return {
+            "eligible_section_ids": list(section_ids),
+            "writer_call_unit": "The complete author-owned article body",
+            "author_owned_components": ["body prose and headings", "body tables, image links and captions"],
+            "read_only_components": ["frozen document title and plan",
+                "registered source data, measurements and execution records", "actual image bytes",
+                "generated references and citation numbering", "explicitly declared assembly-owned blocks"],
+            "unavailable_remedy": "Source, asset or assembly/input defects stay unresolved for their owner. Body edits cannot change protected inputs; do not demand that remedy as this candidate's acceptance condition.",
+        }
     return {
         "eligible_section_ids": list(section_ids),
         "writer_call_unit": "One selected section's model-authored body, display heading and supported metadata only",

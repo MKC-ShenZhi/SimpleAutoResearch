@@ -1,18 +1,89 @@
 # Changelog
 
-[中文版本](CHANGELOG_zh.md)
+[中文版本](CHANGELOG_zh.md) · [Entry guidelines](docs/CHANGELOG_GUIDE.md)
 
-User-visible changes, newest first. Entries describe behavior on their date; later entries may change or retire it. See [usage](docs/USAGE.md), [CLI](docs/CLI_REFERENCE.md), and [configuration](docs/CONFIG_REFERENCE.md) for current instructions.
+User-visible changes, newest first, dated when confirmed. Multi-day development may be summarized together rather than assigned invented completion dates. Development-branch work is distinguished from main; engineering checks do not establish task success. See [usage](docs/USAGE.md) for current instructions.
 
-## Unreleased — V2.10
+## 2026-10-24 — V2.10 development (unreleased)
 
-- **Runnable examples:** publish saved-result analysis and a robotics survey with original report/figure sources, offline rebuild instructions, file hashes and explicit development costs/human involvement.
-- **Continue existing work:** new tasks retain native assistant/tool conversation, including actual read text, with bounded whole-turn eviction and an archive index. Professional evidence reuse still checks source versions. Explicit adoption independently checks an existing article without regenerating it or inventing a model-response receipt. Feedback preserves completed producers, historical context contracts and the original ledger.
-- **Execution and recovery:** new tasks require an explicit delivery or question in their last affordable decision. Saved tasks retain their original policy. Validate runnable plans before publication, retain unknown charges, and allow approved local work within remaining process resources after model capacity is exhausted.
-- **Writing and publishing:** new material reports delegate investigation and caption authorship to the writing owner using the original request and roots. Professional investigation receives relevant original feedback before selecting materials; frozen review controls are not offered as overridable tool options. Whole-article feedback uses version-bound replacements and can adopt unchanged candidates. Publication checks the actual composition owner and declared process dependencies, rejecting stale generated assets without replaying commands. Candidate delivery cannot bypass adopted text, figure and reference identities; pure format conversion preserves the body. Version consistency and compilation do not certify scientific quality or venue compliance.
-- **Configuration and tools:** new tasks discover professional capabilities through a short directory and load only the needed full contracts. Named connection timeouts, annotated task TOML and saved tool modes remain supported, without a second runtime or implicit budget expansion.
-- **Experimental local UI:** inspect saved tasks, permissions, model recipients, activity and feedback from a loopback-only client. Unavailable specialist connections no longer break initialization; prepared-command approval displays bound argv, directory and timeout in CLI/UI. Not a multi-user service.
-- **Documentation:** bilingual quick starts now use the organization repository and distinguish offline replay, new paid tasks and remaining limitations. No license change or formal Release.
+### Added
+
+- Explicit local Skill and read-only/plan Python tool packages in task TOML, using the common tool registry, permissions, history and interruption recovery. See [setup and trust boundaries](docs/LOCAL_EXTENSIONS.md).
+- Native task TOML accepts `from_session` and named `reuse` groups, sharing CLI/UI material admission without inheriting old execution, permissions or budgets.
+
+### Improved
+
+- Continue inspection of retained drafts, revise by paragraph, and distinguish body figures from separate attachments while preserving originals, failures, usage and historical recovery rules.
+- Keep goals separate from material roles and data meanings through shared CLI/UI declarations. Project edits preserve layout and immutable dependencies; code-only delivery does not require a report.
+- Repairs retain required original materials and distinguish authoring context from delivered execution. Earlier failures remain recorded without blocking a separately verified replacement; unsupported numerical allegations remain unresolved, not proven errors or evidence of improved efficiency.
+- The experimental UI shares configuration preview, material authorization and stop/resume behavior. Complete research interaction remains under acceptance.
+- Multiple attachments from one execution share a complete version check within each inspection, avoiding repeated traversal; new inspections still reject changed inputs and outputs.
+
+### Fixed
+
+- Preserve unedited members when first admitting ordinary or copied projects. Preparation, approval and execution share the same bounded snapshot; direct process-input limits are unchanged. Correct candidate paths and material versions so failed-run leftovers do not invalidate valid source or pair new source with old execution.
+- Isolate nested extension calls so distinct searches cannot reuse one another's receipts, and extension payload fields do not acquire built-in writing/execution semantics. Historical identities and records retain their original contract.
+- Explicitly recover handoff failures after execution results or complete revisions have been saved, without repeating execution or silently reverting a draft. Viewing retained delivery and resuming execution have separate prerequisites.
+- Allocate figure and caption space together using the actual template, preventing captions from crossing the page boundary; captions too large to fit fail explicitly. Narrow tables wrap technical compounds without changing scientific content.
+
+### Status
+
+- This batch completed full server regression, real PDF compilation/relocation and read-only historical compatibility checks. Earlier report feedback and two-template results retain their own versions and limits. See [evidence](docs/EVALUATION.md#v210-development-evidence) for scope, cost and human involvement; these do not establish general success rates or lower cost.
+- Checked incremental improvements may be integrated into main while V2.10 development continues on its original branch. Full persistent-project coverage, coordination efficiency and overall slimming remain incomplete.
+
+## 2026-10-23 — V2.10 development (unreleased)
+
+This section records development and acceptance limits as of October 23, not a release. Later checks are recorded under October 24.
+
+### Added
+
+- Professional work orders delegate investigation, code or writing from a goal, material roots and delivery requirements, reducing coordinator-side file preparation.
+- Complete producer units carry analysis source, data and outputs into writing and delivery through actual production records. Ordinary-entry integration remains under verification.
+
+### Improved
+
+- Load tool contracts on demand and reuse observed originals across professional work. Remove duplicated attachment text from authoring while retaining complete evidence for independent inspection.
+- Correct known-usage, completed JSON, selection and candidate errors within the existing bounded professional steps. Preserve original responses, versions, failures and accounting; interrupted or unknown-use requests are not blindly retried.
+
+### Fixed (full task acceptance still pending)
+
+- Distinguish explicit caller fields from internal defaults so ordinary requests retain complete units. Default publication titles follow the adopted manuscript; historical explicit settings are unchanged.
+- Inspect producer-unit text by actual UTF-8 content rather than a filename suffix whitelist. Binary, changed and oversized inputs remain rejected; saved snapshots retain their original policy.
+- Report unread attachment gaps before authoring instead of repeatedly rewriting prose to fix missing inspection coverage. Preserve original drafts, failures and accounting.
+- Reuse validated evidence for same-request prose-only review fixes and pass version-bound editorial feedback to the Writer. New feedback, evidence gaps and attachment defects still require investigation rather than silently inheriting old scope.
+- Separate writing evidence from declared deliverables. Complete producer units replace implicit promotion of context results and historical source versions into attachments; actual external command inputs and explicitly selected attachments remain checked. Saved and interrupted requests retain their original subject-selection policy.
+- Review whole-article tables, image links and captions as author-owned body content, rather than incorrectly treating them as automatic assembly additions. Historical review requests retain their original payload.
+
+### Not yet complete as of October 23
+
+- Real tasks had produced partial reports, tables, figures and PDFs; full acceptance runs had stopped with failures and accounting retained. Corrected-candidate delivery and feedback were still unproven at that point.
+- The professional-ownership work package remained open, with unified acceptance and overall code reduction incomplete.
+
+## 2026-10-20
+
+### Added
+
+- **Public main examples:** a six-page saved-results report with a five-panel figure and four tables, and a ten-page robotics survey with two figures, two tables and references. Include original generated files, offline rebuild instructions, costs and human involvement.
+
+### Improved
+
+- **Development branch:** share actual observed source text between investigation and writing; reuse existing evidence and apply version-bound feedback edits.
+- **Development branch:** delegate material selection and captions to professional owners; require explicit delivery, a question or a stop near budget limits rather than labeling incomplete work successful.
+
+### Fixed
+
+- Expose available partial outputs and unfinished work, recheck execution authorization and source/publication versions, and preserve historical task contracts during recovery.
+
+## 2026-10-19
+
+### Improved
+
+- Reuse observed materials and existing articles across professional work, retaining the relationship between conversation context and original source versions.
+- Support source-bound numeric citations in publication; distinguish existing prose from new factual evidence.
+
+### Fixed
+
+- Improve task continuation, directory resolution and runnable implementation handoff. Failures retain already-produced usable outputs.
 
 ## 2026-10-18 — V2.9 release preparation
 

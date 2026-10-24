@@ -1,0 +1,23 @@
+[extension]
+id = "local_notes"
+version = "1.0.0"
+description = "Inspect a small local note and report bounded word counts"
+scope = "User-supplied UTF-8 notes mounted in the current task"
+instructions = "SKILL.md"
+resources = []
+
+[[tools]]
+name = "count_words"
+description = "Count words in one bounded host read of an authorized note; report truncation rather than claiming complete coverage."
+implementation = "notes.py"
+function = "count_words"
+permission_level = "read_only"
+
+[tools.input_schema]
+type = "object"
+required = ["path"]
+additionalProperties = false
+
+[tools.input_schema.properties.path]
+type = "string"
+description = "Current task mounted locator, for example source0/notes.txt"

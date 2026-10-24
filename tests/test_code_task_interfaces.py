@@ -543,8 +543,10 @@ class CodeTaskInterfaceTests(unittest.TestCase):
         from simple_ar.tools.implementation import ImplementationRequest, ImplementationToolGateway
         from simple_ar.tools.workspace import WorkspaceToolGateway
 
-        for inputs in ('goal', 'windows', 'project', 'saved_project', 'explicit'):
-            with self.subTest(inputs=inputs), tempfile.TemporaryDirectory() as tmp:
+        cases = [(inputs, 'direct') for inputs in ('goal', 'windows', 'project', 'saved_project', 'explicit')]
+        cases += [('project', 'primitive'), ('project', 'inputs_only'), ('project', 'exact'), ('explicit', 'unmarked')]
+        for inputs, consumer in cases:
+            with self.subTest(inputs=inputs, consumer=consumer), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 source = root / 'source'
                 original = 'VALUE = 1\n# Preserve the complete original.\n'
@@ -553,6 +555,11 @@ class CodeTaskInterfaceTests(unittest.TestCase):
                 write_text(source / 'method.txt', 'Original method definition.\n')
                 ledger = BudgetLedger({'llm_requests': 2})
                 workspace = WorkspaceToolGateway(root, {'source': source}, ledger)
+                if consumer in ('primitive', 'inputs_only', 'exact'):
+                    write_json(root / 'session_manifest.json', {'session_id': 'session',
+                        'budget': {'recorded_attempts': []}})
+                    write_json(root / 'actions.json', {'config':
+                        {'professional_inputs': 'owner.v3'} if consumer != 'primitive' else {}})
                 output = workspace.resolve('workspace/implementations/unit', write=True)
                 owner = root / 'attempts/unit/implementation'
                 arguments = {'goal': 'Create a library and usage documentation.'}
@@ -617,7 +624,10 @@ class CodeTaskInterfaceTests(unittest.TestCase):
 
                 client.ask_json.side_effect = respond
                 gateway = ImplementationToolGateway(root, workspace, ledger, 'model', 'session',
-                    client_factory=factory, execution_observations=observations)
+                    client_factory=factory, execution_observations=observations,
+                    exact=({'goal': arguments['goal'], 'project_path': str(source),
+                        'allowed_patterns': ['*.py'], 'validation_command': ['python', 'library.py']}
+                        if consumer == 'exact' else None))
                 with patch.object(workspace, 'bind_inventory', wraps=workspace.bind_inventory) as inventory_calls:
                     if inputs == 'saved_project':
                         with patch('simple_ar.code_task.generation.selection.implementation_selection_context',
@@ -649,6 +659,13 @@ class CodeTaskInterfaceTests(unittest.TestCase):
                     binding = read_json(owner / 'request.json')
                     self.assertNotIn('selection', binding)
                     self.assertEqual(binding['request'], {**arguments, 'source_windows': []})
+                    self.assertEqual(binding['argv_semantics'], 'candidate_relative.v2')
+                    if consumer == 'unmarked':
+                        # Historical cached receipts must not gain semantics
+                        # from today's defaults, even with a new context owner.
+                        binding.pop('argv_semantics')
+                        write_json(owner / 'request.json', binding)
+                        gateway.work_context = Mock(side_effect=AssertionError('Keep frozen context'))
                 retained = {path: path.read_bytes() for path in owner.rglob('*.json')}
                 before = ledger.to_dict()
                 # Recover with changed history and no model connection.
@@ -751,6 +768,96 @@ class CodeTaskInterfaceTests(unittest.TestCase):
                 self.assertEqual(ledger.to_dict(), before)
                 if failure.startswith('unknown'):
                     self.assertTrue(ledger.unknown_dimensions())
+
+    def test_professional_revision_keeps_unmarked_parent_material_required(self) -> None:
+        import hashlib
+        from simple_ar.core.budget import BudgetLedger
+        from simple_ar.core.capabilities import ArtifactStore
+        from simple_ar.tools.implementation import ImplementationRequest, ImplementationToolGateway
+        from simple_ar.tools.implementation_work import prepare_work
+        from simple_ar.tools.workspace import WorkspaceToolGateway
+
+        for parent_contract in ({}, {'producer_completion': 'goal_findings.v1'},
+                {'producer_completion': 'goal_findings.v1', 'work_contract': 'shared.v2'}):
+            with self.subTest(parent_contract=parent_contract), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                ledger = BudgetLedger({'llm_requests': 2})
+                workspace = WorkspaceToolGateway(root, {'records': root / 'attempts'}, ledger)
+                project = workspace.workspace / 'project'
+                write_text(project / 'worker.py', 'VALUE = 1\n')
+                text = 'Required original material.\n' * 1500
+                notes = workspace.workspace / 'notes.txt'
+                write_text(notes, text)
+                request_window = {'path': 'workspace/notes.txt', 'max_bytes': 64000, 'full_digest': True}
+                observed = workspace.call('read_file', request_window, identity='original-read')
+                self.assertEqual(observed.status, 'ok', observed.error)
+                row = {'request': request_window, **observed.data,
+                    'role': 'supplied_source_or_diagnostic_not_certified_fact'}
+                self.assertGreater(len(row['text']), 32000)  # Exceeds optional seed allowance.
+                prior = ArtifactStore(root / 'attempts/previous/implementation')
+                prior_request = ImplementationRequest(goal='Original work', source_windows=[request_window],
+                    complete_work='work_contract' in parent_contract, **parent_contract).model_dump()
+                prior.write_json('request.json', {'request': prior_request,
+                    'source_windows': [row]})
+                prior.write_json('result.json', {})
+                retained = {'result_ref': 'records/previous/implementation/result.json',
+                    'result_sha256': hashlib.sha256(prior.resolve('result.json').read_bytes()).hexdigest(),
+                    'source_binding_sha256': hashlib.sha256(prior.resolve('request.json').read_bytes()).hexdigest(),
+                    'project_root': str(project), 'original_files': {}, 'source_windows': [row]}
+                gateway = ImplementationToolGateway(root, workspace, ledger, 'model', 'session',
+                    client_factory=Mock())
+                gateway._retained_candidate = Mock(return_value=retained)
+                gateway._publish_implementation = Mock(return_value='published')
+                current = ImplementationRequest(goal='Revise the registered project', complete_work=True,
+                    producer_completion='goal_findings.v1', work_contract='shared.v2')
+                store = ArtifactStore(root / 'attempts/revision/implementation')
+                original_binding = prior.resolve('request.json').read_bytes()
+                # Registration is checked by the preceding owner. Exercise the
+                # real material reads, source presentation and byte guards here.
+                members = {Path(path).relative_to(project).as_posix(): digest for path, digest in
+                    workspace.bind_inventory(project, identity='previous')['file_hashes'].items()}
+                with patch('simple_ar.code_task.generation.selection.registered_project_files',
+                        return_value=members), \
+                        patch('simple_ar.code_task.generation.writer.write_implementation_unit',
+                            return_value={}) as writer:
+                    self.assertEqual(prepare_work(gateway, current, store,
+                        workspace.workspace / 'revision', project, 'revision', None), 'published')
+                    material = [item for item in writer.call_args.kwargs['source_windows'] if 'request' in item]
+                    self.assertEqual(len(material), 1)
+                    self.assertEqual(material[0]['text'], text)
+                    self.assertEqual(material[0]['sha256'], row['sha256'])
+                    self.assertEqual(material[0]['role'], 'retained_observed_material_not_certified_fact')
+                    self.assertIn(material[0]['observation_ref'],
+                        writer.call_args.kwargs['investigation'].context()['working_set']['required_refs'])
+                    self.assertEqual(prior.resolve('request.json').read_bytes(), original_binding)
+                    write_text(notes, 'Changed material\n')
+                    with self.assertRaisesRegex(ValueError, 'Retained material changed'):
+                        prepare_work(gateway, current, ArtifactStore(root / 'attempts/changed/implementation'),
+                            workspace.workspace / 'changed', project, 'changed', None)
+                    self.assertEqual(writer.call_count, 1)
+                    self.assertEqual(ledger.entries, ())
+
+    def test_source_snapshot_contract_requires_native_preparation(self) -> None:
+        from simple_ar.core.budget import BudgetLedger
+        from simple_ar.core.capabilities import ArtifactStore, AttemptManifest
+        from simple_ar.code_task.generation.selection import ImplementationSources
+        from simple_ar.tools.workspace import WorkspaceToolGateway
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = WorkspaceToolGateway(root, {}, BudgetLedger({}))
+            sources = ImplementationSources(workspace=workspace, project=None, roots=[], windows=[],
+                originals={}, identity='unit')
+            owner = ArtifactStore(root / 'attempts/unit/implementation')
+            binding = {}
+            sources.retain_binding(binding, owner)
+            self.assertNotIn('execution_snapshot', binding)
+            write_json(root / 'session_manifest.json', {'session_id': 'session'})
+            sources.retain_binding(binding, owner)
+            self.assertNotIn('execution_snapshot', binding)
+            ArtifactStore(owner.root.parent).write_attempt_manifest(AttemptManifest('unit', capability='native_tool'))
+            sources.retain_binding(binding, owner)
+            self.assertEqual(binding['execution_snapshot'], 'implementation_inputs.v1')
 
     def test_review_accepts_runtime_placeholders_as_runtime_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

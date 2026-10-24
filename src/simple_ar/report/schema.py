@@ -287,6 +287,9 @@ class ReviewerFinding(ReportModel):
     required_action: Literal["advisory", "revise", "verify"] | None = None
     draft_quotes: list[ReportDraftQuote] = Field(default_factory=list, exclude_if=lambda quotes: not quotes)
     evidence_quotes: list[ReportEvidenceQuote] = Field(default_factory=list, exclude_if=lambda quotes: not quotes)
+    delivery_targets: list[str] = Field(default_factory=list, max_length=32,
+        exclude_if=lambda targets: not targets,
+        description='Explicit accused attachment text fields: absolute JSON Pointers into the current frozen delivery_artifacts. Evidence quotations are counter-evidence, not repair targets. Omit for prose-only findings. Producer ownership is controller-resolved, never model-selected.')
 
 
 # A model may label a factual defect "minor" even when it remains unresolved.
@@ -415,6 +418,15 @@ class ReportFindingCheck(ReportModel):
     evidence_quotes: list[ReportEvidenceQuote] = Field(default_factory=list, exclude_if=lambda quotes: not quotes)
 
 
+class ProducerClaimCheck(ReportModel):
+    """Independent adoption of an original, version-bound producer statement."""
+    declaration_id: str = Field(min_length=1)
+    status: Literal['satisfied_by_execution', 'accepted_limitation', 'unresolved_work']
+    explanation: str = Field(min_length=1)
+    draft_quotes: list[ReportDraftQuote] = Field(default_factory=list)
+    evidence_quotes: list[ReportEvidenceQuote] = Field(default_factory=list)
+
+
 class ReportSectionReview(ReportModel):
     """Reviewer output for one drafted report section."""
 
@@ -426,6 +438,8 @@ class ReportSectionReview(ReportModel):
     revision_instructions: list[str] = Field(default_factory=list)
     notes: str = ""
     finding_checks: list[ReportFindingCheck] = Field(default_factory=list, exclude_if=lambda checks: not checks)
+    producer_claim_checks: list[ProducerClaimCheck] = Field(default_factory=list,
+        exclude_if=lambda checks: not checks)
 
     @field_validator("revision_instructions", mode="before")
     @classmethod
@@ -494,6 +508,7 @@ class ReportIterationRecord(ReportModel):
     section_reviews: list[ReportSectionReview] = Field(default_factory=list, exclude_if=lambda reviews: not reviews)
     # Writer-initiated reads use the same trace and gateway allowance.
     tool_requests: list[ReportToolCall] = Field(default_factory=list, exclude_if=lambda requests: not requests)
+    independent_review: dict[str, Any] | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class AgentReportResult(ReportModel):
@@ -508,6 +523,9 @@ class AgentReportResult(ReportModel):
     reviewer_findings: list[ReviewerFinding] = Field(default_factory=list)
     tool_results: list[ReportToolResult] = Field(default_factory=list)
     used_agent: bool = False
+    independent_review: dict[str, Any] | None = Field(default=None, exclude_if=lambda value: value is None)
+    # Rejected prose and its actual negative inspection, never adopted delivery.
+    pending_candidate: dict[str, Any] | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class CitationAudit(ReportModel):

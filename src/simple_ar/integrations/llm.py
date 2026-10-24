@@ -1338,6 +1338,74 @@ def _decode_json_candidate(text: str) -> Any:
     return json.loads("".join(output))
 
 
+def normalize_terminal_json_object(raw: str) -> tuple[dict, str] | None:
+    """Close only missing terminal containers of one plain JSON object.
+
+    Return the decoded object and exact suffix appended to ``raw``; already
+    valid objects return an empty suffix. Nesting and suffix length are each
+    limited to 64. Whitespace is preserved, and no scalar or interior syntax
+    is repaired. Duplicate keys and non-JSON constants are rejected throughout.
+
+    Callers must establish physical response completion first: finish_reason
+    ``length`` and transport-incomplete responses are never eligible. A number
+    at EOF can be syntactically complete even if its intended digits are not;
+    this pure function cannot determine provider completion or author intent.
+    """
+    text = raw.lstrip(" \t\r\n")
+    if not text.startswith("{"):
+        return None
+
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif not stack and index > 0:
+            if char not in " \t\r\n":
+                return None
+        elif char == '"':
+            in_string = True
+        elif char in "{[":
+            stack.append("}" if char == "{" else "]")
+            if len(stack) > 64:
+                return None
+        elif char in "}]":
+            if not stack or stack.pop() != char:
+                return None
+    if in_string:
+        return None
+    suffix = "".join(reversed(stack))
+    if len(suffix) > 64:
+        return None
+    candidate = raw + suffix
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("Duplicate JSON key")
+            value[key] = item
+        return value
+
+    def reject_constant(token: str) -> Any:
+        raise ValueError("Non-JSON constant")
+
+    try:
+        # The shared decoder supports legacy escape recovery. This strict gate
+        # prevents that or duplicate-key acceptance in this append-only utility.
+        value = json.loads(candidate, object_pairs_hook=unique_object,
+                           parse_constant=reject_constant)
+    except (ValueError, RecursionError):
+        return None
+    return (value, suffix) if isinstance(value, dict) else None
+
+
 def _first_json_object(text: str) -> str | None:
     """Locate the first outer object, never salvage a nested object on failure."""
     opening = re.search(r"[\[{]", text)

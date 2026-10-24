@@ -45,57 +45,53 @@ Runtime outputs belong in ignored directories such as `runs/`, not source.
 
 ## Understand the two entry paths
 
-Technical greenfield tasks may start from an empty workspace or a mounted scaffold (`copy`/`sparse_copy`) through the same native preparation and feedback owner. Scientific domains own measurement protocols; legacy planning and dispatch share `task_plan.action_binding`. This identity mapping never grants permissions or substitutes a validator for a scientific measurement. Saved actions and ledgers retain their original meaning.
-
-New CLI tasks and explicit compatibility consumers have different application boundaries:
+Ordinary goals, new structured CLI tasks and `create_research_task` use one action
+backbone. Structured inputs supply domain contracts; they do not create a separate
+scheduler or grant permissions.
 
 ```text
-Ordinary goals / all new structured CLI tasks / create_research_task
-  → ToolApplication → CommonToolGateway → professional tools
-
-Saved legacy structured sessions / explicit create_session or ResearchApplication.create
-  → ResearchApplication → typed capabilities
-
-Shared: SessionController, artifact records, budgets and execution primitives
+New tasks → ToolApplication → CommonToolGateway → professional tools
+Explicit compatibility APIs / saved ResearchApplication sessions
+          → ResearchApplication → typed capabilities
+Shared    → SessionController, artifacts, budget and process records
 ```
 
-The common action loop chooses actions from goals and observations; structured inputs project frozen domain contracts into it. Task names do not grant permissions. Unsupported new declarations fail before creation, without falling back to ResearchApplication. Saved sessions resume under their recorded owner; explicit compatibility APIs retain their original return types and continuation contracts.
+Read [CLI dispatch](../src/simple_ar/cli/main.py),
+[start input adaptation](../src/simple_ar/cli/start.py),
+[common research creation](../src/simple_ar/app/research_intake.py),
+[ToolApplication](../src/simple_ar/app/tool_application.py) and
+[the gateway](../src/simple_ar/tools/gateway.py) in that order for a new-task change.
+The application owns cross-domain decisions, task feedback and terminal state.
+Professional owners perform bounded investigation, implementation, repair and checks without coordinator-side file-by-file wiring.
+Core retains attempts, artifacts, resource usage and process results through the same shared execution and records.
 
-New native tasks expose core workspace tools and a catalog of authorized professional capabilities; `load_tools` selects the full contracts needed next. This reuses the same registry, permission checks and accepted journal, not a second router or a mandatory planning stage. Python callers can explicitly select `tool_contracts="full"` for an eager-contract comparison. Saved tasks without a mode remain eager, including through supply; creating or supplying unrelated inputs never silently changes their presentation policy. Neither mode guarantees efficient investigation or a successful professional outcome.
+New native tasks expose workspace tools and an authorized capability catalog;
+`load_tools` loads the contracts needed for the next action through the same registry.
+Contract presentation options and exact defaults belong in the
+[configuration reference](CONFIG_REFERENCE.md), not a second dispatch path.
 
-For a bounded professional work unit, `focus_work` can select necessary `inputs` using the existing `FileWindow` contract. The workspace owner reads these and records the actual bytes, range and identity in the ordinary receipt. Valid selected inputs take precedence over unrelated operation history within the same remaining token capacity; oversized, changed or unavailable inputs are disclosed, not silently substituted. Feedback supersedes the old work goal; unchanged previous material is historical context, not new instructions or permission. Focus calls without inputs keep their behavior. Evidence supply is not scientific verification, and users need not select internal tools or hashes.
+Compatibility remains deliberate. Explicit `create_session` and
+`ResearchApplication.create` consumers retain their return types and continuation
+contracts; see [ResearchApplication](../src/simple_ar/app/research_application.py).
+Saved sessions resume under their recorded owner and policy. Read-only legacy v1
+records differ from saved ResearchApplication sessions that can still execute.
+The retired eight-stage executor is no longer launched by `run`, `resume`,
+`research-code-task` or `research-experiment`; this does not mean ResearchApplication
+has been deleted. `research-brief` remains the summary-only compatibility spelling
+of `research-session`. Unsupported new declarations fail before creation rather
+than silently falling back to compatibility execution.
 
-New whole-article inputs explicitly bind registered body citation markers (for example `[@P1]`) to the supplied bibliography; assembly alone generates numbered citations and references. Writer admission rejects unknown markers or a nonempty bibliography without body citations, excluding the replaced title, reference list and fenced examples. It retains the raw response without automatic redrafting or treating the failure as a layout correction. Frozen historical requests retain their original validation; citation identity does not prove claim support or source quality.
-
-`ToolApplication.supply(supply_id=..., reason=..., changes=..., resource_allowances=...)` is a caller-only operation to fill missing native contracts, not a model tool or a new runtime. Creation and supply share preflight; the existing actions journal records prior config, pending supply and final terms. The ledger grants the same stable ID once. Work is blocked during an interrupted supply; completed observations and old charges are never rewritten. Adding measurement obligations upgrades report evidence from materials to execution; an old materials report cannot satisfy them. Explicit native contract replacement uses the [supply contract](CLI_REFERENCE.md#native-recovery); legacy continuation retains its saved protocol.
-
-`request_execution_confirmation()` freezes an already declared scientific contract through the same source protocol owner. Caller proposals live under `inputs/caller-protocols`, not fake attempts or generated designs. Save the confirmation obligation (`research_policy.require_design=true`) through creation or supply first; accepting it neither grants process access nor cancels its queued commands. Protocol/response verification is shared with actual research designs, which still require their original design and source records. Existing user response and process approval are distinct authorities.
-
-Native measurement can select a completed implementation receipt rather than a global active candidate. The implementation owner verifies its actual preparation, independent validator and shared process accounting; scientific execution uses that candidate's interpreter/environment and retains its producing references. Original sources remain pinned, and added source/dependency files require validation. Physical validator verification belongs to CodeTask and is shared with interruption recovery, not copied into each consumer. Formal measurement is a separate physical invocation from validation, even when an ordinary benchmark uses the same argv. Strict reproduction retains its distinct-checker contract.
-
-Caller-frozen single-command and declared multi-condition measurements use the same owner with or without a model. Their exact cwd/argv/environment policy is not a writable workspace mount or an OS sandbox. Each literal initial caller condition authorizes one execution; model follow-up is not preapproved. Compatible conditions share receipt-verified environment preparation. Fixed measurements and CodeTask share frozen external baseline snapshots; implementation binds verified observations without invented preparation ancestry or new process accounting. Research-led CodeTask implementation consumes the accepted original design through its existing professional handoff, not a coordinator summary; scientific source roles remain owned by the frozen execution contract.
-
-Exact CodeTask and a flat formal measurement contract can coexist. Preparation stores both declarations; native approval binds the scientific contract, and the common source owner verifies the actual independent validator before measurement. Project argv relocation belongs to CodeTask's environment owner and is shared by execution and provenance, not reimplemented in the CLI. Independent validation does not require already-produced scientific artifacts; whole-project/API checks remain, and the separate formal measurement owns its runtime result schema. Greenfield planning consumes the declared formal entrypoint/metrics rather than mistaking the validator for the experiment. Report projection consumes receipt-verified measurements for the accepted code lineage. Frozen measurement obligations survive report-only feedback; unrelated old candidate output bytes are not a report dependency. Reuse reads the delivered formal argv template, never a completed invocation's physical output directory or old allowance.
-
-Validated candidate inputs stay pinned. A measurement may declare new candidate-relative `workspace_outputs`; approval binds the exact paths and inventory, and physical execution receipts pin the observed output bytes. Undeclared additions, changes to prior inputs or outputs, and new source/dependency files do not inherit validation. Delivery and feedback use this same ownership check. Derived data can be retained/copied but are not newly validated code: another measurement requires a feedback candidate with its full inventory independently revalidated. Prefer attempt-local `{output_dir}` for successive results; existing candidate files cannot be overwritten as new outputs. Missing declared outputs force disclosed partial delivery, including the separate final-delivery path. Final delivery may reference registered domain outputs, not arbitrary observations or ledgers.
-
-Start reading here:
-
-- [CLI dispatch](../src/simple_ar/cli/main.py) and [start input adaptation](../src/simple_ar/cli/start.py).
-- [Native task application](../src/simple_ar/app/tool_application.py) and [tool gateway](../src/simple_ar/tools/gateway.py).
-- [Common research creation](../src/simple_ar/app/research_intake.py), [compatibility research application](../src/simple_ar/app/research_application.py) and [legacy task planning](../src/simple_ar/research/task_plan.py).
-- [Session control](../src/simple_ar/core/session.py), [artifacts](../src/simple_ar/core/artifacts.py) and [budgets](../src/simple_ar/core/budget.py).
-
-The old eight-stage executor has been retired. `run`, `resume`, `research-code-task`
-and `research-experiment` no longer launch it.
-`research-brief` is a summary-only compatibility spelling of `research-session`; new tasks use common creation. Its CLI consumer no longer uses the removed `app.research_brief` session request/result wrapper. Library integrations can use `create_research_task` with `ResearchApplicationServices` for custom providers, or invoke typed research capabilities directly. Distinguish read-only legacy v1 records from saved ResearchApplication sessions that can still continue execution.
+For input supply, approvals and continuation, use the
+[CLI recovery contract](CLI_REFERENCE.md#native-recovery). Preserve saved contracts,
+prior observations and charges when adding inputs or allowances. Do not silently
+migrate historical tasks to new defaults.
 
 ## Place changes with their owner
 
 | Change | Preferred owner | Avoid |
 | --- | --- | --- |
 | User parameters and defaults | CLI and existing configuration parser | Separate conversions for every entry |
-| Next actions and feedback | app | Domain modules owning another scheduler or task state |
+| Cross-domain actions and feedback | app | A second global scheduler or task state |
 | Source retrieval and text selection | research | Reimplementing retrieval in each report entry |
 | Code creation, changes and validation | code_task / corresponding tools | Restricting abilities by task name |
 | Numerical computation and data figures | result_analysis and mature libraries | Treating model prose as computation |
@@ -103,65 +99,94 @@ and `research-experiment` no longer launch it.
 | Connections and accounting | integrations and shared budget | Independent Writer/CodeTask ledgers |
 
 Source material, measurements and adopted drafts have distinct owners.
-Summaries are views, not replacements for original records.
-Reports express results; they do not create them.
-Do not persist competing state solely for temporary context.
+Summaries are views of original records; reports express results rather than create them.
+Keep action state in the application and execution facts in the shared ledger.
+Nested model calls, retries and professional work use that same accounting;
+do not add parallel task state, fee counters or global schedulers.
 
-New native tasks use `protected_decision.v1`: protect an affordable follow-up opportunity in the shared ledger, including nested provider reservations and retries. This temporary spending floor is not a charge, allowance or second ledger. The action owner records its estimate once per decision for dispatch. Accepted local work can still execute within the actual budget, attempt and approval limits when no further model decision fits; it is not cancelled merely for lacking a terminal action. Only an explicit, validated delivery completes the request. Exhaustion retains work without marking it complete. Historical `closing_decision.v2` tasks retain their stricter saved closing requirement across approval and recovery; saved no-policy contracts also retain their behavior. Neither policy guarantees scientific quality, efficient tool choice or a complete deliverable within the allowance.
-
-Structured scientific actions select their protocol and lineage, while the shared dispatch boundary binds the local backend, finite measurement budgets and attempt-scoped implementation services. Do not rebuild these in each baseline, supplement, revision or retry branch. Work-plan consumers use `task`, `steps`, `accepted_refs` and the session's attempts/budget; the unused nested `research_task_context.v1` duplicate is no longer emitted. Existing saved records are not rewritten. Experiment reports extend the literature projection's source identities rather than numbering citations or reinterpreting source metadata independently.
+New native tasks protect an affordable follow-up decision in the shared budget
+(`protected_decision.v1`). This temporary spending floor is not an extra charge or allowance.
+Accepted local work remains subject to actual budget, attempt and approval limits.
+Only explicit, validated delivery completes a request; exhaustion preserves work
+without declaring success. Historical `closing_decision.v2` and no-policy tasks
+retain their saved behavior. See [budget ownership](../src/simple_ar/core/budget.py)
+and [configuration](CONFIG_REFERENCE.md) for policy details.
 
 ### Add or change a capability
 
-Trace one real consumer through input, execution and output before choosing the smallest change:
+Trace one real consumer from input through execution to output:
 
 1. Define inputs, outputs and failure meaning in the responsible domain.
-2. Reuse existing capability/tool boundaries; not every internal function needs registration or a factory.
-3. Validate at user, model, file and process boundaries; reuse established typed contracts internally.
-4. Save results through existing session/artifact mechanisms. Let the application choose continuation, clarification or delivery. A verification-only `review_document` may carry an explicit `delivery`, like other final-work tools: validate and bind declared existing artifacts before inference, include the actual review output, and use the same terminal commit. `needs_revision` forces unresolved partial delivery; no manuscript is corrected or scientifically certified. Without this field, inspection remains nonterminal, including historical requests.
-5. Cover consumers and failure/recovery behavior, then retire the replaced implementation in the same package.
+2. Reuse existing capability/tool boundaries; register only implemented operations.
+3. Validate user, model, file and process boundaries; reuse typed contracts internally.
+4. Save results through existing session/artifact mechanisms and return evidence to the application.
+5. Cover direct consumers and failure/recovery behavior, then retire the replaced implementation.
+
+Start with [capability contracts](../src/simple_ar/core/capabilities.py),
+[tool specifications](../src/simple_ar/tools/specs.py) and
+[registration](../src/simple_ar/tools/registry.py). Professional work may use a necessary bounded local loop, but must not create a second global task runtime, approval mechanism or ledger.
 
 ### Material and candidate ownership
 
-Use `prepare_implementation(execution_requested=true)` when the unit must be runnable. Its owner validates an execution plan before publishing a prepared candidate; code-only requests retain the default `false`. New receipts expose `executable` and `next_operation`, distinguishing saved source from a runnable proposal. This grants no execution permission and does not certify execution. Historical requests and receipts keep their original binding.
+Keep read-only materials separate from editable projects. Preparation produces a
+candidate; a runnable proposal is still neither permission to execute nor evidence
+of success. Execution consumes the registered preparation receipt and approved
+command, environment, input versions and expected outputs. Feedback creates a new
+candidate while preserving the original.
 
-Writing and code preparation share bounded material investigation rather than asking the coordinator to guess filenames. `prepare_implementation(material_roots=[...])` accepts read-only material directories or exact files separately from the editable `project_path`; selected observed windows feed file selection and generation directly, with workspace-owned digests. The shared reader can batch `read_file` windows and inspect continuations, bounded by six decisions and 96,000 observed characters within the same task budget. Exact roots obey discovery's private/environment/link exclusions without scanning siblings. Changed roots on a retained candidate are rejected before dispatch; changed inspected bytes invalidate reuse. Old selections keep their binding and interrupted requests are not replayed automatically. This prepares an unverified candidate, not execution, scientific/visual validation or a completed research lifecycle.
+Validation, physical execution and scientific measurement answer different questions.
+CodeTask owns technical validation and bounded repair; research owns measurement
+protocols; report projection joins accepted measurements to the measured code version.
+A passing validator, citation marker or compiled report does not establish scientific
+quality. Later patches and superseded measurements remain history.
 
-A generated code unit can propose one optional `execution_plan` alongside its files. `execute_implementation` takes the registered preparation receipt, not coordinator-transcribed commands or hashes. Explicit task approval pins the command, interpreter/environment, generated and directly invoked files, consumed input versions and fresh expected outputs; execution uses the existing workspace process owner and physical ledger. Real process diagnostics feed later preparation, with a new candidate preserving the original. Source/output changes invalidate delivery; incomplete crash output binding cannot be repaired by replaying or retroactively adopting files. A final execution may explicitly deliver its actual outputs and propagate preparation gaps, without another coordinator decision. This is physical/version evidence, not independent scientific or visual verification; exact CodeTask validators and scientific measurement keep their existing contracts.
+Bind delivery to registered outputs and actual bytes. Changed source, dependencies or
+inputs invalidate reuse; generated data do not automatically become validated source.
+Missing required outputs and unresolved review findings must remain visible in partial
+delivery. Use existing workspace snapshots and atomic writers for edits and rollback,
+retaining restoration failures alongside the original error.
 
-New units choose 1–12 editable text sources during generation. When `project_path` is an unchanged registered candidate, feedback uses its complete source inventory and original material spans directly, without another file-selection model call. Return only exact replacements or necessary new text files; omitted originals survive, and the merged source inventory remains bounded. `files: []` requires a valid execution plan and changes only that proposal. Runtime outputs are not copied as source or certified for the revised version. Unknown source additions require project investigation; changed inputs invalidate reuse. Unfamiliar projects and saved selections retain their original path. Empty/provider-truncated final responses stop rather than trigger a format request; effort and output caps remain named-profile settings. These protections do not guarantee professional quality or make a failed task successful.
-
-Native tool recovery asks the registered domain's `can_reconcile` before dispatch. That method admits only retained work; the domain still checks request and output bindings and must never start a replacement operation. Process/publication owners also expose whether execution has started. The application does not inspect their receipt filenames. Core commits saved attempt outcomes in one place; research continuation decisions belong to the application, including programmatic callers.
-
-Code patches and generated repair actions use the shared atomic file writer. File snapshots own rollback and byte verification: failure to restore one file does not prevent attempts to restore the others, and restoration errors remain alongside the original failure. CodeTask consumes the core process record directly; watchdog and scientific quality judgments are domain results, not rewrites of physical execution facts.
-
-CodeTask also owns completed-proposal correction and authorized technical verification/repair. Research callers supply approval, protocol-asset guards and the shared ledger, then retain the returned evidence; they do not run another repair loop. Proposal-only public execution still waits for approval. Failed restoration, changed protected assets or insufficient verification allowance stop further automatic work; scientific measurement remains a separate responsibility.
-
-Completed-response corrections capture a call-local accounting boundary. An unchanged historical `unknown` remains charged and preserved, but does not by itself forbid correcting a later fully received response. Pending reservations, new uncertainty, changed historical records and ledger replacement still block correction. Fallback checks cover the whole planning/generation unit. The original client owns every physical retry/reservation and output limit; this boundary neither adds capacity nor replays transport failures, and exact source-span/candidate validation remains unchanged.
-
-`ResearchApplicationServices.max_attempts=None` lets model-backed public creation use the native owner's attempt sizing instead of treating the legacy 16-stage default as 16 individual model/tool operations. Explicit limits and saved task limits remain authoritative. Caller-directed creation and legacy stages retain their bounded default; process allowances are not multiplied with native attempt space.
-
-The report projection owns measurement-to-text evidence joins. Applications select accepted records; comparisons must reference those measurements, and implementation history stops at the measured revision. Later patches and superseded measurements remain history, not evidence for the current result. Source retrieval uses canonical document chunks and in-memory ranking; the retired persistent-index API fails explicitly without modifying historical stores.
-
-See [capability contracts](../src/simple_ar/core/capabilities.py),
-[tool specifications](../src/simple_ar/tools/specs.py) and
-[registration](../src/simple_ar/tools/registry.py).
-Do not register unimplemented tools merely to expose a schema or MCP interface.
+Exact preparation, execution and output parameters belong in
+[configuration](CONFIG_REFERENCE.md) and [CLI contracts](CLI_REFERENCE.md);
+follow the [CodeTask owner](../src/simple_ar/code_task/) and
+[report owner](../src/simple_ar/report/) for implementation details.
 
 ### Permissions, execution and recovery
 
 - Models may propose actions, not expand edit scope, network access or resource authorization.
-- Mounted originals are read-only. Commands require the relevant approval. Workspaces and virtual environments are not OS sandboxes.
-- Commands, exit status, logs and accounting come from execution, not model self-reports.
-- Distinguish model failure, process failure and valid negative experimental results.
-- Recovery preserves the ledger, failures and unknown usage; it must not blindly replay operations with possible side effects.
-- A core-confirmed interrupted native tool can restore its missing failure observation from the actual failed result. This neither re-executes the tool nor changes its core result to success. Without confirmation or a retained result, restoration still refuses blind replay.
-- SDK failure diagnostics retain only safe transport events and cause types. A later redirected TLS failure cannot erase an earlier HTTP send; old unknown reservations remain unchanged.
-- External agent output is untrusted input. Apply existing edit, validation and artifact rules before acceptance; do not execute it implicitly.
+- Mounted originals are read-only. Protocol acceptance and process approval are distinct authorities; initial caller authorization does not preapprove model follow-up.
+- Workspaces and virtual environments are not OS sandboxes. Treat external agent output as untrusted input.
+- Commands, exit status, logs and usage come from execution. Distinguish model failure, process failure and valid negative experimental results.
+- Preserve reservations, failures and unknown usage on recovery. A later transport error does not prove that an earlier request was never sent.
+- Reconcile retained results through the domain owner; never blindly replay an operation with possible side effects. A core-confirmed interruption can restore a missing failure observation without re-execution or changing failure to success.
+- Input supply must preserve prior charges and apply each authorized allowance once; interrupted supply blocks work until reconciled.
 
-See [permissions](../src/simple_ar/tools/permissions.py),
+See [session control](../src/simple_ar/core/session.py),
+[artifacts](../src/simple_ar/core/artifacts.py),
+[permissions](../src/simple_ar/tools/permissions.py),
 [process control](../src/simple_ar/core/process.py) and
 [model catalogs](../src/simple_ar/integrations/model_profiles.py).
+
+### Add a trusted local extension
+
+For a local skill or custom read/plan operation, start with
+[LOCAL_EXTENSIONS](LOCAL_EXTENSIONS.md) and
+[the example package](../examples/local_extension/).
+Select packages explicitly through the task configuration; they use the existing
+catalog, gateway, attempts and receipts. The implemented v1 supports instructions
+and read-only/plan Python tools, not arbitrary write, execution or network permissions.
+
+Trusted Python runs with the host process's OS privileges. Restricted host services
+and permission declarations are **not a sandbox**; load only trusted packages.
+Saved tasks verify package identity, so keep selected code and declared resources
+unchanged for continuation. Do not add a private scheduler, billing or recovery layer.
+
+See [the loader](../src/simple_ar/tools/extensions.py) and
+[extension tests](../tests/test_local_extensions.py). The extension guide contains
+the focused verification commands and recovery limitations. This is an implemented,
+bounded local path; it does not establish completion of the broader persistent-project
+workflow. Checked scope and remaining limits belong in
+[development evidence](EVALUATION.md#v210-development-evidence).
 
 ## Refactor and reduce complexity
 
@@ -224,9 +249,8 @@ Use `-t .` for full discovery and import shared fixtures from the `tests` packag
 Consolidate duplicate fixtures and repeated behavioral coverage, without packing unrelated behaviors
 into giant test methods. Delete tests only when behavior has retired or retained tests cover it.
 
-[CI](../.github/workflows/ci.yml) currently runs its listed groups and builds a wheel.
-This is neither full discovery nor live API acceptance.
-Check selection when introducing a shared boundary.
+[CI configuration](../.github/workflows/ci.yml) defines grouped offline checks and a wheel build, not full discovery or live API acceptance. Whether automatic runs are enabled is managed separately by the maintainers.
+Check test selection when introducing a shared boundary; documentation updates do not authorize enabling workflows.
 
 Live task acceptance separately inspects content, numbers, figures, feedback and reconstruction.
 Mocks, process exit codes and PDF compilation alone do not establish scientific quality.
@@ -263,6 +287,7 @@ Licensing is not yet settled; discuss code contributions first.
 | WORKFLOWS | Recipes organized by user goals |
 | CLI_REFERENCE | Command and option lookup |
 | CONFIG_REFERENCE | Configuration locations, fields, defaults and combination rules |
+| LOCAL_EXTENSIONS | Trusted local package setup, examples and limits |
 | DEVELOPMENT | Architecture entry points, development, verification and maintenance |
 | CHANGELOG | Implemented user-visible changes and migration notes |
 

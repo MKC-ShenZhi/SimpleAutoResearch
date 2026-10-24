@@ -11,6 +11,34 @@ class ToolRegistry:
     """In-memory registry that composes domain tools without owning their logic."""
 
     _specs: dict[str, CommonToolSpec] = field(default_factory=dict)
+    _owners: dict[str, object] = field(default_factory=dict)
+    _request_visible: set[str] = field(default_factory=set)
+
+    def register_package(self, specs: Iterable[CommonToolSpec], owner: object, *,
+                         request_visible: bool | Iterable[str] = False) -> None:
+        """Bind contracts and dispatch together, for built-ins and local packages."""
+        if not callable(getattr(owner, 'call', None)):
+            raise ValueError('Package owner requires the common call contract')
+        specs = list(specs)
+        names = [spec.name for spec in specs]
+        if len(set(names)) != len(names) or any(name in self._specs for name in names):
+            raise ValueError('Package tool name collision')
+        visible = set(names) if request_visible is True else set() if request_visible is False else set(request_visible)
+        if not visible.issubset(names):
+            raise ValueError('Request-visible tools must belong to this package')
+        for spec in specs:
+            if spec.domain in self._owners and self._owners[spec.domain] is not owner:
+                raise ValueError('Package domain collision: ' + spec.domain)
+        for spec in specs:
+            self.register(spec)
+            self._owners[spec.domain] = owner
+        self._request_visible.update(visible)
+
+    def domain_gateways(self) -> dict[str, object]:
+        return dict(self._owners)
+
+    def request_visible(self, name: str) -> bool:
+        return name in self._request_visible
 
     def register(self, spec: CommonToolSpec, *, replace: bool = False) -> None:
         if spec.name in self._specs and not replace:

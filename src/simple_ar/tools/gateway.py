@@ -38,7 +38,11 @@ class CommonToolGateway:
         self._report = None
         self._report_context = report_context
         self._trace = ToolTraceWriter(trace_path or self.run_dir / "tools" / "tool_trace.jsonl", debug_payloads=debug_payloads)
-        self._domain_gateways = dict(domain_gateways or {})
+        self._domain_gateways = self.registry.domain_gateways()
+        for domain, owner in (domain_gateways or {}).items():
+            if domain in self._domain_gateways and self._domain_gateways[domain] is not owner:
+                raise ValueError('Conflicting registered domain owner: ' + domain)
+            self._domain_gateways[domain] = owner
 
     def list_specs(self) -> list[CommonToolSpec]:
         return self.registry.list_specs()
@@ -82,8 +86,61 @@ class CommonToolGateway:
         spec = self.registry.get(name)
         if spec is None or not self.policy.is_allowed(spec)[0]:
             return None
-        owner = self._domain_gateways.get(spec.domain)
+        owner = self.domain_owner(name)
         return owner if name in getattr(owner, 'context_tools', ()) else None
+
+    def domain_owner(self, name: str) -> Any | None:
+        """Identify a receipt's owner without granting permission to run it."""
+        spec = self.registry.get(name)
+        if spec is None:
+            return None
+        return self._domain_gateways.get(spec.domain)
+
+    def coordination_result(self, result: dict, record: str) -> dict:
+        """Let a domain present its receipt without changing persisted evidence."""
+        owner = self.domain_owner(result.get('tool_name', ''))
+        present = getattr(owner, 'coordination_result', None)
+        if present is None:
+            return result
+        # Validation detaches nested fields from the canonical caller object.
+        from copy import deepcopy
+        return present(ToolResult.model_validate(deepcopy(result)), receipt_path=record)
+
+    def continuation_attempts(self, name: str, arguments: dict) -> int:
+        """A target owner supplies its known admission floor, not authorization."""
+        owner = self.domain_owner(name)
+        required = getattr(owner, 'continuation_attempts', None)
+        minimum = required(name, arguments) if required is not None else 1
+        if type(minimum) is not int or minimum < 1:
+            raise ValueError('Professional continuation requires a positive attempt floor')
+        return minimum
+
+    def professional_action(self, observed: dict, source: str, *, resume: bool,
+                            consume_outcome: bool) -> tuple[Any, dict | None]:
+        """Ask existing receipt owners; scheduling and authorization stay outside.
+
+        The producing owner gets first refusal. Domain consumers may then accept
+        its proven outcome. No tasks, model calls or state are created here.
+        """
+        owner = self.domain_owner(observed.get('tool_name', ''))
+        continuation = getattr(owner, 'continuation', None)
+        if continuation is None:
+            return owner, None
+        attempt_id = Path(source).parent.name
+        action = (getattr(owner, 'resume_after_budget', continuation) if resume else continuation)(
+            observed, attempt_id)
+        if action is None and consume_outcome:
+            proposals = [consumer(observed, source)
+                for other in self._domain_gateways.values() if other is not owner
+                and (consumer := getattr(other, 'consume_outcome', None)) is not None]
+            proposals = [proposal for proposal in proposals if proposal is not None]
+            if len(proposals) > 1:
+                return owner, None  # No unique handoff: retain the outcome for coordination.
+            action = next(iter(proposals), None)
+        fallback = getattr(owner, 'stop_after_review', None)
+        if action is None and fallback is not None:
+            action = fallback(observed, attempt_id)
+        return owner, action
 
     def _bound_context(self, call: ToolCall, context: Any) -> bool:
         """A path-shaped context is not evidence of controller ownership."""
@@ -99,15 +156,23 @@ class CommonToolGateway:
         except (OSError, ValueError, KeyError, TypeError):
             return False
 
-    def delivery_issues(self, observations: list[dict[str, Any]], *, proposed: ToolCall | None = None) -> list[str]:
+    def delivery_issues(self, observations: list[dict[str, Any]], *, proposed: ToolCall | None = None,
+                        delivery: dict | None = None) -> list[str]:
         """Domains judge their accepted evidence; the gateway does not reinterpret it."""
         issues = []
+        adoptions = []
+        for owner in self._domain_gateways.values():
+            adopt = getattr(owner, 'delivery_adoptions', None)
+            if adopt is not None:
+                adoptions.extend(adopt(observations, delivery, proposed))
         for owner in self._domain_gateways.values():
             check = getattr(owner, 'delivery_issues', None)
             if check is not None:
                 preflight = getattr(owner, 'delivery_preflight', None)
                 if proposed is not None and self.session_owner(proposed.tool_name) is owner and preflight:
                     issues.extend(preflight(observations, proposed.arguments))
+                elif (adoption := getattr(owner, 'delivery_issues_for', None)) is not None:
+                    issues.extend(adoption(observations, delivery, adoptions))
                 else:
                     issues.extend(check(observations))
         return issues

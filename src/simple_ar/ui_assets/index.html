@@ -10,6 +10,9 @@
 </section>
 <main id="workspaceMain"><aside><h2>工作区</h2><p id="grants"></p><button id="new">＋ 新建研究任务</button><h2>已有任务</h2><div id="tasks"></div><p class="hint">状态来自原生 manifest。已保存成果浏览不代表任务正在此进程执行。</p></aside>
 <section id="create"><span class="eyebrow">START WITH YOUR MATERIALS</span><h2>接下来想研究什么？</h2><form id="createForm">
+<label>复用任务 TOML（可选，服务器本机路径）<input id="taskConfig" placeholder="限左侧 read 授权；相对材料路径以 TOML 所在目录为准"></label>
+<p class="hint">填写 TOML 后，整份任务配置由 CLI 共同入口解释，下方表单停用。output_root 若有设置，须等于启动任务目录。先查看实际生效配置，再一次确认；配置或连接变化需重新预览。</p>
+<fieldset id="plainCreation">
 <label>目标<textarea id="goal" required placeholder="描述要回答的问题、希望交付的成果和需要保留的条件"></textarea></label>
 <label>材料路径（服务器本机，每行一项）<textarea id="materials" placeholder="只能使用左侧明确授予的目录"></textarea></label>
 <label>工作连接<select id="profile"></select></label><p id="recipient" class="hint"></p>
@@ -21,11 +24,12 @@
 <label>进程总墙钟秒<input id="seconds" type="number" min="0" step="any" required></label></div>
 <label class="check"><input id="network" type="checkbox">允许公共网络来源获取</label>
 <label class="check"><input id="execution" type="checkbox">允许提出进程执行（每项仍需精确批准；不是系统沙箱）</label>
-<p id="effectiveAccess" class="hint"></p><button id="createSubmit" type="submit" disabled>确认配置并创建任务</button>
+<p id="effectiveAccess" class="hint"></p></fieldset><button id="createSubmit" type="submit" disabled>预览实际配置</button>
 <p class="hint">创建只保存原任务。选择“继续执行”后才开始工作。自然语言中的资源偏好不能替代这些上限。</p></form></section>
 <section id="detail" hidden>
 <div class="titleRow"><div><span class="eyebrow" id="identity"></span><h2 id="title"></h2></div><span class="badge" id="status"></span></div>
-<details><summary>完整原始目标</summary><p id="originalGoal"></p></details><p id="reason"></p>
+<details><summary>完整原始目标</summary><p id="originalGoal"></p></details><p id="reason"></p><p id="savedAt" class="hint"></p>
+<details><summary>当前保存的模型接收方</summary><pre id="connectionSummary"></pre></details>
 <nav><button id="resume">继续执行</button><button id="stop" class="secondary">请求边界停止</button></nav>
 <p id="worker"></p><p class="hint">停止等待当前行动返回；不宣称提供方或在途进程已取消。外部进程需由其原操作者管理。</p>
 <div class="grid"><article><h3>实际工作与当前动作</h3><div id="currentAction"></div>
@@ -36,6 +40,6 @@
 <article id="approvalBox" hidden><h3>待批准的原始操作</h3><pre id="proposal"></pre><button id="approve">批准上述精确操作</button></article>
 <article><h3>来源与成果</h3><p class="hint">点击文件查看；声明的来源包显示标题、URL、提取状态与有限摘录，普通 JSON 按原文显示。工作文件不会标成原始来源。文件浏览不认证内容质量或当前交付；反馈在途时，旧成果仍可见。</p>
 <div class="filebar"><select id="mount"></select><button id="root" class="secondary">返回根目录</button><span id="location"></span></div><div id="files"></div><div id="preview"></div></article>
-<article><h3>继续同一项研究</h3><form id="feedbackForm"><textarea id="feedback" required placeholder="给出反馈，保留同一任务、原成果与账本"></textarea><button type="submit">发送反馈并继续</button></form>
+<article><h3>继续同一项研究</h3><p class="hint">当前任务选择、材料目录与未提交文字保存在本浏览器标签页，刷新和切换任务可恢复。反馈发送后仍保留草稿，请核对原始请求记录；刷新不会自动执行或重新批准。</p><form id="feedbackForm"><textarea id="feedback" required placeholder="给出反馈，保留同一任务、原成果与账本"></textarea><button id="feedbackSubmit" type="submit">发送反馈并继续</button></form>
 <details><summary>显式更换命名连接</summary><p class="hint">接收方将变化；原预算、未知用量与历史保留，安全条件由原 owner 校验。</p><select id="switchProfile"></select><input id="switchReason" placeholder="更换原因"><button id="switch" class="secondary">确认更换连接</button></details></article>
 </section></main><script src="/app.js"></script></body></html>

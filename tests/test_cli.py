@@ -115,8 +115,16 @@ class CliTests(unittest.TestCase):
                     'environment': 'inherited-value'})
                 self.assertEqual(script.read_bytes(), original)
                 self.assertEqual(len(app.ledger.entries), 1)
-                self.assertEqual(len(app.session.list_attempts()), 1)
-                payload = app.session.store.read_json(app.state['turns'][0]['tools'][0]['result'])
+                observations = [app.session.store.read_json(item['result'])
+                    for turn in app.state['turns'] for item in turn['tools']]
+                self.assertEqual([row['tool_name'] for row in observations],
+                    ['update_work_plan', 'measure_experiment'])
+                self.assertTrue(all(row['status'] == 'ok' for row in observations), observations)
+                self.assertEqual(observations[0]['data']['report_intent']['kind'], 'none')
+                attempts = app.session.list_attempts()
+                self.assertEqual([row.capability for row in attempts], ['native_tool', 'native_tool'])
+                self.assertEqual({entry.attempt_id for entry in app.ledger.entries}, {attempts[1].attempt_id})
+                payload = observations[1]
                 self.assertEqual(payload['data']['metrics']['score'], 4)
                 self.assertTrue(any(path.endswith('/analysis.md') for path in
                     app.session.store.read_json('delivery.json')['artifacts']))

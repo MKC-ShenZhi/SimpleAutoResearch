@@ -12,11 +12,15 @@ import tomllib
 
 FIELDS = {
     'request': str, 'model': str, 'source': list, 'output_root': str,
+    'kind': str, 'project': str, 'document': list, 'material': list,
+    'extensions': list, 'from_session': str, 'reuse': list,
+    'data_file': str, 'data_path': list,
     'project_python': str, 'allow_execution': bool, 'allow_network': bool,
     'allow_vision': bool, 'max_images': int, 'max_turns': int, 'max_tokens': int,
     'max_processes': int, 'max_process_seconds': (int, float),
 }
-PATHS = {'output_root', 'project_python'}
+PATHS = {'output_root', 'project_python', 'project', 'data_file', 'from_session'}
+PATH_LISTS = {'source', 'document', 'material', 'data_path', 'extensions'}
 
 
 def shell_path(path: Path) -> str:
@@ -49,6 +53,23 @@ def native_process_limits(args: argparse.Namespace) -> dict | None:
     return limits or None
 
 
+def validate_resume_options(args: argparse.Namespace) -> None:
+    """Reject creation settings instead of silently ignoring them on resume."""
+    if not args.resume_task:
+        return
+    creation = set(getattr(args, '_explicit_start_destinations', ())) & {
+        'max_turns', 'max_tokens', 'max_images', 'max_processes',
+        'max_process_seconds', 'project_python', 'output_root',
+        'extensions', 'from_session', 'reuse',
+    }
+    creation.update(name for name in ('max_processes', 'max_process_seconds')
+                    if getattr(args, name, None) is not None)
+    creation.update(name for name in ('max_images', 'project_python') if getattr(args, name, None))
+    if creation:
+        raise ValueError('Resume retains saved creation settings: ' + ', '.join(sorted(creation))
+                         + '; use --authorize-remaining for resource changes, or --supply-task for contract changes')
+
+
 def apply_task_config(args: argparse.Namespace) -> None:
     path = getattr(args, 'task_config', None)
     if path is None:
@@ -69,9 +90,16 @@ def apply_task_config(args: argparse.Namespace) -> None:
         types = FIELDS[name] if isinstance(FIELDS[name], tuple) else (FIELDS[name],)
         if type(value) not in types or isinstance(value, float) and not math.isfinite(value):
             raise ValueError(f'Invalid task setting type: {name}')
-        if name == 'source':
+        if name == 'kind':
+            from simple_ar.cli.start import FUNCTION_LABELS
+            if value not in FUNCTION_LABELS:
+                raise ValueError('Unknown task outcome preference: ' + value)
+        if name == 'reuse' and (any(type(item) is not str or not item.strip() for item in value)
+                               or len(set(value)) != len(value)):
+            raise ValueError('Task reuse must list distinct nonempty registered result names')
+        if name in PATH_LISTS:
             if any(type(item) is not str or not item.strip() for item in value):
-                raise ValueError('Task source must list nonempty file/directory paths')
+                raise ValueError(f'Task {name} must list nonempty file/directory paths')
             value = [(path.parent / Path(item).expanduser()).resolve() for item in value]
         elif name in PATHS:
             candidate = path.parent / Path(value).expanduser()
@@ -94,7 +122,8 @@ def write_task_config(args: argparse.Namespace) -> bool:
     limits = native_process_limits(args) or {}
     values = {name: getattr(args, name, None) for name in FIELDS}
     values['request'] = args.request or args.goal or 'Describe your goal and required deliverables here.'
-    values['source'] = [str(item.expanduser().absolute()) for item in args.source]
+    for name in PATH_LISTS:
+        values[name] = [str(Path(item).expanduser().absolute()) for item in getattr(args, name, [])]
     for name in PATHS:
         if values[name] is not None:
             values[name] = str(Path(values[name]).expanduser().absolute())
@@ -103,7 +132,16 @@ def write_task_config(args: argparse.Namespace) -> bool:
     comments = {
         'request': 'Goal, language, length and intended figures belong here; the assistant chooses tools as needed.',
         'model': 'Named connection from your global models.toml; never put credentials in this file.',
+        'extensions': 'Explicit trusted local extension.toml files or directories. Relative paths use this config location. Python has host OS privileges; v1 tools declare read_only/plan only.',
         'source': 'Read-only files/directories visible on the execution machine. Relative paths use this file location.',
+        'kind': 'Optional outcome preference; tools combine according to the goal, without a fixed pipeline.',
+        'project': 'Existing read-only project directory; omit to create new code from the goal.',
+        'document': 'Local original-source files/directories; paths are relative to this configuration.',
+        'material': 'Local notes, prior drafts or result packages; not independently verified evidence.',
+        'from_session': 'Previous task with current byte-checked delivered materials; creates new work, not a resume or inherited budget.',
+        'reuse': 'Named groups from results SESSION, e.g. artifacts or report. Names are not filesystem paths; pair with from_session.',
+        'data_file': 'Existing data file. No column assumptions or experiment execution are implied.',
+        'data_path': 'Additional read-only data files/directories.',
         'project_python': 'Python entry path, preserving a virtualenv symlink; relative paths use this file location. Saved task environments do not change on resume.',
         'allow_execution': 'Allows process proposals only. Each actual command still needs approval.',
         'allow_network': 'Allows public source acquisition; does not authorize installations.',

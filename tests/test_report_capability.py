@@ -111,12 +111,12 @@ class CompositionArticleOwnerTests(unittest.TestCase):
                 self.assertEqual(revised.status, 'ok', revised.error)
                 self.assertIn('0.75', json.dumps(drafts[-1]['source_handles']))
                 self.assertTrue(drafts[-1]['prior_draft'])
-                self.assertEqual(drafts[-1]['edit_contract']['version'], 'exact_replacements.v1')
+                self.assertEqual(drafts[-1]['edit_contract']['version'], 'paragraph_replacements.v2')
                 feedback_snapshot = json.loads((task / 'tools/writing/feedback-native/writer/report_inputs.json').read_text())
                 self.assertEqual(feedback_snapshot['owner'], ARTICLE_OWNER)
                 self.assertEqual(feedback_snapshot['source_attempt'], 'feedback-native')
                 self.assertEqual(feedback_snapshot['inputs']['article'],
-                    {key: value for key, value in drafts[-1].items() if key != 'edit_contract'})
+                    {key: value for key, value in drafts[-1].items() if key not in {'edit_contract', 'draft_locator'}})
                 self.assertEqual(drafts[-1]['prior_draft'], workspace.resolve(produced.data['editable_markdown']).read_text())
                 self.assertEqual({p: p.read_bytes() for p in parent.rglob('*') if p.is_file()}, original)
                 with patch.object(gateway, 'client_factory', side_effect=AssertionError('No admission calls')) as factory:
@@ -447,8 +447,10 @@ class ReportAuditCapabilityTests(unittest.TestCase):
 
     def test_whole_article_preserves_structure_through_preview_and_delivery(self) -> None:
         code = '````text\n# Literal title\n## References\n```\nvalue with two spaces  \n````'
-        article = ('# Authored title\n\n## Findings\n\nSupported claim [@P1].\n\n'
-                   '### Calibration\n\n#### Limits\n\n' + code +
+        body_visuals = ('| Condition | Value |\n| --- | --- |\n| Recorded | 0.75 |\n\n'
+                        '![Recorded observation](assets/observation.svg)\n\nFigure: supplied observation.')
+        article = ('# Authored title\n\n## Findings\n\nSupported claim [@P1].\n\n' +
+                   body_visuals + '\n\n### Calibration\n\n#### Limits\n\n' + code +
                    '\n\n## Discussion\n\nBounded interpretation.\n\n'
                    '## References\n\nObsolete bibliography.')
         request = ReportAssemblyRequest(title="Task instructions", assembly_mode="whole_article",
@@ -468,6 +470,8 @@ class ReportAuditCapabilityTests(unittest.TestCase):
         self.assertIn("### Calibration\n\n#### Limits", preview.report_body_markdown)
         self.assertIn(code, preview.report_body_markdown)
         self.assertIn(code, preview.report_markdown)
+        self.assertIn(body_visuals, preview.report_body_markdown)
+        self.assertIn(body_visuals, preview.report_markdown)
         self.assertIn("Supported claim [@paper-1].", preview.report_body_markdown)
         self.assertIn("Supported claim [1].", preview.report_markdown)
         self.assertIn("## 1 Findings\n", preview.report_markdown)
@@ -677,6 +681,146 @@ class ArticleClient:
 
 
 class StructuredArticleWritingTests(unittest.TestCase):
+    def test_inspector_shared_producer_protocol_and_legacy_corrections_recover_exact_bytes(self):
+        from contextlib import nullcontext
+        from copy import deepcopy
+        from simple_ar.report.review_evidence import (
+            DELIVERY_REVIEW_CONTRACT, LOCATOR_REFERENCE_CONTRACT, SHARED_PRODUCER_LOCATOR_CONTRACT,
+            restore_delivery_producers,
+        )
+        request = self.request()
+        producer = {'owner': 'actual-owner', 'receipt': {'full': 'original record\n' * 300}}
+        artifacts = [{'path': f'source/{i}.csv', 'sha256': 'same-sha', 'text': 'Full attachment text.\n' * 100,
+            'coverage': 'complete', 'producer': {**producer, 'owner': owner},
+            'copy_contract': 'delivery_copies.v1', 'copies': [{'path': f'copy/{i}.csv', 'sha256': 'same-sha'}],
+            'consumers': [{'path': f'consumer/{i}'}]}
+            for i, owner in enumerate(('actual-owner', 'actual-owner', 'other-owner'))]
+        snapshot = {'contract': DELIVERY_REVIEW_CONTRACT, 'artifacts': artifacts,
+            'producer_declarations': [{'declarations': [{'id': 'original:0', 'statement': 'One observation only.'}],
+                'execution': {'status': 'Recorded original execution.'}}]}
+        original = deepcopy(snapshot)
+        context = request.report_context.model_copy(update={
+            'results': {**request.report_context.results, 'delivery_review': snapshot}})
+        for contract in (SHARED_PRODUCER_LOCATOR_CONTRACT, LOCATOR_REFERENCE_CONTRACT, None):
+            for correction in (False, True):
+                with self.subTest(contract=contract, correction=correction), tempfile.TemporaryDirectory() as tmp:
+                    first = ArtifactStore(Path(tmp) / 'first')
+                    calls = []
+                    class Client:
+                        def ask_json(self, system, prompt, **options):
+                            calls.append(json.loads(prompt))
+                            if correction and len(calls) == 1:
+                                return {'section_reviews': 'invalid format'}
+                            return {'section_reviews': [{'section_id': 'document', 'verdict': 'revise_required',
+                                'findings': [{'finding_id': 'attachment', 'section_id': 'document',
+                                    'type': 'unsupported_claim', 'severity': 'major', 'required_action': 'revise',
+                                    'message': 'Repair this attached claim.',
+                                    'delivery_targets': ['/delivery_artifacts/2/text'],
+                                    'evidence_quotes': [{'pointer': '/delivery_artifacts/2/text'}]}],
+                                'producer_claim_checks': [{'declaration_id': 'original:0',
+                                    'status': 'accepted_limitation', 'explanation': 'The original limitation is disclosed.',
+                                    'draft_quotes': [{'section_id': 'document', 'paragraph': 'p1'}],
+                                    'evidence_quotes': [{'pointer': '/producer_declarations/0/execution/status'}]}]}]}
+                    arguments = dict(identity='inspection', report_context=context, config=request.config,
+                        template=request.template, markdown='Complete current manuscript. One observation only.')
+                    # Only new requests choose a default. Historical v1 and absent
+                    # markers must continue reconstructing their original payloads.
+                    with (nullcontext() if contract == SHARED_PRODUCER_LOCATOR_CONTRACT else
+                            patch('simple_ar.report.writing.SHARED_PRODUCER_LOCATOR_CONTRACT', contract)):
+                        result = inspect_article(store=first, client=Client(), **arguments)
+                    self.assertEqual(len(calls), 2 if correction else 1)
+                    for view in calls:
+                        self.assertEqual(view.get('evidence_navigation_contract'), contract)
+                        self.assertEqual(restore_delivery_producers(view), artifacts)
+                        self.assertEqual(view['producer_declarations'], snapshot['producer_declarations'])
+                        self.assertEqual(view['sections'][0]['markdown'], arguments['markdown'])
+                        if contract == SHARED_PRODUCER_LOCATOR_CONTRACT:
+                            self.assertEqual(len(view['delivery_producers']), 2)
+                            self.assertEqual(view['delivery_artifacts'][0]['producer'],
+                                {'$ref': '/delivery_producers/0'})
+                        else:
+                            self.assertNotIn('delivery_producers', view)
+                            self.assertEqual(view['delivery_artifacts'], artifacts)
+                    if correction:
+                        for key in ('delivery_artifacts', 'delivery_producers', 'sections', 'evidence_locator'):
+                            self.assertEqual(calls[0].get(key), calls[1].get(key))
+                    delivery = result['delivery_review']
+                    self.assertEqual(delivery['status'], 'needs_revision')
+                    self.assertEqual(delivery['declaration_adoption']['producers'], snapshot['producer_declarations'])
+                    self.assertEqual(result['section_reviews'][0]['producer_claim_checks'][0]['evidence_quotes'][0]['role'],
+                        'executor_record')
+                    target = delivery['defects'][0]['targets'][0]
+                    self.assertEqual(target['path'], artifacts[2]['path'])
+                    self.assertEqual(target['producer'], artifacts[2]['producer'])
+                    self.assertEqual(target['copies'], artifacts[2]['copies'])
+                    self.assertEqual(target['consumers'], artifacts[2]['consumers'])
+                    records = {p.relative_to(first.root).as_posix(): p.read_bytes()
+                        for p in first.root.rglob('*.json')}
+                    recovered = ArtifactStore(Path(tmp) / 'recovered')
+                    self.assertEqual(inspect_article(store=recovered, resume_store=first, client=None,
+                        **{**arguments, 'identity': 'resumed'}), result)
+                    for name, raw in records.items():
+                        self.assertEqual(first.resolve(name).read_bytes(), raw)
+                        self.assertEqual(recovered.resolve(name).read_bytes(), raw)
+                    for prefix in ('', 'format_correction/') if correction else ('',):
+                        retained = first.read_json(prefix + 'request.json')
+                        self.assertEqual(retained.get('evidence_navigation_contract'), contract)
+                    self.assertEqual(snapshot, original)
+
+    def test_author_selected_evidence_and_inspector_full_text_keep_frozen_recovery(self):
+        import copy
+        import hashlib
+        from simple_ar.report.writing import ARTICLE_SYSTEM, write_whole_article
+        artifact = {'text': 'attachment-only sentinel', 'path': 'source0/table.csv', 'sha256': 'original',
+            'coverage': 'complete', 'producer': {'receipt': 'physical'}, 'consumers': [{'receipt': 'consumer'}],
+            'copies': [{'path': 'workspace/materials/table.csv', 'sha256': 'original'}],
+            'evidence_role': 'recorded_material'}
+        review = {'contract': 'delivery_artifacts.v1', 'artifacts': [artifact],
+            'producer_declarations': [{'declarations': [{'id': 'run:0', 'statement': 'Original limitation'}]}]}
+        inputs = {'article': {'title': 'Bound inputs', 'goal': 'Explain the original measurements',
+            'source_handles': [{'handle': 'original-source', 'metadata': {'evidence_passages': [
+                {'text': 'selected original evidence'}]}}, {'handle': 'figure:main.svg', 'artifact': 'main.svg'}],
+            'delivery_review': review, 'results': {'delivery_review': review, 'other': 'keep'}}}
+        original = copy.deepcopy(inputs)
+        for legacy_contract in ('new', None, 'article_delivery_once.v1'):
+            legacy = legacy_contract != 'new'
+            with self.subTest(contract=legacy_contract), tempfile.TemporaryDirectory() as tmp:
+                store = ArtifactStore(Path(tmp))
+                client = ArticleClient({'draft_markdown': 'Recorded observations.'})
+                if legacy:
+                    snapshot = {'owner': ARTICLE_OWNER, 'source_attempt': 'article',
+                        'system': ARTICLE_SYSTEM, 'inputs': inputs}
+                    if legacy_contract is not None:
+                        snapshot['prompt_contract'] = legacy_contract
+                    snapshot['snapshot_id'] = hashlib.sha256(json.dumps(snapshot,
+                        sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+                    store.write_json('report_inputs.json', snapshot)
+                    store.write_json('response.json', client.response)
+                write_whole_article(store=store, inputs=inputs, identity='article', client=client, recovering=legacy)
+                retained = {path: path.read_bytes() for path in store.root.iterdir() if path.is_file()}
+                if not legacy:
+                    prompt = client.calls[0][1]
+                    self.assertEqual(prompt['delivery_review'], {**review, 'artifacts': [
+                        {key: value for key, value in artifact.items() if key != 'text'}]})
+                    self.assertNotIn('attachment-only sentinel', json.dumps(prompt))
+                    self.assertIn('selected original evidence', json.dumps(prompt))
+                    self.assertIn('independent inspector receives complete frozen attachment text',
+                        prompt['attachment_text_scope'])
+                    self.assertEqual(prompt['goal'], inputs['article']['goal'])
+                    self.assertEqual(prompt['results'], {'other': 'keep'})
+                    self.assertEqual(prompt['source_handles'], inputs['article']['source_handles'])
+                    self.assertEqual(store.read_json('report_inputs.json')['prompt_contract'], 'article_authoring_evidence.v1')
+                else:
+                    self.assertEqual(store.read_json('report_inputs.json').get('prompt_contract'), legacy_contract)
+                # The inspector's input corpus retains the full original text,
+                # independent of the author-only projection and saved marker.
+                self.assertEqual(store.read_json('report_inputs.json')['inputs']['article']['delivery_review'], review)
+                calls = len(client.calls)
+                write_whole_article(store=store, inputs=inputs, identity='article', client=None, recovering=True)
+                self.assertEqual(len(client.calls), calls)
+                self.assertEqual({path: path.read_bytes() for path in retained}, retained)
+                self.assertEqual(inputs, original)
+
     def test_article_projection_keeps_exact_current_figure_paths_and_caption_instructions(self):
         from simple_ar.core.capabilities import ArtifactRef
         from simple_ar.report.writing import ARTICLE_SYSTEM, article_writing_inputs
@@ -750,6 +894,31 @@ class StructuredArticleWritingTests(unittest.TestCase):
                 client.ask_json('Evidence-bound writing', '{"section":"first"}',
                                 label='section-first', max_output_tokens=1000)
             self.assertEqual(provider.ask_json.call_count, 2)
+
+    def test_reviewed_section_calls_bind_candidate_not_repeated_role_label(self):
+        from simple_ar.integrations.llm import LLMError
+        from simple_ar.report.writing import retained_writing_client
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ArtifactStore(Path(tmp))
+            store.write_json('report_inputs.json', {'snapshot_id': 'frozen'})
+            provider = Mock()
+            provider.ask_json.side_effect = [{'verdict': 'revise'}, {'verdict': 'pass'}, LLMError('unknown')]
+            client = retained_writing_client(store=store, identity='sections', client=provider,
+                contract='atomic_complete.v2')
+            original = client.ask_json('Review', '{"candidate":"original"}', label='verifier')
+            revised = client.ask_json('Review', '{"candidate":"revised"}', label='verifier')
+            self.assertNotEqual(original, revised)
+            self.assertEqual(provider.ask_json.call_count, 2)
+            recovered = retained_writing_client(store=store, identity='sections', client=None,
+                contract='atomic_complete.v2')
+            self.assertEqual(recovered.ask_json('Review', '{"candidate":"revised"}', label='verifier'), revised)
+            self.assertTrue(Path(recovered.last_inspection_source['response_path']).is_file())
+            with self.assertRaisesRegex(LLMError, 'unknown'):
+                client.ask_json('Review', '{"candidate":"interrupted"}', label='verifier')
+            with self.assertRaisesRegex(ValueError, 'no blind replay'):
+                client.ask_json('Review', '{"candidate":"changed-after-interruption"}', label='verifier')
+            self.assertEqual(provider.ask_json.call_count, 3)
 
     def request(self, client=None):
         config = ReportRuntimeConfig(reviewer='disabled', max_review_iterations=0,
@@ -976,7 +1145,7 @@ class StructuredArticleWritingTests(unittest.TestCase):
                                 identity=producer + '-reject').status, 'error')
                         if producer == 'professional-sections':
                             unmarked = json.loads((parent / 'request.json').read_text())
-                            self.assertEqual(unmarked.pop('section_response_contract'), 'atomic_complete.v1')
+                            self.assertEqual(unmarked.pop('section_response_contract'), 'atomic_complete.v2')
                             with changed_record(parent / 'request.json', unmarked):
                                 publication = gateway.publication_source(produced.data['editable_markdown'],
                                     produced.data['report_binding'])
@@ -991,7 +1160,7 @@ class StructuredArticleWritingTests(unittest.TestCase):
                                         gateway.publication_source(produced.data['editable_markdown'],
                                             produced.data['report_binding'])
                             self.assertEqual(json.loads((parent / 'request.json').read_text())[
-                                'section_response_contract'], 'atomic_complete.v1')
+                                'section_response_contract'], 'atomic_complete.v2')
                             self.assertEqual(gateway.publication_source(produced.data['editable_markdown'],
                                 produced.data['report_binding']), publication)
                             self.assertEqual(new_client.ask_json.call_count, 1)
@@ -1021,7 +1190,7 @@ class StructuredArticleWritingTests(unittest.TestCase):
             self.assertEqual(article['metric_sources'][0]['value'], .75)
             self.assertEqual(article['results']['status'], 'partial')
             self.assertEqual(store.read_json('report_inputs.json')['edit_contract'], {
-                'version': 'exact_replacements.v1', 'max_replacements': 40, 'max_text_chars': 96_000})
+                'version': 'paragraph_replacements.v2', 'max_replacements': 40, 'max_text_chars': 96_000})
             self.assertIn('draft_markdown', store.read_json('response.json'))
             self.assertTrue(article['source_handles'][0]['metadata']['evidence_passages_truncated'])
             # The existing structured snapshot is still exact input data, not
@@ -1134,6 +1303,11 @@ class StructuredArticleWritingTests(unittest.TestCase):
             self.assertEqual(len(request.llm_client.calls), 1)
 
     def test_article_inspection_preserves_draft_and_recovers_both_responses(self):
+        from simple_ar.report.data_delivery import DELIVERY_RULES
+        from simple_ar.report.narrative import report_edit_scope
+        from simple_ar.report.writing import ARTICLE_REVIEW_BODY_CONTRACT
+        body_visuals = ('| Condition | Value |\n| --- | --- |\n| Recorded | 0.75 |\n\n'
+                        '![Recorded observation](assets/observation.svg)\n\nFigure: supplied observation.')
         case = self
         class Client(ArticleClient):
             def ask_json(self, system, prompt, **options):
@@ -1142,11 +1316,22 @@ class StructuredArticleWritingTests(unittest.TestCase):
                     view = json.loads(prompt)
                     case.assertIn('0.75', json.dumps(view['metric_sources']))
                     case.assertEqual(view['verified_execution_results']['status'], 'partial')
+                    case.assertIn(body_visuals, view['sections'][0]['markdown'])
+                    case.assertEqual(view['edit_scope'], report_edit_scope(['document'], author_owns_body=True))
+                    case.assertIn('body tables, image links and captions', view['edit_scope']['author_owned_components'])
+                    for protected in ('registered source data, measurements and execution records',
+                            'actual image bytes', 'generated references and citation numbering',
+                            'explicitly declared assembly-owned blocks'):
+                        case.assertIn(protected, view['edit_scope']['read_only_components'])
+                    case.assertEqual(view['assembly_owned_content'], [])
+                    case.assertEqual(view['length_observation']['assembly_additions_status'], 'no_declared_additions')
+                    case.assertTrue(all(rule not in view['focus'] for rule in DELIVERY_RULES))
                     return {'section_reviews': [{'section_id': 'document', 'verdict': 'revise_required',
                         'findings': [{'finding_id': 'extent', 'type': 'structure', 'severity': 'major',
                             'required_action': 'revise', 'message': 'Clarify the conclusion.'}]}]}
                 return self.response
         request = self.request(Client())
+        request.llm_client.response['draft_markdown'] += '\n\n' + body_visuals
         request = replace(request, config=request.config.model_copy(update={'reviewer': 'llm',
             'document_review': True, 'review_scope': 'document', 'max_review_iterations': 0}))
         with tempfile.TemporaryDirectory() as tmp:
@@ -1159,7 +1344,9 @@ class StructuredArticleWritingTests(unittest.TestCase):
 
             review = ArtifactStore(first.root / 'review')
             records = {name: review.read_json(name) for name in ('request.json', 'response.json')}
+            self.assertEqual(records['request.json']['body_ownership_contract'], ARTICLE_REVIEW_BODY_CONTRACT)
             for name, changed in (('request.json', {**records['request.json'], 'prompt': 'Changed'}),
+                    ('request.json', {**records['request.json'], 'body_ownership_contract': 'unknown'}),
                     ('response.json', None), ('response.json', {'raw_response': 'Rejected JSON'})):
                 with self.subTest(review_record=name), changed_record(review.resolve(name), changed):
                     blocked = ArtifactStore(Path(tmp) / 'blocked-review')
@@ -1171,6 +1358,7 @@ class StructuredArticleWritingTests(unittest.TestCase):
                     self.assertFalse(blocked.root.exists())
             self.assertEqual(len(request.llm_client.calls), 2)
             self.assertEqual(first.read_json('reviewed_writer.json')['sections'], first.read_json('writer.json')['sections'])
+            self.assertIn(body_visuals, first.read_json('reviewed_writer.json')['sections'][0]['draft_markdown'])
             self.assertEqual(first.read_json('reviewed_writer.json')['independent_review']['review_status'], 'needs_revision')
             self.assertEqual(first.read_json('reviewed_writer.json')['memory']['reviewer_findings'][0]['finding_id'], 'extent')
             ref = result.artifacts[0]
@@ -1182,8 +1370,77 @@ class StructuredArticleWritingTests(unittest.TestCase):
                 self.assertEqual(target.read_json(name), first.read_json(name))
             self.assertEqual(len(request.llm_client.calls), 2)
 
+        # Complete-candidate checks with the same transport identity still use
+        # section ownership unless the actual body owner explicitly opts in.
+        from simple_ar.report.editor import review_document
+        section = ReportSectionDraft(section_id='document', heading=request.report_context.topic,
+            draft_markdown=body_visuals)
+        client = Mock()
+        client.ask_json.return_value = {'section_reviews': [{'section_id': 'document', 'verdict': 'pass'}]}
+        arguments = dict(client=client, template=request.template,
+            memory=ReportMemory(objective='Inspect supplied prose'), sections=[section], config=request.config,
+            execution_summary={}, metric_summary={}, complete_candidate=True)
+        review_document(**arguments)
+        legacy_view = json.loads(client.ask_json.call_args.args[1])
+        self.assertEqual(legacy_view['edit_scope'], report_edit_scope(['document']))
+        self.assertTrue(all(rule in legacy_view['focus'] for rule in DELIVERY_RULES))
+        # An explicitly declared unavailable preview must remain protected and
+        # unknown, even when the body owner has an unrelated section identity.
+        client.ask_json.return_value = {'section_reviews': [{'section_id': 'article-body', 'verdict': 'pass'}]}
+        review_document(**{**arguments, 'sections': [section.model_copy(update={'section_id': 'article-body'})]},
+            author_owns_body=True, assembly_owned_content=[{'markdown': '', 'markdown_token_count': 0,
+                'preview_status': 'unavailable'}])
+        declared_view = json.loads(client.ask_json.call_args.args[1])
+        self.assertEqual(declared_view['edit_scope'], report_edit_scope(['article-body'], author_owns_body=True))
+        self.assertEqual(declared_view['length_observation']['assembly_additions_status'], 'declared_preview_unavailable')
+        self.assertFalse(declared_view['length_observation']['assembly_preview_complete'])
+        self.assertTrue(all(rule in declared_view['focus'] for rule in DELIVERY_RULES))
+
+    def test_review_terminal_closure_preserves_raw_and_negative_judgment_without_retry(self):
+        from simple_ar.report.writing import _retained_response
+        request = self.request()
+        rejected = {'section_reviews': [{'section_id': 'document', 'verdict': 'revise_required',
+            'findings': [{'finding_id': 'remaining', 'type': 'style', 'severity': 'minor',
+                'required_action': 'revise', 'message': 'Clarify this wording.',
+                'draft_quotes': [{'section_id': 'document', 'quote': 'Current original manuscript.'}]}]}]}
+        raw = json.dumps(rejected)[:-1]
+        for eligible, finish in ((True, None), (True, 'stop'), (False, 'length'), (True, 'length')):
+            with self.subTest(eligible=eligible, finish=finish), tempfile.TemporaryDirectory() as tmp:
+                store = ArtifactStore(Path(tmp) / 'first')
+                client = Mock()
+                client.ask_json.side_effect = LLMResponseError('Invalid JSON', raw_response=raw,
+                    correction_allowed=eligible, finish_reason=finish)
+                arguments = dict(identity='original', report_context=request.report_context,
+                    config=request.config, template=request.template, markdown='Current original manuscript.')
+                if finish == 'length':
+                    with self.assertRaises(LLMResponseError):
+                        inspect_article(store=store, client=client, **arguments)
+                    self.assertTrue(store.exists('response_error.json'))
+                    continue
+                result = inspect_article(store=store, client=client, **arguments)
+                self.assertEqual(result['review_status'], 'needs_revision')
+                self.assertEqual(client.ask_json.call_count, 1)
+                record = store.read_json('response.json')
+                self.assertEqual(record['response'], rejected)
+                self.assertEqual(record['normalization']['raw_response'], raw)
+                self.assertEqual(record['normalization']['appended_suffix'], '}')
+                self.assertFalse(store.exists('response_error.json'))
+                self.assertEqual(inspect_article(store=store, client=None, **arguments), result)
+                changed = {**record, 'normalization': {**record['normalization'], 'appended_suffix': ']'}}
+                with changed_record(store.resolve('response.json'), changed), self.assertRaises(ValueError):
+                    inspect_article(store=store, client=None, **arguments)
+                self.assertEqual(client.ask_json.call_count, 1)
+        with tempfile.TemporaryDirectory() as tmp:
+            # A saved old contract cannot acquire today's syntax policy.
+            store = ArtifactStore(Path(tmp))
+            with self.assertRaises(LLMResponseError):
+                _retained_response(store, 'request.json', {'response_record_contract': 'atomic_complete.v1'},
+                    lambda: (_ for _ in ()).throw(LLMResponseError('Invalid JSON', raw_response=raw)))
+            self.assertEqual(store.read_json('response.json'), {'raw_response': raw})
+
     def test_article_independent_format_correction_retains_failure_and_recovers_without_calls(self):
         from simple_ar.report.editor import DOCUMENT_FORMAT_CORRECTION_CONTRACT
+        from simple_ar.report.writing import ARTICLE_REVIEW_BODY_CONTRACT
         for second_bad in (False, True):
             with self.subTest(second_bad=second_bad), tempfile.TemporaryDirectory() as tmp:
                 request = self.request()
@@ -1219,8 +1476,11 @@ class StructuredArticleWritingTests(unittest.TestCase):
                 self.assertEqual([options['budget_call_id'] for _, options in calls],
                     ['original:review', 'original:review-format-correction'])
                 self.assertEqual(calls[0][0]['format_correction_contract'], DOCUMENT_FORMAT_CORRECTION_CONTRACT)
-                for key in ('sections', 'source_evidence', 'metric_sources', 'execution_evidence'):
+                for key in ('sections', 'source_evidence', 'metric_sources', 'execution_evidence', 'edit_scope', 'length_observation'):
                     self.assertEqual(calls[0][0][key], calls[1][0][key])
+                for prefix in ('', 'format_correction/'):
+                    self.assertEqual(first.read_json(prefix + 'request.json')['body_ownership_contract'],
+                        ARTICLE_REVIEW_BODY_CONTRACT)
                 self.assertEqual(first.read_json('response.json')['response'], rejected)
                 self.assertIn('scalar field', first.read_json('rejection.json')['validation_error'])
                 before = {p.relative_to(first.root).as_posix(): p.read_bytes() for p in first.root.rglob('*.json')}
@@ -1236,6 +1496,35 @@ class StructuredArticleWritingTests(unittest.TestCase):
                             self.assertEqual(recovered.resolve(name).read_bytes(), first.resolve(name).read_bytes())
                 for name, raw in before.items():
                     self.assertEqual(first.resolve(name).read_bytes(), raw)
+
+        # Freeze both requests using the pre-ownership payload, then replay
+        # under the new default. Absence of the marker must select legacy scope
+        # and delivery rules for the original AND its saved format correction.
+        from simple_ar.report.data_delivery import DELIVERY_RULES
+        from simple_ar.report.narrative import report_edit_scope
+        with tempfile.TemporaryDirectory() as tmp:
+            request = self.request()
+            first = ArtifactStore(Path(tmp) / 'legacy')
+            arguments = dict(identity='original', report_context=request.report_context,
+                config=request.config, template=request.template, markdown='Current original manuscript.')
+            client = Mock()
+            client.ask_json.side_effect = [rejected,
+                {'section_reviews': [{'section_id': 'document', 'verdict': 'pass'}]}]
+            with patch('simple_ar.report.writing.ARTICLE_REVIEW_BODY_CONTRACT', None):
+                result = inspect_article(store=first, client=client, **arguments)
+            for prefix in ('', 'format_correction/'):
+                saved = first.read_json(prefix + 'request.json')
+                self.assertNotIn('body_ownership_contract', saved)
+                view = json.loads(saved['prompt'])
+                self.assertEqual(view['edit_scope'], report_edit_scope(['document']))
+                self.assertTrue(all(rule in view['focus'] for rule in DELIVERY_RULES))
+                self.assertNotIn('assembly_additions_status', view['length_observation'])
+            before = {p.relative_to(first.root).as_posix(): p.read_bytes() for p in first.root.rglob('*.json')}
+            recovered = ArtifactStore(Path(tmp) / 'recovered')
+            self.assertEqual(inspect_article(store=recovered, resume_store=first, client=None, **arguments), result)
+            for name, raw in before.items():
+                self.assertEqual(first.resolve(name).read_bytes(), raw)
+                self.assertEqual(recovered.resolve(name).read_bytes(), raw)
 
     def test_article_review_unknown_and_legacy_rejection_never_authorize_new_requests(self):
         for phase in ('initial', 'correction', 'legacy', 'dual'):
@@ -1257,8 +1546,12 @@ class StructuredArticleWritingTests(unittest.TestCase):
                     config=request.config, template=request.template, markdown='Current original manuscript.')
                 if phase in {'legacy', 'dual'}:
                     import hashlib
-                    inspect_article(store=first, client=Client(), **arguments)
+                    # Create the pre-navigation request shape, not a hybrid
+                    # of a new short-reference contract and old quote schema.
+                    with patch('simple_ar.report.writing.SHARED_PRODUCER_LOCATOR_CONTRACT', None):
+                        inspect_article(store=first, client=Client(), **arguments)
                     saved = first.read_json('request.json')
+                    self.assertNotIn('evidence_navigation_contract', saved)
                     saved.pop('response_record_contract')
                     view = json.loads(saved['prompt'])
                     from simple_ar.report.review_evidence import EVIDENCE_QUOTE_RULES, EVIDENCE_QUOTE_SCHEMA
@@ -1453,7 +1746,7 @@ class StructuredArticleWritingTests(unittest.TestCase):
                     'required_action': 'revise', 'message': 'Clarify the prose.',
                     'draft_quotes': [{'section_id': 'document', 'quote': 'Supported prose [@P1].'}]}]}]},
             {'prior_draft_sha256': hashlib.sha256(b'Supported prose [@P1].').hexdigest(),
-                'replacements': [{'old_text': 'Supported prose [@P1].',
+                'replacements': [{'paragraph': 'p1', 'position': 'replace',
                     'new_text': 'Revised prose lost its attribution.'}]}]
         with tempfile.TemporaryDirectory() as tmp, patch.object(client, 'ask_json', side_effect=responses) as model:
             store = ArtifactStore(Path(tmp))
@@ -1481,7 +1774,7 @@ class StructuredArticleWritingTests(unittest.TestCase):
                 view = json.loads(prompt)
                 calls.append(view)
                 outer.assertEqual(view['prior_draft'], prior)
-                outer.assertEqual(view['edit_contract'], {'version': 'exact_replacements.v1',
+                outer.assertEqual(view['edit_contract'], {'version': 'paragraph_replacements.v2',
                     'max_replacements': 40, 'max_text_chars': 96_000,
                     'prior_draft_sha256': hashlib.sha256(prior.encode('utf-8')).hexdigest()})
                 outer.assertIn('Recorded value: 0.75.', json.dumps(view['source_handles']))
@@ -1531,6 +1824,27 @@ class StructuredArticleWritingTests(unittest.TestCase):
             {'draft_markdown': 'A full rewrite is not a patch.'},
             {'prior_draft_sha256': bound, 'replacements': [{'old_text': 'unique', 'new_text': 'new'}] * 41},
             {'prior_draft_sha256': bound, 'replacements': [{'old_text': 'unique', 'new_text': 'x' * 96_001}]},
+            {'prior_draft_sha256': bound, 'replacements': [
+                {'paragraph': 'p1', 'position': 'replace', 'new_text': 'Valid first edit.'},
+                {'paragraph': 'p2', 'position': 'after', 'new_text': 'Invalid ID.'}]},
+            {'prior_draft_sha256': bound, 'replacements': [
+                {'paragraph': 'p1', 'position': 'replace', 'new_text': 'Replacement.'},
+                {'paragraph': 'p1', 'position': 'after', 'new_text': 'Duplicate target.'}]},
+            {'prior_draft_sha256': bound, 'replacements': [
+                {'paragraph': 'p1', 'position': 'after', 'new_text': 'Comment.'},
+                {'old_text': 'unique', 'new_text': 'Intersecting exact edit.'}]},
+            {'prior_draft_sha256': bound, 'replacements': [
+                {'paragraph': 'p1', 'position': 'replace', 'new_text': 'Valid first edit.'},
+                {'old_text': 'missing table tail 0.74', 'new_text': 'Still rejects the whole group.'}]},
+            {'prior_draft_sha256': bound, 'replacements': [
+                {'paragraph': 'p1', 'position': 'replace', 'old_text': prior, 'new_text': 'Mixed.'}]},
+            *({'prior_draft_sha256': bound, 'replacements': [edit]} for edit in (
+                {'paragraph': 'p0', 'position': 'replace', 'new_text': 'Bad ID.'},
+                {'paragraph': 'p01', 'position': 'replace', 'new_text': 'Bad ID.'},
+                {'paragraph': 'p1', 'position': 'before', 'new_text': 'Unsupported position.'},
+                {'paragraph': 'p1', 'position': 'replace', 'new_text': ''},
+                {'paragraph': 'p1', 'position': 'after', 'new_text': 'x' * 96_001},
+            )),
         ]
         for index, response in enumerate(responses):
             with self.subTest(case=index), tempfile.TemporaryDirectory() as tmp:
@@ -1551,6 +1865,113 @@ class StructuredArticleWritingTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, 'complete bound record'):
                         write_whole_article(**arguments, recovering=True)
                 self.assertEqual(store.read_json('response.json'), retained)
+
+    def test_paragraph_article_edits_share_review_offsets_and_preserve_crlf(self):
+        import hashlib
+        import re
+        from simple_ar.report.review_evidence import draft_paragraph_spans, review_draft_locator
+        from simple_ar.report.writing import ARTICLE_PARAGRAPH_EDIT_SYSTEM, write_whole_article
+
+        prior = '  # 结果\r\n\r\n重复正文。\r\n \t\r\n重复正文。\r\n\r\n| 指标 | 值 |\r\n| --- | --- |\r\n| 观测 | 0.75 |  \r\n\r\n删除此段。\r\n'
+        paragraphs = [part.strip() for part in re.split(r'\r?\n[ \t]*\r?\n', prior) if part.strip()]
+        self.assertEqual([prior[a:b] for a, b in draft_paragraph_spans(prior)], paragraphs)
+        expected = prior.replace('重复正文。\r\n\r\n|', '第二处已澄清。\r\n\r\n|').replace(
+            '| 观测 | 0.75 |  ', '| 观测 | 0.75 |  \r\n\r\n注：只对应一次观测。').replace('删除此段。', '')
+        response = {'prior_draft_sha256': hashlib.sha256(prior.encode('utf-8')).hexdigest(),
+            'replacements': [
+                {'paragraph': 'p3', 'position': 'replace', 'new_text': '第二处已澄清。'},
+                {'paragraph': 'p4', 'position': 'after', 'new_text': '\r\n注：只对应一次观测。\r\n'},
+                {'paragraph': 'p5', 'position': 'replace', 'new_text': ''}]}
+        client = ArticleClient(response)
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ArtifactStore(Path(tmp) / 'first')
+            inputs = {'article': {'title': '结果', 'prior_draft': prior}}
+            written = write_whole_article(store=store, inputs=inputs, identity='paragraphs', client=client)
+            self.assertEqual(written['sections'][0]['draft_markdown'], expected)
+            system, prompt, _ = client.calls[0]
+            self.assertEqual(system, ARTICLE_PARAGRAPH_EDIT_SYSTEM)
+            self.assertEqual(prompt['draft_locator'], review_draft_locator(
+                {'sections': [{'section_id': 'document', 'markdown': prior}]})['document'])
+            self.assertEqual(prompt['draft_locator']['paragraph_count'], 5)
+            self.assertNotIn('paragraphs', prompt)
+            self.assertEqual(write_whole_article(store=ArtifactStore(Path(tmp) / 'resume'), inputs=inputs,
+                identity='new', client=client, resume_store=store), written)
+            snapshot = store.read_json('report_inputs.json')
+            for change in ({'version': 'exact_replacements.v1'}, {'prior_draft_sha256': '0' * 64}):
+                altered = {**snapshot, 'edit_contract': {**snapshot['edit_contract'], **change}}
+                altered['snapshot_id'] = hashlib.sha256(json.dumps(
+                    {k: v for k, v in altered.items() if k != 'snapshot_id'},
+                    sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+                with changed_record(store.resolve('report_inputs.json'), altered), self.assertRaises(ValueError):
+                    write_whole_article(store=store, inputs=inputs, identity='paragraphs', client=client, recovering=True)
+            self.assertEqual(len(client.calls), 1)
+
+    def test_frozen_v1_article_receipts_recover_or_reject_without_version_upgrade(self):
+        import hashlib
+        from simple_ar.report.writing import ARTICLE_EDIT_SYSTEM, ARTICLE_EDIT_CONTRACT, write_whole_article
+
+        def digest(value):
+            return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+        # Literal saved v1 wire shape, including the failing table-tail case.
+        prior = '原句。\n\n| 观测 | 0.75 |'
+        inputs = {'article': {'title': 'Saved v1', 'prior_draft': prior}}
+        for failing in (False, True):
+            with self.subTest(failing=failing), tempfile.TemporaryDirectory() as tmp:
+                store = ArtifactStore(Path(tmp) / 'original')
+                snapshot = {'owner': ARTICLE_OWNER, 'source_attempt': 'saved-v1', 'system': ARTICLE_EDIT_SYSTEM,
+                    'inputs': inputs, 'edit_contract': {**ARTICLE_EDIT_CONTRACT,
+                        'prior_draft_sha256': hashlib.sha256(prior.encode('utf-8')).hexdigest()},
+                    'prompt_contract': 'article_authoring_evidence.v1', 'response_record_contract': 'atomic_complete.v1'}
+                snapshot['snapshot_id'] = digest(snapshot)
+                response = {'prior_draft_sha256': snapshot['edit_contract']['prior_draft_sha256'],
+                    'replacements': [{'old_text': '原句。', 'new_text': '澄清后的句子。'}] + (
+                        [{'old_text': '| 观测 | 0.74 |', 'new_text': '注：未证明。'}] if failing else [])}
+                receipt = {'response': response, 'request_sha256': digest(snapshot), 'response_sha256': digest(response)}
+                store.write_json('report_inputs.json', snapshot)
+                store.write_json('response.json', receipt)
+                client = ArticleClient()
+                for attempt in range(2):
+                    target = ArtifactStore(Path(tmp) / f'resume-{attempt}')
+                    arguments = dict(store=target, inputs=inputs, identity='new', client=client, resume_store=store)
+                    if failing:
+                        with self.assertRaisesRegex(ValueError, 'match exactly once'):
+                            write_whole_article(**arguments)
+                        self.assertFalse(target.exists('writer.json'))
+                    else:
+                        written = write_whole_article(**arguments)
+                        self.assertEqual(written['sections'][0]['draft_markdown'], prior.replace('原句。', '澄清后的句子。'))
+                        self.assertEqual(target.read_json('report_inputs.json'), snapshot)
+                # Even with a recomputed snapshot ID, system/version disagreement is invalid.
+                for version in ('paragraph_replacements.v2', 'paragraph_replacements.v99'):
+                    altered = {**snapshot, 'edit_contract': {**snapshot['edit_contract'], 'version': version}}
+                    altered['snapshot_id'] = digest({k: v for k, v in altered.items() if k != 'snapshot_id'})
+                    with changed_record(store.resolve('report_inputs.json'), altered), self.assertRaises(ValueError):
+                        write_whole_article(store=store, inputs=inputs, identity='saved-v1', client=client, recovering=True)
+                self.assertEqual(client.calls, [])
+                self.assertEqual(store.read_json('response.json'), receipt)
+
+        # Old no-model candidate receipts also retain their v1 correction policy.
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate = Path(tmp) / 'candidate.md'
+            candidate.write_bytes(prior.encode('utf-8'))
+            inputs = {'article': {'title': 'Supplied v1', 'prior_draft': prior},
+                'candidate_source': {'path': str(candidate.resolve()),
+                    'sha256': hashlib.sha256(candidate.read_bytes()).hexdigest()}}
+            store = ArtifactStore(Path(tmp) / 'supplied')
+            snapshot = {'owner': ARTICLE_OWNER, 'source_attempt': 'supplied-v1', 'inputs': inputs,
+                'producer': {'kind': 'supplied_candidate.v1', **inputs['candidate_source']},
+                'edit_contract': {**ARTICLE_EDIT_CONTRACT,
+                    'prior_draft_sha256': hashlib.sha256(prior.encode('utf-8')).hexdigest()}}
+            snapshot['snapshot_id'] = digest(snapshot)
+            store.write_json('report_inputs.json', snapshot)
+            client = ArticleClient()
+            target = ArtifactStore(Path(tmp) / 'recovered')
+            written = write_whole_article(store=target, inputs=inputs, identity='new', client=client, resume_store=store)
+            self.assertEqual(written['sections'][0]['draft_markdown'], prior)
+            self.assertEqual(target.read_json('report_inputs.json'), snapshot)
+            self.assertFalse(target.exists('response.json'))
+            self.assertEqual(client.calls, [])
 
     def test_article_patch_interruption_and_historical_fulltext_keep_original_contracts(self):
         import hashlib

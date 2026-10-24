@@ -153,9 +153,17 @@ class ProjectEnvironmentTests(unittest.TestCase):
                 self.assertEqual(app.ledger.limits['process_wall_seconds'], defaults['process_wall_seconds'])
                 self.assertEqual(app.ledger.remaining('process_invocations'), 0)
                 self.assertEqual(len(app.ledger.entries), 2)
-                self.assertEqual(len(app.session.list_attempts()), 1)
-                observed = app.session.store.read_json(app.state['turns'][0]['tools'][0]['result'])
+                observations = [app.session.store.read_json(item['result'])
+                    for turn in app.state['turns'] for item in turn['tools']]
+                self.assertEqual([row['tool_name'] for row in observations],
+                    ['update_work_plan', 'measure_experiment'])
+                self.assertTrue(all(row['status'] == 'ok' for row in observations), observations)
+                self.assertEqual(observations[0]['data']['report_intent']['kind'], 'none')
+                attempts = app.session.list_attempts()
+                self.assertEqual([row.capability for row in attempts], ['native_tool', 'native_tool'])
+                observed = observations[1]
                 canonical = app.workspace.resolve(observed['data']['result_ref'])
+                self.assertEqual(canonical.parent.name, attempts[1].attempt_id)
                 self.assertEqual({entry.attempt_id for entry in app.ledger.entries}, {canonical.parent.name})
                 measured = json.loads(canonical.read_text(encoding='utf-8'))
                 self.assertEqual(measured['metrics'], {'score': 0.5})

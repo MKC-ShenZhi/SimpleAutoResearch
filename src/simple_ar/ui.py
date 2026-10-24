@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
+import io
 from itertools import islice
 import json
 import mimetypes
@@ -14,19 +16,22 @@ import os
 from pathlib import Path
 import re
 import secrets
+import sys
 import threading
+import tomllib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 from simple_ar.app.tool_application import ToolApplication
 from simple_ar.cli.project_tasks import discover_project_tasks
-from simple_ar.cli.start import add_start_parser, native_creation_options
+from simple_ar.cli.start import add_start_parser, migrate_new_start, native_creation_options
+from simple_ar.cli.task_options import apply_task_config
 from simple_ar.core.budget import BudgetLedger
 from simple_ar.integrations.llm import LLMClient
 from simple_ar.integrations.model_profiles import load_model_catalog
 from simple_ar.tools.sources import SourceToolGateway
 from simple_ar.tools.implementation import ImplementationToolGateway
-from simple_ar.tools.workspace import WorkspaceToolGateway, resolve_mounted_path, resolve_source_mount
+from simple_ar.tools.workspace import RetainedDelivery, WorkspaceToolGateway, resolve_mounted_path, resolve_source_mount
 
 
 def native_arguments() -> argparse.Namespace:
@@ -88,6 +93,7 @@ class Workspace:
         self.lock = threading.Lock()
         self.workers: dict[str, tuple[threading.Thread, threading.Event]] = {}
         self.errors: dict[str, str] = {}
+        self.creation_key = secrets.token_bytes(32)
 
     def task(self, name: str) -> Path:
         # Discovery exposes native direct-child names, not an ASCII identifier.
@@ -134,6 +140,11 @@ class Workspace:
     def creation_defaults(self) -> dict:
         args = native_arguments()
         options = native_creation_options(args)
+        # These options select creation-time state owners in create(), not
+        # resource configuration. The preview must not create a task merely
+        # to consume them, or forward them to the narrower configuration API.
+        for key in ('professional_inputs', 'context_protocol'):
+            options.pop(key, None)
         # The native configuration owner resolves automatic process limits.
         # No model or material is authorized for this read-only projection.
         options.update(model=None, sources={})
@@ -150,6 +161,148 @@ class Workspace:
             raise ValueError('A named Chat binding is required')
         return binding, hashlib.sha256(json.dumps(binding, sort_keys=True).encode()).hexdigest()
 
+    def extension_grants(self, entries: list[Path]) -> dict[str, str]:
+        """Access preflight only; the extension owner validates/freezes contracts.
+
+        Inspect descriptor path references before freeze_extensions can read them.
+        Do not import Python or treat read_only/plan as an OS sandbox.
+        """
+        descriptors = {}
+        for entry in entries:
+            path = self.read(entry)
+            path = self.read(path / 'extension.toml') if path.is_dir() else path
+            if path.stat().st_size > 65536:
+                raise ValueError('Extension descriptor exceeds display limit')
+            raw = path.read_bytes()
+            doc = tomllib.loads(raw.decode('utf-8'))
+            meta = doc.get('extension', {})
+            references = [*meta.get('resources', [])]
+            if meta.get('instructions'):
+                references.append(meta['instructions'])
+            references.extend(tool['implementation'] for tool in doc.get('tools', []))
+            for reference in references:
+                self.read(path.parent / reference)
+            descriptors[str(path)] = hashlib.sha256(raw).hexdigest()
+        return descriptors
+
+    def creation_inputs(self, data: dict) -> tuple[argparse.Namespace, str | None]:
+        args = native_arguments()
+        args._explicit_start_destinations = set()
+        config_digest = None
+        if data.get('task_config'):
+            args.task_config = self.read(Path(data['task_config']).expanduser().absolute())
+            if args.task_config.stat().st_size > 65536:
+                raise ValueError('Task configuration must be at most 64 KiB')
+            config_digest = hashlib.sha256(args.task_config.read_bytes()).hexdigest()
+            apply_task_config(args)
+            if hashlib.sha256(args.task_config.read_bytes()).hexdigest() != config_digest:
+                raise ValueError('Task configuration changed during inspection')
+            if ('output_root' in args._explicit_start_destinations
+                    and args.output_root != self.tasks.resolve()):
+                raise ValueError('Task output_root must match the UI launch task root')
+        else:
+            args.request = data['goal']
+            args.model = data['model']
+            args.source = [Path(p) for p in data['materials']]
+            args.allow_execution = data.get('execution') is True
+            args.allow_network = data.get('network') is True
+            for field, destination in (('max_turns', 'max_turns'), ('max_tokens', 'max_tokens'),
+                    ('process_invocations', 'max_processes'), ('process_wall_seconds', 'max_process_seconds')):
+                value = data[field]
+                allowed = {int, float} if field == 'process_wall_seconds' else {int}
+                if type(value) not in allowed:
+                    raise ValueError('Use numeric hard caps; task owner validates their bounds')
+                setattr(args, destination, value)
+        # Check every material before common migration inspects package contents.
+        for field in ('source', 'document', 'material', 'data_path'):
+            setattr(args, field, [self.read(Path(p).expanduser().absolute()) for p in getattr(args, field)])
+        for field in ('project', 'data_file'):
+            if getattr(args, field) is not None:
+                setattr(args, field, self.read(getattr(args, field)))
+        args.extensions = [self.read(p) for p in args.extensions]
+        if args.from_session is not None:
+            args.from_session = self.read(args.from_session)
+            args._material_authorize = self.read
+            args._material_preflight = self.material_grants
+        # Common CLI migration rechecks declared analysis packages. Grant their
+        # explicitly referenced attachments BEFORE that owner opens any bytes.
+        # This is path admission, not a second package validator or importer.
+        self.material_grants(args.material)
+        if not (args.request or args.goal or '').strip():
+            raise ValueError('Supply a nonempty task goal')
+        # UI main detaches terminal input. These flags suppress access/selection
+        # questions: the browser previews and confirms the complete projection.
+        args.yes = args.prepare_only = True
+        migrate_new_start(args)
+        args.source = [self.read(p) for p in args.source]
+        args.request = args.request or args.goal
+        catalog = load_model_catalog()
+        if catalog is None or (args.model and args.model != 'env' and not args.model.startswith(('profile:', 'route:'))):
+            raise ValueError('Select a named Chat connection')
+        name, _ = catalog.select(None if args.model == 'env' else args.model, purpose='text')
+        args.model = 'profile:' + name
+        if args.model not in {p['selector'] for p in self.profiles()}:
+            raise ValueError('Select an available named Chat profile')
+        _, identity = self.connection(args.model)
+        if not data.get('task_config') and data.get('binding_id') != identity:
+            raise ValueError('Connection changed after selection')
+        return args, config_digest
+
+    def material_grants(self, paths: list[Path]) -> None:
+        """Admit selected package references before the common importer reads them."""
+        for path in paths:
+            path = self.read(path)
+            if path.is_file() and path.suffix.lower() == '.json':
+                if path.stat().st_size > 16 * 1024 * 1024:
+                    raise ValueError('Material exceeds UI inspection limit')
+                payload = json.loads(path.read_text(encoding='utf-8-sig'))
+                schema = str(payload.get('schema_version', '')) if isinstance(payload, dict) else ''
+                if schema.startswith('table_analysis.'):
+                    self.read(path.parent / payload['source']['path'])
+                elif schema.startswith('code_analysis.'):
+                    for relative in [*payload['files'], 'outputs/results.json']:
+                        self.read(path.parent / relative)
+
+    def creation_configuration(self, root: Path, goal: str, options: dict) -> tuple:
+        descriptors = self.extension_grants(options['extensions'])
+        projected = {k: v for k, v in options.items() if k not in {'professional_inputs', 'context_protocol'}}
+        result = ToolApplication._configuration(root, goal, **projected)
+        for extension in result[0].get('extensions', []):
+            if descriptors.get(extension['path']) != extension['descriptor_sha256']:
+                raise ValueError('Extension descriptor changed during inspection')
+        return result
+
+    def creation_identity(self, args: argparse.Namespace, config_digest: str | None,
+                          options: dict, result: tuple) -> tuple[str, dict | None]:
+        image = None
+        if args.max_images:
+            name, profile = load_model_catalog().select(purpose='image')
+            image = {'profile': name, **profile.model_dump(mode='json')}
+        frozen = dict(goal=args.request, task_config=str(args.task_config) if args.task_config else None,
+                      config_digest=config_digest, options=options, configuration=result, image=image)
+        seal = hmac.new(self.creation_key, json.dumps(frozen, sort_keys=True, default=str,
+            allow_nan=False).encode(), hashlib.sha256).hexdigest()
+        return seal, image
+
+    def preview_creation(self, data: dict) -> dict:
+        args, digest = self.creation_inputs(data)
+        options = native_creation_options(args)
+        config, _, limits, attempts = result = self.creation_configuration(self.tasks, args.request, options)
+        seal, image = self.creation_identity(args, digest, options, result)
+        binding = config['model_connection']
+        recipients = _model_recipients(binding)
+        if config.get('vision_connection'):
+            recipients['vision'] = _model_recipients(config['vision_connection'])['task']
+        if image:
+            recipients['image'] = {k: image[k] for k in ('profile', 'api', 'base_url', 'model')}
+        return dict(preview_id=seal, goal=args.request, task_config=str(args.task_config) if args.task_config else None,
+            creation_declarations=config['creation_declarations'],
+            task_root=str(self.tasks), model=config['model'],
+            binding_id=hashlib.sha256(json.dumps(binding, sort_keys=True).encode()).hexdigest(),
+            recipients=recipients, sources=config['sources'], project_python=config['project_python'],
+            access={k: config[k] for k in ('allow_execution', 'allow_network', 'allow_vision')},
+            limits=limits, attempts=attempts, extensions=config.get('extensions', []))
+
     def listing(self) -> list[dict]:
         tasks, _ = discover_project_tasks(self.tasks)
         return [dict(task='.' if task.path == self.tasks else task.path.name,
@@ -157,6 +310,12 @@ class Workspace:
 
     def validate_sources(self, root: Path) -> None:
         config = self.record(root, 'actions.json')['config']
+        for extension in config.get('extensions', []):
+            descriptor = self.read(Path(extension['path']))
+            if self.extension_grants([descriptor]).get(str(descriptor)) != extension['descriptor_sha256']:
+                raise ValueError('Retained extension descriptor changed')
+            for relative in extension['files']:
+                self.read(descriptor.parent / relative)
         for source in config.get('sources', {}).values():
             path = Path(source)
             if path.is_relative_to(root / 'evidence'):
@@ -180,26 +339,37 @@ class Workspace:
                     or state['turns'][-1]['remaining']):
                 return result
             try:
-                self.validate_sources(root)
                 for directory in ('workspace', 'evidence'):
                     if not bounded(root / directory, root).is_dir():
                         return result
-                groups = ToolApplication.load(root).reusable_materials()
-                files = []
+                def admit(path):
+                    if path.is_relative_to(root):
+                        return bounded(path, root)
+                    return self.read(path)
+                groups = RetainedDelivery(root, authorize=admit).reusable_materials()
+                files, unavailable = [], set()
                 for group, paths in groups.items():
                     for path in paths:
                         for mount in ('workspace', 'evidence'):
                             if path.is_relative_to(root / mount):
                                 relative = path.relative_to(root / mount).as_posix()
-                                self.file(name, mount, relative)
+                                try:
+                                    self.file(name, mount, relative)
+                                except ValueError:
+                                    # The native owner already checked every
+                                    # delivered byte. HTTP preview policy is a
+                                    # separate, narrower display capability.
+                                    unavailable.add(path)
+                                    break
                                 files.append(dict(group=group, mount=mount, path=relative, name=path.name))
                                 break
                 if (self.record(root, 'session_manifest.json') != manifest
                         or self.record(root, 'actions.json') != state):
                     return result
-                result.update(current=True, label='当前可复用交付（原 owner 核查；不认证科研质量）', files=files)
-            except Exception:
-                pass
+                result.update(current=True, label='当前可复用交付（原 owner 核查；不认证科研质量）',
+                              files=files, unavailable_file_count=len(unavailable))
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                result['diagnostic'] = public_text(str(exc))
             return result
 
     def snapshot(self, name: str) -> dict:
@@ -298,8 +468,10 @@ class Workspace:
             live = bool(worker and worker[0].is_alive())
             stopping = bool(live and worker[1].is_set())
             error = self.errors.get(name)
+            local_workers = [task for task, (thread, _) in self.workers.items() if thread.is_alive()]
         return dict(task=name, mode='live execution' if live else 'saved results browser',
             worker_live=live, stop_requested=stopping, worker_error=error,
+            local_workers=local_workers,
             manifest={k: manifest.get(k) for k in ('session_id', 'topic', 'status', 'status_reason',
                 'current_attempt', 'revision', 'budget', 'updated_at')},
             requests=state['requests'], plan=plan, pending=pending_view, approval=approval,
@@ -368,29 +540,31 @@ class Workspace:
         with self.lock:
             if any(t.is_alive() for t, _ in self.workers.values()):
                 raise ValueError('Wait for the current local worker before mutating tasks')
+            if op == 'preview_create':
+                return self.preview_creation(data)
             if op == 'create':
                 if data.get('confirmed') is not True:
                     raise ValueError('Confirm displayed access and hard caps')
-                selector = data['model']
-                if selector not in {p['selector'] for p in self.profiles()}:
-                    raise ValueError('Select an available named Chat profile')
-                _, identity = self.connection(selector)
-                if data.get('binding_id') != identity:
-                    raise ValueError('Connection changed after confirmation')
-                args = native_arguments()
-                args.model = selector
-                args.source = [self.read(Path(p)) for p in data['materials']]
-                args.allow_execution = data.get('execution') is True
-                args.allow_network = data.get('network') is True
+                args, _ = self.creation_inputs(data)
                 root = self.task('task-' + secrets.token_hex(8))
-                for field, destination in (('max_turns', 'max_turns'), ('max_tokens', 'max_tokens'),
-                        ('process_invocations', 'max_processes'), ('process_wall_seconds', 'max_process_seconds')):
-                    value = data[field]
-                    allowed = {int, float} if field == 'process_wall_seconds' else {int}
-                    if type(value) not in allowed:
-                        raise ValueError('Use numeric hard caps; task owner validates their bounds')
-                    setattr(args, destination, value)
-                ToolApplication.create(root, data['goal'], **native_creation_options(args))
+                workspace = self
+
+                class ConfirmedCreation(ToolApplication):
+                    @classmethod
+                    def _configuration(cls, root, goal, **kwargs):
+                        # Gate the actual owner's final projection BEFORE any
+                        # session/ledger writes. No retained UI config or task.
+                        current, digest = workspace.creation_inputs(data)
+                        if goal != current.request:
+                            raise ValueError('Task request changed during creation')
+                        options = native_creation_options(current)
+                        result = workspace.creation_configuration(root, current.request, options)
+                        identity, _ = workspace.creation_identity(current, digest, options, result)
+                        if not hmac.compare_digest(str(data.get('preview_id', '')), identity):
+                            raise ValueError('Effective configuration changed; preview and confirm again')
+                        return result
+
+                ConfirmedCreation.create(root, args.request, **native_creation_options(args))
                 return {'task': root.name}
             root = self.task(name)
             # Launch grants also constrain execution of retained tasks. An old
@@ -555,6 +729,8 @@ def main():
     parser.add_argument('--task-root', type=Path, required=True)
     parser.add_argument('--port', type=int, default=0)
     args = parser.parse_args()
+    # A thin HTTP consumer never asks the launch terminal CLI intake questions.
+    sys.stdin = io.StringIO()
     workspace = Workspace(args.project_root.absolute(), [p.absolute() for p in args.read_root],
                           args.task_root.absolute())
     httpd = server(workspace, args.port)

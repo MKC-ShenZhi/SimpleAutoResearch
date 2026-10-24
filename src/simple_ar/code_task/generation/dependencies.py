@@ -86,6 +86,25 @@ def _scan_installed_packages() -> dict[str, dict[str, Any]]:
     return dict(sorted(packages.items()))
 
 
+def dependency_observation_view(advice: dict[str, Any]) -> dict[str, Any]:
+    """Supply actual observed names/versions, not topic-selected recommendations.
+
+    A different target remains unknown. No subprocess is used to inspect it by
+    proxy, and metadata never certifies imports or permits package installation.
+    """
+    known = (advice.get('target_matches_inspecting_interpreter') is True
+        and advice.get('environment_scope') == 'inspecting_interpreter_metadata')
+    return {key: advice.get(key) for key in (
+        'schema_version', 'environment_scope', 'inspecting_python_executable',
+        'target_python_executable', 'target_matches_inspecting_interpreter',
+        'environment_package_count')} | {
+        'observed_distributions': [{key: row.get(key) for key in ('package', 'version', 'import_names')}
+            for row in advice.get('environment_packages', [])] if known else None,
+        'scope': 'Observed distribution metadata only. Unlisted/unreadable distributions and import or '
+            'binary compatibility are not certified absent/present. A different target is unknown. '
+            'No imports, subprocesses, installation or method substitution are authorized.'}
+
+
 def _term_in_text(term: str, text: str) -> bool:
     spelling = r'[-_.]+'.join(re.escape(part) for part in re.split(r'[-_.]+', term))
     return bool(term and re.search(r'(?<![\w-])' + spelling + r'(?![\w-])', text, re.IGNORECASE))

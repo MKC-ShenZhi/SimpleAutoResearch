@@ -34,6 +34,7 @@ from simple_ar.integrations.llm import (
     _call_openai_sdk,
     _request_for_api_mode,
     estimate_tokens,
+    normalize_terminal_json_object,
     parse_json_object,
 )
 
@@ -717,6 +718,76 @@ class LLMParsingTests(unittest.TestCase):
 
     def test_parse_direct_json_object(self) -> None:
         self.assertEqual(parse_json_object('{"a": 1}'), {"a": 1})
+
+    def test_terminal_json_closure_preserves_exact_input_and_suffix(self) -> None:
+        for raw, suffix in (
+            ('{}', ''),
+            (' \t{"a": [1, true, null]}\r\n', ''),
+            ('{', '}'),
+            ('{"a": [', ']}'),
+            ('{"a": {', '}}'),
+            ('{"a": [{"b": "done"}', ']}'),
+            ('{"a": [{"b": []', '}]}'),
+            ('{"a": [true, false, null', ']}'),
+            (' \n{"a": {"b": "done" \t\n', '}}'),
+            (json.dumps({'a': ['brackets } ] { [', 'escaped " quote', 'slash \\']})[:-1], '}'),
+            (r'{"a": "\u00e9\n\t\/"', '}'),
+            ('{"a": 0', '}'),
+            ('{"a": -12', '}'),
+            ('{"a": 1.25', '}'),
+            ('{"a": 2e+3', '}'),
+        ):
+            with self.subTest(raw=raw):
+                expected = json.loads(raw + suffix)
+                self.assertEqual(normalize_terminal_json_object(raw), (expected, suffix))
+                self.assertEqual(normalize_terminal_json_object(raw + suffix), (expected, ''))
+                if suffix:
+                    self.assertIsNone(parse_json_object(raw))
+
+    def test_terminal_json_closure_rejects_incomplete_tokens_and_interior_damage(self) -> None:
+        for raw in (
+            '', ' \n', '[]', '[{"a": 1}', 'true', '123',
+            '```json\n{"a": 1', 'prefix {"a": 1', '{"a": 1} suffix',
+            '{} {}', '{"a": 1}\n[]', '\ufeff{"a": 1', '\v{"a": 1',
+            '{"a": "unfinished', '{"a": "escape' + '\\',
+            r'{"a": "escaped quote\"', r'{"a": "\u12',
+            r'{"a": "\uZZZZ"', r'{"a": "\q"',
+            '{"a": "raw\ncontrol"',
+            '{"a": tru', '{"a": fals', '{"a": nul',
+            '{"a":', '{"a"', '{"a": 1,', '{"a": [1,',
+            '{"a": [1,]}', '{"a": 1,}', '{"a": 1, "b":',
+            '{"a": 1, "b"', '{"a": 1, "b', '{"a" 1',
+            '{a: 1', '{"a": , "b": {}', '{"a": [1 2',
+            '{"a": [}', '{"a": {]', '{"a": []}}',
+            '{"a": true false', '{"a": -', '{"a": 01',
+            '{"a": 1.', '{"a": 1e', '{"a": 1e+', '{"a": +1',
+            '{"a": NaN', '{"a": Infinity', '{"a": -Infinity',
+            '{"a": 1 /* comment */',
+        ):
+            with self.subTest(raw=raw):
+                self.assertIsNone(normalize_terminal_json_object(raw))
+
+    def test_terminal_json_closure_rejects_duplicate_keys_at_any_depth(self) -> None:
+        for raw in (
+            '{"a": 1, "a": 2}', '{"a": 1, "a": 2',
+            '{"outer": [{"a": 1, "a": 2}',
+            r'{"a": 1, "\u0061": 2',
+        ):
+            with self.subTest(raw=raw):
+                self.assertIsNone(normalize_terminal_json_object(raw))
+
+    def test_terminal_json_closure_bounds_depth_and_suffix(self) -> None:
+        for depth in (63, 64, 65):
+            raw = '{"a":' + '[' * (depth - 1)
+            suffix = ']' * (depth - 1) + '}'
+            for closed in (False, True):
+                candidate = raw + suffix if closed else raw
+                with self.subTest(depth=depth, closed=closed):
+                    if depth > 64:
+                        self.assertIsNone(normalize_terminal_json_object(candidate))
+                    else:
+                        self.assertEqual(normalize_terminal_json_object(candidate),
+                                         (json.loads(raw + suffix), '' if closed else suffix))
 
     def test_parse_fenced_json_object(self) -> None:
         text = 'Here:\n```json\n{"a": 1, "b": "x"}\n```'

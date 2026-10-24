@@ -1,0 +1,2631 @@
+"""Writing-owner presentation preserves receipts and actionable review feedback."""
+import json
+import hashlib
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import Mock, PropertyMock, patch
+
+from simple_ar.tools.specs import ToolResult
+from simple_ar.tools.writing import ComposeRequest, WritingToolGateway
+from simple_ar.tools.workspace import FileWindow, WorkspaceToolGateway
+from simple_ar.core.budget import BudgetLedger
+from simple_ar.core.capabilities import ArtifactStore
+from simple_ar.report.schema import ReportSectionReview, ReviewerFinding
+from simple_ar.report.review_evidence import restore_delivery_producers
+
+
+class ProducerDeclarationReviewTests(unittest.TestCase):
+    """Review response contracts only; these fixtures certify no execution."""
+    def setUp(self):
+        from simple_ar.report.review_evidence import DELIVERY_REVIEW_CONTRACT, DECLARATION_ADOPTION_CONTRACT
+        self.group = {'execution_ref': 'records/run/candidate_execution.json',
+            'declarations': [{'id': 'run:0', 'statement': 'Artifacts require execution'},
+                {'id': 'run:1', 'statement': 'The source supplies no physical unit'}],
+            'goal': 'Report the supplied measurements without inventing units',
+            'execution': {'status': 'run_succeeded', 'returncode': 0, 'output_sha256': {'table.csv': 'fixture'}}}
+        self.snapshot = {'contract': DELIVERY_REVIEW_CONTRACT, 'artifacts': [],
+            'producer_declarations': [self.group]}
+        self.view = {'delivery_review_contract': DELIVERY_REVIEW_CONTRACT,
+            'declaration_adoption_contract': DECLARATION_ADOPTION_CONTRACT,
+            'delivery_artifacts': [], 'producer_declarations': [self.group],
+            'sections': [{'section_id': 'results', 'heading': 'Results',
+                'markdown': 'Values retain the unspecified source unit.'}]}
+        self.checks = [{'declaration_id': 'run:0', 'status': 'satisfied_by_execution',
+            'explanation': 'The executor binds the produced output bytes.',
+            'evidence_quotes': [{'pointer': '/producer_declarations/0/execution/status'}]},
+            {'declaration_id': 'run:1', 'status': 'accepted_limitation',
+             'explanation': 'The goal does not authorize invented units; the manuscript discloses the limit.',
+             'draft_quotes': [{'section_id': 'results', 'quote': 'Values retain the unspecified source unit.'}],
+             'evidence_quotes': [{'pointer': '/producer_declarations/0/execution/returncode'}]}]
+
+    def _reviews(self, checks, **changes):
+        from simple_ar.report.editor import _validate_document_reviews
+        from simple_ar.report.schema import ReportSectionDraft
+        return _validate_document_reviews({'section_reviews': [{'section_id': 'results',
+            'verdict': 'pass', 'findings': [], 'producer_claim_checks': checks, **changes}]},
+            sections=[ReportSectionDraft(section_id='results', heading='Results',
+                draft_markdown=self.view['sections'][0]['markdown'])], prior_by_key={}, evidence_view=self.view)
+
+    def test_goal_findings_keeps_located_notes_without_per_note_adoption(self):
+        from simple_ar.integrations.llm import LLMResponseError
+        from simple_ar.report.review_evidence import delivery_review_result, resolve_review_evidence
+        group = {'prepared_result': 'records/run/implementation/result.json',
+            'prepared_sha256': 'retained-preparation', 'source_binding_sha256': 'retained-request',
+            'goal': self.group['goal'], 'notes': [row['statement'] for row in self.group['declarations']],
+            'execution': self.group['execution']}
+        for target in (self.view, self.snapshot):
+            target.pop('producer_declarations')
+            target.pop('declaration_adoption_contract', None)
+            target.update(producer_completion='goal_findings.v1', producer_notes=[group])
+        reviews = self._reviews([])
+        result = delivery_review_result(self.snapshot, reviews)
+        self.assertEqual(result['status'], 'reviewed')
+        self.assertEqual(result['producer_notes'], [group])
+        self.assertNotIn('declaration_adoption', result)
+        checks = json.loads(json.dumps(self.checks))
+        checks[0]['evidence_quotes'] = [{'pointer': '/producer_notes/0/execution/status'}]
+        checks[1]['evidence_quotes'] = [{'pointer': '/producer_notes/0/execution/returncode'}]
+        with self.assertRaisesRegex(LLMResponseError, 'does not accept'):
+            self._reviews(checks)
+        resolved = resolve_review_evidence({'findings': [{'evidence_quotes': [
+            {'pointer': '/producer_notes/0/notes/0'},
+            {'pointer': '/producer_notes/0/execution/status'}]}]}, self.view)
+        self.assertEqual([row['role'] for row in resolved['findings'][0]['evidence_quotes']],
+            ['declaration', 'executor_record'])
+        with self.assertRaises(LLMResponseError):
+            resolve_review_evidence({'findings': [{'evidence_quotes': [
+                {'pointer': '/producer_notes/0/invented-anchor'}]}]}, self.view)
+
+    def test_goal_findings_real_limitation_still_needs_an_anchored_required_finding(self):
+        from simple_ar.report.schema import finding_requires_resolution
+        self.view.pop('producer_declarations')
+        self.view.pop('declaration_adoption_contract')
+        self.view.update(producer_completion='goal_findings.v1', producer_notes=[])
+        finding = {'finding_id': 'unsupported-unit', 'type': 'evidence_gap', 'severity': 'major',
+            'required_action': 'verify', 'message': 'The claimed physical unit lacks original source support.',
+            'suggested_action': 'Verify the source or qualify the claim without inventing units.',
+            'draft_quotes': [{'section_id': 'results', 'quote': self.view['sections'][0]['markdown']}],
+            'evidence_quotes': [{'pointer': '/objective'}]}
+        self.view['objective'] = self.group['goal']
+        reviews = self._reviews([], verdict='revise_required', findings=[finding])
+        self.assertTrue(finding_requires_resolution(reviews[0].findings[0]))
+        self.assertEqual(reviews[0].verdict, 'revise_required')
+        self.assertFalse(reviews[0].producer_claim_checks)
+
+    def test_joint_inspection_requires_every_statement_and_literal_current_evidence(self):
+        import copy
+        from simple_ar.integrations.llm import LLMResponseError
+        from simple_ar.report.review_evidence import delivery_review_result
+        reviewed = self._reviews(self.checks)
+        result = delivery_review_result(self.snapshot, reviewed)
+        self.assertEqual(result['status'], 'reviewed')
+        self.assertEqual(result['declaration_adoption']['contract'], 'producer_declarations.v1')
+        self.assertEqual(result['declaration_adoption']['producers'], [self.group])
+        self.assertEqual(len(result['declaration_adoption']['checks']), 2)
+        for mode in ('missing', 'duplicate', 'undisclosed', 'wrong-producer', 'invented-quote'):
+            checks = copy.deepcopy(self.checks)
+            if mode == 'missing':
+                checks.pop()
+            elif mode == 'duplicate':
+                checks.append(copy.deepcopy(checks[0]))
+            elif mode == 'undisclosed':
+                checks[1]['draft_quotes'] = []
+            elif mode == 'wrong-producer':
+                checks[1]['evidence_quotes'][0]['pointer'] = '/producer_declarations/1/execution/status'
+            else:
+                checks[1]['draft_quotes'][0]['quote'] = 'The unit was independently verified.'
+            with self.subTest(mode=mode), self.assertRaises(LLMResponseError):
+                self._reviews(checks)
+        self.assertEqual(delivery_review_result(self.snapshot, [])['status'], 'incomplete')
+
+    def test_adoption_does_not_suppress_new_required_findings_or_unfinished_work(self):
+        import copy
+        from simple_ar.report.review_evidence import delivery_review_result
+        finding = {'finding_id': 'actual-gap', 'section_id': 'results', 'type': 'evidence_gap',
+            'severity': 'major', 'required_action': 'verify', 'message': 'A required comparison is absent',
+            'draft_quotes': [{'section_id': 'results', 'quote': 'Values retain the unspecified source unit.'}]}
+        checks = copy.deepcopy(self.checks)
+        checks[1].update(status='unresolved_work', explanation='Required comparison remains unperformed')
+        reviews = self._reviews(checks, verdict='revise_required', findings=[finding])
+        self.assertEqual(reviews[0].findings[0].finding_id, 'actual-gap')
+        self.assertEqual(delivery_review_result(self.snapshot, reviews)['status'], 'needs_revision')
+        # A historical opinion-only request has no authority to adopt producer declarations.
+        self.view.pop('declaration_adoption_contract')
+        from simple_ar.integrations.llm import LLMResponseError
+        with self.assertRaises(LLMResponseError):
+            self._reviews(self.checks)
+
+    def test_v2_separates_declaration_identity_from_supplied_execution_evidence(self):
+        import copy
+        from simple_ar.integrations.llm import LLMResponseError
+        from simple_ar.report.review_evidence import (
+            CLAIM_ADOPTION_V2, delivery_review_result, attachment_review_blocks_editing)
+        later = copy.deepcopy(self.group)
+        later['declarations'] = []
+        later['execution_ref'] = 'records/later/candidate_execution.json'
+        self.view['producer_declarations'].append(later)
+        checks = copy.deepcopy(self.checks)
+        checks[0]['evidence_quotes'] = [{'pointer': '/producer_declarations/1/execution/status'}]
+        checks[1]['evidence_quotes'] = []
+        with self.assertRaises(LLMResponseError):
+            self._reviews(checks)  # Frozen v1 still demands own execution.
+        self.view['declaration_adoption_contract'] = CLAIM_ADOPTION_V2
+        self.snapshot.update(declaration_adoption_contract=CLAIM_ADOPTION_V2,
+            producer_declarations=self.view['producer_declarations'])
+        reviews = self._reviews(checks)
+        result = delivery_review_result(self.snapshot, reviews)
+        self.assertEqual(result['declaration_adoption']['contract'], CLAIM_ADOPTION_V2)
+        self.assertEqual(result['status'], 'reviewed')
+        self.assertFalse(attachment_review_blocks_editing(result))
+        for fault in ('missing', 'duplicate', 'undisclosed', 'non-executor', 'bad-quote'):
+            changed = copy.deepcopy(checks)
+            if fault == 'missing':
+                changed.pop()
+            elif fault == 'duplicate':
+                changed.append(copy.deepcopy(changed[0]))
+            elif fault == 'undisclosed':
+                changed[1]['draft_quotes'] = []
+            elif fault == 'non-executor':
+                changed[0]['evidence_quotes'] = [{'pointer': '/producer_declarations/1/goal'}]
+            else:
+                changed[0]['evidence_quotes'] = [{'pointer': '/producer_declarations/1/execution/status',
+                    'quote': 'invented success', 'role': 'executor_record'}]
+            with self.subTest(fault=fault), self.assertRaises(LLMResponseError):
+                self._reviews(changed)
+        self.view['declaration_adoption_contract'] = 'unknown'
+        with self.assertRaises(ValueError):
+            self._reviews(checks)
+        with self.assertRaises(ValueError):
+            delivery_review_result({**self.snapshot, 'declaration_adoption_contract': 'unknown'}, reviews)
+        with self.assertRaises(ValueError):
+            attachment_review_blocks_editing({'declaration_adoption': {'contract': 'unknown'}})
+
+    def test_v2_accepts_original_statement_and_current_limitation_disclosure(self):
+        import copy
+        from simple_ar.integrations.llm import LLMResponseError
+        from simple_ar.report.review_evidence import CLAIM_ADOPTION_V2, delivery_review_result
+        checks = copy.deepcopy(self.checks)
+        for index, check in enumerate(checks):
+            check.update(status='accepted_limitation',
+                draft_quotes=copy.deepcopy(self.checks[1]['draft_quotes']),
+                evidence_quotes=[{'pointer': f'/producer_declarations/0/declarations/{index}/statement'}])
+        with self.assertRaisesRegex(LLMResponseError, 'own execution'):
+            self._reviews(checks)
+        self.view['declaration_adoption_contract'] = CLAIM_ADOPTION_V2
+        self.snapshot['declaration_adoption_contract'] = CLAIM_ADOPTION_V2
+        result = delivery_review_result(self.snapshot, self._reviews(checks))
+        self.assertEqual(result['status'], 'reviewed')
+        self.assertTrue(all(row['evidence_quotes'][0]['role'] == 'declaration'
+            for row in result['declaration_adoption']['checks']))
+
+    def test_current_paragraph_selection_persists_exact_disclosure_and_keeps_completeness(self):
+        import copy
+        from simple_ar.integrations.llm import LLMResponseError
+        from simple_ar.report.review_evidence import DRAFT_REFERENCE_CONTRACT, delivery_review_result
+        self.view['draft_reference_contract'] = DRAFT_REFERENCE_CONTRACT
+        self.view['sections'][0]['markdown'] = 'Observed value: 2.5.\r\n \r\nValues retain the unspecified source unit.'
+        checks = copy.deepcopy(self.checks)
+        checks[1]['draft_quotes'] = [{'section_id': 'results', 'paragraph': 'p2'}]
+        raw = copy.deepcopy(checks)
+        reviews = self._reviews(checks)
+        saved = delivery_review_result(self.snapshot, reviews)
+        quote = saved['declaration_adoption']['checks'][1]['draft_quotes'][0]
+        self.assertEqual(quote, self.checks[1]['draft_quotes'][0])
+        self.assertEqual(checks, raw)
+        for incomplete in (checks[:1], checks + [checks[0]]):
+            with self.assertRaises(LLMResponseError):
+                self._reviews(incomplete)
+        self.view['sections'][0]['markdown'] = 'Replacement candidate with a different limitation.'
+        restored = ReportSectionReview.model_validate(reviews[0].model_dump(mode='json'))
+        self.assertEqual(restored.producer_claim_checks[1].draft_quotes[0].quote, quote['quote'])
+
+    def test_paragraph_contract_rejects_invalid_mixed_and_invented_quotes(self):
+        import copy
+        from pydantic import ValidationError
+        from simple_ar.integrations.llm import LLMResponseError
+        from simple_ar.report.review_evidence import DRAFT_REFERENCE_CONTRACT
+        self.view['draft_reference_contract'] = DRAFT_REFERENCE_CONTRACT
+        for reference in (
+            {'section_id': 'results', 'paragraph': value}
+            for value in ('p0', 'p01', 'p2', 'p-1', 'P1', '', None, 1)
+        ):
+            checks = copy.deepcopy(self.checks)
+            checks[1]['draft_quotes'] = [reference]
+            with self.subTest(reference=reference), self.assertRaises(LLMResponseError):
+                self._reviews(checks)
+        for reference in (
+            {'section_id': 'old-section', 'paragraph': 'p1'},
+            {'section_id': 'results', 'paragraph': 'p1', 'quote': self.checks[1]['draft_quotes'][0]['quote']},
+            {'section_id': 'results', 'paragraph': 'p1', 'pointer': '/sections/0/markdown'},
+            {'section_id': 'results', 'anchor': 'p1'},
+            {'section_id': 'results', 'quote': 'The unit was verified.'},
+            {'section_id': 'results'},
+        ):
+            checks = copy.deepcopy(self.checks)
+            checks[1]['draft_quotes'] = [reference]
+            with self.subTest(reference=reference), self.assertRaises((LLMResponseError, ValidationError)):
+                self._reviews(checks)
+        self.assertTrue(self._reviews(self.checks))  # Exact literals still work.
+        checks = copy.deepcopy(self.checks)
+        checks[1]['draft_quotes'] = []
+        with self.assertRaises(LLMResponseError):
+            self._reviews(checks)  # No inferred limitation quote.
+        self.view['draft_reference_contract'] = 'future-unknown'
+        with self.assertRaisesRegex(LLMResponseError, 'contract'):
+            self._reviews(self.checks)
+
+    def test_paragraph_resolution_covers_findings_checks_and_frozen_legacy_requests(self):
+        import copy
+        from pydantic import ValidationError
+        from simple_ar.integrations.llm import LLMResponseError
+        from simple_ar.report.review_evidence import DRAFT_REFERENCE_CONTRACT, resolve_review_evidence
+        view = {'sections': [{'section_id': 'results', 'markdown': 'First exact paragraph.\n\nSecond exact paragraph.'}],
+            'draft_reference_contract': DRAFT_REFERENCE_CONTRACT}
+        response = {name: [{'draft_quotes': [{'section_id': 'results', 'paragraph': 'p2'}]}]
+            for name in ('findings', 'finding_checks', 'producer_claim_checks')}
+        raw = copy.deepcopy(response)
+        selected = resolve_review_evidence(response, view)
+        for name in response:
+            self.assertEqual(selected[name][0]['draft_quotes'],
+                [{'section_id': 'results', 'quote': 'Second exact paragraph.'}])
+        self.assertEqual(response, raw)
+        view.pop('draft_reference_contract')
+        self.assertEqual(resolve_review_evidence(response, view), raw)
+        # An old request still needs literal quotations under the old schema.
+        with self.assertRaises(ValidationError):
+            ReportSectionReview.model_validate({'section_id': 'results', 'verdict': 'pass',
+                'producer_claim_checks': [{**self.checks[1], **raw['producer_claim_checks'][0]}]})
+        view['draft_reference_contract'] = DRAFT_REFERENCE_CONTRACT
+        view['sections'][0]['markdown'] = ''
+        with self.assertRaises(LLMResponseError):
+            resolve_review_evidence(response, view)
+
+    def test_draft_locator_is_bounded_navigation_without_duplicating_markdown(self):
+        from simple_ar.report.review_evidence import review_draft_locator
+        parts = [f'Paragraph {index}: ' + 'x' * 500 for index in range(30)]
+        view = {'sections': [{'section_id': 'results', 'markdown': '\n\n'.join(parts)},
+            {'section_id': 'empty', 'markdown': ''}]}
+        locator = review_draft_locator(view)
+        self.assertEqual(locator['results']['paragraph_count'], 30)
+        self.assertEqual(locator['results']['omitted_preview_count'], 6)
+        self.assertEqual(len(locator['results']['previews']), 24)
+        self.assertEqual(locator['results']['previews']['p1'], parts[0][:80])
+        self.assertTrue(all(len(preview) <= 80 for preview in locator['results']['previews'].values()))
+        self.assertEqual(locator['empty']['previews'], {})
+
+
+class WritingCoordinationTests(unittest.TestCase):
+    def _real_workspace(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        ledger = BudgetLedger({}, storage_path=root / 'ledger.json')
+        workspace = WorkspaceToolGateway(root, {'records': root / 'attempts'}, ledger)
+        return root, workspace, WritingToolGateway(root, workspace, None, 'unused', 'task')
+
+    def _document_work_fixture(self):
+        from types import SimpleNamespace
+        root, workspace, writing = self._real_workspace()
+        source = root / 'source'
+        (source / 'code').mkdir(parents=True)
+        (source / 'results').mkdir()
+        script, table = source / 'code' / 'calculate.py', source / 'results' / 'record.txt'
+        script.write_bytes(b'from pathlib import Path\nprint((Path(__file__).parent / "../results/record.txt").read_text())\n')
+        table.write_bytes(b'value=2.5\nscope=saved record; no new execution\n')
+        (source / 'unselected.txt').write_bytes(b'This file was not selected.')
+        workspace.mounts['source0'] = source
+        writing.ledger = workspace.ledger
+        writing.document_work = True
+        prompts = []
+
+        def answer(system, prompt, **options):
+            view = json.loads(prompt)
+            label = options['label']
+            prompts.append((label, view))
+            if label == 'composition-selection-1':
+                return {'read_windows': [{'path': str(path)} for path in (script, table)]}
+            if label.startswith('composition-selection-'):
+                return {'title': 'Recorded value and scope', 'materials': [str(table)],
+                    'delivery_artifacts': [str(script), str(table)]}
+            if label == 'composition-article':
+                body = '## Results\n\nThe supplied record says value=2.5. No new execution was requested.'
+                if view.get('edit_contract'):
+                    return {'prior_draft_sha256': view['edit_contract']['prior_draft_sha256'],
+                        'replacements': [{'old_text': view['prior_draft'], 'new_text': body}]}
+                return {'draft_markdown': body}
+            if label == 'article-independent-review':
+                return {'section_reviews': [{'section_id': 'document', 'verdict': 'pass', 'findings': []}]}
+            self.fail('Unexpected document-work model step: ' + label)
+
+        client = SimpleNamespace(ask_json=Mock(side_effect=answer))
+        writing.client_factory = Mock(return_value=client)
+        return root, workspace, writing, source, script, table, client, prompts
+
+    def test_document_focus_keeps_task_evidence_and_replay_keeps_original_scope(self):
+        from types import SimpleNamespace
+        root, workspace, writing, source, _, table, _, _ = self._document_work_fixture()
+        focused = workspace.workspace / 'new-results'
+        focused.mkdir()
+        result_file = focused / 'summary.txt'
+        result_file.write_text('A derived result; original conditions are in the supplied source.\n', encoding='utf-8')
+        request = ComposeRequest(goal='Revise the result explanation against original conditions',
+            material_roots=[str(focused)])
+        calls = []
+        def answer(system, prompt, **options):
+            view = json.loads(prompt)
+            calls.append(view)
+            visible = {row[0] for inventory in view['inventories'] for row in inventory['files']}
+            selected = [str(result_file), *([str(table)] if workspace.locator(str(table)) in visible else [])]
+            if options['label'] == 'composition-selection-1':
+                return {'read_windows': [{'path': path} for path in selected]}
+            return {'title': 'Result and original conditions', 'materials': selected, 'delivery_artifacts': []}
+        client = SimpleNamespace(ask_json=Mock(side_effect=answer))
+        for name, added, expected in (('new-scope', [str(source)], True), ('old-scope', [], False)):
+            owner = ArtifactStore(root / 'tools/writing' / name)
+            selected, _ = writing._select_materials(request, owner, name, client, '', None,
+                document_work=True, task_evidence_roots=added)
+            inputs = owner.read_json('selection-input.json')
+            self.assertEqual(str(source) in [row['project_path'] for row in inputs['inventories']], expected)
+            self.assertEqual(str(table) in [row.path for row in selected.materials], expected)
+            original = owner.resolve('selection-input.json').read_bytes()
+            before = client.ask_json.call_count
+            writing._select_materials(request, owner, name, client, '', None,
+                document_work=True, task_evidence_roots=[str(source)])
+            self.assertEqual(client.ask_json.call_count, before)
+            self.assertEqual(owner.resolve('selection-input.json').read_bytes(), original)
+        inaccessible = root / 'not-granted'
+        inaccessible.mkdir()
+        before = client.ask_json.call_count
+        with self.assertRaises(ValueError):
+            writing._select_materials(request, ArtifactStore(root / 'tools/writing/refused'),
+                'refused', client, '', None, document_work=True, task_evidence_roots=[str(inaccessible)])
+        self.assertEqual(client.ask_json.call_count, before)
+
+    def test_document_work_selects_title_packages_real_materials_and_finishes_via_export(self):
+        root, workspace, writing, source, script, table, client, prompts = self._document_work_fixture()
+        # Roles are professional choices, not a PNG/PDF filename convention.
+        body, attachment, legacy = source / 'a.png', source / 'b.pdf', source / 'c.svg'
+        body.write_bytes(b'\x89PNG\r\n\x1a\nfixture image bytes')
+        attachment.write_bytes(b'%PDF-1.4\n% fixture attachment bytes\n')
+        legacy.write_bytes(b'<svg xmlns="http://www.w3.org/2000/svg"/>')
+        selected_figures = [{'path': str(body), 'caption': 'Recorded result.'},
+            {'path': str(attachment), 'placement': 'attachment', 'caption': 'Editable companion.'}, str(legacy)]
+        original_answer = client.ask_json.side_effect
+
+        def answer(system, prompt, **options):
+            reply = original_answer(system, prompt, **options)
+            if options['label'] == 'composition-selection-2':
+                reply['figures'] = selected_figures
+            elif options['label'] == 'composition-article':
+                reply['draft_markdown'] += ('\n\n![Recorded result.](figures/selected-1.png)'
+                    '\n\n![Legacy body asset](figures/selected-3.svg)')
+            return reply
+
+        client.ask_json.side_effect = answer
+        arguments = {'goal': 'Explain the saved value and retain the necessary source and record',
+            'material_roots': [str(source)], 'publication': {'compile_pdf': False}, 'finish': True}
+        self.assertTrue(writing.finishes_request(arguments))
+        self.assertFalse(writing.finishes_request({'finish': 1}))
+        self.assertFalse(writing.finishes_request({}))
+        result = writing.call('compose_document', arguments, identity='document-unit')
+        self.assertEqual(result.status, 'ok', result)
+        owner = ArtifactStore(root / 'tools/writing/document-unit')
+        binding = owner.read_json('request.json')
+        self.assertEqual(binding['request']['title'], 'Recorded value and scope')
+        self.assertEqual(owner.read_json('selection-input.json')['document_work'], 'document_work.v2')
+        self.assertEqual(owner.read_json('selection-input.json')['figure_selection_contract'], 'compose_figure.v1')
+        self.assertEqual(binding['request']['figures'], selected_figures)
+        self.assertEqual(result.data['material_selection']['selected_figures'], selected_figures)
+        self.assertEqual(result.data['material_selection']['figure_selection_contract'], 'compose_figure.v1')
+        article_prompt = next(prompt for label, prompt in prompts if label == 'composition-article')
+        handles = {row['artifact']: row for row in article_prompt['source_handles']
+            if row.get('artifact', '').startswith('figures/')}
+        self.assertEqual(handles['figures/selected-1.png']['metadata']['placement'], 'body')
+        companion = handles['figures/selected-2.pdf']
+        self.assertEqual(companion['metadata']['placement'], 'attachment')
+        self.assertIn('separately delivered attachment', companion['summary'])
+        self.assertNotIn('Embed as one standalone', companion['summary'])
+        self.assertEqual(binding['delivery_review']['required_figures'],
+            ['figures/selected-1.png', 'figures/selected-3.svg'])
+        for number, path in enumerate((body, attachment, legacy), 1):
+            target = f'workspace/manuscripts/document-unit/figures/selected-{number}{path.suffix}'
+            self.assertIn(target, result.artifacts)
+            self.assertEqual(workspace.resolve(target).read_bytes(), path.read_bytes())
+            bound = next(row for row in binding['inputs'] if row['path'] == str(path))
+            self.assertEqual(bound['sha256'], hashlib.sha256(path.read_bytes()).hexdigest())
+        manuscript = workspace.resolve(result.data['editable_markdown']).read_text(encoding='utf-8')
+        self.assertNotIn('](figures/selected-2.pdf)', manuscript)
+        manifest = workspace.resolve('workspace/manuscripts/document-unit/figures/figures_manifest.json')
+        self.assertEqual({row['path']: row['caption'] for row in json.loads(manifest.read_text())['figures']},
+            {'figures/selected-1.png': 'Recorded result.', 'figures/selected-2.pdf': 'Editable companion.'})
+        self.assertEqual([label for label, _ in prompts], ['composition-selection-1',
+            'composition-selection-2', 'composition-article', 'article-independent-review'])
+        rows = binding['document_work']['materials']
+        self.assertEqual({row['path'] for row in rows}, {
+            'workspace/manuscripts/document-unit/materials/source0/code/calculate.py',
+            'workspace/manuscripts/document-unit/materials/source0/results/record.txt'})
+        snapshot = {row['path']: row for row in binding['delivery_review']['artifacts']}
+        for row in rows:
+            self.assertEqual(workspace.resolve(row['path']).read_bytes(), Path(row['source']).read_bytes())
+            self.assertIn(row['path'], result.artifacts)
+            self.assertEqual(snapshot[row['source']]['sha256'], row['sha256'])
+            alias, = snapshot[row['source']]['copies']
+            self.assertEqual(alias, {'path': str(workspace.resolve(row['path'])), 'sha256': row['sha256']})
+            self.assertNotIn('producer', alias)
+            self.assertNotIn(str(workspace.resolve(row['path'])), snapshot)
+        copied_script = workspace.resolve(next(row['path'] for row in rows if row['source'] == str(script)))
+        copied_table = workspace.resolve(next(row['path'] for row in rows if row['source'] == str(table)))
+        self.assertEqual((copied_script.parent / '../results/record.txt').resolve(), copied_table)
+        self.assertEqual((copied_script.parent / '../results/record.txt').read_bytes(), table.read_bytes())
+        self.assertFalse(any('unselected' in path for path in result.artifacts))
+        observed = result.model_dump(mode='json')
+        continuation = writing.continuation(observed, 'document-unit')
+        self.assertIsNotNone(continuation)
+        self.assertEqual(continuation['tool_name'], 'export_report')
+        delivered = continuation['arguments']['delivery']
+        self.assertEqual(delivered['report'], {'status': 'canonical', 'manuscript': result.data['editable_markdown']})
+        self.assertEqual(set(delivered['artifacts']), set(result.artifacts))
+        self.assertFalse(continuation['arguments']['compile_pdf'])
+        self.assertNotIn('delivery', result.data, 'Composition is not a terminal delivery receipt')
+        # Successful presentation cannot hide a failed retained owner result.
+        saved = owner.read_json('result.json')
+        for change in ({'status': 'error'}, {'error': 'Interrupted owner commit'}):
+            with self.subTest(retained_result=change):
+                owner.write_json('result.json', {**saved, **change})
+                self.assertIsNone(writing.continuation(observed, 'document-unit'))
+        owner.write_json('result.json', saved)
+        # Historical receipts omitted status; preserve that successful default.
+        legacy = {key: value for key, value in saved.items() if key != 'status'}
+        owner.write_json('result.json', legacy)
+        self.assertIsNotNone(writing.continuation(observed, 'document-unit'))
+        owner.write_json('result.json', saved)
+        calls = client.ask_json.call_count
+        resumed = writing.call('compose_document', arguments, identity='document-unit')
+        self.assertEqual(resumed.model_dump(mode='json'), observed)
+        self.assertEqual(client.ask_json.call_count, calls)
+        # Metadata changes invalidate the bound recipe just like byte changes.
+        selection_response = owner.read_json('selection-response.json')
+        frozen_response = json.loads(json.dumps(selection_response))
+        for field, value in (('placement', 'body'), ('caption', 'Changed caption.')):
+            altered = json.loads(json.dumps(frozen_response))
+            altered['figures'][1][field] = value
+            owner.write_json('selection-response.json', altered)
+            refused = writing.call('compose_document', arguments, identity='document-unit')
+            self.assertEqual(refused.status, 'error', refused)
+            self.assertEqual(client.ask_json.call_count, calls)
+            self.assertEqual(workspace.resolve(result.data['editable_markdown']).read_text(encoding='utf-8'), manuscript)
+        owner.write_json('selection-response.json', frozen_response)
+        raw = attachment.read_bytes()
+        attachment.write_bytes(raw + b'changed')
+        self.assertIsNone(writing.continuation(observed, 'document-unit'))
+        refused = writing.call('compose_document', arguments, identity='document-unit')
+        self.assertEqual(refused.status, 'error', refused)
+        self.assertEqual(client.ask_json.call_count, calls)
+        attachment.write_bytes(raw)
+        source_bytes = table.read_bytes()
+        table.write_bytes(source_bytes + b'changed original input')
+        with self.assertRaisesRegex(ValueError, 'Report source changed'):
+            writing.check_delivery(result.data)
+        self.assertIsNone(writing.continuation(observed, 'document-unit'))
+        table.write_bytes(source_bytes)
+        copy = workspace.resolve(rows[0]['path'])
+        original = copy.read_bytes()
+        copy.write_bytes(original + b'changed')
+        self.assertIsNone(writing.continuation(observed, 'document-unit'))
+        copy.write_bytes(original)
+
+    def test_material_selection_keeps_figure_roles_through_inventory_merge_and_replay(self):
+        from simple_ar.tools.writing import ComposeFigure
+        for document_work in (False, True):
+            with self.subTest(document_work=document_work):
+                root, workspace, writing, source, _, table, client, _ = self._document_work_fixture()
+                first, second = source / 'first.svg', source / 'second.svg'
+                for path in (first, second):
+                    path.write_bytes(b'<svg xmlns="http://www.w3.org/2000/svg"/>')
+                extras = [source / f'extra-{number}.svg' for number in range(12)]
+                for path in extras:
+                    path.write_bytes(first.read_bytes())
+                explicit = {'path': str(first), 'caption': 'Explicit caption.', 'placement': 'attachment'}
+                figures = [{'path': 'source0/first.svg', 'caption': 'Selector caption.'},
+                    {'path': str(second), 'placement': 'attachment'}]
+                request = ComposeRequest(goal='Select figures from evidence', title='Existing title',
+                    material_roots=[str(source)], figures=[explicit])
+                response = {'materials': [str(table)], 'figures': figures}
+                if document_work:
+                    response['title'] = 'Selected title'
+                client.ask_json.side_effect = lambda *args, **kwargs: (
+                    {'read_windows': [{'path': str(table)}]}
+                    if kwargs['label'] == 'composition-selection-1' else response)
+                owner = ArtifactStore(root / 'tools/writing/figure-selection')
+                selected, coverage = writing._select_materials(request, owner, 'figure-selection', client,
+                    '', None, document_work=document_work)
+                self.assertEqual(selected.figures, [ComposeFigure.model_validate(explicit),
+                    ComposeFigure.model_validate(figures[1])])
+                self.assertEqual(coverage['selected_figures'], figures)
+                frozen = owner.resolve('selection-input.json').read_bytes()
+                client.ask_json.reset_mock()
+                replay, repeated = writing._select_materials(request, owner, 'figure-selection', client,
+                    '', None, document_work=document_work)
+                self.assertEqual(replay, selected)
+                self.assertEqual(repeated, coverage)
+                # Cached response consumers must still enforce the same schema,
+                # authorized inventory, path uniqueness and combined limit.
+                for bad in ([figures[1], figures[1]],
+                        [figures[0], {'path': str(first), 'placement': 'attachment'}],
+                        [{'path': str(root / 'outside.svg'), 'placement': 'attachment'}],
+                        [{'path': str(second), 'placement': 'appendix'}],
+                        [{'path': str(second), 'caption': ' '}],
+                        [str(second)] * 13, [str(path) for path in extras]):
+                    with self.subTest(figures=bad):
+                        owner.write_json('selection-response.json', {**response, 'figures': bad})
+                        with self.assertRaises(ValueError):
+                            writing._select_materials(request, owner, 'figure-selection', client,
+                                '', None, document_work=document_work)
+                owner.write_json('selection-response.json', response)
+                self.assertEqual(owner.resolve('selection-input.json').read_bytes(), frozen)
+                saved_input = owner.read_json('selection-input.json')
+                owner.write_json('selection-input.json', {**saved_input,
+                    'figure_selection_contract': 'compose_figure.unknown'})
+                with self.assertRaisesRegex(ValueError, 'Unknown composition figure selection contract'):
+                    writing._select_materials(request, owner, 'figure-selection', client,
+                        '', None, document_work=document_work)
+                owner.write_json('selection-input.json', saved_input)
+                client.ask_json.assert_not_called()
+
+    def test_declaration_policy_is_frozen_by_composition_snapshot(self):
+        from simple_ar.report.review_evidence import CLAIM_ADOPTION_V2
+        for policy in (None, CLAIM_ADOPTION_V2):
+            with self.subTest(policy=policy):
+                root, workspace, writing, source, _, _, client, _ = self._document_work_fixture()
+                writing.declaration_adoption_contract = policy
+                arguments = {'goal': 'Explain the retained value', 'material_roots': [str(source)]}
+                result = writing.call('compose_document', arguments, identity='policy')
+                self.assertEqual(result.status, 'ok', result)
+                store = ArtifactStore(root / 'tools/writing/policy')
+                original = store.resolve('request.json').read_bytes()
+                snapshot = store.read_json('request.json')['delivery_review']
+                self.assertEqual(snapshot.get('declaration_adoption_contract'), policy)
+                selection = store.read_json('selection-input.json')
+                self.assertEqual(selection.get('selection_validation'), 'observed_windows.v1' if policy else None)
+                self.assertEqual(selection.get('producer_unit_contract'),
+                    'professional_delivery_unit.v1' if policy else None)
+                if policy is None:
+                    self.assertNotIn('declaration_adoption_contract', snapshot)
+                writing.declaration_adoption_contract = CLAIM_ADOPTION_V2 if policy is None else None
+                calls = client.ask_json.call_count
+                replay = writing.call('compose_document', arguments, identity='policy')
+                self.assertEqual(replay.model_dump(mode='json'), result.model_dump(mode='json'))
+                self.assertEqual(client.ask_json.call_count, calls)
+                self.assertEqual(store.resolve('request.json').read_bytes(), original)
+
+    def test_pending_candidate_routes_repairs_without_adopting_its_verdict(self):
+        root, workspace, writing, source, _, _, _, _ = self._document_work_fixture()
+        result = writing.call('compose_document', {'goal': 'Explain the retained value',
+            'material_roots': [str(source)]}, identity='pending-review')
+        self.assertEqual(result.status, 'ok', result)
+        data = dict(result.data)
+        final = writing.final_review(data)
+        from simple_ar.report.schema import ReportSectionDraft
+        sections = [ReportSectionDraft(section_id='results', heading='Results',
+            draft_markdown='Retained improvement, awaiting attachment repair.').model_dump(mode='json')]
+        body = '# Candidate\n\nRetained improvement, awaiting attachment repair.'
+        review = {'review_status': 'needs_revision', 'delivery_review': {'status': 'needs_revision',
+            'defects': [{'type': 'delivery_artifact_defect'}]}, 'assembly_identity': {
+                'body_sha256': hashlib.sha256(body.encode()).hexdigest(),
+                'sections_sha256': hashlib.sha256(json.dumps(sections, sort_keys=True,
+                    ensure_ascii=False, separators=(',', ':')).encode()).hexdigest()}}
+        candidate = {'sections': sections, 'report_body_markdown': body, 'independent_review': review}
+        locator = data['version'] + '/pending_candidate.json'
+        path = workspace.resolve(locator, write=True)
+        path.write_text(json.dumps(candidate), encoding='utf-8')
+        data['pending_candidate'] = locator
+        data['artifact_sha256'] = {**data['artifact_sha256'], locator: hashlib.sha256(path.read_bytes()).hexdigest()}
+        self.assertEqual(writing.repair_review(data), review)
+        self.assertEqual(writing.final_review(data), final)
+        self.assertEqual(writing.repair_candidate(data)['report_body_markdown'], body)
+        self.assertIsNone(writing.continuation({**result.model_dump(mode='json'), 'data': data}, 'pending-review'))
+        path.write_text(json.dumps({**candidate, 'report_body_markdown': 'Tampered'}), encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'Pending candidate changed'):
+            writing.repair_review(data)
+
+    def test_professional_final_selection_can_correct_an_uninspected_window(self):
+        from simple_ar.report.review_evidence import CLAIM_ADOPTION_V2
+        root, workspace, writing, source, script, table, client, prompts = self._document_work_fixture()
+        writing.declaration_adoption_contract = CLAIM_ADOPTION_V2
+        original_answer = client.ask_json.side_effect
+
+        def answer(system, prompt, **options):
+            if options['label'] == 'composition-selection-2':
+                return {'title': 'Recorded value and scope', 'materials': [str(source / 'unselected.txt')],
+                    'delivery_artifacts': [str(script), str(table)]}
+            if options['label'] == 'composition-selection-3':
+                view = json.loads(prompt)
+                self.assertIn('not inspected', json.dumps(view['read_admission']))
+                self.assertEqual(view['observations'], [], 'The unrelated old ranges were archived, not supplied')
+                return {'read_windows': [{'path': str(table)}]}
+            return original_answer(system, prompt, **options)
+
+        client.ask_json.side_effect = answer
+        result = writing.call('compose_document', {'goal': 'Explain the selected original evidence',
+            'material_roots': [str(source)]}, identity='selection-correction')
+        self.assertEqual(result.status, 'ok', result)
+        self.assertEqual(client.ask_json.call_count, 6)
+        store = ArtifactStore(root / 'tools/writing/selection-correction')
+        self.assertEqual(store.read_json('selection-input.json')['selection_validation'], 'observed_windows.v1')
+        archived = store.read_json('selection-steps/2/input.json')['observations']
+        self.assertEqual({row['request']['path'] for row in archived}, {str(script), str(table)})
+        active = store.read_json('selection-steps/4/input.json')['observations']
+        self.assertEqual([row['request']['path'] for row in active], [str(table)])
+        self.assertEqual(active[0]['data']['sha256'], hashlib.sha256(table.read_bytes()).hexdigest())
+        self.assertEqual(store.read_json('selection-steps/3/response.json'),
+            {'read_windows': [{'path': str(table)}]})
+        self.assertNotIn(str(source / 'unselected.txt'),
+            [row['path'] for row in store.read_json('request.json')['inputs']])
+        calls = client.ask_json.call_count
+        replay = writing.call('compose_document', {'goal': 'Explain the selected original evidence',
+            'material_roots': [str(source)]}, identity='selection-correction')
+        self.assertEqual(replay.model_dump(mode='json'), result.model_dump(mode='json'))
+        self.assertEqual(client.ask_json.call_count, calls)
+
+    def test_registered_professional_unit_is_delivered_whole_without_repackaging(self):
+        from types import SimpleNamespace
+        from simple_ar.app.tool_application import ToolApplication
+        from simple_ar.tools.writing import freeze_report_requirement
+        from tests.test_professional_work_loop import ProfessionalWorkLoopTests
+        from simple_ar.tools.producer_declarations import professional_units
+        fixture = ProfessionalWorkLoopTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        goal = 'Deliver the recorded result with its reusable program unit'
+        requirement = freeze_report_requirement({'outline_strategy': 'auto',
+            'reviewer': 'llm', 'document_review': True, 'review_scope': 'document',
+            'max_review_iterations': 0,
+            'allow_source_backtracking': False, 'allow_llm_fallback': False,
+            'figures': {'enabled': False}}, method='article')
+        app = ToolApplication.create(fixture.root, goal, model='fixture', sources={},
+            services=fixture.services, professional_inputs=True, allow_execution=True,
+            report_requirement=requirement, max_turns=10, max_tokens=600000, max_attempts=40,
+            process_limits={'process_invocations': 3, 'process_wall_seconds': 30})
+        self.assertEqual(app.state['config']['professional_work'], 'requests.v1')
+        self.assertTrue(app.writing.professional_inputs)
+        self.assertEqual(app._report_inputs()['evidence_contract'], 'materials.v1')
+        predecessors = [app.workspace.workspace / name for name in
+            ('original.py', 'failed-predecessor.py')]
+        for path in predecessors:
+            path.write_bytes(b'# Observed design context, superseded by the registered unit.\n')
+        predecessor_bytes = {path: path.read_bytes() for path in predecessors}
+        # This earlier generated result is scientific material, not a declared
+        # attachment. Keep its real producer distinct from the current unit.
+        context_root = app.workspace.workspace / 'earlier-results'
+        context_root.mkdir()
+        context_script, context_csv = context_root / 'summarize.py', context_root / 'key_numbers.csv'
+        context_script.write_bytes(b'from pathlib import Path\nPath("key_numbers.csv").write_text("value\\n13\\n")\n')
+        context_result = app.workspace.call('run_process', {
+            'argv': ['python', str(context_script)], 'cwd': str(context_root), 'timeout_sec': 3,
+            'inputs': [str(context_script)], 'outputs': [str(context_csv)]}, identity='context-producer')
+        self.assertEqual((context_result.status, context_result.data.get('returncode')), ('ok', 0), context_result)
+        context_bytes = {path: path.read_bytes() for path in (context_script, context_csv)}
+        context_receipt = fixture.root / context_result.data['receipt']
+        context_receipt_bytes = context_receipt.read_bytes()
+        context_provenance = app.workspace.artifact_provenance([str(context_csv)])[str(context_csv)]
+        self.assertEqual(context_provenance['producer']['invocation_id'], 'context-producer')
+        self.assertEqual(app.workspace.resolved_versions(context_provenance['producer']['inputs']),
+            {context_script: hashlib.sha256(context_bytes[context_script]).hexdigest()})
+        code = ("from pathlib import Path\n"
+            "p = Path('bundle'); p.mkdir()\n"
+            "(p/'run.py').write_text('from pathlib import Path\\nprint(Path(__file__).with_name(\"records.csv\").read_text())\\n')\n"
+            "(p/'records.csv').write_text('value\\n21\\n')\n"
+            "(p/'README.md').write_text('说明' * 18000, encoding='utf-8')\n"
+            "(p/'reference.txt').write_bytes((p/'README.md').read_bytes())\n"
+            "(p/'table.csv').write_text('value\\n21\\n')\n"
+            "(p/'inventory').write_text('Saved inputs and program inventory\\n')\n"
+            "for index in range(18):\n"
+            "    (p/f'aux-{index}.txt').write_text('retained output')\n")
+        proposal = fixture._proposal(code)
+        proposal['files'].extend({'path': f'library/part-{index}.py',
+            'content': '# Retained source unit member.\n'} for index in range(11))
+        # An old version explicitly retained IN the unit remains mandatory.
+        proposal['files'][1] = {'path': 'library/prior-version.py',
+            'content': predecessors[1].read_text(encoding='utf-8')}
+        proposal['execution_plan']['outputs'] = ['bundle/run.py', 'bundle/records.csv',
+            'bundle/README.md', 'bundle/reference.txt', 'bundle/table.csv', 'bundle/inventory',
+            *(f'bundle/aux-{index}.txt' for index in range(18))]
+        fixture.responses = [proposal]
+        preparation = fixture._prepare()
+        preparation['arguments']['source_windows'] = [{'path': str(path), 'full_digest': True}
+            for path in predecessors]
+        fixture._run(app, actions=[preparation])
+        self.assertEqual(fixture._observations(app)[-1]['status'], 'ok', fixture._observations(app)[-1])
+        _, token = fixture._pending_execution(app)
+        fixture._run(app, approved_execution=token)
+        execution = fixture._observations(app)[-1]
+        self.assertEqual(execution['tool_name'], 'execute_implementation')
+        candidate = Path(execution['data']['cwd'])
+        bundle = candidate / 'bundle'
+        material_roots = [str(bundle), str(context_root)]
+        units = professional_units(app.writing, material_roots, [str(bundle / 'run.py')])
+        unit, = units
+        self.assertEqual(len(unit['files']), 36, 'All 12 sources plus 24 actual outputs belong to the unit')
+        self.assertEqual(set(unit['files']), {*(str(candidate / row['path']) for row in proposal['files']),
+            *(str(candidate / name) for name in proposal['execution_plan']['outputs'])})
+        provenance = app.workspace.artifact_provenance([str(bundle / 'run.py')])
+        consumed = app.workspace.resolved_versions(provenance[str(bundle / 'run.py')]['producer']['inputs'])
+        approval = json.loads(app.workspace.resolve(execution['data']['execution_ref']).read_bytes())['approval']['binding']
+        guarded = app.workspace.resolved_versions(approval['source_sha256'])
+        context = app.workspace.resolved_versions(approval['context_sha256'])
+        for path, raw in predecessor_bytes.items():
+            self.assertEqual(guarded[path], hashlib.sha256(raw).hexdigest())
+            self.assertEqual(context[path], hashlib.sha256(raw).hexdigest())
+            self.assertNotIn(path, consumed, 'Observed design context is not an execution-consumption claim')
+            self.assertNotIn(str(path), unit['files'])
+        retained_version = candidate / 'library/prior-version.py'
+        self.assertIn(str(retained_version), unit['files'])
+        self.assertEqual(retained_version.read_bytes(), predecessor_bytes[predecessors[1]])
+        original = {Path(path): Path(path).read_bytes() for path in unit['files']}
+        from simple_ar.tools.producer_declarations import professional_unit_input_owners
+        input_owners = professional_unit_input_owners(app.writing, units)
+        from simple_ar.tools.producer_declarations import _proof
+        self.assertEqual(professional_unit_input_owners(_proof(_proof(app.writing)), units), input_owners)
+        for row in proposal['files']:
+            owners, = [input_owners[str(candidate / row['path'])]]
+            self.assertEqual(len(owners), 1)
+            self.assertEqual(owners[0]['invocation_id'], Path(execution['data']['execution_ref']).parent.name)
+        self.assertFalse(set(map(str, predecessors)).intersection(input_owners))
+        self.assertNotIn(str(bundle / 'table.csv'), input_owners, 'An output is not a registered source input')
+        expect_units = True
+
+        def answer(system, prompt, **options):
+            view = json.loads(prompt)
+            label = options['label']
+            if label.startswith('composition-selection'):
+                if expect_units:
+                    self.assertIn('entire proven source/output unit without recopying', system)
+                    self.assertIn('32000-byte-per-file/96000-byte-total', system)
+                    self.assertIn('256000-byte total text limit', system)
+                else:
+                    self.assertNotIn('entire proven source/output unit without recopying', system)
+                if not view['observations']:
+                    return {'read_windows': [{'path': str(path)} for path in (bundle / 'table.csv', context_csv)]}
+                return {'title': 'Provisional selection title',
+                    'materials': [str(bundle / 'table.csv'), str(context_csv)],
+                    'delivery_artifacts': [str(bundle / 'run.py'), str(bundle / 'table.csv')]}
+            if label == 'composition-article':
+                if view.get('edit_contract'):
+                    return {'prior_draft_sha256': view['edit_contract']['prior_draft_sha256'],
+                        'replacements': [{'old_text': view['prior_draft'],
+                            'new_text': '## Results\n\nThe saved value is 21.'}]}
+                return {'draft_markdown': '## Results\n\nThe recorded value is 21.'}
+            if label == 'article-independent-review':
+                subjects = {row['path']: row for row in view['delivery_artifacts']}
+                self.assertEqual(set(unit['files']) <= set(subjects), expect_units)
+                if expect_units:
+                    self.assertEqual(set(subjects), set(unit['files']),
+                        'Consumed ancestors do not expand the registered review responsibility')
+                self.assertTrue({str(bundle / 'run.py'), str(bundle / 'table.csv')} <= set(subjects))
+                for path, raw in original.items():
+                    if str(path) in subjects:
+                        self.assertEqual(subjects[str(path)]['coverage'], 'complete')
+                        self.assertEqual(subjects[str(path)]['text'], raw.decode('utf-8'))
+                if expect_units:
+                    self.assertEqual(subjects[str(bundle / 'README.md')]['sha256'],
+                        subjects[str(bundle / 'reference.txt')]['sha256'])
+                return {'section_reviews': [{'section_id': 'document', 'verdict': 'pass', 'findings': []}]}
+            self.fail(label)
+
+        app.writing.client_factory = Mock(return_value=SimpleNamespace(ask_json=Mock(side_effect=answer)))
+        arguments = {'goal': goal,
+            'material_roots': material_roots, 'publication': {'compile_pdf': False}, 'finish': True}
+        result = app.writing.call('compose_document', arguments, identity='whole-unit')
+        self.assertEqual(result.status, 'ok', result)
+        self.assertTrue(set(unit['files']) <= set(result.artifacts))
+        self.assertTrue(set(context_bytes).isdisjoint(app.workspace.resolve(path) for path in result.artifacts))
+        self.assertEqual(result.data['document_work']['materials'], [])
+        self.assertEqual(result.data['document_work']['producer_units'], units)
+        self.assertFalse((app.workspace.resolve(result.data['version']) / 'materials').exists())
+        export = app.writing.continuation(result.model_dump(mode='json'), 'whole-unit')
+        self.assertEqual(export['arguments']['title'], '', 'Exporter consumes the canonical H1, not the selection title')
+        self.assertTrue(set(unit['files']) <= set(export['arguments']['delivery']['artifacts']))
+        store = ArtifactStore(app.session.store.root / 'tools/writing/whole-unit')
+        binding = store.read_json('request.json')
+        self.assertEqual(binding['report_binding'], app._report_inputs())
+        self.assertEqual(binding['report_binding']['evidence_contract'], 'materials.v1')
+        self.assertEqual(binding['input_contract'], 'owner.v1')
+        self.assertEqual(binding['delivery_subject_contract'], 'declared_delivery_subjects.v1')
+        self.assertNotIn('delivery_subject_contract', binding['request'])
+        self.assertEqual(binding['document_work']['publication_title_contract'], 'canonical_heading.v1')
+        self.assertNotIn('figures', arguments, 'Normalization must not change caller intent or caller arguments')
+        self.assertEqual(binding['request']['figures'], [])
+        self.assertEqual(store.read_json('selection-input.json')['producer_unit_contract'],
+            'professional_delivery_unit.v1')
+        selection_binding = store.read_json('selection-input.json')
+        self.assertEqual(selection_binding['delivery_subject_contract'], 'declared_delivery_subjects.v1')
+        self.assertNotIn('delivery_subject_contract', selection_binding['request'])
+        self.assertEqual(binding['request']['delivery_artifacts'],
+            [str(bundle / 'run.py'), str(bundle / 'table.csv')])
+        # A saved unit contract alone cannot upgrade an interrupted historical
+        # selection. Absence keeps the old policy and the no-blind-replay gate.
+        old_selection = {key: value for key, value in selection_binding.items()
+            if key != 'delivery_subject_contract'}
+        interrupted_store = ArtifactStore(app.session.store.root / 'tools/writing/whole-unit-old-selection')
+        interrupted_store.write_json('selection-input.json', old_selection)
+        calls = app.writing.client_factory.return_value.ask_json.call_count
+        factories = app.writing.client_factory.call_count
+        with patch.object(app.writing, '_select_materials', wraps=app.writing._select_materials) as select:
+            interrupted = app.writing.call('compose_document', arguments, identity='whole-unit-old-selection')
+        self.assertEqual(interrupted.status, 'error')
+        self.assertIn('Interrupted material selection', interrupted.error)
+        self.assertTrue(select.call_args.kwargs['adopt_units'])
+        self.assertIsNone(select.call_args.kwargs['delivery_subject_contract'])
+        self.assertEqual(interrupted_store.read_json('selection-input.json'), old_selection)
+        self.assertFalse(interrupted_store.exists('request.json'))
+        self.assertEqual(app.writing.client_factory.return_value.ask_json.call_count, calls)
+        self.assertEqual(app.writing.client_factory.call_count, factories)
+        interrupted_store.write_json('selection-input.json', {
+            **old_selection, 'delivery_subject_contract': 'declared_delivery_subjects.unknown'})
+        with patch.object(app.writing, '_select_materials') as select:
+            rejected = app.writing.call('compose_document', arguments, identity='whole-unit-old-selection')
+        self.assertEqual(rejected.status, 'error')
+        self.assertIn('Unknown retained delivery subject contract', rejected.error)
+        select.assert_not_called()
+        self.assertEqual(app.writing.client_factory.return_value.ask_json.call_count, calls)
+        self.assertEqual(app.writing.client_factory.call_count, factories)
+        # This saved request is the resolved recipe, not a second caller API.
+        # Roots retain investigation provenance alongside selected windows.
+        self.assertEqual(binding['request']['material_roots'], material_roots)
+        self.assertEqual({row['path'] for row in binding['request']['materials']},
+            {str(bundle / 'table.csv'), str(context_csv)})
+        with self.assertRaisesRegex(ValueError, 'Choose explicit material windows OR material_roots'):
+            ComposeRequest.model_validate(binding['request'])
+        calls = app.writing.client_factory.return_value.ask_json.call_count
+        frozen = {path: path.read_bytes() for path in store.root.rglob('*') if path.is_file()}
+        resolved, parent_binding, linkage = app.writing._prior_inputs(ComposeRequest(
+            goal='Reuse the same proven evidence recipe', prior_draft=result.data['editable_markdown'],
+            reuse_prior_inputs=True), 'whole-unit-reuse')
+        self.assertEqual(resolved.materials,
+            [FileWindow.model_validate(row) for row in binding['request']['materials']])
+        self.assertEqual(resolved.sources, [])
+        self.assertEqual(resolved.material_roots, [])
+        self.assertEqual(parent_binding, binding)
+        self.assertEqual(linkage['owner'], 'whole-unit')
+        self.assertEqual(app.writing.client_factory.return_value.ask_json.call_count, calls)
+        self.assertEqual({path: path.read_bytes() for path in store.root.rglob('*') if path.is_file()}, frozen)
+        self.assertEqual(set(unit['files']) | {str(context_csv)}, {row['path'] for row in binding['inputs']})
+        context_input, = [row for row in binding['inputs'] if row['path'] == str(context_csv)]
+        self.assertEqual(context_input['sha256'], hashlib.sha256(context_bytes[context_csv]).hexdigest())
+        self.assertEqual(set(unit['files']), {row['path'] for row in binding['delivery_review']['artifacts']})
+        # Explicitly supplied sources remain subjects even when the unit also
+        # consumed them. Small files isolate ownership from admission limits.
+        for path in predecessors:
+            with self.subTest(explicit_source=path.name):
+                paths, _ = app.writing._joint_delivery_paths(
+                    [{'path': str(bundle / 'run.py')}, {'path': str(path)}], [str(path)],
+                    producer_units=units, delivery_copies=set(), declared_subjects_only=True)
+                self.assertEqual({app.workspace.resolve(item) for item in paths},
+                    {*(Path(item) for item in unit['files']), path})
+                snapshot = app.writing._freeze_delivery_review(paths, 'explicit-' + path.stem,
+                    copies=[], producer_units=units)
+                subject, = [row for row in snapshot['artifacts'] if row['path'] == str(path)]
+                self.assertEqual(subject['coverage'], 'complete')
+                self.assertEqual(subject['text'], predecessor_bytes[path].decode('utf-8'))
+        with self.assertRaises(ValueError):
+            ComposeRequest.model_validate({**arguments, 'delivery_artifacts': list(unit['files'])[:33]})
+        self.assertEqual(binding['delivery_review']['text_admission']['contract'], 'professional_unit_text.v2')
+        self.assertGreater(sum(len(raw) for raw in original.values()), 96000)
+        legacy = app.writing._freeze_delivery_review(list(unit['files']), 'legacy-unit-windows')
+        self.assertNotIn('text_admission', legacy)
+        self.assertEqual(next(row for row in legacy['artifacts']
+            if row['path'] == str(bundle / 'README.md'))['coverage'], 'oversized')
+        with self.assertRaisesRegex(ValueError, '32 original subjects'):
+            app.writing._freeze_delivery_review(list(unit['files']), 'legacy-unit-count', copies=[])
+        with self.assertRaisesRegex(ValueError, '32 files'):
+            app.writing._joint_delivery_paths([], list(unit['files']), delivery_copies=set())
+        identity = {'composition': result.data['version'], 'artifact_sha256': result.data['artifact_sha256'],
+            'receipt_sha256': hashlib.sha256(store.resolve('result.json').read_bytes()).hexdigest()}
+        app.writing.check_delivery_set(identity, result.artifacts, set())
+        with self.assertRaisesRegex(ValueError, 'complete registered professional unit'):
+            app.writing.check_delivery_set(identity, [path for path in result.artifacts
+                if path != str(bundle / 'records.csv')], set())
+        calls = app.writing.client_factory.return_value.ask_json.call_count
+        policy = app.writing.declaration_adoption_contract
+        app.writing.declaration_adoption_contract = None
+        replay = app.writing.call('compose_document', arguments, identity='whole-unit')
+        self.assertEqual(replay.model_dump(mode='json'), result.model_dump(mode='json'))
+        self.assertEqual(app.writing.client_factory.return_value.ask_json.call_count, calls)
+        app.writing.declaration_adoption_contract = policy
+        unknown = {**binding, 'delivery_subject_contract': 'declared_delivery_subjects.unknown'}
+        store.write_json('request.json', unknown)
+        factories = app.writing.client_factory.call_count
+        rejected = app.writing.call('compose_document', arguments, identity='whole-unit')
+        self.assertEqual(rejected.status, 'error')
+        self.assertIn('Unknown retained delivery subject contract', rejected.error)
+        self.assertEqual(app.writing.client_factory.return_value.ask_json.call_count, calls)
+        self.assertEqual(app.writing.client_factory.call_count, factories)
+        store.write_json('request.json', binding)
+        unknown = json.loads(json.dumps(binding))
+        unknown['delivery_review']['text_admission']['contract'] = 'professional_unit_text.unknown'
+        store.write_json('request.json', unknown)
+        rejected = app.writing.call('compose_document', arguments, identity='whole-unit')
+        self.assertEqual(rejected.status, 'error')
+        self.assertIn('Unknown joint inspection text admission contract', rejected.error)
+        self.assertEqual(app.writing.client_factory.return_value.ask_json.call_count, calls)
+        store.write_json('request.json', binding)
+        # Missing attachment coverage is not a request to regenerate prose.
+        # Selection can still observe material, but no author/reviewer call
+        # should be charged for an input that cannot be inspected at all.
+        freeze = app.writing._freeze_delivery_review
+        def incomplete_inputs(*args, **kwargs):
+            snapshot = freeze(*args, **kwargs)
+            subject = snapshot['artifacts'][0]
+            subject['coverage'] = 'incomplete'
+            subject.pop('text', None)
+            return snapshot
+        calls = app.writing.client_factory.return_value.ask_json.call_count
+        with patch.object(app.writing, '_freeze_delivery_review', side_effect=incomplete_inputs):
+            gap = app.writing.call('compose_document', arguments, identity='whole-unit-gap')
+        self.assertEqual(gap.status, 'error')
+        self.assertEqual(gap.data['failure_kind'], 'inspection_inputs_incomplete')
+        self.assertTrue(gap.data['uninspected'])
+        self.assertIn('Rewriting prose cannot resolve', gap.data['next_action'])
+        labels = [call.kwargs.get('label') for call in
+            app.writing.client_factory.return_value.ask_json.call_args_list[calls:]]
+        self.assertTrue(all(label.startswith('composition-selection') for label in labels), labels)
+        self.assertFalse(app.writing.can_return_gap(gap.model_dump(mode='json'), 'whole-unit-gap'))
+        self.assertFalse((app.session.store.root / 'tools/writing/whole-unit-gap/writer').exists())
+        # A completed editorial diagnosis is a revision request, not another
+        # evidence-discovery task. Repeated access roots must not force paid
+        # reselection; a new user event or evidence gap still must.
+        answer_without_revision = app.writing.client_factory.return_value.ask_json.side_effect
+        def editorial_review(system, prompt, **options):
+            if options['label'] == 'article-independent-review':
+                return {'section_reviews': [{'section_id': 'document', 'verdict': 'revise_required',
+                    'findings': [{'finding_id': 'editorial', 'type': 'repetition', 'severity': 'major',
+                        'required_action': 'revise', 'message': 'Remove repeated phrasing.'}]}]}
+            return answer_without_revision(system, prompt, **options)
+        app.writing.client_factory.return_value.ask_json.side_effect = editorial_review
+        prior = app.writing.call('compose_document', arguments, identity='whole-unit-editorial')
+        self.assertEqual(prior.status, 'ok', prior)
+        self.assertEqual(app.writing.final_review(prior.data)['review_status'], 'needs_revision')
+        app.writing.client_factory.return_value.ask_json.side_effect = answer_without_revision
+        correction = {**arguments, 'prior_draft': prior.data['editable_markdown']}
+        request = ComposeRequest.model_validate(correction)
+        current = app._report_inputs()
+        prior_directory = str(Path(prior.data['editable_markdown']).parent)
+        self.assertIsNotNone(app.writing._prose_review_revision(request.model_copy(
+            update={'material_roots': [prior_directory]}), current))
+        self.assertIsNotNone(app.writing._prose_review_revision(request.model_copy(
+            update={'material_roots': [*request.material_roots, prior_directory]}), current))
+        extra = app.session.store.root / 'workspace' / 'new-material'
+        extra.mkdir()
+        self.assertIsNone(app.writing._prose_review_revision(request.model_copy(
+            update={'material_roots': [str(extra)]}), current))
+        with patch.object(app.writing, '_inspection_interrupted', return_value=True):
+            self.assertIsNone(app.writing._prose_review_revision(request, current))
+            self.assertFalse(app.writing.can_return_gap(prior.model_dump(mode='json'), 'whole-unit-editorial'))
+        self.assertTrue(app.writing._inspection_interrupted({'unresolved': [
+            {'type': 'document_revision_unavailable'}]}))
+        self.assertFalse(app.writing._inspection_interrupted({'unresolved': [
+            {'type': 'document_revision_unresolved'}]}))
+        # A declaration still needing prose disclosure does not invalidate
+        # observed source bytes. Attachment defects/coverage gaps do.
+        from simple_ar.report.review_evidence import CLAIM_ADOPTION_V2
+        original_review = app.writing.final_review(prior.data)
+        receipt_store, receipt_binding, receipt_data = app.writing._composition_receipt('whole-unit-editorial')
+        with patch.object(app.writing, '_composition_receipt', return_value=(receipt_store,
+                {**receipt_binding, 'section_delivery_review_contract': 'section_delivery_review.v1'}, receipt_data)):
+            self.assertFalse(app.writing.can_return_gap(prior.model_dump(mode='json'), 'whole-unit-editorial'))
+        disclosure = {**original_review, 'delivery_review': {
+            'status': 'needs_revision', 'defects': [], 'uninspected': [],
+            'declaration_adoption': {'contract': CLAIM_ADOPTION_V2}}}
+        with patch.object(app.writing, 'final_review', return_value=disclosure), patch(
+                'simple_ar.tools.implementation_work._independent_delivery_review'):
+            self.assertIsNotNone(app.writing._prose_review_revision(request, current))
+            for field in ('defects', 'uninspected'):
+                with self.subTest(blocking_attachment=field):
+                    disclosure['delivery_review'][field] = [{'path': 'fixture'}]
+                    self.assertIsNone(app.writing._prose_review_revision(request, current))
+                    disclosure['delivery_review'][field] = []
+        self.assertIsNone(app.writing._prose_review_revision(request,
+            {**current, 'requests': [*current['requests'], 'Include additional original material']}))
+        with patch.object(app.writing, 'final_review', return_value={
+                'review_status': 'needs_revision', 'delivery_review': {'status': 'reviewed'},
+                'section_reviews': [{'findings': [{'type': 'evidence_gap', 'required_action': 'verify'}]}]}):
+            self.assertIsNone(app.writing._prose_review_revision(request, current))
+        calls = app.writing.client_factory.return_value.ask_json.call_count
+        revised = app.writing.call('compose_document', correction, identity='whole-unit-editorial-fixed')
+        self.assertEqual(revised.status, 'ok', revised)
+        labels = [call.kwargs.get('label') for call in
+            app.writing.client_factory.return_value.ask_json.call_args_list[calls:]]
+        self.assertEqual(labels, ['composition-article', 'article-independent-review'])
+        fixed = ArtifactStore(app.session.store.root / 'tools/writing/whole-unit-editorial-fixed')
+        feedback = fixed.read_json('request.json')['revision_feedback']
+        self.assertEqual(feedback['section_reviews'][0]['findings'][0]['finding_id'], 'editorial')
+        self.assertIn('revision_feedback', json.dumps(fixed.read_json('writer/report_inputs.json')))
+        calls = app.writing.client_factory.return_value.ask_json.call_count
+        replay = app.writing.call('compose_document', correction, identity='whole-unit-editorial-fixed')
+        self.assertEqual(replay.model_dump(mode='json'), revised.model_dump(mode='json'))
+        self.assertEqual(app.writing.client_factory.return_value.ask_json.call_count, calls)
+        # Both calls normalize to figures=[] internally. Only the exact caller
+        # actually supplied that field, so it retains explicit-copy semantics.
+        expect_units = False
+        exact = app.writing.call('compose_document', {**arguments, 'figures': []}, identity='whole-unit-exact')
+        self.assertEqual(exact.status, 'ok', exact)
+        self.assertNotIn('producer_units', exact.data['document_work'])
+        self.assertNotIn('publication_title_contract', exact.data['document_work'])
+        self.assertEqual(len(exact.data['document_work']['materials']), 2)
+        exact_export = app.writing.continuation(exact.model_dump(mode='json'), 'whole-unit-exact')
+        self.assertEqual(exact_export['arguments']['title'], 'Provisional selection title')
+        exact_store = ArtifactStore(app.session.store.root / 'tools/writing/whole-unit-exact')
+        self.assertNotIn('producer_unit_contract', exact_store.read_json('selection-input.json'))
+        self.assertNotIn('delivery_subject_contract', exact_store.read_json('selection-input.json'))
+        self.assertNotIn('delivery_subject_contract', exact_store.read_json('request.json'))
+        legacy_subjects = {row['path'] for row in exact_store.read_json('request.json')['delivery_review']['artifacts']}
+        self.assertFalse({str(path) for path in predecessors}.intersection(legacy_subjects),
+            'Explicit-copy writing cannot turn new producer authoring context into physical input edges')
+        self.assertTrue({str(context_script), str(context_csv)} <= legacy_subjects,
+            'Legacy selection still promotes generated materials and their consumed scripts')
+        exact_binding = exact_store.resolve('request.json').read_bytes()
+        calls = app.writing.client_factory.return_value.ask_json.call_count
+        with patch.object(app.writing, '_joint_delivery_paths', side_effect=AssertionError(
+                'Recovery must replay saved subjects without applying new declaration filtering')):
+            exact_replay = app.writing.call('compose_document', arguments, identity='whole-unit-exact')
+        self.assertEqual(exact_replay.model_dump(mode='json'), exact.model_dump(mode='json'))
+        self.assertEqual(app.writing.client_factory.return_value.ask_json.call_count, calls)
+        self.assertEqual(exact_store.resolve('request.json').read_bytes(), exact_binding)
+        self.assertEqual({path: path.read_bytes() for path in original}, original)
+        self.assertEqual({path: path.read_bytes() for path in predecessor_bytes}, predecessor_bytes)
+        self.assertEqual({path: path.read_bytes() for path in context_bytes}, context_bytes)
+        self.assertEqual(context_receipt.read_bytes(), context_receipt_bytes)
+        # Material-only ownership does not weaken the evidence/provenance gate.
+        # A script change must invalidate delivery even with unchanged CSV bytes.
+        calls = app.writing.client_factory.return_value.ask_json.call_count
+        factories = app.writing.client_factory.call_count
+        for path, raw in context_bytes.items():
+            with self.subTest(changed_context=path.name):
+                path.write_bytes(raw + b'# changed\n')
+                try:
+                    if path == context_script:
+                        self.assertEqual(context_csv.read_bytes(), context_bytes[context_csv])
+                    with self.assertRaises(ValueError):
+                        app.writing._joint_delivery_paths(
+                            [{'path': str(bundle / 'table.csv')}, {'path': str(context_csv)}],
+                            [str(bundle / 'run.py'), str(bundle / 'table.csv')],
+                            producer_units=units, delivery_copies=set(), declared_subjects_only=True)
+                    with self.assertRaises(ValueError):
+                        app.writing.check_delivery(result.data)
+                    self.assertIsNone(app.writing.continuation(result.model_dump(mode='json'), 'whole-unit'))
+                finally:
+                    path.write_bytes(raw)
+        self.assertIsNotNone(app.writing.continuation(result.model_dump(mode='json'), 'whole-unit'))
+        self.assertEqual(app.writing.client_factory.return_value.ask_json.call_count, calls)
+        self.assertEqual(app.writing.client_factory.call_count, factories)
+        # Context is not a runtime edge, but its original byte guard still binds
+        # the completed owner result and all current writing/publication use.
+        for path in predecessors:
+            with self.subTest(changed_authoring_context=path.name):
+                path.write_bytes(predecessor_bytes[path] + b'# changed\n')
+                try:
+                    with self.assertRaises(ValueError):
+                        professional_units(app.writing, [], [], retained=units)
+                    self.assertIsNone(app.writing.continuation(result.model_dump(mode='json'), 'whole-unit'))
+                finally:
+                    path.write_bytes(predecessor_bytes[path])
+        self.assertEqual({path: path.read_bytes() for path in frozen}, frozen)
+        altered = bundle / 'records.csv'
+        altered.write_bytes(original[altered] + b'changed\n')
+        with self.assertRaises(ValueError):
+            professional_units(app.writing, [], [], retained=units)
+        self.assertIsNone(app.writing.continuation(result.model_dump(mode='json'), 'whole-unit'))
+
+    def test_whole_unit_text_admission_is_total_not_file_layout_or_equal_hash(self):
+        from simple_ar.tools.materials import read_bound_material_bytes
+        # Isolate admission with an already-validated unit; the preceding
+        # integration test exercises the real registration/provenance proof.
+        _, workspace, writing = self._real_workspace()
+        directory = workspace.resolve('workspace/unit', write=True)
+        directory.mkdir()
+        whole, first, second, external = [directory / name
+            for name in ('whole.py', 'first.py', 'second.py', 'external.txt')]
+        whole.write_bytes(b'#' * 256000)
+        first.write_bytes(b'#' * 128000)
+        second.write_bytes(first.read_bytes())
+        external.write_bytes(b'external')
+        with patch('simple_ar.tools.producer_declarations.professional_units') as validate, \
+                patch('simple_ar.tools.producer_declarations.professional_unit_input_owners', return_value={}):
+            def freeze(paths, *, imported=(), text_contract=None):
+                unit = {'files': workspace.artifact_hashes(map(str, paths))}
+                validate.return_value = [unit]
+                contract = {} if text_contract is None else {'text_contract': text_contract}
+                return writing._freeze_delivery_review([*map(str, paths), *map(str, imported)],
+                    'text-boundary', copies=[], producer_units=[unit], **contract)
+
+            for paths, text_contract in ((paths, contract)
+                    for paths in ([whole], [first, second])
+                    for contract in (None, 'professional_unit_text.v1')):
+                with self.subTest(paths=paths, text_contract=text_contract):
+                    result = freeze(paths, text_contract=text_contract)
+                    self.assertEqual(sum(len(row['text'].encode('utf-8')) for row in result['artifacts']), 256000)
+                    self.assertEqual(result['text_admission']['contract'],
+                        text_contract or 'professional_unit_text.v2')
+                    self.assertEqual(result['text_admission']['max_text_bytes'], 256000)
+                    for subject in result['artifacts']:
+                        self.assertEqual(read_bound_material_bytes(workspace, subject['path'],
+                            subject['sha256'], max_bytes=256000), subject['text'].encode('utf-8'))
+                        with self.assertRaises(ValueError):
+                            read_bound_material_bytes(workspace, subject['path'],
+                                subject['sha256'], max_bytes=32000)
+                        with self.assertRaisesRegex(ValueError, 'changed during complete reading'):
+                            read_bound_material_bytes(workspace, subject['path'], '0' * 64, max_bytes=256000)
+                    with self.assertRaisesRegex(ValueError, '256000 total text bytes'):
+                        freeze(paths, imported=[external], text_contract=text_contract)
+            for paths, changed in (([whole], whole), ([first, second], second)):
+                with self.subTest(over_limit=paths):
+                    original = changed.read_bytes()
+                    changed.write_bytes(original + b'#')
+                    with self.assertRaisesRegex(ValueError, '256000 total text bytes'):
+                        freeze(paths)
+                    changed.write_bytes(original)
+            # A multi-byte character crossing the old 64k window is decoded
+            # only once; invalid UTF-8 remains explicitly uninspected.
+            whole.write_bytes(('字' * 30000).encode('utf-8'))
+            self.assertEqual(freeze([whole])['artifacts'][0]['text'], '字' * 30000)
+            whole.write_bytes(b'invalid\xff')
+            row, = freeze([whole])['artifacts']
+            self.assertEqual(row['coverage'], 'incomplete')
+            self.assertNotIn('text', row)
+            # New whole units admit safe UTF-8 by content, including arbitrary
+            # extensionless names and unfamiliar suffixes. Saved v1 markers
+            # retain their historical suffix admission during recovery.
+            for name in ('inventory', 'record.meta', 'current.txt'):
+                path = directory / name
+                with self.subTest(byte_limit_name=name):
+                    path.write_bytes(b'x' * 256000)
+                    row, = freeze([path])['artifacts']
+                    self.assertEqual(row['coverage'], 'complete')
+                    self.assertEqual(row['text'], 'x' * 256000)
+                    with self.assertRaisesRegex(ValueError, '256000 total text bytes'):
+                        freeze([path], imported=[external])
+                    path.write_bytes(b'x' * 256001)
+                    with self.assertRaisesRegex(ValueError, '256000 total text bytes'):
+                        freeze([path])
+                raw = 'Inventory: 字\n\tcomplete\r\n'.encode('utf-8')
+                path.write_bytes(raw)
+                for text_contract in (None, 'professional_unit_text.v2', 'professional_unit_text.v1'):
+                    with self.subTest(name=name, text_contract=text_contract):
+                        result = freeze([path], text_contract=text_contract)
+                        self.assertEqual(result['text_admission']['contract'],
+                            text_contract or 'professional_unit_text.v2')
+                        row, = result['artifacts']
+                        supported = text_contract != 'professional_unit_text.v1' or name == 'current.txt'
+                        self.assertEqual(row['coverage'], 'complete' if supported else 'unsupported')
+                        if supported:
+                            self.assertEqual(row['text'], raw.decode('utf-8'))
+                        else:
+                            self.assertNotIn('text', row)
+                legacy = writing._freeze_delivery_review([str(path)], 'legacy-suffix')
+                self.assertNotIn('text_admission', legacy)
+                row, = legacy['artifacts']
+                self.assertEqual(row['coverage'], 'complete' if name == 'current.txt' else 'unsupported')
+                if name == 'current.txt':
+                    self.assertEqual(row['text'], raw.decode('utf-8'))
+                else:
+                    self.assertNotIn('text', row)
+                for raw in (b'binary\x00payload', b'control\x01payload', b'control\x1fpayload', b'invalid\xff'):
+                    with self.subTest(name=name, rejected=raw):
+                        path.write_bytes(raw)
+                        row, = freeze([path])['artifacts']
+                        self.assertEqual(row['coverage'], 'incomplete')
+                        self.assertNotIn('text', row)
+            # Merely accompanying a unit does not upgrade imported material.
+            whole.write_bytes(b'# valid')
+            external.write_bytes(b'x' * 32001)
+            self.assertEqual(freeze([whole], imported=[external])['artifacts'][1]['coverage'], 'oversized')
+            # The same new-mode count bound applies during subject selection
+            # and snapshot freezing; the request's caller bound is unchanged.
+            members = [directory / f'member-{index}.txt' for index in range(201)]
+            for path in members:
+                path.write_bytes(b'x')
+            for count in (200, 201):
+                unit = {'files': workspace.artifact_hashes(map(str, members[:count]))}
+                if count == 200:
+                    paths, _ = writing._joint_delivery_paths([], [], producer_units=[unit], delivery_copies=set())
+                    self.assertEqual(set(paths), set(unit['files']))
+                    self.assertEqual(len(freeze(members[:count])['artifacts']), count)
+                else:
+                    with self.assertRaisesRegex(ValueError, '200 files'):
+                        writing._joint_delivery_paths([], [], producer_units=[unit], delivery_copies=set())
+                    with self.assertRaisesRegex(ValueError, '200 original subjects'):
+                        freeze(members[:count])
+        # No marker means the old aggregate admission, even for short files.
+        short = []
+        for index in range(4):
+            path = directory / f'short-{index}.txt'
+            path.write_bytes(b'x' * 32000)
+            short.append(str(path))
+        legacy = writing._freeze_delivery_review(short, 'legacy-total')
+        self.assertNotIn('text_admission', legacy)
+        self.assertEqual([row['coverage'] for row in legacy['artifacts']],
+            ['complete', 'complete', 'complete', 'oversized'])
+
+    def test_publication_title_uses_canonical_heading_only_for_new_ordinary_work(self):
+        from simple_ar.report.review_evidence import CLAIM_ADOPTION_V2
+        for policy, explicit in ((None, False), (CLAIM_ADOPTION_V2, False), (CLAIM_ADOPTION_V2, True)):
+            with self.subTest(policy=policy, explicit=explicit):
+                _, _, writing, source, _, _, _, _ = self._document_work_fixture()
+                writing.declaration_adoption_contract = policy
+                arguments = {'goal': 'Explain the retained record', 'material_roots': [str(source)],
+                    'publication': {'compile_pdf': False}, 'finish': True}
+                if explicit:
+                    arguments['title'] = 'Explicit caller title'
+                result = writing.call('compose_document', arguments, identity='title-policy')
+                self.assertEqual(result.status, 'ok', result)
+                export = writing.continuation(result.model_dump(mode='json'), 'title-policy')
+                self.assertEqual(export['arguments']['title'], 'Explicit caller title' if explicit else
+                    '' if policy else 'Recorded value and scope')
+
+    def test_document_work_feedback_reuses_proven_recipe_and_preserves_original_version(self):
+        root, workspace, writing, source, _, _, client, prompts = self._document_work_fixture()
+        initial = writing.call('compose_document', {'goal': 'Explain the record',
+            'material_roots': [str(source)], 'title': 'Explicit source title'}, identity='document-first')
+        self.assertEqual(initial.status, 'ok', initial)
+        original = {path: workspace.resolve(path).read_bytes() for path in initial.artifacts}
+        calls = len(prompts)
+        revised = writing.call('compose_document', {'goal': 'Clarify the scope without new measurements',
+            'prior_draft': initial.data['editable_markdown'], 'publication': {'compile_pdf': False},
+            'finish': True}, identity='document-feedback')
+        self.assertEqual(revised.status, 'ok', revised)
+        self.assertEqual([label for label, _ in prompts[calls:]], ['composition-article', 'article-independent-review'])
+        binding = ArtifactStore(root / 'tools/writing/document-feedback').read_json('request.json')
+        self.assertEqual(binding['request']['title'], 'Explicit source title')
+        self.assertTrue(binding['request']['reuse_prior_inputs'])
+        self.assertEqual(binding['prior_input_reuse']['owner'], 'document-first')
+        self.assertTrue(all(row['path'].startswith('workspace/manuscripts/document-feedback/materials/')
+            for row in binding['document_work']['materials']))
+        self.assertEqual({path: workspace.resolve(path).read_bytes() for path in original}, original)
+        self.assertIsNotNone(writing.continuation(revised.model_dump(mode='json'), 'document-feedback'))
+
+    def test_document_work_continues_failed_article_author_without_selection_or_redrafting(self):
+        for stage in ('initial', 'revision', 'revision_checkpoint_lag', 'revision_negative'):
+            with self.subTest(stage=stage):
+                self._article_continuation_case(stage)
+
+    def _article_continuation_case(self, stage):
+        from simple_ar.tools.writing import freeze_report_requirement, material_report_binding
+        from simple_ar.report.review_evidence import COMPARISON_VERIFICATION_CONTRACT
+        root, workspace, writing, source, _, table, client, prompts = self._document_work_fixture()
+        templates = ArtifactStore(root / 'article-templates')
+        templates.write_text('article.md', '# Recorded results\n\n## Results\nExplain the record.\n\n## Scope\nState limits.\n')
+        templates.write_text('criteria.md', 'Use the provided record and disclose execution limits.\n')
+        requirement = freeze_report_requirement({'template': str(templates.resolve('article.md')),
+            'criteria': str(templates.resolve('criteria.md')), 'outline_strategy': 'template',
+            'draft_scope': 'document', 'review_scope': 'document',
+            'reviewer': 'llm', 'document_review': True, 'max_review_iterations': 0 if stage == 'initial' else 1,
+            'allow_source_backtracking': False, 'allow_llm_fallback': False,
+            'figures': {'enabled': False}}, method='article')
+        goal = 'Explain the saved record without new execution'
+        report = material_report_binding(workspace, requirement, mounts=[str(table)], requests=[goal])
+        writing.report_inputs = lambda: report
+        writing.professional_inputs = True
+        original_answer = client.ask_json.side_effect
+        accepting = False
+        initial_body = '## Results\n\nThe supplied record says value=2.5.\n\n## Scope\n\nNo new execution was requested.'
+        body = (initial_body.replace('The supplied record says value=2.5.', 'The saved value is 2.5.')
+            if stage != 'initial' else initial_body)
+        def answer(system, prompt, **options):
+            view = json.loads(prompt)
+            if options['label'].startswith('composition-selection-'):
+                return original_answer(system, prompt, **options)
+            prompts.append((options['label'], view))
+            if options['label'] == 'composition-article':
+                self.assertFalse(accepting, 'A complete retained author must not be drafted again')
+                if view.get('edit_contract'):
+                    return {'prior_draft_sha256': view['edit_contract']['prior_draft_sha256'],
+                        'replacements': [{'old_text': initial_body, 'new_text': body}]}
+                return {'draft_markdown': initial_body}
+            self.assertTrue(options['label'].startswith('article-independent-review'))
+            self.assertEqual(view['comparison_verification_contract'], COMPARISON_VERIFICATION_CONTRACT)
+            if stage != 'initial' and not accepting and view['sections'][0]['markdown'] == initial_body:
+                return {'section_reviews': [{'section_id': 'document', 'verdict': 'revise_required',
+                    'findings': [{'finding_id': 'style', 'type': 'style', 'severity': 'minor',
+                        'required_action': 'revise', 'section_id': 'document', 'message': 'Clarify the sentence.',
+                        'draft_quotes': [{'section_id': 'document', 'quote': 'The supplied record says value=2.5.'}]}]}]}
+            self.assertEqual(view['sections'][0]['markdown'], body)
+            if accepting and stage == 'revision_negative':
+                return {'section_reviews': [{'section_id': 'document', 'verdict': 'revise_required',
+                    'findings': [{'finding_id': 'remaining-style', 'type': 'style', 'severity': 'minor',
+                        'required_action': 'revise', 'section_id': 'document',
+                        'message': 'Clarify the remaining sentence.',
+                        'draft_quotes': [{'section_id': 'document', 'quote': 'The saved value is 2.5.'}]}]}]}
+            return {'section_reviews': [{'section_id': 'document', 'verdict': 'pass', 'findings': []}]
+                if accepting else 'Malformed even after one correction'}
+        client.ask_json.side_effect = answer
+        initial_arguments = {'material_roots': [str(source)], 'finish': True,
+            'publication': {'compile_pdf': False}}
+        failed = writing.call('compose_document', initial_arguments, identity='article-stopped')
+        if stage == 'initial':
+            self.assertEqual(failed.status, 'error', failed)
+            self.assertTrue(failed.data['incomplete'])
+            self.assertEqual(failed.data['retained_candidate']['status'], 'unreviewed')
+            readable = workspace.resolve(failed.data['retained_candidate']['markdown']).read_text()
+            self.assertIn('The supplied record says value=2.5.', readable)
+            self.assertIn('No new execution was requested.', readable)
+        else:
+            self.assertEqual(failed.status, 'ok', failed)
+            self.assertTrue(failed.data['unresolved'])
+        old = ArtifactStore(root / 'tools/writing/article-stopped')
+        if stage == 'revision_checkpoint_lag':
+            # The atomic author response/projection committed, but the editor
+            # checkpoint did not. Its earlier started event is not authoritative
+            # about whether new prose exists and cannot select the old body.
+            checkpoint = old.read_json('writer/review/checkpoint.json')
+            event = next(row for row in checkpoint['iterations'] if row['action'] == 'document_joint_revise')
+            event.update(drafts=[], status='started', adopted=False)
+            checkpoint['iterations'] = [event]
+            old.resolve('writer/review/checkpoint.json').write_text(json.dumps(checkpoint), encoding='utf-8')
+        native = ArtifactStore(root / 'attempts/article-stopped')
+        native.write_json('native_result.json', failed.model_dump(mode='json'))
+        observed = failed.model_dump(mode='json')
+        before_proof = {p: p.read_bytes() for folder in (old.root, native.root, source)
+            for p in folder.rglob('*') if p.is_file()}
+        before_calls = client.ask_json.call_count
+        before_factories = writing.client_factory.call_count
+        # Only native registration is stubbed; all owner, author, source,
+        # manuscript and inspection proofs below consume the real fixtures.
+        registration = 'simple_ar.tools.implementation.ImplementationToolGateway._registered_ref'
+        with patch(registration, return_value=native.ref('native_result.json', kind='native_observation')):
+            self.assertTrue(writing.can_resume_after_budget(observed, 'article-stopped'))
+            self.assertIsNone(writing.resume_after_budget({**observed, 'summary': 'changed'}, 'article-stopped'))
+            if stage != 'initial':
+                limits = dict(writing.ledger.limits)
+                for resource in ('llm_requests', 'total_tokens'):
+                    writing.ledger.limits[resource] = 0
+                    before = writing.ledger.to_dict()
+                    with patch('simple_ar.tools.implementation_work.stop_decision',
+                            side_effect=lambda owner, observation, identity, reason, detail: {'reason': reason}):
+                        self.assertEqual(writing.stop_after_review(observed, 'article-stopped'),
+                            {'reason': 'shared_budget_exhausted'})
+                    self.assertFalse(writing.can_resume_after_budget(observed, 'article-stopped'))
+                    self.assertIsNone(writing.resume_after_budget(observed, 'article-stopped'))
+                    self.assertEqual(writing.ledger.to_dict(), before)
+                    writing.ledger.limits = dict(limits)
+                # Explicit resource authorization is the application's boundary.
+                # This owner merely reads its resulting current capacity.
+                writing.ledger.limits.update(llm_requests=100, total_tokens=1_000_000)
+                for status in ('reserved', 'unknown'):
+                    from types import SimpleNamespace
+                    with patch.object(type(writing.ledger), 'entries', new_callable=PropertyMock,
+                            return_value=(*writing.ledger.entries,
+                                SimpleNamespace(status=status, attempt_id='another-owner'))):
+                        self.assertFalse(writing.can_resume_after_budget(observed, 'article-stopped'))
+                        self.assertIsNone(writing.resume_after_budget(observed, 'article-stopped'))
+                action = writing.resume_after_budget(observed, 'article-stopped')
+                self.assertEqual(action, {'tool_name': 'compose_document', 'arguments': {
+                    'prior_result': 'records/article-stopped/native_result.json',
+                    'goal': old.read_json('request.json')['request']['goal'], 'finish': True,
+                    'publication': old.read_json('request.json')['request']['publication']}})
+                from simple_ar.report.writing import retained_article_candidate
+                candidate = Path(retained_article_candidate(old, old.read_json('request.json'))['path'])
+                raw = candidate.read_bytes()
+                candidate.unlink()
+                self.assertFalse(writing.can_resume_after_budget(observed, 'article-stopped'))
+                self.assertIsNone(writing.resume_after_budget(observed, 'article-stopped'))
+                candidate.write_bytes(raw)
+                # A complete negative response beats a stale interrupted
+                # checkpoint and never authorizes another same-scope check.
+                response_path = candidate.parent / 'inspection/response.json'
+                raw = response_path.read_bytes()
+                response = json.loads(raw)
+                response['response'] = {'section_reviews': [{'section_id': 'document',
+                    'verdict': 'revise_required', 'findings': [{'finding_id': 'checked-style',
+                        'type': 'style', 'severity': 'minor', 'required_action': 'revise',
+                        'section_id': 'document', 'message': 'A completed negative check.',
+                        'draft_quotes': [{'section_id': 'document', 'quote': 'The saved value is 2.5.'}]}]}]}
+                response['response_sha256'] = hashlib.sha256(json.dumps(response['response'],
+                    sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+                response_path.write_text(json.dumps(response), encoding='utf-8')
+                self.assertFalse(writing.can_resume_after_budget(observed, 'article-stopped'))
+                self.assertIsNone(writing.resume_after_budget(observed, 'article-stopped'))
+                response_path.write_bytes(raw)
+                before = table.read_bytes()
+                table.write_bytes(b'changed original evidence')
+                self.assertFalse(writing.can_resume_after_budget(observed, 'article-stopped'))
+                self.assertIsNone(writing.resume_after_budget(observed, 'article-stopped'))
+                table.write_bytes(before)
+        self.assertEqual(client.ask_json.call_count, before_calls)
+        self.assertEqual(writing.client_factory.call_count, before_factories)
+        self.assertEqual({p: p.read_bytes() for p in before_proof}, before_proof)
+        if stage == 'revision':
+            # A cached historical owner without the new marker retains its
+            # frozen revision ceiling and replays its actual saved result.
+            self.assertNotIn('continued_source_review', old.read_json('request.json'))
+            replay = writing.call('compose_document', initial_arguments, identity='article-stopped')
+            self.assertEqual(replay.model_dump(mode='json'), observed)
+            self.assertEqual(client.ask_json.call_count, before_calls)
+        old_files = {p: p.read_bytes() for folder in (old.root, native.root, source)
+            for p in folder.rglob('*') if p.is_file()}
+        arguments = {'prior_result': 'records/article-stopped/native_result.json'}
+        calls = client.ask_json.call_count
+        path = old.resolve('writer/writer.json')
+        tampered = old.read_json('writer/writer.json')
+        tampered['sections'][0]['draft_markdown'] = 'Invented replacement author'
+        path.write_text(json.dumps(tampered), encoding='utf-8')
+        with patch(registration, return_value=native.ref('native_result.json', kind='native_observation')):
+            self.assertFalse(writing.can_resume_after_budget(observed, 'article-stopped'))
+            self.assertIsNone(writing.resume_after_budget(observed, 'article-stopped'))
+        rejected = writing.call('compose_document', arguments, identity='article-tampered')
+        self.assertEqual(rejected.status, 'error')
+        self.assertEqual(client.ask_json.call_count, calls)
+        path.write_bytes(old_files[path])
+        accepting = True
+        with patch.object(writing, '_select_materials', side_effect=AssertionError('No reselection')):
+            accepted = writing.call('compose_document', action['arguments'] if stage != 'initial' else arguments,
+                identity='article-continued')
+        self.assertEqual(accepted.status, 'ok', accepted)
+        self.assertEqual(client.ask_json.call_count, calls + 1)
+        current = ArtifactStore(root / 'tools/writing/article-continued')
+        self.assertEqual(current.read_json('request.json')['prior_input_reuse']['candidate_contract'],
+            'retained_article_author.v1')
+        from simple_ar.report.writing import professional_writer_config, retained_article_candidate, completed_composition_writer
+        binding = current.read_json('request.json')
+        self.assertEqual(binding['continued_source_review'], 'inspect_only.v1')
+        self.assertEqual(binding['report_binding']['requirement'], requirement)
+        self.assertEqual(professional_writer_config(binding).max_review_iterations, 0)
+        historical = {key: value for key, value in binding.items() if key != 'continued_source_review'}
+        self.assertEqual(professional_writer_config(historical).max_review_iterations,
+            requirement['config']['max_review_iterations'])
+        self.assertEqual(old.read_json('writer/report_inputs.json')['inputs']['binding']['config']['max_review_iterations'],
+            requirement['config']['max_review_iterations'])
+        self.assertEqual([label for label, _ in prompts[calls:]], ['article-independent-review'])
+        if stage == 'revision_negative':
+            self.assertTrue(accepted.data['unresolved'])
+            self.assertEqual(writing.final_review(accepted.data)['review_status'], 'needs_revision')
+            self.assertFalse(writing.can_resume_after_budget(accepted.model_dump(mode='json'), 'article-continued'))
+            with self.assertRaises(ValueError):
+                retained_article_candidate(current, binding, unchecked_revision=True)
+        else:
+            self.assertFalse(accepted.data.get('unresolved'))
+        self.assertEqual(current.read_json('writer/writer.json')['sections'][0]['draft_markdown'], body)
+        self.assertEqual({p: p.read_bytes() for p in old_files}, old_files)
+        with patch.object(client, 'ask_json', side_effect=AssertionError('No model replay')):
+            completed_composition_writer(store=current, binding=binding, identity='article-continued')
+            retained_article_candidate(current, binding)
+            replay = writing.call('compose_document', action['arguments'] if stage != 'initial' else arguments,
+                identity='article-continued')
+        self.assertEqual(replay.model_dump(mode='json'), accepted.model_dump(mode='json'))
+
+    def test_document_work_continues_failed_section_candidate_before_any_redraft(self):
+        from simple_ar.tools.writing import freeze_report_requirement, material_report_binding
+        from simple_ar.report.review_evidence import DRAFT_REFERENCE_CONTRACT
+
+        root, workspace, writing, source, _, table, client, prompts = self._document_work_fixture()
+        templates = ArtifactStore(root / 'fixture-templates')
+        templates.write_text('two-sections.md', '# Recorded value and scope\n\n'
+            '## Results\nExplain the saved value.\n\n## Scope\nState the execution limit.\n')
+        templates.write_text('criteria.md', 'Check both sections against the supplied record and execution scope.\n')
+        requirement = freeze_report_requirement({'template': str(templates.resolve('two-sections.md')),
+            'criteria': str(templates.resolve('criteria.md')), 'outline_strategy': 'template',
+            'draft_scope': 'document', 'review_scope': 'document', 'reviewer': 'llm',
+            'document_review': True, 'max_review_iterations': 0,
+            'allow_source_backtracking': False, 'allow_llm_fallback': False,
+            'figures': {'enabled': False}}, method='sections')
+        self.assertEqual(requirement['outline'], [
+            {'heading': 'Results', 'required': True}, {'heading': 'Scope', 'required': True}])
+        goal = 'Explain the saved value and execution scope using the supplied record'
+        # Freeze actual mounted evidence once, as the controller does. Rebuilding
+        # it after a mutation would accidentally authorize the changed bytes.
+        report = material_report_binding(workspace, requirement, mounts=[str(table)], requests=[goal])
+        writing.report_inputs = lambda: report
+        writing.professional_inputs = True
+        original_answer = client.ask_json.side_effect
+        accepting = False
+        bodies = {'results': 'The supplied record says value=2.5.',
+            'scope': 'The saved record is supplied evidence. No new execution was requested.'}
+
+        def answer(system, prompt, **options):
+            view, _suffix_start = json.JSONDecoder().raw_decode(prompt[prompt.index('{'):])
+            label = options['label']
+            # Fixture usage records model work without contacting a provider.
+            reservation = f'section-fixture-{len(prompts)}'
+            workspace.ledger.reserve(reservation, {'llm_requests': 1},
+                session_id='task', attempt_id='candidate-review' if accepting else 'candidate-author',
+                purpose=label)
+            workspace.ledger.settle(reservation, {'llm_requests': 1}, actual_source='fixture')
+            if label.startswith('composition-selection-'):
+                return original_answer(system, prompt, **options)
+            prompts.append((label, view))
+            if label == 'report-writer-document' and not accepting:
+                self.assertEqual([row['section']['section_id'] for row in view['sections']], list(bodies))
+                self.assertEqual([row['section']['heading'] for row in view['sections']], ['Results', 'Scope'])
+                return {'sections': [{'section_id': sid, 'draft_markdown': body}
+                    for sid, body in bodies.items()]}
+            if label in {'report-document-reviewer', 'report-document-reviewer-format-correction'}:
+                self.assertEqual(view['task'], 'review_document_coherence')
+                self.assertEqual({row['section_id']: row['markdown'] for row in view['sections']}, bodies)
+                if accepting:
+                    self.assertEqual(label, 'report-document-reviewer')
+                    self.assertEqual(view['historical_findings_to_check'], [])
+                    self.assertFalse(view['response_format_correction'])
+                    self.assertEqual(view['draft_reference_contract'], DRAFT_REFERENCE_CONTRACT)
+                    for sid in bodies:
+                        self.assertEqual(view['draft_locator'][sid]['paragraph_count'], 1)
+                        self.assertEqual(view['draft_locator'][sid]['previews']['p1'], bodies[sid][:80])
+                    return {'section_reviews': [{'section_id': sid, 'verdict': 'pass', 'findings': []}
+                        for sid in bodies]}
+                return {'section_reviews': 'invalid even after the one format correction'}
+            self.fail('Unexpected selection, initial writing or correction: ' + label)
+
+        client.ask_json.side_effect = answer
+        initial_arguments = {'material_roots': [str(source)], 'publication': {'compile_pdf': False}}
+        failed = writing.call('compose_document', initial_arguments, identity='section-stopped')
+        self.assertEqual(failed.status, 'error', failed)
+        self.assertTrue(failed.data['incomplete'])
+        self.assertIn('retained_candidate', failed.data, failed.error)
+        self.assertEqual(failed.data['retained_candidate']['status'], 'unreviewed')
+        self.assertFalse(failed.data['retained_candidate']['adopted'])
+        self.assertEqual([label for label, _ in prompts], ['composition-selection-1',
+            'composition-selection-2', 'report-writer-document', 'report-document-reviewer',
+            'report-document-reviewer-format-correction'])
+        old = ArtifactStore(root / 'tools/writing/section-stopped')
+        old_binding = old.read_json('request.json')
+        old_written = old.read_json('writer/writer.json')
+        self.assertEqual(len(old_written['sections']), 2)
+        self.assertEqual(len(old_binding['request']['materials']), 1)
+        self.assertFalse(old.exists('result.json'))
+        self.assertFalse(old.exists('professional_result.json'))
+        self.assertFalse(workspace.resolve('workspace/manuscripts/section-stopped/manuscript.md').exists())
+        # Controller fixture: persist precisely the gateway's failure, never an
+        # invented successful parent result or a developer-exported manuscript.
+        native = ArtifactStore(root / 'attempts/section-stopped')
+        native.write_json('native_result.json', failed.model_dump(mode='json'))
+        reference = 'records/section-stopped/native_result.json'
+        arguments = {'prior_result': reference}
+        old_files = {path: path.read_bytes() for directory in
+            (old.root, native.root, source, workspace.resolve('workspace/manuscripts/section-stopped'))
+            for path in directory.rglob('*') if path.is_file()}
+        old_entries = workspace.ledger.to_dict()['entries']
+        calls = client.ask_json.call_count
+
+        for fault in ('changed-source', 'changed-evidence', 'missing-section', 'author-body'):
+            with self.subTest(fault=fault):
+                changed = {}
+                try:
+                    if fault == 'changed-source':
+                        path = old.resolve('writer/report_inputs.json')
+                        payload = old.read_json('writer/report_inputs.json')
+                        payload['context']['topic'] += ' changed'
+                        changed[path] = json.dumps(payload).encode()
+                    elif fault == 'changed-evidence':
+                        changed[table] = b'value=999\nscope=changed evidence\n'
+                    else:
+                        # Alter both projections together so a mere checkpoint
+                        # equality check cannot stand in for author/plan proof.
+                        for name in ('writer/writer.json', 'writer/sections.json'):
+                            payload = old.read_json(name)
+                            candidate = payload['completed'] if name.endswith('sections.json') else payload
+                            if fault == 'missing-section':
+                                candidate['sections'].pop()
+                            else:
+                                candidate['sections'][0]['draft_markdown'] = 'An invented author body.'
+                            changed[old.resolve(name)] = json.dumps(payload).encode()
+                    for path, raw in changed.items():
+                        path.write_bytes(raw)
+                    rejected = writing.call('compose_document', arguments, identity='reject-' + fault)
+                    self.assertEqual(rejected.status, 'error', rejected)
+                    diagnostic = {'changed-source': 'original section owner/checkpoint',
+                        'changed-evidence': 'Report source', 'missing-section': 'full ordered plan',
+                        'author-body': 'matching complete author response'}[fault]
+                    self.assertIn(diagnostic, rejected.error)
+                    self.assertEqual(client.ask_json.call_count, calls, rejected)
+                    self.assertFalse(ArtifactStore(root / 'tools/writing' / ('reject-' + fault)).exists('result.json'))
+                finally:
+                    for path in changed:
+                        path.write_bytes(old_files[path])
+
+        accepting = True
+        with patch.object(writing, '_select_materials', side_effect=AssertionError('No reselection')):
+            accepted = writing.call('compose_document', arguments, identity='section-continued')
+        self.assertEqual(accepted.status, 'ok', accepted)
+        self.assertEqual([label for label, _ in prompts[calls:]], ['report-document-reviewer'])
+        self.assertEqual(client.ask_json.call_count, calls + 1)
+        self.assertFalse(accepted.data.get('unresolved'))
+        self.assertEqual(accepted.data['delivery_review']['status'], 'reviewed')
+        current = ArtifactStore(root / 'tools/writing/section-continued')
+        binding = current.read_json('request.json')
+        self.assertEqual(binding['report_binding']['requirement'], requirement)
+        for field in ('materials', 'sources', 'figures', 'publication'):
+            self.assertEqual(binding['request'][field], old_binding['request'][field])
+        self.assertEqual(binding['candidate_source']['contract'], 'retained_sections.v1')
+        self.assertEqual(binding['candidate_source']['owner'], str(old.root.resolve()))
+        self.assertEqual(binding['prior_input_reuse']['result_ref'], reference)
+        snapshot = current.read_json('writer/report_inputs.json')
+        self.assertEqual(snapshot['candidate_source'], binding['candidate_source'])
+        self.assertEqual(snapshot['config'], requirement['config'])
+        written = current.read_json('writer/writer.json')
+        self.assertNotEqual(written['snapshot_id'], old_written['snapshot_id'])
+        self.assertEqual({row['section_id']: row['draft_markdown'] for row in written['sections']}, bodies)
+        self.assertEqual(written['independent_review']['review_status'], 'reviewed')
+        self.assertEqual(sum(row['action'] == 'document_current_review' for row in written['iterations']), 1)
+        self.assertFalse(any(row['action'] in {'draft', 'document_joint_revise'} for row in written['iterations']))
+        markdown = workspace.resolve(accepted.data['editable_markdown']).read_text(encoding='utf-8')
+        for heading, body in zip(('Results', 'Scope'), bodies.values()):
+            self.assertIn('## ' + heading, markdown)
+            self.assertIn(body, markdown)
+
+        # Admission/recovery and publication consume the newly inspected exact
+        # version without reviving the stopped review or paying for another call.
+        from simple_ar.report.writing import completed_composition_writer
+        with patch.object(client, 'ask_json', side_effect=AssertionError('Replay must be offline')):
+            completed_composition_writer(store=current, binding=binding, identity='section-continued')
+            publication = writing.publication_source(accepted.data['editable_markdown'], report,
+                observation=accepted.model_dump(mode='json'))
+            writing.check_delivery_set(publication, accepted.artifacts, set())
+            self.assertIsNotNone(writing.continuation(accepted.model_dump(mode='json'), 'section-continued'))
+            replayed = writing.call('compose_document', arguments, identity='section-continued')
+            self.assertEqual(replayed.model_dump(mode='json'), accepted.model_dump(mode='json'))
+            client.ask_json.assert_not_called()
+        self.assertEqual({path: path.read_bytes() for path in old_files}, old_files)
+        self.assertEqual(workspace.ledger.to_dict()['entries'][:len(old_entries)], old_entries)
+        fixture_usage = [entry for entry in workspace.ledger.entries if entry.actual_source == 'fixture']
+        self.assertEqual(len(fixture_usage), calls + 1)
+        self.assertTrue(all(entry.status == 'settled' for entry in fixture_usage))
+
+    def test_document_work_nested_mounts_preserve_layout_and_unchanged_copy_defects(self):
+        root, workspace, writing, source, script, table, client, prompts = self._document_work_fixture()
+        # The same authorized tree may also have narrower/duplicate aliases.
+        # Neither alias insertion order nor a deeper mount may split siblings.
+        workspace.mounts['nested_results'] = source / 'results'
+        workspace.mounts['source9'] = source
+        original_answer = client.ask_json.side_effect
+        first_review = True
+
+        def answer(system, prompt, **options):
+            nonlocal first_review
+            if options['label'] == 'article-independent-review' and first_review:
+                first_review = False
+                view = json.loads(prompt)
+                target = workspace.resolve('workspace/manuscripts/copy-defect-first/materials/source0/results/record.txt')
+                index = next(index for index, row in enumerate(view['delivery_artifacts'])
+                    if any(workspace.resolve(copy['path']) == target for copy in row.get('copies', [])))
+                pointer = f'/delivery_artifacts/{index}/text'
+                return {'section_reviews': [{'section_id': 'document', 'verdict': 'revise_required',
+                    'findings': [{'finding_id': 'copy-unit-missing', 'type': 'evidence_gap',
+                        'severity': 'major', 'required_action': 'verify',
+                        'message': 'The delivered record omits the recorded physical unit.',
+                        'suggested_action': 'Supply the recorded unit in the actual record and inspect the new bytes.',
+                        'delivery_targets': [pointer], 'evidence_quotes': [
+                            {'pointer': pointer, 'quote': 'value=2.5', 'role': 'recorded_material'}]}]}]}
+            return original_answer(system, prompt, **options)
+
+        client.ask_json.side_effect = answer
+        arguments = {'goal': 'Explain the saved record with its unit', 'material_roots': [str(source)],
+            'publication': {'compile_pdf': False}, 'finish': True}
+        first = writing.call('compose_document', arguments, identity='copy-defect-first')
+        self.assertEqual(first.status, 'ok', first)
+        self.assertEqual(first.data['delivery_review']['status'], 'needs_revision')
+        self.assertTrue(writing.can_return_gap(first.model_dump(mode='json'), 'copy-defect-first'))
+        with patch('simple_ar.tools.implementation_work._independent_delivery_review',
+                side_effect=ValueError('Incomplete original response')):
+            self.assertFalse(writing.can_return_gap(first.model_dump(mode='json'), 'copy-defect-first'))
+        original_defect, = first.data['delivery_review']['defects']
+        self.assertIsNone(writing.continuation(first.model_dump(mode='json'), 'copy-defect-first'))
+        first_owner = ArtifactStore(root / 'tools/writing/copy-defect-first')
+        # A real negative inspection is useful only with its exact successful
+        # composition receipt and complete current artifact set.
+        saved = first_owner.read_json('result.json')
+        for change in ({'status': 'error'}, {'error': 'Writer interrupted'},
+                {'artifacts': saved['artifacts'][:-1]}):
+            with self.subTest(retained_negative=change):
+                altered = {**saved, **change}
+                first_owner.write_json('result.json', altered)
+                presented = {**first.model_dump(mode='json'), 'artifacts': altered['artifacts']}
+                self.assertFalse(writing.can_return_gap(presented, 'copy-defect-first'))
+                self.assertIsNone(writing.continuation(presented, 'copy-defect-first'))
+        first_owner.write_json('result.json', saved)
+        self.assertTrue(writing.can_return_gap(first.model_dump(mode='json'), 'copy-defect-first'))
+        # Stop disposition uses the retained review as well as presentation;
+        # only the parent native-observation registration boundary is stubbed.
+        with patch('simple_ar.tools.implementation_work.stop_decision',
+                side_effect=lambda owner, observation, identity, reason, detail: {'reason': reason}):
+            self.assertEqual(writing.stop_after_review(first.model_dump(mode='json'),
+                'copy-defect-first'), {'reason': 'work_gap'})
+            first_owner.write_json('result.json', {**saved, 'status': 'error'})
+            self.assertEqual(writing.stop_after_review(first.model_dump(mode='json'),
+                'copy-defect-first'), {'reason': 'owner_state_unresolved'})
+            first_owner.write_json('result.json', saved)
+        calls = client.ask_json.call_count
+        for _ in range(2):
+            self.assertIsNone(writing.continuation(first.model_dump(mode='json'), 'copy-defect-first'))
+        self.assertEqual(client.ask_json.call_count, calls, 'Inspecting a gap must not start corrective work')
+        frozen = {path: path.read_bytes() for path in first_owner.root.rglob('*') if path.is_file()}
+        frozen.update({workspace.resolve(path): workspace.resolve(path).read_bytes() for path in first.artifacts})
+
+        second = writing.call('compose_document', {'goal': 'Clarify the same record',
+            'prior_draft': first.data['editable_markdown'], 'publication': {'compile_pdf': False},
+            'finish': True}, identity='copy-defect-second')
+        self.assertEqual(second.status, 'ok', second)
+        self.assertEqual(second.data['delivery_review']['status'], 'needs_revision',
+            'A fresh pass opinion cannot repair the same defective bytes under a new copy path')
+        self.assertIsNone(writing.continuation(second.model_dump(mode='json'), 'copy-defect-second'))
+        owner = ArtifactStore(root / 'tools/writing/copy-defect-second')
+        binding = owner.read_json('request.json')
+        history = binding['delivery_review']['prior_defects']
+        self.assertIn(original_defect, history)
+        rebound, = [row for row in history if row != original_defect]
+        self.assertEqual(rebound['finding_ref']['finding'], original_defect['finding'])
+        self.assertEqual(rebound['targets'][0]['sha256'], original_defect['targets'][0]['sha256'])
+        current_copy = workspace.resolve('workspace/manuscripts/copy-defect-second/materials/source0/results/record.txt')
+        self.assertEqual(workspace.resolve(rebound['targets'][0]['path']), table)
+        self.assertIn(str(current_copy), [copy['path'] for copy in rebound['targets'][0]['copies']])
+        self.assertIsNone(rebound['targets'][0]['producer'])
+        rows = binding['document_work']['materials']
+        copied_script = workspace.resolve(next(row['path'] for row in rows if row['source'] == str(script)))
+        self.assertEqual((copied_script.parent / '../results/record.txt').resolve(), current_copy)
+        self.assertEqual((copied_script.parent / '../results/record.txt').read_bytes(), table.read_bytes())
+        for pointer in rebound['finding']['delivery_targets']:
+            subject = binding['delivery_review']['artifacts'][int(pointer.split('/')[2])]
+            self.assertEqual(subject['path'], str(table))
+            self.assertIn(str(current_copy), [copy['path'] for copy in subject['copies']])
+        # Reconstruct the same rejected version from its saved responses only.
+        calls = client.ask_json.call_count
+        replay = writing.call('compose_document', {'goal': 'Clarify the same record',
+            'prior_draft': first.data['editable_markdown'], 'publication': {'compile_pdf': False},
+            'finish': True}, identity='copy-defect-second')
+        self.assertEqual(replay.model_dump(mode='json'), second.model_dump(mode='json'))
+        self.assertEqual(client.ask_json.call_count, calls)
+
+        unrelated = source / 'same-bytes-unrelated.txt'
+        unrelated.write_bytes(table.read_bytes())
+        other = writing._document_material_copies([str(unrelated)], identity='copy-unrelated')
+        other_snapshot = writing._freeze_delivery_review([other['materials'][0]['path']], 'copy-unrelated')
+        writing._document_copy_review_history(other_snapshot, first.data,
+            first_owner.read_json('request.json')['document_work'], other)
+        self.assertEqual(other_snapshot['prior_defects'], [], 'Equal bytes from an unrelated source are not a lineage')
+
+        table.write_bytes(b'value=2.5\nunit=recorded_units\nscope=saved record; no new execution\n')
+        revised = writing.call('compose_document', {**arguments,
+            'prior_draft': second.data['editable_markdown']}, identity='copy-defect-revised')
+        self.assertEqual(revised.status, 'ok', revised)
+        self.assertEqual(revised.data['delivery_review']['status'], 'reviewed')
+        self.assertFalse(writing.can_return_gap(revised.model_dump(mode='json'), 'copy-defect-revised'))
+        self.assertEqual(revised.data['delivery_review']['defects'], [])
+        self.assertIsNotNone(writing.continuation(revised.model_dump(mode='json'), 'copy-defect-revised'))
+        self.assertEqual({path: path.read_bytes() for path in frozen}, frozen)
+
+    def test_document_work_defaults_to_authorized_sources_and_keeps_old_contracts(self):
+        root, workspace, writing, _, _, _, client, prompts = self._document_work_fixture()
+        result = writing.call('compose_document', {'goal': 'Explain the saved evidence'}, identity='document-defaults')
+        self.assertEqual(result.status, 'ok', result)
+        selection = ArtifactStore(root / 'tools/writing/document-defaults').read_json('selection-input.json')
+        self.assertEqual(selection['request']['professional_review']['max_revision_rounds'], 1)
+        self.assertEqual(selection['inventories'][0]['project_path'], str(workspace.mounts['source0']))
+        self.assertFalse(any('attempts' in row['project_path'] for row in selection['inventories']))
+        self.assertNotIn('finish', selection['request'])
+        writing.document_work = False
+        self.assertFalse(writing.finishes_request({'finish': True}))
+        rejected = writing.call('compose_document', {'goal': 'Historical request still needs title',
+            'material_roots': ['source0']}, identity='historical-title')
+        self.assertEqual(rejected.status, 'error')
+        self.assertIn('title', rejected.error)
+        self.assertNotIn('finish', ComposeRequest(goal='Old shape', title='Existing title').model_dump())
+        # The professional owner's omitted-title request must round-trip through
+        # its real frozen input, rather than serialize an invalid default value.
+        pending = ComposeRequest(goal='Let the material owner select the title')
+        self.assertEqual(ComposeRequest.model_validate(pending.model_dump()), pending)
+
+    def test_document_work_finish_delivers_markdown_but_requires_actual_review(self):
+        root, workspace, writing, source, script, _, client, prompts = self._document_work_fixture()
+        arguments = {'goal': 'Deliver the editable report',
+            'material_roots': [str(source)], 'finish': True}
+        result = writing.call('compose_document', arguments, identity='document-no-publication')
+        self.assertEqual(result.status, 'ok', result)
+        observed = result.model_dump(mode='json')
+        action = writing.continuation(observed, 'document-no-publication')
+        self.assertEqual(action['tool_name'], 'deliver_result')
+        self.assertEqual(set(action['arguments']['artifacts']), set(result.artifacts))
+        self.assertEqual(action['arguments']['report']['manuscript'], result.data['editable_markdown'])
+        calls = client.ask_json.call_count
+        self.assertEqual(writing.call('compose_document', arguments,
+            identity='document-no-publication').model_dump(mode='json'), observed)
+        self.assertEqual(client.ask_json.call_count, calls)
+        script.write_text('Changed original evidence', encoding='utf-8')
+        self.assertIsNone(writing.continuation(observed, 'document-no-publication'))
+
+        root, workspace, writing, source, _, _, client, prompts = self._document_work_fixture()
+        writing.report_inputs = lambda: {'obligation': {'formats': ['markdown', 'pdf']}}
+        rejected = writing.call('compose_document', {'goal': 'Deliver the requested PDF',
+            'material_roots': [str(source)], 'finish': True}, identity='document-no-publication')
+        self.assertEqual(rejected.status, 'error')
+        self.assertIn('publication', rejected.error)
+        client.ask_json.assert_not_called()
+        writing.report_inputs = None
+        real_answer = client.ask_json.side_effect
+
+        # An unavailable independent response must never gain finish authority,
+        # even though Writer and copied attachment bytes are already retained.
+        def failed_review(system, prompt, **options):
+            if options['label'] == 'article-independent-review':
+                raise ValueError('Independent response unavailable')
+            return real_answer(system, prompt, **options)
+
+        client.ask_json.side_effect = failed_review
+        failed = writing.call('compose_document', {'goal': 'Explain and publish',
+            'material_roots': [str(source)], 'publication': {'compile_pdf': False}, 'finish': True},
+            identity='document-no-review')
+        self.assertEqual(failed.status, 'error')
+        self.assertIsNone(writing.continuation(failed.model_dump(mode='json'), 'document-no-review'))
+
+    def test_document_material_copies_enforce_scope_size_and_retained_bytes(self):
+        root, workspace, writing, source, script, table, _, _ = self._document_work_fixture()
+        proof = writing._document_material_copies([str(script), str(table)], identity='copy-unit')
+        self.assertEqual(writing._document_material_copies([str(script), str(table)],
+            identity='copy-unit', retained=proof), proof)
+        with self.assertRaisesRegex(ValueError, 'distinct'):
+            writing._document_material_copies([str(table), str(table)], identity='copy-duplicate')
+        with self.assertRaises(ValueError):
+            writing._document_material_copies([str(root / 'ledger.json')], identity='copy-private')
+        oversized = source / 'large.dat'
+        with oversized.open('wb') as handle:
+            handle.truncate(17 * 1024 * 1024)
+        with self.assertRaisesRegex(ValueError, '16 MiB'):
+            writing._document_material_copies([str(oversized)], identity='copy-oversized')
+
+    def test_document_work_does_not_upgrade_an_interrupted_historical_selection(self):
+        root, workspace, writing, source, _, _, client, _ = self._document_work_fixture()
+        writing.document_work = False
+        arguments = {'goal': 'Keep the original selection contract', 'title': 'Explicit old title',
+            'material_roots': [str(source)]}
+        client.ask_json.side_effect = ValueError('Interrupted original selection')
+        original = writing.call('compose_document', arguments, identity='old-selection')
+        self.assertEqual(original.status, 'error')
+        owner = ArtifactStore(root / 'tools/writing/old-selection')
+        # Model an actual pre-migration receipt, rather than a fresh selection
+        # which now freezes the ComposeFigure response schema.
+        historical = owner.read_json('selection-input.json')
+        historical.pop('figure_selection_contract')
+        owner.write_json('selection-input.json', historical)
+        original_bytes = owner.resolve('selection-input.json').read_bytes()
+        self.assertNotIn('document_work', owner.read_json('selection-input.json'))
+        writing.document_work = True
+        client.ask_json.reset_mock()
+        recovered = writing.call('compose_document', arguments, identity='old-selection')
+        self.assertEqual(recovered.status, 'error')
+        self.assertIn('Interrupted material selection', recovered.error)
+        client.ask_json.assert_not_called()
+        self.assertEqual(owner.resolve('selection-input.json').read_bytes(), original_bytes)
+        # Both old selection schemas must still accept strings and reject
+        # object responses without rewriting the input or contacting a model.
+        figure = source / 'legacy.svg'
+        figure.write_bytes(b'<svg xmlns="http://www.w3.org/2000/svg"/>')
+        for document_work in (False, True):
+            with self.subTest(document_work=document_work):
+                request = ComposeRequest.model_validate(arguments)
+                retained_owner = ArtifactStore(root / 'tools/writing' / f'legacy-figures-{document_work}')
+                response = {'materials': [str(source / 'results/record.txt')], 'figures': [str(figure)]}
+                if document_work:
+                    response['title'] = 'Historical title'
+                client.ask_json.side_effect = lambda *args, **kwargs: (
+                    {'read_windows': [{'path': str(source / 'results/record.txt')}]}
+                    if kwargs['label'] == 'composition-selection-1' else response)
+                selected, coverage = writing._select_materials(request, retained_owner, 'legacy-figures',
+                    client, '', None, document_work=document_work)
+                self.assertEqual(selected.figures, [str(figure)])
+                self.assertEqual(coverage['selected_figures'], [str(figure)])
+                old_input = retained_owner.read_json('selection-input.json')
+                old_input.pop('figure_selection_contract')
+                retained_owner.write_json('selection-input.json', old_input)
+                frozen = retained_owner.resolve('selection-input.json').read_bytes()
+                client.ask_json.reset_mock()
+                selected, _ = writing._select_materials(request, retained_owner, 'legacy-figures',
+                    client, '', None, document_work=document_work)
+                self.assertEqual(selected.figures, [str(figure)])
+                old_response = retained_owner.read_json('selection-response.json')
+                retained_owner.write_json('selection-response.json', {**old_response,
+                    'figures': [{'path': str(figure), 'placement': 'attachment'}]})
+                with self.assertRaises(ValueError):
+                    writing._select_materials(request, retained_owner, 'legacy-figures', client, '', None,
+                        document_work=document_work)
+                self.assertEqual(retained_owner.resolve('selection-input.json').read_bytes(), frozen)
+                client.ask_json.assert_not_called()
+
+    def _declared_document_fixture(self):
+        root, workspace, writing, source, _, table, client, prompts = self._document_work_fixture()
+        analysis = workspace.workspace / 'analysis'
+        sizes = {'code/report.py': 24740, 'record.json': 25470, 'summary.md': 15519,
+            'table.csv': 1000, 'inputs/data.txt': 2400, 'inputs/scope.txt': 1200}
+        for name, size in sizes.items():
+            path = analysis / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if name == 'record.json':
+                raw = b'{"record":"' + b'x' * (size - len(b'{"record":""}')) + b'"}'
+            elif name == 'code/report.py':
+                head = b'from pathlib import Path\nprint((Path(__file__).parent / "../inputs/data.txt").read_text())\n#'
+                raw = head + b'x' * (size - len(head))
+            else:
+                raw = b'x' * size
+            path.write_bytes(raw)
+        figure = analysis / 'figure.svg'
+        figure.write_bytes(b'<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"/>')
+        explicit = ['workspace/analysis/' + name for name in sizes]
+        # Same resolved explicit file under two legal locator spellings.
+        declared = [*explicit, str(analysis / 'code/report.py')]
+        original_answer = client.ask_json.side_effect
+
+        def answer(system, prompt, **options):
+            view = json.loads(prompt)
+            if options['label'].startswith('composition-selection-'):
+                self.assertEqual({row['absolute_path'] for row in view['declared_delivery_artifacts']},
+                    {str(workspace.resolve(path)) for path in explicit})
+                self.assertEqual(len(view['declared_delivery_artifacts']), 6)
+                for row in view['declared_delivery_artifacts']:
+                    self.assertEqual(row['sha256'], hashlib.sha256(workspace.resolve(row['path']).read_bytes()).hexdigest())
+                self.assertEqual(view['explicit_figures'][0]['absolute_path'], str(figure))
+                self.assertEqual(view['explicit_figures'][0]['sha256'], hashlib.sha256(figure.read_bytes()).hexdigest())
+            if options['label'].startswith('composition-selection-') and options['label'] != 'composition-selection-1':
+                prompts.append((options['label'], view))
+                return {'title': 'Recorded value and scope', 'materials': [str(table)],
+                    'delivery_artifacts': [str(table)]}
+            reply = original_answer(system, prompt, **options)
+            if options['label'] == 'composition-article' and 'draft_markdown' in reply:
+                reply['draft_markdown'] += '\n\n![Supplied report figure](figures/selected-1.svg)'
+            return reply
+
+        client.ask_json.side_effect = answer
+        arguments = {'goal': 'Explain the recorded result with the complete necessary inputs',
+            'material_roots': [str(source)], 'delivery_artifacts': declared,
+            'figures': [str(figure)], 'publication': {'compile_pdf': False}, 'finish': True}
+        return root, workspace, writing, table, client, prompts, arguments, explicit
+
+    def test_document_explicit_inputs_and_discoveries_share_one_bounded_copy_review(self):
+        root, workspace, writing, table, client, prompts, arguments, explicit = self._declared_document_fixture()
+        result = writing.call('compose_document', arguments, identity='offered-document')
+        self.assertEqual(result.status, 'ok', result)
+        self.assertEqual(result.data['delivery_review']['status'], 'reviewed')
+        owner = ArtifactStore(root / 'tools/writing/offered-document')
+        binding = owner.read_json('request.json')
+        self.assertEqual(binding['document_work']['contract'], 'document_work.v2')
+        self.assertEqual(binding['request']['delivery_artifacts'], [*explicit, str(table)])
+        snapshot = binding['delivery_review']['artifacts']
+        byte_count = sum(len(row.get('text', '').encode('utf-8')) for row in snapshot)
+        self.assertGreater(byte_count, 70000)
+        self.assertLessEqual(byte_count, 96000)
+        self.assertGreater(byte_count * 2, 96000, 'The old double-text package must not fit this bound')
+        self.assertEqual(len(snapshot), 8)  # six explicit files, original data, one figure
+        self.assertTrue(all(row['coverage'] in {'complete', 'visual_uninspected'} for row in snapshot))
+        self.assertEqual(sum(len(row['copies']) for row in snapshot), 8)
+        self.assertTrue(all(set(copy) == {'path', 'sha256'} for row in snapshot for copy in row['copies']))
+        for label, view in prompts:
+            if label == 'composition-article':
+                supplied = view['delivery_review']['artifacts']
+                self.assertEqual(supplied, [{key: value for key, value in row.items() if key != 'text'}
+                    for row in snapshot])
+                self.assertIn('independent inspector', view['attachment_text_scope'])
+            elif label == 'article-independent-review':
+                supplied = restore_delivery_producers(view)
+                self.assertEqual(supplied, snapshot)
+            else:
+                continue
+        for row in result.data['delivery_review']['artifacts']:
+            self.assertIn('copies', row)
+            for copy in row['copies']:
+                self.assertEqual(workspace.resolve(copy['path']).read_bytes(), workspace.resolve(row['path']).read_bytes())
+        script = workspace.resolve('workspace/manuscripts/offered-document/materials/workspace/analysis/code/report.py')
+        self.assertEqual((script.parent / '../inputs/data.txt').read_bytes(),
+            workspace.resolve('workspace/analysis/inputs/data.txt').read_bytes())
+        self.assertIsNotNone(writing.continuation(result.model_dump(mode='json'), 'offered-document'))
+        identity = writing.publication_source(result.data['editable_markdown'], None,
+            observation=result.model_dump(mode='json'))
+        writing.check_delivery_set(identity, result.artifacts, set())
+        calls = client.ask_json.call_count
+        self.assertEqual(writing.call('compose_document', arguments,
+            identity='offered-document').model_dump(mode='json'), result.model_dump(mode='json'))
+        self.assertEqual(client.ask_json.call_count, calls)
+        for fault in ('missing-alias', 'wrong-source', 'producer-on-copy'):
+            altered = json.loads(json.dumps(result.data))
+            subject = next(row for row in altered['delivery_review']['artifacts'] if row.get('copies'))
+            if fault == 'missing-alias':
+                subject['copies'] = []
+            elif fault == 'wrong-source':
+                subject['path'] = str(table)
+            else:
+                subject['copies'][0]['producer'] = {'invocation_id': 'invented'}
+            with self.subTest(fault=fault), self.assertRaises(ValueError):
+                writing._check_document_copy_review(altered)
+
+    def test_document_discoveries_cannot_expand_explicit_scope_or_replace_declared_versions(self):
+        for fault in ('outside-discovery', 'changed-declared'):
+            with self.subTest(fault=fault):
+                root, workspace, writing, _, client, prompts, arguments, explicit = self._declared_document_fixture()
+                original_answer = client.ask_json.side_effect
+
+                def answer(system, prompt, **options):
+                    response = original_answer(system, prompt, **options)
+                    if options['label'] == 'composition-selection-2':
+                        if fault == 'outside-discovery':
+                            response['delivery_artifacts'] = [explicit[0]]
+                        else:
+                            path = workspace.resolve(explicit[0])
+                            path.write_bytes(path.read_bytes() + b'changed after preflight')
+                    return response
+
+                client.ask_json.side_effect = answer
+                result = writing.call('compose_document', arguments, identity='declared-scope-' + fault)
+                self.assertEqual(result.status, 'error', result)
+                self.assertIn('inventory' if fault == 'outside-discovery' else 'changed', result.error)
+                self.assertFalse(any(label == 'composition-article' for label, _ in prompts))
+
+    def test_document_equal_hashes_do_not_merge_different_original_subjects(self):
+        root, workspace, writing, source, script, _, _, _ = self._document_work_fixture()
+        offered = workspace.workspace / 'offered.py'
+        offered.write_bytes(script.read_bytes())
+        result = writing.call('compose_document', {'goal': 'Explain both actual source locations',
+            'material_roots': [str(source)], 'delivery_artifacts': [str(offered)]}, identity='distinct-origins')
+        self.assertEqual(result.status, 'ok', result)
+        binding = ArtifactStore(root / 'tools/writing/distinct-origins').read_json('request.json')
+        subjects = {row['path']: row for row in binding['delivery_review']['artifacts']}
+        first, second = subjects[str(script)], subjects[str(offered)]
+        self.assertEqual(first['sha256'], second['sha256'])
+        self.assertNotEqual(first['copies'], second['copies'])
+        self.assertEqual(len(binding['document_work']['materials']), 3)
+
+    def test_document_review_rejects_changed_actual_copy_bytes_even_when_reviewer_passes(self):
+        root, workspace, writing, source, _, _, client, _ = self._document_work_fixture()
+        original_answer = client.ask_json.side_effect
+
+        def answer(system, prompt, **options):
+            response = original_answer(system, prompt, **options)
+            if options['label'] == 'article-independent-review':
+                copy = json.loads(prompt)['delivery_artifacts'][0]['copies'][0]
+                path = workspace.resolve(copy['path'])
+                path.write_bytes(path.read_bytes() + b'changed during review')
+            return response
+
+        client.ask_json.side_effect = answer
+        result = writing.call('compose_document', {'goal': 'Explain the recorded value',
+            'material_roots': [str(source)], 'publication': {'compile_pdf': False}, 'finish': True},
+            identity='changed-copy-review')
+        self.assertEqual(result.status, 'error', result)
+        self.assertIn('changed before canonical receipt', result.error)
+        self.assertIsNone(writing.continuation(result.model_dump(mode='json'), 'changed-copy-review'))
+
+    def test_document_v1_receipts_keep_double_subject_semantics_on_recovery(self):
+        root, workspace, writing, source, _, _, client, _ = self._document_work_fixture()
+        arguments = {'goal': 'Preserve the historical unit', 'material_roots': [str(source)],
+            'publication': {'compile_pdf': False}, 'finish': True}
+        with patch('simple_ar.tools.writing._DOCUMENT_WORK_CONTRACT', 'document_work.v1'):
+            result = writing.call('compose_document', arguments, identity='document-v1')
+        self.assertEqual(result.status, 'ok', result)
+        owner = ArtifactStore(root / 'tools/writing/document-v1')
+        frozen = {path: path.read_bytes() for path in owner.root.rglob('*') if path.is_file()}
+        snapshot = owner.read_json('request.json')['delivery_review']['artifacts']
+        self.assertEqual(len(snapshot), 4)
+        self.assertTrue(all('copies' not in row for row in snapshot))
+        self.assertEqual(owner.read_json('selection-input.json')['document_work'], 'document_work.v1')
+        client.ask_json.reset_mock()
+        replay = writing.call('compose_document', arguments, identity='document-v1')
+        self.assertEqual(replay.model_dump(mode='json'), result.model_dump(mode='json'))
+        client.ask_json.assert_not_called()
+        self.assertEqual({path: path.read_bytes() for path in frozen}, frozen)
+
+    def test_selection_reserves_writer_joint_review_and_closing_floor_before_provider(self):
+        from simple_ar.integrations.llm import LLMClient, LLMSettings
+        for mode, failure_kind in (('exhausted', 'resource_exhausted'),
+                ('unknown', 'accounting_unresolved')):
+            with self.subTest(mode=mode):
+                root, workspace, writing = self._real_workspace()
+                ledger = workspace.ledger
+                # Exhausted: three requests remain, all needed downstream.
+                # Unknown: ample nominal allowance must not permit a send.
+                ledger.limits['llm_requests'] = 4 if mode == 'exhausted' else 100
+                ledger.reserve('original-call', {'llm_requests': 1},
+                    session_id='task', attempt_id='original', purpose='original-work')
+                if mode == 'unknown':
+                    ledger.mark_unknown('original-call', reason='Provider usage awaits reconciliation')
+                else:
+                    ledger.settle('original-call', {'llm_requests': 1}, actual_source='provider')
+                before, ledger_bytes = ledger.to_dict(), ledger.storage_path.read_bytes()
+                material = workspace.workspace / 'measurements.txt'
+                material.write_text('Recorded measurement: 2.5\n', encoding='utf-8')
+                client = LLMClient(LLMSettings(model='fixture-model', api_key='fixture-only',
+                    api_mode='chat', max_output_tokens=256, retry_attempts=1),
+                    budget_ledger=ledger, budget_session_id='task', budget_attempt_id='selection-stop')
+                writing.ledger = ledger
+                writing.joint_delivery = True
+                writing.client_factory = Mock(return_value=client)
+                ask_json = client.ask_json
+                closing_floor, known_calls = 1, 2  # article Writer + joint delivery reviewer
+
+                def selection_request(*args, **kwargs):
+                    self.assertGreaterEqual(ledger._remaining_floor('llm_requests'),
+                        closing_floor + known_calls)
+                    if mode == 'exhausted':
+                        self.assertEqual(json.loads(args[1])['decisions_remaining'], 0)
+                    return ask_json(*args, **kwargs)
+
+                # Keep real client reservation/error chaining; mock only the
+                # provider transport, which must never be reached by this call.
+                with patch('simple_ar.integrations.llm._call_provider') as provider, \
+                        patch.object(client, 'ask_json', side_effect=selection_request) as selection, \
+                        ledger.protect_remaining({'llm_requests': closing_floor}):
+                    result = writing.call('compose_document', {'goal': 'Explain the recorded measurement',
+                        'title': 'Recorded result', 'material_roots': [str(material)]},
+                        identity='selection-stop')
+                    selection.assert_called_once()
+                    provider.assert_not_called()
+                    self.assertEqual(ledger._remaining_floor('llm_requests'), closing_floor)
+                self.assertEqual(ledger._remaining_floor('llm_requests'), 0)
+                self.assertEqual((result.status, result.data['failure_kind']), ('error', failure_kind), result)
+                self.assertTrue(result.data['incomplete'])
+                if mode == 'unknown':
+                    self.assertIn('Reconcile', result.data['next_action'])
+                    self.assertNotIn('append a continuation request', result.data['next_action'])
+                    self.assertEqual(ledger.entries[0].status, 'unknown')
+                else:
+                    self.assertIn('Authorize', result.data['next_action'])
+                    self.assertIn('append a continuation request', result.data['next_action'])
+                self.assertEqual(ledger.to_dict(), before)
+                self.assertEqual(ledger.storage_path.read_bytes(), ledger_bytes)
+
+    def _journal_material(self, root, workspace, raw, **window):
+        sources = root / 'originals'
+        sources.mkdir(exist_ok=True)
+        workspace.mounts['source0'] = sources
+        source = sources / 'values.txt'
+        source.write_bytes(raw)
+        request = {'path': 'source0/values.txt', 'full_digest': True, **window}
+        result = workspace.call('read_file', request, identity='parent-read')
+        self.assertEqual(result.status, 'ok', result)
+        store = ArtifactStore(root / 'attempts' / 'parent-read')
+        store.write_json('tool_result.json', result.model_dump(mode='json'))
+        reference = {'record': 'records/parent-read/tool_result.json', 'request': request,
+            'receipt_sha256': hashlib.sha256(store.resolve('tool_result.json').read_bytes()).hexdigest()}
+        return source, result, reference
+
+    def test_journal_content_reuses_relocated_windows_without_moving_source_authority(self):
+        from simple_ar.tools.materials import (MaterialSelection, inspect_materials,
+            material_inventories, material_observation_seed, selected_material_windows,
+            validate_material_observation)
+        for window in ({'offset_bytes': 7, 'max_bytes': 6},
+                {'start_line': 2, 'max_lines': 1, 'max_bytes': 40}):
+            with self.subTest(window=window):
+                root, workspace, _ = self._real_workspace()
+                raw = 'header\n测量\nunseen tail\n'.encode('utf-8')
+                source, result, reference = self._journal_material(root, workspace, raw, **window)
+                # Source-side role/provenance labels are not target facts.
+                result.data.update(evidence_role='draft_claims_not_evidence',
+                    producer={'invocation_id': 'old-producer'}, execution='old-authority')
+                journal = ArtifactStore(root / 'attempts' / 'parent-read')
+                journal.write_json('tool_result.json', result.model_dump(mode='json'))
+                reference['receipt_sha256'] = hashlib.sha256(journal.resolve('tool_result.json').read_bytes()).hexdigest()
+                target = workspace.workspace / 'project' / 'renamed.csv'
+                target.parent.mkdir()
+                target.write_bytes(raw)
+                # The target is its own byte owner even when the historical
+                # source is subsequently edited. No copy command is inspected.
+                source.write_bytes(b'changed original')
+                inventory = material_inventories(workspace, [str(target.parent)], identity='selection')
+                before = workspace.ledger.to_dict()
+                seed = material_observation_seed(workspace=workspace, inventories=inventory,
+                    provider=lambda roots: [reference], roots=[str(target.parent)], context={})
+                self.assertEqual(len(seed['observations']), 1)
+                row, = seed['observations']
+                self.assertEqual(row['data']['text'], result.data['text'])
+                self.assertNotIn('unseen', row['data']['text'])
+                self.assertEqual(row['request']['path'], str(target))
+                self.assertEqual(row['data']['absolute_path'], str(target))
+                self.assertEqual(row['content_reuse']['source'], reference)
+                self.assertEqual(row['content_reuse']['target']['sha256'], result.data['sha256'])
+                self.assertEqual(row['content_reuse']['target']['offset_bytes'], 7)
+                for key in ('producer', 'evidence_role', 'execution', 'record'):
+                    self.assertNotIn(key, row)
+                    self.assertNotIn(key, row['data'])
+                self.assertEqual(validate_material_observation(workspace, row, identity='resume'), row)
+                self.assertEqual(workspace.ledger.to_dict(), before)
+                owner = ArtifactStore(root / 'selection')
+                client = Mock()
+                client.ask_json.return_value = {'materials': [row['request']]}
+                response = inspect_materials(workspace=workspace, context={}, instructions='Inspect',
+                    inventories=inventory, owner=owner, identity='selection', client=client,
+                    response_model=MaterialSelection, label='selection', final_fields=('materials',), seed=seed)
+                self.assertEqual(client.ask_json.call_count, 1)
+                selected, = selected_material_windows(workspace, MaterialSelection.model_validate(response),
+                    owner.read_json('selection-observations.json'), identity='resume')
+                self.assertEqual(selected, row)
+                with self.assertRaisesRegex(ValueError, 'not inspected'):
+                    selected_material_windows(workspace, MaterialSelection(materials=[
+                        FileWindow(path=str(target), max_bytes=len(raw))]), [row], identity='tail')
+                target.write_bytes(raw.replace(b'unseen', b'UNSEEN'))
+                with self.assertRaises(ValueError):
+                    validate_material_observation(workspace, row, identity='changed-target')
+                target.write_bytes(raw)
+                ArtifactStore(root / 'attempts' / 'parent-read').write_json('tool_result.json', {})
+                with self.assertRaisesRegex(ValueError, 'receipt changed'):
+                    validate_material_observation(workspace, row, identity='changed-receipt')
+
+    def test_journal_content_rejects_different_lossy_unhashed_and_excluded_inputs(self):
+        from simple_ar.tools.materials import material_inventories, material_observation_seed
+        for mode in ('different-bytes', 'invalid-utf8', 'split-utf8', 'no-full-hash',
+                'failed-read', 'changed-receipt', 'excluded-source', 'excluded-target',
+                'not-in-inventory', 'outside-mount'):
+            with self.subTest(mode=mode):
+                root, workspace, _ = self._real_workspace()
+                raw = b'head\nvalue=123\ntail\n'
+                window = {'offset_bytes': 5, 'max_bytes': 9}
+                if mode == 'invalid-utf8':
+                    raw = b'head\nvalue=\xff23\ntail\n'
+                elif mode == 'split-utf8':
+                    raw = 'head\n测量\ntail\n'.encode('utf-8')
+                    window = {'offset_bytes': 6, 'max_bytes': 4}
+                source, result, reference = self._journal_material(root, workspace, raw, **window)
+                target = workspace.workspace / 'copy.txt'
+                target.write_bytes(raw if mode != 'different-bytes' else raw.replace(b'tail', b'TAIL'))
+                if mode in ('no-full-hash', 'failed-read'):
+                    payload = result.model_dump(mode='json')
+                    if mode == 'no-full-hash':
+                        payload['data']['sha256'] = None
+                    else:
+                        payload.update(status='error', error='Read failed')
+                    record = ArtifactStore(root / 'attempts' / 'parent-read')
+                    record.write_json('tool_result.json', payload)
+                    reference['receipt_sha256'] = hashlib.sha256(record.resolve('tool_result.json').read_bytes()).hexdigest()
+                elif mode == 'changed-receipt':
+                    reference['receipt_sha256'] = '0' * 64
+                inventory = material_inventories(workspace, [str(target)], identity='selection')
+                if mode == 'not-in-inventory':
+                    inventory[0]['candidate_files'] = {}
+                elif mode == 'outside-mount':
+                    inaccessible = root / 'private.txt'
+                    inaccessible.write_bytes(raw)
+                    inventory[0]['candidate_files'] = {str(inaccessible): len(raw)}
+                excluded = ({str(source)} if mode == 'excluded-source' else
+                    {str(target)} if mode == 'excluded-target' else set())
+                seed = material_observation_seed(workspace=workspace, inventories=inventory,
+                    provider=lambda roots: [reference], roots=[str(target)], context={}, excluded_paths=excluded)
+                self.assertEqual(seed['observations'], [])
+
+    def test_journal_content_preserves_same_path_shape_and_bounds_validation_and_supply(self):
+        from simple_ar.tools.materials import (material_inventories, material_observation_seed,
+            validate_material_observation)
+        root, workspace, _ = self._real_workspace()
+        source, _, reference = self._journal_material(root, workspace, b'value\n', max_bytes=6)
+        inventory = material_inventories(workspace, [str(source)], identity='same-path')
+        seed = material_observation_seed(workspace=workspace, inventories=inventory,
+            provider=lambda roots: [reference], roots=[str(source)], context={})
+        self.assertEqual(seed['observations'], [validate_material_observation(workspace, reference, identity='old-shape')])
+        self.assertNotIn('content_reuse_contract', seed['coverage'])
+        # A bounded inventory can contain many byte-identical targets; neither
+        # validation nor supplied content may expand without a finite ceiling.
+        targets = workspace.workspace / 'many'
+        targets.mkdir()
+        for index in range(130):
+            (targets / f'{index:03}.txt').write_bytes(b'value\n')
+        inventory = material_inventories(workspace, [str(targets)], identity='bounded')
+        seed = material_observation_seed(workspace=workspace, inventories=inventory,
+            provider=lambda roots: [reference], roots=[str(targets)], context={})
+        self.assertLessEqual(len(seed['observations']), 128)
+        self.assertEqual(seed['coverage']['content_validation']['probes'], 128)
+        self.assertTrue(any(row['reason'] == 'content_validation_capacity' for row in seed['coverage']['not_admitted']))
+        with patch('simple_ar.tools.materials._CONTENT_REUSE_MAX_HASH_BYTES', 18):
+            bounded = material_observation_seed(workspace=workspace, inventories=inventory,
+                provider=lambda roots: [reference], roots=[str(targets)], context={})
+        self.assertEqual(bounded['coverage']['content_validation']['hash_bytes_upper_bound'], 18)
+        self.assertEqual(len(bounded['observations']), 3)
+        source, _, reference = self._journal_material(root, workspace, b'x' * 64000, max_bytes=64000)
+        for path in targets.iterdir():
+            path.write_bytes(b'x' * 64000)
+        seed = material_observation_seed(workspace=workspace,
+            inventories=material_inventories(workspace, [str(targets)], identity='text-capacity'),
+            provider=lambda roots: [reference], roots=[str(targets)], context={})
+        self.assertEqual(len(seed['observations']), 1)
+        self.assertEqual(seed['coverage']['content_validation']['probes'], 1)
+        self.assertTrue(any(row['reason'] == 'observation_capacity' for row in seed['coverage']['not_admitted']))
+
+    def test_journal_reference_cross_mount_lookup_is_explicit_and_does_not_expand_inventory(self):
+        from simple_ar.tools.materials import journal_material_references
+        root, workspace, _ = self._real_workspace()
+        _, _, reference = self._journal_material(root, workspace, b'values\n', max_bytes=7)
+        store = ArtifactStore(root)
+        store.write_json('reply.json', {'tool_calls': [{'id': 'read', 'function': {
+            'name': 'read_file', 'arguments': json.dumps(reference['request'])}}]})
+        turns = [{'reply': 'reply.json', 'tools': [{'id': 'read',
+            'result': 'attempts/parent-read/tool_result.json'}]}]
+        self.assertEqual(journal_material_references(workspace, store, turns, ['workspace']), [])
+        self.assertEqual(journal_material_references(workspace, store, turns, ['workspace'],
+            include_cross_path=True), [reference])
+
+    def test_journal_content_keeps_focus_input_receipt_identity(self):
+        from simple_ar.tools.materials import material_inventories, material_observation_seed
+        root, workspace, _ = self._real_workspace()
+        _, result, reference = self._journal_material(root, workspace, b'values\n', max_bytes=7)
+        store = ArtifactStore(root / 'attempts' / 'parent-read')
+        store.write_json('tool_result.json', ToolResult(tool_name='focus_work', data={'inputs': [
+            {'request': reference['request'], 'data': result.data}]}).model_dump(mode='json'))
+        reference.update(input_index=0, receipt_sha256=hashlib.sha256(store.resolve('tool_result.json').read_bytes()).hexdigest())
+        target = workspace.workspace / 'copy.csv'
+        target.write_bytes(b'values\n')
+        inventory = material_inventories(workspace, [str(target)], identity='focus-copy')
+        seed = material_observation_seed(workspace=workspace, inventories=inventory,
+            provider=lambda roots: [reference], roots=[str(target)], context={})
+        row, = seed['observations']
+        self.assertEqual(row['content_reuse']['source']['input_index'], 0)
+        invalid = {**reference, 'input_index': 1}
+        rejected = material_observation_seed(workspace=workspace, inventories=inventory,
+            provider=lambda roots: [invalid], roots=[str(target)], context={})
+        self.assertEqual(rejected['observations'], [])
+
+    def test_producer_reuse_preserves_partial_samehash_and_requires_complete_changed_bytes(self):
+        root, workspace, writing = self._real_workspace()
+        old, new = workspace.workspace / 'old', workspace.workspace / 'new'
+        old.mkdir()
+        new.mkdir()
+        # Only lineage resolution is stubbed: all file/window reads, bounds,
+        # identities and returned reuse recipes below use the real workspace.
+        execution = ArtifactStore(root / 'attempts' / 'repair')
+        execution.write_json('candidate_execution.json', {'fixture': 'lineage supplied by integration test'})
+        execution.write_json('native_result.json', {'fixture': 'not an accepted execution receipt'})
+        request = ComposeRequest(goal='Reuse the actual inspected records', title='Recorded result',
+            prior_draft='workspace/manuscripts/prior/manuscript.md', reuse_prior_inputs=True,
+            producer_repair='records/repair/candidate_execution.json')
+        for mode, maximum in (('samehash', 5), ('changed-full', 100), ('changed-too-large', 5),
+                ('whole-growth', 100), ('whole-over-reader-bound', 100)):
+            with self.subTest(mode=mode):
+                original = b'header\nvalue=1\ntail=old\n'
+                replacement = original if mode == 'samehash' else original.replace(b'tail=old', b'tail=NEW-EVIDENCE')
+                if mode == 'whole-over-reader-bound':
+                    replacement = b'x' * 64001
+                source, target = old / 'values.csv', new / 'values.csv'
+                source.write_bytes(original)
+                target.write_bytes(replacement)
+                whole = mode.startswith('whole-')
+                window = FileWindow(path=str(source), offset_bytes=0 if whole else 7,
+                    max_bytes=len(original) if whole else maximum, full_digest=True)
+                observed = workspace.call('read_file', window.model_dump(exclude_unset=True), identity='original-window')
+                self.assertEqual(observed.status, 'ok', observed)
+                data = observed.data
+                selection = {key: data[key] for key in ('size_bytes', 'next_offset_bytes', 'has_more', 'start_line') if key in data}
+                selection.update(offset_bytes=0 if whole else 7, window_sha256=hashlib.sha256(data['text'].encode()).hexdigest())
+                bound = {'path': str(source), 'sha256': data['sha256'], 'selection': selection}
+                binding = {'request': {'sources': [], 'materials': [window.model_dump()]}, 'inputs': [bound]}
+                linkage = {'owner': 'prior', 'inputs': [bound]}
+                frozen = json.dumps([binding, linkage], sort_keys=True)
+                repair = {'owner': 'prior', 'arguments': request.model_dump(),
+                    'execution_ref': request.producer_repair, 'execution_sha256': hashlib.sha256(execution.resolve('candidate_execution.json').read_bytes()).hexdigest(),
+                    'review_ref': 'records/repair/native_result.json', 'old_project': old, 'new_project': new,
+                    'source_replacements': {}, 'old_versions': {source: hashlib.sha256(original).hexdigest()},
+                    'new_versions': {target: hashlib.sha256(replacement).hexdigest()},
+                    'replace': lambda path: str(target) if workspace.resolve(path) == source else path}
+                resolved = request.model_copy(update={'materials': [window]})
+                with patch.object(writing, '_producer_repair', return_value=repair), \
+                        patch.object(workspace, 'call', wraps=workspace.call) as reads:
+                    if mode == 'whole-over-reader-bound':
+                        with self.assertRaises(ValueError):
+                            writing._repaired_prior_inputs(request, resolved, binding, linkage)
+                    elif mode == 'changed-too-large':
+                        with self.assertRaisesRegex(ValueError, 'Complete repaired material exceeds'):
+                            writing._repaired_prior_inputs(request, resolved, binding, linkage)
+                    else:
+                        reused, evidence, retained = writing._repaired_prior_inputs(request, resolved, binding, linkage)
+                        if mode == 'samehash':
+                            def normalize(values):
+                                return writing._material_report_arguments(values,
+                                    {'requests': ['Original request', 'Later feedback']})
+                            effective = ComposeRequest.model_validate(normalize(request.model_dump()))
+                            effective_resolved = resolved.model_copy(update={'goal': effective.goal})
+                            with self.assertRaisesRegex(ValueError, 'Producer reuse differs'):
+                                writing._repaired_prior_inputs(effective, effective_resolved, binding, linkage)
+                            transported, _, _ = writing._repaired_prior_inputs(effective, effective_resolved, binding,
+                                linkage, normalize_arguments=normalize)
+                            self.assertEqual(transported.goal, effective.goal)
+                            with self.assertRaisesRegex(ValueError, 'Producer reuse differs'):
+                                writing._repaired_prior_inputs(effective.model_copy(update={'title': 'Unrelated request'}),
+                                    effective_resolved, binding, linkage, normalize_arguments=normalize)
+                        current = retained['inputs'][0]
+                        self.assertEqual(current['sha256'], hashlib.sha256(replacement).hexdigest())
+                        self.assertEqual(current['path'], str(target))
+                        if mode == 'samehash':
+                            self.assertEqual(reused.materials[0].model_dump(), {**window.model_dump(), 'path': str(target)})
+                            self.assertEqual(current['selection'], selection)
+                            self.assertEqual(retained['producer_repair']['changed_materials'], [])
+                            full_reads = [call for call in reads.call_args_list
+                                if call.args[0] == 'read_file' and call.args[1].get('offset_bytes', 0) == 0
+                                and call.args[1].get('max_bytes', 16000) >= len(original)]
+                            self.assertFalse(full_reads, 'Same-hash relocation must not force whole-file text acquisition')
+                        else:
+                            self.assertEqual(reused.materials[0].offset_bytes, 0)
+                            self.assertEqual(current['selection']['next_offset_bytes'], len(replacement))
+                            self.assertFalse(current['selection']['has_more'])
+                            self.assertEqual(current['selection']['window_sha256'], hashlib.sha256(replacement).hexdigest())
+                            self.assertEqual(retained['producer_repair']['changed_materials'], ['compose-material-1'])
+                    if mode not in {'samehash', 'whole-over-reader-bound'}:
+                        reads.assert_called_once()
+                        self.assertEqual(reads.call_args.args[0], 'read_file')
+                        self.assertEqual(reads.call_args.args[1]['offset_bytes'], 0)
+                self.assertEqual(json.dumps([binding, linkage], sort_keys=True), frozen)
+                self.assertEqual(source.read_bytes(), original)
+
+    def test_joint_subjects_keep_actual_old_script_argv_and_directory_dependencies(self):
+        # This isolated argv projection has no accepted implementation unit;
+        # full registered input ownership is covered by the real-unit test.
+        self.enterContext(patch('simple_ar.tools.producer_declarations.professional_unit_input_owners',
+            return_value={}))
+        root, workspace, writing = self._real_workspace()
+        old, new = workspace.workspace / 'old', workspace.workspace / 'new'
+        old.mkdir()
+        new.mkdir()
+        code = ("from pathlib import Path\nimport sys\n"
+            "if len(sys.argv) > 1:\n    assert (Path(sys.argv[1].split('=', 1)[-1]) / Path(__file__).name).read_bytes()\n"
+            "Path('values.csv').write_text('value\\n1\\n', encoding='utf-8')\n")
+        # Physical execution/provenance are real. Only the small upstream
+        # lineage wrapper is projected from their actual argv/cwd/receipt;
+        # approval and accepted implementation lineage live in the full chain.
+        for suffix, mode in ((suffix, mode) for suffix in ('.py', '.txt', '.json', '')
+                for mode in ('current', 'old-script', 'old-directory')):
+            with self.subTest(suffix=suffix, mode=mode):
+                source, current = old / ('plot' + suffix), new / ('plot' + suffix)
+                source.write_text(code, encoding='utf-8')
+                current.write_bytes(source.read_bytes())
+                digest = hashlib.sha256(source.read_bytes()).hexdigest()
+                invocation = 'producer-' + mode + '-' + (suffix.lstrip('.') or 'extensionless')
+                cwd = new / invocation
+                cwd.mkdir()
+                output = cwd / 'values.csv'
+                argv = ['python', str(source) if mode == 'old-script' else str(current)]
+                if mode == 'old-directory':
+                    argv.append('--source-dir=' + str(old))
+                result = workspace.call('run_process', {'argv': argv, 'cwd': str(cwd), 'timeout_sec': 3,
+                    'inputs': [str(source), str(current)], 'outputs': [str(output)]}, identity=invocation)
+                self.assertEqual((result.status, result.data.get('returncode')), ('ok', 0), result)
+                receipt = root / result.data['receipt']
+                receipt_bytes = receipt.read_bytes()
+                physical = json.loads(receipt_bytes)
+                execution = ArtifactStore(root / 'attempts' / invocation)
+                reference = execution.write_json('candidate_execution.json', {
+                    'argv': physical['argv'], 'cwd': physical['cwd'], 'receipt': result.data['receipt']})
+                repair = {'source_replacements': {str(source): {
+                    'old_sha256': digest, 'path': str(current), 'sha256': digest}},
+                    'execution_ref': 'records/' + invocation + '/candidate_execution.json',
+                    'execution_sha256': hashlib.sha256(execution.resolve(reference).read_bytes()).hexdigest()}
+                for units, declared_only in ((units, declared_only)
+                        for units in (None, [{'files': {str(output): hashlib.sha256(output.read_bytes()).hexdigest(),
+                            str(current): digest}}])
+                        for declared_only in (False, True)):
+                    with self.subTest(complete_unit=units is not None, declared_subjects_only=declared_only):
+                        paths, consumers = writing._joint_delivery_paths([{'path': str(output)}],
+                            [str(output)] if declared_only else [],
+                            producer_repair=repair, producer_units=units,
+                            **({'declared_subjects_only': True} if declared_only else {}))
+                        selected = {workspace.resolve(path) for path in paths}
+                        self.assertEqual(current in selected,
+                            units is not None or suffix == '.py' or declared_only and mode != 'old-script',
+                            'Declared argv dependencies ignore suffix; legacy source admission stays unchanged')
+                        self.assertIn(output, selected)
+                        expected_source = mode != 'current' and (suffix == '.py' or declared_only)
+                        self.assertEqual(source in selected, expected_source,
+                            'Actual argv file/directory dependencies are subjects under the declared contract; '
+                            'unreferenced design context stays outside it and legacy suffix handling is unchanged')
+                        if expected_source:
+                            self.assertTrue(consumers[str(source)])
+                            self.assertEqual(consumers[str(source)][0]['invocation_id'], invocation)
+                self.assertEqual(receipt.read_bytes(), receipt_bytes)
+                self.assertEqual(source.read_text(encoding='utf-8'), code)
+
+    def test_bound_report_projection_keeps_saved_findings_without_reading_current_review(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = Mock()
+            workspace.resolve.side_effect = lambda path: root / path
+            gateway = WritingToolGateway(root, workspace, None, 'unused', 'task')
+            review = {
+                'review_status': 'needs_revision',
+                'section_reviews': [{'section_id': 'document', 'verdict': 'revise_required',
+                    'findings': [{'finding_id': 'caption', 'severity': 'minor',
+                        'type': 'caption_mismatch', 'required_action': 'revise', 'message': 'Caption says four panels; figure has two.',
+                        'suggested_action': 'Correct the panel count.',
+                        }],
+                    'revision_instructions': ['Replace four panels with two panels.'],
+                    'context_requests': [], 'notes': 'Do not reinterpret the measurements.'}],
+                'mechanical_constraints': {'status': 'needs_revision', 'diagnostic': 'Missing Limitations'},
+            }
+            review['section_reviews'] = [ReportSectionReview.model_validate(row).model_dump(mode='json')
+                for row in review['section_reviews']]
+            path = root / 'workspace/manuscripts/draft/review.json'
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps(review), encoding='utf-8')
+            result = ToolResult(tool_name='compose_document', artifacts=[
+                'workspace/manuscripts/draft/manuscript.md', 'workspace/manuscripts/draft/review.json'],
+                data={'version': 'workspace/manuscripts/draft',
+                    'editable_markdown': 'workspace/manuscripts/draft/manuscript.md',
+                    'review_path': 'workspace/manuscripts/draft/review.json',
+                    'report_binding': {'requests': ['original request'], 'evidence': 'x' * 20000},
+                    'inputs': [{'path': 'data.csv', 'sha256': 'original'}],
+                    'material_selection': {'observations': ['x' * 20000]},
+                    'artifact_sha256': {'manuscript.md': 'original'},
+                    'unresolved': [ReviewerFinding.model_validate(review['section_reviews'][0]['findings'][0]).model_dump(mode='json'),
+                        {'type': 'incomplete_independent_review', 'review_status': 'needs_revision'}]})
+            original = result.model_dump(mode='json')
+            presented = gateway.coordination_result(result)
+            self.assertNotIn('independent_review', presented['data'])
+            self.assertEqual(presented['data']['review_path'], 'workspace/manuscripts/draft/review.json')
+            self.assertEqual(presented['data']['unresolved'], result.data['unresolved'])
+            self.assertEqual(presented['artifacts'], result.artifacts)
+            self.assertEqual(presented['receipt_path'], 'tools/writing/draft/result.json')
+            self.assertLess(len(json.dumps(presented)), len(json.dumps(original)) // 4)
+            presented['data']['unresolved'].clear()
+            self.assertEqual(result.model_dump(mode='json'), original)
+            self.assertEqual(json.loads(path.read_text(encoding='utf-8')), review)
+            workspace.resolve.assert_not_called()
+            path.write_text('{"review_status":"reviewed"}', encoding='utf-8')
+            self.assertEqual(gateway.coordination_result(result), gateway.coordination_result(ToolResult.model_validate(original)))
+
+            # Producer graphs remain durable evidence, not a repeated payload
+            # that can evict the current inspection result from model context.
+            result.data['pending_candidate'] = 'workspace/manuscripts/draft/pending_candidate.json'
+            result.data['delivery_review'] = {'contract': 'delivery_artifacts.v1',
+                'status': 'needs_revision', 'defects': [{'message': 'Attachment and text disagree.',
+                    'path': 'artifact.csv', 'required_action': 'revise'}],
+                'uninspected': [{'path': 'image.bin', 'reason': 'No visual inspection'}],
+                'artifacts': [{'path': 'artifact.csv', 'coverage': 'complete', 'visual_reviewed': False,
+                    'producer': {'inputs': {'source': 'x' * 300000}}},
+                    {'path': 'image.bin', 'coverage': 'visual_uninspected', 'visual_reviewed': False}],
+                'declaration_adoption': {'producers': ['x' * 300000]}}
+            saved = result.model_dump(mode='json')
+            projected = gateway.coordination_result(result)
+            inspection = projected['data']['delivery_review']
+            self.assertEqual(inspection['defects'], saved['data']['delivery_review']['defects'])
+            self.assertEqual(inspection['uninspected'], saved['data']['delivery_review']['uninspected'])
+            self.assertEqual(inspection['artifact_coverage_counts'], {'complete': 1, 'visual_uninspected': 1})
+            self.assertEqual(inspection['visually_reviewed_count'], 0)
+            self.assertEqual(projected['outcome'], {'delivery_review_status': 'needs_revision',
+                'unresolved_count': len(result.data['unresolved']),
+                'pending_candidate': result.data['pending_candidate']})
+            self.assertEqual(projected['data']['pending_candidate'], result.data['pending_candidate'])
+            self.assertLess(len(json.dumps(projected)), len(json.dumps(saved)) // 20)
+            inspection['defects'].clear()
+            self.assertEqual(result.model_dump(mode='json'), saved)
+            workspace.resolve.assert_not_called()
+
+    def test_producer_repair_handoff_uses_candidate_diagnosis_not_adopted_review(self):
+        from types import SimpleNamespace
+        from simple_ar.tools.implementation_work import _repair_view
+        with tempfile.TemporaryDirectory() as directory:
+            record = Path(directory) / 'result.json'
+            adopted = {'delivery_review': {'status': 'reviewed', 'defects': []},
+                'pending_candidate': 'retained-candidate.json'}
+            record.write_text(json.dumps({'data': adopted}), encoding='utf-8')
+            diagnosis = {'delivery_review': {'status': 'needs_revision', 'defects': [
+                {'finding': {'message': 'Producer and candidate disagree.',
+                    'evidence_quotes': [{'quote': 'wrong label'}]},
+                 'targets': [{'path': 'source.py'}]}]}}
+            original = json.loads(json.dumps(diagnosis))
+            owner = SimpleNamespace(workspace=SimpleNamespace(resolve=lambda _: record))
+            with patch.object(WritingToolGateway, 'repair_review', return_value=diagnosis) as select:
+                projected = _repair_view(owner, 'registered-result',
+                    {'tool_name': 'compose_document', 'data': adopted}, {}, [])
+            select.assert_called_once_with(owner, adopted)
+            self.assertEqual(projected['delivery_review'], diagnosis['delivery_review'])
+            projected['delivery_review']['defects'][0]['finding']['message'] = 'Changed copy'
+            self.assertEqual(diagnosis, original)
+            self.assertEqual(json.loads(record.read_text())['data'], adopted)
+            self.assertEqual(adopted['delivery_review']['defects'], [])
+
+    def test_native_failure_and_historical_review_preserve_diagnostics_and_delivery(self):
+        gateway = WritingToolGateway(Path('.'), Mock(), None, 'unused', 'task')
+        for result in (
+            ToolResult(tool_name='compose_document', status='error', error='Writer interrupted; no blind retry.',
+                artifacts=['workspace/manuscripts/partial/manuscript.md'], data={
+                    'incomplete': True, 'failure_kind': 'review_incomplete',
+                    'retained_candidate': {'markdown': 'workspace/manuscripts/partial/unchecked_candidate.md',
+                        'status': 'unreviewed', 'adopted': False},
+                    'next_action': 'Correct the retained candidate with original evidence.'}),
+            ToolResult(tool_name='review_document', data={
+                'review_status': 'needs_revision', 'section_reviews': [ReportSectionReview(
+                    section_id='document', verdict='fail',
+                    revision_instructions=['Remove the unsupported speedup claim.']).model_dump(mode='json')],
+                'delivery': {'unresolved': ['Need independent timing evidence.'],
+                    'artifacts': ['report.pdf']}, 'inputs': [{'path': 'original.md'}]}),
+        ):
+            with self.subTest(tool=result.tool_name):
+                original = result.model_dump(mode='json')
+                view = gateway.coordination_result(result, receipt_path='attempts/owner/native_result.json')
+                self.assertEqual(view['receipt_path'], 'attempts/owner/native_result.json')
+                self.assertEqual((view['status'], view['error']), (result.status, result.error))
+                self.assertEqual(view['data'], {k: v for k, v in result.data.items() if k != 'inputs'})
+                self.assertEqual(result.model_dump(mode='json'), original)
+        gateway.workspace.resolve.assert_not_called()

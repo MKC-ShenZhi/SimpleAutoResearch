@@ -12,6 +12,44 @@ from simple_ar.cli.research_config import FIELDS, report_settings, research_defa
 
 
 class ReportDocumentArgumentsTests(unittest.TestCase):
+    def test_project_material_config_roundtrip_uses_common_creation_projection(self):
+        from simple_ar.cli.main import main
+        from simple_ar.cli.start import native_creation_options
+        import shutil
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            root = base / 'original'
+            root.mkdir()
+            project = root / 'project'
+            project.mkdir()
+            note = root / 'note.md'
+            note.write_text('Existing results', encoding='utf-8')
+            config = root / 'task.toml'
+            with patch('sys.stdin.isatty', return_value=False), redirect_stdout(io.StringIO()):
+                main(['start', 'Combine source and existing observations', '--project', str(project),
+                      '--material', str(note), '--model', 'profile:science', '--max-processes', '0',
+                      '--write-task-config', str(config)])
+            # A relocated configuration resolves role paths in its new home;
+            # explicit CLI material replaces that role, while other roles stay.
+            config.write_text('[task]\nrequest="Combine source and observations"\n'
+                'project="project"\nmaterial=["missing-old-note.md"]\nmodel="profile:science"\n'
+                'max_processes=0\nmax_turns=4\nmax_tokens=500\n', encoding='utf-8')
+            moved = base / 'moved'
+            shutil.copytree(root, moved)
+            config, project, note = moved / 'task.toml', moved / 'project', moved / 'note.md'
+            with patch('sys.stdin.isatty', return_value=False), \
+                    patch('simple_ar.cli.main._run_native_start') as run:
+                main(['start', '--task-config', str(config), '--material', str(note),
+                      '--max-tokens', '900', '--prepare-only'])
+            args = run.call_args.args[0]
+            options = native_creation_options(args)
+            self.assertEqual(set(options['sources'].values()), {project, note})
+            self.assertEqual(options['model'], 'profile:science')
+            self.assertEqual(options['max_tokens'], 900)
+            self.assertEqual(options['max_turns'], 4)
+            self.assertEqual(options['process_limits'], {'process_invocations': 0})
+            self.assertFalse(options['allow_execution'])
+
     def test_native_task_config_export_edit_create_and_explicit_override(self):
         from simple_ar.cli.main import main
         from simple_ar.app.tool_application import ToolApplication

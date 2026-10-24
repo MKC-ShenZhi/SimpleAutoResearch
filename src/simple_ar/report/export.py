@@ -19,6 +19,7 @@ class ReportExportError(ValueError):
 
 class ReportExportResourceError(ReportExportError):
     """Resource owner refused further dispatch; do not attempt later checks."""
+    failure_kind = 'resource_exhausted'
 
 
 def validate_publication_checks(checks: dict[str, Any]) -> None:
@@ -132,6 +133,15 @@ def report_image_targets(markdown: str) -> list[str]:
             if token.children:
                 yield from images(token.children)
     return list(dict.fromkeys(images(MarkdownIt().parse(markdown))))
+
+
+def missing_report_images(markdown: str, required: list[str]) -> list[str]:
+    """Compare declared body assets with actual CommonMark image nodes."""
+    import posixpath
+    from urllib.parse import unquote
+    normalize = lambda value: posixpath.normpath(unquote(value))
+    present = {normalize(path) for path in report_image_targets(markdown)}
+    return [path for path in required if normalize(path) not in present]
 
 
 def _copy_image(source: Path, output: Path, index: int | str, *, convert_svg: bool = True,
@@ -295,8 +305,185 @@ def _breakable_code(text: str) -> str:
     return r"\texttt{\seqsplit{" + _tex_literal(text) + "}}"
 
 
+def _tex_group_end(text: str, start: int) -> int:
+    """Read a writer-produced TeX argument, including escaped/nested braces."""
+    if text[start] not in '{[':
+        raise ReportExportError('Expected a Pandoc TeX argument')
+    closing = ['}' if text[start] == '{' else ']']
+    index = start + 1
+    while index < len(text):
+        char = text[index]
+        if char == '\\':
+            index += 2
+            continue
+        if char == '%':
+            newline = text.find('\n', index)
+            index = len(text) if newline < 0 else newline + 1
+            continue
+        if char == '{':
+            closing.append('}')
+        elif char == '}':
+            if closing[-1] != '}':
+                raise ReportExportError('Unbalanced Pandoc figure argument; editable source retained')
+            closing.pop()
+        elif char == ']' and closing[-1] == ']':
+            closing.pop()
+        if not closing:
+            return index + 1
+        index += 1
+    raise ReportExportError('Unbalanced Pandoc figure argument; editable source retained')
+
+
+def _paginate_figure_tex(body: str) -> str:
+    """Separate graphics from unscaled content in the actual LaTeX writer output.
+
+    Both legacy implicit figures and modern Figure blocks go through this one
+    boundary. Caption TeX (including citations, math, labels and optional short
+    captions) is left verbatim. Unknown compound graphics fail rather than
+    silently clipping or scaling caption text with the image.
+    """
+    def allocate_content(content: str) -> str:
+        images = list(re.finditer(r'\\includegraphics\*?(?![A-Za-z@])', content))
+        if not images:
+            return content
+        if len(images) != 1:
+            raise ReportExportError('Figure pagination requires one graphic per float; '
+                'split compound figures into separate figures in the editable source')
+        # Writers can put the ENTIRE figure in an anchor/formatting argument.
+        # Preserve the common enclosing scope rather than cutting that valid
+        # group into independently unbalanced before/image/after arguments.
+        # Graphic-only wrappers stay with the image below, so they cannot
+        # accidentally resize the caption together with it.
+        captions = list(re.finditer(r'\\caption\*?(?![A-Za-z@])', content))
+        cursor = 0
+        while captions and cursor < images[0].start():
+            if content[cursor] == '\\':
+                cursor += 2
+            elif content[cursor] == '%':
+                newline = content.find('\n', cursor)
+                cursor = len(content) if newline < 0 else newline + 1
+            elif content[cursor] == '{':
+                end = _tex_group_end(content, cursor)
+                if images[0].end() < end and all(cursor < caption.start() < end for caption in captions):
+                    return (content[:cursor + 1] + allocate_content(content[cursor + 1:end - 1])
+                            + content[end - 1:])
+                cursor = end
+            else:
+                cursor += 1
+        start = images[0].start()
+        end = images[0].end()
+        while end < len(content) and content[end].isspace():
+            end += 1
+        # graphicx accepts optional bounding-box arguments as well as keys.
+        while end < len(content) and content[end] == '[':
+            end = _tex_group_end(content, end)
+            while end < len(content) and content[end].isspace():
+                end += 1
+        if end == len(content) or content[end] != '{':
+            raise ReportExportError('Unsupported Pandoc graphic argument; editable source retained')
+        end = _tex_group_end(content, end)
+        # New Pandoc wraps graphics in pandocbounded. Keep the wrapper with
+        # the graphic, never split its braces across the caption boxes.
+        wrapper = re.search(r'\\pandocbounded\s*\{\s*$', content[:start])
+        if wrapper:
+            wrapper_end = _tex_group_end(content, content.index('{', wrapper.start()))
+            if content[end:wrapper_end - 1].strip():
+                raise ReportExportError('Unsupported compound pandocbounded figure; editable source retained')
+            start, end = wrapper.start(), wrapper_end
+        before, image, after = content[:start], content[start:end], content[end:]
+        # A linked image or nested subfigure must not be cut inside a group.
+        # Captions themselves can contain arbitrarily nested TeX arguments.
+        for fragment in (before, after):
+            cursor = 0
+            while cursor < len(fragment):
+                if fragment[cursor] == '\\':
+                    cursor += 2
+                elif fragment[cursor] == '%':
+                    newline = fragment.find('\n', cursor)
+                    cursor = len(fragment) if newline < 0 else newline + 1
+                elif fragment[cursor] == '{':
+                    cursor = _tex_group_end(fragment, cursor)
+                elif fragment[cursor] == '}':
+                    raise ReportExportError('Unsupported nested Pandoc figure graphic; editable source retained')
+                else:
+                    cursor += 1
+        return '\n\\sarfigurecontent{' + before + '}{' + image + '}{' + after + '}\n'
+
+    def allocate(match: re.Match) -> str:
+        star, placement, content = match.group(1, 2, 3)
+        return (r'\begin{figure' + star + '}' + (placement or '[htbp]')
+                + allocate_content(content) + r'\end{figure' + star + '}')
+
+    return re.sub(r'\\begin\{figure(\*?)\}(\[[^\]\n]*\])?(.*?)\\end\{figure\1\}',
+                  allocate, body, flags=re.S)
+
+
+def _figure_pagination_preamble() -> str:
+    # Typeset each part ONCE, inside the real class's float. In particular,
+    # measuring a caption must not step counters twice, write duplicate list
+    # entries or discard hyperlink destinations. Ship its original box intact.
+    # Only the image box is resized. Dimensions are evaluated at the float,
+    # after all template packages/font/geometry setup, not in Python/preamble.
+    return r"""\usepackage{graphicx}
+\providecommand{\pandocbounded}[1]{#1}
+\makeatletter
+\def\sarmaxwidth{\ifdim\Gin@nat@width>\linewidth\linewidth\else\Gin@nat@width\fi}
+\def\sarmaxheight{\ifdim\Gin@nat@height>\textheight\textheight\else\Gin@nat@height\fi}
+\setkeys{Gin}{width=\sarmaxwidth,height=\sarmaxheight,keepaspectratio}
+\newsavebox{\sarfigurebefore}
+\newsavebox{\sarfigureimage}
+\newsavebox{\sarfigureafter}
+\newdimen\sarfigureavailable
+\newdimen\sarfigurereserve
+\newcommand{\sarfigurecontent}[3]{%
+  \par
+  \setbox\sarfigurebefore=\vbox{\hsize=\linewidth #1\par}%
+  \setbox\sarfigureimage=\hbox{#2}%
+  \setbox\sarfigureafter=\vbox{\hsize=\linewidth #3\par}%
+  \sarfigureavailable=\@colht
+  \ifdim\sarfigureavailable>\textheight \sarfigureavailable=\textheight\fi
+  \sarfigurereserve=2\intextsep
+  \ifdim\textfloatsep>\sarfigurereserve \sarfigurereserve=\textfloatsep\fi
+  \ifdim\dbltextfloatsep>\sarfigurereserve \sarfigurereserve=\dbltextfloatsep\fi
+  \ifdim\floatsep>\sarfigurereserve \sarfigurereserve=\floatsep\fi
+  \advance\sarfigureavailable by -\sarfigurereserve
+  \advance\sarfigureavailable by -\ht\sarfigurebefore
+  \advance\sarfigureavailable by -\dp\sarfigurebefore
+  \advance\sarfigureavailable by -\ht\sarfigureafter
+  \advance\sarfigureavailable by -\dp\sarfigureafter
+  \ifdim\sarfigureavailable>0pt\else
+    \PackageError{simple-ar}{Figure caption cannot fit on one page}%
+      {The template's caption and float spacing leave no room for the image.
+       Use a larger page area or split the figure in the editable source.
+       Caption text has not been reduced or rewritten.}%
+  \fi
+  \ifdim\wd\sarfigureimage>\linewidth
+    \sbox\sarfigureimage{\resizebox{\linewidth}{!}{\usebox\sarfigureimage}}%
+  \fi
+  \ifdim\dimexpr\ht\sarfigureimage+\dp\sarfigureimage\relax>\sarfigureavailable
+    \sbox\sarfigureimage{\resizebox*{!}{\sarfigureavailable}{\usebox\sarfigureimage}}%
+  \fi
+  \vbox{\box\sarfigurebefore\nointerlineskip
+    \hbox to\linewidth{\hfil\usebox\sarfigureimage\hfil}%
+    \nointerlineskip\box\sarfigureafter}%
+}
+\makeatother
+"""
+
+
 def _prepare_technical_content(fragments: Any, output: Path) -> None:
     """Prepare only the TeX AST; canonical code and display text stay intact."""
+    # A technical compound can overflow a table cell below the ordinary
+    # 32-character identifier boundary (operators and mixed letter/digit IDs
+    # have no dependable language hyphenation). Keep ordinary words and their
+    # interword spacing under TeX's native handling.
+    # Use TeX's discretionary splitting, not content-specific abbreviations,
+    # font reduction or inferred column roles. This table rule adds no breaks
+    # to numeric literals or math; existing identifier rules remain in effect.
+    # Link destinations are not Str nodes and remain unchanged.
+    table_words = {id(word) for table in _nodes(fragments) if table.get('t') == 'Table'
+                   for word in _nodes(table.get('c')) if word.get('t') == 'Str'
+                   and not word['c'].isalpha() and any(char.isalpha() for char in word['c'])}
     block_index = 0
     for node in _nodes(fragments):
         if node.get('t') == 'Table':
@@ -327,7 +514,7 @@ def _prepare_technical_content(fragments: Any, output: Path) -> None:
         elif node.get("t") == "Code":
             node.update(t="RawInline", c=["latex", _breakable_code(node["c"][1])])
         elif (node.get("t") == "Str" and not any(char.isspace() for char in node["c"])
-                and ("/" in node["c"] or len(node["c"]) >= 32)):
+                and (id(node) in table_words or "/" in node["c"] or len(node["c"]) >= 32)):
             # Long prose tokens also occur as checksums/identifiers. Keep
             # their surrounding font; math and link targets are separate nodes.
             node.update(t="RawInline", c=["latex", r"\seqsplit{" + _tex_literal(node["c"]) + "}"])
@@ -432,7 +619,10 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
     title_inlines = [{"t": "Space"} if token.isspace() else {"t": "Str", "c": token}
                     for token in re.split(r"(\s+)", title or "") if token]
     if blocks and blocks[0].get("t") == "Header" and blocks[0]["c"][0] == 1:
-        header = blocks.pop(0)
+        # A user template need not render title metadata. Keep the authored
+        # heading in that case, just as we retain its authored abstract below.
+        renders_title = not template_files or '$title$' in template_files['template.latex'].read_text(encoding='utf-8')
+        header = blocks.pop(0) if renders_title else blocks[0]
         if not title_inlines:
             title_inlines = header["c"][2]
     if not title_inlines:
@@ -452,10 +642,13 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
             abstract = blocks[index + 1:end]
             del blocks[index:end]
             break
-    # Markdown reports use H2 for top-level sections; LaTeX starts at section.
+    # Managed reports start at H2; supplied manuscripts can start at H1 or
+    # deeper. Normalize the actual body base, preserving relative hierarchy.
+    heading_base = min((node['c'][0] for node in _nodes(blocks)
+                        if node.get('t') == 'Header'), default=1)
     for node in _nodes(blocks):
         if node.get("t") == "Header":
-            node["c"][0] = max(1, node["c"][0] - 1)
+            node["c"][0] -= heading_base - 1
     citations = {citation["citationId"] for node in _nodes([blocks, abstract])
                  if node.get("t") == "Cite" for citation in node["c"][0]}
     bibliography_path = root / "references.bib"
@@ -544,21 +737,12 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
         manifest["external_sources_included"] = False
         _prepare_technical_content([title_inlines, blocks, abstract], output)
 
-        def latex(fragment: list[dict]) -> str:
-            document = {**ast, "blocks": fragment}
-            division = template.get('top_level_division') if template_files else None
-            return run([pandoc, "--from=json", "--to=latex", "--natbib", "--no-highlight",
-                        *(['--top-level-division=' + division] if division else [])],
-                        cwd=output, text=json.dumps(document)).strip()
-
-        heading = latex([{"t": "Plain", "c": title_inlines}])
-        body_tex = latex(blocks)
-        # Pandoc's bare figure environment defaults to tbp, often pushing
-        # figures away from their owning prose. Prefer near-source placement
-        # while retaining TeX's pagination/floating decisions; do not force H.
-        body_tex = body_tex.replace("\\begin{figure}\n", "\\begin{figure}[htbp]\n")
+        division = template.get('top_level_division') if template_files else None
+        body_tex = run([pandoc, "--from=json", "--to=latex", "--natbib", "--no-highlight",
+            *(['--top-level-division=' + division] if division else [])],
+            cwd=output, text=json.dumps({**ast, 'blocks': blocks})).strip()
+        body_tex = _paginate_figure_tex(body_tex)
         (output / "body.tex").write_text(body_tex + "\n", encoding="utf-8")
-        abstract_tex = latex(abstract) if abstract else ""
         (output / "references.bib").write_text(bibliography, encoding="utf-8")
         markdown = run([pandoc, "--from=json", "--to=markdown", "--wrap=none"],
                         cwd=output, text=json.dumps(source_ast))
@@ -610,17 +794,7 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
             "\\providecommand{\\tightlist}{\\setlength{\\itemsep}{0pt}\\setlength{\\parskip}{0pt}}\n"
             "\\providecommand{\\passthrough}[1]{#1}\n"
             "\\setlength{\\emergencystretch}{1em}\n") if template_files else ''
-        # One graphicx owner for built-in and supplied templates, including
-        # older Pandoc includegraphics and newer pandocbounded output. Preserve
-        # small intrinsic sizes; shrink large figures to both page dimensions
-        # with room for captions. Tables remain unscaled, wrapping longtables.
-        preamble += ("\\usepackage{graphicx}\n"
-            "\\providecommand{\\pandocbounded}[1]{#1}\n"
-            "\\makeatletter\n"
-            "\\def\\sarmaxwidth{\\ifdim\\Gin@nat@width>\\linewidth\\linewidth\\else\\Gin@nat@width\\fi}\n"
-            "\\def\\sarmaxheight{\\ifdim\\Gin@nat@height>0.8\\textheight0.8\\textheight\\else\\Gin@nat@height\\fi}\n"
-            "\\makeatother\n"
-            "\\setkeys{Gin}{width=\\sarmaxwidth,height=\\sarmaxheight,keepaspectratio}\n")
+        preamble += _figure_pagination_preamble()
         if citation_style == 'numeric' and citations:
             # Templates/classes may already load natbib (even before this
             # header hook). Configure after preamble setup but before the aux
@@ -637,13 +811,17 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
                 "  {Load natbib in the trusted publication template.}}}\n"
                 "\\makeatother\n")
         if not template_files or template.get('engine', 'pdflatex') == 'pdflatex':
-            preamble += _scientific_unicode_preamble(heading, body_tex, abstract_tex, bibliography, source)
+            # Metadata is rendered by the final standalone writer. Include its
+            # actual Unicode (also an explicit title absent from source.md),
+            # without dispatching separate fragment conversions to discover it.
+            preamble += _scientific_unicode_preamble(
+                json.dumps([title_inlines, abstract], ensure_ascii=False), body_tex, bibliography, source)
         def meta_tex(value: str) -> dict:
             return {'t': 'MetaBlocks', 'c': [{'t': 'RawBlock', 'c': ['latex', value]}]}
-        metadata = {'title': meta_tex(heading),
+        metadata = {'title': {'t': 'MetaInlines', 'c': title_inlines},
             'header-includes': {'t': 'MetaList', 'c': [meta_tex(preamble)]}}
-        if abstract_tex:
-            metadata['abstract'] = meta_tex(abstract_tex)
+        if abstract:
+            metadata['abstract'] = {'t': 'MetaBlocks', 'c': abstract}
         if citations:
             metadata['bibliography'] = {'t': 'MetaString', 'c': 'references.bib'}
             # plainnat prints an authorless entry's key in the bibliography.
@@ -708,6 +886,10 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
                    'Class, body, bibliography records and exact citation keys are preserved; no author/year fields are inferred.\n'
                    if citation_style == 'numeric' else
                    'Template citation defaults are preserved (built-in ACM remains acmnumeric).\n'))
+        readme += ('Figure pagination measures captions once using the selected template at its native font size. '
+            'Only graphics are reduced to the remaining page area; small graphics are not enlarged. '
+            'Captions that leave no image area fail with a simple-ar TeX error. '
+            'Compound/nested graphics require separate figures; inspect image readability in all-page previews.\n')
         (output / 'README.txt').write_text(readme, encoding='utf-8')
         manifest["status"] = "exported"
         if compile_pdf:
@@ -723,6 +905,9 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
             if not manifest['compiled']:
                 raise ReportExportError(manifest.get('compile_note') or "PDF compilation did not produce a PDF; requested preview unavailable")
             manifest['pdf_preview'].update(_render_pdf_preview(output, runner=run))
+    except ReportExportResourceError as exc:
+        manifest.update(status='failed', failure_kind=exc.failure_kind, error=str(exc))
+        raise ReportExportResourceError(f"Export stopped; retained files and export.json at {output}: {exc}") from exc
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         manifest.update(status="failed", error=str(exc))
         raise ReportExportError(f"Export failed; retained files and export.json at {output}: {exc}") from exc
@@ -849,6 +1034,9 @@ def _compile(output: Path, has_citations: bool, *, runner: Callable | None = Non
     try:
         for argv in commands:
             logs.append((runner or _run)(argv, cwd=output, timeout=90, env=env))
+    except ReportExportResourceError as exc:
+        logs.append(str(exc))
+        raise
     except (OSError, subprocess.SubprocessError, ReportExportError) as exc:
         logs.append(str(exc))
         return {"status": "compile_failed", "compiled": False, "compile_note": str(exc)}

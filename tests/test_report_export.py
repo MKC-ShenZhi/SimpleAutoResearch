@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from simple_ar.report.export import ReportExportError, _compile, _copy_image, export_acm_report
+from simple_ar.report.export import ReportExportError, ReportExportResourceError, _compile, _copy_image, export_acm_report, _nodes
 
 
 def _ast(image: str | None = None, citation: str = "p1") -> dict:
@@ -36,7 +36,9 @@ def _standalone_fixture(document: dict, output: Path) -> str:
         if value['t'] == 'MetaList':
             text = '\n'.join(item['c'][0]['c'][1] for item in value['c'])
         else:
-            text = value['c'] if value['t'] == 'MetaString' else value['c'][0]['c'][1]
+            text = value['c'] if value['t'] == 'MetaString' else ' '.join(
+                node['c'] if node['t'] == 'Str' else node['c'][1]
+                for node in _nodes(value['c']) if node.get('t') in {'Str', 'RawBlock', 'RawInline'})
         template = template.replace('$' + key + '$', text)
     return template.replace('$body$', document['blocks'][0]['c'][1])
 
@@ -503,6 +505,14 @@ class ReportExportTests(unittest.TestCase):
             for widths in ([0, 0, 0], [0.3, 0.7], [0, 0.6]):
                 tables.append({'t': 'Table', 'c': [[], [{'t': 'AlignRight'}] * len(widths),
                     widths, [], []]})
+            cell = [{'t': 'Str', 'c': 'latency+throughput'}, {'t': 'Space'},
+                    {'t': 'Str', 'c': '0.123456789'}, {'t': 'Space'},
+                    {'t': 'Math', 'c': [{'t': 'InlineMath'}, 'x/y']},
+                    {'t': 'Link', 'c': [['', [], []], [{'t': 'Str', 'c': 'Reference'}],
+                        ['https://example.test/unbroken-target', '']]}]
+            tables[0]['c'][3][1] = [[['', [], []], [
+                [['', [], []], {'t': 'AlignLeft'}, 1, 1, [{'t': 'Plain', 'c': cell}]]]]]
+            tables[4]['c'][3] = [[{'t': 'Plain', 'c': cell}]]
             document['blocks'].extend(tables)
             document["blocks"].append({"t": "Para", "c": [
                 {"t": "Str", "c": "train/validation/calibration/test"},
@@ -538,7 +548,7 @@ class ReportExportTests(unittest.TestCase):
             with patch("simple_ar.report.export.shutil.which", return_value="pandoc"), patch(
                     "simple_ar.report.export._run", side_effect=convert):
                 export_acm_report(source, root / "acm")
-            para = converted[1]["blocks"][-2]["c"]
+            para = converted[0]["blocks"][-2]["c"]
             self.assertEqual(para[0], {"t": "RawInline", "c": ["latex",
                 r"\seqsplit{train/validation/calibration/test}"]})
             self.assertEqual(para[2]["c"][1], r"\seqsplit{10,123/3,639/2,048/5,803}")
@@ -549,11 +559,17 @@ class ReportExportTests(unittest.TestCase):
             self.assertEqual(para[6]["c"][-1][0], "https://example.test/a/b")
             self.assertEqual(para[7]['c'][1], r'\seqsplit{' + identifier + '}')
             self.assertNotIn(r'\input{', para[8]['c'][1])
-            self.assertEqual(converted[1]['blocks'][-1]['c'], ['latex',
+            self.assertEqual(converted[0]['blocks'][-1]['c'], ['latex',
                 r'\VerbatimInput[breaklines=true,breakanywhere=true,breaksymbolleft={},breaksymbolright={},breakanywheresymbolpre={},breakanywheresymbolpost={}]{code/block-1.txt}'])
             self.assertEqual((root / 'acm/code/block-1.txt').read_text(), code)
             self.assertEqual(markdown[0]['blocks'][-2:], document['blocks'][-2:])
-            rendered_tables = [block for block in converted[1]['blocks'] if block['t'] == 'Table']
+            rendered_tables = [block for block in converted[0]['blocks'] if block['t'] == 'Table']
+            for actual_cell in (rendered_tables[0]['c'][3][1][0][1][0][4][0]['c'],
+                                rendered_tables[4]['c'][3][0][0]['c']):
+                self.assertEqual(actual_cell[0], {'t': 'RawInline',
+                    'c': ['latex', r'\seqsplit{latency+throughput}']})
+                self.assertEqual(actual_cell[2:5], cell[2:5])  # Numbers and math are atomic.
+                self.assertEqual(actual_cell[5], cell[5])  # Ordinary words and link targets stay authored.
             for index, fraction in ((0, 1 / 3), (1, 1 / 5)):
                 self.assertEqual([column[1] for column in rendered_tables[index]['c'][2]],
                     [{'t': 'ColWidth', 'c': fraction}] * len(tables[index]['c'][2]))
@@ -577,21 +593,28 @@ class ReportExportTests(unittest.TestCase):
     def test_supplied_templates_preserve_body_without_inferred_abstract_roles(self):
         # Template variables are presentation, not proof that authored text
         # will be rendered. Do not move a section out of the body by its name.
-        for heading, abstract_slot, style in (
-                ('Abstract', False, None), ('Summary', True, None), ('Executive summary', False, None),
-                ('Abstract', True, 'numeric'), ('Executive summary', False, 'template')):
+        for heading, abstract_slot, style, title_slot, base, expected_levels in (
+                ('Abstract', False, None, False, 2, [1, 2, 2, 3]),
+                ('Summary', True, None, True, 1, [1, 1, 2]),
+                ('Executive summary', False, None, True, 3, [1, 1, 2]),
+                ('Abstract', True, 'numeric', True, 2, [1, 1, 2]),
+                ('Executive summary', False, 'template', False, 2, [1, 2, 2, 3])):
             with self.subTest(heading=heading, abstract_slot=abstract_slot, citation_style=style), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 source = self._source(root)
                 document = _ast()
                 document['blocks'][1]['c'][2] = [{'t': 'Str', 'c': heading}]
+                for block in document['blocks'][1:]:
+                    if block.get('t') == 'Header':
+                        block['c'][0] = base
                 document['blocks'].extend([
-                    {'t': 'Header', 'c': [3, ['', [], []], [{'t': 'Str', 'c': 'Summary'}]]},
+                    {'t': 'Header', 'c': [base + 1, ['', [], []], [{'t': 'Str', 'c': 'Summary'}]]},
                     {'t': 'Para', 'c': [{'t': 'Str', 'c': 'Nested discussion is still body content.'}]}])
                 template = source / 'layout.latex'
                 template.write_text('\\documentclass{article}\n'
                     '$for(header-includes)$\n$header-includes$\n$endfor$\n'
                     '\\usepackage[authoryear]{natbib}\n\\begin{document}\n'
+                    + ('$title$\n' if title_slot else '')
                     + ('$if(abstract)$$abstract$$endif$\n' if abstract_slot else '')
                     + '$body$\n\\end{document}\n', encoding='utf-8')
                 converted = []
@@ -615,7 +638,9 @@ class ReportExportTests(unittest.TestCase):
                 self.assertEqual('\\setcitestyle{numbers,square,comma}' in main, style == 'numeric')
                 self.assertEqual(converted[-1]['meta']['biblio-style']['c'], 'plainurl' if style == 'numeric' else 'plainnat')
                 self.assertEqual((root / 'export/template.latex').read_bytes(), template.read_bytes())
-                self.assertEqual(converted[1]['blocks'][0]['c'][2], [{'t': 'Str', 'c': heading}])
+                headers = [node for node in _nodes(converted[0]['blocks']) if node.get('t') == 'Header']
+                self.assertEqual([node['c'][0] for node in headers], expected_levels)
+                self.assertEqual(headers[0]['c'][2], [{'t': 'Str', 'c': heading if title_slot else 'Evidence report'}])
                 self.assertIn('A bounded finding.', (root / 'export/body.tex').read_text())
                 self.assertIn('Nested discussion is still body content.', (root / 'export/body.tex').read_text())
                 self.assertNotIn('abstract', converted[-1]['meta'])
@@ -645,8 +670,13 @@ class ReportExportTests(unittest.TestCase):
             self.assertNotIn('checks', result)
             self.assertNotIn('citation_style', result)
             self.assertTrue(all(document["meta"] == {} for document in calls[:-1]))
+            # Body LaTeX, portable Markdown, standalone LaTeX: title/abstract
+            # metadata must not spend two additional process invocations.
+            self.assertEqual(len(calls), 3)
             self.assertEqual(set(calls[-1]['meta']), {'title', 'abstract', 'header-includes', 'bibliography', 'biblio-style'})
-            body_headers = [block["c"][0] for block in calls[1]["blocks"] if block["t"] == "Header"]
+            self.assertEqual(calls[-1]['meta']['title'], {'t': 'MetaInlines', 'c': _ast()['blocks'][0]['c'][2]})
+            self.assertEqual(calls[-1]['meta']['abstract'], {'t': 'MetaBlocks', 'c': [_ast()['blocks'][2]]})
+            body_headers = [block["c"][0] for block in calls[0]["blocks"] if block["t"] == "Header"]
             self.assertEqual(body_headers, [1])
             self.assertEqual((root / "acm/source.md").read_text(), "converted text")
             self.assertEqual((source / "report_body.md").read_text(), "# Evidence report\n\nBody [@p1].\n")
@@ -662,7 +692,10 @@ class ReportExportTests(unittest.TestCase):
             self.assertNotIn('brace the full optional label', (root / "acm/README.txt").read_text())
             self.assertIn("full CM-Super", (root / "acm/README.txt").read_text())
             self.assertIn("\\Gin@nat@width>\\linewidth", main)
-            self.assertIn("\\Gin@nat@height>0.8\\textheight", main)
+            self.assertNotIn('0.8\\textheight', main)
+            self.assertIn('\\sarfigureavailable=\\@colht', main)
+            self.assertIn('\\advance\\sarfigureavailable by -\\ht\\sarfigureafter', main)
+            self.assertIn('Figure caption cannot fit on one page', main)
             self.assertIn("\\setkeys{Gin}{width=\\sarmaxwidth,height=\\sarmaxheight,keepaspectratio}", main)
             self.assertNotIn("\\setkeys{Gin}{width=\\linewidth,keepaspectratio}", main)
             self.assertTrue((root / "acm/export.json").is_file())
@@ -1150,19 +1183,99 @@ class ReportExportTests(unittest.TestCase):
             self.assertEqual((root / "moved" / saved_vector).read_text(), vector)
             self.assertFalse((root / "moved/experiment").exists())
 
-    def test_generated_figure_placement_prefers_source_location_without_forcing_it(self) -> None:
+    def test_tex_argument_scanner_balances_nested_groups_escapes_and_comments(self) -> None:
+        from simple_ar.report.export import _tex_group_end
+
+        arguments = ('{}', '{{{nested}}}', r'{\{escaped\} and \% literal percent}',
+            '{before % } ignored closing brace\n{after}}',
+            r'[alt={Nested {alt} and ]},width=\linewidth]',
+            r'{math \(x_{i}^{2}\) and \href{https://example.org}{a link}}')
+        for argument in arguments:
+            with self.subTest(argument=argument):
+                self.assertEqual(_tex_group_end('prefix' + argument + 'suffix', 6), 6 + len(argument))
+        for argument in ('{', '{{nested}', '[alt={unclosed]', '[stray}closing]'):
+            with self.subTest(argument=argument), self.assertRaises(ReportExportError):
+                _tex_group_end(argument, 0)
+
+    def test_figure_pagination_preserves_common_enclosing_writer_groups(self) -> None:
+        from simple_ar.report.export import _paginate_figure_tex, _tex_group_end
+
+        # Identifier-bearing Pandoc figures can enclose both the graphic and
+        # caption in a hyperlink target. Nested common scopes must also survive.
+        caption = r'\caption{Math \(x_i^2\), \href{https://example.org}{linked text}, \citep{p1}.}\label{fig:plot}'
+        for modern in (False, True):
+            for nested in (False, True):
+                with self.subTest(modern=modern, nested=nested):
+                    graphic = r'\includegraphics{figures/plot.pdf}'
+                    if modern:
+                        graphic = r'\pandocbounded{' + graphic + '}'
+                    content = '\n\\centering\n' + graphic + '\n' + caption + '\n'
+                    if nested:
+                        content = r'\textnormal{' + content + '}'
+                    prefix = r'\hypertarget{fig:plot}{'
+                    wrapped = prefix + '%\n' + content + '}'
+                    source = r'\begin{figure}' + wrapped + r'\end{figure}'
+                    allocated = _paginate_figure_tex(source)
+                    self.assertEqual(allocated.count(r'\sarfigurecontent'), 1)
+                    self.assertEqual(allocated.count(caption), 1)
+                    self.assertLess(allocated.index(prefix), allocated.index(r'\sarfigurecontent'))
+                    outer_start = allocated.index(prefix) + len(prefix) - 1
+                    self.assertEqual(_tex_group_end(allocated, outer_start), allocated.index(r'\end{figure}'))
+                    self.assertIn('}{' + graphic + '}{', allocated)
+
+    def test_figure_pagination_uses_both_writer_protocols_and_preserves_caption_tex(self) -> None:
+        from simple_ar.report.export import _paginate_figure_tex
+
+        caption = (r'\caption[Short {title}]{Full \emph{caption} with $x_{i}^{2}$, '
+            r'\citep{p1}, \href{https://example.org/a}{a link}, and escaped \{braces\}.}'
+            '\n' + r'\label{fig:fixture}')
+        for modern in (False, True):
+            for star, placement in (('', ''), ('', '[p]'), ('*', '[tbp]')):
+                for caption_first in (False, True):
+                    with self.subTest(modern=modern, star=star, placement=placement, caption_first=caption_first):
+                        graphic = r'\includegraphics[width=\linewidth,alt={Nested {alt} and ]}]{figures/a.pdf}'
+                        if modern:
+                            graphic = r'\pandocbounded{' + graphic + '}'
+                        before = '\n\\centering\n' + (caption + '\n' if caption_first else '')
+                        after = '\n' + ('' if caption_first else caption + '\n')
+                        source = (r'\begin{figure' + star + '}' + placement + before + graphic + after
+                            + r'\end{figure' + star + '}')
+                        allocated = _paginate_figure_tex(source)
+                        self.assertEqual(allocated, r'\begin{figure' + star + '}' + (placement or '[htbp]')
+                            + '\n\\sarfigurecontent{' + before + '}{' + graphic + '}{' + after
+                            + '}\n' + r'\end{figure' + star + '}')
+                        self.assertEqual(allocated.count(caption), 1)
+                        self.assertNotIn('[H]', allocated)
+        # A float-free document and an ordinary inline image are unchanged.
+        inline = r'An inline \includegraphics{figures/a.pdf} without a float.'
+        self.assertEqual(_paginate_figure_tex(inline), inline)
+        # Refuse unsupported compositions before producing broken brace groups
+        # or shrinking subcaptions together with their graphics.
+        for graphic in (r'\includegraphics{a.pdf}\includegraphics{b.pdf}',
+                r'\href{https://example.org}{\includegraphics{a.pdf}}',
+                r'\pandocbounded{\includegraphics{a.pdf} extra}',
+                r'\includegraphics[alt={unclosed]{a.pdf}'):
+            with self.subTest(graphic=graphic), self.assertRaises(ReportExportError):
+                _paginate_figure_tex(r'\begin{figure}' + graphic + caption + r'\end{figure}')
+
+    def test_export_routes_writer_figures_through_page_allocation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source = self._source(root)
             def convert(argv, **kwargs):
                 if "--to=json" in argv:
                     return json.dumps(_ast())
-                return "\\begin{figure}\nGenerated\\end{figure}\n\\begin{figure}[p]\nExplicit\\end{figure}"
+                return (r'\begin{figure}' + '\n\\centering\n'
+                    + r'\includegraphics{figures/a.pdf}\caption{Generated}\end{figure}' + '\n'
+                    + r'\begin{figure}[p]\includegraphics{figures/b.pdf}\caption{Explicit}\end{figure}')
             with patch("simple_ar.report.export.shutil.which", return_value="pandoc"), patch("simple_ar.report.export._run", side_effect=convert):
                 export_acm_report(source, root / "acm")
             rendered = (root / "acm/body.tex").read_text()
-            self.assertIn("\\begin{figure}[htbp]\nGenerated", rendered)
-            self.assertIn("\\begin{figure}[p]\nExplicit", rendered)
+            self.assertIn('\\begin{figure}[htbp]\n\\sarfigurecontent{', rendered)
+            self.assertIn('\\begin{figure}[p]\n\\sarfigurecontent{', rendered)
+            self.assertEqual(rendered.count(r'\sarfigurecontent'), 2)
+            self.assertEqual(rendered.count(r'\caption{Generated}'), 1)
+            self.assertEqual(rendered.count(r'\caption{Explicit}'), 1)
             self.assertNotIn("\\begin{figure}[H]", rendered)
 
     def test_out_of_scope_image_and_unknown_citation_fail_before_export(self) -> None:
@@ -1231,6 +1344,40 @@ class ReportExportTests(unittest.TestCase):
             self.assertIn("missing package", (root / "build.log").read_text())
             self.assertIn("-no-shell-escape", run.call_args.args[0])
             self.assertEqual(run.call_args.kwargs["env"]["openin_any"], "p")
+            # A resource refusal is terminal, unlike an ordinary TeX error.
+            # Keep its class through compilation and the export manifest so no
+            # Poppler/preview work is dispatched after the refusal.
+            for stage in ('body', 'standalone', 'pdflatex', 'bibtex'):
+                with self.subTest(stage=stage):
+                    source = root / stage
+                    source.mkdir()
+                    (source / 'report_body.md').write_text('# Evidence\n\nBody [@p1].', encoding='utf-8')
+                    (source / 'references.bib').write_text('@misc{p1,title={Evidence}}', encoding='utf-8')
+                    output = root / (stage + '-export')
+                    dispatched = []
+                    def render(argv, **kwargs):
+                        current = ('standalone' if '--standalone' in argv else
+                            'body' if '--to=latex' in argv else argv[0])
+                        dispatched.append(current)
+                        if current == stage:
+                            raise ReportExportResourceError('Process allowance exhausted')
+                        if '--to=json' in argv:
+                            return json.dumps(_ast())
+                        return 'renderer output'
+                    with patch('simple_ar.report.export.shutil.which', side_effect=lambda name: name):
+                        with self.assertRaises(ReportExportResourceError) as stopped:
+                            export_acm_report(source, output, compile_pdf=True, render_preview=True,
+                                checks={'max_pages': 12}, runner=render)
+                    self.assertEqual(stopped.exception.failure_kind, 'resource_exhausted')
+                    manifest = json.loads((output / 'export.json').read_text(encoding='utf-8'))
+                    self.assertEqual(manifest['failure_kind'], 'resource_exhausted')
+                    self.assertEqual(manifest['status'], 'failed')
+                    self.assertFalse(manifest['compiled'])
+                    self.assertEqual(dispatched[-1], stage)
+                    self.assertNotIn('pdfinfo', dispatched)
+                    self.assertFalse(manifest['pdf_preview']['rendered'])
+                    if stage in {'pdflatex', 'bibtex'}:
+                        self.assertIn('Process allowance exhausted', (output / 'build.log').read_text())
 
 
 class ProcessArtifactBindingTests(unittest.TestCase):
@@ -1245,6 +1392,7 @@ class ProcessArtifactBindingTests(unittest.TestCase):
                 workspace.resolve(name, write=True).write_bytes(raw)
             record = {'status': 'finished', 'returncode': returncode, 'stop_reason': None,
                 'invocation_id': identity, 'started_at': identity, 'streams': {},
+                'argv': list(spec.argv), 'cwd': str(spec.cwd.resolve()), 'timeout_sec': spec.timeout_sec,
                 'output': {'stdout': '', 'stderr': ''}}
             if spec.input_binding is not None:
                 record['input_binding'] = spec.input_binding
@@ -1263,12 +1411,20 @@ class ProcessArtifactBindingTests(unittest.TestCase):
             workspace = WorkspaceToolGateway(Path(tmp), {}, None)
             workspace.resolve('source.any').write_bytes(b'v1')
             workspace.resolve('unrelated').write_bytes(b'irrelevant')
-            args = {'argv': ['arbitrary-tool'], 'inputs': ['source.any'], 'outputs': ['middle.any']}
-            self.assertTrue(self._run(workspace, 'a', args, {'middle.any': b'intermediate'}).ok)
-            second = {'argv': ['another-tool'], 'inputs': ['middle.any'], 'outputs': ['figure.png']}
+            args = {'argv': ['arbitrary-tool'], 'inputs': ['source.any'],
+                'outputs': ['middle.any', 'sibling.any']}
+            self.assertTrue(self._run(workspace, 'a', args,
+                {'middle.any': b'intermediate', 'sibling.any': b'sibling'}).ok)
+            second = {'argv': ['another-tool'], 'inputs': ['middle.any', 'sibling.any'], 'outputs': ['figure.png']}
             self.assertTrue(self._run(workspace, 'b', second, {'figure.png': b'old image'}).ok)
             workspace.resolve('unrelated').write_bytes(b'changed')
-            workspace.check_artifact_producers(['figure.png', 'unrelated'])
+            with patch.object(workspace, '_check_process_inputs', wraps=workspace._check_process_inputs) as inputs, \
+                    patch.object(workspace, '_version_hashes', wraps=workspace._version_hashes) as hashes:
+                workspace.check_artifact_producers(['figure.png', 'middle.any', 'sibling.any', 'unrelated'])
+                self.assertEqual([call.kwargs['identity'] for call in inputs.call_args_list], ['b', 'a'])
+                self.assertEqual(hashes.call_count, 4)  # All inputs and outputs once per record.
+                workspace.check_artifact_producers(['figure.png'])
+                self.assertEqual(inputs.call_count, 4)  # No implicit cache between calls.
             cache = {}
             with patch.object(workspace, '_artifact_producers', wraps=workspace._artifact_producers) as receipts, \
                     patch.object(workspace, '_version_hashes', wraps=workspace._version_hashes) as hashes:
@@ -1280,6 +1436,17 @@ class ProcessArtifactBindingTests(unittest.TestCase):
                 workspace.check_artifact_producers(['figure.png'], cache=cache, refresh=True)
                 self.assertEqual(receipts.call_count, 2)
                 self.assertGreater(hashes.call_count, first)
+            # Request only one output; any sibling change must still invalidate it.
+            for name in ('source.any', 'middle.any', 'sibling.any'):
+                with self.subTest(changed=name):
+                    path = workspace.resolve(name)
+                    original = path.read_bytes()
+                    path.write_bytes(b'tampered')
+                    try:
+                        with self.assertRaisesRegex(ValueError, 'changed'):
+                            workspace.check_artifact_producers(['middle.any'])
+                    finally:
+                        path.write_bytes(original)
             workspace.resolve('source.any').write_bytes(b'v2')
             cache = {}
             for _ in range(2):
@@ -1293,6 +1460,30 @@ class ProcessArtifactBindingTests(unittest.TestCase):
             workspace.resolve('figure.png').write_bytes(b'tampered')
             with self.assertRaisesRegex(ValueError, 'changed'):
                 workspace.check_artifact_producers(['figure.png'])
+
+    def test_distinct_records_with_same_invocation_id_are_checked_independently(self):
+        from simple_ar.core.artifacts import read_json, write_json
+        from simple_ar.tools.workspace import WorkspaceToolGateway
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = WorkspaceToolGateway(Path(tmp), {}, None)
+            for identity in ('a', 'b'):
+                args = {'argv': ['tool'], 'outputs': [identity]}
+                self.assertTrue(self._run(workspace, identity, args, {identity: b'output'}).ok)
+            receipt = Path(tmp) / 'tools/processes/b/invocation.json'
+            record = read_json(receipt)
+            record['invocation_id'] = 'a'
+            write_json(receipt, record)
+            with patch.object(workspace, '_check_process_inputs', wraps=workspace._check_process_inputs) as inputs:
+                workspace.check_artifact_producers(['a', 'b'])
+                self.assertEqual(inputs.call_count, 2)
+            workspace.resolve('b').write_bytes(b'tampered')
+            with self.assertRaisesRegex(ValueError, 'outputs changed'):
+                workspace.check_artifact_producers(['a', 'b'])
+            record['returncode'] = 1
+            write_json(receipt, record)
+            with self.assertRaisesRegex(ValueError, 'no successful output binding'):
+                workspace.check_artifact_producers(['a', 'b'])
 
     def test_recovery_preserves_receipt_bytes_and_cannot_backfill_legacy_or_missing_outputs(self):
         from simple_ar.tools.workspace import WorkspaceToolGateway, validate_workspace_arguments

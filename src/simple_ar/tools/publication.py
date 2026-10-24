@@ -149,19 +149,19 @@ class PublicationToolGateway:
         self.report_source = report_source
 
     def check_report_delivery(self, observations: list[dict], identity: dict | None, artifacts: list[str], *,
-                              formats: list[str], manuscript: str | None, proposed: dict | None = None) -> None:
+                              formats: list[str], manuscript: str | None, proposed: dict | None = None) -> set[Path]:
         """Prove requested publication roles belong to this authoring version."""
         source = manuscript or (identity or {}).get('manuscript')
         if not source:
             raise ValueError('Canonical conversion delivery must identify its actual input manuscript')
         if identity is not None and set(formats) <= {'markdown'}:
-            return
+            return set()
         if proposed is not None:
             if self.workspace.resolve(proposed['markdown']) != self.workspace.resolve(source):
                 raise ValueError('Proposed publication uses a different authoring version')
             if 'pdf' in formats and not proposed.get('compile_pdf', True):
                 raise ValueError('The declared PDF obligation requires compilation')
-            return  # The same rule rechecks actual owner results before terminal commit.
+            return set()  # Recheck actual owner results before terminal commit.
         delivered = {self.workspace.resolve(path) for path in artifacts}
         for row in observations:
             data = row.get('data') or {}
@@ -195,7 +195,7 @@ class PublicationToolGateway:
             if not required:
                 required.add(project / 'source.md')
             if required.issubset(delivered) and all(path.is_file() for path in required):
-                return
+                return {self.workspace.resolve(path) for path in hashes}
         raise ValueError('Requested report formats need a byte-bound publication of the same manuscript, figures and bibliography')
 
     def call(self, name: str, arguments: dict[str, Any], *, identity: str) -> ToolResult:
@@ -350,6 +350,9 @@ class PublicationToolGateway:
                 error='' if completed else str((manifest.get('error') if request.checks is not None else None)
                     or manifest.get('compile_note') or manifest.get('error') or 'Publication did not complete; inspect the retained manifest'),
                 data={"manifest": manifest, "project": prefix, "artifacts": artifacts,
+                    **({'failure_kind': manifest['failure_kind'],
+                        'next_action': 'Rendering resource allowance exhausted. Retain the manuscript and failed publication; explicit resource authorization is required before new rendering.'}
+                       if manifest.get('failure_kind') == 'resource_exhausted' else {}),
                     **({'report_identity': report_identity} if report_identity is not None else {}),
                     **({'artifact_sha256': hashes, 'output_integrity': 'byte_bound'} if hashes is not None else {}),
                     **({'delivery': delivery} if delivery is not None else {}),
@@ -369,5 +372,9 @@ class PublicationToolGateway:
                     pass
             return ToolResult(tool_name=name, status="error",
                 artifacts=retained, summary='Export stopped; source manuscript retained.',
-                data={'incomplete': True, 'next_action': 'Correct the reported source/asset or build issue, then export a new version. Do not repeat an unchanged failed export.'},
+                data={'incomplete': True,
+                    **({'failure_kind': 'resource_exhausted'} if isinstance(exc, ReportExportResourceError) else {}),
+                    'next_action': ('Rendering resource allowance exhausted; retain existing artifacts and request explicit resource authorization before new rendering.'
+                        if isinstance(exc, ReportExportResourceError) else
+                        'Correct the reported source/asset or build issue, then export a new version. Do not repeat an unchanged failed export.')},
                 error=f"Publication unavailable ({type(exc).__name__}: {exc}); inspect saved export/process records. Source and failed version retained; no blind replay.")

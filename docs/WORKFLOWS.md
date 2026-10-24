@@ -21,6 +21,8 @@ A task can investigate sources, change code, run calculations and produce a repo
 Existing results can be reused without rerunning experiments. Grant only the access
 needed by the recipe; commands still need approval and model/API calls may incur charges.
 
+The main-branch [installation](USAGE.md#installation) and public examples remain valid. Sections marked V2.10 describe ongoing work on `feat/v2.10-project-research-assistant`; checked improvements can be integrated into main in stages while V2.10 development continues. Development checks and public cases retain separate evidence; see [tested bounds and limits](EVALUATION.md#v210-development-evidence). Review [effective task settings](USAGE.md#configure-once-and-continue-from-the-result) before starting. Preferences guide deliverables, while permissions and budget settings govern access and resources.
+
 ## Direction research
 
 **Provide:** the topic, purpose and constraints that affect the recommendation, such as dates,
@@ -63,6 +65,17 @@ uv run simple-ar start "Create a Python CLI that summarizes selected metrics fro
 `--source` mounts originals read-only. Inspect the delivered working copy or code package;
 do not assume your original project was modified.
 Proposed commands still require individual approval. Review their code and side effects before execution.
+
+On the V2.10 development branch, first-time work on an ordinary or copied project,
+and feedback on a registered working copy, preserve unchanged non-runtime members.
+The bounded edit set is separate from project retention: currently up to 12
+edited sources, with complete copying bounded to 4,096 members, 64 MiB per file
+and 128 MiB total. Retained binary/large dependencies keep their bytes without
+being sent as editable text or certified as inspected. This does not discover
+missing dependencies or copy an entire task history. Oversized projects are refused
+before generation. Prepared projects use the same owner-bound member inventory at
+approval and execution; they do not need to enumerate every member as a separate
+public process input. Broader project-continuity acceptance remains incomplete.
 
 **Inspect:** source or patches, actual verification logs, outcomes and unresolved issues.
 Model review and static checks do not replace behavioral verification.
@@ -186,6 +199,10 @@ Distinguish local editing from restructuring:
 uv run simple-ar start --resume-task "SESSION" "Keep the first draft. Reorganize it into problem, route comparisons, evidence limitations and recommendations without changing the results."
 ```
 
+### Continue a retained draft (V2.10 development)
+
+If a complete article, section draft or unadopted article revision remains after failed independent inspection, ask to inspect and finish that candidate. The writing owner checks original author responses and unchanged evidence before reuse; it can inspect the retained revision without reverting to the initial draft. Older drafts lacking the necessary production records do not qualify. Failed inspection remains a failure until a new inspection accepts the candidate; retained files alone are not completed delivery.
+
 ### Export ACM LaTeX and PDF
 
 The exporter accepts an assembled report directory containing `report_body.md` and
@@ -203,7 +220,7 @@ See the [CLI reference](CLI_REFERENCE.md) for files and dependencies.
 
 ### Supplied templates
 
-Native tasks can use a trusted **Pandoc LaTeX template** instead of the built-in ACM layout:
+On the V2.10 development branch, native tasks can use a trusted **Pandoc LaTeX template** instead of the built-in ACM layout:
 
 ```bash
 uv run simple-ar start "Use this report and supplied trusted template. Preserve the Markdown and references, export an editable TeX project and PDF, and render every page for inspection. Explain any unchecked submission requirements." --source ./paper --allow-execution
@@ -212,7 +229,22 @@ uv run simple-ar start "Use this report and supplied trusted template. Preserve 
 Keep the report and a focused template bundle in the supplied directory, not your
 credentials or unrelated files. The template needs `$body$` and the standard
 `$for(header-includes)$$header-includes$$endfor$` hook in its preamble.
-This is not automatic conversion of arbitrary conference TeX or official-template discovery.
+The renderer consumes a prepared template. The inspected conversions used a supplied template and an operator-provided recipe, with zero model/API calls; both five-page outputs were readable with minor layout limits. This is not evidence of autonomous template discovery. For a new task requiring template preparation, provide an explicit
+official entry point, year and submission stage. The task may use research and code capabilities to retrieve rules and adapt an example into a Pandoc wrapper, subject to network and execution permissions. Treat this as a request requiring verification, not an accepted end-to-end workflow:
+
+```bash
+uv run simple-ar start "Use https://iclr.cc/Conferences/2025/CallForPapers and its links to prepare the supplied manuscript in the 2025 initial anonymous submission layout. Preserve the prose, references, figures, tables and numbers. Retain template/rule sources and adaptation notes; deliver editable sources, PDF and every page preview. Disclose unmet rules without changing scientific content to force compliance. Do not rerun experiments or install an environment." --source ./paper --allow-network --allow-execution
+```
+
+The assistant should verify the year and stage and retain the rules and template as
+task materials. Template adaptation handles variables, packages and layout; users
+need not write a wrapper, select internal tools or edit task JSON. Files already in
+an authorized directory can be copied into the working manuscript directory using
+their observed full hashes. Use an existing Pandoc template directly; native conference
+TeX needs adaptation. If retrieval fails, retain the failure and request the template
+and rules rather than guessing another year or silently falling back to ACM.
+Research, code and file tools provide this composition; the renderer itself does
+not discover or download templates. Autonomous completion remains unverified.
 Authored sections, including Abstract or Summary, stay in the supplied template's body;
 their headings do not implicitly populate its `$abstract$` metadata slot.
 
@@ -239,10 +271,16 @@ budget. The standalone `report-export` CLI does not expose these options.
 Page limits count all pages, including references and appendices. String checks
 match case-sensitive literal substrings in extracted text; they do not cover
 images, metadata or indirect identification, and do not certify anonymity.
+If an official limit applies only to the main body, do not use that number as an
+all-PDF `max_pages` limit. Body boundaries, minimum length, stage options and other
+requirements need separate checks against the rules and actual PDF. `checks` only
+executes the finite checks specified; it does not certify all official requirements.
 Inspect `export.json` and the retained `checks/pdfinfo.txt` or `checks/text.txt`.
 Failed or unavailable checks block optional final delivery but retain the project
 and diagnostics. They do not automatically revise the manuscript. Reading a saved
 result does not rerun checks; changed files need a new export.
+
+The development exporter budgets figure and caption height together using the actual template layout. Captions that cannot fit, and unsupported composite/nested images, fail explicitly with sources retained. It preserves scientific text, numbering, links and citations; inspect compact figures and table wrapping yourself.
 
 Model-based visual inspection additionally needs a configured vision connection
 and explicit `--allow-vision`; rendering alone does not grant it.
@@ -269,18 +307,26 @@ Failed preparation is not a measurement. Virtual environments isolate dependenci
 
 ## View results and continue
 
-For native tasks:
+Use the continuation command printed for the task. New native and common structured tasks continue with:
 
 ```bash
 uv run simple-ar results "SESSION"
 uv run simple-ar start --resume-task "SESSION" "Your follow-up request"
 ```
 
-For structured `research-session` tasks, use the session path printed by that command:
+Saved legacy ResearchApplication sessions retain their original command:
 
 ```bash
 uv run simple-ar research-session --session-root "SESSION" --model env
 ```
+
+### Reuse materials in a new task (V2.10 development)
+
+To give saved outputs a new goal and budget, add `from_session = "../saved-task"` and `reuse = ["artifacts"]` to the existing native `[task]` TOML table. You can also select named groups listed by `simple-ar results`; group names are not filesystem paths. The session path is relative to the configuration. Reuse checks material bytes and does not inherit permissions, budget or execution state. To continue the original task, use `--resume-task` instead.
+
+### Add a trusted local extension (V2.10 development)
+
+Add `extensions = ["../my-skill"]` to the same native `[task]` table and start with `--task-config PATH`. Selected packages share the task's registry, history and recovery. V1 accepts instructions and Python tools declaring read-only/plan operations; missing or changed packages block continuation. Python runs with the host process's OS privileges, including direct file, process and network access. The declarations and restricted host services are not a sandbox. Use only trusted packages; see [setup and identity rules](LOCAL_EXTENSIONS.md) (English).
 
 Keep complete delivery directories rather than copying only a PDF and losing figures, sources
 or reconstruction materials. When paused or failed, inspect the reason first.

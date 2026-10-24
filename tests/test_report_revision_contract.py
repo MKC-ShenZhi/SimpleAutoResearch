@@ -18,6 +18,96 @@ from tests.report_review_fixtures import draft_quotes, prompt_payload
 
 
 class RevisionContractTests(unittest.TestCase):
+    def test_article_disclosure_only_delivery_review_uses_shared_revision_and_recovery(self):
+        from copy import deepcopy
+        from dataclasses import replace
+        from simple_ar.core.capabilities import ArtifactStore
+        from simple_ar.report.review_evidence import CLAIM_ADOPTION_V2
+        from simple_ar.report.writing import ReportWritingRequest, _edit_article, write_whole_article
+
+        # Exercise the adapter with the real editor and retained article writer.
+        # Independent inspection is a fixture, not a claim of scientific QA.
+        for accepted, max_rounds in ((False, 1), (True, 1), (True, 2)):
+            with self.subTest(accepted=accepted, max_rounds=max_rounds), tempfile.TemporaryDirectory() as tmp:
+                context, config, _, memory, template = self.objects(
+                    reviewer='llm', document_review=True)
+                config = config.model_copy(update={'max_review_iterations': max_rounds})
+                calls = []
+                class Client:
+                    def ask_json(client, system, prompt, *, label='', **options):
+                        calls.append(label)
+                        view = json.loads(prompt)
+                        if 'prior_draft' not in view:
+                            return {'draft_markdown': 'Original account.'}
+                        self.assertEqual(view['prior_draft'], 'Original account.')
+                        self.assertEqual(len(view['revision_findings']['reviews'][0]['findings']), 3)
+                        return {'prior_draft_sha256': view['edit_contract']['prior_draft_sha256'],
+                            'replacements': [{'old_text': 'Original account.',
+                                'new_text': 'Qualified account; visual inspection was not performed.'}]}
+
+                store = ArtifactStore(Path(tmp) / 'original')
+                inputs = {'article': {'title': 'Supplied observations'}}
+                request = ReportWritingRequest(report_context=context, config=config, memory=memory,
+                    template=template, llm_client=Client(), method='article')
+                written = write_whole_article(store=store, inputs=inputs, identity='original',
+                    client=request.llm_client)
+                written['memory'] = memory.model_dump(mode='json')
+                findings = [ReviewerFinding(finding_id=str(index), section_id='document',
+                    type='unsupported_claim', severity='major', required_action='revise', message=message)
+                    for index, message in enumerate(('Unsupported hardware description.',
+                        'Unsupported causal inference.', 'Missing visual-inspection disclosure.'))]
+                review = ReportSectionReview(section_id='document', verdict='revise_required', findings=findings)
+                delivery = {'status': 'needs_revision', 'defects': [], 'uninspected': [],
+                    'declaration_adoption': {'contract': CLAIM_ADOPTION_V2}}
+                initial = {'review_status': 'needs_revision',
+                    'section_reviews': [review.model_dump(mode='json')], 'delivery_review': delivery}
+                store.write_json('initial_review.json', initial)
+                original_review = deepcopy(initial)
+                candidate_review = ReportSectionReview(section_id='document',
+                    verdict='pass' if accepted else 'revise_required', findings=[] if accepted else findings)
+                candidate_inspection = {'review_status': 'reviewed' if accepted else 'needs_revision',
+                    'section_reviews': [candidate_review.model_dump(mode='json')],
+                    'delivery_review': {**delivery, 'status': 'reviewed' if accepted else 'needs_revision'}}
+
+                def inspect(**arguments):
+                    receipt = arguments['store']
+                    if arguments['client'] is None:
+                        return (arguments.get('resume_store') or receipt).read_json('fixture_inspection.json')
+                    self.assertIn('visual inspection was not performed', arguments['markdown'])
+                    receipt.write_json('fixture_inspection.json', candidate_inspection)
+                    return deepcopy(candidate_inspection)
+
+                with patch('simple_ar.report.writing.inspect_article', side_effect=inspect):
+                    edited = _edit_article(store=store, retained=store, written=written,
+                        inputs=inputs, request=request, initial_review=initial)
+                    checkpoint = store.read_json('review/checkpoint.json')
+                    attempts = [row for row in checkpoint['iterations'] if row['action'] == 'document_joint_revise']
+                    self.assertEqual(len(attempts), 1)
+                    self.assertEqual(attempts[0]['adopted'], accepted)
+                    self.assertEqual(attempts[0]['status'], 'verified' if accepted else 'rejected')
+                    self.assertIn('visual inspection was not performed', attempts[0]['drafts'][0]['draft_markdown'])
+                    self.assertEqual(edited['review']['review_status'], 'reviewed' if accepted else 'needs_revision')
+                    self.assertEqual(edited['sections'][0]['draft_markdown'],
+                        attempts[0]['drafts'][0]['draft_markdown'] if accepted else 'Original account.')
+                    self.assertEqual(edited['adopted_revision'] is not None, accepted)
+                    self.assertEqual({row['finding_id'] for row in edited['reviewer_findings']} & {'0', '1', '2'},
+                        set() if accepted else {'0', '1', '2'})
+                    self.assertEqual(attempts[0]['section_reviews'][0]['findings'], initial['section_reviews'][0]['findings'])
+                    protected = {path: path.read_bytes() for path in store.root.rglob('*.json')}
+                    with patch.object(request.llm_client, 'ask_json',
+                            side_effect=AssertionError('Recovery must not call the live client')):
+                        for index, client in enumerate((None, request.llm_client)):
+                            target = ArtifactStore(Path(tmp) / f'recovered-{index}')
+                            recovered = _edit_article(store=target, retained=store,
+                                written=written, inputs=inputs, request=replace(request, llm_client=client),
+                                initial_review=initial)
+                            self.assertEqual(recovered, edited)
+                            self.assertEqual(target.read_json('review/checkpoint.json'), checkpoint)
+                self.assertEqual(calls, ['composition-article', 'composition-article'])
+                self.assertEqual(initial, original_review)
+                for path, raw in protected.items():
+                    self.assertEqual(path.read_bytes(), raw)
+
     def test_material_binding_preserves_observations_bytes_and_feedback(self):
         from simple_ar.tools.workspace import WorkspaceToolGateway
         from simple_ar.tools.writing import freeze_report_requirement, material_report_binding

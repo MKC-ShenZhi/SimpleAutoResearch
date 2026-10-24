@@ -13,6 +13,7 @@ Use this reference to look up configuration fields and constraints. A model cata
 | Table fields and statistical transformations | [Existing data](#existing-data-descriptive-analysis) |
 | Decisions and additional allowances | [Continuation](#research-continuation-and-decisions) |
 | Project, interpreter, models and edit budgets | [CodeTask fields](#codetask-field-reference) |
+| Python creation, native controls and trusted services | [Python API](#python-task-creation) |
 
 ## Guided setup
 
@@ -20,80 +21,24 @@ Ordinary `start`, `--guided` and outcome preferences save a native session, not 
 
 Structured precedence is defaults → TOML → explicit CLI. CLI lists replace file lists. Research paths resolve from the TOML directory; argv stays literal. Protocol protected paths use execution cwd. CodeTask retains separate [loading rules](#loading-rules). Native access/resource changes use explicit continuation controls rather than ordinary overrides.
 
-### Python task creation
+### V2.10 task declarations (development branch)
 
-For direct native creation, `ToolApplication.create(..., delivery_files=["**/*.md", "**/*.pdf"])` can require nonempty workspace output files before an unqualified completed delivery. These relative patterns check presence, not scientific quality; a disclosed partial delivery remains possible. The API does not infer these requirements from prose or count source PDFs as output. Existing tasks can explicitly replace `delivery_files`, `tool_contracts` or `completion_policy` through caller `supply(..., replace_existing=True)`; unrelated supply preserves the saved policy and ledger.
+V2.10 work continues on `feat/v2.10-project-research-assistant`; verified improvements may be integrated into main before the milestone is complete. For the scope actually checked, see [development evidence and limits](EVALUATION.md#v210-development-evidence).
 
-New tasks use `tool_contracts="on_demand"`: ordinary workspace tools and a short capability directory are available initially; the assistant loads the full professional contracts needed for its current work. This leaves input capacity for materials rather than every tool's parameters. Users do not choose a workflow or approve tool loading. Permissions and command approval still apply. Advanced callers can select `full` or `outcomes`; saved tasks retain their explicit mode.
+The development branch stores the original request separately from material roles, data meanings and outcome preferences. CLI and UI confirm the same effective declarations rather than appending generated path lists to the user's words. Preferences guide delivery, not capability access; declarations are neither verified facts nor additional permissions. Omitting `--with-report` does not prohibit a report requested in prose. Historical sessions retain their original input rules.
 
-New tasks use `context_protocol="conversation.v1"`: actual assistant/tool messages retain read text and write arguments, evicting complete oldest turns when needed. The latest complete turn remains intact even when it exceeds the soft `context_input_tokens` working target; the overrun is recorded and the actual request must still fit the remaining total token allowance. A bounded archive index links to original records, without pretending archived text is supplied. Historical observations are not fresh reads or verified facts. Saved tasks without this marker and explicit Python `context_protocol=None` retain their original projection.
+On the V2.10 development branch, native `[task]` TOML also accepts `extensions = ["../my-skill"]`.
+These explicitly selected trusted local packages use the common tool registry and saved task;
+v1 accepts instruction packages and Python tools declaring read-only/plan operations.
+Trusted Python runs with the host process’s OS privileges, including direct file, process and network access; declarations and host-service restrictions are not a sandbox. Load only trusted packages.
+See [local extension setup and limitations](LOCAL_EXTENSIONS.md).
 
-New native tasks default to `completion_policy="closing_decision.v2"`. Before the last affordable decision, available contracts are restricted to direct delivery, a question, or already-loaded final operations with required delivery. Operations needing another model call are excluded. New closing replies require one terminal action; saved replies retain their recorded admission contract. Incomplete work must remain explicit; this policy does not guarantee task completion or scientific quality. Historical policies, including missing fields and explicit `protected_decision.v1`, retain their behavior.
+For new work based on saved outputs, native `[task]` also accepts `from_session = "../saved-task"`
+and `reuse = ["artifacts"]` (or named groups listed by `simple-ar results`). The session path is
+relative to the configuration; group names are not paths. This reuses byte-checked materials,
+not the previous permissions, budget or execution state. Use `--resume-task` for the same task.
 
-Professional article composition can inspect and revise its own draft within a declared bound: `compose_document.professional_review={"max_revision_rounds":1}` requests independent inspection and at most one correction round. Zero requests inspection without automatic correction; omission retains the original drafting behavior. Initial and feedback composition use the same writing owner, evidence checks and shared budget. Feedback can reuse an intact prior composition's inputs without selecting them again. Unresolved findings remain explicit and prevent accepted publication. For native reports, declare the optional `professional_review` in `update_work_plan.report_intent` when creating the obligation; inherited and user-frozen report settings remain authoritative. Inspection covers supplied evidence and prose, not visual or scientific certification.
-
-New CLI/UI tasks and `create_research_task` use a versioned report contract. The assistant interprets the requested deliverables in its normal action batch, without a separate classification call. Report composition receives the original materials and actual results; publication and delivery must refer to the adopted manuscript and matching assets. A disclosed candidate remains partial, not a completed scientific report. Converting existing text adopts its current version without requiring a rewrite. These bindings establish provenance and version consistency, not scientific correctness.
-
-Direct Python callers can opt in with `ToolApplication.create(..., report_protocol="canonical_report.v1")`; omission retains the earlier low-level API contract. Existing tasks are not silently upgraded, and caller-frozen writing or execution requirements cannot be relaxed by the assistant's plan.
-
-New CLI/UI and `create_research_task` material reports delegate evidence selection to the writing owner. It receives the saved user request and authorized material roots, not a coordinator-authored replacement goal or preselected source windows. Python callers can enable the same behavior with `professional_inputs=True` alongside the report protocol. Expert calls and saved requests retain their original input contract. New whole-article feedback and bounded corrections return version-bound exact replacements; an empty replacement list adopts an unchanged valid candidate. Original responses and earlier manuscript versions remain intact.
-
-`run_process` optionally declares file `inputs` and workspace `outputs` (up to 64 each, 64 MiB per binding). Approval pins the inputs; successful execution records output bytes. Writing/publication rejects a known declared producer whose inputs or outputs have changed, rather than silently using its old image. Regenerate explicitly with a new invocation. These declarations do not infer dependencies, cover undeclared files, grant execution, or prove scientific correctness. Historical runs are not retroactively bound.
-
-`compose_document.adopt_draft=true` checks and adopts an existing `prior_draft` without a drafting request. Article writing and independent professional review must already be enabled; it cannot replace frozen controls. The supplied body has a distinct source receipt, not a fabricated model response. With `reuse_prior_inputs`, an intact same-task producer supplies its authorial body and evidence; external drafts do not acquire that reuse authority. Unresolved checks prevent accepted publication, and authorized corrections still use the shared exact-replacement editor.
-
-For new owner-directed material reports, figure inputs are existing paths, not coordinator-authored authoritative captions. The writing owner authors and reconciles captions against its materials and original request. Bound reports expose their frozen review controls rather than a conflicting `professional_review` option. Writing and implementation investigation receive relevant original feedback before selecting materials; historical invocations keep their saved context. None of this constitutes visual or scientific verification.
-
-`app.run()` and read-only `app.result_snapshot()` also report `retained_work`: existing intermediate workspace files, the last operation and continuation guidance. These files are not an accepted delivery. Failed composition may retain a candidate manuscript; a rejected independent review may retain `incomplete_review.json` with individually validated observations. Correct using the original evidence and a new version; incomplete inspection remains unresolved. New composition checks CommonMark image links before registering its canonical result; export keeps its full path and compilation checks.
-
-New ordinary `run_process` calls return an error for a nonzero exit or stop, retaining the exit code and logs. Historical observations are not rewritten. Invalid execution proposals return the professional owner's preflight diagnosis without running the proposal. Section writing rejects a known outline that cannot fit even one request per section before spending requests on material selection; this lower bound does not guarantee that the remaining work fits.
-
-Structured research, writing, tables and declared execution use the same creation owner as the CLI:
-
-```python
-from pathlib import Path
-from simple_ar.app.research_intake import create_research_task
-from simple_ar.app.tool_application import ToolApplication
-from simple_ar.research.workflow_contracts import ResearchBrief
-
-app = create_research_task(
-    ResearchBrief(request_text="Explain the evidence and its limits.",
-        requested_outputs=("summary",),
-        asset_requests=({"locator": "notes.md", "role": "material"},)),
-    root=Path("runs/evidence-note"), model="route:default",
-)
-app.run(progress=print)
-restored = ToolApplication.load(Path("runs/evidence-note"))
-```
-
-Creation validates inputs but makes no model or process calls. Omit `model` for caller-directed actions and later explicit supply; a declared report remains an obligation, not permission to invoke a model. `ResearchApplicationServices` supplies research settings and finite budgets. Put a declared command/condition set in `services.config["execution"]`; optional `code_task` uses the existing CodeTask configuration defaults, edit boundaries and independent validator. Paths resolve from `input_base_dir`, not the output task directory. Explicit zero allowances remain zero. Source aliases, environments and verified external baseline snapshots share the same compilation as CLI creation, rather than separate Python execution semantics.
-
-`create_research_task(..., allow_vision=True)` explicitly authorizes image inspection; the keyword defaults to `False` and accepts only a boolean. Request text and materials do not grant it. The existing owner still validates the named vision route and connection, and inspection uses the same request/token ledger supplied through `services.budget_limits`. This grants neither source network access nor image generation and does not change saved task permissions or the return type.
-
-For example, this creates a caller-directed measurement task without running it:
-
-```python
-from simple_ar.app.research_application import ResearchApplicationServices
-
-services = ResearchApplicationServices(input_base_dir=Path.cwd(), config={
-    "execution": {"command": ["python", "experiment.py"], "cwd": ".", "timeout_sec": 120,
-        "result_schema": {"primary_metric": "score", "required_metrics": ["score"]}}},
-    budget_limits={"process_invocations": 1, "process_wall_seconds": 120})
-app = create_research_task(ResearchBrief(request_text="Measure the supplied program.",
-    requested_outputs=("experiments",)), root=Path("runs/measurement"), services=services)
-```
-
-Execution still requires a separately approved proposal. `execution_confirmation=True` additionally requires acceptance of the caller's frozen protocol; it is not process permission. CodeTask's omitted/empty `allowed_patterns` keeps its existing default source scope with mandatory protections, not “no edits”; supply explicit globs to narrow it.
-
-When research is required and comparison controls are omitted, creation retains an open design—not an implicit `baseline_policy="skip"`. An accepted design feeds the same scientific owner and, for scoped code, binds the unchanged-source baseline and implemented candidate separately. It cannot widen edit scope, replace the environment or fabricate a source baseline for an empty project. Without a model, a structured experiment request can first retain materials and pause for [explicit supply](CLI_REFERENCE.md), whether or not a command is already declared; collection alone is not experiment/report completion. Binding the first model requires new positive request/token allowances on the original ledger.
-
-All new structured CLI tasks use this common creation owner; unsupported declarations fail before creation, never fall back to a different application. `create_session`/`ResearchApplication.create` remain explicit compatibility APIs with their original `view`/`advance` and historical-run contracts, not the backend for new CLI tasks. Initialized-run adoption and producing-source baseline lineage cannot be replaced by copying directories or bare result files.
-
-For trusted Python integrations, services may inject a text client, independent reviewer and `SearchProviderRegistry`. Clients must implement `with_budget` and `ask_json` or `chat_turn`, binding the task's actual ledger, session and attempt. Reload with `ToolApplication.load(path, services=services)` before further service work. Only type/model identities and provider names are retained—not credentials or executable objects. Missing dependencies do not fall back to environment clients or built-in providers. Custom implementations remain caller-trusted, not sandboxed or independently identity-verified. Named connections are preferable for CLI/restart portability; `model="env"` selects the configured default, not a literal provider model called `env`.
-
-`snapshot_sources=True` retains only selected regular files, each bounded by `max_snapshot_bytes` (default 16 MiB); it does not copy a whole directory. Hashes bind retained bytes. Legacy v1 import uses these copies, preserves the parent link and original files, and records `unknown_not_imported` for historical budget rather than importing or resetting it. Continue the new task with `start --resume-task`; the original task still uses its original recovery contract.
-
-### Named model connections
+## Named model connections
 
 Load one catalog from an explicit catalog path where offered, `SIMPLE_AR_MODELS_CONFIG`, or `~/.config/simple-ar/models.toml`. New native tasks also retain the selected catalog's absolute location for each authorized consumer. On continuation, explicit caller/environment selection wins, then an existing retained location, then the user catalog. Catalogs are not merged or discovered by scanning project directories. `models --config PATH` inspects that file without activating it for later commands. `start`, `models` and the client load current-directory `.env` without replacing existing environment variables.
 
@@ -560,3 +505,82 @@ Use the [field table](#execute-and-budget-fields). Connection retries, research 
 ## Edit Scope Behavior
 
 Only workspace files are edited. Empty allowlist allows normalized non-protected paths; otherwise allowed match and no protected match required. Built-in tests/benchmarks/.env/secrets/credentials stay protected; custom patterns add protection. Batch/work-plan targets narrow scope further. Context/planning/proposal/repair enforce scope; apply rechecks paths, unique exact old text and budgets. Empty old creates an absent allowed file, never replaces existing; creations share snapshots/rollback.
+
+## Python task creation
+
+Use `create_research_task` for structured research, writing, tables and declared execution. It shares CLI input validation and returns a `ToolApplication`; creating it makes no model or process call. Use `ToolApplication.create` for direct native integrations.
+
+### Create, run and reload
+
+```python
+from pathlib import Path
+from simple_ar.app.research_intake import create_research_task
+from simple_ar.app.tool_application import ToolApplication
+from simple_ar.research.workflow_contracts import ResearchBrief
+
+app = create_research_task(
+    ResearchBrief(request_text="Explain the evidence and its limits.",
+        requested_outputs=("summary",),
+        asset_requests=({"locator": "notes.md", "role": "material"},)),
+    root=Path("runs/evidence-note"), model="route:default",
+)
+app.run(progress=print)
+restored = ToolApplication.load(Path("runs/evidence-note"))
+```
+
+Paths resolve from `ResearchApplicationServices.input_base_dir`, not the output task directory. Services supply research settings and finite `budget_limits`; explicit zero allowances stay zero. Omit `model` for caller-directed actions and later explicit supply. A requested report is a delivery obligation, not permission to call a model. Source aliases, environments and verified external baselines use the same input compilation as CLI creation.
+
+```python
+from simple_ar.app.research_application import ResearchApplicationServices
+
+services = ResearchApplicationServices(input_base_dir=Path.cwd(), config={
+    "execution": {"command": ["python", "experiment.py"], "cwd": ".", "timeout_sec": 120,
+        "result_schema": {"primary_metric": "score", "required_metrics": ["score"]}}},
+    budget_limits={"process_invocations": 1, "process_wall_seconds": 120})
+app = create_research_task(ResearchBrief(request_text="Measure the supplied program.",
+    requested_outputs=("experiments",)), root=Path("runs/measurement"), services=services)
+```
+
+Put declared commands/conditions in `services.config["execution"]`. Optional `code_task` retains CodeTask defaults, edit boundaries and independent validation. Execution requires a separately approved proposal; `execution_confirmation=True` additionally requires acceptance of the frozen protocol. Omitted/empty CodeTask `allowed_patterns` retains the default protected source scope; use explicit globs to narrow it.
+
+When research is required, omitted comparison controls leave design open rather than imply `baseline_policy="skip"`. An accepted design binds unchanged-source baselines and implemented candidates separately; it cannot widen scope, replace the environment or invent a baseline for an empty project. Without a model, an experiment task can retain materials and pause for [explicit supply](CLI_REFERENCE.md#native-recovery), with or without a declared command. Collection alone is not completion. First model binding requires positive new request/token allowances on the original ledger.
+
+### Native controls and compatibility
+
+These controls describe the current development implementation. Saved tasks retain their recorded contracts; creation defaults do not migrate old sessions.
+
+| API setting | Behavior |
+| --- | --- |
+| `delivery_files=["**/*.md", "**/*.pdf"]` | Require nonempty workspace outputs for an unqualified completed delivery. Relative patterns check presence, not quality; source PDFs do not count. Requirements are explicit, not inferred from prose; disclosed partial delivery remains possible. |
+| `tool_contracts="on_demand"` (default) | Start with workspace tools and a short capability directory; load professional contracts as needed without user workflow selection or tool-loading approval. Permissions and command approvals still apply. Advanced alternatives: `full`, `outcomes`. |
+| `context_protocol="conversation.v1"` (default) | Retain actual read text/write arguments; evict complete oldest turns. Keep the latest complete turn even above the soft `context_input_tokens` target, record the overrun and enforce the remaining total allowance. The bounded archive index links original records; archived text is not current context, and old observations are not fresh reads. Missing markers or explicit `None` retain the original projection. |
+| `completion_policy="closing_decision.v2"` (default) | The last affordable decision offers direct delivery, a question, or loaded final operations requiring delivery; no operation needing another model call. A new closing reply has one terminal action. Saved replies keep their admission contract; missing/older policies, including `protected_decision.v1`, retain their behavior. Incomplete work stays explicit. |
+| `report_protocol="canonical_report.v1"` | CLI/UI and `create_research_task` use the versioned report contract. Direct `ToolApplication.create` callers opt in; omission keeps the earlier low-level contract. |
+| `professional_inputs=True` | With the report protocol, let the writing owner select evidence from the saved request and authorized roots. CLI/UI and `create_research_task` material reports use this behavior. Explicit expert calls and saved requests retain their input contracts. |
+| `create_research_task(..., allow_vision=True)` | Strict boolean, default `False`. Requires the named vision route and connection; shares `services.budget_limits`. Neither prose nor an injected text client grants inspection. Grants no source network or image generation and changes neither saved permissions nor the return type. |
+| `supply(..., replace_existing=True)` | Caller can explicitly replace `delivery_files`, `tool_contracts` or `completion_policy`. Unrelated supply preserves saved policy and ledger. |
+
+Tool loading and closing decisions do not guarantee completion, scientific quality or a particular cost. See [task budgets and evidence](EVALUATION.md#v210-development-evidence) before sizing a long report.
+
+### Writing, output binding and retained work
+
+| Operation / field | Contract |
+| --- | --- |
+| Report composition and delivery | Interpret deliverables in the normal action batch, without a separate classification call. Use original materials and actual results; publish the adopted manuscript with matching assets. Converting existing prose adopts its current version without mandatory rewriting. A disclosed candidate remains partial. Frozen writing/execution requirements cannot be relaxed by a work plan. |
+| `compose_document.professional_review={"max_revision_rounds":1}` | Independent inspection and at most one correction round; zero inspects without correction, omission keeps original drafting behavior. For a native report, declare the option in `update_work_plan.report_intent` when creating the obligation. Inherited/frozen controls take precedence and are exposed instead of a conflicting option. |
+| Feedback and figure inputs | The writing owner receives original feedback before selecting evidence and authors captions from actual materials/request; figure inputs are existing paths, not coordinator-authored authoritative captions. Implementation investigation also receives relevant original feedback. Initial/feedback writing shares ownership, evidence checks and budget. |
+| Whole-article corrections | Return exact replacements bound to the manuscript version; an empty list adopts an unchanged valid candidate. Preserve original responses and earlier versions. Intact prior composition inputs can be reused for feedback. Unresolved required findings prevent accepted publication. |
+| `compose_document.adopt_draft=true` | Check and adopt `prior_draft` without a drafting request; requires article writing and independent professional review already enabled. The body has its own source receipt, not a fabricated model response. `reuse_prior_inputs` requires an intact same-task producer; external drafts do not acquire that authority. Frozen controls and exact-replacement correction still apply. |
+| `run_process.inputs` / `outputs` | Optional file inputs and workspace outputs: up to 64 each, 64 MiB per binding. Approval pins inputs; successful execution records output bytes. Writing/publication rejects a declared producer with changed inputs/outputs; regenerate with a new invocation. No inferred dependencies, coverage of undeclared files, extra permissions or retroactive binding. |
+| Process failure / preflight | Nonzero exits or stops return errors with exit code/logs. Invalid proposals return the professional owner's diagnosis without execution. Historical observations remain unchanged. |
+| `app.run()` / `app.result_snapshot()` | Include `retained_work`: intermediate workspace files, last operation and continuation guidance. These are not accepted deliveries. Failed writing may retain a candidate; rejected inspection may retain individually validated observations in `incomplete_review.json`. Correct from original evidence as a new version; unfinished inspection stays unresolved. |
+
+Composition checks CommonMark image links before registering the canonical result; export retains path and compilation checks. Section writing refuses a known outline that cannot afford even one request per section before paid material selection, but that lower bound does not guarantee completion. Provenance, arithmetic and prose inspection do not certify visual or scientific correctness.
+
+### Trusted services, snapshots and legacy APIs
+
+Services may inject a text client, independent reviewer and `SearchProviderRegistry`. Clients implement `with_budget` and `ask_json` or `chat_turn`, binding the actual ledger, session and attempt. Reload with `ToolApplication.load(path, services=services)` before further service work. Persistence retains type/model identities and provider names, not credentials or executable objects. Missing dependencies fail rather than fall back to environment clients or built-in providers. Custom implementations are caller-trusted, not sandboxed or independently identity-verified. Prefer named connections for CLI/restart portability; `model="env"` selects the configured default.
+
+`snapshot_sources=True` retains selected regular files only, bounded individually by `max_snapshot_bytes` (default 16 MiB), with hashes binding retained bytes. It does not copy a whole directory. Legacy v1 import uses those copies, preserves parent links and originals, and records historical budget as `unknown_not_imported` rather than importing or resetting it. Continue the new task with `start --resume-task`; originals retain their own recovery contract.
+
+New structured CLI tasks use the common creation API and reject unsupported declarations before creation. `create_session` / `ResearchApplication.create` remain explicit compatibility APIs with their original `view` / `advance` and historical-run contracts. Initialized-run adoption and producing-source baseline lineage require their original records; copying directories or bare results cannot replace them.

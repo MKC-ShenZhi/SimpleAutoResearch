@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Callable, Mapping
@@ -24,6 +25,7 @@ from simple_ar.report.execution_evidence import report_execution_evidence
 from simple_ar.report.review_evidence import (
     EVIDENCE_QUOTE_RULES, EVIDENCE_QUOTE_SCHEMA, validate_finding_anchors, review_draft_quote_sources,
     review_evidence_locator, resolve_review_evidence,
+    attachment_review_blocks_editing,
 )
 from simple_ar.report.narrative import (
     DERIVED_CONTEXT_STATUS, REVIEW_OPINIONS_STATUS,
@@ -176,6 +178,40 @@ expectations. Keep the outline broad, readable, and evidence-bounded.
 Return one JSON object matching the requested schema."""
 
 
+SECTION_DELIVERY_REVIEW_CONTRACT = 'section_delivery_review.v1'
+
+
+def _section_delivery_assembly(context: ReportContext, memory: ReportMemory,
+                               sections: list[ReportSectionDraft], config: ReportRuntimeConfig) -> dict[str, Any]:
+    """Use the assembly owner's text preparation; never certify future rendering.
+
+    The consumer must compare body_sha256 with actual report_body.md and check
+    the separately retained transport receipts and attachment versions.
+    """
+    from simple_ar.report.capability import ReportAssemblyRequest, preview_report_document
+
+    contract = context.results['section_delivery_review']
+    if contract.get('contract') != SECTION_DELIVERY_REVIEW_CONTRACT:
+        raise ValueError('Unknown section delivery review contract')
+    options = contract['assembly']
+    if (set(options) - {'title', 'assembly_mode', 'template_name'}
+            or options.get('assembly_mode') != 'section_drafts'):
+        raise ValueError('Section delivery inspection requires explicit canonical section assembly options')
+    preview = preview_report_document(ReportAssemblyRequest(**options, sections=tuple(sections),
+        config=config, document_plan=memory.document_plan, papers=tuple(context.papers),
+        citation_key_map=context.citation_key_map))
+    def digest(value: Any) -> str:
+        return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False,
+            separators=(',', ':')).encode('utf-8')).hexdigest()
+    return {'contract': SECTION_DELIVERY_REVIEW_CONTRACT,
+        'identity': {
+            'body_sha256': hashlib.sha256(preview.report_body_markdown.encode('utf-8')).hexdigest(),
+            'report_sha256': hashlib.sha256(preview.report_markdown.encode('utf-8')).hexdigest(),
+            'sections_sha256': digest([row.model_dump(mode='json') for row in sections]),
+            'delivery_snapshot_sha256': digest(context.results['delivery_review'])},
+        'report_body_markdown': preview.report_body_markdown, 'report_markdown': preview.report_markdown}
+
+
 def run_report_agent(
     *,
     client: LLMClient | None,
@@ -188,6 +224,7 @@ def run_report_agent(
     checkpoint_sink: Callable[[dict[str, Any]], None] | None = None,
     completed_checkpoint: Mapping[str, Any] | None = None,
     assemble_body: bool = True,
+    on_delivery_review: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> AgentReportResult | None:
     """Run the bounded Writer/Reviewer loop for the report stage.
 
@@ -203,6 +240,9 @@ def run_report_agent(
         completed_checkpoint: Previously completed prefix; the caller verifies input identity.
         assemble_body: Preserve the direct-call report body by default. Capability
             callers publish sections through the assembly owner instead.
+        on_delivery_review: Resolve the completed transport receipt for a validated
+            delivery observation. Defaults to client.last_inspection_source;
+            persistence and filesystem receipt validation stay with the caller.
 
     Returns:
         Agent-generated report body and updated memory, or ``None`` when agent
@@ -219,6 +259,22 @@ def run_report_agent(
     all_findings: list[ReviewerFinding] = []
     all_tool_results: list[ReportToolResult] = []
     document_review_done = bool(completed_checkpoint.get("document_review_done")) if completed_checkpoint else False
+    # No implicit upgrade of historical checkpoint/review protocols.
+    delivery_contract = (completed_checkpoint.get('section_delivery_review_contract')
+        if completed_checkpoint is not None else
+        context.results.get('section_delivery_review', {}).get('contract'))
+    if delivery_contract is not None:
+        if delivery_contract != SECTION_DELIVERY_REVIEW_CONTRACT:
+            raise ValueError('Unknown section delivery review checkpoint contract')
+        if 'delivery_review' not in context.results:
+            raise ValueError('Integrated section review requires frozen delivery context')
+        if config.draft_scope not in {'document', 'auto'}:
+            raise ValueError('Integrated section review requires joint document correction scope')
+        if on_delivery_review is None:
+            def retained_delivery_source(_observation: dict[str, Any]) -> dict[str, Any]:
+                source = getattr(client, 'last_inspection_source', None)
+                return source() if callable(source) else source
+            on_delivery_review = retained_delivery_source
     # The existing checkpoint owns the method as well as the drafts. Missing
     # markers are historical opinion-check contracts, never an implicit upgrade.
     review_contract = (completed_checkpoint.get("document_review_contract") if completed_checkpoint is not None
@@ -287,6 +343,7 @@ def run_report_agent(
                              "tool_results": [row.model_dump(mode="json") for row in all_tool_results],
                              "pending_draft": pending_draft.model_dump(mode="json") if pending_draft else None,
                              "document_review_done": document_review_done,
+                            **({'section_delivery_review_contract': delivery_contract} if delivery_contract else {}),
                              **({'document_review_contract': review_contract} if review_contract else {})})
 
     # Save the seed before selecting reads. Until document_plan is resolved,
@@ -629,6 +686,7 @@ def run_report_agent(
                 all_findings=all_findings, emit=emit,
                 checkpoint=checkpoint, gateway=gateway, all_tool_results=all_tool_results,
                 current_draft_review=review_contract == 'current_draft.v1',
+                on_delivery_review=on_delivery_review if delivery_contract else None,
             )
         # Final section-review reconciliation also matters when whole-document
         # review is disabled or inapplicable. Persist the memory we return,
@@ -638,6 +696,14 @@ def run_report_agent(
         if assemble_body:
             title = current.document_plan.title if current.document_plan and current.document_plan.title else context.topic
             body = assemble_report_sections(title=title, sections=_final_sequence(current.section_plan, sections))
+        independent_review = None
+        pending_candidate = None
+        if delivery_contract:
+            identity = _section_delivery_assembly(context, current,
+                _final_sequence(current.section_plan, sections), config)['identity']
+            independent_review = _matching_section_delivery_review(iterations, identity)
+            pending_candidate = _pending_section_delivery_candidate(
+                context, current, config, iterations, adopted_identity=identity)
         return AgentReportResult(
             report_body=body,
             memory=current,
@@ -646,6 +712,8 @@ def run_report_agent(
             reviewer_findings=all_findings,
             tool_results=all_tool_results,
             used_agent=True,
+            independent_review=independent_review,
+            pending_candidate=pending_candidate,
         )
     except (LLMError, ValidationError, ValueError) as exc:
         if not config.allow_llm_fallback:
@@ -656,6 +724,77 @@ def run_report_agent(
         return None
 
 
+def _matching_section_delivery_review(
+    iterations: list[ReportIterationRecord], identity: dict[str, Any],
+) -> dict[str, Any] | None:
+    return next((row.independent_review for row in reversed(iterations)
+        if row.action in {'document_current_review', 'document_joint_verify'} and row.independent_review
+        and row.independent_review.get('assembly_identity') == identity), None)
+
+
+def _last_section_proposal(iterations: list[ReportIterationRecord]) -> tuple:
+    """Reconstruct one saved proposal, including inherited section edits."""
+    baseline, proposal, verification = [], None, None
+    for event in iterations:
+        if event.action == 'document_current_review':
+            baseline = list(event.drafts)
+            proposal = verification = None
+        elif event.action == 'document_joint_revise':
+            proposal, verification = event, None
+            updates = {row.section_id: row for row in event.drafts}
+            if (not baseline or len(updates) != len(event.drafts)
+                    or not set(updates).issubset({row.section_id for row in baseline})):
+                baseline = []
+            else:
+                baseline = [updates.get(row.section_id, row) for row in baseline]
+        elif event.action == 'document_joint_verify' and proposal is not None:
+            verification = event
+    return baseline, proposal, verification
+
+
+def _pending_section_delivery_candidate(
+    context: ReportContext, memory: ReportMemory, config: ReportRuntimeConfig,
+    iterations: list[ReportIterationRecord], *, adopted_identity: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Project the latest proposal's persisted negative proof, without adoption.
+
+    Joint events save only edited targets. Rebuild the verifier's complete
+    baseline, including changes inherited from earlier rejected proposals.
+    Receipt paths and hashes remain exactly as retained by the inspection owner.
+    """
+    baseline, proposal, verification = _last_section_proposal(iterations)
+    if (proposal is None or proposal.adopted is not False or proposal.status != 'rejected'
+            or not proposal.drafts or not baseline or verification is None
+            or verification.status not in {'completed', 'failed'}):
+        return None
+    ordered = _final_sequence(memory.section_plan, baseline)
+    ids = {row.section_id for row in ordered}
+    reviews = verification.section_reviews
+    if (len(ids) != len(ordered) or len(reviews) != len(ordered)
+            or {row.section_id for row in reviews} != ids
+            or any(row.context_requests for row in reviews)):
+        return None
+    assembly = _section_delivery_assembly(context, memory, ordered, config)
+    identity = assembly['identity']
+    review = _matching_section_delivery_review([verification], identity)
+    if (identity == adopted_identity or not review or review.get('review_status') != 'needs_revision'
+            or review.get('section_reviews') != [row.model_dump(mode='json') for row in reviews]
+            or set(review.get('inspection_source') or {}) != {
+                'request_path', 'request_sha256', 'response_path', 'response_sha256'}
+            or set(review.get('inspection_payload_sha256') or {}) != {'request', 'response'}):
+        return None
+    delivery = review.get('delivery_review', {})
+    from simple_ar.report.review_evidence import delivery_review_result
+    if (delivery.get('status') != 'needs_revision' or not delivery.get('defects')
+            or delivery.get('uninspected')
+            or delivery != delivery_review_result(context.results['delivery_review'], reviews)):
+        return None
+    return {'sections': [row.model_dump(mode='json') for row in ordered],
+        'report_body_markdown': assembly['report_body_markdown'],
+        'assembly_identity': identity, 'independent_review': review,
+        'revision_iteration': proposal.iteration, 'verification_iteration': verification.iteration}
+
+
 def _edit_whole_document(
     *, client: LLMClient, context: ReportContext, template: ReportTemplateBundle,
     memory: ReportMemory, config: ReportRuntimeConfig, sections: list[ReportSectionDraft],
@@ -664,6 +803,7 @@ def _edit_whole_document(
     checkpoint: Callable[[], None], gateway: ReportToolGateway,
     all_tool_results: list[ReportToolResult],
     current_draft_review: bool = False,
+    on_delivery_review: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> bool:
     """Correct frozen targets within their configured, recoverable allowance."""
     review_finished = True
@@ -697,6 +837,7 @@ def _edit_whole_document(
     pending_opinions: list[ReviewerFinding] | None = None
     partial_review_owners: set[str] = set()
     completed_opinion_reviews: list[ReportSectionReview] = []
+    latest_delivery_review: dict[str, Any] | None = None
     if not continuations:
         owners = {"document_context": "report-document-reviewer",
                   "document_finding_context": "report-document-finding-checker",
@@ -752,6 +893,8 @@ def _edit_whole_document(
     def checked_document_reviews(label: str, *, historical_findings: list[ReviewerFinding] | None = None,
                                  complete_candidate: bool = False,
                                  candidate_sections: list[ReportSectionDraft] | None = None) -> list[ReportSectionReview]:
+        nonlocal latest_delivery_review
+        latest_delivery_review = None
         inspected = sections if candidate_sections is None else candidate_sections
         requested_context = list(pending_contexts.get(label, []))
         def prepare_rejected_context(event: ReportIterationRecord) -> None:
@@ -815,6 +958,25 @@ def _edit_whole_document(
             additions = supplied_data_delivery(context, config=config, plan=memory.document_plan,
                 section_ids=[row.section_id for row in ordered])
             delivery = delivery_text_observation(context, memory, ordered, config, additions=additions)
+            assembly = _section_delivery_assembly(context, memory, ordered, config) if on_delivery_review else None
+            def retain_delivery_review(observation: dict[str, Any]) -> None:
+                nonlocal latest_delivery_review
+                # The callback must resolve real persisted request/response files.
+                # A checkpoint is history, never a fabricated transport receipt.
+                payload_hashes = {name: hashlib.sha256(json.dumps(
+                    observation[name], sort_keys=True, ensure_ascii=False, separators=(',', ':'),
+                    allow_nan=False).encode('utf-8')).hexdigest() for name in ('request', 'response')}
+                source = on_delivery_review({**observation, 'inspection_payload_sha256': payload_hashes})
+                if not isinstance(source, dict) or set(source) != {
+                        'request_path', 'request_sha256', 'response_path', 'response_sha256'}:
+                    raise ValueError('Integrated review callback must return actual transport receipt paths and hashes')
+                verdict = {key: observation[key] for key in ('review_status', 'section_reviews', 'delivery_review')}
+                verdict.update(inspection_source=dict(source), assembly_identity=assembly['identity'])
+                # Hash the actual primitive payloads, not filenames or a verdict
+                # reconstructed from the checkpoint. The receipt consumer must
+                # recompute these from json.loads(request['prompt']) and response.
+                verdict['inspection_payload_sha256'] = payload_hashes
+                latest_delivery_review = verdict
             for _ in range(2 if correction is None else 1):
                 validated_subset = []
                 before = len(iterations)
@@ -837,7 +999,7 @@ def _edit_whole_document(
                         execution_summary=_compact_execution_results(context.results),
                         execution_evidence=report_execution_evidence(context), supplementary_evidence=all_tool_results,
                         requested_context=requested_context, historical_findings=historical_findings,
-                        complete_candidate=complete_candidate,
+                        complete_candidate=complete_candidate or assembly is not None,
                         on_invalid_response=retain_rejection, format_correction=correction,
                         on_validated_subset=capture_validated_subset,
                         metric_summary=_prompt_metrics(memory, detail="summary"),
@@ -845,6 +1007,9 @@ def _edit_whole_document(
                         writing_objective=report_objective(context, memory),
                         assembly_owned_content=additions + _experiment_delivery_view(context, config),
                         delivery_text_observation=delivery,
+                        delivery_review=context.results['delivery_review'] if assembly is not None else None,
+                        delivery_assembly=assembly,
+                        on_delivery_review=retain_delivery_review if assembly is not None else None,
                         label=review_label + "-format-correction" if correction is not None else review_label)
                     if correction_record is not None:
                         correction_record.status = "completed"
@@ -931,7 +1096,8 @@ def _edit_whole_document(
                     memory.reviewer_findings = [row for row in memory.reviewer_findings if row not in previous_opinions]
                 current_review = ReportIterationRecord(iteration=len(iterations) + 1, section_id='',
                     action='document_current_review', status='completed', drafts=list(sections),
-                    section_reviews=reviews, requested_findings=previous_opinions)
+                    section_reviews=reviews, requested_findings=previous_opinions,
+                    independent_review=latest_delivery_review)
                 iterations.append(current_review)
                 for review in reviews:
                     all_findings.extend(review.findings)
@@ -1055,6 +1221,10 @@ def _edit_whole_document(
     reviews = [*(request for _, request in continuations.values()),
                *sorted(unsent, key=priority, reverse=True)]
     if config.draft_scope in {"document", "auto"} and not continuations:
+        initial_inspection = current_review.independent_review if current_review and on_delivery_review else None
+        if initial_inspection and attachment_review_blocks_editing(initial_inspection['delivery_review']):
+            return review_finished
+
         def joint_draft(event: ReportIterationRecord, baseline: list[ReportSectionDraft]) -> list[ReportSectionDraft]:
             requests = list({call.model_dump_json(): call for review in event.section_reviews
                 for call in review.context_requests[:max(0, config.max_backtracking_calls)]}.values())
@@ -1078,7 +1248,8 @@ def _edit_whole_document(
 
         edit_joint_document(memory=memory, config=config, sections=sections, iterations=iterations,
             reviews=reviews, all_findings=all_findings, checkpoint=checkpoint,
-            draft=joint_draft, inspect=joint_inspect)
+            draft=joint_draft, inspect=joint_inspect,
+            inspection_review=(lambda: latest_delivery_review) if on_delivery_review else None)
         return review_finished and not any(row.type == "document_revision_unavailable"
                                            for row in memory.reviewer_findings)
     # This bounded queue also handles a new defect introduced by a correction.
