@@ -421,6 +421,10 @@ class WritingCoordinationTests(unittest.TestCase):
                 self.assertEqual(review['profiled_artifacts'][0]['reader_coverage']['row_count'], 50000)
                 self.assertIn('all individual values', review['profiled_artifacts'][0]['unverified'])
                 self.assertEqual(bool(review['uninspected']), unsupported)
+                if unsupported:
+                    self.assertNotIn('pending_candidate', result.data,
+                        'Incomplete coverage must not be promoted to complete checked negative work')
+                    self.assertNotIn('retained_candidate', result.data)
                 observed = result.model_dump(mode='json')
                 self.assertEqual(writing.continuation(observed, 'scoped-table') is not None, not unsupported)
                 calls = client.ask_json.call_count
@@ -1119,7 +1123,8 @@ class WritingCoordinationTests(unittest.TestCase):
             update={'material_roots': [str(extra)]}), current))
         with patch.object(app.writing, '_inspection_interrupted', return_value=True):
             self.assertIsNone(app.writing._document_revision_feedback(request, current))
-            self.assertFalse(app.writing.can_return_gap(prior.model_dump(mode='json'), 'whole-unit-editorial'))
+            self.assertTrue(app.writing.can_return_gap(prior.model_dump(mode='json'), 'whole-unit-editorial'),
+                'A metadata shortcut cannot revoke the independently proved complete negative work')
         self.assertTrue(app.writing._inspection_interrupted({'unresolved': [
             {'type': 'document_revision_unavailable'}]}))
         self.assertFalse(app.writing._inspection_interrupted({'unresolved': [
@@ -1128,10 +1133,15 @@ class WritingCoordinationTests(unittest.TestCase):
         # observed source bytes. Attachment defects/coverage gaps do.
         from simple_ar.report.review_evidence import CLAIM_ADOPTION_V2
         original_review = app.writing.final_review(prior.data)
-        receipt_store, receipt_binding, receipt_data = app.writing._composition_receipt('whole-unit-editorial')
-        with patch.object(app.writing, '_composition_receipt', return_value=(receipt_store,
-                {**receipt_binding, 'section_delivery_review_contract': 'section_delivery_review.v1'}, receipt_data)):
+        receipt_store, receipt_binding, _ = app.writing._composition_receipt('whole-unit-editorial')
+        original_binding = receipt_store.resolve('request.json').read_bytes()
+        try:
+            changed_binding = json.loads(json.dumps(receipt_binding))
+            changed_binding['inputs'][0]['sha256'] = '0' * 64
+            receipt_store.write_json('request.json', changed_binding)
             self.assertFalse(app.writing.can_return_gap(prior.model_dump(mode='json'), 'whole-unit-editorial'))
+        finally:
+            receipt_store.resolve('request.json').write_bytes(original_binding)
         disclosure = {**original_review, 'delivery_review': {
             'status': 'needs_revision', 'defects': [], 'uninspected': [],
             'declaration_adoption': {'contract': CLAIM_ADOPTION_V2}}}
@@ -1582,7 +1592,9 @@ class WritingCoordinationTests(unittest.TestCase):
         ledger = app.ledger.to_dict()
         processes = fixture._process_receipts()
         app.writing.document_source_contract = 'document_source.v1'
-        with patch.object(client, 'ask_json', side_effect=AssertionError('Do not rewrite a producer defect')):
+        with patch.object(client, 'ask_json', side_effect=AssertionError('Do not rewrite a producer defect')), \
+                patch('simple_ar.tools.writing.WritingToolGateway.__init__',
+                    side_effect=AssertionError('Producer proof must not instantiate a second Writer')):
             gap = app.writing.call('compose_document', {'goal': 'Resolve the failed output check',
                 'prior_result': 'records/producer-negative/native_result.json'}, identity='producer-gap')
             self.assertEqual(gap.status, 'error', gap)
@@ -1688,6 +1700,10 @@ class WritingCoordinationTests(unittest.TestCase):
         else:
             self.assertEqual(failed.status, 'ok', failed)
             self.assertTrue(failed.data['unresolved'])
+            self.assertTrue(any(row.get('type') == 'document_revision_unavailable'
+                for row in failed.data['unresolved']), 'Retain the actual interrupted verification')
+            self.assertNotIn('pending_candidate', failed.data,
+                'A malformed verifier cannot become a checked negative candidate')
         old = ArtifactStore(root / 'tools/writing/article-stopped')
         if stage == 'revision_checkpoint_lag':
             # The atomic author response/projection committed, but the editor
@@ -1857,8 +1873,9 @@ class WritingCoordinationTests(unittest.TestCase):
                 original=None, selection=None, document_work=True, caller_fields=frozenset(intent),
                 work_source=admission, normalize_arguments=None)
             if stage == 'revision_negative':
-                self.assertIsNone(resolved.candidate)
-                self.assertTrue(resolved.recipe.reuse_prior_inputs)
+                self.assertIsNotNone(resolved.candidate)
+                self.assertTrue(resolved.linkage['checked_work'])
+                self.assertFalse(resolved.recipe.reuse_prior_inputs)
             else:
                 self.assertIsNotNone(resolved.candidate)
                 self.assertEqual(resolved.linkage['candidate_contract'], 'retained_article_author.v1')
@@ -1868,8 +1885,13 @@ class WritingCoordinationTests(unittest.TestCase):
                 'goal': binding['request']['goal']}), 'after-feedback', report=feedback_report,
                 original=None, selection=None, document_work=True, caller_fields=frozenset(intent),
                 work_source=admission, normalize_arguments=None)
-            self.assertIsNone(feedback.candidate)
-            self.assertTrue(feedback.recipe.reuse_prior_inputs)
+            if stage == 'revision_negative':
+                self.assertIsNotNone(feedback.candidate)
+                self.assertTrue(feedback.linkage['checked_work'])
+                self.assertFalse(feedback.recipe.reuse_prior_inputs)
+            else:
+                self.assertIsNone(feedback.candidate)
+                self.assertTrue(feedback.recipe.reuse_prior_inputs)
 
     def test_document_work_continues_failed_section_candidate_before_any_redraft(self):
         from simple_ar.tools.writing import freeze_report_requirement, material_report_binding
@@ -1953,8 +1975,7 @@ class WritingCoordinationTests(unittest.TestCase):
         self.assertFalse(workspace.resolve('workspace/manuscripts/section-stopped/manuscript.md').exists())
         # Controller fixture: persist precisely the gateway's failure, never an
         # invented successful parent result or a developer-exported manuscript.
-        native = ArtifactStore(root / 'attempts/section-stopped')
-        native.write_json('native_result.json', failed.model_dump(mode='json'))
+        native = self._record_native_result(root, 'section-stopped', failed)
         reference = 'records/section-stopped/native_result.json'
         arguments = {'prior_result': reference}
         old_files = {path: path.read_bytes() for directory in
@@ -2245,15 +2266,22 @@ class WritingCoordinationTests(unittest.TestCase):
         writing.document_source_contract = 'document_source.v1'
         select = client.ask_json.side_effect
         continuing = False
-        old_scope = 'Ambiguous scope.'
-        revised_scope = 'This is a saved record. No new execution was requested.'
-        final_scope = 'The supplied record was analyzed without a new experiment.'
+        # The 0078 structure: the original has one wrongly located image; the
+        # checked rejected proposal fixes its path but still fails its caption.
+        old_scope = '![Wrong caption](outputs/figure/main_figure.png)'
+        revised_scope = '![Still wrong caption](figures/selected-1.png)'
+        final_scope = '![Recorded value and scope.](figures/selected-1.png)'
+        figure = source / 'main_figure.png'
+        figure.write_bytes(b'\x89PNG\r\n\x1a\nfixture image bytes')
 
         def answer(system, prompt, **options):
             label = options['label']
             if label.startswith('composition-selection-'):
                 self.assertFalse(continuing, 'Continue the proven recipe without investigating again')
-                return select(system, prompt, **options)
+                reply = select(system, prompt, **options)
+                if label == 'composition-selection-2':
+                    reply['figures'] = [{'path': str(figure), 'caption': 'Recorded value and scope.'}]
+                return reply
             view = prompt_payload(prompt)
             prompts.append((label, view))
             if label.startswith('report-writer-'):
@@ -2269,17 +2297,19 @@ class WritingCoordinationTests(unittest.TestCase):
                     self.assertIn(revised_scope, json.dumps(view))
                     self.assertNotIn(old_scope, json.dumps(view))
                 return {'sections': [{'section_id': row['section']['section_id'],
-                    'draft_markdown': final_scope if continuing else revised_scope}
+                    'draft_markdown': (final_scope if continuing else revised_scope)
+                        if row['section']['heading'] == 'Scope' else 'The supplied record says value=2.5.'}
                     for row in view['sections']]}
             self.assertIn(label, {'report-document-reviewer', 'report-document-verifier'})
             reviews = []
             for row in view['sections']:
                 body = row['markdown']
                 needs = row['heading'] == 'Scope' and body != final_scope
-                finding = {'finding_id': 'clarify-scope', 'type': 'style',
-                    'severity': 'major' if body == old_scope else 'minor',
+                finding = {'finding_id': 'F1-figure-exact-caption-and-path' if body == old_scope
+                        else 'findings_figure_caption_exactness', 'type': 'style',
+                    'severity': 'major',
                     'required_action': 'revise', 'section_id': row['section_id'],
-                    'message': 'Make the scope sentence clearer.',
+                    'message': 'Use the exact supplied figure caption and publication path.',
                     'draft_quotes': [{'section_id': row['section_id'], 'quote': body}]}
                 reviews.append({'section_id': row['section_id'],
                     'verdict': 'warning' if needs else 'pass', 'findings': [finding] if needs else []})
@@ -2288,22 +2318,96 @@ class WritingCoordinationTests(unittest.TestCase):
         client.ask_json.side_effect = answer
         args = {'goal': 'Explain the saved value and execution scope', 'material_roots': [str(source)],
             'writing_method': 'sections', 'required_headings': ['Results', 'Scope'], 'finish': True}
-        first = writing.call('compose_document', args, identity='checked-first')
+        # This section request uses a frozen report. Set its local allowance in
+        # that requirement, rather than overriding it with professional_review.
+        from simple_ar.tools.writing import freeze_report_requirement, material_report_binding
+        templates = ArtifactStore(root / 'zero-round-templates')
+        templates.write_text('report.md', '# Recorded value and scope\n\n'
+            '## Results\nExplain the record.\n\n## Scope\nState the figure and limits.\n')
+        templates.write_text('criteria.md', 'Use the exact supplied figure caption and publication path.\n')
+        zero_requirement = freeze_report_requirement({'template': str(templates.resolve('report.md')),
+            'criteria': str(templates.resolve('criteria.md')), 'outline_strategy': 'template',
+            'draft_scope': 'document', 'review_scope': 'document', 'reviewer': 'llm',
+            'document_review': True, 'max_review_iterations': 0,
+            'allow_source_backtracking': False, 'allow_llm_fallback': False,
+            'figures': {'enabled': False}}, method='sections')
+        zero_report = material_report_binding(workspace, zero_requirement,
+            mounts=[str(source)], requests=[args['goal']])
+        writing.report_inputs = lambda: zero_report
+        writing.professional_inputs = True
+        zero_args = dict(args)
+        with patch('simple_ar.report.capability.run_report_capability',
+                side_effect=AssertionError('Negative work is not a publication')):
+            zero = writing.call('compose_document', zero_args, identity='checked-zero')
+        self.assertEqual(zero.status, 'ok', zero)
+        self.assertIn(old_scope, workspace.resolve(zero.data['editable_markdown']).read_text())
+        self.assertTrue(writing.can_return_gap(zero.model_dump(mode='json'), 'checked-zero'))
+        calls = client.ask_json.call_count
+        ledger = writing.ledger.to_dict()
+        with patch.object(client, 'ask_json', side_effect=AssertionError('Recovery cannot reset local rounds')):
+            replay = writing.call('compose_document', zero_args, identity='checked-zero')
+        self.assertEqual(replay.model_dump(mode='json'), zero.model_dump(mode='json'))
+        self.assertEqual(client.ask_json.call_count, calls)
+        self.assertEqual(writing.ledger.to_dict(), ledger)
+        writing.report_inputs = None
+        writing.professional_inputs = False
+        with patch('simple_ar.report.capability.run_report_capability',
+                side_effect=AssertionError('Negative work must finish before publication assembly')):
+            first = writing.call('compose_document', args, identity='checked-first')
         self.assertEqual(first.status, 'ok', first)
         self.assertIsNone(writing.continuation(first.model_dump(mode='json'), 'checked-first'))
         self.assertTrue(writing.can_return_gap(first.model_dump(mode='json'), 'checked-first'))
-        self.assertIn(old_scope, workspace.resolve(first.data['editable_markdown']).read_text())
+        self.assertTrue(first.data['editable_markdown'].endswith('/candidate.md'))
+        self.assertIn(revised_scope, workspace.resolve(first.data['editable_markdown']).read_text())
+        self.assertFalse(workspace.resolve(first.data['version'] + '/manuscript.md').exists())
+        self.assertEqual([row['finding_id'] for row in first.data['unresolved']],
+            ['findings_figure_caption_exactness'])
+        with self.assertRaisesRegex(ValueError, 'Unresolved work'):
+            writing.check_delivery(first.data)
+        with self.assertRaisesRegex(ValueError, 'unresolved'):
+            writing.publication_source(first.data['editable_markdown'], None,
+                observation=first.model_dump(mode='json'))
         self._record_native_result(root, 'checked-first', first)
         retained = writing.coordination_result(first)['data']['retained_candidate']
         self.assertEqual((retained['status'], retained['adopted']), ('checked_not_adopted', False))
         self.assertEqual(retained['prior_result'], 'records/checked-first/native_result.json')
         self.assertEqual(retained['review_status'], 'needs_revision')
         owner = ArtifactStore(root / 'tools/writing/checked-first')
+        original_result = owner.resolve('result.json').read_bytes()
+        corrupt = owner.read_json('result.json')
+        del corrupt['data']['artifact_sha256'][first.data['editable_markdown']]
+        corrupt['artifacts'].remove(first.data['editable_markdown'])
+        try:
+            owner.write_json('result.json', corrupt)
+            with self.assertRaisesRegex(ValueError, 'receipt|artifacts'):
+                writing._composition_receipt('checked-first')
+        finally:
+            owner.resolve('result.json').write_bytes(original_result)
         prior_bytes = {path: path.read_bytes() for path in owner.root.rglob('*') if path.is_file()}
         with patch('simple_ar.report.writing.validate_document_inspection',
                 side_effect=ValueError('Changed original inspection')):
             self.assertFalse(writing.can_return_gap(first.model_dump(mode='json'), 'checked-first'))
             self.assertNotIn('retained_candidate', writing.coordination_result(first)['data'])
+        # Also admit the saved pre-fix failure shape: no composition result,
+        # but a complete checked proposal and a registered native error. This
+        # changes only this fixture, never the real 0078 evidence or ledger.
+        owner.resolve('result.json').unlink()
+        legacy = ToolResult(tool_name='compose_document', status='error',
+            data={'incomplete': True, 'failure_kind': 'image_reference'},
+            error='Missing or out-of-scope report image: outputs/figure/main_figure.png')
+        native = self._record_native_result(root, 'checked-first', legacy)
+        protected = {path: path.read_bytes() for path in owner.root.rglob('*') if path.is_file()}
+        protected[native.resolve('native_result.json')] = native.resolve('native_result.json').read_bytes()
+        calls, ledger = client.ask_json.call_count, writing.ledger.to_dict()
+        with patch.object(client, 'ask_json', side_effect=AssertionError('A saved complete review is read only')):
+            self.assertTrue(writing.can_return_gap(legacy.model_dump(mode='json'), 'checked-first'))
+            presented = writing.coordination_result(legacy,
+                receipt_path='attempts/checked-first/native_result.json')
+        self.assertEqual(presented['status'], 'error')
+        self.assertEqual(presented['data']['retained_candidate']['status'], 'checked_not_adopted')
+        self.assertEqual(client.ask_json.call_count, calls)
+        self.assertEqual(writing.ledger.to_dict(), ledger)
+        prior_bytes = protected
         continuing = True
         before = len(prompts)
         with patch.object(writing, '_select_materials', side_effect=AssertionError('No reselection')):
@@ -2311,10 +2415,85 @@ class WritingCoordinationTests(unittest.TestCase):
                 'prior_result': 'records/checked-first/native_result.json', 'finish': True}, identity='checked-next')
         self.assertEqual(second.status, 'ok', second)
         self.assertEqual([label for label, _ in prompts[before:]],
-            ['report-document-reviewer', 'report-document-joint-reviser', 'report-document-verifier'])
+            ['report-document-joint-reviser', 'report-document-verifier'])
         self.assertIn(final_scope, workspace.resolve(second.data['editable_markdown']).read_text())
         self.assertIsNotNone(writing.continuation(second.model_dump(mode='json'), 'checked-next'))
         self.assertEqual({path: path.read_bytes() for path in prior_bytes}, prior_bytes)
+        from simple_ar.report.writing import continued_checked_candidate
+        current = ArtifactStore(root / 'tools/writing/checked-next')
+        saved_binding = current.read_json('request.json')
+        for fault in ('escape', 'cycle', 'records', 'source'):
+            corrupt = json.loads(json.dumps(saved_binding))
+            if fault == 'escape':
+                corrupt['prior_input_reuse']['owner'] = '../outside'
+            elif fault == 'cycle':
+                corrupt['prior_input_reuse']['owner'] = 'checked-next'
+            elif fault == 'records':
+                corrupt['prior_input_reuse']['receipt_sha256'].pop('writer/sections.json')
+            else:
+                corrupt['candidate_source']['sha256']['writer/writer.json'] = '0' * 64
+            with self.subTest(lineage=fault), self.assertRaises(ValueError):
+                continued_checked_candidate(current, corrupt)
+        self.assertEqual({path: path.read_bytes() for path in prior_bytes}, prior_bytes)
+
+    def test_checked_article_keeps_rejected_author_and_review_before_publication(self):
+        root, workspace, writing, source, _, _, client, prompts = self._document_work_fixture()
+        writing.document_source_contract = 'document_source.v1'
+        select = client.ask_json.side_effect
+        figure = source / 'article.png'
+        figure.write_bytes(b'\x89PNG\r\n\x1a\nfixture image bytes')
+        original = 'Recorded result.\n\n![Wrong](outputs/figure/main_figure.png)'
+        corrected_path = 'Recorded result.\n\n![Still wrong](figures/selected-1.png)'
+        accepted_body = 'Recorded result.\n\n![Exact caption.](figures/selected-1.png)'
+        accepting = False
+
+        def answer(system, prompt, **options):
+            label, view = options['label'], json.loads(prompt)
+            if label.startswith('composition-selection-'):
+                reply = select(system, prompt, **options)
+                if label == 'composition-selection-2':
+                    reply['figures'] = [{'path': str(figure), 'caption': 'Exact caption.'}]
+                return reply
+            prompts.append((label, view))
+            if label == 'composition-article':
+                if 'edit_contract' in view:
+                    return {'prior_draft_sha256': view['edit_contract']['prior_draft_sha256'],
+                        'replacements': [{'old_text': view['prior_draft'],
+                            'new_text': accepted_body if accepting else corrected_path}]}
+                self.assertFalse(accepting, 'The retained author must not be drafted again')
+                return {'draft_markdown': original}
+            self.assertEqual(label, 'article-independent-review')
+            body = view['sections'][0]['markdown']
+            return {'section_reviews': [{'section_id': 'document',
+                'verdict': 'pass' if body == accepted_body else 'revise_required',
+                'findings': [] if body == accepted_body else [{'finding_id': 'caption-exactness',
+                    'type': 'style', 'severity': 'major', 'required_action': 'revise',
+                    'message': 'The exact supplied caption is still required.',
+                    'draft_quotes': [{'section_id': 'document', 'quote': body}]}]}]}
+
+        client.ask_json.side_effect = answer
+        args = {'goal': 'Explain this saved result with its exact caption', 'material_roots': [str(source)]}
+        with patch('simple_ar.report.capability.run_report_capability',
+                side_effect=AssertionError('Rejected work cannot require publication')):
+            first = writing.call('compose_document', args, identity='article-negative')
+        self.assertEqual(first.status, 'ok', first)
+        self.assertIn(corrected_path, workspace.resolve(first.data['editable_markdown']).read_text())
+        self.assertEqual([row['finding_id'] for row in first.data['unresolved']], ['caption-exactness'])
+        self.assertTrue(writing.can_return_gap(first.model_dump(mode='json'), 'article-negative'))
+        self.assertIsNone(writing.continuation(first.model_dump(mode='json'), 'article-negative'))
+        self._record_native_result(root, 'article-negative', first)
+        owner = ArtifactStore(root / 'tools/writing/article-negative')
+        saved = {path: path.read_bytes() for path in owner.root.rglob('*') if path.is_file()}
+        accepting = True
+        start = len(prompts)
+        second = writing.call('compose_document', {'goal': 'Correct the retained caption and deliver',
+            'prior_result': 'records/article-negative/native_result.json', 'finish': True}, identity='article-fixed')
+        self.assertEqual(second.status, 'ok', second)
+        self.assertEqual([label for label, _ in prompts[start:]], ['composition-article', 'article-independent-review'])
+        self.assertIn(accepted_body, workspace.resolve(second.data['editable_markdown']).read_text())
+        self.assertTrue(second.data['editable_markdown'].endswith('/manuscript.md'))
+        self.assertIsNotNone(writing.continuation(second.model_dump(mode='json'), 'article-fixed'))
+        self.assertEqual({path: path.read_bytes() for path in saved}, saved)
 
     def test_document_work_defaults_to_authorized_sources_and_keeps_old_contracts(self):
         root, workspace, writing, _, _, _, client, prompts = self._document_work_fixture()
@@ -3122,10 +3301,10 @@ class WritingCoordinationTests(unittest.TestCase):
                  'targets': [{'path': 'source.py'}]}]}}
             original = json.loads(json.dumps(diagnosis))
             owner = SimpleNamespace(workspace=SimpleNamespace(resolve=lambda _: record))
-            with patch.object(WritingToolGateway, 'repair_review', return_value=diagnosis) as select:
+            with patch('simple_ar.tools.writing.read_repair_review', return_value=diagnosis) as select:
                 projected = _repair_view(owner, 'registered-result',
                     {'tool_name': 'compose_document', 'data': adopted}, {}, [])
-            select.assert_called_once_with(owner, adopted)
+            select.assert_called_once_with(owner.workspace, adopted)
             self.assertEqual(projected['delivery_review'], diagnosis['delivery_review'])
             projected['delivery_review']['defects'][0]['finding']['message'] = 'Changed copy'
             self.assertEqual(diagnosis, original)

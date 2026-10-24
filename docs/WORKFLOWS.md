@@ -201,7 +201,9 @@ uv run simple-ar start --resume-task "SESSION" "Keep the first draft. Reorganize
 
 ### Continue a retained draft (V2.10 development)
 
-If a complete article, section draft or unadopted article revision remains after failed independent inspection, ask to inspect and finish that candidate. The writing owner checks original author responses and unchanged evidence before reuse; it can inspect the retained revision without reverting to the initial draft. Older drafts lacking the necessary production records do not qualify. Failed inspection remains a failure until a new inspection accepts the candidate; retained files alone are not completed delivery.
+When a draft has not passed inspection, ask to finish the latest retained candidate. The writing owner checks its author records and original evidence. An unfinished inspection is completed; a complete negative inspection feeds correction directly, followed by verification, without redrafting an older version.
+
+Work candidates and adopted manuscripts are saved separately. Fixing one problem does not waive the remaining required findings or authorize publication. Earlier drafts, candidates, inspections and usage records remain intact. Older drafts without the necessary production records do not acquire this continuation authority.
 
 ### Export ACM LaTeX and PDF
 

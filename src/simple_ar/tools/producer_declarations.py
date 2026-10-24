@@ -21,6 +21,7 @@ def _proof(owner: Any) -> Any:
     if not callable(registered):
         registered = lambda record, **kwargs: ImplementationToolGateway._registered_ref(owner, record, **kwargs)
     return SimpleNamespace(root=owner.root, workspace=owner.workspace, ledger=owner.ledger,
+        session_id=getattr(owner, 'session_id', None),
         _registered_ref=registered)
 
 
@@ -110,9 +111,9 @@ def delivery_evidence(owner: Any, observations: list[dict], delivery: dict | Non
                 or owner.workspace.artifact_hashes(data['artifact_sha256']) != data['artifact_sha256']):
             raise ValueError('Delivered composition source/version changed before producer selection')
         if binding.get('delivery_review', {}).get('producer_completion') == 'goal_findings.v1':
-            from simple_ar.tools.writing import WritingToolGateway
+            from simple_ar.tools.writing import read_composition_review
             from simple_ar.report.writing import validate_document_inspection
-            review = WritingToolGateway.final_review(owner, data)
+            review = read_composition_review(owner.workspace, data)
             if (review.get('review_status') != 'reviewed' or data.get('unresolved') or data.get('incomplete')
                     or data.get('delivery_review', {}).get('status') != 'reviewed'):
                 raise ValueError('Delivered composition requires its current independent review to pass')

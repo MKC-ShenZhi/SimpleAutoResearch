@@ -4,6 +4,15 @@
 
 User-visible changes, newest first, dated when confirmed. Multi-day development may be summarized together rather than assigned invented completion dates. Development-branch work is distinguished from main; engineering checks do not establish task success. See [usage](docs/USAGE.md) for current instructions.
 
+## 2026-10-25 — V2.10 development (unreleased)
+
+### Fixed
+
+- Preserve complete, independently checked revisions as work candidates when required corrections remain. A rejected revision no longer depends on publishing an older draft before professional work can continue; only adopted manuscripts qualify for publication.
+- Share writing-result validation with producer repair and delivery consumers, retaining original evidence, failed attempts and usage records. Incomplete inspections and unread attachments keep their separate recovery and coverage limits.
+
+Full unattended draft, feedback and delivery acceptance remains in progress; this engineering update does not establish general success or lower cost.
+
 ## 2026-10-24 — V2.10 development (unreleased)
 
 ### Added

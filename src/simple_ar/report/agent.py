@@ -785,7 +785,8 @@ def _pending_section_delivery_candidate(
         return None
     delivery = review.get('delivery_review', {})
     from simple_ar.report.review_evidence import delivery_review_result
-    if (delivery.get('status') != 'needs_revision' or not delivery.get('defects')
+    if (delivery.get('status') not in {'reviewed', 'needs_revision'}
+            or not any(_needs_revision(row) for row in reviews)
             or delivery.get('uninspected')
             or delivery != delivery_review_result(context.results['delivery_review'], reviews)):
         return None

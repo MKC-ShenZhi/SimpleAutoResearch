@@ -1792,9 +1792,11 @@ class ToolApplication:
         known = retained.get('resource_authorizations')
         stop = retained.get('owner_stop') or {}
         if (self.state['config'].get('professional_work') == _REQUEST_OWNER
-                and stop.get('reason') == 'work_gap'):
+                and stop.get('reason') in {'work_gap', 'owner_failed'}):
             # A checked negative outcome may return to its request owner without
-            # buying more work. Prove the retained receipt before consulting its
+            # buying more work, even when an older caller recorded owner_failed.
+            # This does not rewrite that stop or replay its physical operation.
+            # Prove the retained receipt before consulting its
             # domain owner; this grants no retry, adoption or extra resources.
             source = retained['source_result']
             self._check_professional_stop(source, stop)
@@ -1891,7 +1893,7 @@ class ToolApplication:
         if 'stop' in action:
             gap = getattr(owner, 'can_return_gap', None)
             if (self.state['config'].get('professional_work') == _REQUEST_OWNER
-                    and action['stop'].get('reason') == 'work_gap'
+                    and action['stop'].get('reason') in {'work_gap', 'owner_failed'}
                     and gap is not None and gap(observed, Path(source).parent.name)):
                 self._check_professional_stop(source, action['stop'])
                 # The completed negative review remains the outcome. Give the

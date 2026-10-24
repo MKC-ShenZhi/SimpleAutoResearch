@@ -470,7 +470,7 @@ def completed_composition_writer(*, store: ArtifactStore, binding: dict[str, Any
             # initial draft prefix. Rebuilding the initial prefix against the
             # adopted text would reject valid revisions (or redraft them).
             responses = list((writer.root / 'model_calls').glob('*/request.json'))
-            if not responses:
+            if not responses and snapshot.get('candidate_source') is None:
                 raise ValueError('Reviewed section producer has no complete response records')
             for prior in responses:
                 call_store = _writing_child(writer, 'model_calls/' + prior.parent.name)
@@ -1112,6 +1112,25 @@ def run_report_writing_capability(*, context: CapabilityContext, request: Report
             'document_review_contract': 'current_draft.v1',
             **({'section_delivery_review_contract': request.report_context.results['section_delivery_review']['contract']}
                 if 'section_delivery_review' in request.report_context.results else {})}
+        if context.input_store is not None and context.input_store.exists('request.json'):
+            prior = continued_checked_candidate(context.input_store, context.input_store.read_json('request.json'))
+            if prior is not None:
+                from simple_ar.report.schema import ReportIterationRecord, ReportSectionDraft, ReportSectionReview
+                if candidate['sections'] != prior['sections']:
+                    # Section production order may differ from final article order.
+                    if {row['section_id']: row for row in candidate['sections']} != {
+                            row['section_id']: row for row in prior['sections']}:
+                        raise ValueError('Continued review does not concern the supplied author candidate')
+                rows = [ReportSectionReview.model_validate(row) for row in prior['independent_review']['section_reviews']]
+                concerns = [finding for row in rows for finding in row.findings]
+                seeded.reviewer_findings = concerns
+                completed.update(memory=seeded.model_dump(mode='json'),
+                    reviewer_findings=[row.model_dump(mode='json') for row in concerns],
+                    iterations=[ReportIterationRecord(iteration=1, section_id='',
+                        action='document_current_review', status='completed',
+                        drafts=[ReportSectionDraft.model_validate(row) for row in candidate['sections']],
+                        section_reviews=rows,
+                        summary='Saved negative opinions from the explicitly continued author; no new inspection or adoption.').model_dump(mode='json')])
     checkpoint_ref = context.store.ref("sections.json", kind="report_checkpoint", schema="report_checkpoint.v1")
 
     def save_checkpoint(completed: dict[str, Any]) -> None:
@@ -1207,7 +1226,10 @@ def professional_writer_config(binding: dict[str, Any]) -> ReportRuntimeConfig:
     limits = [value for value in (config.max_cited_sources, saved.get('max_cited_sources', 0)) if value]
     config.max_cited_sources = min(limits) if limits else 0
     inspection = binding.get('continued_source_review')
-    if inspection is not None:
+    if inspection == 'checked_work.v1':
+        if not binding.get('prior_input_reuse', {}).get('checked_work') or not binding.get('candidate_source'):
+            raise ValueError('Checked-work continuation requires its original source proof')
+    elif inspection is not None:
         if (inspection != 'inspect_only.v1'
                 or binding.get('prior_input_reuse', {}).get('candidate_contract') != 'retained_article_author.v1'
                 or not binding.get('candidate_source') or not saved.get('prior_result')):
@@ -1336,8 +1358,8 @@ def validate_document_inspection(store: ArtifactStore, binding: dict, data: dict
         declaration_adoption_contract, delivery_review_result, restore_delivery_producers)
     from simple_ar.report.schema import ReportSectionDraft
 
-    snapshot = binding['delivery_review']
-    if snapshot.get('contract') != DELIVERY_REVIEW_CONTRACT:
+    snapshot = binding.get('delivery_review')
+    if snapshot is not None and snapshot.get('contract') != DELIVERY_REVIEW_CONTRACT:
         raise ValueError('Unknown independent delivery inspection contract')
     def matches(review: ArtifactStore) -> bool:
         request = review.read_json('request.json')
@@ -1346,7 +1368,7 @@ def validate_document_inspection(store: ArtifactStore, binding: dict, data: dict
             return False  # Old unbound responses do not acquire stronger authority.
         try:
             view = json.loads(request['prompt'])
-            if ('required_figures' in snapshot and view.get('delivery_text_observation', {}).get(
+            if (snapshot is not None and 'required_figures' in snapshot and view.get('delivery_text_observation', {}).get(
                     'required_figures') != snapshot['required_figures']):
                 return False
             if reviewed_sections is not None and [{key: row[key] for key in (
@@ -1354,14 +1376,15 @@ def validate_document_inspection(store: ArtifactStore, binding: dict, data: dict
                     {'section_id': row['section_id'], 'heading': row['heading'],
                      'markdown': row['draft_markdown']} for row in reviewed_sections]:
                 return False
-            if (view.get('task') != 'review_document_coherence'
-                    or view.get('delivery_review_contract') != DELIVERY_REVIEW_CONTRACT
+            if view.get('task') != 'review_document_coherence':
+                return False
+            if snapshot is not None and (view.get('delivery_review_contract') != DELIVERY_REVIEW_CONTRACT
                     or restore_delivery_producers(view) != snapshot['artifacts']
                     or view.get('producer_declarations') != snapshot.get('producer_declarations')
                     or view.get('producer_completion') != snapshot.get('producer_completion')
                     or view.get('producer_notes') != snapshot.get('producer_notes')):
                 return False
-            if ('producer_declarations' in snapshot and view.get('declaration_adoption_contract')
+            if (snapshot is not None and 'producer_declarations' in snapshot and view.get('declaration_adoption_contract')
                     != declaration_adoption_contract(snapshot)):
                 return False  # Never reinterpret a retained review under another adoption contract.
             response = _retained_response(review, 'request.json', request)
@@ -1377,6 +1400,10 @@ def validate_document_inspection(store: ArtifactStore, binding: dict, data: dict
             if ('inspection_payload_sha256' in review_result
                     and review_result.get('section_reviews') != [row.model_dump(mode='json') for row in validated]):
                 return False
+            if snapshot is None:
+                return (review_result.get('section_reviews') == [row.model_dump(mode='json') for row in validated]
+                    and review_result.get('review_status') == ('needs_revision' if _review_pending(validated) else 'reviewed')
+                    and data.get('delivery_review') is None)
             return delivery_review_result(snapshot, validated) == data['delivery_review']
         except LLMError as exc:
             raise ValueError('Independent delivery response is incomplete or invalid') from exc
@@ -1419,6 +1446,167 @@ def validate_document_inspection(store: ArtifactStore, binding: dict, data: dict
             return
     raise ValueError('Delivery defects lack a matching complete independent review receipt')
 
+
+
+def section_author_source(owner: ArtifactStore) -> tuple[dict, dict]:
+    """The same complete section-author proof for work and source consumers."""
+    names = ['request.json', 'documents.json', 'writer/report_inputs.json',
+        'writer/sections.json', 'writer/writer.json']
+    names.extend(file.relative_to(owner.root).as_posix()
+        for file in (owner.root / 'writer/model_calls').rglob('*.json'))
+    source = {'contract': 'retained_sections.v1', 'owner': str(owner.root.resolve()),
+        'sha256': {name: hashlib.sha256(owner.resolve(name).read_bytes()).hexdigest() for name in names}}
+    return source, retained_section_candidate(source)
+
+
+def continued_checked_candidate(owner: ArtifactStore, binding: dict, *,
+                                _seen: frozenset[Path] = frozenset()) -> dict | None:
+    """Carry saved negative opinions into a new admitted request, not a new review.
+
+    The gateway has admitted the task, current permissions and normal shared
+    budget. This port only proves the prior bytes. It grants no additional local
+    rounds to recovery and never modifies the stopped owner or its ledger.
+    """
+    if binding.get('continued_source_review') != 'checked_work.v1':
+        return None
+    root = owner.root.resolve()
+    if root in _seen or root.parent.name != 'writing' or root.parent.parent.name != 'tools':
+        raise ValueError('Checked work lineage is cyclic or outside its writing owner')
+    prior = binding['prior_input_reuse']
+    if not prior.get('checked_work') or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', prior['owner']):
+        raise ValueError('Invalid checked work source owner')
+    source = ArtifactStore(owner.root.parent / prior['owner'])
+    if source.root.resolve().parent != root.parent or source.root.resolve() in _seen | {root}:
+        raise ValueError('Checked work source escaped its task or contains a cycle')
+    candidate_source = binding['candidate_source']
+    if candidate_source.get('contract') == 'retained_sections.v1':
+        proved_source, _ = section_author_source(source)
+        if proved_source != candidate_source:
+            raise ValueError('Checked section lineage differs from its complete author source')
+        required = set(proved_source['sha256'])
+    else:
+        required = {'request.json', 'documents.json', *(path.relative_to(source.root).as_posix()
+            for path in (source.root / 'writer').rglob('*.json'))}
+        original = source.read_json('request.json')
+        if candidate_source != retained_article_candidate(source, original,
+                allow_standalone=original.get('writing_owner') == ARTICLE_OWNER):
+            raise ValueError('Checked article lineage differs from its complete author source')
+    if set(prior['receipt_sha256']) != required:
+        raise ValueError('Checked work lineage lacks its complete original records')
+    for name, digest in prior['receipt_sha256'].items():
+        path = source.resolve(name).resolve()
+        if not path.is_relative_to(source.root.resolve()) or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            raise ValueError('Checked work source receipt changed')
+    # Native source registration and input access remain the gateway's gate.
+    # The bound result digest also belongs to this proof on every replay.
+    task = root.parent.parent.parent
+    native = task / 'attempts' / prior['owner'] / 'native_result.json'
+    if (not native.resolve().is_relative_to((task / 'attempts').resolve())
+            or hashlib.sha256(native.read_bytes()).hexdigest() != prior['result_sha256']):
+        raise ValueError('Checked work native source changed')
+    return checked_writing_candidate(source, source.read_json('request.json'), _seen=_seen | {root})
+
+
+def checked_writing_candidate(owner: ArtifactStore, binding: dict, *,
+                              _seen: frozenset[Path] = frozenset()) -> dict:
+    """Read the latest complete negative inspection, without assembly or calls.
+
+    The adopted Writer stays untouched. A rejected complete proposal is a work
+    outcome, not publication authority. Missing/failed inspections cannot use
+    this port; their original recovery and accounting contracts still apply.
+    """
+    from simple_ar.report.schema import ReportSectionDraft, ReportSectionReview
+    from simple_ar.report.agent import _final_sequence, _section_delivery_assembly
+    writer = _CompletedWritingStore(owner.root / 'writer')
+    snapshot = writer.read_json('report_inputs.json')
+    if owner.root.resolve() in _seen:
+        raise ValueError('Checked work source contains a cycle')
+    inherited = continued_checked_candidate(owner, binding, _seen=_seen)
+    article = snapshot.get('owner') == ARTICLE_OWNER
+    if article:
+        standalone = binding.get('writing_owner') == ARTICLE_OWNER
+        source = retained_article_candidate(owner, binding, allow_standalone=standalone)
+        produced = json.loads(Path(source['path']).read_bytes())
+        if writer.exists('review/checkpoint.json'):
+            attempts = [row for row in writer.read_json('review/checkpoint.json')['iterations']
+                if row['action'] == 'document_joint_revise']
+            if attempts and not attempts[-1].get('drafts'):
+                raise ValueError('Latest author operation is incomplete; retain its original stop')
+        sections = produced['sections']
+        frozen = snapshot['inputs']
+        config = (ReportRuntimeConfig.model_validate(frozen['assembly_config']) if standalone
+            else professional_writer_config(binding))
+        if standalone:
+            from simple_ar.report.templates import load_report_template_bundle
+            original = frozen['article']
+            context = ReportContext(topic=original['title'], report_mode='supplied_materials',
+                goal_markdown=original['goal'], source_handles=original['source_handles'],
+                papers=original['bibliography'], citation_key_map=original['citation_key_map'])
+            if 'delivery_review' in original:
+                context.results['delivery_review'] = original['delivery_review']
+            template = load_report_template_bundle(report_mode=context.report_mode, config=config)
+        else:
+            context = ReportContext.model_validate(frozen['binding']['context'])
+            template = ReportTemplateBundle.model_validate(frozen['binding']['template'])
+        initial = Path(source['path']).parent == writer.root
+        inspection = _CompletedWritingStore(Path(source['path']).parent / ('review' if initial else 'inspection'))
+        if inherited is not None and initial and not inspection.exists('request.json'):
+            if sections != inherited['sections']:
+                raise ValueError('Inherited checked article differs from its proven author')
+            return inherited
+        review = inspect_article(store=inspection, identity=produced['source_attempt'], client=None,
+            report_context=context, config=config, template=template,
+            markdown=sections[0]['draft_markdown'], target_words=config.longform.target_words,
+            inspection_root=owner.root,
+            required_headings=([row['heading'] for row in frozen['article'].get('constraints', {}).get('outline', [])]
+                if standalone else ()))
+        from simple_ar.report.capability import ReportAssemblyRequest, preview_report_document
+        from simple_ar.report.assembler import ReportAssemblyMode
+        preview = preview_report_document(ReportAssemblyRequest(title=binding['request']['title'],
+            sections=tuple(ReportSectionDraft.model_validate(row) for row in sections),
+            assembly_mode=ReportAssemblyMode.WHOLE_ARTICLE, config=config,
+            papers=tuple(context.papers), citation_key_map=context.citation_key_map))
+        body = preview.report_body_markdown
+        identity = {'body_sha256': hashlib.sha256(body.encode('utf-8')).hexdigest(),
+            'sections_sha256': hashlib.sha256(json.dumps(sections, sort_keys=True,
+                ensure_ascii=False, separators=(',', ':')).encode('utf-8')).hexdigest()}
+        result = {'sections': sections, 'report_body_markdown': body,
+            'assembly_identity': identity, 'independent_review': review}
+    else:
+        _, authored = section_author_source(owner)
+        sections = [row.model_dump(mode='json') for row in _final_sequence(
+            ReportMemory.model_validate(authored['memory']).section_plan,
+            [ReportSectionDraft.model_validate(row) for row in authored['sections']])]
+        written = writer.read_json('writer.json')
+        if any(row.get('type') in {'document_review_unavailable', 'document_revision_unavailable'}
+                for row in written['memory']['reviewer_findings']):
+            raise ValueError('Latest candidate operation is incomplete; retain its original stop')
+        review = (authored.get('checked_revision') or {}).get('independent_review') or written.get('independent_review')
+        if review is None and inherited is not None:
+            if sections != inherited['sections']:
+                raise ValueError('Inherited checked sections differ from their proven author')
+            return inherited
+        context = ReportContext.model_validate(snapshot['context'])
+        config = ReportRuntimeConfig.model_validate(snapshot['config'])
+        assembly = _section_delivery_assembly(context, ReportMemory.model_validate(authored['memory']),
+            [ReportSectionDraft.model_validate(row) for row in sections], config)
+        if not review or review.get('assembly_identity') != assembly['identity']:
+            raise ValueError('Complete candidate has no matching independent inspection')
+        result = {'sections': sections, 'report_body_markdown': assembly['report_body_markdown'],
+            'assembly_identity': assembly['identity'], 'independent_review': review}
+        if authored.get('checked_revision'):
+            result['revision_iteration'] = authored['checked_revision']['revision_iteration']
+    if (review.get('review_status') != 'needs_revision'
+            or {row['section_id'] for row in review['section_reviews']} != {row['section_id'] for row in sections}
+            or len(review['section_reviews']) != len(sections)
+            or any(row.get('context_requests') for row in review['section_reviews'])
+            or review.get('delivery_review', {}).get('uninspected')
+            or not (_review_pending([ReportSectionReview.model_validate(row) for row in review['section_reviews']])
+                or review.get('delivery_review', {}).get('defects'))):
+        raise ValueError('Work outcome requires a complete negative candidate inspection')
+    validate_document_inspection(owner, binding, {'delivery_review': review.get('delivery_review')},
+        review_result=review, reviewed_sections=sections)
+    return result
 
 
 def retained_section_candidate(source: dict[str, Any], *, _seen: frozenset[Path] = frozenset()) -> dict[str, Any]:
@@ -1471,8 +1659,9 @@ def retained_section_candidate(source: dict[str, Any], *, _seen: frozenset[Path]
         if ('report_binding' in binding
                 or set(inputs) != input_keys
                 or binding.get('section_delivery_review_contract') != 'section_delivery_review.v1'
-                or work_source.get('contract') != 'document_source.v1'
-                or not isinstance(work_source.get('intent'), dict)
+                or (work_source.get('contract') != 'document_source.v1'
+                    and binding.get('work_result_contract') != 'checked_candidate.v1')
+                or (work_source and not isinstance(work_source.get('intent'), dict))
                 or saved.get('writing_method') != 'sections'
                 or not isinstance(review, dict) or set(review) != {'max_revision_rounds'}
                 or type(review['max_revision_rounds']) is not int
@@ -1536,7 +1725,7 @@ def retained_section_candidate(source: dict[str, Any], *, _seen: frozenset[Path]
         parent = retained_section_candidate(inputs['candidate_source'], _seen=ancestry)
         authored.update((row['section_id'], row['draft_markdown']) for row in parent['sections'])
     calls = [name for name in records if name.startswith('writer/model_calls/') and name.endswith('/request.json')]
-    if not calls:
+    if not calls and inputs.get('candidate_source') is None:
         raise ValueError('Retained candidate has no complete author response records')
     for name in calls:
         call = ArtifactStore(owner.resolve(name).parent)
@@ -1702,7 +1891,7 @@ def write_section_article(*, store: ArtifactStore, input_store: ArtifactStore,
             # initial author prefix. Prove every physical operation complete
             # before the existing section owner can consume that checkpoint.
             responses = list(store.resolve('model_calls').glob('*/request.json'))
-            if not responses:
+            if not responses and candidate_source is None:
                 raise ValueError('Reviewed section producer has no complete response records')
             for path in responses:
                 call = _writing_child(store, 'model_calls/' + path.parent.name)
@@ -2047,7 +2236,13 @@ def _run_article_writing(*, context: CapabilityContext, request: ReportWritingRe
     writer_path, status, diagnostics = 'writer.json', 'completed', ('Whole article drafted without independent writing review or source backtracking.',)
     if article_inspection_enabled(config):
         review_store = _writing_child(context.store, 'review')
-        report = inspect_article(store=review_store, identity=written['source_attempt'], client=request.llm_client,
+        source_binding = (context.input_store.read_json('request.json')
+            if context.input_store is not None and context.input_store.exists('request.json')
+            else (request.composition_inputs or {}).get('binding', {}))
+        prior = continued_checked_candidate(ArtifactStore(context.store.root.parent), source_binding)
+        if prior is not None and written['sections'] != prior['sections']:
+            raise ValueError('Continued review does not concern the supplied article candidate')
+        report = prior['independent_review'] if prior is not None else inspect_article(store=review_store, identity=written['source_attempt'], client=request.llm_client,
             report_context=report_context, config=config, template=request.template,
             markdown=written['sections'][0]['draft_markdown'], target_words=config.longform.target_words,
             inspection_root=context.store.root.parent,

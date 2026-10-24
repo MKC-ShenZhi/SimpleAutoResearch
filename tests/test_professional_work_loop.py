@@ -814,21 +814,23 @@ class ProfessionalWorkLoopTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'accepted source'):
                 app._continue_professional_work()
             action['stop']['source_sha256'] = hashlib.sha256(original).hexdigest()
-            for reason in ('shared_budget_exhausted', 'accounting_unresolved', 'owner_failed'):
+            action['stop']['reason'] = 'owner_failed'
+            self.assertFalse(app._continue_professional_work())
+            for reason in ('shared_budget_exhausted', 'accounting_unresolved'):
                 action['stop']['reason'] = reason
                 self.assertTrue(app._continue_professional_work())
-            self.assertEqual(pause.call_count, 3)
+            self.assertEqual(pause.call_count, 2)
             action['stop']['reason'] = 'work_gap'
             owner.can_return_gap.return_value = False
             self.assertTrue(app._continue_professional_work())
             owner.can_return_gap.return_value = True
             app.state['config']['professional_work'] = 'owners.v3'
             self.assertTrue(app._continue_professional_work())
-            self.assertEqual(pause.call_count, 5)
+            self.assertEqual(pause.call_count, 4)
         self.coordinator.assert_not_called()
         self.send.assert_not_called()
 
-    def _paused_noncode_domain_gap(self):
+    def _paused_noncode_domain_gap(self, reason='work_gap'):
         from simple_ar.tools.professional_outcomes import stop_decision
 
         app = self._create(professional_work=None)
@@ -841,7 +843,7 @@ class ProfessionalWorkLoopTests(unittest.TestCase):
             can_return_gap=Mock(return_value=True), continuation=Mock(return_value=None),
             resume_after_budget=Mock(return_value=None), can_resume_after_budget=Mock(return_value=False))
         action = stop_decision(owner, observed, Path(source).parent.name,
-            'work_gap', 'Complete independent inspection retains required corrections')
+            reason, 'Complete independent inspection retains required corrections')
         owner.stop_after_review = Mock(return_value=action)
         app._pause_professional_stop(source, action)
         return app, owner, source
@@ -890,10 +892,10 @@ class ProfessionalWorkLoopTests(unittest.TestCase):
         source_bytes = app.session.store.resolve(source).read_bytes()
         ledger_bytes = (self.root / 'budget_ledger.json').read_bytes()
         ledger, turns = app.ledger.to_dict(), list(app.state['turns'])
-        cases = [('requests.v1', 'work_gap', False),
+        cases = [('requests.v1', 'work_gap', False), ('requests.v1', 'owner_failed', False),
             *[(mode, 'work_gap', True) for mode in ('owners.v3', 'outcomes.v2')],
             *[('requests.v1', reason, True) for reason in ('permission_unavailable',
-                'accounting_unresolved', 'owner_failed', 'owner_state_unresolved', 'shared_budget_exhausted')],
+                'accounting_unresolved', 'owner_state_unresolved', 'shared_budget_exhausted')],
             ('requests.v1', 'invalid_source', True)]
         for mode, reason, eligible in cases:
             with self.subTest(mode=mode, reason=reason, eligible=eligible):
@@ -916,7 +918,7 @@ class ProfessionalWorkLoopTests(unittest.TestCase):
                 attempt.assert_not_called()
                 if reason == 'invalid_source':
                     self.assertIn('accepted source', status['status_reason'])
-                if mode != 'requests.v1' or reason != 'work_gap':
+                if mode != 'requests.v1' or reason not in {'work_gap', 'owner_failed'}:
                     owner.can_return_gap.assert_not_called()
                 self.assertEqual(app.ledger.to_dict(), ledger)
                 self.assertEqual((self.root / 'budget_ledger.json').read_bytes(), ledger_bytes)
@@ -924,6 +926,29 @@ class ProfessionalWorkLoopTests(unittest.TestCase):
                 self.assertEqual(app.session.store.resolve(source).read_bytes(), source_bytes)
                 app.session.store.resolve(journal).write_bytes(original)
         owner.resume_after_budget.assert_not_called()
+        owner.can_resume_after_budget.assert_not_called()
+        self.coordinator.assert_not_called()
+        self.send.assert_not_called()
+
+    def test_legacy_owner_failed_returns_proven_work_without_rewriting_stop_or_replaying(self):
+        app, owner, source = self._paused_noncode_domain_gap(reason='owner_failed')
+        journal = app.state['turns'][-1]['reply']
+        protected = {name: app.session.store.resolve(name).read_bytes() for name in (source, journal)}
+        ledger = (self.root / 'budget_ledger.json').read_bytes()
+        app = self._load()
+        spec = app.gateway.registry.get('write_file')
+        with patch.object(spec, 'domain', 'independent_material_inspection'), \
+                patch.object(app.gateway, '_domain_gateways', {'independent_material_inspection': owner}), \
+                patch.object(app, '_attempt', side_effect=RuntimeError('Request owner boundary')) as attempt:
+            status = app.run(progress=lambda _: None)
+        self.assertIn('Request owner boundary', status['status_reason'])
+        self.assertEqual(attempt.call_count, 1)
+        self.assertEqual(attempt.call_args.args[0], 'native_turn')
+        self.assertEqual(json.loads(protected[journal])['owner_stop']['reason'], 'owner_failed')
+        for name, raw in protected.items():
+            self.assertEqual(app.session.store.resolve(name).read_bytes(), raw)
+        self.assertEqual((self.root / 'budget_ledger.json').read_bytes(), ledger)
+        owner.continuation.assert_not_called()
         owner.can_resume_after_budget.assert_not_called()
         self.coordinator.assert_not_called()
         self.send.assert_not_called()
@@ -1915,8 +1940,8 @@ class ProfessionalReportChainTests(unittest.TestCase):
                 self.assertEqual(view['diagnosis_record']['sha256'], hashlib.sha256(canonical_bytes).hexdigest())
                 canonical = json.loads(canonical_bytes)
                 self.assertEqual(view['tool_name'], 'compose_document')
-                from simple_ar.tools.writing import WritingToolGateway
-                diagnosis = WritingToolGateway.repair_review(self.app.implementation, canonical['data'])['delivery_review']
+                from simple_ar.tools.writing import read_repair_review
+                diagnosis = read_repair_review(self.app.workspace, canonical['data'])['delivery_review']
                 self.assertEqual(view['delivery_review']['status'], diagnosis['status'])
                 restored = json.loads(json.dumps(view['delivery_review']['defects']))
                 already_supplied = [row['text'] for row in prompt['original_files'].values()]
@@ -2529,13 +2554,21 @@ class ProfessionalReportChainTests(unittest.TestCase):
             self.assertEqual(sum(e.actual.get('process_invocations', 0)
                 for e in self.app.ledger.entries), process_count)
             self.assertEqual({path: Path(path).read_bytes() for path in attachment_bytes}, attachment_bytes)
-            # A rejected joint revision is not a canonical prose correction.
-            # Its inspection, however, must retain the newly found material bug.
+            # The improved complete proposal is the public work candidate,
+            # while its new material defect still prevents atomic adoption.
             self.assertEqual(manuscript.splitlines(),
-                [line.rstrip() for line in initial_body.splitlines()])
+                [line.rstrip() for line in self.correct_prose.splitlines()])
+            self.assertTrue(composed['data']['editable_markdown'].endswith('/candidate.md'))
+            self.assertFalse(composed['data']['retained_candidate']['adopted'])
+            self.assertTrue(composed['data']['unresolved'])
+            with self.assertRaisesRegex(ValueError, 'Unresolved work'):
+                self.app.writing.check_delivery(composed['data'])
             review = json.loads(self.app.workspace.resolve(composed['data']['review_path']).read_text())
             source = review['inspection_source']
             owner = self.root / 'tools/writing' / Path(composed['data']['version']).name
+            original_author = json.loads((owner / 'writer/writer.json').read_text())['sections'][0]['draft_markdown']
+            self.assertEqual(original_author.splitlines(), initial_body.splitlines(),
+                'Saving a negative work candidate must not replace the original author or adopt it')
             self.assertEqual(Path(composed['data']['version']).name, identity)
             self.assertEqual(source, proof)
             self.assertIn('/inspection/', source['request_path'])
@@ -2547,7 +2580,7 @@ class ProfessionalReportChainTests(unittest.TestCase):
             inspected = json.loads(json.loads((owner / source['request_path']).read_text())['prompt'])
             self.assertEqual(inspected['sections'][0]['markdown'], self.correct_prose)
         for (model, policy), value in self.expected.items():
-            expected = '3.026' if revision_defect and (model, policy) == ('linear', 'frozen') else f'{value:.3f}'
+            expected = f'{value:.3f}'
             self.assertIn(f'{model}/{policy}: {expected}', manuscript)
         self.assertIn(caption, manuscript)
         copied_figure = self.app.workspace.resolve(composed['data']['version'] + '/figures/selected-1.png')
@@ -2718,8 +2751,12 @@ class ProfessionalReportChainTests(unittest.TestCase):
         self.assertEqual(self.app.workspace.resolve(recipe['historical_project']), wrong)
         history, = binding['delivery_review']['prior_defect_refs']
         review_record = self.app.workspace.resolve(history['review_ref'])
-        self.assertEqual(history['review_ref'], recipe['review_ref'])
+        self.assertEqual(history['review_ref'], prose['data'].get('pending_candidate') or recipe['review_ref'])
         self.assertEqual(history['review_sha256'], hashlib.sha256(review_record.read_bytes()).hexdigest())
+        located = json.loads(review_record.read_text())
+        for part in history['pointer'].split('/')[1:]:
+            located = located[int(part)] if isinstance(located, list) else located[part]
+        self.assertEqual(located['finding_id'], 'wrong-delivered-table')
         self.assertEqual(history['finding']['finding_id'], 'wrong-delivered-table')
         self.assertEqual([self.app.workspace.resolve(row['path']) for row in history['targets']], [wrong / 'comparison.md'])
         self.assertEqual([self.app.workspace.resolve(row['path']) for row in history['current_targets']],

@@ -1528,8 +1528,13 @@ class JointRevisionTests(unittest.TestCase):
                 labels, saved = [], []
                 kwargs, client = self._integrated_delivery_case(Path(tmp), labels, reject=reject)
                 result = run_report_agent(**kwargs, client=client, checkpoint_sink=saved.append)
-                self.assertIsNone(result.pending_candidate)
-                self.assertNotIn('pending_candidate', result.model_dump(mode='json'))
+                if reject:
+                    self.assertIsNotNone(result.pending_candidate)
+                    self.assertEqual(result.pending_candidate['independent_review']['review_status'], 'needs_revision')
+                    self.assertFalse(result.pending_candidate['independent_review']['delivery_review']['defects'])
+                else:
+                    self.assertIsNone(result.pending_candidate)
+                    self.assertNotIn('pending_candidate', result.model_dump(mode='json'))
                 review = result.independent_review
                 self.assertIsNotNone(review)
                 self.assertEqual(review['assembly_identity'], _section_delivery_assembly(

@@ -21,13 +21,13 @@ def _repair_view(owner: Any, locator: str, observed: dict,
                  originals: dict, windows: list[dict], *, dynamic_windows: bool = False) -> dict:
     """Project one verified diagnosis; retain the full inspection as authority."""
     import copy
-    from simple_ar.tools.writing import WritingToolGateway
+    from simple_ar.tools.writing import read_repair_review
 
     record = owner.workspace.resolve(locator)
     # Review admission and material handoff must select the same diagnosis.
     # An unadopted candidate can expose a producer defect while the adopted
     # manuscript's own inspection legitimately remains successful and empty.
-    inspection = WritingToolGateway.repair_review(owner, observed['data'])['delivery_review']
+    inspection = read_repair_review(owner.workspace, observed['data'])['delivery_review']
     defects = copy.deepcopy(inspection['defects'])
     available = [
         {'path': row['path'], 'sha256': row['sha256'], 'text': row['text'],
@@ -379,32 +379,22 @@ def _review_execution(owner: Any, locator: str) -> tuple[dict, dict]:
         raise ValueError('Review repair needs records/<compose-attempt>/native_result.json')
     observed = ArtifactStore(record.parent).read_json(record.name)
     _accepted(owner, observed, relative[0])
-    writing = ArtifactStore(owner.root / 'tools/writing' / relative[0])
-    saved, binding = writing.read_json('result.json'), writing.read_json('request.json')
-    data = saved['data']
-    if (observed.get('tool_name') != 'compose_document' or observed.get('status') != 'ok'
-            or observed.get('error') or saved.get('status', 'ok') != 'ok' or saved.get('error')
-            or observed.get('data') != data or observed.get('artifacts') != saved['artifacts']
-            or data.get('inputs') != binding['inputs']
-            or data.get('report_binding') != binding.get('report_binding')
-            or data.get('version') != f'workspace/manuscripts/{relative[0]}'
-            or data.get('editable_markdown') != f'workspace/manuscripts/{relative[0]}/manuscript.md'
-            or not data.get('artifact_sha256') or set(saved['artifacts']) != set(data['artifact_sha256'])
-            or owner.workspace.artifact_hashes(saved['artifacts']) != data['artifact_sha256']):
-        raise ValueError('Composition differs from its accepted writing result or current artifacts')
-    from simple_ar.tools.writing import WritingToolGateway
+    from simple_ar.tools.writing import (
+        read_composition_receipt, check_composition_inputs, read_repair_review, read_composition_candidate)
+    writing, binding, data = read_composition_receipt(root=owner.root, workspace=owner.workspace,
+        session_id=owner.session_id, identity=relative[0], observed=observed)
     # This existing read-only byte consumer needs only the shared workspace;
     # no writing runtime, client or recovery owner is instantiated here.
-    WritingToolGateway._check_input_bytes(owner, data['inputs'])
+    check_composition_inputs(owner.workspace, data['inputs'])
     # A rejected prose candidate may uncover genuine defects in unchanged
     # attachments. Repair authority follows that verified observation, while
     # publication continues to consume only the adopted manuscript's review.
-    review = WritingToolGateway.repair_review(owner, data)
+    review = read_repair_review(owner.workspace, data)
     inspection = review['delivery_review']
     if (review.get('review_status') != 'needs_revision'
             or inspection.get('status') != 'needs_revision' or not inspection.get('defects')):
         raise ValueError('Composition has no independently bound delivery defects')
-    candidate = WritingToolGateway.repair_candidate(owner, data)
+    candidate = read_composition_candidate(owner.workspace, data)
     from simple_ar.report.writing import validate_document_inspection
     validate_document_inspection(writing, binding, {**data, 'delivery_review': inspection},
         review_result=review, reviewed_sections=candidate['sections'] if candidate else None)
@@ -552,8 +542,7 @@ def review_repair_outcome(owner: Any, observed: dict, source: str) -> tuple[dict
         selected = owner.workspace.resolve(str(owner.root / locator) if locator.startswith('attempts/') else locator)
         if selected != (owner.root / 'attempts' / prior_id / 'native_result.json').resolve():
             raise ValueError('Producer diagnosis differs from its admitted result source')
-    elif (not intent.get('prior_draft') or owner.workspace.resolve(intent['prior_draft'])
-            != owner.workspace.resolve(f'workspace/manuscripts/{prior_id}/manuscript.md')):
+    elif not intent.get('prior_draft'):
         raise ValueError('Producer diagnosis differs from its admitted draft source')
     prior = ArtifactStore(owner.root / 'attempts' / prior_id).read_json('native_result.json')
     _, digest = accepted_native_result(owner.root, owner.session_id, prior, prior_id)
@@ -564,7 +553,12 @@ def review_repair_outcome(owner: Any, observed: dict, source: str) -> tuple[dict
             hashlib.sha256(writing.resolve(name).read_bytes()).hexdigest() != value
             for name, value in origin['receipt_sha256'].items()):
         raise ValueError('Producer diagnosis original writing receipts changed')
-    saved = writing.read_json('result.json')['data']
+    from simple_ar.tools.writing import read_composition_receipt
+    _, _, saved = read_composition_receipt(root=owner.root, workspace=owner.workspace,
+        session_id=owner.session_id, identity=prior_id, observed=prior)
+    if (not intent.get('prior_result')
+            and owner.workspace.resolve(intent['prior_draft']) != owner.workspace.resolve(saved['editable_markdown'])):
+        raise ValueError('Producer diagnosis differs from its admitted draft source')
     paths = {saved['editable_markdown']}
     if saved.get('review_path'):
         paths.add(saved['review_path'])

@@ -452,7 +452,7 @@ def delivery_issues(owner: Any, observations: list[dict], *, delivery: dict | No
             # carry this obligation; notes and evidence quotes do not accuse files.
             try:
                 from simple_ar.report.writing import validate_document_inspection
-                from simple_ar.tools.writing import WritingToolGateway
+                from simple_ar.tools.writing import read_composition_review
                 delivered = owner.workspace.resolve_delivery(DeliveryRequest.model_validate(delivery))['artifacts']
                 hashes = owner.workspace.artifact_hashes(delivered)
                 current = {owner.workspace.resolve(path): digest for path, digest in hashes.items()}
@@ -471,7 +471,7 @@ def delivery_issues(owner: Any, observations: list[dict], *, delivery: dict | No
                     if store.read_json('result.json')['data'] != data:
                         raise ValueError('Retained attachment findings differ from the accepted composition')
                     validate_document_inspection(store, store.read_json('request.json'), data,
-                        review_result=WritingToolGateway.final_review(owner, data))
+                        review_result=read_composition_review(owner.workspace, data))
                     return ['Delivered attachment bytes retain an independently evidenced required finding; '
                         'repair and inspect the actual candidate, or disclose partial delivery']
             except (OSError, ValueError, KeyError, TypeError):

@@ -358,6 +358,140 @@ class _AssemblyStore(ArtifactStore):
         return super().write_json(path, data, **kwargs)
 
 
+def read_composition_receipt(*, root: Path, workspace: Any, session_id: str, identity: str, observed: dict | None = None) -> tuple[ArtifactStore, dict, dict]:
+    """Validate retained composition identity, not its review disposition.
+
+    Negative reviews remain valid receipts. Source windows, producer proof,
+    review completion and delivery acceptance belong to the consuming policy.
+    Missing historical result status retains its original successful default.
+    """
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', identity):
+        raise ValueError('Invalid composition identity')
+    store = ArtifactStore(root / 'tools/writing' / identity)
+    binding, saved = store.read_json('request.json'), store.read_json('result.json')
+    data = saved['data']
+    prefix = f'workspace/manuscripts/{identity}'
+    hashes = data.get('artifact_sha256')
+    work = (data.get('editable_markdown') == f'{prefix}/candidate.md'
+        and binding.get('work_result_contract') == 'checked_candidate.v1')
+    if (saved.get('status', 'ok') != 'ok' or saved.get('error')
+            or observed is not None and (
+                observed.get('tool_name') != 'compose_document'
+                or observed.get('status') != 'ok' or observed.get('error')
+                or observed.get('data') != data or observed.get('artifacts') != saved['artifacts'])
+            or data.get('version') != prefix
+            or not work and workspace.resolve(data['editable_markdown']) != workspace.resolve(f'{prefix}/manuscript.md')
+            or data.get('inputs') != binding['inputs']
+            or data.get('report_binding') != binding.get('report_binding')
+            or not hashes or data['editable_markdown'] not in hashes
+            or set(saved['artifacts']) != set(hashes)
+            or workspace.artifact_hashes(saved['artifacts']) != hashes):
+        raise ValueError('Canonical report receipt, source binding or authoring artifacts changed')
+    if work:
+        check_work_receipt(root=root, workspace=workspace, session_id=session_id,
+            store=store, binding=binding, data=data)
+    return store, binding, data
+
+
+def check_work_receipt(*, root: Path, workspace: Any, session_id: str, store: ArtifactStore, binding: dict, data: dict) -> dict:
+    """Prove negative work against the actual author and inspection owner."""
+    from simple_ar.report.writing import checked_writing_candidate
+    from simple_ar.report.schema import ReviewerFinding, finding_requires_resolution
+    if binding.get('continued_source_review') == 'checked_work.v1':
+        prior = binding['prior_input_reuse']
+        native = ArtifactStore(root / 'attempts' / prior['owner'])
+        accepted_native_result(root, session_id, native.read_json('native_result.json'), prior['owner'])
+    candidate = read_composition_candidate(workspace, data)
+    expected = ([finding for row in candidate['independent_review']['section_reviews'] for finding in row['findings']
+        if finding_requires_resolution(ReviewerFinding.model_validate(finding))]
+        + candidate['independent_review'].get('delivery_review', {}).get('defects', [])) if candidate else []
+    if (candidate is None or not data.get('unresolved') or data.get('incomplete')
+            or candidate != checked_writing_candidate(store, binding)
+            or data['unresolved'] != expected
+            or read_composition_review(workspace, data) != candidate['independent_review']
+            or data.get('retained_candidate', {}).get('status') != 'checked_not_adopted'
+            or data.get('retained_candidate', {}).get('adopted') is not False
+            or data.get('retained_candidate', {}).get('markdown') != f"{data['version']}/candidate.md"
+            or workspace.resolve(data['retained_candidate']['markdown']).read_text(encoding='utf-8')
+                != candidate['report_body_markdown']):
+        raise ValueError('Negative work receipt differs from its complete checked candidate')
+    return candidate
+
+
+def read_composition_review(workspace: Any, data: dict) -> dict:
+    """Read the final Writer review, preserving legacy inline receipts.
+
+    A published review locator is authoritative only at its retained version
+    and current byte hash. Inline and artifact forms must never disagree.
+    This reads evidence only; callers still enforce their required status.
+    """
+    review = data.get('independent_review')
+    review_path = data.get('review_path')
+    if review_path is not None:
+        hashes = data.get('artifact_sha256') or {}
+        if (review_path != f"{data.get('version')}/review.json"
+                or review_path not in hashes
+                or workspace.artifact_hashes([review_path])[review_path] != hashes[review_path]):
+            raise ValueError('Composition has no current version-bound independent review artifact')
+        retained = json.loads(workspace.resolve(review_path).read_text(encoding='utf-8'))
+        if review is not None and review != retained:
+            raise ValueError('Inline independent review differs from its retained artifact')
+        review = retained
+    if not isinstance(review, dict):
+        raise ValueError('Composition has no retained independent review')
+    if 'delivery_review' in data and review.get('delivery_review') != data['delivery_review']:
+        raise ValueError('Final independent review differs from the delivery inspection')
+    return review
+
+
+def read_composition_candidate(workspace: Any, data: dict) -> dict | None:
+    """Read a retained candidate for repair; never confer adoption authority."""
+    locator = data.get('pending_candidate')
+    if locator is None:
+        return None
+    if locator != f"{data['version']}/pending_candidate.json":
+        raise ValueError('Pending candidate is outside its composition')
+    expected = data.get('artifact_sha256', {}).get(locator)
+    path = workspace.resolve(locator)
+    if not expected or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+        raise ValueError('Pending candidate changed after composition')
+    candidate = json.loads(path.read_bytes())
+    review = candidate['independent_review']
+    identity = candidate.get('assembly_identity') or review['assembly_identity']
+    if (review['review_status'] != 'needs_revision'
+            or not (review.get('delivery_review', {}).get('defects')
+                or any(row.get('verdict') in {'revise_required', 'fail'} or row.get('findings')
+                    for row in review.get('section_reviews', [])))
+            or identity['body_sha256'] != hashlib.sha256(
+                candidate['report_body_markdown'].encode('utf-8')).hexdigest()):
+        raise ValueError('Pending candidate lacks a bound negative delivery review')
+    sections = hashlib.sha256(json.dumps(candidate['sections'], sort_keys=True,
+        ensure_ascii=False, separators=(',', ':')).encode('utf-8')).hexdigest()
+    if identity['sections_sha256'] != sections:
+        raise ValueError('Pending candidate sections differ from their review')
+    return candidate
+
+
+def read_repair_review(workspace: Any, data: dict) -> dict:
+    candidate = read_composition_candidate(workspace, data)
+    return candidate['independent_review'] if candidate else read_composition_review(workspace, data)
+
+
+def check_composition_inputs(workspace: Any, inputs: list[dict[str, Any]]) -> None:
+    for row in inputs:
+        if row.get('sha256') is not None:
+            if workspace.artifact_hashes([row['path']])[row['path']] != row['sha256']:
+                raise ValueError('Report source changed; compose a new current version')
+        else:
+            selection = row['selection']
+            read = workspace.call('read_file', {'path': row['path'],
+                'offset_bytes': selection['offset_bytes'],
+                'max_bytes': selection['next_offset_bytes'] - selection['offset_bytes']}, identity='report-delivery')
+            if (read.status != 'ok' or read.data['size_bytes'] != selection['size_bytes']
+                    or hashlib.sha256(read.data['text'].encode('utf-8')).hexdigest() != selection['window_sha256']):
+                raise ValueError('Report source window changed; compose a new current version')
+
+
 def writing_tool_specs() -> list[CommonToolSpec]:
     specs = [CommonToolSpec(name="compose_document", domain="writing", permission_level="write_patch",
         risk_level="medium", input_schema=ComposeRequest.model_json_schema(),
@@ -587,7 +721,8 @@ class WritingToolGateway:
                     raise ValueError('Document source is not a composition')
             elif request.prior_draft:
                 path = self.workspace.resolve(request.prior_draft)
-                if path == self.workspace.resolve(f'workspace/manuscripts/{path.parent.name}/manuscript.md'):
+                if path in {self.workspace.resolve(f'workspace/manuscripts/{path.parent.name}/{leaf}')
+                        for leaf in ('manuscript.md', 'candidate.md')}:
                     parent_id = path.parent.name
             if parent_id is not None:
                 if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', parent_id) or parent_id == identity:
@@ -627,6 +762,7 @@ class WritingToolGateway:
                 if observed.get('tool_name') != 'compose_document':
                     raise ValueError('Document source native receipt belongs to another operation')
                 data = observed.get('data') or {}
+                draft = data.get('editable_markdown') or draft
                 interrupted = observed.get('status') != 'ok' or self._inspection_interrupted(data)
                 if observed.get('status') == 'ok':
                     self._composition_receipt(parent_id, observed)
@@ -668,10 +804,14 @@ class WritingToolGateway:
                 checked_section_revision = (not interrupted and method == 'sections'
                     and bool(data.get('unresolved'))
                     and self._section_author_source(parent)[1].get('checked_revision') is not None)
+                checked_work = (binding.get('work_result_contract') == 'checked_candidate.v1'
+                    and data.get('editable_markdown') == f'workspace/manuscripts/{parent_id}/candidate.md')
                 if interrupted or (method in {'article', 'sections'}
                         and (self.root / 'attempts' / parent_id / 'native_result.json').exists()
-                        and (not data.get('unresolved') or checked_section_revision)
-                        and (not feedback_requested or request.prior_result and checked_section_revision)):
+                        and (not data.get('unresolved') or checked_section_revision or checked_work)
+                        and (not feedback_requested or (request.prior_result
+                            or request.prior_draft == data.get('retained_candidate', {}).get('markdown'))
+                                and (checked_section_revision or checked_work))):
                     continued = request.model_copy(update={'prior_result': f'records/{parent_id}/native_result.json',
                         'prior_draft': '', 'material_roots': [], 'reuse_prior_inputs': False})
                     (result.recipe, result.binding, result.linkage, result.candidate) = self._continued_document_inputs(
@@ -708,7 +848,8 @@ class WritingToolGateway:
         if (document_work and request.prior_draft and not request.reuse_prior_inputs
                 and not (request.material_roots or request.materials or request.sources)):
             path = self.workspace.resolve(request.prior_draft)
-            if path == self.workspace.resolve(f'workspace/manuscripts/{path.parent.name}/manuscript.md'):
+            if path in {self.workspace.resolve(f'workspace/manuscripts/{path.parent.name}/{leaf}')
+                    for leaf in ('manuscript.md', 'candidate.md')}:
                 request = request.model_copy(update={'reuse_prior_inputs': True})
         if request.reuse_prior_inputs:
             request, result.binding, result.linkage = self._prior_inputs(request, identity,
@@ -739,8 +880,9 @@ class WritingToolGateway:
         prior_id = path.parent.name
         if (not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', prior_id)
                 or prior_id == identity
-                or path != self.workspace.resolve(f'workspace/manuscripts/{prior_id}/manuscript.md')):
-            raise ValueError('Prior input reuse requires a distinct same-task canonical manuscript')
+                or path not in {self.workspace.resolve(f'workspace/manuscripts/{prior_id}/{leaf}')
+                    for leaf in ('manuscript.md', 'candidate.md')}):
+            raise ValueError('Prior input reuse requires a distinct same-task manuscript or checked candidate')
         store = ArtifactStore(self.root / 'tools/writing' / prior_id)
         if store.root.resolve().parent != (self.root / 'tools/writing').resolve():
             raise ValueError('Prior composition owner escapes this task')
@@ -764,8 +906,8 @@ class WritingToolGateway:
                 raise ValueError('Prior composition receipt hashes changed')
             hashes = {name: hashes[name] for name in recorded}
         store, binding, data = self._composition_receipt(prior_id)
-        if data['editable_markdown'] != f'workspace/manuscripts/{prior_id}/manuscript.md':
-            raise ValueError('Prior composition has no canonical manuscript locator')
+        if self.workspace.resolve(data['editable_markdown']) != path:
+            raise ValueError('Prior composition has no matching version-bound author locator')
         if binding.get('writing_owner') == 'professional_report.v1':
             report = binding.get('report_binding', {})
             if report.get('evidence_contract') != 'materials.v1':
@@ -824,14 +966,8 @@ class WritingToolGateway:
     @staticmethod
     def _section_author_source(store: ArtifactStore) -> tuple[dict, dict]:
         """Bind the existing author/checkpoint port once for both consumers."""
-        from simple_ar.report.writing import retained_section_candidate
-        names = ['request.json', 'documents.json', 'writer/report_inputs.json',
-            'writer/sections.json', 'writer/writer.json']
-        names.extend(file.relative_to(store.root).as_posix()
-            for file in (store.root / 'writer/model_calls').rglob('*.json'))
-        source = {'contract': 'retained_sections.v1', 'owner': str(store.root.resolve()),
-            'sha256': {name: hashlib.sha256(store.resolve(name).read_bytes()).hexdigest() for name in names}}
-        candidate = retained_section_candidate(source)
+        from simple_ar.report.writing import section_author_source
+        source, candidate = section_author_source(store)
         if candidate.get('checked_revision') is not None:
             from simple_ar.report.agent import _final_sequence
             from simple_ar.report.schema import ReportMemory, ReportSectionDraft
@@ -872,6 +1008,7 @@ class WritingToolGateway:
         observed = json.loads(path.read_bytes())
         if observed.get('tool_name') != 'compose_document':
             raise ValueError('prior_result requires a composition result')
+        accepted_native_result(self.root, self.session_id, observed, relative.parts[0])
         store = ArtifactStore(self.root / 'tools/writing' / relative.parts[0])
         if store.root.resolve().parent != (self.root / 'tools/writing').resolve():
             raise ValueError('Stopped composition owner escapes this task')
@@ -897,17 +1034,24 @@ class WritingToolGateway:
         failed_author = (observed.get('status') == 'error' and observed.get('error')
             and observed.get('data', {}).get('incomplete'))
         checked_revision = (section_candidate or {}).get('checked_revision')
+        checked_work = None
+        if (observed.get('data', {}).get('failure_kind') == 'image_reference'
+                or observed.get('status') == 'ok' and binding.get('work_result_contract') == 'checked_candidate.v1'
+                    and observed.get('data', {}).get('editable_markdown') ==
+                        f"workspace/manuscripts/{relative.parts[0]}/candidate.md"):
+            from simple_ar.report.writing import checked_writing_candidate
+            checked_work = checked_writing_candidate(store, binding)
         pending_author = (observed.get('status') == 'ok' and (
             method == 'article' and observed.get('data', {}).get('unresolved')
                 and Path(source['path']).parent != store.root / 'writer'
-            or method == 'sections' and checked_revision is not None))
+            or method == 'sections' and checked_revision is not None or checked_work is not None))
         completed_author = allow_completed and observed.get('status') == 'ok' and not observed.get('data', {}).get('unresolved')
         if not failed_author and not pending_author and not completed_author:
             raise ValueError('prior_result requires retained failed author work or an unadopted complete revision; '
                 'use prior_draft for completed compositions')
         if pending_author or completed_author:
             self._composition_receipt(relative.parts[0], observed)
-        if inspect_only and method == 'article' and not completed_author:
+        if inspect_only and method == 'article' and not completed_author and checked_work is None:
             source = retained_article_candidate(store, binding, unchecked_revision=True,
                 **({'allow_standalone': True} if standalone else {}))
         receipt_hashes = {name: hashlib.sha256(store.resolve(name).read_bytes()).hexdigest() for name in names}
@@ -935,11 +1079,13 @@ class WritingToolGateway:
             'publication': (request.publication if request.publication is not None else
                 CompositionPublication.model_validate(saved['publication']) if saved.get('publication') else None),
             'delivery_artifacts': saved.get('delivery_artifacts') or []})
-        if standalone and method == 'article':
+        if standalone and method == 'article' and checked_work is None:
             resolved = resolved.model_copy(update={'professional_review': ProfessionalReview(max_revision_rounds=0)})
         linkage = {'owner': relative.parts[0], 'receipt_sha256': receipt_hashes,
             'artifact_sha256': versions, 'inputs': inputs, 'candidate_contract': candidate_contract,
             'result_ref': self.workspace.locator(str(path)), 'result_sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+        if checked_work is not None:
+            linkage['checked_work'] = True
         return resolved, binding, linkage, source
 
     def _repaired_prior_inputs(self, request: ComposeRequest, resolved: ComposeRequest,
@@ -1058,7 +1204,8 @@ class WritingToolGateway:
         if not report_binding or not request.prior_draft:
             return None
         path = self.workspace.resolve(request.prior_draft)
-        if path != self.workspace.resolve(f'workspace/manuscripts/{path.parent.name}/manuscript.md'):
+        if path not in {self.workspace.resolve(f'workspace/manuscripts/{path.parent.name}/{leaf}')
+                for leaf in ('manuscript.md', 'candidate.md')}:
             return None
         store = ArtifactStore(self.root / 'tools/writing' / path.parent.name)
         if not all(store.exists(name) for name in ('request.json', 'result.json')):
@@ -1082,8 +1229,11 @@ class WritingToolGateway:
             return None
         from simple_ar.report.writing import validate_document_inspection
         self._check_input_bytes(data['inputs'])
-        self._check_document_copy_review(data)
-        validate_document_inspection(store, binding, data, review_result=review)
+        if data['editable_markdown'] == f"{data['version']}/candidate.md":
+            self._check_work_receipt(store, binding, data)
+        else:
+            self._check_document_copy_review(data)
+            validate_document_inspection(store, binding, data, review_result=review)
         review_path = self.workspace.resolve(data['review_path'])
         return {'contract': 'prior_prose_review.v1', 'requested_roots': request.material_roots,
             'path': str(review_path), 'sha256': hashlib.sha256(review_path.read_bytes()).hexdigest(),
@@ -1124,6 +1274,23 @@ class WritingToolGateway:
             'mechanical_constraints', 'independent_review', 'delivery',
             'delivery_review',
             'incomplete', 'failure_kind', 'next_action', 'retained_candidate', 'pending_candidate') if key in data}
+        if match and result.status == 'ok' and data.get('editable_markdown') == f'{version}/candidate.md':
+            try:
+                self._composition_receipt(match[1], result.model_dump(mode='json'))
+            except (OSError, ValueError, KeyError, TypeError):
+                visible.pop('retained_candidate', None)
+        if data.get('failure_kind') == 'image_reference' and receipt_path:
+            identity = Path(receipt_path).parent.name
+            if self.can_return_gap(result.model_dump(mode='json'), identity):
+                from simple_ar.report.writing import checked_writing_candidate
+                owner = ArtifactStore(self.root / 'tools/writing' / identity)
+                candidate = checked_writing_candidate(owner, owner.read_json('request.json'))
+                visible['retained_candidate'] = {'status': 'checked_not_adopted', 'adopted': False,
+                    'review_status': 'needs_revision', 'prior_result': f'records/{identity}/native_result.json',
+                    'scope': 'Saved complete author and negative inspection; original error is retained. '
+                        'Continue this candidate through an admitted professional request, not by replaying the failed operation.'}
+                visible['unresolved'] = [finding for row in candidate['independent_review']['section_reviews']
+                    for finding in row['findings']]
         if (match and result.status == 'ok' and data.get('unresolved')
                 and 'retained_candidate' not in visible
                 and (self.root / 'attempts' / match[1] / 'native_result.json').is_file()):
@@ -1172,33 +1339,72 @@ class WritingToolGateway:
             'receipt_path': receipt_path}
 
     def _composition_receipt(self, identity: str, observed: dict | None = None) -> tuple[ArtifactStore, dict, dict]:
-        """Validate retained composition identity, not its review disposition.
+        return read_composition_receipt(root=self.root, workspace=self.workspace, session_id=self.session_id,
+            identity=identity, observed=observed)
 
-        Negative reviews remain valid receipts. Source windows, producer proof,
-        review completion and delivery acceptance belong to the consuming policy.
-        Missing historical result status retains its original successful default.
-        """
-        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', identity):
-            raise ValueError('Invalid composition identity')
-        store = ArtifactStore(self.root / 'tools/writing' / identity)
-        binding, saved = store.read_json('request.json'), store.read_json('result.json')
-        data = saved['data']
-        prefix = f'workspace/manuscripts/{identity}'
-        hashes = data.get('artifact_sha256')
-        if (saved.get('status', 'ok') != 'ok' or saved.get('error')
-                or observed is not None and (
-                    observed.get('tool_name') != 'compose_document'
-                    or observed.get('status') != 'ok' or observed.get('error')
-                    or observed.get('data') != data or observed.get('artifacts') != saved['artifacts'])
-                or data.get('version') != prefix
-                or self.workspace.resolve(data['editable_markdown']) != self.workspace.resolve(f'{prefix}/manuscript.md')
-                or data.get('inputs') != binding['inputs']
-                or data.get('report_binding') != binding.get('report_binding')
-                or not hashes or data['editable_markdown'] not in hashes
-                or set(saved['artifacts']) != set(hashes)
-                or self.workspace.artifact_hashes(saved['artifacts']) != hashes):
-            raise ValueError('Canonical report receipt, source binding or authoring artifacts changed')
-        return store, binding, data
+    def _check_work_receipt(self, store: ArtifactStore, binding: dict, data: dict) -> dict:
+        return check_work_receipt(root=self.root, workspace=self.workspace, session_id=self.session_id,
+            store=store, binding=binding, data=data)
+
+    def _save_negative_work(self, owner: ArtifactStore, binding: dict, *, prefix: str,
+                            figure_inputs: list, document_materials: dict | None) -> ToolResult:
+        """Finish checked work before attempting publication of the adopted body."""
+        from simple_ar.report.writing import checked_writing_candidate
+        from simple_ar.report.schema import ReviewerFinding, finding_requires_resolution
+        candidate = checked_writing_candidate(owner, binding)
+        review = candidate['independent_review']
+        self._check_input_bytes(binding['inputs'])
+        self.workspace.check_artifact_producers(row['path'] for row in binding['inputs'])
+        output = ArtifactStore(self.workspace.resolve(prefix, write=True))
+        texts = {'candidate.md': candidate['report_body_markdown'],
+            'pending_candidate.json': json.dumps(candidate, ensure_ascii=False, indent=2) + '\n',
+            'review.json': json.dumps(review, ensure_ascii=False, indent=2) + '\n'}
+        artifacts = []
+        for name, text in texts.items():
+            if output.exists(name):
+                if output.read_text(name) != text:
+                    raise ValueError('Retained negative work changed; preserve the original')
+            else:
+                output.write_text(name, text)
+            artifacts.append(f'{prefix}/{name}')
+        for _, target, raw in figure_inputs:
+            path = self.workspace.resolve(f'{prefix}/{target}', write=True)
+            if path.exists() and path.read_bytes() != raw:
+                raise ValueError('Retained work asset differs from its bound bytes')
+            if not path.exists():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(raw)
+            artifacts.append(f'{prefix}/{target}')
+        if document_materials is not None:
+            artifacts.extend(row['path'] for row in document_materials['materials'])
+            artifacts.extend(path for unit in document_materials.get('producer_units', []) for path in unit['files'])
+        artifacts = list(dict.fromkeys(artifacts))
+        data = {'version': prefix, 'inputs': binding['inputs'], 'editable_markdown': f'{prefix}/candidate.md',
+            'artifact_sha256': self.workspace.artifact_hashes(artifacts),
+            'review_path': f'{prefix}/review.json', 'pending_candidate': f'{prefix}/pending_candidate.json',
+            'independent_review': review,
+            'retained_candidate': {'status': 'checked_not_adopted', 'adopted': False,
+                'markdown': f'{prefix}/candidate.md', 'review_status': 'needs_revision',
+                'prior_result': f'records/{owner.root.name}/native_result.json'},
+            'unresolved': [finding for row in review['section_reviews'] for finding in row['findings']
+                if finding_requires_resolution(ReviewerFinding.model_validate(finding))],
+            'scope': 'Complete independently checked work with unresolved findings; candidate is not adopted or publication-ready.'}
+        if review.get('delivery_review', {}).get('defects'):
+            data['unresolved'].extend(review['delivery_review']['defects'])
+        if not data['unresolved']:
+            raise ValueError('Negative work must retain its required findings')
+        if 'delivery_review' in review:
+            data['delivery_review'] = review['delivery_review']
+        if binding.get('report_binding') is not None:
+            data['report_binding'] = binding['report_binding']
+        if document_materials is not None:
+            data['document_work'] = document_materials
+            data['title'] = binding['request']['title']
+        result = {'artifacts': artifacts, 'data': data,
+            'summary': 'Complete checked candidate saved; required findings remain. No canonical manuscript or publication was issued.'}
+        self._check_work_receipt(owner, binding, data)
+        owner.write_json('result.json', result)
+        return ToolResult(tool_name='compose_document', **result)
 
     def continuation(self, observed: dict, attempt_id: str) -> dict | None:
         """Read retained successful composition; propose export via normal dispatch.
@@ -1263,29 +1469,7 @@ class WritingToolGateway:
             return None
 
     def final_review(self, data: dict) -> dict:
-        """Read the final Writer review, preserving legacy inline receipts.
-
-        A published review locator is authoritative only at its retained version
-        and current byte hash. Inline and artifact forms must never disagree.
-        This reads evidence only; callers still enforce their required status.
-        """
-        review = data.get('independent_review')
-        review_path = data.get('review_path')
-        if review_path is not None:
-            hashes = data.get('artifact_sha256') or {}
-            if (review_path != f"{data.get('version')}/review.json"
-                    or review_path not in hashes
-                    or self.workspace.artifact_hashes([review_path])[review_path] != hashes[review_path]):
-                raise ValueError('Composition has no current version-bound independent review artifact')
-            retained = json.loads(self.workspace.resolve(review_path).read_text(encoding='utf-8'))
-            if review is not None and review != retained:
-                raise ValueError('Inline independent review differs from its retained artifact')
-            review = retained
-        if not isinstance(review, dict):
-            raise ValueError('Composition has no retained independent review')
-        if 'delivery_review' in data and review.get('delivery_review') != data['delivery_review']:
-            raise ValueError('Final independent review differs from the delivery inspection')
-        return review
+        return read_composition_review(self.workspace, data)
 
     def can_return_gap(self, observed: dict, attempt_id: str) -> bool:
         """A completed negative inspection can inform the request owner.
@@ -1294,11 +1478,30 @@ class WritingToolGateway:
         Unavailable/incomplete responses cannot become a semantic handoff.
         """
         if (observed.get('tool_name') != 'compose_document'
-                or observed.get('status') != 'ok' or observed.get('error')
                 or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', attempt_id)):
             return False
         try:
+            if observed.get('status') != 'ok' or observed.get('error'):
+                # Read a legacy assembly failure only through its registered
+                # receipt and the saved complete negative author/check proof.
+                if observed.get('data', {}).get('failure_kind') != 'image_reference':
+                    return False
+                accepted_native_result(self.root, self.session_id, observed, attempt_id)
+                from simple_ar.report.writing import checked_writing_candidate
+                store = ArtifactStore(self.root / 'tools/writing' / attempt_id)
+                binding = store.read_json('request.json')
+                checked_writing_candidate(store, binding)
+                self._check_input_bytes(binding['inputs'])
+                self.workspace.check_artifact_producers(row['path'] for row in binding['inputs'])
+                return True
             store, binding, data = self._composition_receipt(attempt_id, observed)
+            if data.get('editable_markdown') == f"{data['version']}/candidate.md":
+                self._check_input_bytes(data['inputs'])
+                self.workspace.check_artifact_producers(row['path'] for row in data['inputs'])
+                # This is work, not delivery of a newly certified copy package.
+                # Current source/copy bytes are bound above; final package and
+                # copy-review authority remain check_delivery's responsibility.
+                return True  # _composition_receipt proved the complete negative work, even with zero rounds.
             if self._inspection_interrupted(data):
                 return False
             review = self.repair_review(data)
@@ -1329,33 +1532,10 @@ class WritingToolGateway:
             return False
 
     def repair_candidate(self, data: dict) -> dict | None:
-        """Read a retained candidate for repair; never confer adoption authority."""
-        locator = data.get('pending_candidate')
-        if locator is None:
-            return None
-        if locator != f"{data['version']}/pending_candidate.json":
-            raise ValueError('Pending candidate is outside its composition')
-        expected = data.get('artifact_sha256', {}).get(locator)
-        path = self.workspace.resolve(locator)
-        if not expected or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
-            raise ValueError('Pending candidate changed after composition')
-        candidate = json.loads(path.read_bytes())
-        review = candidate['independent_review']
-        identity = review['assembly_identity']
-        if (review['review_status'] != 'needs_revision'
-                or not review['delivery_review'].get('defects')
-                or identity['body_sha256'] != hashlib.sha256(
-                    candidate['report_body_markdown'].encode('utf-8')).hexdigest()):
-            raise ValueError('Pending candidate lacks a bound negative delivery review')
-        sections = hashlib.sha256(json.dumps(candidate['sections'], sort_keys=True,
-            ensure_ascii=False, separators=(',', ':')).encode('utf-8')).hexdigest()
-        if identity['sections_sha256'] != sections:
-            raise ValueError('Pending candidate sections differ from their review')
-        return candidate
+        return read_composition_candidate(self.workspace, data)
 
     def repair_review(self, data: dict) -> dict:
-        candidate = WritingToolGateway.repair_candidate(self, data)
-        return candidate['independent_review'] if candidate else WritingToolGateway.final_review(self, data)
+        return read_repair_review(self.workspace, data)
 
     @staticmethod
     def _review_needs_material_work(review: dict) -> bool:
@@ -1393,6 +1573,9 @@ class WritingToolGateway:
             reason = data.get('owner_stop_reason') or {'resource_exhausted': 'shared_budget_exhausted',
                 'accounting_unresolved': 'accounting_unresolved'}.get(data.get('failure_kind'), 'owner_failed')
             detail = data.get('next_action') or observed.get('error') or 'Writing owner did not complete'
+            if data.get('failure_kind') == 'image_reference' and self.can_return_gap(observed, attempt_id):
+                reason, detail = 'work_gap', ('Saved complete candidate has a negative inspection; '
+                    'legacy publication of the unadopted original failed. Preserve both; no replay or resource grant.')
         elif (data.get('incomplete') or data.get('unresolved')
                 or data.get('delivery_review', {}).get('status', 'reviewed') != 'reviewed'):
             reason, detail = 'work_gap', 'Writing review retains unresolved findings; no proven producer continuation is available'
@@ -1485,6 +1668,9 @@ class WritingToolGateway:
 
     def check_delivery(self, data: dict[str, Any]) -> None:
         """Validate the current manuscript, source bytes and declared body assets."""
+        if (not data.get('editable_markdown')
+                or data['editable_markdown'] == f"{data.get('version')}/candidate.md"):
+            raise ValueError('Unresolved work is not an adopted canonical delivery')
         from simple_ar.report.export import missing_report_images
         identity = Path(data['version']).name
         binding = ArtifactStore(self.root / 'tools/writing' / identity).read_json('request.json')
@@ -2223,7 +2409,8 @@ class WritingToolGateway:
         path = self.workspace.resolve(markdown)
         identity = path.parent.name
         if (not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', identity)
-                or path != self.workspace.resolve(f'workspace/manuscripts/{identity}/manuscript.md')):
+                or path not in {self.workspace.resolve(f'workspace/manuscripts/{identity}/{leaf}')
+                    for leaf in ('manuscript.md', 'candidate.md')}):
             from simple_ar.tools.publication import ExportRequest, export_input_binding
             # Publication owns original-text conversion input bytes too. A raw
             # input identity never acquires a scientific composition identity.
@@ -2234,6 +2421,8 @@ class WritingToolGateway:
                 raise ValueError('Adopted conversion source or input bytes changed')
             return result
         store, request, data = self._composition_receipt(identity, observation)
+        if path != self.workspace.resolve(data['editable_markdown']):
+            raise ValueError('Requested authoring version differs from its current writing receipt')
         if data.get('unresolved'):
             raise ValueError('Canonical report has unresolved writing findings/review; deliver a candidate with explicit unresolved work')
         if not self._same_report_content(data.get('report_binding'), binding, intent):
@@ -2280,18 +2469,7 @@ class WritingToolGateway:
         raise ValueError('Report delivery needs a current canonical composition receipt, intact manuscript and original evidence; deliver an explicit candidate when incomplete')
 
     def _check_input_bytes(self, inputs: list[dict[str, Any]]) -> None:
-        for row in inputs:
-            if row.get('sha256') is not None:
-                if self.workspace.artifact_hashes([row['path']])[row['path']] != row['sha256']:
-                    raise ValueError('Report source changed; compose a new current version')
-            else:
-                selection = row['selection']
-                read = self.workspace.call('read_file', {'path': row['path'],
-                    'offset_bytes': selection['offset_bytes'],
-                    'max_bytes': selection['next_offset_bytes'] - selection['offset_bytes']}, identity='report-delivery')
-                if (read.status != 'ok' or read.data['size_bytes'] != selection['size_bytes']
-                        or hashlib.sha256(read.data['text'].encode('utf-8')).hexdigest() != selection['window_sha256']):
-                    raise ValueError('Report source window changed; compose a new current version')
+        check_composition_inputs(self.workspace, inputs)
 
     @staticmethod
     def _completed_writer(store: ArtifactStore, expected: dict[str, Any], identity: str) -> dict:
@@ -3455,9 +3633,10 @@ class WritingToolGateway:
                     prior_path = self.workspace.resolve(request.prior_draft)
                     prior_id = prior_path.parent.name
                     if (re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', prior_id)
-                            and prior_path == self.workspace.resolve(f'workspace/manuscripts/{prior_id}/manuscript.md')):
+                            and prior_path in {self.workspace.resolve(f'workspace/manuscripts/{prior_id}/{leaf}')
+                                for leaf in ('manuscript.md', 'candidate.md')}):
                         prior_store = ArtifactStore(self.root / 'tools/writing' / prior_id)
-                        prior_result = prior_store.read_json('result.json')['data']
+                        _, _, prior_result = self._composition_receipt(prior_id)
                         if prior_result.get('artifact_sha256', {}).get(request.prior_draft) != prior_binding['sha256']:
                             # Locator spellings may differ; canonical artifact key owns the proof.
                             canonical = f'workspace/manuscripts/{prior_id}/manuscript.md'
@@ -3500,8 +3679,10 @@ class WritingToolGateway:
                 binding['candidate_source'] = candidate_source
             if continued_source is not None:
                 binding['candidate_source'] = continued_source
+                if reuse_linkage.get('checked_work'):
+                    binding['continued_source_review'] = 'checked_work.v1'
                 if reuse_linkage['candidate_contract'] == 'retained_article_author.v1':
-                    if not recovering or 'continued_source_review' in original_binding:
+                    if not reuse_linkage.get('checked_work') and (not recovering or 'continued_source_review' in original_binding):
                         binding['continued_source_review'] = 'inspect_only.v1'
                     from simple_ar.report.review_evidence import _resolve_pointer
                     _, previous = _resolve_pointer(json.loads(Path(continued_source['path']).read_bytes()),
@@ -3555,6 +3736,11 @@ class WritingToolGateway:
                 binding['assembly_mode'] = assembly_mode.value
             if request.figures and (not recovering or 'figure_caption_contract' in original_binding):
                 binding['figure_caption_contract'] = 'pandoc_image.v1'
+            if not recovering or 'work_result_contract' in original_binding:
+                binding['work_result_contract'] = (original_binding['work_result_contract'] if recovering
+                    else 'checked_candidate.v1')
+                if binding['work_result_contract'] != 'checked_candidate.v1':
+                    raise ValueError('Unknown writing work result contract')
             if (not recovering and 'work_context' in binding
                     and len(json.dumps(binding, ensure_ascii=False).encode('utf-8')) > 4 * 1024 * 1024):
                 raise ValueError('Composition binding with work context exceeds 4 MiB; narrow related inputs')
@@ -3563,6 +3749,9 @@ class WritingToolGateway:
                     raise ValueError('Inputs changed; preserve this version and request a new one')
                 if owner.exists('result.json'):
                     saved = owner.read_json('result.json')
+                    if not inspecting and saved['data'].get('editable_markdown') == f'{prefix}/candidate.md':
+                        self._composition_receipt(identity)
+                        return ToolResult(tool_name=name, **saved)
                     hashes = saved['data'].get('artifact_sha256')
                     if (not hashes or set(hashes) != set(saved['artifacts'])
                             or saved['data'].get('inputs') != bindings
@@ -3914,6 +4103,24 @@ class WritingToolGateway:
                 memory = ReportMemory.model_validate(written['memory'])
                 context, memory = apply_report_bibliography(context, memory, documents=documents,
                     notes=memory.outline_planning.get('source_notes', []))
+            # needs_revision also describes an interrupted verifier or unread
+            # attachment coverage. Those keep their existing incomplete-work
+            # receipts/recovery; they are not complete checked negative work.
+            # Select from the saved Writer disposition before invoking the
+            # strict proof port. Never catch proof failures as availability.
+            review = written.get('independent_review') or {}
+            inspection_interrupted = any(row.get('type') in {
+                'document_review_unavailable', 'document_revision_unavailable'}
+                for row in written.get('memory', {}).get('reviewer_findings', []))
+            inspection_incomplete = (inspection_interrupted
+                or bool(review.get('delivery_review', {}).get('uninspected'))
+                or any(row.get('context_requests') for row in review.get('section_reviews', [])))
+            if (binding.get('work_result_contract') == 'checked_candidate.v1' and not inspection_incomplete
+                    and ((written.get('independent_review') or {}).get('review_status') == 'needs_revision'
+                        or written.get('pending_candidate')
+                        or binding.get('continued_source_review') == 'checked_work.v1' and unresolved)):
+                return self._save_negative_work(owner, binding, prefix=prefix,
+                    figure_inputs=figure_inputs, document_materials=document_materials)
             constraints_checked = None
             if report_binding is not None:
                 from simple_ar.report.assembler import assemble_report_sections
