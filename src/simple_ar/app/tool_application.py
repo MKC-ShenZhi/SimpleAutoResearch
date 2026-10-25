@@ -419,6 +419,8 @@ class ToolApplication:
             observations=self._operation_observations,
             record_artifacts=self._record_artifacts,
             coordination={'specs':coordination,'owner':self},extension_host=self._extension_host_call,
+            execution_observations=self._execution_observations, work_context=self._work_context,
+            material_observations=self._material_observations,
             search_registry=getattr(self.services,'search_registry',None))
         self.workspace, self.gateway = self.operations.workspace, self.operations.gateway
         self.sources, self.publication = self.operations.sources, self.operations.publication
@@ -1672,6 +1674,7 @@ class ToolApplication:
         if control_protocol is not None:
             config['report_protocol'] = None
             config['inspection_protocol'] = 'subjects.v1'
+            config['source_generation_protocol'] = 'prepared.v1'
             # Old per-stage contracts belong to saved tasks, not this loop.
             for name in ('professional_inputs','professional_work','producer_completion',
                          'result_investigation','document_source_contract','publication_preparation'):
@@ -1845,7 +1848,7 @@ class ToolApplication:
             # their original closing obligation. Absent historical fields stay
             # absent unless explicitly supplied, including unrelated supplies.
             for field in ('completion_policy', 'tool_contracts', 'report_protocol', 'tool_completions', 'inspection_protocol',
-                          'document_source_contract'):
+                          'document_source_contract', 'source_generation_protocol'):
                 if field not in supplied:
                     if field in old:
                         config[field] = old[field]
@@ -3474,7 +3477,7 @@ class ToolApplication:
             arguments = json.loads(call["function"]["arguments"])
             if not isinstance(arguments, dict):
                 raise ValueError("Tool arguments must be an object")
-            if (call['function']['name'] == 'prepare_implementation'
+            if (self.operations is None and call['function']['name'] == 'prepare_implementation'
                     and (self.state['config'].get('professional_work') == 'outcomes.v2'
                         or (self.state['config'].get('professional_work') == _REQUEST_OWNER
                             and self.state['turns'][-1].get('origin') == 'request_owner'))):
@@ -3482,7 +3485,7 @@ class ToolApplication:
                 # when omitted by caller/provider. Persisted historical tasks
                 # keep the original preparation-only default.
                 arguments.setdefault('complete_work', True)
-            if call['function']['name'] == 'prepare_implementation':
+            if self.operations is None and call['function']['name'] == 'prepare_implementation':
                 # Hidden schemas are not authority. Derive internal markers
                 # from saved session/owner contracts, including their absence.
                 retained = ArtifactStore(context.store.root / 'implementation')

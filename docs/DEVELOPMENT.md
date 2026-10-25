@@ -71,6 +71,13 @@ inspect several targets, but each decision names its own supporting observations
 Each target's completeness, findings and evidence versions are evaluated separately;
 cross-file support must be explicit. Saved grouped opinions are not retroactively
 split, and unrelated supplies do not upgrade their inspection contract.
+`source_generation_protocol=prepared.v1` exposes goal/material/project preparation
+and approved execution as ordinary operations. The source owner investigates and
+generates the candidate; shared execution retains approval, accounting and provenance.
+Original requests, relevant opinions and admitted parent reads are supplied through
+existing context ports. Source-only delivery does not acquire an execution obligation.
+Fixed code-task authority still controls its edit/validation scope; ordinary source
+generation does not disable workspace primitives or add an automatic continuation.
 Formal delivery declares its manuscript and requested formats. Fixed code and
 measurement contracts remain enforced by their original execution owners.
 Historical native tasks without this protocol retain their saved professional

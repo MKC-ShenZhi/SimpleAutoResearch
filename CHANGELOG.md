@@ -15,6 +15,7 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 - Inspection stops gathering earlier when capacity is tight, reserving its final opinion and the caller's next decision on the existing ledger. Insufficient evidence remains an explicit finding; it does not become a pass.
 - New publications track the manuscript's actual presentation dependencies. Stale unrelated previews no longer block export or recovery; consumed figures and their producer versions remain checked.
 - New inspections bind each target's findings and supporting files independently. Editing a sibling no longer discards an unchanged target's pass or required defect; historical grouped inspections retain their saved contract.
+- Ordinary tasks can request a coherent source candidate and execution proposal from the existing code generator, reuse observed materials, and revise the registered candidate. Execution remains separately approved; this does not restore automatic professional handoffs or require an existing repository.
 
 End-to-end initial-draft and feedback acceptance is still in progress. These changes do not establish lower whole-task costs.
 

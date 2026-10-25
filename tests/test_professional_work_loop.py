@@ -735,6 +735,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
             require_pass=['report.md']),[])
         issues = assessment_issues(self.app.workspace,observations,['incorrect.txt'])
         self.assertTrue(any('9.0 contradicts' in text for text in issues),issues)
+        context = self.app._work_context(['workspace'])
+        self.assertIn('9.0 contradicts',json.dumps(context['professional_findings']))
+        self.assertNotIn('sample,value',json.dumps(context['professional_findings']))
         self._submit(_action('deliver_result',summary='Incorrect result',artifacts=['incorrect.txt']))
         self._not_delivered()
         # A source change invalidates the dependent report without erasing its sibling's defect.

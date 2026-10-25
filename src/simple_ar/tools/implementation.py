@@ -39,6 +39,18 @@ class ImplementationWorkRequest(BaseModel):
         description='Complete investigation, implementation, approved execution and bounded diagnosed repair. Explicit false requests source only. No new execution permission or scientific rerun authorization.')
 
 
+class ImplementationPreparationRequest(BaseModel):
+    """Source-generation inputs only; no caller-selected implementation or controller."""
+    model_config = ConfigDict(extra='forbid', strict=True)
+    goal: str = Field(min_length=1, max_length=16000)
+    project_path: str = Field(default='',
+        description='Authorized existing project or unchanged registered candidate; omit to create from requirements.')
+    material_roots: list[str] = Field(default_factory=list, max_length=8,
+        description='Authorized read-only material files or directories for source generation.')
+    execution_requested: bool = Field(default=True,
+        description='Propose an execution_plan with the source. False requests code only. Execution requires a separate explicitly approved execute_implementation call.')
+
+
 class ImplementationRequest(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
     goal: str = Field(min_length=1, max_length=16000)
@@ -222,7 +234,10 @@ class ExactCodeWork(BaseModel):
         return self
 
 
-def implementation_tool_specs(*, exact: bool = False) -> list[CommonToolSpec]:
+def implementation_tool_specs(*, exact: bool = False,
+                              preparation_only: bool = False) -> list[CommonToolSpec]:
+    if exact and preparation_only:
+        raise ValueError('Preparation-only source generation cannot use the exact code-task contract')
     if exact:
         return [CommonToolSpec(name='prepare_code_task', domain='implementation',
             permission_level='execution', risk_level='high',
@@ -232,6 +247,16 @@ def implementation_tool_specs(*, exact: bool = False) -> list[CommonToolSpec]:
             permission_level='execution', risk_level='high',
             input_schema=ExactCodeWork.model_json_schema(),
             description='Implement the frozen scoped code task using its approved isolated-workspace preparation, CodeTask investigation, edit/protected-file gates, independent review and declared validator. Uses this task budget and attempt. Optional instruction/prior_result support feedback on the existing candidate; no arguments change scope, preparation or validator. Requires explicit approval of the displayed work and current source/environment identity. Only the saved technical-repair ceiling is authorized (one for legacy contracts); no scientific measurement. Installation is allowed only by an explicitly frozen environment preparation contract; it shares this attempt and process budget. Inspect the retained result before delivery. Interrupted work without a complete domain result is never replayed automatically.')]
+    if preparation_only:
+        return [CommonToolSpec(name='prepare_implementation', domain='implementation',
+            permission_level='write_patch', risk_level='medium',
+            input_schema=ImplementationPreparationRequest.model_json_schema(),
+            description='Prepare a reusable source candidate from a goal, optional project_path and read-only material_roots. The existing source generator selects and reads bounded sources, preserves originals and retains its proposal and byte-bound result. An unchanged registered candidate supports direct feedback with preserved members. execution_requested defaults to true to propose a plan; false requests code only. This operation does not execute, schedule follow-up work or own automatic repair. Execution and independent scientific/visual verification remain separate.'),
+            CommonToolSpec(name='execute_implementation', domain='implementation',
+                completion={'field': 'delivery'},
+                permission_level='execution', risk_level='high',
+                input_schema=ExecuteImplementationRequest.model_json_schema(),
+                description='Execute one registered prepare_implementation execution_plan after explicit approval through the existing process owner and shared physical ledger. Uses prepared_result and pins source, consumed inputs, command/environment and fresh outputs. Retains canonical execution evidence and actual errors without automatic continuation, repair, retry or installation. Optional delivery finishes after a successful run. Physical execution does not certify scientific or visual correctness.')]
     from simple_ar.tools.implementation_findings import InvestigationRequest
     return [CommonToolSpec(name='investigate_implementation', domain='implementation',
         permission_level='write_patch', risk_level='medium', input_schema=InvestigationRequest.model_json_schema(),
@@ -250,6 +275,8 @@ def implementation_tool_specs(*, exact: bool = False) -> list[CommonToolSpec]:
 
 class ImplementationToolGateway:
     def requires_followup(self, name: str, arguments: dict) -> bool:
+        if self.preparation_only:
+            return False
         if name == 'prepare_implementation':
             return arguments.get('complete_work') is True
         if name == 'investigate_implementation':
@@ -309,8 +336,9 @@ class ImplementationToolGateway:
             'error': result.error, 'artifacts': list(result.artifacts), 'data': visible,
             'outcome': outcome, 'receipt_path': receipt_path}
 
-    @staticmethod
-    def continuation_attempts(name: str, arguments: dict) -> int:
+    def continuation_attempts(self, name: str, arguments: dict) -> int:
+        if self.preparation_only:
+            return 1
         # Complete preparation needs a subsequent execution in this same session.
         if name == 'prepare_implementation' and arguments.get('complete_work'):
             return 3 if arguments.get('result_investigation') else 2
@@ -318,6 +346,8 @@ class ImplementationToolGateway:
 
     def continuation(self, observed: dict[str, Any], attempt_id: str) -> dict[str, Any] | None:
         """Read-only next action from accepted receipts; caller owns scheduling/approval."""
+        if self.preparation_only:
+            return None
         if observed.get('tool_name') == 'investigate_implementation':
             from simple_ar.tools.professional_outcomes import accepted_native_result, stop_decision
             accepted_native_result(self.root, self.session_id, observed, attempt_id, ledger=self.ledger)
@@ -331,6 +361,8 @@ class ImplementationToolGateway:
 
     def resume_after_budget(self, observed: dict[str, Any], attempt_id: str) -> dict[str, Any] | None:
         """Read-only proposal after the caller's newly saved resource grant."""
+        if self.preparation_only:
+            return None
         if observed.get('tool_name') != 'prepare_implementation':
             return self.continuation(observed, attempt_id)
         from simple_ar.tools.implementation_work import resume_after_budget
@@ -338,6 +370,8 @@ class ImplementationToolGateway:
 
     def consume_outcome(self, observed: dict, source: str) -> dict | None:
         """Accept an actual joint-review defect for its unique code producer."""
+        if self.preparation_only:
+            return None
         if observed.get('tool_name') != 'compose_document':
             return None
         from simple_ar.tools.implementation_work import review_repair_outcome, WorkStopped
@@ -389,6 +423,8 @@ class ImplementationToolGateway:
             else self.workspace.has_started(identity))
 
     def can_reconcile(self, name: str, identity: str) -> bool:
+        if self.preparation_only and name not in {'prepare_implementation', 'execute_implementation'}:
+            return False
         if name == 'investigate_implementation' and self.exact is None:
             store = self.root / 'attempts' / identity / 'implementation_findings'
             return (store / 'result.json').is_file() or all(
@@ -423,13 +459,17 @@ class ImplementationToolGateway:
                  material_observations: Callable[[list[str]], list[dict]] | None = None,
                  declaration_review: bool = False,
                  professional_requests: bool = False,
+                 preparation_only: bool = False,
                  measurement: dict[str, Any] | None = None,
                  measurement_supplier: Callable[[], dict[str, Any] | None] | None = None,
                  exact: dict[str, Any] | None = None) -> None:
+        if preparation_only and exact is not None:
+            raise ValueError('Preparation-only source generation cannot use the exact code-task contract')
         self.root, self.workspace, self.ledger = root, workspace, ledger
         self.model, self.session_id = model, session_id
         self.declaration_review = declaration_review
         self.professional_requests = professional_requests
+        self.preparation_only = preparation_only
         self.client_factory = client_factory
         self.execution_observations = execution_observations
         self.candidate_outputs = candidate_outputs
@@ -1462,17 +1502,32 @@ class ImplementationToolGateway:
             'metadata': {'capability_artifacts': [ArtifactStore(owner.root.parent).ref(
                 'implementation/result.json', kind='prepared_implementation',
                 schema='prepared_implementation.v1').to_dict()]}}
+        if self.preparation_only and not executable:
+            # Code-only preparation is a complete source unit, not a plan obligation.
+            data['data'].pop('next_operation', None)
         owner.write_json('result.json', data)
         return ToolResult(tool_name='prepare_implementation', **data)
 
     def call(self, name: str, arguments: dict[str, Any], *, identity: str) -> ToolResult:
         try:
+            if self.preparation_only and name != 'prepare_implementation':
+                raise ValueError('Preparation-only calls support prepare_implementation; execution requires its approved context')
             if name == 'investigate_implementation':
                 from simple_ar.tools.implementation_findings import investigate_execution
                 return investigate_execution(self, arguments, identity=identity)
             if name != 'prepare_implementation' or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', identity):
                 raise ValueError('Invalid implementation invocation')
-            request = ImplementationRequest.model_validate(arguments)
+            if self.preparation_only:
+                # Validate the public boundary before translating to the existing
+                # engine. Even false/default historical controls are forbidden.
+                narrow = ImplementationPreparationRequest.model_validate(arguments)
+                # Freeze current producer semantics internally: author notes are
+                # review leads; actual execution/version/findings checks still apply.
+                request = ImplementationRequest.model_validate({**narrow.model_dump(),
+                    'complete_work': False, 'max_repairs': 0,
+                    'producer_completion': 'goal_findings.v1'})
+            else:
+                request = ImplementationRequest.model_validate(arguments)
             repair_observation = None
             if request.repair_execution:
                 from simple_ar.tools.implementation_work import repair_request
@@ -1519,7 +1574,7 @@ class ImplementationToolGateway:
             professional_project = (self.professional_requests and project is not None
                 and not request.files and self.exact is None)
             if method in {PROFESSIONAL_GENERATION, REGISTERED_PROJECT_GENERATION} or (
-                    not historical and (request.complete_work or professional_project)):
+                    not historical and (request.complete_work or professional_project or self.preparation_only)):
                 return prepare_work(self, request, owner, output, project, identity, repair_observation)
             retained_request = (owner.read_json('request.json').get('request') if owner.exists('request.json')
                 else owner.read_json('selection-input.json').get('request') if owner.exists('selection-input.json') else None)
@@ -1761,12 +1816,12 @@ class ImplementationToolGateway:
                 reason = ('accounting_unresolved' if any(
                     row.status in {'reserved', 'unknown'} for row in self.ledger.entries)
                     else 'shared_budget_exhausted')
-            entered = isinstance(exc, WorkStopped)
+            entered = isinstance(exc, WorkStopped) and not self.preparation_only
             refusal = None
             if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', identity):
                 retained = ArtifactStore(self.root / 'attempts' / identity /
                     ('implementation_findings' if name == 'investigate_implementation' else 'implementation'))
-                if retained.exists('request.json'):
+                if retained.exists('request.json') and not self.preparation_only:
                     entered = (name == 'investigate_implementation'
                         or bool(retained.read_json('request.json')['request'].get('complete_work')))
                 if entered and reason == 'shared_budget_exhausted' and 'request' in locals():

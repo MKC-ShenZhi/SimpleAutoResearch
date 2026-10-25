@@ -468,6 +468,18 @@ class InspectionToolGateway:
                                    'severity': 'required', 'message': finding['message']})
         return result
 
+    def work_inputs(self, targets: list[str], *, include_observations: bool = False) -> list[dict]:
+        """Supply relevant current opinions to source work, not another copy of its evidence."""
+        roots = [self.workspace.resolve(path) for path in targets]
+        result = []
+        for assessment in self.prior_assessments() if self.prior_assessments else []:
+            if any(any(Path(path)==root or root.is_dir() and Path(path).is_relative_to(root)
+                    for root in roots) for path in assessment['subjects']):
+                result.append({'kind':'artifact_assessment','assessment':assessment,
+                    'scope':'Current version-bound inspection opinion, not original source evidence, '
+                        'execution permission or a certificate for changed files.'})
+        return result
+
     def _mark_evidence(self, saved: dict[str, Any]) -> None:
         if self.protocol:
             return  # Independence is relative to each explicit subject decision.

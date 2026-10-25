@@ -50,7 +50,8 @@ class OperationTools:
     """Composition root with narrow runtime ports, not a second controller."""
 
     def __init__(self, *, root, config, ledger, session_id, client_factory,
-                 record_artifacts, coordination, extension_host, observations, search_registry=None):
+                 record_artifacts, coordination, extension_host, observations, search_registry=None,
+                 execution_observations=None, work_context=None, material_observations=None):
         from simple_ar.tools.inspection import InspectionToolGateway, inspection_tool_specs
         self.root, self.config = root, config
         self.observations = observations
@@ -79,23 +80,33 @@ class OperationTools:
         self.registry.register_package(analysis_tool_specs(),
             AnalysisToolGateway(root,self.workspace,contract=config.get('table_analysis')))
         self.implementation = self.scientific = None
-        if config.get('code_task') is not None:
+        preparation = config.get('source_generation_protocol')
+        if preparation not in {None,'prepared.v1'}:
+            raise ValueError('Unsupported source generation protocol')
+        exact = config.get('code_task') is not None
+        if exact or preparation is not None and config['model'] is not None:
             from simple_ar.tools.implementation import ImplementationToolGateway, implementation_tool_specs
             self.implementation = ImplementationToolGateway(root,self.workspace,ledger,config['model'],session_id,
-                client_factory=lambda identity:client_factory(identity,'code'), exact=config['code_task'],
-                measurement=config.get('execution_contract'),
+                client_factory=lambda identity:client_factory(identity,'code'), exact=config.get('code_task'),
+                preparation_only=not exact,
+                execution_observations=execution_observations if not exact else None,
+                work_context=work_context if not exact else None,
+                material_observations=material_observations if not exact else None,
+                measurement=config.get('execution_contract') if exact else None,
                 measurement_supplier=(lambda:self.scientific.execution_contract)
-                    if config.get('scientific_tools') else None,
+                    if exact and config.get('scientific_tools') else None,
                 research_inputs=self.sources.implementation_evidence,
-                measurement_inputs=lambda origin,required:self.scientific.implementation_inputs(
+                measurement_inputs=(lambda origin,required:self.scientific.implementation_inputs(
                     self._measurement_refs([row for row in self.observations()
-                        if row.get('contract_current',True)]),origin,required=required),
-                candidate_outputs=lambda record:self.scientific.candidate_outputs(record) if self.scientific else {})
-            self.registry.register_package(implementation_tool_specs(exact=True),self.implementation)
+                        if row.get('contract_current',True)]),origin,required=required)) if exact else None,
+                candidate_outputs=(lambda record:self.scientific.candidate_outputs(record) if self.scientific else {})
+                    if exact else None)
+            self.registry.register_package(implementation_tool_specs(exact=exact,preparation_only=not exact),
+                self.implementation,request_visible=not exact)
         if config.get('scientific_tools'):
             from simple_ar.tools.scientific import ScientificToolGateway, scientific_tool_specs
             self.scientific = ScientificToolGateway(root,self.workspace,ledger,session_id,
-                implementation=self.implementation if config.get('scientific_lineage') else None,
+                implementation=self.implementation if exact and config.get('scientific_lineage') else None,
                 execution_contract=config.get('execution_contract'),
                 research_contract=self.sources.accepted_execution_contract,
                 research_requirements=self.sources.execution_issues)
@@ -122,7 +133,7 @@ class OperationTools:
         blocked = {
                 spec.name for spec in self.registry.list_specs()
                 if spec.domain=='sources' and spec.permission_level=='network' and not config.get('allow_network')}
-        if self.implementation is not None:
+        if exact:
             blocked.update(spec.name for spec in self.registry.list_specs()
                 if spec.domain=='workspace' and spec.permission_level in {'write_patch','execution'})
             if not config.get('scientific_lineage'):
@@ -224,7 +235,8 @@ class OperationTools:
                 if limit and len(body_citation_ids(markdown,set(),include_unknown=True)) > limit:
                     issues.append('Report exceeds frozen max_cited_sources')
         issues.extend(assessment_issues(self.workspace,observations,resolved['artifacts'],require_pass=required))
-        if self.implementation is not None:
+        implementation = None
+        if self.config.get('code_task') is not None:
             implementation = next((row for row in reversed(owned)
                 if row.get('tool_name')=='implement_code_task'),None)
             if implementation is None or implementation.get('status')!='ok':
@@ -238,11 +250,11 @@ class OperationTools:
             measurements=self._measurement_refs(owned)
             analyses=[row['record'] for row in owned
                 if row.get('tool_name')=='analyze_measurements' and row.get('status')=='ok']
-            if self.implementation is not None and implementation is not None and implementation.get('status')=='ok':
+            if implementation is not None and implementation.get('status')=='ok':
                 refs = [implementation['artifacts'][0]]
                 evidence = self.scientific.report_evidence(measurements,refs,analysis_records=analyses)
                 issues.extend(self.scientific.delivery_requirement({**evidence,'implementation_refs':refs}))
-            elif self.implementation is None:
+            elif self.config.get('code_task') is None:
                 issues.extend(self.scientific.evidence_requirement(measurements,analyses))
         # Export owns all version/provenance checks; no Writer identity is needed.
         published = [row for row in observations if row.get('tool_name')=='export_report'

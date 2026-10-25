@@ -230,10 +230,18 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
     def test_prepared_unit_executes_approved_plan_and_pins_delivery_version(self) -> None:
         from simple_ar.core.capabilities import ArtifactStore
-        _, _, fake, _, app, _ = self._native_fixture(process_limits={
-            'process_invocations': 2, 'process_wall_seconds': 10})
+        _, inputs, fake, _, app, _ = self._native_fixture(process_limits={
+            'process_invocations': 2, 'process_wall_seconds': 10}, operation_control=True)
         fake.chat_turn.side_effect = AssertionError('Caller actions must not request coordinator decisions')
         app.implementation.client_factory = lambda _: fake
+        self.assertTrue(app.implementation.preparation_only)
+        self.assertIn('write_file',{spec.name for spec in app.gateway.list_specs()})
+        self.assertIn('run_process',{spec.name for spec in app.gateway.list_specs()})
+        self.assertNotIn('investigate_implementation',{spec.name for spec in app.gateway.list_specs()})
+        rejected = app.implementation.call('prepare_implementation',
+            {'goal':'Create a source unit','complete_work':False},identity='unsupported-controller')
+        self.assertEqual(rejected.status,'error')
+        fake.ask_json.assert_not_called()
         code = "from pathlib import Path\nPath('result.txt').write_text(str(sum(range(7))))\n"
         external = app.workspace.workspace / 'caller-runner.py'
         external.write_text(code)
@@ -241,10 +249,14 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             'files': [{'path': 'calculate.py', 'content': code}],
             'execution_plan': {'argv': ['python', str(external)], 'outputs': ['result.txt'], 'timeout_sec': 3}}
         stop = {'tool_name': 'ask_user', 'arguments': {'question': 'Await next explicit action'}}
+        (inputs/'request.txt').write_text('Save the integer sum of range(7); no training is requested.\n')
+        app.run(actions=[{'tool_name':'read_file','arguments':{'path':'source0/request.txt'}},stop],
+            progress=lambda _:None)
         app.run(actions=[{'tool_name': 'prepare_implementation', 'arguments': {
             'goal': 'Compute the integer sum and save its result'}}, stop], progress=lambda _: None)
         prepared = app.session.store.read_json(app.state['turns'][-1]['tools'][0]['result'])
         self.assertEqual(prepared['status'], 'ok', prepared.get('error'))
+        self.assertIn('Save the integer sum',json.dumps(_writing_prompt(fake)['source_windows']))
         locator = prepared['data']['prepared_result']
         candidate = Path(prepared['data']['project_dir'])
         self.assertFalse((candidate / 'result.txt').exists())
@@ -320,22 +332,55 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertFalse((Path(revised['data']['project_dir']) / 'result.txt').exists())
         self.assertEqual(sorted(_writing_prompt(fake)['original_files']), ['calculate.py'])
         self.assertIsNone(_writing_prompt(fake)['planned_files'])
+        context = [row['work_context'] for row in _writing_prompt(fake)['source_windows']
+            if row.get('role')=='user_request_and_accepted_feedback_not_source_or_authority']
+        self.assertEqual(context[0]['user_requests'][-1],
+            'Keep the source; use its portable entry for the next run')
         # Recover through the exact frozen owner request, including internal
         # completion semantics supplied by the application on the first call.
-        revision_args = read_json(Path(revised['data']['source_binding']))['request']
+        revision_args = {'goal':'Change only the execution entry','project_path':str(candidate)}
         revision_id = Path(revised['data']['project_dir']).name
         repeated = app.implementation.call('prepare_implementation', revision_args, identity=revision_id)
         self.assertEqual(repeated.data, revised['data'])
         extra = candidate / 'unlisted-source.txt'
         extra.write_text('A new source requires investigation, not silent omission.\n')
         try:
+            # The registered source unit does not acquire an unrelated file
+            # merely because it appeared in the enclosing runtime directory.
+            repeated = app.implementation.call('prepare_implementation', revision_args, identity=revision_id)
+            self.assertEqual(repeated.data,revised['data'])
+            self.assertFalse((Path(revised['data']['project_dir'])/extra.name).exists())
+            bound = candidate/'calculate.py'
+            bound.write_text(code+'# actual registered source changed\n')
             rejected = app.implementation.call('prepare_implementation', revision_args, identity=revision_id)
-            self.assertEqual(rejected.status, 'error')
-            self.assertIn('no investigation or replay', rejected.error)
+            self.assertEqual(rejected.status,'error')
         finally:
             extra.unlink()
         fake.chat_turn.assert_not_called()
         self.assertEqual(fake.ask_json.call_count, 2)
+
+    def test_ordinary_source_generation_can_deliver_code_without_requesting_execution(self):
+        _, _, fake, _, app, _ = self._native_fixture(operation_control=True)
+        fake.chat_turn.side_effect = AssertionError('No coordinator or execution is requested')
+        app.implementation.client_factory = lambda _:fake
+        fake.ask_json.return_value = {'summary':'Editable source only','unresolved':[],
+            'files':[{'path':'utility.py','content':'def total(values):\n    return sum(values)\n'}]}
+        before = app.ledger.to_dict()
+        app.run(actions=[{'tool_name':'prepare_implementation','arguments':{
+            'goal':'Provide an editable utility without running it','execution_requested':False}},
+            {'tool_name':'ask_user','arguments':{'question':'Ready for source review'}}],progress=lambda _:None)
+        result = app.session.store.read_json(app.state['turns'][-1]['tools'][0]['result'])
+        self.assertEqual(result['status'],'ok',result)
+        self.assertFalse(result['data']['executable'])
+        self.assertNotIn('next_operation',result['data'])
+        self.assertEqual(app.ledger.to_dict(),before)
+        app = ToolApplication.load(app.session.store.root)
+        app.run(actions=[{'tool_name':'deliver_result','arguments':{
+            'summary':'Editable source; execution was not requested',
+            'artifacts':[str(Path(result['data']['project_dir'])/'utility.py')]}}],progress=lambda _:None)
+        self.assertEqual(app.session.manifest.status,'completed',app.result_snapshot())
+        fake.chat_turn.assert_not_called()
+        self.assertEqual(fake.ask_json.call_count,1)
 
     def test_prepared_execution_failure_supplies_real_diagnosis_and_feedback_version(self) -> None:
         _, inputs, fake, _, app, _ = self._native_fixture(process_limits={
@@ -576,7 +621,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                         goal='Create and verify a small tool', mount_inputs=True,
                         allow_execution=True, allow_network=False, max_turns=30, code_task=None, process_limits=None,
                         report_requirement=None, measurement_command=None, tool_contracts=None,
-                        completion_policy=None, report_protocol=None, context_target=24000):
+                        completion_policy=None, report_protocol=None, context_target=24000,
+                        operation_control=False):
         run_dir, inputs = self._tool_materials()
         fake = Mock()
         fake.ask_json = _LegacyArticleFixtureResponses()
@@ -590,7 +636,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             interpreter = run_dir / 'task-python'
             interpreter.symlink_to(sys.executable)
         app = ToolApplication.create(run_dir / 'native', goal,
-            context_protocol=None,  # Historical projection fixtures keep their original contract.
+            context_protocol='working.v1' if operation_control else None,
             model='fixture', sources={'source0': inputs} if mount_inputs else {},
             allow_execution=allow_execution, allow_network=allow_network,
             max_turns=max_turns, project_python=interpreter, code_task=code_task, process_limits=process_limits,
@@ -602,7 +648,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 'result_schema': {'primary_metric': 'score', 'required_metrics': ['score']},
                 'protocol': {'hypothesis': 'Record the implemented value', 'dataset': 'Supplied local input',
                     'expected_outcome': 'Observed score, not proof of improvement'}}
-                if measurement_command is not None else None), control_protocol=None)
+                if measurement_command is not None else None),
+            control_protocol='operations.v1' if operation_control else None)
         code = "from pathlib import Path\np = Path('counter.txt')\np.write_text(str(int(p.read_text()) + 1) if p.exists() else '1')\nprint('done')\n"
         code += "# Native history preserves the actual source, not substitute payloads.\n" * 80
         if counter or completed:
