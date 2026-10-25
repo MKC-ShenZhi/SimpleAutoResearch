@@ -115,6 +115,27 @@ class CommonToolGateway:
             raise ValueError('Professional continuation requires a positive attempt floor')
         return minimum
 
+    def professional_inputs(self, targets: list[str], *, include_observations: bool = False) -> list[dict]:
+        """Ask registered owners for current result context, never infer it here.
+
+        Owners retain source/version/access proof. This creates no state,
+        scientific certification or authority to read beyond the supplied scope.
+        """
+        results, seen = [], set()
+        for owner in self._domain_gateways.values():
+            if id(owner) in seen:
+                continue
+            seen.add(id(owner))
+            provide = getattr(owner, 'work_inputs', None)
+            if provide is not None:
+                results.extend(provide(targets, include_observations=include_observations))
+        return results
+
+    def requires_followup(self, name: str, arguments: dict) -> bool:
+        owner = self.domain_owner(name)
+        check = getattr(owner, 'requires_followup', None)
+        return bool(check and check(name, arguments))
+
     def professional_action(self, observed: dict, source: str, *, resume: bool,
                             consume_outcome: bool) -> tuple[Any, dict | None]:
         """Ask existing receipt owners; scheduling and authorization stay outside.

@@ -342,9 +342,13 @@ def freeze_producer_context(owner: Any, artifacts: list[dict]) -> dict:
     from simple_ar.tools.implementation_work import _accepted, _retained_request
     preparations, executions = delivery_evidence(owner, [], {
         'summary': 'Retain producer review context', 'artifacts': [row['path'] for row in artifacts]})
-    proof, groups, legacy, executed = _proof(owner), [], [], set()
+    proof, groups, legacy, executed, findings = _proof(owner), [], [], set(), []
     for observed in executions:
         executed.add(owner.workspace.resolve(observed['data']['prepared_result']))
+        from simple_ar.tools.implementation_findings import accepted_investigation
+        investigated = accepted_investigation(proof, observed['data']['execution_ref'])
+        if investigated is not None:
+            findings.append(investigated)
         group = _producer_group(owner, observed['data']['execution_ref'])
         if group is not None and group.get('producer_completion') == 'goal_findings.v1':
             groups.append(group)
@@ -369,6 +373,7 @@ def freeze_producer_context(owner: Any, artifacts: list[dict]) -> dict:
             'goal': request.goal, 'notes': prepared['data']['unresolved'],
             'scope': 'Prepared source only; execution and scientific correctness remain unverified.'})
     return {'producer_notes': sorted(groups, key=lambda row: (row['prepared_result'], row.get('execution_ref', ''))),
+        **({'professional_findings': findings} if findings else {}),
         **({'producer_declarations': sorted(legacy, key=lambda row: row['execution_ref'])} if legacy else {})}
 
 

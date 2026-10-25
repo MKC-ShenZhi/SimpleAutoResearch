@@ -12,6 +12,7 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 - Keep complete rejected drafts as work candidates for revision or reorganization. A never-dispatched inspection can continue after its original accounting is verified, without redrafting. Failures, unknown requests and historical contracts remain protected.
 - Share source, outline and provenance across writing, repair and delivery, avoiding reselection for equivalent attachments or prior drafts. Professional selection checks source references against actual document identities; ordinary code and data remain readable materials.
 - Keep professional work phases and artifact roots available after read history is trimmed. Resolve resumed drafts consistently across feedback, repair and delivery; preparation-time notes stay distinct from execution issues, with raw receipts and failures retained.
+- New complete implementation work investigates its actual outputs before returning findings and remaining needs. Writing can reuse those observed materials; delivery requires the current investigation. Source-only work and saved historical contracts retain their behavior.
 
 Full unattended draft, feedback and delivery acceptance remains in progress; this engineering update does not establish general success or lower cost.
 

@@ -301,6 +301,11 @@ def _execution(owner: Any, locator: str, *, successful: bool = False) -> tuple[d
         from simple_ar.tools.implementation_run import candidate_source
         _, prepared, source = candidate_source(owner, saved['prepared_result'])
         completion = source['request'].get('producer_completion')
+        investigation = source['request'].get('result_investigation')
+        if (saved.get('result_investigation') != investigation
+                or binding.get('result_investigation') != investigation
+                or prepared['data'].get('result_investigation') != investigation):
+            raise ValueError('Result investigation responsibility differs from the approved preparation')
         if (saved.get('producer_completion') != completion or binding.get('producer_completion') != completion
                 or saved.get('unresolved') != prepared['data'].get('unresolved', [])
                 or binding.get('unresolved') != saved.get('unresolved')):
@@ -774,6 +779,9 @@ def continuation(owner: Any, observed: dict, attempt_id: str) -> dict | None:
                 entered = True
                 if record['status'] == 'run_succeeded':
                     _execution(owner, locator, successful=True)
+                    if request.result_investigation is not None:
+                        return {'tool_name': 'investigate_implementation',
+                            'arguments': {'execution_ref': locator}}
                     # These are inherited model-authored gaps, not a typed
                     # physical failure. Keep them in the immutable execution
                     # observation for writing/review and final delivery gates;

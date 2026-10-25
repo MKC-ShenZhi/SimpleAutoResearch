@@ -56,6 +56,10 @@ class ImplementationRequest(BaseModel):
     producer_completion: Literal['goal_findings.v1'] | None = Field(default=None,
         exclude_if=lambda value: value is None,
         description='Internal frozen completion semantics. Notes inform independent review; actual execution, versions and required findings govern completion. Absence retains historical gates.')
+    result_investigation: Literal['execution_findings.v1'] | None = Field(default=None,
+        exclude_if=lambda value: value is None,
+        description='Internal frozen complete-work responsibility for investigating actual execution outcomes. '
+            'Absence retains the historical execution handoff, without upgrading saved work.')
     max_repairs: int = Field(default=0, ge=0, le=2,
         description='Local technical repair ceiling for complete_work (0-2); defaults to one when complete_work is true and omitted. Explicit zero disables repair. Each repair creates a fresh candidate and requires fresh execution approval; never replays a physical attempt.')
     repair_execution: str = Field(default='', max_length=500, exclude_if=lambda value: not value,
@@ -75,6 +79,8 @@ class ImplementationRequest(BaseModel):
     def completion_contract(self) -> 'ImplementationRequest':
         if self.work_contract is not None and not self.complete_work:
             raise ValueError('Shared work ownership requires complete_work')
+        if self.result_investigation is not None and not self.complete_work:
+            raise ValueError('Execution investigation requires complete_work')
         if self.repair_execution and self.repair_review:
             raise ValueError('Choose a process diagnosis or a delivery-review diagnosis, not both')
         if (self.max_repairs or self.repair_execution or self.repair_review) and not self.complete_work:
@@ -226,7 +232,14 @@ def implementation_tool_specs(*, exact: bool = False) -> list[CommonToolSpec]:
             permission_level='execution', risk_level='high',
             input_schema=ExactCodeWork.model_json_schema(),
             description='Implement the frozen scoped code task using its approved isolated-workspace preparation, CodeTask investigation, edit/protected-file gates, independent review and declared validator. Uses this task budget and attempt. Optional instruction/prior_result support feedback on the existing candidate; no arguments change scope, preparation or validator. Requires explicit approval of the displayed work and current source/environment identity. Only the saved technical-repair ceiling is authorized (one for legacy contracts); no scientific measurement. Installation is allowed only by an explicitly frozen environment preparation contract; it shares this attempt and process budget. Inspect the retained result before delivery. Interrupted work without a complete domain result is never replayed automatically.')]
-    return [CommonToolSpec(name='prepare_implementation', domain='implementation',
+    from simple_ar.tools.implementation_findings import InvestigationRequest
+    return [CommonToolSpec(name='investigate_implementation', domain='implementation',
+        permission_level='write_patch', risk_level='medium', input_schema=InvestigationRequest.model_json_schema(),
+        description='Investigate the actual outputs of one registered successful complete implementation '
+            'against its original goal, using authorized source/result reads. Retains supported findings, '
+            'limitations and remaining needs under the same ledger. No new execution, scientific '
+            'certification, report obligation or final delivery. Saved work must own this operation.'),
+        CommonToolSpec(name='prepare_implementation', domain='implementation',
         permission_level='write_patch', risk_level='medium', input_schema=ImplementationRequest.model_json_schema(),
         description='Prepare coherent code from a goal and optional read-only material_roots, without coordinator-selected files or code. Opt into complete_work for owner-managed preparation, approved execution and diagnosed local technical repairs (max_repairs 0-2), all in the existing action turn and shared ledger; every execution still needs exact approval. New units choose text sources during generation; project_path pointing to an unchanged registered candidate reuses complete originals/materials for direct feedback, preserving omitted files and allowing necessary new sources or plan-only fixes. Unfamiliar projects retain investigation. The same generation can propose execution_plan; execute_implementation uses the registered result after explicit approval. Existing files require exact replacements. One complete format correction shares the original budget; transport, unknown-use, truncation and syntax failures are not replayed. Originals stay unchanged; preparation is not execution or scientific/visual verification.'),
         CommonToolSpec(name='execute_implementation', domain='implementation',
@@ -236,6 +249,24 @@ def implementation_tool_specs(*, exact: bool = False) -> list[CommonToolSpec]:
 
 
 class ImplementationToolGateway:
+    def requires_followup(self, name: str, arguments: dict) -> bool:
+        if name == 'prepare_implementation':
+            return arguments.get('complete_work') is True
+        if name == 'investigate_implementation':
+            return True
+        if name == 'execute_implementation':
+            try:
+                from simple_ar.tools.implementation_work import _request
+                request, _ = _request(self, arguments['prepared_result'])
+                return request.result_investigation is not None
+            except (ValueError, OSError, KeyError, TypeError):
+                return False  # Invalid sources still fail their execution admission.
+        return False
+
+    def work_inputs(self, targets: list[str], *, include_observations: bool = False) -> list[dict]:
+        from simple_ar.tools.implementation_findings import investigations_for
+        return investigations_for(self, targets, include_observations=include_observations)
+
     def coordination_result(self, result: ToolResult, *, receipt_path: str | None = None) -> dict[str, Any]:
         """Present the work phase without reclassifying prepared author notes.
 
@@ -281,10 +312,20 @@ class ImplementationToolGateway:
     @staticmethod
     def continuation_attempts(name: str, arguments: dict) -> int:
         # Complete preparation needs a subsequent execution in this same session.
-        return 2 if name == 'prepare_implementation' and arguments.get('complete_work') else 1
+        if name == 'prepare_implementation' and arguments.get('complete_work'):
+            return 3 if arguments.get('result_investigation') else 2
+        return 1
 
     def continuation(self, observed: dict[str, Any], attempt_id: str) -> dict[str, Any] | None:
         """Read-only next action from accepted receipts; caller owns scheduling/approval."""
+        if observed.get('tool_name') == 'investigate_implementation':
+            from simple_ar.tools.professional_outcomes import accepted_native_result, stop_decision
+            accepted_native_result(self.root, self.session_id, observed, attempt_id, ledger=self.ledger)
+            if observed.get('status') != 'ok':
+                return stop_decision(self, observed, attempt_id,
+                    (observed.get('data') or {}).get('owner_stop_reason', 'owner_failed'),
+                    observed.get('error', 'Professional result investigation stopped'))
+            return None
         from simple_ar.tools.implementation_work import continuation
         return continuation(self, observed, attempt_id)
 
@@ -342,10 +383,16 @@ class ImplementationToolGateway:
             else self.execute(context, arguments, approval=approval or {}))
 
     def has_started(self, identity: str) -> bool:
+        if (self.root / 'attempts' / identity / 'implementation_findings' / 'request.json').exists():
+            return True
         return ((self.workspace.workspace / 'code_tasks' / identity).exists() if self.exact
             else self.workspace.has_started(identity))
 
     def can_reconcile(self, name: str, identity: str) -> bool:
+        if name == 'investigate_implementation' and self.exact is None:
+            store = self.root / 'attempts' / identity / 'implementation_findings'
+            return (store / 'result.json').is_file() or all(
+                (store / name).is_file() for name in ('selection-response.json', 'selection-observations.json'))
         if name == 'execute_implementation' and self.exact is None:
             return ((self.root / 'attempts' / identity / 'candidate_execution.json').is_file()
                 or self.workspace.can_reconcile('run_process', identity))
@@ -1400,7 +1447,9 @@ class ImplementationToolGateway:
         locator = f'records/{identity}/implementation/result.json'
         executable = 'execution_plan' in result
         completion = owner.read_json('request.json')['request'].get('producer_completion')
+        investigation = owner.read_json('request.json')['request'].get('result_investigation')
         data = {'data': {**result, **({'producer_completion': completion} if completion else {}),
+                **({'result_investigation': investigation} if investigation else {}),
                 **({'verification': 'Prepared source and its recorded byte versions only; execution, scientific '
                     'and visual correctness remain unverified. Original producer notes remain in unresolved as review leads, '
                     'not independently established completion failures.'} if completion else {}),
@@ -1418,6 +1467,9 @@ class ImplementationToolGateway:
 
     def call(self, name: str, arguments: dict[str, Any], *, identity: str) -> ToolResult:
         try:
+            if name == 'investigate_implementation':
+                from simple_ar.tools.implementation_findings import investigate_execution
+                return investigate_execution(self, arguments, identity=identity)
             if name != 'prepare_implementation' or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', identity):
                 raise ValueError('Invalid implementation invocation')
             request = ImplementationRequest.model_validate(arguments)
@@ -1478,7 +1530,8 @@ class ImplementationToolGateway:
                 raise ValueError('Execution planning contract changed; preserve this identity without model dispatch')
             if retained_request is not None and any(retained_request.get(key, default) != getattr(request, key)
                     for key, default in (('complete_work', False), ('max_repairs', 0),
-                        ('repair_execution', ''), ('repair_review', ''), ('producer_completion', None))):
+                        ('repair_execution', ''), ('repair_review', ''), ('producer_completion', None),
+                        ('result_investigation', None))):
                 raise ValueError('Complete-work contract changed; preserve this identity without model dispatch')
             for locator in request.material_roots:
                 material = self.workspace.resolve_material_root(locator)
@@ -1711,9 +1764,11 @@ class ImplementationToolGateway:
             entered = isinstance(exc, WorkStopped)
             refusal = None
             if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', identity):
-                retained = ArtifactStore(self.root / 'attempts' / identity / 'implementation')
+                retained = ArtifactStore(self.root / 'attempts' / identity /
+                    ('implementation_findings' if name == 'investigate_implementation' else 'implementation'))
                 if retained.exists('request.json'):
-                    entered = bool(retained.read_json('request.json')['request'].get('complete_work'))
+                    entered = (name == 'investigate_implementation'
+                        or bool(retained.read_json('request.json')['request'].get('complete_work')))
                 if entered and reason == 'shared_budget_exhausted' and 'request' in locals():
                     refusal = {'request': request.model_dump(),
                         'physical_activity': any(row.attempt_id == identity for row in self.ledger.entries)}

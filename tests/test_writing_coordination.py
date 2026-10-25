@@ -854,6 +854,7 @@ class WritingCoordinationTests(unittest.TestCase):
             'figures': {'enabled': False}}, method='article')
         app = ToolApplication.create(fixture.root, goal, model='fixture', sources={},
             services=fixture.services, professional_inputs=True, allow_execution=True,
+            investigate_results=False,  # Frozen unit transport; result ownership is checked in the work-loop suite.
             report_requirement=requirement, max_turns=10, max_tokens=600000, max_attempts=40,
             process_limits={'process_invocations': 3, 'process_wall_seconds': 30})
         # Exercise the historical whole-text contract, including its pre-author

@@ -581,6 +581,9 @@ def writing_tool_specs() -> list[CommonToolSpec]:
 
 
 class WritingToolGateway:
+    def requires_followup(self, name: str, arguments: dict) -> bool:
+        return arguments.get('publication') is not None
+
     def __init__(self, root: Path, workspace: Any, ledger: Any, model: str, session_id: str,
                  *, client_factory: Callable[[str], Any] | None = None,
                  report_inputs: Callable[[], dict[str, Any]] | None = None,
@@ -2367,6 +2370,20 @@ class WritingToolGateway:
 
     def consume_outcome(self, observed: dict, source: str) -> dict | None:
         """Accept a verified producer revision without repeating material selection."""
+        if observed.get('tool_name') == 'investigate_implementation' and observed.get('status') == 'ok':
+            from simple_ar.tools.implementation_findings import accepted_investigation
+            from simple_ar.tools.implementation_work import _execution
+            from simple_ar.tools.producer_declarations import _proof
+            from simple_ar.tools.professional_outcomes import native_result_path
+            path = native_result_path(self.root, self.workspace, source)
+            accepted_native_result(self.root, self.session_id, observed, path.parent.name, ledger=self.ledger)
+            proof = _proof(self)
+            reference = observed['data']['execution_ref']
+            findings = accepted_investigation(proof, reference)
+            if findings is None or findings['disposition'] != 'outcome_ready':
+                return None
+            _, execution = _execution(proof, reference, successful=True)
+            return self.resubmit_after_repair(execution)
         if (observed.get('tool_name') == 'export_report' and observed.get('status') == 'ok'
                 and observed.get('data', {}).get('candidate_preparation') and self.prepared_publication is not None):
             prepared = self.prepared_publication(source)
@@ -2398,6 +2415,10 @@ class WritingToolGateway:
             proof = _proof(self)
             saved, observed = _execution(proof, new_execution['data']['execution_ref'], successful=True)
             if observed != new_execution:
+                return None
+            from simple_ar.tools.implementation_findings import accepted_investigation
+            findings = accepted_investigation(proof, new_execution['data']['execution_ref'])
+            if findings is not None and findings['disposition'] != 'outcome_ready':
                 return None
             prepared = self.workspace.resolve(saved['prepared_result'])
             request, _ = _request(proof, saved['prepared_result'])

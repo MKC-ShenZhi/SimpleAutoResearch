@@ -569,7 +569,8 @@ def inspect_materials(*, workspace: Any, context: dict, instructions: str,
                       client: Any, response_model: type[BaseModel], label: str,
                       final_fields: tuple[str, ...], excluded_paths: set[str] | None = None,
                       seed: dict | None = None,
-                      validate_selection: Callable[[dict, list[dict]], None] | None = None) -> dict:
+                      validate_selection: Callable[[dict, list[dict]], None] | None = None,
+                      terminal_purpose: str | None = None) -> dict:
     """Read real windows before selection, using the caller's client and receipts.
 
     The caller binds its inputs before entry and rejects interrupted replay.
@@ -584,6 +585,10 @@ def inspect_materials(*, workspace: Any, context: dict, instructions: str,
         owner.write_json('selection-observations.json', observations)
     admission = []
     correction = None
+    if terminal_purpose is not None:
+        instructions += (' The terminal purpose is actual investigation: ' + terminal_purpose
+            + ' Finalize that investigation using selected observed material windows; '
+            'selection alone does not complete this responsibility.')
     instructions += (
         ' Investigate before choosing local materials: return {read_windows: [FileWindow objects]} '
         'alone to inspect relevant candidates. Then finalize only exact material windows already observed '
@@ -695,6 +700,13 @@ def inspect_materials(*, workspace: Any, context: dict, instructions: str,
                     owner.write_json(f'selection-steps/{step + 1}/admission.json', admission)
                     if step == 5:
                         raise
+                    continue
+                except ValueError as error:
+                    if terminal_purpose is None or not record_failure(error,
+                            raw_response=json.dumps(response, ensure_ascii=False), correctable=True):
+                        raise
+                    correction = {'role': 'untrusted_response_validation_context', 'diagnostic': str(error),
+                        'record': f'selection-steps/{step + 1}/response-error.json'}
                     continue
             owner.write_json('selection-observations.json', observations)
             return response

@@ -257,6 +257,9 @@ def bind_command_input_versions(owner: Any, unit: dict, candidate: Path, argv: l
 def execution_binding(owner: Any, arguments: dict, *, identity: str) -> dict:
     request = ExecuteImplementationRequest.model_validate(arguments)
     unit, candidate, payload = prepared_unit(owner, request.prepared_result)
+    investigation = payload['data'].get('result_investigation')
+    if investigation is not None and request.delivery is not None:
+        raise ValueError('Owned execution requires result investigation before final delivery; submit delivery afterwards')
     if owner.workspace.artifact_hashes(unit['source_sha256']) != unit['source_sha256']:
         raise ValueError('Prepared implementation or its consumed materials changed before execution')
     # A new physical run must not certify pre-existing figures/results.
@@ -284,6 +287,7 @@ def execution_binding(owner: Any, arguments: dict, *, identity: str) -> dict:
         'argv': argv, 'process_artifacts': 1,
         **({'producer_completion': payload['data']['producer_completion']}
             if 'producer_completion' in payload['data'] else {}),
+        **({'result_investigation': investigation} if investigation else {}),
         'unresolved': payload['data'].get('unresolved', []),
         'environment': owner.workspace.process_environment(), 'outputs': outputs}
 
@@ -393,6 +397,7 @@ def execute_prepared(owner: Any, context: Any, arguments: dict,
         'schema_version': 'prepared_implementation_execution.v1',
         'prepared_result': request.prepared_result, 'approval': approval, 'status': status,
         **({'producer_completion': binding['producer_completion']} if 'producer_completion' in binding else {}),
+        **({'result_investigation': binding['result_investigation']} if 'result_investigation' in binding else {}),
         'unresolved': binding['unresolved'],
         'output_sha256': outputs, 'issues': issues,
         'verification': 'Physical invocation and byte versions only; no independent scientific or visual validation.'}
@@ -489,6 +494,11 @@ def delivery_issues(owner: Any, observations: list[dict], *, delivery: dict | No
                 checked, _ = _execution(owner, data['execution_ref'], successful=True)
                 if checked != saved:
                     return ['Delivered execution differs from its accepted physical receipt']
+            from simple_ar.tools.implementation_findings import accepted_investigation
+            findings = accepted_investigation(owner, data['execution_ref'])
+            if findings is not None and findings['disposition'] != 'outcome_ready':
+                return ['Professional result investigation retains required work: '
+                    + '; '.join(findings['remaining_work'])]
             if saved.get('unresolved'):
                 from simple_ar.tools.implementation_work import _request
                 request, _ = _request(owner, saved['prepared_result'])

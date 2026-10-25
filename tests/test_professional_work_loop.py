@@ -218,8 +218,11 @@ class ProfessionalWorkLoopTests(unittest.TestCase):
         self.assertEqual(mode, 'chat')
         self.assertFalse(request.get('tools'), 'Coordinator dispatch reached the provider')
         system = request['messages'][0]['content']
-        self.assertIn('Implement one coherent, bounded code work unit', system)
         prompt, _ = json.JSONDecoder().raw_decode(request['messages'][1]['content'])
+        if 'findings' in prompt.get('response_schema', {}).get('properties', {}):
+            self.assertIn('scientific certification', system)
+        else:
+            self.assertIn('Implement one coherent, bounded code work unit', system)
         self.prompts.append(prompt)
         self.assertTrue(self.responses, 'Unexpected additional professional provider call')
         return {'choices': [{'message': {'role': 'assistant',
@@ -228,10 +231,11 @@ class ProfessionalWorkLoopTests(unittest.TestCase):
 
     def _create(self, *, allow_execution=True, professional_inputs=True,
                 tool_contracts='on_demand', process_invocations=3, professional_work='owners.v3',
-                producer_completion=None):
+                producer_completion=None, investigate_results=False):
         app = ToolApplication.create(self.root, 'Compute and save sum(range(7))',
             model='fixture', sources={}, services=self.services,
             professional_inputs=professional_inputs, allow_execution=allow_execution,
+            investigate_results=investigate_results,
             tool_contracts=tool_contracts,
             max_turns=10, max_tokens=600000, max_attempts=40,
             process_limits={'process_invocations': process_invocations, 'process_wall_seconds': 30})
@@ -286,6 +290,107 @@ class ProfessionalWorkLoopTests(unittest.TestCase):
     def _process_receipts(self):
         return {path.relative_to(self.root).as_posix(): path.read_bytes()
             for path in (self.root / 'tools' / 'processes').glob('*/invocation.json')}
+
+    def test_owned_execution_investigates_actual_results_before_coordinator_or_delivery(self):
+        from simple_ar.tools.implementation_findings import accepted_investigation
+        for value, disposition in ((21, 'outcome_ready'), (17, 'handoff_required')):
+            with self.subTest(value=value):
+                self.root = self.root / f'actual-{value}'
+                app = self._create(professional_work='requests.v1',
+                    producer_completion='goal_findings.v1', investigate_results=True)
+                code = f"from pathlib import Path\nPath('result.txt').write_text('{value}')\n"
+                proposal = self._proposal(code)
+                proposal['unresolved'] = ['Proposed command has not run']
+                self.responses = [proposal]
+                self._run(app, actions=[self._prepare()])
+                _, token = self._pending_execution(app)
+                prepared = self._observations(app)[-1]
+                app = self._load()
+                self._run(app, approved_execution=token)
+                execution = self._observations(app)[-1]
+                reference = execution['data']['execution_ref']
+                self.assertEqual(execution['tool_name'], 'execute_implementation')
+                self.assertEqual(execution['data']['result_investigation'], 'execution_findings.v1')
+                with self.assertRaises(ValueError):
+                    accepted_investigation(app.implementation, reference)
+                target = str(Path(prepared['data']['project_dir']) / 'result.txt')
+                window = {'path': target, 'max_bytes': 100}
+                source_window = {'path': str(Path(target).with_name('calculate.py')), 'max_bytes': 1000}
+                final = {
+                    'materials': [window],
+                    'findings': [{'statement': f'The actual saved result is {value}.',
+                        'evidence': [{'path': target, 'quote': str(value)}]}],
+                    'limitations': ['The fixture checks an integer only; no scientific or visual certification.'],
+                    'remaining_work': ([] if value == sum(range(7)) else
+                        ['The executed value does not meet the original sum(range(7)) goal.']),
+                    'disposition': disposition}
+                source_only = {'materials': [source_window], 'findings': [{
+                    'statement': 'The program imports pathlib.',
+                    'evidence': [{'path': source_window['path'], 'quote': 'from pathlib import Path'}]}],
+                    'limitations': [], 'remaining_work': [], 'disposition': 'outcome_ready'}
+                self.responses = [{'read_windows': [source_window, window]},
+                    *([source_only] if value == 21 else []), final]
+                app.run(progress=lambda _: None, should_stop=lambda: bool(self._observations(app)
+                    and self._observations(app)[-1]['tool_name'] == 'investigate_implementation'))
+                observed = self._observations(app)[-1]
+                self.assertEqual(observed['status'], 'ok', observed)
+                self.assertEqual(observed['data']['disposition'], disposition)
+                self.assertFalse(self.responses)
+                inspected = accepted_investigation(app.implementation, reference, include_observations=True)
+                self.assertEqual(inspected['findings'][0]['evidence'][0]['quote'], str(value))
+                self.assertEqual(inspected['disposition'], disposition)
+                self.assertTrue(inspected['observations'])
+                with patch.object(app.writing, 'resubmit_after_repair', return_value=None) as resubmit:
+                    app.writing.consume_outcome(observed, inspected['record'])
+                    if disposition == 'outcome_ready':
+                        resubmit.assert_called_once_with(execution)
+                    else:
+                        resubmit.assert_not_called()
+                # Writer consumes actual producer findings and reusable reads,
+                # without a coordinator-authored evidence/file recipe.
+                context = app._work_context([str(Path(target).parent)])
+                self.assertTrue(context['professional_findings'])
+                reused = app._material_observations([str(Path(target).parent)])
+                self.assertTrue(any(str(value) == row.get('data', {}).get('text') for row in reused))
+                ledger, calls = app.ledger.to_dict(), self.send.call_count
+                app = self._load()
+                cached = app.implementation.call('investigate_implementation',
+                    {'execution_ref': reference}, identity=Path(inspected['record']).parts[1])
+                self.assertEqual(cached.model_dump(mode='json'), observed)
+                with changed_record(Path(target), 'changed after investigation'):
+                    with self.assertRaises(ValueError):
+                        accepted_investigation(app.implementation, reference)
+                self.assertEqual(app.ledger.to_dict(), ledger)
+                self.assertEqual(self.send.call_count, calls)
+                for name, arguments in (('execute_implementation', {'prepared_result': prepared['data']['prepared_result']}),
+                        ('investigate_implementation', {'execution_ref': reference})):
+                    count = len(self._observations(app))
+                    app.run(actions=[{'tool_name': name, 'arguments': arguments},
+                        {'tool_name': 'read_file', 'arguments': window}], progress=lambda _: None,
+                        should_stop=lambda: len(self._observations(app)) > count)
+                    refused = self._observations(app)[-1]
+                    self.assertEqual(refused['status'], 'blocked', refused)
+                    self.assertIn('must be last', refused['error'])
+                    app._cancel_unstarted('Fixture retains the rejected batch without executing trailing reads')
+                    app._save()
+                self.assertEqual(app.ledger.to_dict(), ledger)
+                self.assertEqual(self.send.call_count, calls)
+                self.coordinator.assert_not_called()
+                self.assertFalse((self.root / 'delivery.json').exists())
+
+    def test_source_only_and_legacy_execution_do_not_acquire_result_investigation(self):
+        app = self._create(professional_work='requests.v1',
+            producer_completion='goal_findings.v1', investigate_results=True)
+        self.responses = [self._proposal("from pathlib import Path\nPath('result.txt').write_text('21')\n")]
+        app.run(actions=[{'tool_name': 'prepare_implementation', 'arguments': {
+            'goal': 'Provide the source only', 'complete_work': False}}],
+            progress=lambda _: None, should_stop=lambda: bool(self._observations(app)))
+        source, = self._observations(app)
+        self.assertEqual(source['status'], 'ok', source)
+        self.assertNotIn('result_investigation', source['data'])
+        self.assertIsNone(app.implementation.continuation(source,
+            Path(source['data']['prepared_result']).parts[1]))
+        self.coordinator.assert_not_called()
 
     def test_goal_findings_execution_retains_notes_without_adoption_or_report(self):
         from tests.test_tool_agent_handoff import ConversationContextTests
@@ -2051,7 +2156,7 @@ class ProfessionalReportChainTests(unittest.TestCase):
             'Independently check the original records and every delivered material. '
             'Separate measured model costs from unknown policy costs. Do not fit or rerun experiments.',
             model='fixture', sources={'results': self.inputs}, services=self.services,
-            professional_inputs=True, report_protocol='canonical_report.v1',
+            professional_inputs=True, investigate_results=False, report_protocol='canonical_report.v1',
             allow_execution=True, max_turns=28, max_tokens=700000, max_attempts=100,
             process_limits={'process_invocations': 16, 'process_wall_seconds': 480})
 

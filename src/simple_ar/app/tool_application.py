@@ -446,6 +446,8 @@ class ToolApplication:
             raise ValueError('Unsupported document work source contract')
         self.writing.joint_delivery = config.get('professional_work') in _OUTCOME_WORK
         self.writing.producer_completion = config.get('producer_completion')
+        if config.get('result_investigation') not in {None, 'execution_findings.v1'}:
+            raise ValueError('Unsupported result investigation contract')
         if self.writing.producer_completion not in {None, 'goal_findings.v1'}:
             raise ValueError('Unsupported producer completion contract')
         if config.get('professional_work') == _REQUEST_OWNER and self.writing.producer_completion is None:
@@ -597,6 +599,7 @@ class ToolApplication:
                 row['function']['parameters'].get('properties', {}).pop('repair_review', None)
                 row['function']['parameters'].get('properties', {}).pop('work_contract', None)
                 row['function']['parameters'].get('properties', {}).pop('producer_completion', None)
+                row['function']['parameters'].get('properties', {}).pop('result_investigation', None)
                 row['function']['parameters'].get('properties', {}).pop('candidate_admission', None)
                 if self.state['config'].get('professional_work') in _SHARED_OWNER_MODES:
                     row['function']['parameters'].get('properties', {}).pop('max_repairs', None)
@@ -921,8 +924,10 @@ class ToolApplication:
         """
         if not self.gateway.policy.is_allowed(self.gateway.registry.get('read_file'))[0]:
             return []
-        return journal_material_references(self.workspace, self.session.store, self.state['turns'], targets,
+        references = journal_material_references(self.workspace, self.session.store, self.state['turns'], targets,
             include_cross_path=self.state['config'].get('professional_work') in _ADOPTING_OWNER_MODES)
+        findings = self.gateway.professional_inputs(targets, include_observations=True)
+        return [row for finding in findings for row in finding.get('observations', [])] + references
 
     def _work_context(self, targets: list[str]) -> dict[str, Any]:
         """Pass related original feedback, not another coordinator summary.
@@ -990,6 +995,9 @@ class ToolApplication:
                     'arguments': arguments, 'result': result, 'subjects': subjects})
         context = {'user_requests': list(self.state['requests']), 'review_observations': reviews,
             'scope': 'Original requests and related accepted checks, not permission, scientific proof or verification of changed files. Historical checks without bound inputs are not inferred.'}
+        findings = self.gateway.professional_inputs(targets)
+        if findings:
+            context['professional_findings'] = findings
         if self.state['config'].get('input_contract') == _DECLARED_INPUTS:
             context['creation_declarations'] = self.state['config']['creation_declarations']
         if len(json.dumps(context, ensure_ascii=False).encode('utf-8')) > 256000:
@@ -1418,6 +1426,7 @@ class ToolApplication:
                delivery_files: list[str] | None = None,
                tool_contracts: Literal['full', 'on_demand', 'outcomes'] = 'on_demand',
                completion_policy: str = 'closing_decision.v2', professional_inputs: bool = False,
+               investigate_results: bool = True,
                creation_declarations: dict[str, Any] | None = None,
                context_protocol: Literal['conversation.v1'] | None = 'conversation.v1') -> ToolApplication:
         if context_protocol not in {None, 'conversation.v1'}:
@@ -1438,6 +1447,10 @@ class ToolApplication:
         if professional_inputs:
             config['professional_inputs'] = 'owner.v3'
             config['professional_work'] = _REQUEST_OWNER if code_task is None else 'outcomes.v2'
+        if type(investigate_results) is not bool:
+            raise ValueError('investigate_results must be boolean')
+        if investigate_results and professional_inputs and code_task is None:
+            config['result_investigation'] = 'execution_findings.v1'
         if context_protocol is not None:
             config['context_protocol'] = context_protocol
         config['producer_completion'] = 'goal_findings.v1'
@@ -1579,6 +1592,8 @@ class ToolApplication:
                 config['document_source_contract'] = candidate['document_source_contract']
             if 'producer_completion' in old:
                 config['producer_completion'] = old['producer_completion']
+            if 'result_investigation' in old:
+                config['result_investigation'] = old['result_investigation']
             for name in fields - {'model', 'sources', 'allow_execution', 'allow_network'}:
                 if not replace_existing and old.get(name) is not None and old[name] != config.get(name):
                     raise ValueError(f'{name} is already frozen; use its existing feedback/revision contract')
@@ -3168,10 +3183,12 @@ class ToolApplication:
                         'candidate_admission': 'python_candidate_admission.v1'}
                     if self.state['config'].get('producer_completion') is not None:
                         frozen['producer_completion'] = self.state['config']['producer_completion']
+                    if self.state['config'].get('result_investigation') is not None:
+                        frozen['result_investigation'] = self.state['config']['result_investigation']
                 else:
                     frozen = {key: self.state['config'][key] for key in ('producer_completion',)
                         if self.state['config'].get(key) is not None}
-                for field in ('work_contract', 'candidate_admission', 'producer_completion'):
+                for field in ('work_contract', 'candidate_admission', 'producer_completion', 'result_investigation'):
                     expected = frozen.get(field)
                     if (field != 'producer_completion' and expected is not None
                             and (self.state['config'].get('professional_work') not in _SHARED_OWNER_MODES
@@ -3180,6 +3197,9 @@ class ToolApplication:
                         raise ValueError('Historical sessions cannot acquire a new internal work contract')
                     if field in arguments and arguments[field] != expected:
                         raise ValueError(f'{field} conflicts with the saved ownership contract')
+                    if field == 'result_investigation' and expected is not None and (
+                            self.state['config'].get(field) != expected):
+                        raise ValueError('Historical tasks cannot acquire execution investigation')
                     if expected is not None:
                         arguments[field] = expected
         except (OSError, ValueError, KeyError, TypeError) as exc:
@@ -3187,8 +3207,7 @@ class ToolApplication:
         else:
             terminal_error = self._terminal_error(call)
             spec = self.gateway.registry.get(call['function']['name'])
-            professional_request = bool(spec is not None and spec.domain in {'implementation', 'writing'}
-                and (arguments.get('complete_work') is True or arguments.get('publication') is not None))
+            professional_request = self.gateway.requires_followup(call['function']['name'], arguments)
             # A domain's explicit terminal operation already owns its actual
             # result and delivery gate (e.g. final review/export). It needs no
             # subsequent model decision, unlike an ordinary professional call.
