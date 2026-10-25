@@ -2205,8 +2205,7 @@ class ToolApplication:
 
     def _system_text(self, *, closing: bool = False) -> str:
         if self.operations is not None:
-            from simple_ar.app.operation_tools import SYSTEM as operations_system
-            return operations_system + ('\n\n'+_CLOSING_DECISION if closing else '')
+            return self.operations.system + ('\n\n'+_CLOSING_DECISION if closing else '')
         # Do not append delegation advice to the old do-everything solver role:
         # professional owners now hold the complete investigation-to-result unit.
         mode = self.state['config'].get('professional_work')

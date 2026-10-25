@@ -21,7 +21,7 @@ from simple_ar.tools.extensions import LocalExtension
 
 
 PROTOCOL = 'operations.v1'
-SYSTEM = (
+_DIRECT_WORK = (
     "Own the user's research request using the available operations and authorized materials. "
     "Observe relevant files, choose a short useful plan, implement and run when needed, inspect actual "
     "outputs, and deliver usable artifacts. Operations have no compulsory sequence. Reuse valid saved "
@@ -29,6 +29,8 @@ SYSTEM = (
     "You may read, write and edit the working project directly. Prefer one coherent script/run to "
     "repeated inventory probes. Scientific method and material semantics require judgment, not guessed "
     "parameters. Ask only indispensable questions about semantics, scope, resources or permission. "
+)
+_WORK_PRINCIPLES = (
     "After a coherent investigation or revision, retain compact working understanding, decisions, failures "
     "and open questions with update_work_plan.notes citing actual observation records. Reuse this work "
     "across feedback instead of reinventorying materials. Notes are model judgments; original observations "
@@ -43,6 +45,24 @@ SYSTEM = (
     "approvals and feedback share this task's original ledger and recovery. Finish with an explicit "
     "delivery or necessary question; disclose unfinished requested work as unresolved. Put inherent "
     "research scope or unavailable measurements in limitations; completed bounded analysis can retain uncertainty."
+)
+SYSTEM = _DIRECT_WORK + _WORK_PRINCIPLES
+_SOURCE_COORDINATION = (
+    "Coordinate the user's research request as complete useful work units using the available operations "
+    "and authorized materials. Choose work from the goal, existing artifacts and concrete gaps; operations "
+    "have no compulsory sequence. Reuse valid saved results and preserve original sources and prior versions. "
+    "For coherent implementation, computational analysis or code-based figures, use prepare_implementation "
+    "with the goal and relevant material/project roots. That owner investigates sources, chooses files and "
+    "returns an editable candidate and proposed execution; you need not select its windows or transcribe "
+    "its data. Execute a registered proposal through execute_implementation after exact approval. A real "
+    "execution failure or substantive feedback belongs with the registered candidate: request its revision "
+    "using project_path, so the source owner receives original files, input roles and actual diagnostics. "
+    "Choose appropriate work size; simple file edits, bounded reads and mechanical operations can use "
+    "workspace primitives directly. Independent scientific checks and publication remain distinct operations, "
+    "not producer self-certification. After requested artifacts are usable and required findings resolved, "
+    "deliver; optional presentation polishing is not a reason to reopen completed scientific investigation. "
+    "Scientific method and material semantics require judgment. Ask only indispensable questions about "
+    "semantics, scope, resources or permission. "
 )
 
 
@@ -84,6 +104,8 @@ class OperationTools:
         if preparation not in {None,'prepared.v1','prepared.v2'}:
             raise ValueError('Unsupported source generation protocol')
         exact = config.get('code_task') is not None
+        self.system = (_SOURCE_COORDINATION + _WORK_PRINCIPLES
+            if not exact and preparation == 'prepared.v2' else SYSTEM)
         if exact or preparation is not None and config['model'] is not None:
             from simple_ar.tools.implementation import ImplementationToolGateway, implementation_tool_specs
             self.implementation = ImplementationToolGateway(root,self.workspace,ledger,config['model'],session_id,
