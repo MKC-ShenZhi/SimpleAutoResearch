@@ -208,13 +208,9 @@ class OperationTools:
             and {self.workspace.resolve(path) for path in row.get('artifacts',[])}.intersection(
                 self.workspace.resolve(path) for path in resolved['artifacts'])]
         if report is not None and (published or set(report.formats)-{'markdown'}):
-            formats = list(dict.fromkeys(['markdown',*report.formats]))
-            if any(row['data'].get('manifest',{}).get('status')=='compiled' for row in published):
-                formats.append('pdf')
-            formats.append('tex')
             try:
                 self.publication.check_report_delivery(observations,None,resolved['artifacts'],
-                    formats=formats,manuscript=report.manuscript,
+                    formats=report.formats,manuscript=report.manuscript,
                     proposed=proposed.arguments if proposed is not None and proposed.tool_name=='export_report' else None)
             except (ValueError,OSError,KeyError,RuntimeError) as exc:
                 issues.append(str(exc))

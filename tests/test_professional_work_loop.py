@@ -474,6 +474,107 @@ class OperationsWorkLoopTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), raw)
         self.assertEqual(len(self._observations('run_process')), 0)
 
+    def test_same_path_republication_selects_current_delivery_and_preserves_history(self):
+        if not shutil.which('pandoc'):
+            self.skipTest('Real replacement publication requires Pandoc on the server')
+        compile_pdf = os.environ.get('SAR_TEST_EXPORT_INTEGRATION') == '1'
+        if compile_pdf and not all(shutil.which(tool) for tool in ('pdflatex','bibtex')):
+            self.skipTest('Requested PDF integration needs the real ACM TeX environment')
+        self._create(report=True)
+        original_inputs = self._versions(self.inputs)
+        self._write('analyze.py',_PROGRAM)
+        self._submit(_action('run_process',argv=['python','workspace/analyze.py',
+            'measurements/observations.csv','workspace/paper'],
+            inputs=['analyze.py','measurements/observations.csv'],
+            outputs=['paper/table.csv','paper/summary.json','paper/figure.png'],timeout_sec=10),
+            approve=lambda *_:True)
+        self._ok('run_process')
+        manuscript = 'paper/report.md'
+        self._write('paper/references.bib',
+            '@misc{P1, author={Fixture Author}, title={Supplied observations}, year={2026}}\n')
+        self._write(manuscript,_BODY+'\nThe supplied observation record is cited as [@P1].\n')
+        self._inspect([manuscript])
+        self._ok('inspect_artifacts')
+        self._submit(_action('export_report',markdown=manuscript,compile_pdf=compile_pdf),approve=lambda *_:True)
+        old = self._ok('export_report')
+        old_project = self.app.workspace.resolve(old['data']['project'])
+        formats = ['pdf'] if compile_pdf else ['tex']
+        old_outputs = [self.app.workspace.locator(str(old_project/'main.pdf'))] if compile_pdf else old['artifacts']
+        old_delivery = self._delivery(manuscript,*old_outputs)
+        old_delivery['report']['formats'] = formats
+        self._submit(_action('deliver_result',**old_delivery))
+        self._ok('deliver_result')
+        self.assertEqual(self.app.session.manifest.status,'completed',self.app.result_snapshot())
+        old_bytes = self._versions(old_project)
+        old_records = {path:path.read_bytes() for path in (self.root/'attempts').glob('*/native_result.json')}
+        old_usage = [entry.to_dict() for entry in self.app.ledger.entries]
+
+        self._submit(_action('read_file',path=manuscript,full_digest=True),
+            feedback='Clarify the inference limit in the same manuscript and publish the revised version.')
+        version = self._ok('read_file')['data']['sha256']
+        self._submit(_action('edit_file',path=manuscript,expected_sha256=version,
+            old_text='The sample mean is 2.0 across 3 supplied observations.',new_text=_SCOPE))
+        self._ok('edit_file')
+        self._inspect([manuscript])
+        self._ok('inspect_artifacts')
+        self._reload()
+        self._submit(_action('deliver_result',**old_delivery))
+        self.assertIn('Publication authoring inputs changed',self._last('deliver_result')['error'])
+        self.assertNotEqual(self.app.session.manifest.status,'completed')
+        self._submit(_action('export_report',markdown=manuscript,compile_pdf=compile_pdf),approve=lambda *_:True)
+        current = self._ok('export_report')
+        current_project = self.app.workspace.resolve(current['data']['project'])
+        self.assertNotEqual(current_project,old_project)
+        current_outputs = ([self.app.workspace.locator(str(current_project/'main.pdf'))]
+                           if compile_pdf else current['artifacts'])
+        delivery = self._delivery(manuscript,*current_outputs)
+        delivery['report']['formats'] = formats
+        if compile_pdf:
+            self.assertNotIn(self.app.workspace.locator(str(current_project/'main.tex')),delivery['artifacts'])
+        observations = self.app._operation_observations()
+        ledger = self.app.ledger.to_dict()
+        calls = self.send.call_count
+
+        def check(rows,artifacts):
+            return self.app.publication.check_report_delivery(rows,None,artifacts,
+                formats=formats,manuscript=manuscript)
+
+        expected = {self.app.workspace.resolve(path) for path in current['data']['artifact_sha256']}
+        for rows in (observations,list(reversed(observations))):
+            self.assertEqual(check(rows,delivery['artifacts']),expected)
+            # Even when an old project is also delivered, its stale source
+            # binding cannot veto a genuinely current replacement candidate.
+            self.assertEqual(check(rows,[*delivery['artifacts'],*old_outputs]),expected)
+        old_source = old_project/'source.md'
+        try:
+            old_source.write_bytes(old_bytes[old_source]+b'\nHistorical project damaged.\n')
+            self.assertEqual(check(observations,delivery['artifacts']),expected)
+        finally:
+            old_source.write_bytes(old_bytes[old_source])
+        # PDF-only delivery still validates the full retained project binding;
+        # it simply does not require every editable file in the delivery list.
+        selected = current_project/'main.tex'
+        selected_bytes = selected.read_bytes()
+        try:
+            selected.write_bytes(selected_bytes+b'\n% Changed after export.\n')
+            with self.assertRaisesRegex(ValueError,'Publication project or owner evidence changed'):
+                check(observations,delivery['artifacts'])
+            self._submit(_action('deliver_result',**delivery))
+            self.assertIn('Publication project or owner evidence changed',self._last('deliver_result')['error'])
+            self.assertNotEqual(self.app.session.manifest.status,'completed')
+        finally:
+            selected.write_bytes(selected_bytes)
+        self._reload()
+        self._submit(_action('deliver_result',**delivery))
+        self._ok('deliver_result')
+        self.assertEqual(self.app.session.manifest.status,'completed',self.app.result_snapshot())
+        self.assertEqual(self.app.ledger.to_dict(),ledger)
+        self.assertEqual(self.send.call_count,calls)
+        self.assertEqual([entry.to_dict() for entry in self.app.ledger.entries][:len(old_usage)],old_usage)
+        for path,raw in {**old_bytes,**old_records}.items():
+            self.assertEqual(path.read_bytes(),raw)
+        self.assertEqual(self._versions(self.inputs),original_inputs)
+
     def test_text_inspection_preserves_scope_and_does_not_promote_a_copy_to_evidence(self):
         self._create(report=True)
         missing = self._inspect(['missing.md'])

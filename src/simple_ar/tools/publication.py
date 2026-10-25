@@ -263,41 +263,58 @@ class PublicationToolGateway:
                 raise ValueError('The declared PDF obligation requires compilation')
             return set()  # Recheck actual owner results before terminal commit.
         delivered = {self.workspace.resolve(path) for path in artifacts}
+        failures = []
         for row in observations:
             data = row.get('data') or {}
             if data.get('candidate_preparation') or data.get('report_identity', {}).get('kind') == 'publication_candidate':
                 continue
             if row.get('tool_name') != 'export_report' or row.get('status') != 'ok' or not data.get('project'):
                 continue
-            project = self.workspace.resolve(data['project'])
-            owner = ArtifactStore(self.root / 'tools/publications' / project.name)
-            saved, result = owner.read_json('request.json'), owner.read_json('result.json')
-            if (self.workspace.resolve(saved['markdown']) != self.workspace.resolve(source)
-                    or saved.get('report_identity') != identity or data.get('report_identity') != identity
-                    or result.get('report_identity') != identity):
+            try:
+                project = self.workspace.resolve(data['project'])
+            except (ValueError,OSError,TypeError):
+                continue  # An inaccessible historical project cannot select a delivery role.
+            # Select delivered publication roles before validating historical
+            # inputs. A shared manuscript path can have many immutable exports.
+            if not any(path.is_relative_to(project) for path in delivered):
                 continue
-            hashes = result.get('artifact_sha256')
-            if (not hashes or data.get('artifact_sha256') != hashes
-                    or self.workspace.artifact_hashes(hashes) != hashes
-                    or ArtifactStore(project).read_json('export.json') != data['manifest']):
-                raise ValueError('Publication project or owner evidence changed')
-            request = ExportRequest.model_validate({key: value for key, value in saved.items()
-                if key not in {'inputs', 'image_binding_version', 'output_binding_version', 'report_identity'}})
-            current = export_input_binding(self.workspace.resolve(saved['markdown']), request,
-                output_root=self.workspace.workspace / 'publications')
-            if current['inputs'] != saved.get('inputs'):
-                raise ValueError('Publication authoring inputs changed')
-            self.workspace.check_artifact_producers(str(self.workspace.resolve(saved['markdown']).parent / key)
-                for key, digest in current['inputs'].items() if digest is not None)
             required = {project / 'main.pdf'} if 'pdf' in formats else set()
-            if 'pdf' in formats and data['manifest'].get('compiled') is not True:
-                continue
-            if 'tex' in formats:
-                required.update(self.workspace.resolve(path) for path in hashes)
-            if not required:
+            if not required and 'tex' not in formats:
                 required.add(project / 'source.md')
-            if required.issubset(delivered) and all(path.is_file() for path in required):
-                return {self.workspace.resolve(path) for path in hashes}
+            if not required.issubset(delivered):
+                continue
+            try:
+                owner = ArtifactStore(self.root / 'tools/publications' / project.name)
+                saved, result = owner.read_json('request.json'), owner.read_json('result.json')
+                if (self.workspace.resolve(saved['markdown']) != self.workspace.resolve(source)
+                        or saved.get('report_identity') != identity or data.get('report_identity') != identity
+                        or result.get('report_identity') != identity):
+                    continue
+                hashes = result.get('artifact_sha256')
+                if (not hashes or data.get('artifact_sha256') != hashes
+                        or self.workspace.artifact_hashes(hashes) != hashes
+                        or ArtifactStore(project).read_json('export.json') != data['manifest']):
+                    raise ValueError('Publication project or owner evidence changed')
+                request = ExportRequest.model_validate({key: value for key, value in saved.items()
+                    if key not in {'inputs', 'image_binding_version', 'output_binding_version', 'report_identity'}})
+                current = export_input_binding(self.workspace.resolve(saved['markdown']), request,
+                    output_root=self.workspace.workspace / 'publications')
+                if current['inputs'] != saved.get('inputs'):
+                    raise ValueError('Publication authoring inputs changed')
+                self.workspace.check_artifact_producers(str(self.workspace.resolve(saved['markdown']).parent / key)
+                    for key, digest in current['inputs'].items() if digest is not None)
+                if 'pdf' in formats and data['manifest'].get('compiled') is not True:
+                    continue
+                if 'tex' in formats:
+                    required.update(self.workspace.resolve(path) for path in hashes)
+                if required.issubset(delivered) and all(path.is_file() for path in required):
+                    return {self.workspace.resolve(path) for path in hashes}
+            except (ValueError,OSError,KeyError,TypeError,RuntimeError) as exc:
+                # Rejected candidates remain history, not a veto over another
+                # genuinely current publication delivered for the same source.
+                failures.append(str(exc))
+        if failures:
+            raise ValueError('; '.join(dict.fromkeys(failures)))
         raise ValueError('Requested report formats need a byte-bound publication of the same manuscript, figures and bibliography')
 
     def call(self, name: str, arguments: dict[str, Any], *, identity: str) -> ToolResult:

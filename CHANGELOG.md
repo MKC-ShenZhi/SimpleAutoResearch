@@ -14,6 +14,7 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 
 ### Fixed
 
+- Republishing a revised manuscript at the same path validates the publication actually delivered; retained older exports no longer veto a valid current version. PDF-only delivery does not acquire an implicit TeX requirement.
 - Preserve frozen analysis, research and implementation/measurement obligations through the new action loop. Final writes and approved runs are checked against their actual produced files rather than requiring those files before execution.
 - Rendered-image inspection follows the configured model output limit instead of imposing a separate 3,000-token cap. Explicit recovery of a failed decision with no unknown charges also supports an unchanged, uncapped output setting; unknown charges retain stricter recovery checks.
 
