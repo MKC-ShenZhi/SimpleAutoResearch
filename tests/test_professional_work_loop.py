@@ -114,6 +114,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.services = SimpleNamespace(llm_client=client)
         self.decisions = deque()
         self.inspection_views = []
+        self.inspection_requests = []
+        self.inspection_messages = []
         self.memory_views = []
         self.transport_errors = []
         self.review = lambda view: {'findings': [], 'limitations': []}
@@ -146,11 +148,39 @@ class OperationsWorkLoopTests(unittest.TestCase):
         # We do not choose responses using invocation labels or internal stages.
         try:
             self.assertEqual(mode, 'chat')
-            if request.get('tools'):
+            offered = {tool['function']['name'] for tool in request.get('tools', [])}
+            if 'record_inspection' in offered:
+                self.assertLessEqual(offered, {
+                    'read_file', 'list_directory', 'search_files', 'record_inspection'})
+                # Native follow-ups retain the original view and append assistant/tool
+                # messages; source observations arrive through tool replies.
+                view, _ = json.JSONDecoder().raw_decode(request['messages'][1]['content'])
+                self.assertTrue(view['targets'])
+                self.assertIn('evidence', view)
+                ids = [row['subject'] for row in view['targets']]
+                self.assertEqual(len(ids), len(set(ids)))
+                self.assertTrue(all(row['text_windows'] for row in view['targets']))
+                for row in [*view['targets'], *view['evidence']]:
+                    for window in row['text_windows']:
+                        self.assertIsInstance(window['text'], str)
+                self.inspection_views.append(view)
+                self.inspection_requests.append(deepcopy(request))
+                response = self.review(view)
+                actions = ([_action('record_inspection', **response)]
+                    if isinstance(response, dict) else response)
+                message = {'role': 'assistant', 'content': None,
+                    'reasoning_content': 'Inspect the recorded evidence and retain its limits.',
+                    'tool_calls': [{
+                        'id': f'inspection-{self.send.call_count}-{number}', 'type': 'function',
+                        'function': {'name': action['tool_name'],
+                            'arguments': json.dumps(action['arguments'])}}
+                        for number, action in enumerate(actions)]}
+                self.inspection_messages.append(deepcopy(message))
+                finish = 'tool_calls'
+            elif request.get('tools'):
                 self.assertTrue(self.decisions, 'Unexpected model work after the supplied decisions')
                 action = self.decisions.popleft()
                 action = action() if callable(action) else action
-                offered = {tool['function']['name'] for tool in request['tools']}
                 self.assertIn(action['tool_name'], offered)
                 message = {'role': 'assistant', 'content': None, 'tool_calls': [{
                     'id': f'decision-{self.send.call_count}', 'type': 'function',
@@ -166,25 +196,37 @@ class OperationsWorkLoopTests(unittest.TestCase):
                         'observations':[row['id'] for row in view['observations'][:4]]}]})}
                     return {'choices':[{'message':message,'finish_reason':'stop'}],
                         'usage':{'prompt_tokens':100,'completion_tokens':40,'total_tokens':140}}
-                self.assertIn('findings', view['response_schema']['properties'])
-                self.assertTrue(view['targets'])
-                self.assertIn('evidence', view)
-                ids = [row['subject'] for row in view['targets']]
-                self.assertEqual(len(ids), len(set(ids)))
-                self.assertTrue(all(row['text_windows'] for row in view['targets']))
-                for row in [*view['targets'], *view['evidence']]:
-                    for window in row['text_windows']:
-                        self.assertIsInstance(window['text'], str)
-                self.inspection_views.append(view)
-                response = self.review(view)
-                message = {'role': 'assistant', 'content': json.dumps(response)}
-                finish = 'stop'
+                self.fail('Unexpected non-native provider request outside working memory')
             return {'choices': [{'message': message, 'finish_reason': finish}],
                 'usage': {'prompt_tokens': 100, 'completion_tokens': 40, 'total_tokens': 140}}
         except AssertionError as exc:
             # Production code retains provider failures; surface fixture mistakes at the test boundary.
             self.transport_errors.append(str(exc))
             raise
+
+    def _inspection_history(self):
+        """Check provider-visible native chronology and return the latest tool replies."""
+        messages = self.inspection_requests[-1]['messages']
+        previous = self.inspection_requests[-2]['messages']
+        self.assertEqual([row for row in messages if row['role']=='assistant'],
+            [row for row in previous if row['role']=='assistant'] + [self.inspection_messages[-1]])
+        self.assertEqual([row for row in messages if row['role']=='tool'][:
+            sum(row['role']=='tool' for row in previous)],
+            [row for row in previous if row['role']=='tool'])
+        replies, pending = [], []
+        for message in messages:
+            if message['role'] == 'assistant' and message.get('tool_calls'):
+                self.assertFalse(pending, 'An assistant turn preceded outstanding tool replies')
+                self.assertEqual(message.get('reasoning_content'),
+                    'Inspect the recorded evidence and retain its limits.')
+                pending = [call['id'] for call in message['tool_calls']]
+                replies = []
+            elif message['role'] == 'tool':
+                self.assertTrue(pending, 'Tool reply has no preceding native call')
+                self.assertEqual(message['tool_call_id'], pending.pop(0))
+                replies.append(json.loads(message['content']))
+        self.assertFalse(pending, 'Provider follow-up lost a tool reply')
+        return replies
 
     def _run(self, **kwargs):
         turns = self.app.state['turns']
@@ -805,19 +847,20 @@ class OperationsWorkLoopTests(unittest.TestCase):
         def review(view):
             rounds = len(self.inspection_views)
             if rounds==1:
-                return {'findings':[],'limitations':[], 'requests':[{
-                    'tool':'list_directory','arguments':{'path':'measurements'}}]}
+                return [_action('list_directory', path='measurements')]
+            replies = self._inspection_history()
             if rounds==2:
-                entries = view['discovery'][0]['result']['data']['entries']
-                self.assertTrue(any('observations.csv' in str(row) for row in entries))
-                return {'findings':[],'limitations':[], 'requests':[
-                    {'tool':'read_file','arguments':{'path':'measurements/observations.csv'}},
-                    {'tool':'read_file','arguments':{'path':str(self.directory/'outside.txt')}}]}
+                self.assertEqual(len(replies), 1)
+                self.assertIn('observations.csv', json.dumps(replies[0]))
+                return [
+                    _action('search_files', path='measurements', query='sample'),
+                    _action('read_file', path='measurements/observations.csv'),
+                    _action('read_file', path=str(self.directory/'outside.txt'))]
             self.assertEqual(rounds,3)
-            source = next(row for row in view['evidence'] if row.get('path')==str(self.inputs/'observations.csv'))
-            self.assertIn('a,1',source['text_windows'][0]['text'])
-            self.assertTrue(any(row.get('limitation') for row in view['evidence']))
-            return {'findings':[],'limitations':['The inaccessible file was not read.'],'requests':[]}
+            self.assertEqual(len(replies), 3)
+            self.assertIn('a,1', json.dumps(replies[1]))
+            self.assertNotEqual(replies[2]['status'], 'ok', replies[2])
+            return {'findings':[],'limitations':['The inaccessible file was not read.']}
 
         (self.directory/'outside.txt').write_text('Not authorized for this task.\n')
         self.review = review
@@ -837,36 +880,105 @@ class OperationsWorkLoopTests(unittest.TestCase):
                          _digest(self.inputs/'observations.csv'))
         self.assertNotIn(str(self.directory/'outside.txt'),assessment['evidence_sha256'])
         self.assertNotIn('Not authorized for this task',json.dumps(self.inspection_views))
+        self.assertNotIn('Not authorized for this task',json.dumps(self.inspection_requests))
         self.assertEqual(self.send.call_count,3)
         identity = Path(result['data']['record']).parts[1]
+        saved_records = self._versions(self.root/f'tools/inspection/{identity}')
+        self.assertTrue(any(path.name=='sources-0.json' for path in saved_records))
+        usage = [entry.to_dict() for entry in self.app.ledger.entries if entry.attempt_id==identity]
+        self.assertEqual(sum(row.get('actual', {}).get('llm_requests', 0) for row in usage), 3)
         self._reload()
         cached = self.app.operations.inspection.call('inspect_artifacts',{
             'goal':'Check the claims against supplied observations','targets':['notes.md'],
             'evidence':['measurements/conditions.txt']},identity)
         self.assertEqual(cached.status,'ok',cached.error)
         self.assertEqual(self.send.call_count,3)
+        self.assertEqual(self._versions(self.root/f'tools/inspection/{identity}'), saved_records)
+        self.assertEqual([entry.to_dict() for entry in self.app.ledger.entries
+            if entry.attempt_id==identity], usage)
         (self.inputs/'observations.csv').write_text('sample,value\na,9\n')
         self.assertFalse(self.app.operations.inspection.can_reconcile('inspect_artifacts',identity))
         for path,raw in originals.items():
             path.write_bytes(raw)
         self.assertEqual(self._versions(self.inputs),originals)
 
+    def test_inspector_rejected_native_batches_reply_without_executing_and_can_recover(self):
+        final = _action('record_inspection', findings=[], limitations=[])
+        source = _action('read_file', path='measurements/conditions.txt')
+        cases = {
+            'unoffered_write': [_action('write_file', path='intrusion.txt', content='unapproved')],
+            'mixed_final': [source, final],
+            'final_then_source': [final, source],
+            'multiple_final': [final, final],
+            'invalid_shape': [{'tool_name':'read_file', 'arguments':['measurements/conditions.txt']}],
+            'too_many_sources': [source]*9,
+        }
+        for name, batch in cases.items():
+            with self.subTest(batch=name):
+                self.root = self.directory/name
+                self._create(report=True)
+                self._write('report.md', 'The sample mean is 2.0.\n')
+                before = len(self.inspection_requests)
+                originals = self._versions(self.inputs)
+
+                def recover(view):
+                    if len(self.inspection_requests)==before+1:
+                        return batch
+                    self.assertEqual(len(self.inspection_requests), before+2)
+                    replies = self._inspection_history()
+                    self.assertEqual(len(replies), len(batch))
+                    self.assertTrue(all(reply['status']!='ok' for reply in replies), replies)
+                    return {'findings':[], 'limitations':[]}
+
+                self.review = recover
+                workspace = self.app.operations.inspection.workspace
+                with patch.object(workspace, 'call', wraps=workspace.call) as reads:
+                    self._inspect(['report.md'], [])
+                self.assertEqual(self._assessment()['verdict'], 'passed')
+                self.assertEqual(len(self.inspection_requests)-before, 2)
+                # Admission and version checks can read the target; no rejected
+                # batch may reach a source read or a workspace write.
+                self.assertFalse(any(call.args[0]=='write_file' or
+                    (call.args[0]=='read_file' and
+                     call.args[1].get('path')=='measurements/conditions.txt')
+                    for call in reads.call_args_list))
+                self.assertFalse((self.root/'workspace/intrusion.txt').exists())
+                self.assertEqual(self._versions(self.inputs), originals)
+                self.assertFalse(self._process_receipts())
+
     def test_incomplete_source_investigation_supersedes_prior_pass_and_retains_completed_reads(self):
         self._create(report=True)
         self._write('report.md','The sample mean is 2.0.\n')
         self._inspect(['report.md'])
         self.assertEqual(self._assessment()['verdict'],'passed')
-        self.review = lambda view: {'findings':[],'limitations':[], 'requests':[
-            {'tool':'read_file','arguments':{'path':'measurements/observations.csv'}},
-            {'tool':'read_file','arguments':{'path':'measurements/conditions.txt','max_bytes':-1}}]}
-        result = self._inspect(['report.md'],['measurements/conditions.txt'])
+        first_round = len(self.inspection_requests)
+        def invalid_reads(view):
+            if len(self.inspection_requests)>first_round+1:
+                replies = self._inspection_history()
+                self.assertEqual(len(replies), 2)
+                self.assertNotEqual(replies[1]['status'], 'ok', replies[1])
+            if len(self.inspection_requests)==first_round+7:
+                self.assertEqual({tool['function']['name']
+                    for tool in self.inspection_requests[-1]['tools']}, {'record_inspection'})
+                # The real provider also requested a read after only the final
+                # tool was offered. Exhaustion must not grant another read.
+                return [_action('list_directory', path='measurements')]
+            return [
+                _action('read_file', path='measurements/observations.csv'),
+                _action('read_file', path='measurements/conditions.txt', max_bytes=-1)]
+        self.review = invalid_reads
+        workspace = self.app.operations.inspection.workspace
+        with patch.object(workspace, 'call', wraps=workspace.call) as reads:
+            result = self._inspect(['report.md'],['measurements/conditions.txt'])
+        self.assertFalse(any(call.args[0]=='list_directory' for call in reads.call_args_list))
+        self.assertEqual(len(self.inspection_requests)-first_round, 7)
         self.assertEqual(result['status'],'error')
         self.assertEqual(result['metadata']['assessment']['verdict'],'incomplete')
         identity = Path(result['data']['record']).parts[1]
         saved = self.app.session.store.read_json(f'tools/inspection/{identity}/input.json')
         self.assertTrue(any(row.get('path')==str(self.inputs/'observations.csv') for row in saved['evidence']))
         trace = self.app.session.store.read_json(f'tools/inspection/{identity}/sources-0.json')
-        self.assertEqual(len(trace['results']),1)
+        self.assertEqual(len(trace['results']),2)
         self.assertEqual(trace['results'][0]['tool'],'read_file')
         calls = self.send.call_count
         self._reload()
@@ -997,8 +1109,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._write('report.md', 'The sample mean is 2.0.\n')
         def lose_followup(view):
             if len(self.inspection_views)==1:
-                return {'findings':[],'limitations':[], 'requests':[
-                    {'tool':'list_directory','arguments':{'path':'measurements'}}]}
+                return [_action('list_directory', path='measurements')]
+            self.assertEqual(len(self._inspection_history()), 1)
             raise httpx.ReadTimeout('Response lost after dispatch')
         self.review = lose_followup
         self._inspect(['report.md'])

@@ -94,9 +94,10 @@ it is not replayed or silently marked delivered. Historical receipts remain
 unchanged, and damaged bindings still stop. Publication owns its actual source
 and export inventory; the coordinator does not reconstruct them.
 
-Inspection owns bounded source investigation through the existing workspace read
-contracts, rather than asking the coordinator to assemble each missing window.
-Its final assessment and version rules are unchanged; partial reads and failed
+Inspection owns bounded source investigation through native read-only tools,
+then submits its structured opinion separately. Chat and Responses retain the
+configured connection, paired calls/results and necessary reasoning items rather
+than simulating reads in JSON prose. Its assessment and version rules are unchanged; partial reads and failed
 responses remain in the same inspection records. Publication shares byte-bound
 PDF metadata across checks and previews, forecasts remaining physical process
 slots, and leaves actual charging to core. Sequential timeout sums are upper

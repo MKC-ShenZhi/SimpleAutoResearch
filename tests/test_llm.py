@@ -944,6 +944,90 @@ class LLMParsingTests(unittest.TestCase):
             wrong_mode.chat_turn(history, tools=tools)
         call.assert_not_called()
 
+    def test_tool_turn_responses_preserves_native_items_and_settles_incomplete_usage(self):
+        tools = [{'type': 'function', 'function': {'name': name, 'description': description,
+            'parameters': schema}} for name, description, schema in (
+                ('read_file', 'Read an authorized source.', {'type': 'object',
+                    'properties': {'path': {'type': 'string'}}, 'required': ['path'],
+                    'additionalProperties': False}),
+                ('record_inspection', 'Record the final opinion.', {'type': 'object',
+                    'properties': {'findings': {'type': 'array', 'items': {'type': 'string'}},
+                        'limitations': {'type': 'array', 'items': {'type': 'string'}}},
+                    'required': ['findings', 'limitations'], 'additionalProperties': False}))]
+        opinion = {'findings': [], 'limitations': ['Text inspection only.']}
+        output = [
+            {'type': 'reasoning', 'id': 'rs-source', 'summary': [
+                {'type': 'summary_text', 'text': 'Locate the original source.'}],
+                'encrypted_content': 'opaque-reasoning-payload'},
+            {'type': 'message', 'id': 'msg-source', 'role': 'assistant', 'status': 'completed',
+                'content': [{'type': 'output_text', 'text': 'I will read the source.', 'annotations': []}]},
+            {'type': 'function_call', 'id': 'fc-source-item', 'call_id': 'call-source',
+                'name': 'read_file', 'arguments': '{"path":"observations.csv"}', 'status': 'completed'}]
+        terminal = [{'type': 'function_call', 'id': 'fc-final-item', 'call_id': 'call-final',
+            'name': 'record_inspection', 'arguments': json.dumps(opinion), 'status': 'completed'}]
+        usage = {'input_tokens': 40, 'output_tokens': 20, 'total_tokens': 60}
+        for mode in ('responses', 'auto'):
+            with self.subTest(mode=mode):
+                ledger = BudgetLedger({'llm_requests': 3, 'total_tokens': 10000})
+                observed = []
+                client = LLMClient(LLMSettings(api_key='test-key', api_mode=mode,
+                    max_output_tokens=500, retry_attempts=1),
+                    budget_ledger=ledger, usage_callback=observed.append)
+                history = [{'role': 'system', 'content': 'Inspect authorized sources only.'},
+                    {'role': 'user', 'content': 'Check the report against observations.csv.'}]
+                read_source = Mock(return_value='sample,value\na,1\n')
+                incomplete = {'status': 'incomplete',
+                    'incomplete_details': {'reason': 'max_output_tokens'},
+                    # Even syntactically complete arguments must not escape an incomplete response.
+                    'output': output, 'usage': usage}
+                with patch('simple_ar.integrations.llm._call_openai_sdk', side_effect=[
+                        {'status': 'completed', 'output': output, 'usage': usage},
+                        {'status': 'completed', 'output': terminal, 'usage': usage},
+                        incomplete]) as sdk:
+                    first = client.tool_turn(history, tools=tools,
+                        label='inspect-read', budget_call_id='inspect-read')
+                    self.assertEqual(first['_responses_output'], output)
+                    self.assertEqual(first['role'], 'assistant')
+                    source = first['tool_calls'][0]
+                    self.assertEqual(source['id'], 'call-source')
+                    self.assertEqual(source['type'], 'function')
+                    self.assertEqual(source['function']['name'], 'read_file')
+                    contents = read_source(**json.loads(source['function']['arguments']))
+                    history += [first, {'role': 'tool', 'tool_call_id': source['id'], 'content': contents}]
+                    final = client.tool_turn(history, tools=tools,
+                        label='inspect-final', budget_call_id='inspect-final')
+                    self.assertEqual(final['_responses_output'], terminal)
+                    self.assertEqual(len(final['tool_calls']), 1)
+                    self.assertEqual(final['tool_calls'][0]['id'], 'call-final')
+                    self.assertEqual(final['tool_calls'][0]['function']['name'], 'record_inspection')
+                    self.assertEqual(json.loads(final['tool_calls'][0]['function']['arguments']), opinion)
+                    before = json.dumps(history, sort_keys=True)
+                    with self.assertRaises(LLMResponseError):
+                        partial = client.tool_turn(history, tools=tools,
+                            label='inspect-incomplete', budget_call_id='inspect-incomplete')
+                        read_source(**json.loads(partial['tool_calls'][0]['function']['arguments']))
+                    self.assertEqual(json.dumps(history, sort_keys=True), before)
+                self.assertEqual(sdk.call_count, 3)
+                read_source.assert_called_once_with(path='observations.csv')
+                requests = [invocation.args[1] for invocation in sdk.call_args_list]
+                for invocation, request in zip(sdk.call_args_list, requests):
+                    self.assertEqual(invocation.args[0], 'responses')
+                    self.assertNotIn('messages', request)
+                    self.assertEqual(request['tools'], [
+                        {'type': 'function', 'strict': False, **tool['function']} for tool in tools])
+                initial = requests[0]['input']
+                self.assertIn('Inspect authorized sources only.', json.dumps(initial))
+                self.assertIn('Check the report against observations.csv.', json.dumps(initial))
+                self.assertEqual(requests[1]['input'], initial + output + [
+                    {'type': 'function_call_output', 'call_id': 'call-source', 'output': contents}])
+                self.assertEqual(requests[2]['input'], requests[1]['input'])
+                self.assertEqual([entry.logical_call_id for entry in ledger.entries],
+                    ['inspect-read', 'inspect-final', 'inspect-incomplete'])
+                self.assertEqual([entry.status for entry in ledger.entries], ['settled'] * 3)
+                self.assertEqual([entry.actual['llm_requests'] for entry in ledger.entries], [1] * 3)
+                self.assertEqual([entry.actual['total_tokens'] for entry in ledger.entries], [60] * 3)
+                self.assertEqual([record.total_tokens for record in observed], [60] * 3)
+
     def test_native_length_correction_preserves_history_caps_and_accounting(self):
         history = [{'role': 'system', 'content': 'existing permissions'},
             {'role': 'assistant', 'content': None, 'reasoning_content': 'old reasoning',
@@ -1455,6 +1539,22 @@ class LLMParsingTests(unittest.TestCase):
         with patch("simple_ar.integrations.llm._call_openai_sdk", return_value=response):
             with self.assertRaisesRegex(LLMResponseError, "reasoning content"):
                 client.ask("system", "user")
+        # Native calls are a protocol mismatch, not an output-cap diagnosis.
+        # Rejecting them must still account for the received generation.
+        response['choices'][0].update(finish_reason='tool_calls')
+        response['choices'][0]['message']['tool_calls'] = [{'id':'unoffered', 'type':'function',
+            'function':{'name':'read_file','arguments':'{"path":"source.md"}'}}]
+        with tempfile.TemporaryDirectory() as folder:
+            ledger = BudgetLedger({'llm_requests':1,'total_tokens':50000},
+                storage_path=Path(folder)/'ledger.json')
+            with patch('simple_ar.integrations.llm._call_openai_sdk', return_value=response) as sdk:
+                with self.assertRaisesRegex(LLMResponseError, 'native tool calls') as raised:
+                    client.with_budget(ledger).ask('system','user')
+            self.assertFalse(raised.exception.correction_allowed)
+            self.assertNotIn('internal reasoning',str(raised.exception))
+            self.assertEqual(sdk.call_count,1)
+            self.assertEqual(ledger.entries[0].status,'settled')
+            self.assertIn('text-only request',ledger.entries[0].reason)
 
     def test_length_response_without_reasoning_has_output_cap_hint(self) -> None:
         client = LLMClient(LLMSettings(api_key="test-key", api_mode="chat"))

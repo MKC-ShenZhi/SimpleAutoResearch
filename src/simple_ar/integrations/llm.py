@@ -538,6 +538,52 @@ class LLMClient:
             raise LLMResponseError(_empty_response_message(response))
         return {**message, "role": "assistant"}
 
+    def tool_turn(self, messages: list[dict[str, Any]], *, tools: list[dict[str, Any]],
+                  label: str = '', budget_call_id: str | None = None) -> dict[str, Any]:
+        """Read-only or domain conversations on the configured API, without executing calls.
+
+        Chat keeps its native path. Responses retains complete output items, including
+        reasoning, alongside the normalized assistant message so a subsequent tool
+        result can be paired without flattening history or switching a named route.
+        """
+        if self._settings.api_mode == 'chat':
+            return self.chat_turn(messages,tools=tools,label=label,budget_call_id=budget_call_id)
+        if (not isinstance(messages,list) or not messages
+                or any(not isinstance(row,dict) for row in messages)
+                or not isinstance(tools,list) or any(not isinstance(tool,dict) for tool in tools)):
+            raise LLMError('Native tools require message and function-schema lists')
+        request = self._build_request('','')
+        request.pop('instructions',None)
+        request.pop('input',None)
+        request.update(messages=messages,tools=tools,_native_tools=True)
+        if _has_image_input(request):
+            raise LLMError('Use the named vision client for visual evidence')
+        response = self._complete_request(request,json.dumps(tools,ensure_ascii=False),
+            json.dumps(messages,ensure_ascii=False),label=label,budget_call_id=budget_call_id)
+        if _finish_reason_from_response(response) in {'length','incomplete','failed','cancelled'}:
+            raise LLMResponseError('Native tool response was incomplete; no calls were executed',
+                                   correction_allowed=False)
+        choices = _get_value(response,'choices')
+        if isinstance(choices,list) and choices:
+            message = _get_value(choices[0],'message')
+            dump = getattr(message,'model_dump',None)
+            message = dump(exclude_none=True) if callable(dump) else message
+            if isinstance(message,dict) and (message.get('content') or message.get('tool_calls')):
+                return {**message,'role':'assistant'}
+        items = _get_value(response,'output') or []
+        items = [item.model_dump(exclude_none=True) if callable(getattr(item,'model_dump',None))
+                 else item for item in items]
+        if any(not isinstance(item,dict) for item in items):
+            raise LLMResponseError('Native Responses output items are malformed',correction_allowed=False)
+        calls = [{'id':item['call_id'],'type':'function','function':{
+            'name':item['name'],'arguments':item['arguments']}}
+            for item in items if item.get('type')=='function_call']
+        content = _content_from_response(response).strip()
+        if not (calls or content):
+            raise LLMResponseError(_empty_response_message(response),correction_allowed=False)
+        return {'role':'assistant','content':content or None,'tool_calls':calls,
+                '_responses_output':items}
+
     def effective_output_limit(self, max_output_tokens: int | None = None) -> int | None:
         """Resolve the actual request limit for transport and budget planning."""
         output_cap = max_output_tokens
@@ -607,6 +653,11 @@ class LLMClient:
             output = json.dumps(dump() if callable(dump) else message, ensure_ascii=False)
         elif reasoning:
             output += reasoning
+        elif _get_value(response,'output'):
+            # Responses function arguments and reasoning are generated output too.
+            items = _get_value(response,'output')
+            output = json.dumps([item.model_dump(exclude_none=True)
+                if callable(getattr(item,'model_dump',None)) else item for item in items],ensure_ascii=False)
         try:
             usage = self._build_usage_record(
                 response,
@@ -623,6 +674,8 @@ class LLMClient:
             raise
         reason = ('Native response finish_reason=length; discarded without adoption or execution'
                   if require_settled_response and _finish_reason_from_response(response) == 'length' else '')
+        if tool_calls and not request.get('tools'):
+            reason = 'Provider returned native tool calls to a text-only request; no tools were executed'
         self._settle_budget(reservation_id, usage, **({'reason': reason} if reason else {}))
         self._notify_usage(usage)
         if require_settled_response:
@@ -1729,6 +1782,11 @@ def _empty_response_message(response: object) -> str:
     """Explain why a provider response had no usable final text."""
     finish_reason = _finish_reason_from_response(response)
     reasoning = _reasoning_content_from_response(response)
+    choices = _get_value(response, 'choices')
+    message = _get_value(choices[0], 'message') if isinstance(choices, list) and choices else None
+    if _get_value(message, 'tool_calls'):
+        return ('LLM response contained native tool calls instead of final text. '
+                'No tools were executed; use a declared native tool conversation for tool requests.')
     if reasoning:
         message = (
             "LLM response contained reasoning content but no final content "
@@ -2319,6 +2377,14 @@ def _request_for_api_mode(
     thinking_mode: str = "",
     stream: bool = False,
 ) -> dict[str, Any]:
+    if request.get('_native_tools'):
+        request = dict(request)
+        request.pop('_native_tools')
+        if api_mode == 'responses':
+            request = _native_responses_request(request)
+        else:
+            request['messages'] = [{key:value for key,value in row.items() if key!='_responses_output'}
+                                   for row in request['messages']]
     if api_mode == "responses":
         if thinking_mode:
             raise LLMError("Provider thinking.type is supported only with Chat Completions mode.")
@@ -2342,6 +2408,29 @@ def _request_for_api_mode(
             converted.pop("stream", None)
         return converted
     raise ValueError(f"Unsupported LLM API mode: {api_mode}")
+
+
+def _native_responses_request(request: dict[str, Any]) -> dict[str, Any]:
+    """Translate conversation envelopes only; original Responses items stay intact."""
+    converted = dict(request)
+    items = []
+    for message in converted.pop('messages'):
+        if message.get('_responses_output') is not None:
+            items.extend(message['_responses_output'])
+        elif message['role']=='tool':
+            items.append({'type':'function_call_output','call_id':message['tool_call_id'],
+                          'output':message['content']})
+        else:
+            if message.get('content'):
+                items.append({'role':message['role'],'content':message['content']})
+            for call in message.get('tool_calls') or []:
+                items.append({'type':'function_call','call_id':call['id'],
+                    'name':call['function']['name'],'arguments':call['function']['arguments']})
+    converted['instructions'] = ''
+    converted['input'] = items
+    converted['tools'] = [{'type':'function','strict':False,**tool['function']}
+                          for tool in converted.get('tools',[])]
+    return converted
 
 
 def _has_image_input(request: dict[str, Any]) -> bool:
