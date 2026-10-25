@@ -18,6 +18,33 @@ OUTPUT_LIMIT = 8192
 MEMORY_PURPOSES = {'working-memory', 'working-memory-no-response-format'}
 
 
+def summary_coverage(*, previous: dict, snapshot: dict, view: dict, operations_for_turn: Any) -> int:
+    """Derive replaceable journal coverage from complete actually supplied receipts.
+
+    Historical prefix summaries remain useful notes, but never prove coverage
+    of omitted receipt suffixes or a gap inherited from an empty summary.
+    """
+    if not snapshot.get('notes'):
+        return 0
+    def identity(note):
+        return {key:note.get(key) for key in ('text','records','observed_versions')}
+    supplied_previous = [identity(note) for note in view['previous_notes']]
+    coverage = previous['through_turn'] if (
+        previous.get('notes') and supplied_previous == [identity(note) for note in previous['notes']]) else 0
+    groups = {}
+    for row in view['observations']:
+        groups.setdefault(row['turn'],[]).append(row)
+    while coverage < snapshot['through_turn']:
+        rows = groups.get(coverage,[])
+        operations = operations_for_turn(coverage)
+        if (not rows or any(row.get('truncated') is not False for row in rows)
+                or {row['record'] for row in rows} != set(operations)
+                or any(row.get('arguments',{}) != operations[row['record']] for row in rows)):
+            break
+        coverage += 1
+    return coverage
+
+
 class CheckpointResponseError(ValueError):
     """A closed checkpoint response cannot supply a usable note snapshot."""
 
@@ -148,14 +175,13 @@ def compact_work(*, store: Any, client: Any, requests: list[str],
     for turn, grouped in groupby(rows,key=lambda row:row['turn']):
         group = list(grouped)
         additions = []
-        limit = min(16000,max(1000,target*2//len(group)))
         for row in group:
             identity = 'o'+str(len(view['observations'])+len(additions)+1)
             raw = json.dumps(row['result'],ensure_ascii=False)
             additions.append({'id':identity,'record':row['record'],'turn':turn,
                 'tool':row['result'].get('tool_name'),'arguments':row.get('arguments',{}),
-                'observation_text':raw[:limit], 'truncated':len(raw)>limit,
-                'scope':'Exact prefix of the supplied owner presentation; the original receipt remains authoritative. Omitted content is not reviewed'})
+                'observation_text':raw, 'truncated':False,
+                'scope':'Complete supplied owner presentation; the original receipt remains authoritative.'})
         view['observations'].extend(additions)
         if estimate_tokens(json.dumps(view,ensure_ascii=False)) > target*0.6:
             del view['observations'][-len(additions):]
@@ -187,6 +213,8 @@ def compact_work(*, store: Any, client: Any, requests: list[str],
         checkpoint_entries(client._budget_ledger,attempt_id,client._budget_session_id)
         refs.append(store.write_json('memory_response.json',response,kind='working_memory_response'))
         bound = _bound_response(response,view,bind_notes)
+        if not bound:
+            raise CheckpointResponseError('Empty checkpoint cannot replace existing working understanding')
     except (LLMResponseError, ValidationError, CheckpointResponseError) as exc:
         # A complete, accounted response may be unusable. Transport, budget,
         # binding and unknown/inflight failures deliberately escape this path.

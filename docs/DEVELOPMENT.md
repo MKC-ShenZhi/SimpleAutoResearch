@@ -80,6 +80,10 @@ a bounded checkpoint in the native attempt; it creates no second memory store or
 execution loop. Working notes also live in accepted plan receipts; source versions
 and inspection owners remain authoritative. Saved conversation projections retain
 their original behavior. Context retention is not a scientific verification claim.
+Only complete recorded operations, including their original arguments, can advance
+summary coverage. Replacement notes stay in the model input; omitted receipt suffixes,
+empty summaries and unsupplied prose do not become covered history. Original records
+remain available for explicit rereading. Large atomic operations may stay uncompressed.
 Settled unusable summaries retain diagnostics and previous notes without blocking
 the main decision or repeatedly summarizing unchanged history. Unknown charges
 still stop recovery. Checkpoint costs and registered outputs remain part of the

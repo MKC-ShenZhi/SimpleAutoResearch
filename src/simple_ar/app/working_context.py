@@ -20,6 +20,7 @@ def select_working_context(
     current_artifacts: Sequence[str] = (),
     version_resolver: Callable[[str], str | None] | None = None,
     block_request_counts: Sequence[int] | None = None,
+    summarized_through_turn: int = 0,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Return messages and decision-budget metadata without modifying inputs.
 
@@ -43,6 +44,13 @@ def select_working_context(
     blocks = deepcopy(list(turn_blocks))
     rows = deepcopy(list(observations))
     notes = deepcopy(list(work_notes))
+    if type(summarized_through_turn) is not int or not 0 <= summarized_through_turn <= len(blocks):
+        raise ValueError('Summary coverage must be within the original journal')
+    # Only a usable note snapshot can replace repeated historical presentation.
+    # This retires model input, never observations, required findings or sources.
+    if not any(note.get('current') is not False and note.get('status') in
+               (None, 'current', 'active', 'ok') for note in notes):
+        summarized_through_turn = 0
     counts = (list(block_request_counts) if block_request_counts is not None else
               [min(1, len(user_requests))] * len(blocks))
     if (len(counts) != len(blocks) or any(type(n) is not int or not 0 <= n <= len(user_requests)
@@ -89,7 +97,7 @@ def select_working_context(
     recent = [latest] if latest is not None else []
     native = [message for i in recent for message in blocks[i]]
     if latest is not None:
-        for i in reversed(range(latest)):
+        for i in reversed(range(min(summarized_through_turn,latest),latest)):
             if not blocks[i]:
                 continue
             candidate = blocks[i] + native
@@ -106,7 +114,8 @@ def select_working_context(
         return note.get('current') is not False and note.get('status') in (
             None, 'current', 'active', 'ok')
 
-    references = set(selected_records)
+    explicit_references = set(selected_records)
+    references = set(explicit_references)
     for note in notes:
         if active(note):
             references.update(note.get('records') or [])
@@ -155,7 +164,11 @@ def select_working_context(
                           row.get('next_offset_bytes'), row.get('chunk_id'), text]))
         states.append({'source': locator(row), 'version_status': version,
                        'status': ('invalid' if not valid
-                                  else 'stale' if version == 'stale' else 'capacity'),
+                                  else 'stale' if version == 'stale'
+                                  else 'summarized' if isinstance(row.get('turn'),int)
+                                      and row['turn'] < summarized_through_turn
+                                      and row.get('record') not in explicit_references
+                                      and path not in artifacts else 'capacity'),
                        'estimated_tokens': estimate_tokens(dump(row))})
 
     view: dict[str, Any] = {
@@ -164,7 +177,7 @@ def select_working_context(
                  'Only version_status=matching has a supplied matching digest. '
                  'Operation results are historical raw receipts, never current file facts. '
                  'Historical text is not revalidated when no digest is available.',
-        'observations': [], 'notes': [],
+        'observations': [], 'notes': deepcopy(notes) if summarized_through_turn else [],
         'history': {},
     }
     context['working_view'] = view
@@ -173,7 +186,7 @@ def select_working_context(
         native_texts.clear()
         collect_text([message for i in recent for message in blocks[i]])
         for row, state in zip(rows, states):
-            if state['status'] == 'invalid':
+            if state['status'] in {'invalid','summarized'}:
                 continue
             text = row['text']
             if row.get('kind') == 'operation_result':
@@ -187,6 +200,7 @@ def select_working_context(
             if state['status'] == 'native' and state['version_status'] == 'stale']
         start = recent[0] if recent and any(blocks[:recent[0]]) else 0
         view['history'] = {'total_turns': len(blocks), 'retained_turn': latest,
+                          'notes_through_turn':summarized_through_turn,
                           'recent_start_turn': start, 'archive_end_turn': start,
                           'archived_turn_ranges': [[0, start]] if start else []}
 
@@ -229,7 +243,8 @@ def select_working_context(
     # Keep a bounded evidence share beside fresh work.
     material_ceiling = min(context_token_target, required_cost + context_token_target // 3)
     note_states = [{'index': i, 'records': deepcopy(note.get('records', [])),
-                    'status': 'capacity', 'estimated_tokens': estimate_tokens(dump(note))}
+                    'status': 'working_view' if summarized_through_turn else 'capacity',
+                    'estimated_tokens': estimate_tokens(dump(note))}
                    for i, note in enumerate(notes)]
     # Explicit refs/current artifacts, recent operations, then lexical sources.
     def priority(i: int) -> tuple[int, int, int, int, int]:
@@ -283,7 +298,9 @@ def select_working_context(
     preferred = {i for i in ordered if rows[i].get('record') in references
                  or rows[i].get('path') in artifacts or rows[i].get('absolute_path') in artifacts
                  or rows[i].get('kind') == 'operation_result'}
-    for i in sorted(range(len(notes)), key=lambda i: (not active(notes[i]), i)):
+    # A summary that replaces historical presentation is mandatory context.
+    # Optional note admission cannot hide both its history and the notes.
+    for i in ([] if summarized_through_turn else sorted(range(len(notes)), key=lambda i: (not active(notes[i]), i))):
         view['notes'].append(deepcopy(notes[i]))
         if project()[1] > material_ceiling:
             view['notes'].pop()

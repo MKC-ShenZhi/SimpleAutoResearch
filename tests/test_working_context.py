@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from simple_ar.app.working_context import select_working_context
-from simple_ar.app.work_memory import compact_work, checkpoint_artifacts, checkpoint_entries
+from simple_ar.app.work_memory import compact_work, checkpoint_artifacts, checkpoint_entries, summary_coverage
 from simple_ar.app.tool_application import ToolApplication
 from simple_ar.core.budget import BudgetLedger
 from simple_ar.core.capabilities import ArtifactStore
@@ -200,6 +200,52 @@ class WorkingContextTests(unittest.TestCase):
         self.assertEqual(budget['recent_start_turn'], 3)
         self.assertLessEqual(budget['estimated_input_tokens'], 4000)
 
+    def test_committed_summary_replaces_old_presentation_without_erasing_receipt_access(self):
+        original = 'Original measurement and its conditions. ' * 40
+        failure = json.dumps({'status':'error','error':'Unresolved original diagnostic'})
+        rows = [observation(0, original),
+                {'kind':'operation_result','record':'records/failure.json','turn':1,'text':failure}]
+        blocks = [block(0,original),block(1,failure),block(2,'Previous complete work'),block(3,'Current correction')]
+        notes = [{'text':'Measurement observed; original diagnostic remains unresolved',
+                  'records':['records/0.json','records/failure.json'],'current':True}]
+        before = deepcopy((rows,blocks,notes))
+        messages, budget = select(turn_blocks=blocks,observations=rows,work_notes=notes,
+            summarized_through_turn=3,context_token_target=20000)
+        view = json.loads(messages[1]['content'])['working_view']
+        self.assertEqual(budget['selected_turns'],[3])
+        self.assertEqual(view['notes'],notes)
+        self.assertEqual(view['history']['notes_through_turn'],3)
+        self.assertNotIn(original,json.dumps(messages))
+        self.assertEqual({r['source']['record'] for r in budget['omitted_records']},
+                         {'records/0.json','records/failure.json'})
+        self.assertTrue(all(r['status']=='summarized' for r in budget['omitted_records']))
+        self.assertEqual(messages[-3:-1],blocks[-1])
+        self.assertEqual(messages[-1]['content'],'Keep the error bars')
+        self.assertEqual((rows,blocks,notes),before)
+        mixed, _ = select(turn_blocks=blocks,observations=rows,
+            work_notes=[*notes,{'text':'Changed source requires reassessment','records':['records/old.json'],'current':False}],
+            summarized_through_turn=3,context_token_target=20000)
+        self.assertFalse(json.loads(mixed[1]['content'])['working_view']['notes'][-1]['current'])
+        self.assertNotIn(original,json.dumps(mixed))
+        tight, meta = select(turn_blocks=blocks,observations=rows,work_notes=notes,
+            summarized_through_turn=3,context_token_target=10)
+        self.assertEqual(json.loads(tight[1]['content'])['working_view']['notes'],notes)
+        self.assertTrue(meta['context_exceeds_input_target'])
+        # An explicit current selection can still recover exact original text.
+        restored, _ = select(turn_blocks=blocks,observations=rows,work_notes=notes,
+            summarized_through_turn=3,selected_records=['records/0.json'],context_token_target=20000)
+        self.assertEqual(json.dumps(restored).count(original),1)
+        # Empty/invalidated notes cannot silently retire prior working context.
+        for unusable in ([],[{**notes[0],'current':False}]):
+            with self.subTest(notes=unusable):
+                fallback, meta = select(turn_blocks=blocks,observations=rows,work_notes=unusable,
+                    summarized_through_turn=3,context_token_target=20000)
+                self.assertIn(original,json.dumps(fallback))
+                self.assertEqual(json.loads(fallback[1]['content'])['working_view']['history']['notes_through_turn'],0)
+        for bad in (True,-1,5):
+            with self.subTest(coverage=bad), self.assertRaises(ValueError):
+                select(turn_blocks=blocks,work_notes=notes,summarized_through_turn=bad)
+
     def test_source_excerpt_offsets_address_exact_original_text_and_budget(self):
         text = 'Unrelated preamble. ' * 800 + 'measurement signal 17.25' + ' Tail.' * 800
         row = observation(0, text)
@@ -274,6 +320,43 @@ class CheckpointFailureTests(unittest.TestCase):
     def bind(notes):
         return [{**note,'observed_versions':{},'scope':'model_note_not_verified_evidence'} for note in notes]
 
+    def test_coverage_requires_complete_receipts_and_an_unbroken_nonempty_note_chain(self):
+        note = self.bind([{'text':'Actual retained work','records':['records/0.json']}])[0]
+        previous = {'through_turn':0,'notes':[]}
+        view = {'previous_notes':[],'observations':[
+            {'turn':0,'record':'records/0.json','truncated':False},
+            {'turn':1,'record':'records/1.json','truncated':True}]}
+        records = lambda n:{f'records/{n}.json':{}}
+        snapshot = {'through_turn':2,'notes':[note]}
+        self.assertEqual(summary_coverage(previous=previous,snapshot=snapshot,view=view,operations_for_turn=records),1)
+        # A later snapshot cannot leap over the unsupplied suffix of turn1.
+        previous = {'through_turn':1,'notes':[note]}
+        later = {'previous_notes':[{'id':'p0',**note}], 'observations':[
+            {'turn':2,'record':'records/2.json','truncated':False}]}
+        self.assertEqual(summary_coverage(previous=previous,snapshot={**snapshot,'through_turn':3},
+            view=later,operations_for_turn=records),1)
+        # Empty snapshots reset coverage, including future inherited coverage.
+        self.assertEqual(summary_coverage(previous=previous,snapshot={**snapshot,'notes':[]},
+            view=view,operations_for_turn=records),0)
+        self.assertEqual(summary_coverage(previous={'through_turn':0,'notes':[]},snapshot={**snapshot,'through_turn':3},
+            view=later,operations_for_turn=records),0)
+        # Supplying the missing complete receipt lets the same chain advance.
+        later['observations'].insert(0,{'turn':1,'record':'records/1.json','truncated':False})
+        self.assertEqual(summary_coverage(previous=previous,snapshot={**snapshot,'through_turn':3},
+            view=later,operations_for_turn=records),3)
+        later['previous_notes'] = []
+        self.assertEqual(summary_coverage(previous=previous,snapshot={**snapshot,'through_turn':3},
+            view=later,operations_for_turn=records),0)
+        self.assertEqual(summary_coverage(previous={'through_turn':0,'notes':[]},snapshot=snapshot,
+            view={'previous_notes':[],'observations':[]},operations_for_turn=lambda n:{}),0)
+        authored = {'content':'Complete generated implementation','path':'analysis.py'}
+        one = {'previous_notes':[],'observations':[{'turn':0,'record':'records/0.json','truncated':False,'arguments':{}}]}
+        self.assertEqual(summary_coverage(previous={'through_turn':0,'notes':[]},snapshot={**snapshot,'through_turn':1},
+            view=one,operations_for_turn=lambda n:{'records/0.json':authored}),0)
+        one['observations'][0]['arguments'] = authored
+        self.assertEqual(summary_coverage(previous={'through_turn':0,'notes':[]},snapshot={**snapshot,'through_turn':1},
+            view=one,operations_for_turn=lambda n:{'records/0.json':authored}),1)
+
     def compact(self, *, rows=None):
         return compact_work(store=self.store,client=self.client,requests=['Explain the measurements'],
             previous=self.previous,rows=rows if rows is not None else [{'turn':0,'record':'records/read/native_result.json',
@@ -291,7 +374,7 @@ class CheckpointFailureTests(unittest.TestCase):
             'usage':{'prompt_tokens':100,'completion_tokens':40,'total_tokens':140}}
 
     def test_settled_truncated_malformed_and_invalid_schema_keep_previous_notes(self):
-        for content, finish in [('partial notes','length'),('not JSON','stop'),
+        for content, finish in [('partial notes','length'),('not JSON','stop'),('{"notes":[]}','stop'),
                 ('{"notes":"invalid"}','stop'),
                 ('{"notes":[{"text":"invented","observations":["missing"]}]}','stop')]:
             with self.subTest(finish=finish,content=content):
@@ -320,6 +403,11 @@ class CheckpointFailureTests(unittest.TestCase):
             snapshot, refs = self.compact()
             self.assertEqual(refs,self.artifacts())
             self.assertEqual(send.call_count,1)
+            actual = self.store.read_json('memory_input.json')['observations'][0]
+            self.assertFalse(actual['truncated'])
+            self.assertGreater(len(actual['observation_text']),16000)
+            self.assertEqual(json.loads(actual['observation_text'])['data']['text'],
+                             'Original recorded material with measurement scope. '*400)
         for field, value in [('input_sha256','wrong'),('through_turn',99),('notes',[])]:
             with self.subTest(field=field):
                 self.store.write_json('memory_snapshot.json',{**snapshot,field:value})

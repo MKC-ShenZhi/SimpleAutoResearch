@@ -413,13 +413,16 @@ class OperationsWorkLoopTests(unittest.TestCase):
         for path in checkpoints:
             store = self.app.session.store.__class__(path.parent)
             self.assertTrue(any(ref.kind=='working_memory_snapshot' for ref in store.read_capability_result().artifacts))
+            for row in store.read_json('memory_input.json')['observations']:
+                self.assertEqual(row['arguments'],self.app._memory_operations(row['turn'])[row['record']])
+                self.assertFalse(row['truncated'])
         memory_calls = [entry for entry in self.app.ledger.entries
             if entry.logical_call_id.startswith('working-memory-')]
         self.assertTrue(memory_calls)
         self.assertTrue(all(entry.status=='settled' for entry in memory_calls))
         before = (self.root/'budget_ledger.json').read_bytes()
         self._reload()
-        self.assertTrue(self.app._working_notes())
+        self.assertTrue(self.app._working_memory()['notes'])
         self.assertEqual((self.root/'budget_ledger.json').read_bytes(),before)
         self.assertFalse(self.transport_errors)
 
@@ -463,13 +466,13 @@ class OperationsWorkLoopTests(unittest.TestCase):
             self.assertFalse(store.exists('memory_snapshot.json'))
             self.assertIn(store.ref('memory_failure.json',kind='working_memory_failure'),
                 store.read_capability_result().artifacts)
-        self.assertIn('Keep the original measurement scope',self.app._working_notes()[0]['text'])
+        self.assertIn('Keep the original measurement scope',self.app._working_memory()['notes'][0]['text'])
         self.assertTrue(all(entry.status == 'settled' for entry in self.app.ledger.entries
             if entry.purpose == 'working-memory'))
         before = (self.root/'budget_ledger.json').read_bytes()
         self._reload()
         self.assertEqual((self.root/'budget_ledger.json').read_bytes(),before)
-        self.assertIn('Keep the original measurement scope',self.app._working_notes()[0]['text'])
+        self.assertIn('Keep the original measurement scope',self.app._working_memory()['notes'][0]['text'])
 
     def _interrupt_checkpoint_commit(self, *, truncated=False):
         from simple_ar.core.session import _persist_attempt_result
@@ -501,7 +504,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         turn = self.app.state['turns'][-1]
         if truncated:
             self.assertIsNotNone(self.app._committed_memory_record(turn,path))
-            self.assertIn('Keep the original measurement scope',self.app._working_notes()[0]['text'])
+            self.assertIn('Keep the original measurement scope',self.app._working_memory()['notes'][0]['text'])
         else:
             self.assertIsNotNone(self.app._checkpoint_for_turn(turn))
 
@@ -565,19 +568,19 @@ class OperationsWorkLoopTests(unittest.TestCase):
         before = (self.root/'budget_ledger.json').read_bytes()
         self._reload()
         self.assertEqual((self.root/'budget_ledger.json').read_bytes(), before)
-        self.assertTrue(self.app._working_notes()[0]['current'])
+        self.assertTrue(self.app._working_memory()['notes'][0]['current'])
         self._submit(_action('update_work_plan', steps=[{'step':'Revise only the explanation',
             'status':'pending'}]), feedback='Keep the calculation; clarify interpretation.')
-        self.assertTrue(self.app._working_notes()[0]['current'])
-        self.assertIn('Three recorded', self.app._working_notes()[0]['text'])
+        self.assertTrue(self.app._working_memory()['notes'][0]['current'])
+        self.assertIn('Three recorded', self.app._working_memory()['notes'][0]['text'])
         self._submit(_action('update_work_plan', notes=[{'text':'Invented source',
             'records':['records/not-an-observation/native_result.json']}]))
         self.assertNotEqual(self._last('update_work_plan')['status'],'ok')
-        self.assertIn('Three recorded', self.app._working_notes()[0]['text'])
+        self.assertIn('Three recorded', self.app._working_memory()['notes'][0]['text'])
         (self.inputs/'observations.csv').write_text('sample,value\na,7\n',encoding='utf-8')
-        self.assertFalse(self.app._working_notes()[0]['current'])
+        self.assertFalse(self.app._working_memory()['notes'][0]['current'])
         self._submit(_action('update_work_plan', notes=[]))
-        self.assertEqual(self.app._working_notes(),[])
+        self.assertEqual(self.app._working_memory()['notes'],[])
 
     def test_required_defect_blocks_delivery_without_editing_then_same_bytes_can_be_reassessed(self):
         self._create()

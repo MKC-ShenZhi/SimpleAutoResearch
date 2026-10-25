@@ -4,6 +4,15 @@
 
 User-visible changes, newest first, dated when confirmed. Multi-day development may be summarized together rather than assigned invented completion dates. Development-branch work is distinguished from main; engineering checks do not establish task success. See [usage](docs/USAGE.md) for current instructions.
 
+## 2026-10-26 — V2.10 development (unreleased)
+
+### Improved
+
+- Working summaries can replace repeated history input after complete recorded operations and original arguments have been supplied. Required replacement notes remain visible, while original receipts stay available for rereading.
+- Empty, partial or interrupted summaries retain prior understanding and costs. Historical prefix summaries remain readable without acquiring coverage they never established.
+
+End-to-end initial-draft and feedback acceptance is still in progress. These changes do not establish lower whole-task costs.
+
 ## 2026-10-25 — V2.10 development (unreleased)
 
 ### Improved

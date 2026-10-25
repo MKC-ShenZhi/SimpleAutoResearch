@@ -906,22 +906,42 @@ class ToolApplication:
                         'record': 'records/' + item['result'].removeprefix('attempts/')}
         return None
 
-    def _working_notes(self) -> list[dict]:
+    @staticmethod
+    def _recorded_arguments(call: dict) -> Any:
+        raw = call['function']['arguments']
+        try:
+            return json.loads(raw)
+        except (ValueError,TypeError):
+            return raw
+
+    def _memory_operations(self, number: int) -> dict:
+        turn = self.state['turns'][number]
+        reply = self.session.store.read_json(turn['reply'])
+        calls = {call['id']:call for call in reply.get('tool_calls',[])}
+        return {'records/'+item['result'].removeprefix('attempts/'):
+                self._recorded_arguments(calls[item['id']]) for item in turn['tools']}
+
+    def _working_memory(self) -> dict:
         """Latest explicit snapshot from the original journal, including prior feedback.
 
         This is model-authored working understanding, never another fact store.
         """
-        for turn in reversed(self.state['turns']):
-            for item in reversed(turn['tools']):
+        from simple_ar.app.work_memory import summary_coverage
+        memory = {'notes':[], 'through_turn':0}
+        for turn in self.state['turns']:
+            checkpoint = self._checkpoint_for_turn(turn)
+            if checkpoint is not None:
+                store = ArtifactStore(self.session.store.root / Path(turn['reply']).parent)
+                coverage = summary_coverage(previous=memory,snapshot=checkpoint,
+                    view=store.read_json('memory_input.json'),operations_for_turn=self._memory_operations)
+                memory = {'notes':checkpoint['notes'],'through_turn':coverage}
+            for item in turn['tools']:
                 result = self.session.store.read_json(item['result'])
                 data = result.get('data') or {}
                 if (result.get('tool_name') == 'update_work_plan' and result.get('status') == 'ok'
                         and isinstance(data.get('notes'), list)):
-                    return self.operations.project_notes(data['notes'])
-            checkpoint = self._checkpoint_for_turn(turn)
-            if checkpoint is not None:
-                return self.operations.project_notes(checkpoint['notes'])
-        return []
+                    memory = {'notes':data['notes'], 'through_turn':0}
+        return {**memory,'notes':self.operations.project_notes(memory['notes'])}
 
     def _checkpoint_for_turn(self, turn: dict) -> dict | None:
         return self._committed_memory_record(turn,'memory_snapshot.json')
@@ -964,10 +984,7 @@ class ToolApplication:
         """Checkpoint old closed work through the same model attempt and ledger."""
         if self._request_capacity()<2 or not cutoff:
             return ()
-        previous = next((snapshot for turn in reversed(self.state['turns'])
-            if (snapshot:=self._checkpoint_for_turn(turn)) is not None),
-            {'through_turn':0,'notes':[]})
-        previous = {**previous,'notes':self._working_notes()}
+        previous = self._working_memory()
         delivery_feedback = self._delivery_feedback()
         failure = next((record for turn in reversed(self.state['turns'])
             if (record:=self._committed_memory_record(turn,'memory_failure.json')) is not None),None)
@@ -976,15 +993,15 @@ class ToolApplication:
         rows = []
         for number in range(previous['through_turn'],cutoff):
             turn = self.state['turns'][number]
-            if turn.get('remaining'):
+            if turn.get('remaining') or not turn['tools']:
                 break
             reply = self.session.store.read_json(turn['reply'])
             calls = {call['id']:call for call in reply.get('tool_calls',[])}
             for item in turn['tools']:
                 result = self.session.store.read_json(item['result'])
-                indexed = self._history_observation(calls[item['id']],result,item['result'])
-                rows.append({'turn':number,'record':'records/'+item['result'].removeprefix('attempts/'),
-                    'arguments':indexed['arguments'],'result':self._coordination_result(result,indexed['record'],
+                record = 'records/'+item['result'].removeprefix('attempts/')
+                rows.append({'turn':number,'record':record,
+                    'arguments':self._recorded_arguments(calls[item['id']]),'result':self._coordination_result(result,record,
                         delivery_feedback=delivery_feedback)})
         from simple_ar.app.work_memory import compact_work
         _, refs = compact_work(store=context.store,client=client,requests=self.state['requests'],
@@ -2366,11 +2383,11 @@ class ToolApplication:
 
     def _messages(self, *, client: LLMClient | None = None, closing: bool = False,
                   native_history_start_turn: int | None = None, schemas: list | None = None,
-                  working_notes: list[dict] | None = None) -> list[dict[str, Any]]:
+                  working_memory: dict | None = None) -> list[dict[str, Any]]:
         protocol = self.state['config'].get('context_protocol')
         if protocol in {'conversation.v1','working.v1'}:
             return self._conversation_messages(client=client, closing=closing,
-                native_history_start_turn=native_history_start_turn, schemas=schemas,working_notes=working_notes)
+                native_history_start_turn=native_history_start_turn, schemas=schemas,working_memory=working_memory)
         if protocol is not None:
             raise ValueError('Unknown saved context protocol; no projection migration')
         config = self.state["config"]
@@ -2952,7 +2969,7 @@ class ToolApplication:
 
     def _conversation_messages(self, *, client: LLMClient | None = None, closing: bool = False,
                                native_history_start_turn: int | None = None,
-                               schemas: list | None = None, working_notes: list[dict] | None = None) -> list[dict[str, Any]]:
+                               schemas: list | None = None, working_memory: dict | None = None) -> list[dict[str, Any]]:
         """One chronological working set; receipts retain their actual text once.
 
         This is historical conversation, not a revalidated evidence cache. Tool
@@ -3180,11 +3197,13 @@ class ToolApplication:
                     return self.workspace.artifact_hashes([path])[path]
                 except (ValueError,OSError):
                     return None
+            memory = self._working_memory() if working_memory is None else working_memory
             messages, selection = select_working_context(user_requests=self.state['requests'],
                 system_text=prefix[0]['content'],base_context=context,
                 turn_blocks=[block if position>=boundary else [] for position,block in enumerate(blocks)],
                 observations=working_rows, schema_tokens=schema_cost,context_token_target=target,
-                estimate_tokens=estimate_tokens,work_notes=(self._working_notes() if working_notes is None else working_notes),
+                estimate_tokens=estimate_tokens,work_notes=memory['notes'],
+                summarized_through_turn=memory['through_turn'],
                 selected_records=(plan or {}).get('evidence_records',[]),version_resolver=version,
                 block_request_counts=[turn.get('request_count',1) for turn in turns])
             cost = estimate_tokens(json.dumps(messages,ensure_ascii=False))+schema_cost
@@ -3360,7 +3379,7 @@ class ToolApplication:
         client = self._client(context.attempt.attempt_id)
         messages = self._messages(client=client)
         memory_refs = ()
-        working_notes = None
+        working_memory = None
         if (self.state['config'].get('context_protocol')=='working.v1'
                 and not (self.state.get('pending') or {}).get('skip_memory_checkpoint')):
             projection = json.loads(messages[1]['content'])
@@ -3374,10 +3393,14 @@ class ToolApplication:
                 # The checkpoint belongs to this attempt, not a second mutable
                 # task state. Present it for this decision, then adopt only when
                 # the native turn and its registered outputs commit normally.
-                working_notes = self.operations.project_notes(snapshot['notes'])
+                from simple_ar.app.work_memory import summary_coverage
+                coverage = summary_coverage(previous=self._working_memory(),snapshot=snapshot,
+                    view=context.store.read_json('memory_input.json'),operations_for_turn=self._memory_operations)
+                working_memory = {'notes':self.operations.project_notes(snapshot['notes']),
+                                  'through_turn':coverage}
             if memory_refs:
                 memory_refs = self._memory_artifacts(context.store,context.attempt.attempt_id)
-                messages = self._messages(client=client,working_notes=working_notes)
+                messages = self._messages(client=client,working_memory=working_memory)
         floor = self._completion_floor(client, messages)
         remaining = self.ledger.remaining('total_tokens')
         # A last affordable decision can deliver/question, but its retry must
@@ -3390,7 +3413,7 @@ class ToolApplication:
         if closing:
             # Include the closing contract before context trimming/reservation,
             # not as an unbudgeted suffix added to a capacity-fitted request.
-            messages = self._messages(client=client, closing=True, schemas=schemas,working_notes=working_notes)
+            messages = self._messages(client=client, closing=True, schemas=schemas,working_memory=working_memory)
             floor = {'llm_requests': 1, 'total_tokens': self._decision_tokens(client, messages, schemas=schemas)}
         # Every new decision records its actual offer, even when no completion
         # reservation applies. Old replies without the marker remain unchanged.
