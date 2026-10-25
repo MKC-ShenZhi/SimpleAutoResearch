@@ -225,8 +225,11 @@ class ProfessionalWorkLoopTests(unittest.TestCase):
             self.assertIn('Implement one coherent, bounded code work unit', system)
         self.prompts.append(prompt)
         self.assertTrue(self.responses, 'Unexpected additional professional provider call')
+        response = self.responses.pop(0)
+        if callable(response):
+            response = response(prompt)
         return {'choices': [{'message': {'role': 'assistant',
-            'content': json.dumps(self.responses.pop(0))}, 'finish_reason': 'stop'}],
+            'content': json.dumps(response)}, 'finish_reason': 'stop'}],
             'usage': {'prompt_tokens': 100, 'completion_tokens': 20, 'total_tokens': 120}}
 
     def _create(self, *, allow_execution=True, professional_inputs=True,
@@ -316,19 +319,33 @@ class ProfessionalWorkLoopTests(unittest.TestCase):
                 target = str(Path(prepared['data']['project_dir']) / 'result.txt')
                 window = {'path': target, 'max_bytes': 100}
                 source_window = {'path': str(Path(target).with_name('calculate.py')), 'max_bytes': 1000}
-                final = {
-                    'materials': [window],
-                    'findings': [{'statement': f'The actual saved result is {value}.',
-                        'evidence': [{'path': target, 'quote': str(value)}]}],
-                    'limitations': ['The fixture checks an integer only; no scientific or visual certification.'],
-                    'remaining_work': ([] if value == sum(range(7)) else
-                        ['The executed value does not meet the original sum(range(7)) goal.']),
-                    'disposition': disposition}
-                source_only = {'materials': [source_window], 'findings': [{
-                    'statement': 'The program imports pathlib.',
-                    'evidence': [{'path': source_window['path'], 'quote': 'from pathlib import Path'}]}],
-                    'limitations': [], 'remaining_work': [], 'disposition': 'outcome_ready'}
-                self.responses = [{'read_windows': [source_window, window]},
+                def final(prompt):
+                    evidence = [row['observation_id'] for row in prompt['evidence_index']
+                        if row['path'] == target]
+                    self.assertTrue(evidence)
+                    self.assertNotIn('materials', prompt['response_schema']['properties'])
+                    self.assertNotIn('disposition', prompt['response_schema']['properties'])
+                    from simple_ar.tools.implementation_findings import findings_response_model
+                    model = findings_response_model(prompt['observations'], [target], {})
+                    for statement, references in ((' ', evidence), ('Claim', ['unobserved'])):
+                        with self.assertRaises(ValueError):
+                            model.model_validate({'findings': [{'statement': statement,
+                                'evidence': references}]})
+                    return {'findings': [{'statement': f'The actual saved result is {value}.',
+                            'evidence': evidence}],
+                        'limitations': ['The fixture checks an integer only; no scientific or visual certification.'],
+                        'remaining_work': ([] if value == sum(range(7)) else
+                            ['The executed value does not meet the original sum(range(7)) goal.']),
+                        # An advisory provider status does not override actual remaining work.
+                        'disposition': 'outcome_ready'}
+
+                def source_only(prompt):
+                    evidence, = [row['observation_id'] for row in prompt['evidence_index']
+                        if row['path'] == source_window['path']]
+                    return {'findings': [{'statement': 'The program imports pathlib.',
+                        'evidence': [evidence]}], 'limitations': [], 'remaining_work': []}
+                self.responses = [{'read_windows': [source_window, window,
+                    *([dict(window, max_bytes=120)] if value == 21 else [])]},
                     *([source_only] if value == 21 else []), final]
                 app.run(progress=lambda _: None, should_stop=lambda: bool(self._observations(app)
                     and self._observations(app)[-1]['tool_name'] == 'investigate_implementation'))
@@ -337,7 +354,13 @@ class ProfessionalWorkLoopTests(unittest.TestCase):
                 self.assertEqual(observed['data']['disposition'], disposition)
                 self.assertFalse(self.responses)
                 inspected = accepted_investigation(app.implementation, reference, include_observations=True)
-                self.assertEqual(inspected['findings'][0]['evidence'][0]['quote'], str(value))
+                evidence = inspected['findings'][0]['evidence'][0]
+                self.assertEqual(evidence['path'], target)
+                self.assertEqual(evidence['sha256'], hashlib.sha256(str(value).encode()).hexdigest())
+                self.assertTrue(evidence['observation_id'].startswith('observed-'))
+                self.assertNotIn('quote', evidence)
+                self.assertEqual(len(inspected['materials']), 1)
+                self.assertEqual(len(inspected['findings'][0]['evidence']), 2 if value == 21 else 1)
                 self.assertEqual(inspected['disposition'], disposition)
                 self.assertTrue(inspected['observations'])
                 with patch.object(app.writing, 'resubmit_after_repair', return_value=None) as resubmit:

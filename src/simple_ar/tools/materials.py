@@ -570,7 +570,8 @@ def inspect_materials(*, workspace: Any, context: dict, instructions: str,
                       final_fields: tuple[str, ...], excluded_paths: set[str] | None = None,
                       seed: dict | None = None,
                       validate_selection: Callable[[dict, list[dict]], None] | None = None,
-                      terminal_purpose: str | None = None) -> dict:
+                      terminal_purpose: str | None = None,
+                      response_model_factory: Callable[[list[dict]], type[BaseModel]] | None = None) -> dict:
     """Read real windows before selection, using the caller's client and receipts.
 
     The caller binds its inputs before entry and rejects interrupted replay.
@@ -587,13 +588,21 @@ def inspect_materials(*, workspace: Any, context: dict, instructions: str,
     correction = None
     if terminal_purpose is not None:
         instructions += (' The terminal purpose is actual investigation: ' + terminal_purpose
-            + ' Finalize that investigation using selected observed material windows; '
-            'selection alone does not complete this responsibility.')
-    instructions += (
+            + (' Finalize that investigation using owner-issued observation IDs; '
+                if response_model_factory is not None else
+                ' Finalize that investigation using selected observed material windows; ')
+            + 'selection alone does not complete this responsibility.')
+    read_contract = (
         ' Investigate before choosing local materials: return {read_windows: [FileWindow objects]} '
         'alone to inspect relevant candidates. Then finalize only exact material windows already observed '
         '(string paths mean the first 16000 bytes). Use next_offset_bytes for needed continuations; '
-        'an unseen tail is not evidence of absence. Up to six decisions and 96000 observed characters '
+        'an unseen tail is not evidence of absence.' if response_model_factory is None else
+        ' Investigate actual local materials: return {read_windows: [FileWindow objects]} alone '
+        'to inspect candidates, or finalize findings using the current evidence_index observation IDs. '
+        'Do not reconstruct material paths, window recipes or quotes in a final response. '
+        'Use next_offset_bytes for needed continuations; an unseen tail is not evidence of absence.')
+    instructions += read_contract + (
+        ' Up to six decisions and 96000 observed characters '
         'share the existing task budget; batch related reads. observation_capacity reports actual observed '
         'characters and remaining capacity. read_admission reports the previous decision: a capacity-rejected '
         'window was NOT read and is NOT evidence. Its byte-based character upper bound is conservative, '
@@ -621,6 +630,10 @@ def inspect_materials(*, workspace: Any, context: dict, instructions: str,
 
     for step in range(6):
         context['observations'] = observations
+        current_model = response_model
+        if response_model_factory is not None:
+            current_model = response_model_factory(observations)
+            context['response_schema'] = current_model.model_json_schema()
         ledger = getattr(client, '_budget_ledger', None)
         remaining = ledger.remaining('llm_requests') if isinstance(ledger, BudgetLedger) else None
         context['decisions_remaining'] = min(6 - step, int(remaining)) if remaining is not None else 6 - step
@@ -650,7 +663,7 @@ def inspect_materials(*, workspace: Any, context: dict, instructions: str,
             continue
         owner.write_json(f'selection-steps/{step + 1}/response.json', response)
         try:
-            selected = response_model.model_validate(response)
+            selected = current_model.model_validate(response)
         except ValidationError as error:
             # ask_json returned a complete parsed response. Preserve that value
             # in response.json; its JSON rendering is not the provider's wire text.
@@ -804,7 +817,8 @@ def read_material_window(workspace: Any, request: dict, *, identity: str,
 
 
 def selected_material_windows(workspace: Any, selected: MaterialSelection,
-                              observations: list[dict], *, identity: str) -> list[dict]:
+                              observations: list[dict], *, identity: str,
+                              deduplicate_views: bool = False) -> list[dict]:
     """Revalidate inspected bytes and return only selected observed windows."""
     if selected.read_windows:
         raise ValueError('Material selection ended without a final selection')
@@ -829,7 +843,7 @@ def selected_material_windows(workspace: Any, selected: MaterialSelection,
         return False
     windows = [FileWindow(path=row) if isinstance(row, str) else row for row in selected.materials]
     keys = [window_key(workspace, window) for window in windows]
-    if len(keys) != len(set(keys)):
+    if not deduplicate_views and len(keys) != len(set(keys)):
         raise ValueError('Material selection requires distinct paths/windows from the bound inventory')
     resolved, selected_views = [], set()
     for window, key in zip(windows, keys):
@@ -861,6 +875,8 @@ def selected_material_windows(workspace: Any, selected: MaterialSelection,
                 'read its actual contents first: ' + json.dumps(window.model_dump(exclude_unset=True)))
         effective = observed_window_key(workspace, FileWindow.model_validate(row['request']), row['data'])
         if effective in selected_views:
+            if deduplicate_views:
+                continue
             raise ValueError('Material selection requires distinct paths/windows from the bound inventory')
         selected_views.add(effective)
         resolved.append(row)

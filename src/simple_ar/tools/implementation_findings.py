@@ -2,7 +2,7 @@
 
 Native attempts own scheduling, registration and accounting. These receipts grant
 neither delivery nor repair/rerun authority. Observation bodies remain in the
-investigation receipt; investigation_observations exposes them only for reuse.
+investigation receipt; accepted_investigation exposes them only on request.
 """
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import hashlib
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, create_model, field_validator, model_validator
 
 from simple_ar.core.capabilities import ArtifactStore
 from simple_ar.tools.materials import (
@@ -19,9 +19,11 @@ from simple_ar.tools.materials import (
 )
 from simple_ar.tools.professional_outcomes import accepted_native_result, registered_native_output
 from simple_ar.tools.specs import ToolResult
+from simple_ar.tools.workspace import FileWindow
 
 
 RESULT_INVESTIGATION = 'execution_findings.v1'
+OBSERVED_REFS = 'observed_refs.v1'
 _TOOL = 'investigate_implementation'
 _KIND = 'implementation_findings'
 
@@ -69,6 +71,130 @@ class _Findings(MaterialSelection):
         return self
 
 
+class _ObservedFindings(BaseModel):
+    """New admissions delegate interpretation, not evidence-window reconstruction."""
+    model_config = ConfigDict(extra='forbid', strict=True)
+    read_windows: list[FileWindow] = Field(default_factory=list, max_length=12)
+    findings: list[Any] = Field(default_factory=list, max_length=8)
+    limitations: list[str] = Field(default_factory=list, max_length=8)
+    remaining_work: list[str] = Field(default_factory=list, max_length=8)
+
+    @model_validator(mode='before')
+    @classmethod
+    def advisory_disposition(cls, value: Any) -> Any:
+        # Only this new protocol ignores a recognized advisory status. Never
+        # mutate the raw response retained by the shared decision loop.
+        if (isinstance(value, dict) and not value.get('read_windows')
+                and isinstance(value.get('disposition'), str)
+                and value['disposition'] in {'outcome_ready', 'handoff_required', 'blocked'}):
+            return {key: item for key, item in value.items() if key != 'disposition'}
+        return value
+
+    @model_validator(mode='after')
+    def shape(self) -> _ObservedFindings:
+        if any(not text.strip() or len(text) > 800 for text in self.limitations + self.remaining_work):
+            raise ValueError('Limitations and remaining work require bounded nonempty statements')
+        if sum(len(text) for text in [*self.limitations, *self.remaining_work]) + sum(
+                len(finding.statement) for finding in self.findings) > 12000:
+            raise ValueError('Investigation conclusions exceed 12000 characters')
+        if self.read_windows:
+            if self.findings or self.limitations or self.remaining_work:
+                raise ValueError('Read observed windows OR finalize findings, not both')
+        elif not self.findings and not self.remaining_work:
+            raise ValueError('Final investigation needs supported findings or explicit remaining work')
+        return self
+
+
+def _observation_reference(index: int, row: dict) -> dict:
+    return {'observation_id': f'observed-{index}', 'path': row['request']['path'],
+        'sha256': row['data']['sha256'],
+        'offset_bytes': row['data'].get('offset_bytes', row['request'].get('offset_bytes', 0)),
+        'next_offset_bytes': row['data']['next_offset_bytes']}
+
+
+def findings_response_model(observations: list[dict], outputs: Any, context: dict) -> type[BaseModel]:
+    """Pure schema/index construction from the actual current observation list.
+
+    Output paths must use the observation path spelling; live callers resolve
+    aliases before entry. The diagnostic caller can supply its bound path set.
+    No reads, receipt admission, model calls or changes to observations occur.
+    """
+    ids = [f'observed-{index}' for index in range(len(observations))]
+    output_paths = {str(path) for path in outputs}
+    context['evidence_index'] = [{**_observation_reference(index, row),
+        'role': 'execution_output' if row['request']['path'] in output_paths else 'original_or_context'}
+        for index, row in enumerate(observations)]
+
+    @field_validator('evidence')
+    @classmethod
+    def known_ids(cls: Any, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)) or any(item not in ids for item in value):
+            raise ValueError('Cite distinct owner-issued observation IDs from the current evidence_index')
+        return value
+
+    @field_validator('statement')
+    @classmethod
+    def nonempty_statement(cls: Any, value: str) -> str:
+        if not value.strip():
+            raise ValueError('A finding requires a nonempty statement')
+        return value
+
+    finding = create_model('ObservedFinding', __config__=ConfigDict(extra='forbid', strict=True),
+        __validators__={'known_ids': known_ids, 'nonempty_statement': nonempty_statement},
+        statement=(str, Field(min_length=1, max_length=1200)),
+        evidence=(list[str], Field(min_length=1, max_length=4,
+            json_schema_extra={'items': {'type': 'string', 'enum': ids}})))
+    return create_model('ObservedExecutionFindings', __base__=_ObservedFindings,
+        findings=(list[finding], Field(default_factory=list, max_length=8)))
+
+
+def validate_findings(workspace: Any, response: dict, observations: list[dict], identity: str,
+                      outputs: Any, protocol: str | None) -> list[dict]:
+    """Validate final evidence using existing current-byte/range admission.
+
+    This helper can replay actual observations in a diagnostic workspace without
+    claiming native acceptance. Native registration/accounting remain outside.
+    """
+    output_paths = {workspace.resolve(str(path)) for path in outputs}
+    if protocol is None:
+        selected = _Findings.model_validate(response)
+        windows = selected_material_windows(workspace, selected, observations, identity=identity)
+        for finding in selected.findings:
+            for evidence in finding.evidence:
+                path = workspace.resolve(evidence.path)
+                if not any(workspace.resolve(row['request']['path']) == path
+                        and evidence.quote in row['data']['text'] for row in windows):
+                    raise ValueError('Finding quote must occur literally in a selected observed window')
+        ready = selected.disposition == 'outcome_ready'
+        cites_output = any(workspace.resolve(evidence.path) in output_paths
+            for finding in selected.findings for evidence in finding.evidence)
+    elif protocol == OBSERVED_REFS:
+        selected = findings_response_model(observations, outputs, {}).model_validate(response)
+        if selected.read_windows:
+            raise ValueError('Investigation ended without final findings')
+        cited = {ref for finding in selected.findings for ref in finding.evidence}
+        rows = [row for index, row in enumerate(observations) if f'observed-{index}' in cited]
+        # Exact actual read requests, including line/byte bounds, replace all
+        # model-authored selection recipes. Original observations stay intact.
+        # These are validated owner reads, not a model's bounded file recipe.
+        # The finite citation schema and existing observation/decision budgets
+        # bound this union; do not reapply the legacy 12-material recipe cap.
+        selection = MaterialSelection.model_construct(read_windows=[],
+            materials=[FileWindow.model_validate(row['request']) for row in rows])
+        # Validate every cited observation before coalescing equivalent views.
+        # Different read ceilings/aliases may cover the same actual bytes.
+        windows = selected_material_windows(workspace, selection, rows, identity=identity,
+            deduplicate_views=True)
+        ready = not selected.remaining_work
+        cites_output = any(workspace.resolve(row['request']['path']) in output_paths for row in rows)
+    else:
+        raise ValueError('Unknown investigation response contract')
+    if ready and not cites_output:
+        raise ValueError('Ready findings require an actual execution output as observed evidence; '
+            'source-only evidence must retain the missing result investigation as remaining work')
+    return windows
+
+
 def _identity(identity: str) -> None:
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', identity):
         raise ValueError('Invalid investigation attempt identity')
@@ -114,7 +240,9 @@ def investigation_required(owner: Any, execution_ref: str) -> bool:
     return True
 
 
-def _binding(owner: Any, execution_ref: str) -> dict:
+def _binding(owner: Any, execution_ref: str, *, response_contract: str | None = None) -> dict:
+    if response_contract not in {None, OBSERVED_REFS}:
+        raise ValueError('Unknown investigation response contract')
     candidate, saved, request, source = _source(owner, execution_ref)
     if getattr(request, 'result_investigation', None) != RESULT_INVESTIGATION or not request.complete_work:
         raise ValueError('Execution did not enter the result investigation contract')
@@ -134,34 +262,38 @@ def _binding(owner: Any, execution_ref: str) -> dict:
         'goal': request.goal, 'source_request': source['request'], 'roots': roots,
         'receipt_sha256': {str(path): _hash(path) for path in (
             record, record.parent / 'native_result.json', prepared, prepared.parent / 'request.json')},
-        'artifact_sha256': hashes, 'output_sha256': saved['output_sha256']}
+        'artifact_sha256': hashes, 'output_sha256': saved['output_sha256'],
+        **({'response_contract': response_contract} if response_contract is not None else {})}
 
 
 def _validate(owner: Any, response: dict, observations: list[dict], identity: str) -> list[dict]:
-    selected = _Findings.model_validate(response)
-    windows = selected_material_windows(owner.workspace, selected, observations, identity=identity)
-    for finding in selected.findings:
-        for evidence in finding.evidence:
-            path = owner.workspace.resolve(evidence.path)
-            if not any(owner.workspace.resolve(row['request']['path']) == path
-                    and evidence.quote in row['data']['text'] for row in windows):
-                raise ValueError('Finding quote must occur literally in a selected observed window')
     binding = ArtifactStore(owner.root / 'attempts' / identity / 'implementation_findings').read_json('request.json')
-    outputs = {owner.workspace.resolve(path) for path in binding['output_sha256']}
-    if selected.disposition == 'outcome_ready' and not any(
-            owner.workspace.resolve(evidence.path) in outputs
-            for finding in selected.findings for evidence in finding.evidence):
-        raise ValueError('Ready findings require an actual execution output as observed evidence; '
-            'source-only evidence must retain the missing result investigation as remaining work')
-    return windows
+    return validate_findings(owner.workspace, response, observations, identity,
+        binding['output_sha256'], binding.get('response_contract'))
 
 
-def _view(identity: str, binding: dict, response: dict, windows: list[dict]) -> dict:
-    selected = _Findings.model_validate(response)
+def _view(identity: str, binding: dict, response: dict, windows: list[dict],
+          observations: list[dict] | None = None) -> dict:
+    protocol = binding.get('response_contract')
+    if protocol is None:
+        conclusion = _Findings.model_validate(response).model_dump(mode='json', exclude={'read_windows', 'materials'})
+    elif protocol == OBSERVED_REFS:
+        if observations is None:
+            raise ValueError('Observed-reference findings require their actual observations')
+        selected = findings_response_model(observations, binding['output_sha256'], {}).model_validate(response)
+        references = {f'observed-{index}': _observation_reference(index, row)
+            for index, row in enumerate(observations)}
+        conclusion = {'response_contract': protocol,
+            'findings': [{'statement': finding.statement,
+                'evidence': [references[ref] for ref in finding.evidence]} for finding in selected.findings],
+            'limitations': selected.limitations, 'remaining_work': selected.remaining_work,
+            'disposition': 'handoff_required' if selected.remaining_work else 'outcome_ready'}
+    else:
+        raise ValueError('Unknown investigation response contract')
     base = f'records/{identity}/implementation_findings'
     return {'contract': RESULT_INVESTIGATION, 'execution_ref': binding['execution_ref'],
         'record': f'{base}/result.json',
-        **selected.model_dump(mode='json', exclude={'read_windows', 'materials'}),
+        **conclusion,
         'materials': [row['request'] for row in windows],
         'observation_record': f'{base}/selection-observations.json',
         'observation_references': [{'record': f'{base}/selection-observations.json',
@@ -196,9 +328,12 @@ def investigate_execution(owner: Any, arguments: dict, identity: str) -> ToolRes
     """Run or reconstruct one bounded investigation; never replay incomplete calls."""
     _identity(identity)
     request = InvestigationRequest.model_validate(arguments)
-    binding = _binding(owner, request.execution_ref)
     attempt = ArtifactStore(owner.root / 'attempts' / identity)
     domain = ArtifactStore(attempt.root / 'implementation_findings')
+    # Freeze the protocol on fresh admission only. Missing saved markers are
+    # historical contracts, including incomplete attempts and cached results.
+    protocol = domain.read_json('request.json').get('response_contract') if domain.exists('request.json') else OBSERVED_REFS
+    binding = _binding(owner, request.execution_ref, response_contract=protocol)
     session = ArtifactStore(owner.root).read_json('session_manifest.json')
     # A new identity cannot purchase another interpretation of the same run.
     # Include interrupted/failed registered attempts, not only successful outputs.
@@ -222,7 +357,7 @@ def investigate_execution(owner: Any, arguments: dict, identity: str) -> ToolRes
         domain.write_json('request.json', binding)
         inventories = material_inventories(owner.workspace, binding['roots'], identity=identity)
         context = {'goal': binding['goal'], 'execution_ref': binding['execution_ref'],
-            'inventories': inventories, 'response_schema': _Findings.model_json_schema(),
+            'inventories': inventories,
             'scope': 'Successful execution is a physical fact, not proof the goal was met. '
                 'Inspect results and original conditions. Unread ranges remain unknown.'}
         if getattr(owner, 'work_context', None) is not None:
@@ -237,23 +372,33 @@ def investigate_execution(owner: Any, arguments: dict, identity: str) -> ToolRes
         else:
             from simple_ar.tools.implementation import ImplementationToolGateway
             client = ImplementationToolGateway._client(owner, identity)
+        def response_model_factory(rows: list[dict]) -> type[BaseModel]:
+            output_paths = {owner.workspace.resolve(path) for path in binding['output_sha256']}
+            offered_outputs = [row['request']['path'] for row in rows
+                if owner.workspace.resolve(row['request']['path']) in output_paths]
+            return findings_response_model(rows, offered_outputs, context)
+
         response = inspect_materials(workspace=owner.workspace, context=context,
-            instructions='Return only the response schema. Findings need literal quotes from selected '
-                'actually observed material windows. Diagnose missing or unmet goal requirements as '
+            instructions='Return only the response schema. Link each finding to owner-issued '
+                'observation IDs in evidence_index. Do not return materials, window recipes, quotes '
+                'or disposition. The owner derives windows and outcome state from your citations '
+                'and remaining_work. Diagnose missing or unmet goal requirements as '
                 'remaining_work; never invent tool routes, composition diagnoses, execution permission '
                 'or scientific certification. A successful outcome neither finishes the task nor requires '
                 'a report. Read steps contain read_windows alone.',
             inventories=inventories, owner=domain, identity=identity, client=client,
-            response_model=_Findings, label='implementation-findings', seed=seed,
-            final_fields=('materials', 'findings', 'limitations', 'remaining_work', 'disposition'),
+            response_model=_ObservedFindings, response_model_factory=response_model_factory,
+            label='implementation-findings', seed=seed,
+            final_fields=('findings', 'limitations', 'remaining_work'),
             validate_selection=lambda value, rows: _validate(owner, value, rows, identity),
             terminal_purpose='Interpret the actual execution outcome against the original goal, '
                 'with supported findings, limitations and a bounded remaining-work disposition.')
         domain.write_json('selection-response.json', response)
-    windows = _validate(owner, response, domain.read_json('selection-observations.json'), identity)
-    if _binding(owner, request.execution_ref) != binding:
+    observations = domain.read_json('selection-observations.json')
+    windows = _validate(owner, response, observations, identity)
+    if _binding(owner, request.execution_ref, response_contract=protocol) != binding:
         raise ValueError('Investigation inputs changed during interpretation')
-    data = _view(identity, binding, response, windows)
+    data = _view(identity, binding, response, windows, observations)
     if domain.exists('result.json'):
         if domain.read_json('result.json') != data:
             raise ValueError('Retained investigation result changed')
@@ -263,7 +408,7 @@ def investigate_execution(owner: Any, arguments: dict, identity: str) -> ToolRes
 
 
 def accepted_investigation(owner: Any, execution_ref: str, *, include_observations: bool = False) -> dict | None:
-    """Return compact context only; use investigation_observations for Writer reuse.
+    """Return compact context; optionally include exact selected observations for Writer reuse.
 
     Only unmarked original work returns None. Marked work requires one exact,
     registered, settled and current result from the existing session attempts.
@@ -294,10 +439,13 @@ def accepted_investigation(owner: Any, execution_ref: str, *, include_observatio
         if registered.schema != RESULT_INVESTIGATION or len(outputs) != 1:
             raise ValueError('Invalid investigation registration')
         domain = ArtifactStore(path.parent)
-        response = _cached_response(domain, binding)
-        windows = _validate(owner, response, domain.read_json('selection-observations.json'), identity)
-        data = _view(identity, binding, response, windows)
-        if domain.read_json('result.json') != data or _binding(owner, execution_ref) != binding:
+        protocol = domain.read_json('request.json').get('response_contract')
+        current_binding = _binding(owner, execution_ref, response_contract=protocol)
+        response = _cached_response(domain, current_binding)
+        observations = domain.read_json('selection-observations.json')
+        windows = _validate(owner, response, observations, identity)
+        data = _view(identity, current_binding, response, windows, observations)
+        if domain.read_json('result.json') != data or _binding(owner, execution_ref, response_contract=protocol) != current_binding:
             raise ValueError('Accepted investigation evidence or result changed')
         expected = _result(attempt, domain, data)
         if expected.model_dump(mode='json') != observed:
@@ -313,15 +461,6 @@ def accepted_investigation(owner: Any, execution_ref: str, *, include_observatio
     if len(matches) != 1:
         raise ValueError('Marked execution requires exactly one accepted current investigation')
     return matches[0]
-
-
-def investigation_observations(owner: Any, investigation: dict) -> list[dict]:
-    """Separately expose revalidated selected bodies; never put these in coordinator context."""
-    accepted = accepted_investigation(owner, investigation['execution_ref'], include_observations=True)
-    if accepted is None or {key: value for key, value in accepted.items() if key != 'observations'} != {
-            key: value for key, value in investigation.items() if key != 'observations'}:
-        raise ValueError('Observation reuse requires the exact accepted investigation context')
-    return accepted['observations']
 
 
 def investigations_for(owner: Any, targets: list[str], *, include_observations: bool = False) -> list[dict]:
