@@ -2135,6 +2135,47 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(standalone.ledger.to_dict(), accounted)
         self.assertEqual(standalone.process_argv(['python', '.', '', 'workspace', str(standalone.workspace)]),
             [str(standalone.python), '.', '', str(standalone.workspace), str(standalone.workspace)])
+        batch = inputs / 'search batch'
+        batch.mkdir()
+        filenames = [f'file {index:03d} 测量.txt' for index in range(128)]
+        for name in filenames:
+            (batch / name).write_text('bounded match\n', encoding='utf-8')
+        (batch / '.env').write_text('bounded match private secret', encoding='utf-8')
+        (batch / '.ssh').mkdir()
+        (batch / '.ssh' / 'private.txt').write_text('bounded match private secret', encoding='utf-8')
+        (batch / 'escape.txt').symlink_to(escaped)
+        for identity, options, count in (('search-default-batch', {}, 64),
+                                        ('search-max-batch', {'max_files': 128}, 128)):
+            found = standalone.call('search_files',
+                {'path': 'source0/search batch', 'query': 'bounded match', **options}, identity=identity)
+            self.assertEqual(found.status, 'ok', found.error)
+            self.assertEqual(found.data['searched_files'], count)
+            self.assertEqual(found.data['has_more_files'], count == 64)
+            self.assertEqual(found.data['returncode'], 0)
+            receipt = json.loads((run_dir / found.data['receipt']).read_text(encoding='utf-8'))
+            expected = {f'source0/search batch/{name}:1:bounded match' for name in filenames[:count]}
+            raw = (run_dir / found.data['receipt']).parent.joinpath('stdout.log').read_bytes()
+            normalized = raw.decode('utf-8').replace(str(inputs)+os.sep,'source0/')
+            self.assertEqual(set(normalized.splitlines()), expected)
+            # Returned text is bounded independently of the selected-file count.
+            # Full command output retains every match; a clipped final line is
+            # disclosed rather than mistaken for missing or unsearched files.
+            self.assertEqual(found.data['output_truncated'],len(raw)>12000)
+            visible = found.data['text'].splitlines()
+            self.assertTrue(visible)
+            self.assertTrue(set(visible[:-1] if found.data['output_truncated'] else visible)<=expected)
+            separator = receipt['argv'].index('--')
+            self.assertEqual(receipt['invocation_id'], identity)
+            self.assertEqual(receipt['argv'][separator+1:],
+                             ['bounded match', *[str(batch/name) for name in filenames[:count]]])
+        accounted = standalone.ledger.to_dict()
+        with patch('simple_ar.tools.workspace.run_process') as execute:
+            oversized = standalone.call('run_process', {'argv': ['python', *['argument'] * 40]},
+                                        identity='public-argv-over-limit')
+            self.assertEqual(oversized.status, 'blocked', oversized)
+            self.assertIn('argv', oversized.error)
+            execute.assert_not_called()
+        self.assertEqual(standalone.ledger.to_dict(), accounted)
         blocked_root = run_dir / "bounded"
         blocked_root.mkdir()
         limited = WorkspaceToolGateway(blocked_root, {"source0": inputs}, BudgetLedger({"process_invocations": 0}))

@@ -11,6 +11,7 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 - Working summaries can replace repeated history input after complete recorded operations and original arguments have been supplied. Required replacement notes remain visible, while original receipts stay available for rereading.
 - Empty, partial or interrupted summaries retain prior understanding and costs. Historical prefix summaries remain readable without acquiring coverage they never established.
 - Independent inspection uses real read-only tool calls to investigate sources, then submits structured findings separately. Results stay paired with their native calls; malformed or unauthorized operations do not execute. Diagnostics distinguish tool-call responses from reasoning-only output.
+- Each source search inside an inspection retains its own invocation and charge. Unknown child-process usage stops further requests; bounded internal file searches no longer inherit the public arbitrary-command argument-count limit.
 
 End-to-end initial-draft and feedback acceptance is still in progress. These changes do not establish lower whole-task costs.
 

@@ -109,9 +109,12 @@ class InspectionToolGateway:
         return self.store.exists(self._path(identity, 'input'))
 
     def _usage(self, identity: str) -> list[dict[str, Any]]:
-        # The factory owns client configuration and shared-ledger binding.
+        # Native source calls own distinct process identities on the same ledger.
+        # Legacy receipts without this admission list keep their original usage.
+        path = self._path(identity,'input')
+        invocations = self.store.read_json(path).get('source_invocations',[]) if self.store.exists(path) else []
         return [entry.to_dict() for entry in self.workspace.ledger.entries
-                if entry.attempt_id == identity]
+                if entry.attempt_id == identity or entry.logical_call_id in invocations]
 
     def _digest(self, path: str) -> str:
         return hashlib.sha256(self.store.resolve(path).read_bytes()).hexdigest()
@@ -372,6 +375,11 @@ class InspectionToolGateway:
         turn = getattr(client,'tool_turn',None) or client.chat_turn
         for number in range(7):
             label = f'inspect-artifacts-{identity}' + (f'-sources-{number}' if number else '')
+            if number==6:
+                messages.append({'role':'user','content':
+                    'Source gathering has ended; no additional reads will execute. Submit record_inspection now. '
+                    'For necessary claims not supported by the observed evidence, record concrete required '
+                    'findings; disclose other remaining scope in limitations. Do not claim unread sources were checked.'})
             response = turn(messages,tools=[*tools,terminal] if number<6 else [terminal],
                 label=label,budget_call_id=label)
             trace = self._path(identity,f'sources-{number}')
@@ -421,16 +429,20 @@ class InspectionToolGateway:
                 try:
                     if batch_error:
                         raise ValueError(batch_error)
+                    source_identity = 'inspection-' + hashlib.sha256(
+                        json.dumps([identity,number,index,call['id']]).encode()).hexdigest()[:40]
+                    saved.setdefault('source_invocations',[]).append(source_identity)
+                    self.store.write_json(input_path,saved)
                     if name=='read_file':
                         row = self._observe(FileWindow.model_validate(arguments),
-                            f"evidence-{len(saved['evidence'])+1}",identity,remaining)
+                            f"evidence-{len(saved['evidence'])+1}",source_identity,remaining)
                         saved['evidence'].append(row)
                         self._mark_evidence(saved)
                         visible = self._view({**saved,'targets':[], 'evidence':[row]},request)['evidence'][0]
                         result = ToolResult(tool_name=name, status='ok' if row.get('readable') else 'error',
                             data=visible,error='' if row.get('readable') else row.get('limitation','Read failed'))
                     else:
-                        result = self.workspace.call(name,arguments,identity=identity)
+                        result = self.workspace.call(name,arguments,identity=source_identity)
                 except (ValueError,KeyError,TypeError,OSError) as exc:
                     result = ToolResult(tool_name=name or 'unoffered',status='blocked',error=str(exc))
                 results.append({'tool':name,'arguments':arguments,'call_id':call['id'],
@@ -441,6 +453,8 @@ class InspectionToolGateway:
                 self.store.write_json(trace,{'response':response,'usage':self._usage(identity),'results':results})
                 saved['source_rounds'][-1] = self._digest(trace)
                 self.store.write_json(input_path,saved)
+                if any(row['status'] in {'reserved','unknown'} for row in self._usage(identity)):
+                    raise ValueError('Inspection source usage is unsettled; retain completed observations without further requests')
             self._check_versions([*saved['targets'],*saved['evidence']],identity)
         raise AssertionError('Inspection did not return or disclose its source limit')
 

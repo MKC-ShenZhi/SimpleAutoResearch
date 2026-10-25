@@ -854,12 +854,19 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 self.assertIn('observations.csv', json.dumps(replies[0]))
                 return [
                     _action('search_files', path='measurements', query='sample'),
+                    _action('search_files', path='measurements', query='a,1'),
                     _action('read_file', path='measurements/observations.csv'),
                     _action('read_file', path=str(self.directory/'outside.txt'))]
             self.assertEqual(rounds,3)
-            self.assertEqual(len(replies), 3)
-            self.assertIn('a,1', json.dumps(replies[1]))
-            self.assertNotEqual(replies[2]['status'], 'ok', replies[2])
+            self.assertEqual(len(replies), 4)
+            for reply, match in zip(replies[:2], ('sample,value', 'a,1')):
+                self.assertEqual(reply['status'], 'ok', reply)
+                self.assertIn('measurements/observations.csv:', reply['data']['text'])
+                self.assertIn(match, reply['data']['text'])
+                self.assertEqual(reply['data']['returncode'], 0)
+            self.assertNotEqual(replies[0]['data']['receipt'], replies[1]['data']['receipt'])
+            self.assertIn('a,1', json.dumps(replies[2]))
+            self.assertNotEqual(replies[3]['status'], 'ok', replies[3])
             return {'findings':[],'limitations':['The inaccessible file was not read.']}
 
         (self.directory/'outside.txt').write_text('Not authorized for this task.\n')
@@ -885,17 +892,44 @@ class OperationsWorkLoopTests(unittest.TestCase):
         identity = Path(result['data']['record']).parts[1]
         saved_records = self._versions(self.root/f'tools/inspection/{identity}')
         self.assertTrue(any(path.name=='sources-0.json' for path in saved_records))
-        usage = [entry.to_dict() for entry in self.app.ledger.entries if entry.attempt_id==identity]
+        saved_input = self.app.session.store.read_json(f'tools/inspection/{identity}/input.json')
+        source_ids = saved_input['source_invocations']
+        self.assertEqual(len(source_ids), 5)
+        self.assertEqual(len(set(source_ids)), len(source_ids))
+        trace = self.app.session.store.read_json(f'tools/inspection/{identity}/sources-1.json')
+        searches = trace['results'][:2]
+        process_records = {}
+        for source_id, search, query in zip(source_ids[1:3], searches, ('sample', 'a,1')):
+            self.assertEqual(search['arguments']['query'], query)
+            receipt = self.root/search['result']['data']['receipt']
+            process_records.update(self._versions(receipt.parent))
+            invocation = json.loads(receipt.read_text(encoding='utf-8'))
+            self.assertEqual(invocation['invocation_id'], source_id)
+            separator = invocation['argv'].index('--')
+            self.assertEqual(invocation['argv'][separator+1], query)
+            self.assertEqual(set(invocation['argv'][separator+2:]),
+                             {str(self.inputs/name) for name in ('conditions.txt','observations.csv')})
+        usage = self.app.operations.inspection._usage(identity)
+        charges = [row for row in usage if row['logical_call_id'] in source_ids[1:3]]
+        self.assertEqual({row['logical_call_id'] for row in charges}, set(source_ids[1:3]))
+        self.assertEqual(len(charges), 2)
+        self.assertTrue(all(row['status']=='settled' and row['actual']['process_invocations']==1
+                            for row in charges))
         self.assertEqual(sum(row.get('actual', {}).get('llm_requests', 0) for row in usage), 3)
+        ledger = self.app.ledger.to_dict()
         self._reload()
-        cached = self.app.operations.inspection.call('inspect_artifacts',{
-            'goal':'Check the claims against supplied observations','targets':['notes.md'],
-            'evidence':['measurements/conditions.txt']},identity)
+        with patch('simple_ar.tools.workspace.run_process') as execute:
+            cached = self.app.operations.inspection.call('inspect_artifacts',{
+                'goal':'Check the claims against supplied observations','targets':['notes.md'],
+                'evidence':['measurements/conditions.txt']},identity)
+            execute.assert_not_called()
         self.assertEqual(cached.status,'ok',cached.error)
         self.assertEqual(self.send.call_count,3)
         self.assertEqual(self._versions(self.root/f'tools/inspection/{identity}'), saved_records)
-        self.assertEqual([entry.to_dict() for entry in self.app.ledger.entries
-            if entry.attempt_id==identity], usage)
+        self.assertEqual(self.app.operations.inspection._usage(identity), usage)
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+        for path, raw in process_records.items():
+            self.assertEqual(path.read_bytes(), raw)
         (self.inputs/'observations.csv').write_text('sample,value\na,9\n')
         self.assertFalse(self.app.operations.inspection.can_reconcile('inspect_artifacts',identity))
         for path,raw in originals.items():
@@ -1143,6 +1177,46 @@ class OperationsWorkLoopTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), raw)
         self._not_delivered()
         self.assertTrue((self.root / 'workspace/report.md').is_file())
+
+        # A source process can be unknown even when the parent model settled.
+        self.root = self.directory/'unknown-source-task'
+        self._create()
+        self._write('report.md', 'The sample mean is 2.0.\n')
+        self.review = lambda view: [_action('search_files', path='measurements', query='sample')]
+        def unknown_source(spec, *, budget_ledger):
+            saved_input = next((self.root/'tools/inspection').glob('*/input.json'))
+            self.assertIn(spec.invocation_id, json.loads(saved_input.read_text())['source_invocations'])
+            reservation = f'process-{spec.invocation_id}'
+            budget_ledger.reserve(reservation,
+                {'process_invocations':1, 'process_wall_seconds':spec.timeout_sec},
+                logical_call_id=spec.invocation_id, purpose='local_process')
+            budget_ledger.mark_unknown(reservation, reason='Controlled loss of source process supervision')
+            raise OSError('Source process outcome unknown')
+        before = self.send.call_count
+        with patch('simple_ar.tools.workspace.run_process', side_effect=unknown_source) as execute:
+            self._inspect(['report.md'])
+            execute.assert_called_once()
+        row = self._last('inspect_artifacts')
+        self.assertNotEqual(row['status'], 'ok', row)
+        self.assertEqual(self.send.call_count, before+1)
+        identity = Path(row['data']['record']).parts[1]
+        trace = self.app.session.store.read_json(f'tools/inspection/{identity}/sources-0.json')
+        self.assertEqual(len(trace['results']), 1)
+        self.assertIn('Source process outcome unknown', trace['results'][0]['result']['error'])
+        self.assertTrue(any(entry['status']=='unknown' and entry['reserved'].get('process_invocations')==1
+                            for entry in trace['usage']))
+        ledger = self.app.ledger.to_dict()
+        saved = self._versions(self.root/f'tools/inspection/{identity}')
+        self._reload()
+        with patch('simple_ar.tools.workspace.run_process') as execute:
+            recovered = self.app.operations.inspection.call('inspect_artifacts', {
+                'goal':'Check the claims against supplied observations', 'targets':['report.md'],
+                'evidence':['measurements/observations.csv','measurements/conditions.txt']}, identity)
+            self.assertFalse(recovered.ok, recovered)
+            execute.assert_not_called()
+        self.assertEqual(self.send.call_count, before+1)
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+        self.assertEqual(self._versions(self.root/f'tools/inspection/{identity}'), saved)
 
     def test_frozen_code_contract_rejects_generic_bypass_and_unvalidated_success_but_keeps_partial_work(self):
         # Minimal exact contract used by the existing authority integration in

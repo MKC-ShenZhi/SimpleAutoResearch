@@ -1270,7 +1270,11 @@ class WorkspaceToolGateway:
                 raise ValueError('Historical process lacks declared artifact binding; no retroactive binding or replay')
             return {**process_observation(record, output), "receipt": str(receipt.relative_to(self.root)),
                 **({'output_binding_error': record['output_binding_error']} if record.get('output_binding_error') else {})}
-        binding = self.process_artifact_binding(request.model_dump(exclude_none=True), identity=identity)
+        # Public process arguments were validated at admission. Internal fixed
+        # searches have their own filename bound and no artifact declarations;
+        # do not reinterpret that owned command as another public invocation.
+        binding = (self.process_artifact_binding(request.model_dump(exclude_none=True), identity=identity)
+                   if request.inputs or request.outputs or request.input_snapshot is not None else None)
         result = run_process(ProcessSpec(argv=argv, cwd=cwd, timeout_sec=request.timeout_sec,
             env=self.process_environment(), output_dir=output, invocation_id=identity, tail_bytes=12000, log_bytes=200000,
             input_binding={'workspace_artifacts': binding} if binding is not None else None),
