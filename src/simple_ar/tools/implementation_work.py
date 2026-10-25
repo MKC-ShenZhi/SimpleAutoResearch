@@ -94,7 +94,8 @@ def prepare_work(owner: Any, request: Any, store: ArtifactStore, output: Path,
         inputs = {row['path']: row['sha256'] for row in saved.get('original_files', {}).values()}
         inputs.update({str(owner.workspace.resolve(row['request']['path'])): row['sha256']
             for row in saved['source_windows'] if 'request' in row})
-        inputs.update(preserved_input_hashes(owner.workspace, saved.get('preserved_files', {})))
+        inputs.update(preserved_input_hashes(owner.workspace, saved.get('preserved_files', {}),
+            contract=saved.get('preserved_input_contract')))
         if owner.workspace.artifact_hashes(inputs) != inputs:
             raise ValueError('Professional source inputs changed; retain the original attempt')
         if prior := saved.get('prior_candidate'):
@@ -202,7 +203,7 @@ def prepare_work(owner: Any, request: Any, store: ArtifactStore, output: Path,
         preserved_files=retained.get('preserved_files') if retained else None,
         registered_project=retained, diagnostic_context=bounded_reuse,
         inherited_observations=inherited, inherited_coverage=inherited_coverage,
-        source_owner_paths=source_owner_paths)
+        source_owner_paths=source_owner_paths, input_contract=owner.input_contract)
     sources.requested_files = [row.model_dump() for row in request.files]
     if owner.work_context is not None and not bounded_reuse:
         # Historical fresh work keeps its original context placement. Cached
@@ -698,7 +699,8 @@ def resume_after_budget(owner: Any, observed: dict, attempt_id: str) -> dict:
             hashes.update({row['request']['path']: row['sha256']
                 for row in binding.get('source_windows', []) if 'request' in row})
             from simple_ar.code_task.generation.selection import preserved_input_hashes
-            hashes.update(preserved_input_hashes(owner.workspace, binding.get('preserved_files', {})))
+            hashes.update(preserved_input_hashes(owner.workspace, binding.get('preserved_files', {}),
+                contract=binding.get('preserved_input_contract')))
             if binding.get('generation_method') == REGISTERED_PROJECT_GENERATION:
                 from simple_ar.code_task.generation.selection import registered_project_files
                 registered_project_files(owner.workspace, binding['prior_candidate'])

@@ -295,26 +295,40 @@ def preserved_file_bytes(workspace: Any, binding: dict) -> bytes:
     return raw
 
 
-def preserved_input_hashes(workspace: Any, bindings: dict) -> dict[str, str]:
+def preserved_input_limits(contract: str | None = None) -> tuple[int, int]:
+    """Immutable input volume is independent of the editable-source budget."""
+    if contract not in {None, 'bounded_inputs.v2'}:
+        raise ValueError('Unknown preserved input contract')
+    return (64 if contract else 12), 12 * 256000
+
+
+def preserved_input_hashes(workspace: Any, bindings: dict, *,
+                           contract: str | None = None) -> dict[str, str]:
     """Validate persisted copy bindings; never infer them from matching bytes."""
     from simple_ar.code_task.generation.run_plan import ImplementationRunPlan
 
-    if not isinstance(bindings, dict) or len(bindings) > 12:
+    count, capacity = preserved_input_limits(contract)
+    if not isinstance(bindings, dict) or len(bindings) > count:
         raise ValueError('Invalid preserved input inventory')
     ImplementationRunPlan.validate_outputs(list(bindings))
     hashes = {}
+    total = 0
     for binding in bindings.values():
         preserved_file_bytes(workspace, binding)
+        total += binding['size_bytes']
+        if total > capacity:
+            raise ValueError('Preserved input inventory exceeds its byte capacity')
         hashes[str(workspace.resolve(binding['path']))] = binding['sha256']
     return hashes
 
 
 def publish_preserved_files(workspace: Any, bindings: dict, candidate: Path,
-                            validate_destination: Callable[[str], Any]) -> list[dict]:
+                            validate_destination: Callable[[str], Any], *,
+                            contract: str | None = None) -> list[dict]:
     """Atomic exact bytes inside the existing candidate publication transaction."""
     from simple_ar.core.artifacts import write_atomically
 
-    preserved_input_hashes(workspace, bindings)
+    preserved_input_hashes(workspace, bindings, contract=contract)
     rows = []
     for name, binding in bindings.items():
         validate_destination(name)
@@ -326,18 +340,19 @@ def publish_preserved_files(workspace: Any, bindings: dict, candidate: Path,
         if hashlib.sha256(target.read_bytes()).hexdigest() != binding['sha256']:
             raise ValueError('Preserved candidate bytes changed during publication')
         rows.append({'path': name, 'sha256': binding['sha256']})
-    preserved_input_hashes(workspace, bindings)
+    preserved_input_hashes(workspace, bindings, contract=contract)
     return rows
 
 
-def _preserve_selections(value: Any) -> list:
+def _preserve_selections(value: Any, *, contract: str | None = None) -> list:
     """Parse equivalent preserve syntax; authority is checked by the binder."""
     if isinstance(value, dict):
         if not all(isinstance(source, str) and isinstance(path, str) for source, path in value.items()):
             raise ValueError('Preserve dictionary requires source-to-destination strings')
         value = [{'source': source, 'path': path} for source, path in value.items()]
-    if not isinstance(value, list) or len(value) > 12:
-        raise ValueError('preserve_files requires at most 12 paths or mappings')
+    count, _ = preserved_input_limits(contract)
+    if not isinstance(value, list) or len(value) > count:
+        raise ValueError(f'preserve_files requires at most {count} paths or mappings')
     return value
 
 
@@ -351,8 +366,11 @@ class ImplementationSources:
                  registered_project: dict | None = None, diagnostic_context: bool = False,
                  inherited_observations: list[dict] | None = None,
                  inherited_coverage: dict | None = None,
-                 source_owner_paths: set[str] | None = None) -> None:
+                 source_owner_paths: set[str] | None = None,
+                 input_contract: str | None = None) -> None:
         from simple_ar.tools.materials import material_inventories, material_observation_seed
+        preserved_input_limits(input_contract)
+        self.input_contract = input_contract
         self.workspace, self.project, self.identity = workspace, project, identity
         if project is not None and registered_project is None and not retained and preserved_files is None:
             registered_project = ordinary_project_snapshot(workspace, project)
@@ -368,7 +386,10 @@ class ImplementationSources:
         self.preserved_files = {} if registered_project is not None else dict(preserved_files or {})
         for name, binding in self.immutable_files.items():
             preserved_input_hashes(workspace, {name: binding})
-        preserved_input_hashes(workspace, self.preserved_files)
+        preserved_input_hashes(workspace, self.preserved_files, contract=self.input_contract)
+        if self.input_contract:
+            preserved_input_hashes(workspace, {**self.immutable_files, **self.preserved_files},
+                contract=self.input_contract)
         self._retained_preserved = dict(self.preserved_files)
         self.roots = list(dict.fromkeys([*([str(project)] if project else []), *roots]))
         self.inventories = material_inventories(workspace, self.roots, identity=identity,
@@ -508,6 +529,8 @@ class ImplementationSources:
             binding['project_snapshot'] = self.registered_project
         binding['source_windows'] = self.observations
         binding['investigation'] = self.context()
+        if self.input_contract:
+            binding['preserved_input_contract'] = self.input_contract
         owner.write_json('request.json', binding)
 
     def focus(self, references: list[str]) -> None:
@@ -529,7 +552,10 @@ class ImplementationSources:
         if self.working_set and coverage is not None:
             coverage['details'] = 'request.json:journal_observations.coverage'
             coverage['reference_coverage'] = self.seed_coverage['reference_coverage']
-        return {'inventories': [{'root': self.workspace.locator(row['project_path']),
+        return {**({'preserved_input_contract': self.input_contract,
+                    'preserved_input_limits': dict(zip(('files', 'bytes'),
+                        preserved_input_limits(self.input_contract)))} if self.input_contract else {}),
+            'inventories': [{'root': self.workspace.locator(row['project_path']),
             'files': [[self.workspace.locator(path), size] for path, size in row['candidate_files'].items()],
             'omitted_files': row['omitted_files'], 'scope': row['inventory_scope']} for row in self.inventories],
             'existing_project_paths': sorted(self.project_files),
@@ -596,9 +622,9 @@ class ImplementationSources:
     def bind_response(self, response: dict, *, commit: bool = True) -> tuple[dict, dict]:
         """Validate bindings locally; the writer commits only an admitted candidate."""
         rows = response.get('files')
-        preserve = _preserve_selections(response.get('preserve_files', []))
+        preserve = _preserve_selections(response.get('preserve_files', []), contract=self.input_contract)
         if not isinstance(rows, list):
-            raise ValueError('Candidate requires files and optional preserve_files (at most 12 paths)')
+            raise ValueError('Candidate requires editable files and optional immutable preserve_files')
         from simple_ar.code_task.generation.run_plan import ImplementationRunPlan
 
         legacy, copied = [], dict(self._retained_preserved)
@@ -643,6 +669,8 @@ class ImplementationSources:
                     for name in destinations):
                 raise ValueError('Candidate destination is outside the selected editable subtree')
         ImplementationRunPlan.validate_outputs(list(copied))
+        preserved_input_hashes(self.workspace, {**self.immutable_files, **copied}
+            if self.input_contract else copied, contract=self.input_contract)
         ImplementationRunPlan._check_conflicts(list(copied), [*names, *legacy, *self.originals])
         if self.registered_project is not None:
             # An existing registered file can only be overlaid via its exact
@@ -669,7 +697,7 @@ class ImplementationSources:
         originals = ({name: row for name, row in self.originals.items() if name in {*legacy, *names}}
             if self.registered_project is not None else dict(self.originals))
         originals.update(bound)
-        if len(set(originals) | set(names) | set(copied)) > 12:
+        if len(set(originals) | set(names) | (set() if self.input_contract else set(copied))) > 12:
             raise ValueError('Candidate including preserved dependencies exceeds 12 source files')
         if commit:
             if self.registered_project is not None:
@@ -687,7 +715,8 @@ class ImplementationSources:
             if path in hashes and hashes[path] != row['sha256']:
                 raise ValueError('Observed implementation input has conflicting versions')
             hashes[path] = row['sha256']
-        hashes.update(preserved_input_hashes(self.workspace, self.preserved_files))
+        hashes.update(preserved_input_hashes(self.workspace, self.preserved_files,
+            contract=self.input_contract))
         for name, binding in self.immutable_files.items():
             hashes.update(preserved_input_hashes(self.workspace, {name: binding}))
         if self.registered_project is not None:

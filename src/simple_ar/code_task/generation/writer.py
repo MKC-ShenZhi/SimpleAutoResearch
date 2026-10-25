@@ -138,7 +138,8 @@ def write_implementation_unit(
             'There is no material-selection or file-selection finalization step. At most six decisions '
             'share this task budget. Completed read or candidate contract/admission failures become '
             'actual diagnostics for a later decision within those same six calls, not another retry allowance. '
-            'FileWindow uses path, offset_bytes, max_bytes (1-64000), optional start_line/max_lines; '
+            'Each read decision accepts 1-12 windows. FileWindow uses path, offset_bytes, '
+            'max_bytes (1-64000), optional start_line/max_lines; '
             'continue at next_offset_bytes for unread tails. Windows do not establish full coverage; '
             'never infer unseen contents from inventory. For every existing_project_paths entry use '
             'exact replacements, never content; the owner checks complete current originals. Optional '
@@ -148,9 +149,19 @@ def write_implementation_unit(
             'for byte-for-byte copies of individual files up to 256000 bytes. Do not retransmit their '
             'contents or supply hashes. Copied data is immutable, not editable original_files; '
             'retained preserve mappings survive feedback automatically and cannot be overwritten. '
+            + ('Editable sources and immutable inputs have independent admission. Choose at most 12 '
+                'editable sources; preserve up to 64 individual inputs, each at most 256000 bytes and '
+                '3072000 bytes total. Programmatically parse original data at execution instead of '
+                'transcribing records or computed tables into generated file content. Inspect enough '
+                'examples to understand the format; copying bytes is not reading or verifying all records. '
+                if investigation.input_contract else '')
             + ('The owner retains all admitted project members independently of the edit set. '
                 'Choose at most 12 editable source files and additional bounded preserve mappings. '
                 if investigation.registered_project is not None else
+                'Only explicit preserve mappings are copied into a new candidate; an authorized material '
+                'directory is not copied automatically. Include necessary imports and data dependencies '
+                'without retransmitting their contents. Unmentioned original_files remain unchanged. '
+                if investigation.input_contract else
                 'Include required untouched imports/configuration; no recursive environment, dataset or '
                 'runtime-output copying. Unmentioned original_files remain unchanged. Choose at most 12 '
                 'total source files including preserved dependencies. ')
@@ -247,7 +258,8 @@ def write_implementation_unit(
 
             generated.extend(publish_preserved_files(
                 investigation.workspace if investigation is not None else preserve_workspace,
-                copies, candidate, validate_destination))
+                copies, candidate, validate_destination,
+                contract=investigation.input_contract if investigation is not None else None))
         if investigation is not None:
             investigation.validate()
         if registered:
@@ -297,7 +309,10 @@ def _decode_implementation_response(
     preserved_files: dict | None = None,
     candidate_admission: bool = False,
     registered_paths: list[str] | None = None,
+    input_contract: str | None = None,
 ) -> tuple[dict[str, str], dict[str, str]]:
+    from simple_ar.code_task.generation.selection import preserved_input_limits
+    preserved_input_limits(input_contract)
     modes: dict[str, str] = {}
     rows = response.get('files')
     if (not isinstance(rows, list) or (len(rows) != len(planned) if planned is not None
@@ -369,7 +384,7 @@ def _decode_implementation_response(
     if preserved_files:
         ImplementationRunPlan.validate_outputs(list(preserved_files))
         ImplementationRunPlan._check_conflicts(list(preserved_files), list(contents))
-        if len(contents) + len(preserved_files) > 12:
+        if not input_contract and len(contents) + len(preserved_files) > 12:
             raise ValueError('Candidate including preserved dependencies exceeds 12 files')
     if not legacy and 'execution_plan' in response:
         plan = ImplementationRunPlan.model_validate(response['execution_plan'])
@@ -463,6 +478,7 @@ def _generate_implementation_contents(
                 execution_requested=execution_requested,
                 preserved_files=candidate_preserved,
                 candidate_admission=candidate_admission,
+                input_contract=investigation.input_contract if investigation is not None else None,
                 registered_paths=list(investigation.registered_files) if investigation is not None else None)
             if not legacy and command_source_binding is not None and 'execution_plan' in response:
                 if candidate_root is None:

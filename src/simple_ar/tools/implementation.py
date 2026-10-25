@@ -460,16 +460,22 @@ class ImplementationToolGateway:
                  declaration_review: bool = False,
                  professional_requests: bool = False,
                  preparation_only: bool = False,
+                 input_contract: str | None = None,
                  measurement: dict[str, Any] | None = None,
                  measurement_supplier: Callable[[], dict[str, Any] | None] | None = None,
                  exact: dict[str, Any] | None = None) -> None:
         if preparation_only and exact is not None:
             raise ValueError('Preparation-only source generation cannot use the exact code-task contract')
+        from simple_ar.code_task.generation.selection import preserved_input_limits
+        preserved_input_limits(input_contract)
+        if input_contract is not None and not preparation_only:
+            raise ValueError('Independent input admission requires ordinary source preparation')
         self.root, self.workspace, self.ledger = root, workspace, ledger
         self.model, self.session_id = model, session_id
         self.declaration_review = declaration_review
         self.professional_requests = professional_requests
         self.preparation_only = preparation_only
+        self.input_contract = input_contract
         self.client_factory = client_factory
         self.execution_observations = execution_observations
         self.candidate_outputs = candidate_outputs
@@ -1284,7 +1290,8 @@ class ImplementationToolGateway:
             # A full project inventory is never expanded into model originals.
             editable = (set(source.get('original_files', {}))
                 if source.get('generation_method') == REGISTERED_PROJECT_GENERATION else
-                {row['path'] for row in rows} if len(rows) <= 12 else set())
+                {row['path'] for row in rows if row['path'] not in preserved}
+                    if len([row for row in rows if row['path'] not in preserved]) <= 12 else set())
             specs = [{'path': row['path'], 'source_path': str(candidate / row['path']),
                 'source_sha256': row['sha256']} for row in rows
                 if row['path'] in editable and row['path'] not in preserved
@@ -1320,7 +1327,7 @@ class ImplementationToolGateway:
         from simple_ar.code_task.generation.selection import preserved_input_hashes
 
         preserved = dict(source.get('preserved_files', {}))
-        preserved_input_hashes(self.workspace, preserved)
+        preserved_input_hashes(self.workspace, preserved, contract=source.get('preserved_input_contract'))
         candidate_hashes = {row['path']: row['sha256'] for row in rows}
         if any(candidate_hashes.get(name) != binding['sha256']
                 or self.workspace.artifact_hashes([str(candidate / name)])[str(candidate / name)] != binding['sha256']
@@ -1525,7 +1532,9 @@ class ImplementationToolGateway:
                 # review leads; actual execution/version/findings checks still apply.
                 request = ImplementationRequest.model_validate({**narrow.model_dump(),
                     'complete_work': False, 'max_repairs': 0,
-                    'producer_completion': 'goal_findings.v1'})
+                    'producer_completion': 'goal_findings.v1',
+                    **({'candidate_admission': 'python_candidate_admission.v1'}
+                        if self.input_contract else {})})
             else:
                 request = ImplementationRequest.model_validate(arguments)
             repair_observation = None

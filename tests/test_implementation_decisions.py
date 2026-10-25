@@ -44,11 +44,12 @@ class ImplementationDecisionTests(unittest.TestCase):
         return {'choices': [{'message': {'role': 'assistant', 'content': content}, 'finish_reason': finish}],
             'usage': {'prompt_tokens': 100, 'completion_tokens': 20, 'total_tokens': 120}}
 
-    def _create(self, name='task', sources=None):
+    def _create(self, name='task', sources=None, *, operations=False):
         return ToolApplication.create(self.base / name, 'Implement from the authorized original inputs',
             model='fixture', sources=sources or {}, services=self.services,
             professional_inputs=True, allow_execution=True, max_turns=12, max_tokens=600000,
-            process_limits={'process_invocations': 3, 'process_wall_seconds': 30}, control_protocol=None)
+            process_limits={'process_invocations': 3, 'process_wall_seconds': 30},
+            control_protocol='operations.v1' if operations else None)
 
     @staticmethod
     def _observations(app):
@@ -434,6 +435,99 @@ class ImplementationDecisionTests(unittest.TestCase):
         self.assertEqual(request_path.read_bytes(), frozen_request)
         self.assertEqual(restored.ledger.to_dict(), before)
         self.assertEqual(self.send.call_count, 5)
+
+    def test_ordinary_inputs_survive_execution_and_feedback_without_transcription(self):
+        from simple_ar.code_task.generation.selection import ImplementationSources, preserved_input_hashes
+        from simple_ar.tools.implementation_run import prepared_unit
+
+        materials = self.base / 'records'
+        materials.mkdir()
+        for index in range(32):
+            (materials / f'{index}.json').write_bytes(json.dumps({'value': index}).encode() + b'\r\n')
+        mappings = {f'inputs/{i}.json': f'data/{i}.json' for i in range(32)}
+        code = ("import json\nfrom pathlib import Path\n"
+            "total = sum(json.loads(p.read_text())['value'] for p in Path('data').glob('*.json'))\n"
+            "Path('result.txt').write_text(str(total))\n")
+        proposal = self._candidate(code)
+        proposal['preserve_files'] = mappings
+        self.responses = [{'read_windows': [{'path': 'inputs/0.json'}]}, proposal]
+        app = self._create('independent-inputs', sources={'inputs': materials}, operations=True)
+        prepared = self._prepare(app, {'goal': 'Sum the recorded values without rewriting inputs',
+            'material_roots': ['inputs']})
+        self.assertEqual(prepared['status'], 'ok', prepared)
+        candidate = Path(prepared['data']['project_dir'])
+        for source, destination in mappings.items():
+            self.assertEqual((candidate / destination).read_bytes(), (materials / Path(source).name).read_bytes())
+        source_binding = json.loads(Path(prepared['data']['source_binding']).read_text())
+        self.assertEqual(source_binding['preserved_input_contract'], 'bounded_inputs.v2')
+        self.assertEqual(source_binding['candidate_admission'], 'python_candidate_admission.v1')
+        self.assertIsNotNone(self.prompts[0]['dependency_observation'])
+        self.assertEqual(len(source_binding['preserved_files']), 32)
+        self.assertEqual(sum('request' in row for row in source_binding['source_windows']), 1)
+        # The same complete input inventory is not legal under a missing/old marker.
+        with self.assertRaises(ValueError):
+            preserved_input_hashes(app.workspace, source_binding['preserved_files'])
+        legacy = ImplementationSources(workspace=app.workspace, project=None, roots=['inputs'],
+            windows=[], originals={}, identity='historical-input-admission')
+        with self.assertRaises(ValueError):
+            legacy.bind_response(proposal)
+        for contract in ('unknown', 'bounded_inputs.v3'):
+            with self.assertRaises(ValueError):
+                preserved_input_hashes(app.workspace, {}, contract=contract)
+
+        app.run(actions=[{'tool_name': 'execute_implementation', 'arguments': {
+            'prepared_result': prepared['data']['prepared_result']}}], progress=lambda _: None)
+        token = app.approval_token(app.state['pending']['call'])
+        app.run(approved_execution=token, progress=lambda _: None,
+            should_stop=lambda: self._observations(app)[-1]['tool_name'] == 'execute_implementation')
+        self.assertEqual(self._observations(app)[-1]['status'], 'ok')
+        self.assertEqual((candidate / 'result.txt').read_text(), '496')
+        ledger = app.ledger.to_dict()
+        restored = ToolApplication.load(app.session.store.root, services=self.services)
+        self.assertEqual(restored.ledger.to_dict(), ledger)
+        prepared_unit(restored.implementation, prepared['data']['prepared_result'])
+        self.responses = [{'summary': 'Add one to the computed sum; preserve all input bytes',
+            'unresolved': [], 'files': [{'path': 'calculate.py', 'replacements': [{
+                'old_text': 'str(total)', 'new_text': 'str(total + 1)'}]}],
+            'execution_plan': prepared['data']['execution_plan']}]
+        revised = self._prepare(restored, {'goal': 'Add one to the sum', 'project_path': str(candidate)})
+        self.assertEqual(revised['status'], 'ok', revised)
+        self.assertEqual(set(self.prompts[-1]['original_files']), {'calculate.py'})
+        for destination in mappings.values():
+            self.assertEqual((Path(revised['data']['project_dir']) / destination).read_bytes(),
+                (candidate / destination).read_bytes())
+        frozen = restored.ledger.to_dict()
+        (materials / '31.json').write_text('{"value": 900}')
+        with self.assertRaises(ValueError):
+            prepared_unit(restored.implementation, revised['data']['prepared_result'])
+        self.assertEqual(restored.ledger.to_dict(), frozen)
+        self.coordinator.assert_not_called()
+
+    def test_independent_input_capacity_is_atomic_and_keeps_edit_limit(self):
+        from simple_ar.code_task.generation.selection import ImplementationSources
+
+        material = self.base / 'bounded-inputs'
+        material.mkdir()
+        for index in range(65):
+            (material / f'{index}.bin').write_bytes(b'\x00\xff')
+        (material / 'large.bin').write_bytes(b'x' * 240000)
+        app = self._create('input-capacity', sources={'inputs': material}, operations=True)
+        source = ImplementationSources(workspace=app.workspace, project=None, roots=['inputs'],
+            windows=[], originals={}, identity='capacity', input_contract='bounded_inputs.v2')
+        code = self._candidate('print(7)\n')
+        mappings = {f'inputs/{i}.bin': f'data/{i}.bin' for i in range(64)}
+        originals, copied = source.bind_response({**code, 'preserve_files': mappings}, commit=False)
+        self.assertEqual((len(originals), len(copied)), (0, 64))
+        for invalid in (
+                {**code, 'preserve_files': {**mappings, 'inputs/64.bin': 'data/64.bin'}},
+                {**code, 'preserve_files': [{'source': 'inputs/large.bin', 'path': f'data/{i}.bin'}
+                    for i in range(13)]},
+                {**code, 'files': [{'path': f'module_{i}.py', 'content': 'value = 7\n'}
+                    for i in range(13)]}):
+            with self.assertRaises(ValueError):
+                source.bind_response(invalid)
+            self.assertEqual(source.originals, {})
+            self.assertEqual(source.preserved_files, {})
 
     def _registered_subtree(self, name):
         materials = self.base / f'{name}-materials'

@@ -1674,7 +1674,7 @@ class ToolApplication:
         if control_protocol is not None:
             config['report_protocol'] = None
             config['inspection_protocol'] = 'subjects.v1'
-            config['source_generation_protocol'] = 'prepared.v1'
+            config['source_generation_protocol'] = 'prepared.v2'
             # Old per-stage contracts belong to saved tasks, not this loop.
             for name in ('professional_inputs','professional_work','producer_completion',
                          'result_investigation','document_source_contract','publication_preparation'):

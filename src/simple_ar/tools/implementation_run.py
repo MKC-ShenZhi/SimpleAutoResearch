@@ -65,6 +65,8 @@ def candidate_source(owner: Any, locator: str) -> tuple[Path, dict, dict]:
     if Path(data['source_binding']).resolve() != binding_path.resolve():
         raise ValueError('Prepared source binding is not its producing request')
     source = ArtifactStore(record.parent).read_json('request.json')
+    from simple_ar.code_task.generation.selection import preserved_input_limits
+    preserved_input_limits(source.get('preserved_input_contract'))
     completion = source['request'].get('producer_completion')
     if completion not in {None, 'goal_findings.v1'} or data.get('producer_completion') != completion:
         raise ValueError('Prepared completion semantics differ from the retained request')
@@ -78,7 +80,7 @@ def candidate_source(owner: Any, locator: str) -> tuple[Path, dict, dict]:
     if preserved := source.get('preserved_files'):
         from simple_ar.code_task.generation.selection import preserved_input_hashes
 
-        preserved_input_hashes(owner.workspace, preserved)
+        preserved_input_hashes(owner.workspace, preserved, contract=source.get('preserved_input_contract'))
         files = {row['path']: row['sha256'] for row in data['files']}
         if any(files.get(name) != binding['sha256'] for name, binding in preserved.items()):
             raise ValueError('Preserved inputs differ from the registered candidate inventory')
@@ -115,7 +117,8 @@ def prepared_unit(owner: Any, locator: str) -> tuple[dict, Path, dict]:
     if source.get('preserved_files'):
         from simple_ar.code_task.generation.selection import preserved_input_hashes
 
-        inputs.update(preserved_input_hashes(owner.workspace, source['preserved_files']))
+        inputs.update(preserved_input_hashes(owner.workspace, source['preserved_files'],
+            contract=source.get('preserved_input_contract')))
     if prior := source.get('prior_candidate'):
         previous = owner.workspace.resolve(prior['result_ref'])
         inputs[str(previous)] = prior['result_sha256']

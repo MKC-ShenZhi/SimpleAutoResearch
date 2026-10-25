@@ -17,6 +17,8 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 - New inspections bind each target's findings and supporting files independently. Editing a sibling no longer discards an unchanged target's pass or required defect; historical grouped inspections retain their saved contract.
 - Ordinary tasks can request a coherent source candidate and execution proposal from the existing code generator, reuse observed materials, and revise the registered candidate. Execution remains separately approved; this does not restore automatic professional handoffs or require an existing repository.
 
+- New preparations separate editable source capacity from immutable input copies, retaining original data bytes across execution and feedback without changing historical task admission.
+
 End-to-end initial-draft and feedback acceptance is still in progress. These changes do not establish lower whole-task costs.
 
 ## 2026-10-25 — V2.10 development (unreleased)

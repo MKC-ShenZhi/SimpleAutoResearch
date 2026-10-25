@@ -81,7 +81,7 @@ class OperationTools:
             AnalysisToolGateway(root,self.workspace,contract=config.get('table_analysis')))
         self.implementation = self.scientific = None
         preparation = config.get('source_generation_protocol')
-        if preparation not in {None,'prepared.v1'}:
+        if preparation not in {None,'prepared.v1','prepared.v2'}:
             raise ValueError('Unsupported source generation protocol')
         exact = config.get('code_task') is not None
         if exact or preparation is not None and config['model'] is not None:
@@ -89,6 +89,7 @@ class OperationTools:
             self.implementation = ImplementationToolGateway(root,self.workspace,ledger,config['model'],session_id,
                 client_factory=lambda identity:client_factory(identity,'code'), exact=config.get('code_task'),
                 preparation_only=not exact,
+                input_contract='bounded_inputs.v2' if not exact and preparation == 'prepared.v2' else None,
                 execution_observations=execution_observations if not exact else None,
                 work_context=work_context if not exact else None,
                 material_observations=material_observations if not exact else None,
