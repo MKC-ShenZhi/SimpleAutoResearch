@@ -375,7 +375,8 @@ def composition_owner(*, root: Path, workspace: Any, session_id: str, identity: 
     owner = link['owner']
     if owner == identity or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', owner):
         raise ValueError('Invalid logical document owner')
-    path = workspace.resolve(link['prepared_result'])
+    from simple_ar.tools.professional_outcomes import native_result_path
+    path = native_result_path(root, workspace, link['prepared_result'])
     prepared = json.loads(path.read_bytes())
     accepted_native_result(root, session_id, prepared, path.parent.name)
     source = prepared.get('data', {}).get('report_identity', {})
@@ -387,6 +388,35 @@ def composition_owner(*, root: Path, workspace: Any, session_id: str, identity: 
     if result.exists('resume.json') or not result.exists('request.json'):
         raise ValueError('Continuation must retain one original Writer owner')
     return result
+
+
+def accepted_composition_receipt(*, root: Path, workspace: Any, session_id: str,
+        ledger: Any, observed: dict, identity: str | None = None) -> tuple[ArtifactStore, dict, dict]:
+    """Prove the physical observation before resolving its logical document owner.
+
+    Journal annotations are not native receipt bytes. Historical observations
+    without a record retain their original, noncontinued manuscript identity;
+    a continuation must provide its actual physical identity or record.
+    Review disposition and delivery suitability remain consuming policies.
+    """
+    from simple_ar.tools.professional_outcomes import native_result_path
+    raw = {key: value for key, value in observed.items()
+        if key not in {'arguments', 'record', 'current_request'}}
+    if raw.get('tool_name') != 'compose_document':
+        raise ValueError('Expected an accepted composition observation')
+    if 'record' in observed:
+        record = observed['record']
+        if not isinstance(record, str) or not record:
+            raise ValueError('Composition observation has no native result record')
+        physical = native_result_path(root, workspace, record).parent.name
+        if identity is not None and identity != physical:
+            raise ValueError('Composition identity differs from its physical record')
+        identity = physical
+    if identity is None:
+        identity = workspace.resolve(raw['data']['editable_markdown']).parent.name
+    accepted_native_result(root, session_id, raw, identity, ledger=ledger)
+    return read_composition_receipt(root=root, workspace=workspace,
+        session_id=session_id, identity=identity, observed=raw)
 
 
 def read_composition_receipt(*, root: Path, workspace: Any, session_id: str, identity: str, observed: dict | None = None) -> tuple[ArtifactStore, dict, dict]:
@@ -743,6 +773,46 @@ class WritingToolGateway:
                 raise ValueError('Document access scope receipts changed')
         return self._document_access_roots(parent, parent_binding, seen)
 
+    def _document_source_observation(self, identity: str) -> tuple[str | None, dict | None]:
+        """Locate a draft's physical receipt in the existing registration journal.
+
+        A manuscript names its logical owner. Its first native operation may
+        only have suspended for publication; it is not the later completion.
+        Inspect registered operations, never guess from candidate directories.
+        Exact callers without a native completion retain canonical-owner proof.
+        """
+        store = ArtifactStore(self.root / 'tools/writing' / identity)
+        saved = store.read_json('result.json') if store.exists('result.json') else None
+        journal = ArtifactStore(self.root)
+        registered = (journal.read_json('session_manifest.json')['budget']['recorded_attempts']
+            if journal.exists('session_manifest.json') else [])
+        for physical in reversed(registered):
+            if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', physical):
+                raise ValueError('Invalid registered document operation identity')
+            native = ArtifactStore(self.root / 'attempts' / physical)
+            if not native.exists('native_result.json'):
+                continue
+            observed = native.read_json('native_result.json')
+            if observed.get('tool_name') != 'compose_document':
+                continue
+            if saved is None:
+                if physical != identity:
+                    continue
+            elif (observed.get('data') != saved.get('data')
+                    or observed.get('artifacts') != saved.get('artifacts')
+                    or observed.get('status') != saved.get('status', 'ok')
+                    or observed.get('error', '') != saved.get('error', '')):
+                continue
+            accepted_native_result(self.root, self.session_id, observed, physical, ledger=self.ledger)
+            if composition_owner(root=self.root, workspace=self.workspace,
+                    session_id=self.session_id, identity=physical).root != store.root:
+                raise ValueError('Registered document operation has a different logical owner')
+            return physical, observed
+        if identity in registered or (
+                self.root / 'attempts' / identity / 'native_result.json').exists():
+            raise ValueError('Registered draft has no exact completed physical observation; preserve its receipts')
+        return None, None
+
     def _resolve_document_inputs(self, request: ComposeRequest, identity: str, *,
                                  report: dict | None, original: dict | None,
                                  selection: dict | None, document_work: bool,
@@ -755,7 +825,7 @@ class WritingToolGateway:
             # unadopted revision, an explicit result keeps that candidate even
             # when correction wording changes. Completed drafts retain their
             # ordinary feedback semantics.
-            parent_id = None
+            parent_id = native_id = None
             observed = None
             if request.prior_result:
                 value = request.prior_result
@@ -763,11 +833,13 @@ class WritingToolGateway:
                 relative = path.relative_to((self.root / 'attempts').resolve())
                 if len(relative.parts) != 2 or relative.name != 'native_result.json':
                     raise ValueError('Document source requires a native composition receipt')
-                parent_id = relative.parts[0]
+                native_id = relative.parts[0]
                 observed = json.loads(path.read_bytes())
-                accepted_native_result(self.root, self.session_id, observed, parent_id)
+                accepted_native_result(self.root, self.session_id, observed, native_id, ledger=self.ledger)
                 if observed.get('tool_name') != 'compose_document':
                     raise ValueError('Document source is not a composition')
+                parent_id = composition_owner(root=self.root, workspace=self.workspace,
+                    session_id=self.session_id, identity=native_id).root.name
             elif request.prior_draft:
                 path = self.workspace.resolve(request.prior_draft)
                 if path in {self.workspace.resolve(f'workspace/manuscripts/{path.parent.name}/{leaf}')
@@ -838,11 +910,8 @@ class WritingToolGateway:
                     same_scope = False  # Replay the saved selection decision, not today's eligibility policy.
                 draft = f'workspace/manuscripts/{parent_id}/manuscript.md'
                 if observed is None:
-                    native = ArtifactStore(self.root / 'attempts' / parent_id)
-                    if native.exists('native_result.json'):
-                        observed = native.read_json('native_result.json')
-                        accepted_native_result(self.root, self.session_id, observed, parent_id)
-                    else:
+                    native_id, observed = self._document_source_observation(parent_id)
+                    if observed is None:
                         # Canonical draft reuse retains the completed producer
                         # proof used by exact callers, not a fabricated native result.
                         _, _, data = self._composition_receipt(parent_id)
@@ -854,7 +923,7 @@ class WritingToolGateway:
                 draft = data.get('editable_markdown') or draft
                 interrupted = observed.get('status') != 'ok' or self._inspection_interrupted(data)
                 if observed.get('status') == 'ok':
-                    self._composition_receipt(parent_id, observed)
+                    self._composition_receipt(native_id or parent_id, observed)
                     review = self.final_review(data)
                     if not same_scope or not same_controls:
                         # Explicit new scope investigates current permitted
@@ -863,11 +932,13 @@ class WritingToolGateway:
                         return self._document_investigation(request, work_source, parent, binding, review)
                     attachment = self._document_attachment_gap(binding, review)
                     if attachment is not None:
-                        gap = _DocumentSourceGap(f'records/{parent_id}/native_result.json', review, producer=attachment)
+                        if native_id is None:
+                            raise ValueError('Attachment repair requires the actual registered composition operation')
+                        gap = _DocumentSourceGap(f'records/{native_id}/native_result.json', review, producer=attachment)
                         origin = self._document_investigation(request, work_source, parent, binding, review).investigation
-                        native = ArtifactStore(self.root / 'attempts' / parent_id)
+                        native = ArtifactStore(self.root / 'attempts' / native_id)
                         accepted = native.read_json('native_result.json')
-                        _, digest = accepted_native_result(self.root, self.session_id, accepted, parent_id)
+                        _, digest = accepted_native_result(self.root, self.session_id, accepted, native_id)
                         admission = ArtifactStore(self.root / 'tools/writing' / identity)
                         gap.producer_diagnosis = {'contract': 'document_source_gap.v1',
                             'source_result': gap.source_result, 'source_sha256': digest,
@@ -902,11 +973,11 @@ class WritingToolGateway:
                 if selected_recipe and request.prior_draft and retained_candidate:
                     explicit_candidate = self.workspace.resolve(request.prior_draft) == self.workspace.resolve(retained_candidate)
                 if (not selected_recipe or same_structure) and (interrupted or (method in {'article', 'sections'}
-                        and (self.root / 'attempts' / parent_id / 'native_result.json').exists()
+                        and native_id is not None
                         and (not data.get('unresolved') or checked_section_revision or checked_work)
                         and (not feedback_requested or (request.prior_result
                             or explicit_candidate) and (checked_section_revision or checked_work)))):
-                    continued = request.model_copy(update={'prior_result': f'records/{parent_id}/native_result.json',
+                    continued = request.model_copy(update={'prior_result': f'records/{native_id}/native_result.json',
                         'prior_draft': '', 'material_roots': [], 'reuse_prior_inputs': False})
                     (result.recipe, result.binding, result.linkage, result.candidate) = self._continued_document_inputs(
                         continued, identity, (report or {}).get('requirement'), allow_completed=not interrupted,
@@ -1113,7 +1184,7 @@ class WritingToolGateway:
         observed = json.loads(path.read_bytes())
         if observed.get('tool_name') != 'compose_document':
             raise ValueError('prior_result requires a composition result')
-        accepted_native_result(self.root, self.session_id, observed, relative.parts[0])
+        accepted_native_result(self.root, self.session_id, observed, relative.parts[0], ledger=self.ledger)
         store = composition_owner(root=self.root, workspace=self.workspace,
             session_id=self.session_id, identity=relative.parts[0])
         if store.root.resolve().parent != (self.root / 'tools/writing').resolve():
@@ -2301,7 +2372,7 @@ class WritingToolGateway:
             prepared = self.prepared_publication(source)
             if prepared.get('adopted') is not False:
                 raise ValueError('Publication preparation cannot grant adoption')
-            return {'tool_name': 'compose_document', 'arguments': {'resume_work': source}}
+            return {'tool_name': 'compose_document', 'arguments': {'resume_work': prepared['prepared_result']}}
         return self.resubmit_after_repair(observed)
 
     def _producer_repair(self, new_execution: dict) -> dict | None:
@@ -2370,11 +2441,10 @@ class WritingToolGateway:
             if len(reviewed) != 2 or reviewed[1] != 'native_result.json':
                 return None
             observation = ArtifactStore(review_path.parent).read_json(review_path.name)
-            owner = ArtifactStore(self.root / 'tools/writing' / reviewed[0])
-            original, result = owner.read_json('request.json'), owner.read_json('result.json')
-            if (observation.get('tool_name') != 'compose_document' or observation.get('status') != 'ok'
-                    or observation.get('data') != result['data'] or observation.get('artifacts') != result['artifacts']):
+            if observation.get('tool_name') != 'compose_document' or observation.get('status') != 'ok':
                 return None
+            owner, original, _ = self._composition_receipt(reviewed[0], observation)
+            result = owner.read_json('result.json')
             # _review_execution already proved this exact successful producer
             # against the independent defect receipt, including unique ownership.
             old_prepared = self.workspace.resolve(old_run['prepared_result'])
@@ -2438,7 +2508,7 @@ class WritingToolGateway:
                         and new_versions.get(replacement) == generated[replacement]):
                     source_replacements[str(path)] = {'old_sha256': old_versions[path],
                         'path': str(replacement), 'sha256': generated[replacement]}
-            return {'arguments': arguments, 'owner': reviewed[0], 'replace': replace,
+            return {'arguments': arguments, 'owner': owner.root.name, 'replace': replace,
                 'execution_ref': new_execution['data']['execution_ref'], 'review_ref': review_ref,
                 'execution_sha256': hashlib.sha256(execution.read_bytes()).hexdigest(),
                 'old_project': old_project, 'new_project': new_project,
@@ -2911,11 +2981,17 @@ class WritingToolGateway:
         current = ArtifactStore(self.root/'tools/writing'/identity)
         if identity in {stage['owner'], path.parent.name} or current.exists('request.json'):
             raise ValueError('Continuation requires its own physical operation, not replacement of an existing owner')
-        link = {'owner': stage['owner'], 'prepared_result': arguments['resume_work'],
+        link = {'owner': stage['owner'], 'prepared_result': prepared['prepared_result'],
             'prepared_sha256': prepared['prepared_result_sha256'],
             'stage_sha256': stage['stage_sha256']}
         if current.exists('resume.json'):
-            if current.read_json('resume.json') != link:
+            retained_link = current.read_json('resume.json')
+            # Old handbacks may have saved the journal spelling. Compare its
+            # admitted canonical address without rewriting the historical link.
+            from simple_ar.tools.professional_outcomes import native_result_path
+            retained_path = native_result_path(self.root, self.workspace, retained_link['prepared_result'])
+            canonical_link = {**retained_link, 'prepared_result': self.workspace.locator(str(retained_path))}
+            if canonical_link != link:
                 raise ValueError('Retained document continuation changed')
             if current.exists('result.json'):
                 saved = current.read_json('result.json')
@@ -2938,7 +3014,7 @@ class WritingToolGateway:
             if actual != stage['checkpoint_sha256'] or owner.exists('result.json'):
                 raise ValueError('Document checkpoint already advanced; cannot fork or reset its revision allowance')
             current.write_json('resume.json', link)
-        refs = tuple(dict.fromkeys([*stage['prepared'], arguments['resume_work']]))
+        refs = tuple(dict.fromkeys([*stage['prepared'], prepared['prepared_result']]))
         result = self.call('compose_document', stage['arguments'], identity=stage['owner'],
             _continuation={'physical_identity': identity, 'prepared': refs})
         if result.data.get('work_status') != 'awaiting_publication_preparation':

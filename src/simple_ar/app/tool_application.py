@@ -2817,6 +2817,7 @@ class ToolApplication:
         columns = ['turn', 'request_count', 'reply', 'operations']
         operation_columns = ['id', 'tool', 'arguments', 'record', 'status', 'error', 'artifacts', 'outcome']
         blocks, index, supplies, request_blocks = [], [], [], []
+        professional_outcomes = []
         count = 1
         for position, turn in enumerate(turns):
             current = turn.get('request_count', 1)
@@ -2830,13 +2831,15 @@ class ToolApplication:
             results = {item['id']: item for item in turn['tools']}
             complete = not turn.get('remaining') and set(calls) == set(results)
             block.append(reply)
-            operations, supplied = [], []
+            operations, supplied, presented_results = [], [], {}
             for call_id in [*results, *(key for key in calls if key not in results)]:
                 call = calls[call_id]
                 item = results.get(call_id)
                 result = self.session.store.read_json(item['result']) if item else {'status': 'not_executed'}
                 record = 'records/' + item['result'].removeprefix('attempts/') if item else None
                 presented = self._coordination_result(result, record) if item else result
+                if item:
+                    presented_results[call_id] = presented
                 indexed = self._history_observation(call, result, item['result'] if item else turn['reply'])
                 error = result.get('error', '')
                 if isinstance(error, str) and len(error) > 512:
@@ -2879,15 +2882,17 @@ class ToolApplication:
                             'text_bytes': len(text.encode('utf-8')), 'text_characters': len(text),
                             'version_scope': 'Recorded observation; current bytes not revalidated by conversation projection'})
             index.append([position, current, 'records/' + turn['reply'].removeprefix('attempts/'), operations])
+            if complete:
+                professional_outcomes.extend({'turn': position, 'request_count': current,
+                    'record': operation[3], 'tool': operation[1], 'outcome': operation[7]}
+                    for operation in operations if operation[3] and operation[7])
             if turn.get('origin') == 'professional' and complete:
                 # Owner-scheduled operations are real observations, not invented
                 # provider reasoning/tool calls. Keep their outcome in context.
                 block = (request_messages if declared else []) + [{'role': 'user', 'content': json.dumps({
                     'professional_work': reply['content'],
                     'operations': [{'tool': calls[item['id']]['function']['name'],
-                        'result': self._coordination_result(
-                            self.session.store.read_json(item['result']),
-                            'records/' + item['result'].removeprefix('attempts/'))}
+                        'result': presented_results[item['id']]}
                         for item in turn['tools']]}, ensure_ascii=False)}]
             blocks.append(block if complete else [])
             request_blocks.append(request_indices if complete else set())
@@ -2918,6 +2923,18 @@ class ToolApplication:
                 'scope': 'Recent archived index only (at most 16 turn blocks), not exhaustive history. '
                     'Ranges are zero-based and end-exclusive. Use read_history for older turns; '
                     'complete exact arguments are at reply refs under their call id, and results at record refs.'}
+            # Professional results have a different lifetime from low-level
+            # read conversation. Rebuild a bounded index from closed receipts;
+            # do not require the coordinator to reread scientific files merely
+            # to rediscover a valid production root after unrelated reads.
+            context['professional_outcomes'] = [row for row in professional_outcomes
+                if row['turn'] < index_start][-16:]
+            if context['professional_outcomes']:
+                context['professional_outcome_scope'] = ('Older owner-reported work phases outside the recent '
+                    'archive index; not current bytes, independent verification, permission or a prescribed '
+                    'next operation. Request counts distinguish earlier goals; dependent owners revalidate inputs.')
+            else:
+                context.pop('professional_outcome_scope', None)
             context['material_supply']['native_context'] = [row for rows in supplies[start:] for row in rows]
             context['material_supply']['omitted'] = ([{'start_turn': 0, 'end_turn': start,
                 'status': 'history_not_supplied', 'access': 'read_history for the archived turn range'}] if start else [])
@@ -3082,6 +3099,8 @@ class ToolApplication:
             **({'closing_action_contract': 'single_terminal.v1'} if closing else {}),
             'input_projection': {
                 'resources': projection['resources'],
+                **({'professional_outcomes': projection['professional_outcomes']}
+                    if 'professional_outcomes' in projection else {}),
                 'tool_names': [row['function']['name'] for row in schemas],
                 'material_supply': projection['material_supply'],
                 'supplied': [{key: row[key] for key in ('path', 'sha256', 'record', 'role', 'evidence_role',

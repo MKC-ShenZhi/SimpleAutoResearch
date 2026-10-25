@@ -452,7 +452,7 @@ def delivery_issues(owner: Any, observations: list[dict], *, delivery: dict | No
             # carry this obligation; notes and evidence quotes do not accuse files.
             try:
                 from simple_ar.report.writing import validate_document_inspection
-                from simple_ar.tools.writing import read_composition_review
+                from simple_ar.tools.writing import accepted_composition_receipt, read_composition_review
                 delivered = owner.workspace.resolve_delivery(DeliveryRequest.model_validate(delivery))['artifacts']
                 hashes = owner.workspace.artifact_hashes(delivered)
                 current = {owner.workspace.resolve(path): digest for path, digest in hashes.items()}
@@ -464,13 +464,10 @@ def delivery_issues(owner: Any, observations: list[dict], *, delivery: dict | No
                     if not any(current.get(owner.workspace.resolve(target['path'])) == target['sha256']
                             for defect in defects for target in defect['targets']):
                         continue
-                    identity = owner.workspace.resolve(data['version']).name
-                    store = ArtifactStore(owner.root / 'tools/writing' / identity)
-                    _accepted(owner, {key: value for key, value in observed.items()
-                        if key not in {'arguments', 'record', 'current_request'}}, identity)
-                    if store.read_json('result.json')['data'] != data:
-                        raise ValueError('Retained attachment findings differ from the accepted composition')
-                    validate_document_inspection(store, store.read_json('request.json'), data,
+                    store, binding, data = accepted_composition_receipt(root=owner.root,
+                        workspace=owner.workspace, session_id=owner.session_id, ledger=owner.ledger,
+                        observed=observed)
+                    validate_document_inspection(store, binding, data,
                         review_result=read_composition_review(owner.workspace, data))
                     return ['Delivered attachment bytes retain an independently evidenced required finding; '
                         'repair and inspect the actual candidate, or disclose partial delivery']

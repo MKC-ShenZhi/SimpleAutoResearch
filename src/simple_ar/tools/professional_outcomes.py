@@ -14,6 +14,20 @@ from typing import Any
 from simple_ar.core.capabilities import ArtifactRef, ArtifactStore
 
 
+def native_result_path(root: Path, workspace: Any, locator: str) -> Path:
+    """Resolve the journal or mounted spelling of one same-task native result.
+
+    This is address admission only; callers still prove registration, bytes,
+    settlement and the domain-specific meaning of the original receipt.
+    """
+    path = workspace.resolve(str(root / locator) if locator.startswith('attempts/') else locator)
+    relative = path.relative_to((root / 'attempts').resolve())
+    if (len(relative.parts) != 2 or relative.name != 'native_result.json'
+            or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', relative.parts[0])):
+        raise ValueError('Use a same-task native result receipt')
+    return path
+
+
 def registered_native_output(root: Path, session_id: str, record: Path, *,
                              kind: str, store_root: Path | None = None) -> ArtifactRef:
     """One registration proof for native receipts and declared domain outputs."""
@@ -36,7 +50,7 @@ def registered_native_output(root: Path, session_id: str, record: Path, *,
 
 
 def accepted_native_result(root: Path, session_id: str, observed: dict,
-                           attempt_id: str) -> tuple[ArtifactStore, str]:
+                           attempt_id: str, *, ledger: Any = None) -> tuple[ArtifactStore, str]:
     """Prove registration and hash the very bytes compared with the observation."""
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', attempt_id):
         raise ValueError('Invalid accepted attempt identity')
@@ -46,6 +60,9 @@ def accepted_native_result(root: Path, session_id: str, observed: dict,
     raw = store.resolve(ref).read_bytes()
     if json.loads(raw.decode('utf-8')) != observed:
         raise ValueError('Professional outcome requires the exact accepted native observation')
+    if ledger is not None and any(row.attempt_id == attempt_id
+            and row.status in {'reserved', 'unknown'} for row in ledger.entries):
+        raise ValueError('Professional outcome still has unsettled physical accounting')
     return store, hashlib.sha256(raw).hexdigest()
 
 

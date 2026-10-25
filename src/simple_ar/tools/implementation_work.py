@@ -378,11 +378,10 @@ def _review_execution(owner: Any, locator: str) -> tuple[dict, dict]:
     if len(relative) != 2 or relative[1] != 'native_result.json':
         raise ValueError('Review repair needs records/<compose-attempt>/native_result.json')
     observed = ArtifactStore(record.parent).read_json(record.name)
-    _accepted(owner, observed, relative[0])
     from simple_ar.tools.writing import (
-        read_composition_receipt, check_composition_inputs, read_repair_review, read_composition_candidate)
-    writing, binding, data = read_composition_receipt(root=owner.root, workspace=owner.workspace,
-        session_id=owner.session_id, identity=relative[0], observed=observed)
+        accepted_composition_receipt, check_composition_inputs, read_repair_review, read_composition_candidate)
+    writing, binding, data = accepted_composition_receipt(root=owner.root, workspace=owner.workspace,
+        session_id=owner.session_id, ledger=owner.ledger, identity=relative[0], observed=observed)
     # This existing read-only byte consumer needs only the shared workspace;
     # no writing runtime, client or recovery owner is instantiated here.
     check_composition_inputs(owner.workspace, data['inputs'])
@@ -532,30 +531,33 @@ def review_repair_outcome(owner: Any, observed: dict, source: str) -> tuple[dict
     if work.get('contract') != 'document_source.v1':
         raise ValueError('Producer diagnosis has no admitted document source')
     origin = diagnosis['origin']
-    prior_id = origin['owner']
-    if (not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', prior_id) or prior_id == identity
+    from simple_ar.tools.professional_outcomes import native_result_path
+    from simple_ar.tools.writing import accepted_composition_receipt
+    prior_path = native_result_path(owner.root, owner.workspace, diagnosis['source_result'])
+    prior_id = prior_path.parent.name
+    if (prior_id == identity
             or diagnosis['source_result'] != f'records/{prior_id}/native_result.json'):
         raise ValueError('Producer diagnosis has no distinct original composition')
     intent = work['intent']
     if intent.get('prior_result'):
         locator = intent['prior_result']
         selected = owner.workspace.resolve(str(owner.root / locator) if locator.startswith('attempts/') else locator)
-        if selected != (owner.root / 'attempts' / prior_id / 'native_result.json').resolve():
+        if selected != prior_path:
             raise ValueError('Producer diagnosis differs from its admitted result source')
     elif not intent.get('prior_draft'):
         raise ValueError('Producer diagnosis differs from its admitted draft source')
     prior = ArtifactStore(owner.root / 'attempts' / prior_id).read_json('native_result.json')
-    _, digest = accepted_native_result(owner.root, owner.session_id, prior, prior_id)
-    if digest != diagnosis['source_sha256']:
+    writing, _, saved = accepted_composition_receipt(root=owner.root, workspace=owner.workspace,
+        session_id=owner.session_id, ledger=owner.ledger, identity=prior_id, observed=prior)
+    if hashlib.sha256(prior_path.read_bytes()).hexdigest() != diagnosis['source_sha256']:
         raise ValueError('Producer diagnosis original native receipt changed')
-    writing = ArtifactStore(owner.root / 'tools/writing' / prior_id)
-    if set(origin['receipt_sha256']) != {'request.json', 'result.json'} or any(
+    # The source locator names the physical native attempt; the frozen origin
+    # binds the logical Writer receipts, including after continuation.
+    if (origin['owner'] != writing.root.name
+            or set(origin['receipt_sha256']) != {'request.json', 'result.json'} or any(
             hashlib.sha256(writing.resolve(name).read_bytes()).hexdigest() != value
-            for name, value in origin['receipt_sha256'].items()):
+            for name, value in origin['receipt_sha256'].items())):
         raise ValueError('Producer diagnosis original writing receipts changed')
-    from simple_ar.tools.writing import read_composition_receipt
-    _, _, saved = read_composition_receipt(root=owner.root, workspace=owner.workspace,
-        session_id=owner.session_id, identity=prior_id, observed=prior)
     if (not intent.get('prior_result')
             and owner.workspace.resolve(intent['prior_draft']) != owner.workspace.resolve(saved['editable_markdown'])):
         raise ValueError('Producer diagnosis differs from its admitted draft source')

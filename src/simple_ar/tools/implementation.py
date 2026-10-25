@@ -236,6 +236,48 @@ def implementation_tool_specs(*, exact: bool = False) -> list[CommonToolSpec]:
 
 
 class ImplementationToolGateway:
+    def coordination_result(self, result: ToolResult, *, receipt_path: str | None = None) -> dict[str, Any]:
+        """Present the work phase without reclassifying prepared author notes.
+
+        The original receipt remains the input to execution, writing, recovery
+        and delivery. This view neither validates current bytes nor certifies
+        scientific completion, and it schedules no downstream work.
+        """
+        from copy import deepcopy
+        data = result.data
+        if (result.tool_name not in {'prepare_implementation', 'execute_implementation'}
+                or data.get('producer_completion') != 'goal_findings.v1'):
+            return result.model_dump(mode='json')
+        notes, issues = data.get('unresolved', []), data.get('issues', [])
+        if not isinstance(notes, list) or not isinstance(issues, list):
+            return result.model_dump(mode='json')  # Presentation cannot repair a malformed receipt.
+        prepared = result.tool_name == 'prepare_implementation'
+        visible = {key: deepcopy(data[key]) for key in (
+            'project_dir', 'prepared_result', 'execution_ref', 'status', 'executable',
+            'next_operation', 'cwd', 'returncode', 'stop_reason', 'issues', 'verification',
+            'delivery', 'incomplete', 'failure_kind', 'next_action') if key in data}
+        visible['producer_notes'] = deepcopy(notes)
+        visible['producer_notes_scope'] = ('Original preparation-time author notes, not current execution '
+            'defects or independent findings. Keep their text and compare it with actual results during review.')
+        root = data.get('project_dir' if prepared else 'cwd')
+        roots = []
+        if isinstance(root, str) and root:
+            try:
+                roots = [self.workspace.locator(root)]
+            except (ValueError, OSError, RuntimeError):
+                pass  # A historical spelling never grants current material access.
+        outcome = {'work_phase': 'prepared' if prepared else 'executed',
+            'status': data.get('status', result.status), 'material_roots': roots,
+            'producer_note_count': len(notes), 'issue_count': len(issues),
+            **{key: data[key] for key in ('prepared_result', 'execution_ref') if key in data},
+            'verification': 'Reported source/execution phase only; no independent scientific or visual '
+                'verification. Dependent owners revalidate current versions and inspect their actual inputs.'}
+        if result.status != 'ok' or result.error:
+            visible.update({key: deepcopy(data[key]) for key in ('stdout', 'stderr', 'streams') if key in data})
+        return {'tool_name': result.tool_name, 'status': result.status, 'summary': result.summary,
+            'error': result.error, 'artifacts': list(result.artifacts), 'data': visible,
+            'outcome': outcome, 'receipt_path': receipt_path}
+
     @staticmethod
     def continuation_attempts(name: str, arguments: dict) -> int:
         # Complete preparation needs a subsequent execution in this same session.

@@ -77,6 +77,7 @@ def delivery_evidence(owner: Any, observations: list[dict], delivery: dict | Non
     validates/traverses its declared process edges; reuse its checked cache.
     """
     from simple_ar.tools.implementation_work import _accepted, _execution
+    from simple_ar.tools.writing import accepted_composition_receipt
     from simple_ar.tools.workspace import DeliveryRequest
     preparations = [row for row in observations if row.get('tool_name') == 'prepare_implementation']
     executions = [row for row in observations if row.get('tool_name') == 'execute_implementation']
@@ -101,15 +102,9 @@ def delivery_evidence(owner: Any, observations: list[dict], delivery: dict | Non
                 or not data.get('editable_markdown')
                 or owner.workspace.resolve(data['editable_markdown']) not in subjects):
             continue
-        identity = owner.workspace.resolve(data['editable_markdown']).parent.name
-        store = ArtifactStore(owner.root / 'tools/writing' / identity)
-        _accepted(_proof(owner), {key: value for key, value in observed.items()
-            if key not in {'arguments', 'record', 'current_request'}}, identity)
-        saved, binding = store.read_json('result.json'), store.read_json('request.json')
-        if (saved['data'] != data or saved['artifacts'] != observed.get('artifacts')
-                or data.get('inputs') != binding['inputs']
-                or owner.workspace.artifact_hashes(data['artifact_sha256']) != data['artifact_sha256']):
-            raise ValueError('Delivered composition source/version changed before producer selection')
+        store, binding, data = accepted_composition_receipt(root=owner.root,
+            workspace=owner.workspace, session_id=owner.session_id, ledger=owner.ledger,
+            observed=observed)
         if binding.get('delivery_review', {}).get('producer_completion') == 'goal_findings.v1':
             from simple_ar.tools.writing import read_composition_review
             from simple_ar.report.writing import validate_document_inspection
@@ -380,7 +375,7 @@ def freeze_producer_context(owner: Any, artifacts: list[dict]) -> dict:
 def delivery_adoptions(owner: Any, observations: list[dict], delivery: dict | None,
                        proposed: Any = None) -> list[dict]:
     """Writing owner's proof for the canonical manuscript actually delivered."""
-    from simple_ar.tools.implementation_work import _accepted
+    from simple_ar.tools.writing import accepted_composition_receipt
     from simple_ar.report.writing import validate_document_inspection
     if not delivery:
         return []
@@ -405,19 +400,11 @@ def delivery_adoptions(owner: Any, observations: list[dict], delivery: dict | No
                 and 'declaration_adoption' not in data.get('delivery_review', {})):
             return []  # This receipt has findings, never declaration-waiver authority.
         try:
-            version = owner.workspace.resolve(data['version'])
-            identity = version.name
-            if version != owner.workspace.resolve(f'workspace/manuscripts/{identity}'):
-                return []
-            _accepted(_proof(owner), {key: value for key, value in observed.items()
-                if key not in {'arguments', 'record', 'current_request'}}, identity)
-            store = ArtifactStore(owner.root / 'tools/writing' / identity)
-            result, binding = store.read_json('result.json'), store.read_json('request.json')
-            if (data != result['data'] or observed.get('artifacts') != result['artifacts']
-                    or data.get('unresolved') or data.get('incomplete')
-                    or data.get('delivery_review', {}).get('status') != 'reviewed'
-                    or not data.get('artifact_sha256')
-                    or owner.workspace.artifact_hashes(data['artifact_sha256']) != data['artifact_sha256']):
+            store, binding, data = accepted_composition_receipt(root=owner.root,
+                workspace=owner.workspace, session_id=owner.session_id, ledger=owner.ledger,
+                observed=observed)
+            if (data.get('unresolved') or data.get('incomplete')
+                    or data.get('delivery_review', {}).get('status') != 'reviewed'):
                 return []
             review = owner.final_review(data)
             if review.get('review_status') != 'reviewed':

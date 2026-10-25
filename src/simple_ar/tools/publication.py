@@ -198,11 +198,9 @@ class PublicationToolGateway:
 
     def inspection_source(self, result_ref: str, *, session_id: str) -> dict:
         """Read a proved prepared view; rendering success grants no adoption."""
-        from simple_ar.tools.professional_outcomes import accepted_native_result
-        path = self.workspace.resolve(str(self.root/result_ref) if result_ref.startswith('attempts/') else result_ref)
+        from simple_ar.tools.professional_outcomes import accepted_native_result, native_result_path
+        path = native_result_path(self.root, self.workspace, result_ref)
         relative = path.relative_to((self.root/'attempts').resolve())
-        if len(relative.parts) != 2 or relative.name != 'native_result.json':
-            raise ValueError('Inspection preparation requires a same-task publication receipt')
         observed = json.loads(path.read_bytes())
         _, receipt_sha = accepted_native_result(self.root, session_id, observed, relative.parts[0])
         data = observed.get('data', {})

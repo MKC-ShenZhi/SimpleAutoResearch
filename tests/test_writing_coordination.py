@@ -2967,6 +2967,8 @@ class WritingCoordinationTests(unittest.TestCase):
                         prepared.artifacts, formats=['tex'], manuscript=prepare['markdown'], proposed=prepare)
                 resume = writing.consume_outcome(prepared.model_dump(mode='json'), prepared_ref)
                 self.assertEqual(resume, {'tool_name': 'compose_document', 'arguments': {'resume_work': prepared_ref}})
+                self.assertEqual(writing.consume_outcome(prepared.model_dump(mode='json'),
+                    'attempts/cooperative-prepared/native_result.json'), resume)
                 view_path = workspace.resolve(prepared.data['project']) / 'publication_view.json'
                 for path in (candidate, table, view_path, native.resolve('native_result.json')):
                     with self.subTest(changed_preparation=path.name), changed_record(path, path.read_bytes() + b' '):
@@ -2999,6 +3001,17 @@ class WritingCoordinationTests(unittest.TestCase):
                 completed = writing.call(resume['tool_name'], resume['arguments'], identity='cooperative-reviewed')
                 self.assertEqual([call.args[0] for call in writing.client_factory.call_args_list[bound_clients:]],
                                  ['cooperative-reviewed'])
+                link_path = root / 'tools/writing/cooperative-reviewed/resume.json'
+                historical = json.loads(link_path.read_bytes())
+                historical['prepared_result'] = 'attempts/cooperative-prepared/native_result.json'
+                with changed_record(link_path, json.dumps(historical).encode('utf-8')):
+                    original_link = link_path.read_bytes()
+                    self.assertEqual(composition_owner(root=root, workspace=workspace, session_id='task',
+                        identity='cooperative-reviewed').root, owner.root)
+                    self.assertEqual(writing.call(resume['tool_name'], resume['arguments'],
+                        identity='cooperative-reviewed'), completed)
+                    self.assertEqual(link_path.read_bytes(), original_link)
+                    self.assertEqual(client.ask_json.call_count, 4)
                 if outcome != 'reviewed':
                     self.assertEqual(completed.status, 'error' if outcome == 'stopped' else 'ok', completed)
                     if outcome == 'stopped':

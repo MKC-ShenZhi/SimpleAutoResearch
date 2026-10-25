@@ -288,11 +288,25 @@ class ProfessionalWorkLoopTests(unittest.TestCase):
             for path in (self.root / 'tools' / 'processes').glob('*/invocation.json')}
 
     def test_goal_findings_execution_retains_notes_without_adoption_or_report(self):
+        from tests.test_tool_agent_handoff import ConversationContextTests
+
         app = self._create(professional_work='requests.v1', producer_completion='goal_findings.v1')
-        proposal = self._proposal("from pathlib import Path\nPath('result.txt').write_text('21')\n")
-        proposal['unresolved'] = ['Planned command must execute', 'Derived data equivalence needs inspection']
-        self.responses = [proposal]
-        self._run(app, actions=[self._prepare()])
+        broken = "raise RuntimeError('physical fixture failure')\n"
+        fixed = "from pathlib import Path\nPath('result.txt').write_text('21')\n"
+        proposal = self._proposal(fixed, replacements=[{'old_text': broken, 'new_text': fixed}])
+        proposal['unresolved'] = ['The planned command has not run',
+            'Derived data equivalence needs inspection']
+        first = self._proposal(broken)
+        first['unresolved'] = list(proposal['unresolved'])
+        self.responses = [first, proposal]
+        self._run(app, actions=[self._prepare(repairs=1)])
+        _, failed_token = self._pending_execution(app)
+        app = self._load()
+        self._run(app, approved_execution=failed_token)
+        failed = self._observations(app)[-2]
+        self.assertEqual(failed['tool_name'], 'execute_implementation')
+        self.assertNotEqual(failed['data']['returncode'], 0)
+        self.assertTrue(failed['data']['issues'])
         prepared = self._observations(app)[-1]
         self.assertEqual(prepared['data']['producer_completion'], 'goal_findings.v1')
         code = str(Path(prepared['data']['project_dir']) / 'calculate.py')
@@ -326,6 +340,88 @@ class ProfessionalWorkLoopTests(unittest.TestCase):
         self.assertEqual(app.ledger.to_dict(), ledger)
         self.assertEqual(self.send.call_count, calls)
         self.assertIsNone(app.writing.declaration_adoption_contract)
+
+        # Ordinary reads can push the entire professional unit beyond even
+        # the recent 16-turn archive index. Their bodies are not outcomes.
+        document = app.workspace.workspace / 'ordinary-document.txt'
+        document.write_text('RAW_DOCUMENT_BODY_NOT_A_SCIENTIFIC_RESULT\n' * 20, encoding='utf-8')
+        fixture = ConversationContextTests()
+        for number in range(18):
+            arguments = {'path': str(document), 'max_bytes': 2000}
+            read = app.workspace.call('read_file', arguments, identity=f'ordinary-{number}')
+            self.assertEqual(read.status, 'ok', read)
+            app.state['turns'].append(fixture._record_native_turn(app, 'read_file', arguments,
+                read.data, f'ordinary-{number}'))
+        app._save()
+        app = self._load()
+        ledger, calls = app.ledger.to_dict(), self.send.call_count
+        state = json.dumps(app.state, sort_keys=True)
+        originals = {path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}
+        expected = []
+        for turn_number, turn in enumerate(app.state['turns']):
+            for tool in turn['tools']:
+                raw = app.session.store.read_json(tool['result'])
+                record = 'records/' + tool['result'].removeprefix('attempts/')
+                view = app.gateway.coordination_result(raw, record)
+                if raw['tool_name'] == 'read_file':
+                    self.assertEqual(view, raw)
+                    self.assertNotIn('outcome', view)
+                    continue
+                self.assertEqual(raw['data']['unresolved'], proposal['unresolved'])
+                self.assertNotIn('unresolved', view['data'])
+                self.assertEqual(view['data']['producer_notes'], proposal['unresolved'])
+                self.assertEqual(view['data'].get('issues', []), raw['data'].get('issues', []))
+                outcome = view['outcome']
+                phase = 'prepared' if raw['tool_name'] == 'prepare_implementation' else 'executed'
+                self.assertEqual(outcome['work_phase'], phase)
+                if phase == 'executed':
+                    self.assertEqual(outcome['status'], raw['data']['status'])
+                self.assertEqual(outcome['producer_note_count'], len(proposal['unresolved']))
+                self.assertEqual(outcome['issue_count'], len(raw['data'].get('issues', [])))
+                locator = 'prepared_result' if phase == 'prepared' else 'execution_ref'
+                self.assertEqual(outcome[locator], raw['data'][locator])
+                self.assertTrue(outcome['material_roots'])
+                candidate = raw['data']['project_dir'] if phase == 'prepared' else raw['data']['cwd']
+                self.assertIn(app.workspace.resolve(candidate),
+                    [app.workspace.resolve(root) for root in outcome['material_roots']])
+                scope = str(outcome['verification']).lower()
+                self.assertIn('scientific', scope)
+                self.assertTrue('unverified' in scope or 'no ' in scope, scope)
+                expected.append({'turn': turn_number, 'request_count': turn.get('request_count', 1),
+                    'record': record, 'tool': raw['tool_name'], 'outcome': outcome})
+                # A consumer may edit its detached view without rewriting raw.
+                view['data']['producer_notes'].append('consumer-only mutation')
+                self.assertEqual(app.session.store.read_json(tool['result']), raw)
+
+        self.assertEqual(len(expected), 4)  # prepare, failed run, repair, successful run
+        self.assertGreater(expected[1]['outcome']['issue_count'], 0)
+        self.assertEqual(expected[-1]['outcome']['issue_count'], 0)
+        self.assertEqual(expected[-1]['outcome']['status'], 'run_succeeded')
+        self.assertTrue(all(entry.status == 'settled' for entry in app.ledger.entries))
+        self.assertEqual(len(self._process_receipts()), 2)
+        self.assertEqual((Path(prepared['data']['project_dir']) / 'result.txt').read_text(), '21')
+        # Historical receipts without the completion contract keep their raw shape.
+        legacy = json.loads(json.dumps(executed))
+        legacy['data'].pop('producer_completion')
+        self.assertEqual(app.gateway.coordination_result(legacy, 'records/legacy/native_result.json'), legacy)
+
+        client = LLMClient(replace(self.client._settings, context_input_tokens=16000))
+        messages = app._conversation_messages(client=client,
+            native_history_start_turn=len(app.state['turns']), schemas=[])
+        context = json.loads(messages[1]['content'])
+        self.assertGreater(context['earlier_turns']['start_turn'], expected[-1]['turn'])
+        self.assertEqual(context['professional_outcomes'], expected)
+        self.assertNotIn('RAW_DOCUMENT_BODY_NOT_A_SCIENTIFIC_RESULT', json.dumps(messages))
+        self.assertFalse(context['resources']['context_exceeds_input_target'])
+        self.assertLessEqual(context['resources']['approximate_next_input_tokens'],
+            client._settings.context_input_tokens)
+        self.assertEqual(json.dumps(app.state, sort_keys=True), state)
+        self.assertEqual(app.ledger.to_dict(), ledger)
+        self.assertEqual({path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}, originals)
+        self.assertEqual(self.send.call_count, calls)
+        self.assertEqual(calls, 2)
+        self.coordinator.assert_not_called()
+        self.assertFalse(app.session.store.exists('delivery.json'))
 
     def test_goal_findings_source_only_does_not_require_writer_or_note_copying(self):
         app = self._create(allow_execution=False, professional_work='requests.v1',
@@ -1939,6 +2035,8 @@ class ProfessionalReportChainTests(unittest.TestCase):
         self.expected = {(row['model'], row['policy']): Decimal(row['rmse']) for row in self.raw}
         self.records = json.loads(self.original_bytes['recorded_results.json'])
         self.responses, self.provider_requests, self.provider_errors = [], [], []
+        self.preparations = []
+        self.preparation_bytes = {}
         client = LLMClient(LLMSettings(api_key='offline-fixture', model='fixture',
             api_mode='chat', max_output_tokens=4096, context_input_tokens=100000,
             retry_attempts=1))
@@ -1956,12 +2054,6 @@ class ProfessionalReportChainTests(unittest.TestCase):
             professional_inputs=True, report_protocol='canonical_report.v1',
             allow_execution=True, max_turns=28, max_tokens=700000, max_attempts=100,
             process_limits={'process_invocations': 16, 'process_wall_seconds': 480})
-        # This class's original adoption scenarios explicitly exercise frozen
-        # historical receipts. New completion scenarios opt in before any work.
-        if not self._testMethodName.startswith('test_goal_findings_'):
-            self.app.state['config'].pop('producer_completion')
-            self.app._save()
-            self.app = ToolApplication.load(self.root, services=self.services)
 
     def _provider(self, mode, request, **kwargs):
         self.assertEqual(mode, 'chat')
@@ -1973,6 +2065,12 @@ class ProfessionalReportChainTests(unittest.TestCase):
         messages = request['messages']
         prompt, _ = json.JSONDecoder().raw_decode(messages[1]['content'])
         self.provider_requests.append((messages[0]['content'], prompt))
+        if (prompt.get('delivery_review_contract')
+                and self.app.state['config'].get('publication_preparation') == 'bound_candidate.v1'):
+            self.assertIn('prepared_publication', prompt)
+            prepared = prompt['prepared_publication']
+            self.assertEqual(prepared, self.app.writing.prepared_publication(prepared['prepared_result']))
+            self.assertFalse(prepared['adopted'])
         consumer = self.responses.pop(0)
         try:
             response = consumer(messages[0]['content'], prompt)
@@ -1990,13 +2088,26 @@ class ProfessionalReportChainTests(unittest.TestCase):
     def _observations(self):
         return ProfessionalWorkLoopTests._observations(self.app)
 
+    def _writing_owner(self, identity=None):
+        from simple_ar.tools.writing import composition_owner
+        return composition_owner(root=self.root, workspace=self.app.workspace,
+            session_id=self.app.session.manifest.session_id,
+            identity=identity or self.app.state['pending']['attempt']).root
+
+    @staticmethod
+    def _completed_compositions(rows):
+        return [row for row in rows if row['tool_name'] == 'compose_document'
+            and row['data'].get('work_status') != 'awaiting_publication_preparation']
+
     def _perform(self, action, *, feedback='', allowances=None, stop_tool=None):
         """Submit at the public boundary; never write accepted app state."""
         count = len(self._observations())
+        stop_start = count
         target = stop_tool or action['tool_name']
         def stopped():
-            rows = self._observations()[count:]
-            return bool(rows and rows[-1]['tool_name'] == target)
+            rows = self._observations()[stop_start:]
+            return bool(rows and (rows[-1]['tool_name'] == target
+                or rows[-1]['data'].get('work_status') == 'awaiting_publication_preparation'))
         options = {'feedback': feedback, 'progress': lambda _: None, 'should_stop': stopped}
         if action is not None:
             options['actions'] = [action]
@@ -2004,7 +2115,72 @@ class ProfessionalReportChainTests(unittest.TestCase):
             options.update(resource_allowances=allowances, authorization_id='offline-feedback',
                 authorization_reason='Second offline fixture phase; preserve original usage and artifacts.')
         status = self.app.run(**options)
+        while self._observations()[count:] and self._observations()[-1]['data'].get(
+                'work_status') == 'awaiting_publication_preparation':
+            self._prepare_publication(self._observations()[-1])
+            stop_start = len(self._observations())
+            status = self.app.run(progress=lambda _: None, should_stop=stopped)
         return status, self._observations()[count:]
+
+    def _prepare_publication(self, suspended):
+        """Use the cooperative consumer protocol in test_writing_coordination.
+
+        Keep normal app dispatch, exact approval, the actual renderer and the
+        owner's consume_outcome/resume_work handback at every revision.
+        """
+        self.assertEqual(self.app.state['config']['publication_preparation'], 'bound_candidate.v1')
+        self.assertFalse(suspended['data']['adopted'])
+        stage_path = self.app.workspace.resolve(suspended['data']['publication_stage'])
+        physical = stage_path.parent.name
+        proposal = self.app.writing.continuation(suspended, physical)
+        self.assertEqual(proposal['tool_name'], 'export_report')
+        self.assertTrue(proposal['arguments']['candidate_result'])
+        self.assertFalse(proposal['arguments'].get('delivery'))
+        frozen = {stage_path: stage_path.read_bytes(),
+            **{self.app.workspace.resolve(path): self.app.workspace.resolve(path).read_bytes()
+                for path in suspended['artifacts']}}
+        delivery_path = self.root / 'delivery.json'
+        delivery = delivery_path.read_bytes() if delivery_path.exists() else None
+        calls, ledger = self.send.call_count, self.app.ledger.to_dict()
+        self.app.run(progress=lambda _: None)  # Stop at this candidate's approval gate.
+        pending = self.app.state['pending']
+        self.assertEqual(pending['call']['function']['name'], 'export_report')
+        self.assertEqual(json.loads(pending['call']['function']['arguments']), proposal['arguments'])
+        self.assertEqual(self.send.call_count, calls)
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+        prepared = self._approve_publication()
+        self.assertEqual(prepared['data']['candidate_preparation'], {
+            'source_result': proposal['arguments']['candidate_result'],
+            'adopted': False, 'delivery_authority': False})
+        self.assertNotIn('delivery', prepared['data'])
+        reference = 'records/' + Path(prepared['data']['project']).name + '/native_result.json'
+        inspection = self.app.writing.prepared_publication(reference)
+        self.assertFalse(inspection['adopted'])
+        self.assertEqual(self.app.writing.consume_outcome(prepared, reference),
+            {'tool_name': 'compose_document', 'arguments': {'resume_work': reference}})
+        self.assertEqual({path: path.read_bytes() for path in frozen}, frozen)
+        self.assertEqual(delivery_path.read_bytes() if delivery_path.exists() else None, delivery)
+        self.preparations.append(prepared)
+        self.preparation_bytes.update(frozen)
+        self.preparation_bytes.update({self.app.workspace.resolve(path): self.app.workspace.resolve(path).read_bytes()
+            for path in prepared['artifacts']})
+
+    def _assert_accounting(self, *, fixture_calls=0):
+        entries = self.app.ledger.entries
+        self.assertTrue(all(entry.status in {'settled', 'released'} for entry in entries))
+        calls = sum(entry.actual.get('llm_requests', 0) for entry in entries)
+        self.assertEqual(calls, self.send.call_count - fixture_calls)
+        self.assertEqual(sum(entry.actual.get('total_tokens', 0) for entry in entries), 120 * calls)
+        receipts = [json.loads(path.read_bytes())
+            for path in (self.root / 'tools/processes').glob('*/invocation.json')]
+        self.assertEqual(sum(entry.actual.get('process_invocations', 0) for entry in entries), len(receipts))
+        for record in receipts:
+            charge, = [entry for entry in entries
+                if entry.reservation_id == 'process-' + record['invocation_id']]
+            self.assertEqual(charge.actual, {'process_invocations': 1,
+                'process_wall_seconds': record['duration_sec']})
+        self.assertEqual({path: path.read_bytes() for path in self.preparation_bytes}, self.preparation_bytes)
+        self.assertFalse(self.provider_errors)
 
     def _produce(self, *, wrong_table=False, grayscale=False, missing=False, prior=None,
                  feedback='', allowances=None, review_repair=False):
@@ -2241,12 +2417,13 @@ class ProfessionalReportChainTests(unittest.TestCase):
         rejected_subjects = None
         initial_body = ''
         process_count = sum(e.actual.get('process_invocations', 0) for e in self.app.ledger.entries)
+        preparation_start = len(self.preparations)
         attachment_bytes = {path: Path(path).read_bytes() for path in subjects_expected}
         def writer(system, prompt):
             nonlocal writer_calls, initial_body, producer_declarations
             writer_calls += 1
             self.assertIn('source_handles', prompt)
-            owner = self.root / 'tools/writing' / self.app.state['pending']['attempt']
+            owner = self._writing_owner()
             binding = json.loads((owner / 'request.json').read_text(encoding='utf-8'))
             self.assertEqual(binding['request']['goal'], '\n\n'.join(self.app.state['requests']),
                 'The bound report goal must come from actual user requests, not a coordinator paraphrase')
@@ -2328,7 +2505,8 @@ class ProfessionalReportChainTests(unittest.TestCase):
                     self.assertEqual(initial['declaration_adoption']['checks'][1]['status'], 'unresolved_work')
                 self.assertNotIn(_PRODUCER_DECLARATIONS[1], expected_prior)
                 self.assertEqual(sum(e.actual.get('process_invocations', 0)
-                    for e in self.app.ledger.entries), process_count)
+                    for e in self.app.ledger.entries),
+                    process_count + self._preparation_process_usage(preparation_start))
                 self.assertEqual({path: Path(path).read_bytes() for path in attachment_bytes}, attachment_bytes)
             facts = '; '.join(f'{model}/{policy}: {value:.3f}'
                 for (model, policy), value in self.expected.items())
@@ -2425,7 +2603,7 @@ class ProfessionalReportChainTests(unittest.TestCase):
                 self.assertIn('recorded_material', correction['validation_error'])
                 self.assertEqual(subjects, rejected_subjects,
                     'Format correction must retain every frozen attachment, text, hash and producer')
-                owner = self.root / 'tools/writing' / self.app.state['pending']['attempt']
+                owner = self._writing_owner()
                 rejections = list(owner.glob('writer/review/revision-*/inspection/rejection.json'))
                 self.assertEqual(len(rejections), 1)
                 self.assertEqual(json.loads(rejections[0].read_text())['validation_error'], correction['validation_error'])
@@ -2595,7 +2773,7 @@ class ProfessionalReportChainTests(unittest.TestCase):
                 for path in (self.root / 'tools/writing').glob('*/writer/review/**/rejection.json')}
             self.assertEqual(stopped['status'], 'paused', diagnostic)
             self.assertEqual(len(interrupted), 1, diagnostic)
-            self.assertFalse(incomplete, incomplete)
+            self.assertFalse(self._completed_compositions(incomplete), incomplete)
             pending = self.app.state['pending']
             self.assertIsNotNone(pending, stopped)
             self.assertEqual(pending['call']['function']['name'], 'compose_document')
@@ -2644,19 +2822,20 @@ class ProfessionalReportChainTests(unittest.TestCase):
             status, rows = self._perform(action, stop_tool=target)
         self.assertEqual(status['status'], 'paused', status)
         self.assertTrue(any(row['tool_name'] == 'compose_document' for row in rows), (status, rows))
-        composed = next(row for row in rows if row['tool_name'] == 'compose_document')
+        composed, = self._completed_compositions(rows)
         self.assertEqual(composed['status'], 'ok', composed)
         self.assertFalse(self.responses, 'Expected Writer/reviewer was not actually consumed')
         if resume:
             self.assertEqual((selection_calls, writer_calls, reviewer_calls), (0, 1, 1))
-            self.assertEqual(Path(composed['data']['version']).name, identity)
+            self.assertEqual(Path(composed['data']['version']).name, self._writing_owner(identity).name)
             review = json.loads(self.app.workspace.resolve(composed['data']['review_path']).read_text())
             self.assertEqual(review['inspection_source'], proof)
         manuscript = self.app.workspace.resolve(composed['data']['editable_markdown']).read_text(encoding='utf-8')
         if revision_defect:
             self.assertEqual((writer_calls, reviewer_calls), (2, 3))
             self.assertEqual(sum(e.actual.get('process_invocations', 0)
-                for e in self.app.ledger.entries), process_count)
+                for e in self.app.ledger.entries),
+                process_count + self._preparation_process_usage(preparation_start))
             self.assertEqual({path: Path(path).read_bytes() for path in attachment_bytes}, attachment_bytes)
             # The improved complete proposal is the public work candidate,
             # while its new material defect still prevents atomic adoption.
@@ -2673,7 +2852,7 @@ class ProfessionalReportChainTests(unittest.TestCase):
             original_author = json.loads((owner / 'writer/writer.json').read_text())['sections'][0]['draft_markdown']
             self.assertEqual(original_author.splitlines(), initial_body.splitlines(),
                 'Saving a negative work candidate must not replace the original author or adopt it')
-            self.assertEqual(Path(composed['data']['version']).name, identity)
+            self.assertEqual(Path(composed['data']['version']).name, self._writing_owner(identity).name)
             self.assertEqual(source, proof)
             self.assertIn('/inspection/', source['request_path'])
             self.assertIn('revision-', source['request_path'])
@@ -2708,7 +2887,12 @@ class ProfessionalReportChainTests(unittest.TestCase):
         self.latest_composition = composed
         return composed
 
-    def _publish(self, *, crash=False):
+    def _preparation_process_usage(self, start=0):
+        identities = {Path(row['data']['project']).name for row in self.preparations[start:]}
+        return sum(entry.actual.get('process_invocations', 0) for entry in self.app.ledger.entries
+            if entry.attempt_id in identities)
+
+    def _approve_publication(self, *, crash=False):
         pending = self.app.state['pending']
         self.assertEqual(pending['call']['function']['name'], 'export_report')
         token = self.app.approval_token(pending['call'])
@@ -2732,6 +2916,16 @@ class ProfessionalReportChainTests(unittest.TestCase):
             self.app.run(**options)
         result = self._observations()[-1]
         self.assertEqual((result['tool_name'], result['status']), ('export_report', 'ok'), result)
+        export_id = Path(result['data']['project']).name
+        physical = [json.loads(path.read_text())
+            for path in (self.root / 'tools/processes').glob(export_id + '-render-*/invocation.json')]
+        self.assertEqual(sum('--from=json' in row['argv'] and '--to=latex' in row['argv']
+            for row in physical), 2, 'Only body and standalone TeX conversions are necessary')
+        return result
+
+    def _publish(self, *, crash=False):
+        result = self._approve_publication(crash=crash)
+        self.assertNotIn('candidate_preparation', result['data'])
         self.assertEqual(result['data']['report_identity']['composition'],
             self.latest_composition['data']['version'])
         exported = self.app.workspace.resolve(result['data']['project'] + '/source.md').read_text(encoding='utf-8')
@@ -2739,11 +2933,6 @@ class ProfessionalReportChainTests(unittest.TestCase):
         self.assertNotIn('3.026', exported)
         manifest = result['data']['manifest']
         self.assertEqual(manifest['compiled'], self.compile_pdf)
-        export_id = Path(result['data']['project']).name
-        physical = [json.loads(path.read_text())
-            for path in (self.root / 'tools/processes').glob(export_id + '-render-*/invocation.json')]
-        self.assertEqual(sum('--from=json' in row['argv'] and '--to=latex' in row['argv']
-            for row in physical), 2, 'Only body and standalone TeX conversions are necessary')
         if self.compile_pdf:
             self.assertTrue(manifest['pdf_preview']['rendered'])
             import subprocess
@@ -2771,9 +2960,14 @@ class ProfessionalReportChainTests(unittest.TestCase):
         self.assertFalse(self.app.state['turns'])
         self.app.state['config']['professional_inputs'] = 'owner.v1'
         self.app.state['config']['professional_work'] = 'owners.v3'
+        self.app.state['config'].pop('producer_completion')
+        # Frozen pre-preparation protocol: these assertions prove exact old
+        # adoption/repair recovery, not acceptance of the current work order.
+        self.app.state['config']['publication_preparation'] = None
         self.app._save()
         self.app = ToolApplication.load(self.root, services=self.services)
         self.assertEqual(self.app.state['config']['professional_inputs'], 'owner.v1')
+        self.assertIsNone(self.app.state['config']['publication_preparation'])
         self.assertTrue(self.app.writing.professional_inputs)
         self.assertFalse(self.app.writing.document_work)
         self.compile_pdf = compile_pdf
@@ -3001,17 +3195,7 @@ class ProfessionalReportChainTests(unittest.TestCase):
         self.assertNotEqual(first_export['data']['project'], second_export['data']['project'])
         self.assertEqual({path: path.read_bytes() for path in first_files}, first_files)
         self.assertEqual(len(self.app.state['requests']), 2)
-        self.assertTrue(all(e.status not in {'unknown', 'reserved'} for e in self.app.ledger.entries))
-        provider_usage = sum(e.actual.get('llm_requests', 0) for e in self.app.ledger.entries)
-        self.assertEqual(provider_usage, self.send.call_count)
-        self.assertEqual(sum(e.actual.get('total_tokens', 0) for e in self.app.ledger.entries), 120 * provider_usage)
-        receipts = [json.loads(path.read_text()) for path in (self.root / 'tools/processes').glob('*/invocation.json')]
-        self.assertEqual(sum(e.actual.get('process_invocations', 0) for e in self.app.ledger.entries), len(receipts))
-        for record in receipts:
-            charge, = [entry for entry in self.app.ledger.entries
-                if entry.reservation_id == 'process-' + record['invocation_id']]
-            self.assertEqual(charge.status, 'settled')
-            self.assertEqual(charge.actual['process_wall_seconds'], record['duration_sec'])
+        self._assert_accounting()
         self.assertFalse(self.responses)
         self.assertEqual(self.app._work_focus()['purpose'], 'task')
         self.assertEqual(self.app.state['config']['professional_inputs'], 'owner.v1')
@@ -3047,7 +3231,9 @@ class ProfessionalReportChainTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.app.writing.check_delivery(composed['data'])
         self.assertEqual(self.send.call_count, calls)
+        self._assert_accounting()
 
+    @unittest.skipUnless(shutil.which('pandoc'), 'Candidate preparation requires real Pandoc')
     def test_goal_findings_report_still_rejects_real_prose_and_attachment_defects(self):
         self.assertEqual(self.app.state['config']['producer_completion'], 'goal_findings.v1')
         self.app = ToolApplication.load(self.root, services=self.services)
@@ -3062,6 +3248,7 @@ class ProfessionalReportChainTests(unittest.TestCase):
         self.assertNotIn('declaration_adoption', composed['data']['delivery_review'])
         with self.assertRaises(ValueError):
             self.app.writing.check_delivery(composed['data'])
+        self._assert_accounting()
 
     @unittest.skipUnless(shutil.which('pandoc'), 'Professional report publication requires existing Pandoc')
     def test_goal_findings_default_full_chain_repairs_reviews_publishes_and_delivers(self):
@@ -3110,6 +3297,7 @@ class ProfessionalReportChainTests(unittest.TestCase):
         self.assertEqual(status['status'], 'completed', status)
         self.assertEqual(self.original_bytes,
             {path.name: path.read_bytes() for path in self.inputs.iterdir()})
+        self._assert_accounting()
 
     def test_professional_report_chain_material_repair_feedback_and_recovery(self):
         self._report_chain(compile_pdf=False)
@@ -3157,9 +3345,12 @@ class ProfessionalReportChainTests(unittest.TestCase):
                 'data_meanings': {'timing_scope': 'supplied saved model costs, not policy costs'}},
             professional_inputs=True, report_protocol='canonical_report.v1', allow_execution=True,
             max_turns=18, max_tokens=700000, max_attempts=100,
-            process_limits={'process_invocations': 32, 'process_wall_seconds': 480})
+            # Each version renders once for inspection and once for final
+            # publication; the opt-in PDF variant includes both full renders.
+            process_limits={'process_invocations': 64, 'process_wall_seconds': 480})
         self.assertEqual(self.app.state['config']['professional_inputs'], 'owner.v3')
         self.assertEqual(self.app.state['config']['professional_work'], 'requests.v1')
+        self.assertEqual(self.app.state['config']['publication_preparation'], 'bound_candidate.v1')
         self.enterContext(patch.object(LLMClient, 'chat_turn', self.native_chat_turn))
         feedback = ('Use the supplied grayscale figure version, revise the caption and affected '
             'prose consistently, and keep the old report and all original materials. '
@@ -3324,11 +3515,10 @@ class ProfessionalReportChainTests(unittest.TestCase):
             self.responses.extend([request_owner, select, writer, reviewer])
             delivery_path = self.root / 'delivery.json'
             prior_delivery = delivery_path.read_bytes() if delivery_path.exists() else None
-            count = len(self._observations())
-            status = self.app.run(feedback=feedback if phase else '', progress=lambda _: None)
-            observed = self._observations()[count:]
+            status, observed = self._perform(None, feedback=feedback if phase else '',
+                stop_tool='export_report')
             self.assertEqual(status['status'], 'paused', (status, observed, self.provider_errors))
-            composition, = [row for row in observed if row['tool_name'] == 'compose_document']
+            composition, = self._completed_compositions(observed)
             self.assertEqual(composition['status'], 'ok', composition)
             self.assertEqual([turn['origin'] for turn in self.app.state['turns']
                 if turn.get('request_count') == phase + 1 and turn.get('origin') != 'professional'], ['request_owner'])
@@ -3363,6 +3553,35 @@ class ProfessionalReportChainTests(unittest.TestCase):
             published = {self.app.workspace.resolve(path) for path in publication['artifacts']}
             self.app.writing.check_delivery_set(identity, delivered['artifacts'], published)
             gate_ledger, gate_calls = self.app.ledger.to_dict(), self.send.call_count
+            # The public draft locator must resolve the actual completed
+            # continuation, never its first publication-preparation receipt.
+            from simple_ar.tools.writing import accepted_composition_receipt
+            logical = Path(composition['data']['version']).name
+            physical, receipt = self.app.writing._document_source_observation(logical)
+            self.assertNotEqual(physical, logical)
+            native = self.root / 'attempts' / physical / 'native_result.json'
+            altered = {**receipt, 'data': {**receipt['data'], 'title': 'changed receipt'}}
+            with changed_record(native, altered), self.assertRaisesRegex(ValueError, 'no exact completed'):
+                self.app.writing._document_source_observation(logical)
+            reservation = 'source-accounting-check'
+            self.app.ledger.reserve(reservation, {'llm_requests': 1},
+                session_id=self.app.session.manifest.session_id, attempt_id=physical,
+                logical_call_id=reservation)
+            try:
+                for accounting in ('reserved', 'unknown'):
+                    if accounting == 'unknown':
+                        self.app.ledger.mark_unknown(reservation, reason='Fixture missing response')
+                    with self.subTest(accounting=accounting), self.assertRaisesRegex(ValueError, 'unsettled'):
+                        self.app.writing._document_source_observation(logical)
+                    with self.assertRaisesRegex(ValueError, 'unsettled'):
+                        accepted_composition_receipt(root=self.root, workspace=self.app.workspace,
+                            session_id=self.app.session.manifest.session_id, ledger=self.app.ledger,
+                            identity=physical, observed=receipt)
+            finally:
+                self.app.ledger._entries.pop(reservation)
+                self.app.ledger.save()
+            self.assertEqual(self.app.ledger.to_dict(), gate_ledger)
+            self.assertEqual(self.send.call_count, gate_calls)
             owner_result = self.root / 'tools/writing' / Path(composition['data']['version']).name / 'result.json'
             changed = json.loads(owner_result.read_bytes())
             changed['data']['delivery_review']['artifacts'][0]['copies'].pop()
@@ -3392,22 +3611,12 @@ class ProfessionalReportChainTests(unittest.TestCase):
         self.assertNotEqual(versions[0], versions[1])
         self.assertNotEqual(publications[0], publications[1])
         self.assertEqual(len(self.app.state['requests']), 2)
-        self.assertTrue(all(entry.status not in {'unknown', 'reserved'} for entry in self.app.ledger.entries))
-        physical_calls = sum(entry.actual.get('llm_requests', 0) for entry in self.app.ledger.entries)
-        self.assertEqual(physical_calls, self.send.call_count - fixture_calls)
-        self.assertEqual(sum(entry.actual.get('total_tokens', 0) for entry in self.app.ledger.entries),
-                         120 * physical_calls)
-        process_receipts = list((self.root / 'tools/processes').glob('*/invocation.json'))
-        self.assertEqual(sum(entry.actual.get('process_invocations', 0) for entry in self.app.ledger.entries),
-                         len(process_receipts))
+        self._assert_accounting(fixture_calls=fixture_calls)
         self.assertEqual({path: path.read_bytes() for path in mounted_bytes}, mounted_bytes)
         self.assertEqual({path.name: path.read_bytes() for path in self.inputs.iterdir()}, self.original_bytes)
         self.coordinator.assert_not_called()
 
     def test_exit_zero_missing_output_retains_receipt_without_replay(self):
-        self._missing_output_recovery()
-
-    def test_goal_findings_partial_output_observation_is_not_successful_input_ancestry(self):
         self._missing_output_recovery()
 
     def _missing_output_recovery(self):
