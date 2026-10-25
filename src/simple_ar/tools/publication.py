@@ -90,7 +90,7 @@ def publication_tool_specs(*, preparation: bool = True) -> list[CommonToolSpec]:
 
 
 def export_input_binding(source: Path, request: ExportRequest, *, output_root: Path | None = None,
-                         include_images: bool = True) -> dict[str, Any]:
+                         include_images: bool = True, image_paths: list[str] | None = None) -> dict[str, Any]:
     """Pin authoring inputs once for approval and export recovery, without secrets."""
     root = source.parent.resolve()
     inputs = {}
@@ -111,6 +111,26 @@ def export_input_binding(source: Path, request: ExportRequest, *, output_root: P
                 inputs[authorized.relative_to(root).as_posix()] = hashlib.file_digest(file, 'sha256').hexdigest()
     if not include_images:
         return {**request.model_dump(exclude_none=True), 'inputs': inputs}
+    if image_paths is not None:
+        # Recovery checks the renderer's retained dependencies. New approvals
+        # still inventory potential images; existing publications do not depend
+        # on unrelated workspace files appearing later.
+        if len(image_paths)>4096:
+            raise ValueError('Publication image input count exceeds 4096')
+        total = 0
+        for key in image_paths:
+            if key in inputs:
+                continue
+            path = resolve_mounted_path({'workspace': root}, str(root/key))
+            if (not path.is_file() or path.suffix.lower() not in {'.png','.jpg','.jpeg','.svg','.pdf'}
+                    or output_root is not None and path.is_relative_to(output_root.resolve())):
+                raise ValueError('Invalid retained publication image input')
+            total += path.stat().st_size
+            if total>256_000_000:
+                raise ValueError('Publication image inputs exceed 256 MB')
+            with path.open('rb') as file:
+                inputs[key] = hashlib.file_digest(file, 'sha256').hexdigest()
+        return {**request.model_dump(exclude_none=True), 'inputs':inputs, 'image_binding_version':1}
     # Approval must cover actual figure bytes, including standalone Markdown
     # images without a generated manifest. Bind the authorized local image
     # inventory rather than introducing a second Markdown/Pandoc parser here.
@@ -146,6 +166,28 @@ def export_input_binding(source: Path, request: ExportRequest, *, output_root: P
                 with path.open('rb') as file:
                     inputs[key] = hashlib.file_digest(file, 'sha256').hexdigest()
     return {**request.model_dump(exclude_none=True), 'inputs': inputs, 'image_binding_version': 1}
+
+
+def _publication_inputs(source: Path, request: ExportRequest, saved: dict, manifest: dict,
+                        current: dict, *, output_root: Path) -> dict:
+    """Validate consumed dependencies; older receipts retain their full inventory.
+
+    Approval inventory authorizes potential assets. Only the renderer knows
+    which of them the parsed manuscript actually consumes. Its bound manifest
+    must cover base inputs and remain a subset of that original approval.
+    """
+    expected = manifest.get('consumed_inputs', saved['inputs'])
+    if 'consumed_inputs' in manifest:
+        base = export_input_binding(source, request, output_root=output_root, include_images=False)['inputs']
+        if (not isinstance(expected, dict) or not base.keys() <= expected.keys()
+                or any(key not in saved['inputs'] or saved['inputs'][key] != value
+                       for key, value in expected.items())):
+            raise ValueError('Publication consumed inputs do not match the approved inventory')
+    if any(key not in current['inputs'] or current['inputs'][key] != value for key, value in expected.items()):
+        raise ValueError('Publication authoring inputs changed')
+    if 'consumed_inputs' not in manifest and current['inputs'] != expected:
+        raise ValueError('Publication authoring inputs changed')
+    return expected
 
 
 class PublicationToolGateway:
@@ -184,11 +226,12 @@ class PublicationToolGateway:
                 raise ValueError('Publication options differ from the admitted document work')
         return source
 
-    def approval_binding(self, arguments: dict, *, identity: str) -> dict:
+    def approval_binding(self, arguments: dict, *, identity: str,
+                         image_paths: list[str] | None = None) -> dict:
         request = ExportRequest.model_validate(arguments)
         source = self.workspace.resolve(request.markdown, write=True)
         binding = export_input_binding(source, request,
-            output_root=self.workspace.workspace / 'publications')
+            output_root=self.workspace.workspace / 'publications', image_paths=image_paths)
         if request.candidate_result:
             binding['report_identity'] = self._source_identity(request)
         return binding
@@ -216,8 +259,16 @@ class PublicationToolGateway:
         saved, result = owner.read_json('request.json'), owner.read_json('result.json')
         request = {key: value for key, value in saved.items()
             if key not in {'inputs', 'image_binding_version', 'output_binding_version', 'report_identity'}}
-        binding = self.approval_binding(request, identity=relative.parts[0])
-        if binding != {key: value for key, value in saved.items() if key != 'output_binding_version'}:
+        manifest = ArtifactStore(self.workspace.resolve(data['project'])).read_json('export.json')
+        binding = self.approval_binding(request, identity=relative.parts[0],
+            image_paths=list(manifest['consumed_inputs']) if 'consumed_inputs' in manifest else None)
+        inputs = _publication_inputs(self.workspace.resolve(saved['markdown']),
+            ExportRequest.model_validate(request), saved, manifest, binding,
+            output_root=self.workspace.workspace / 'publications')
+        self.workspace.check_artifact_producers(str(self.workspace.resolve(saved['markdown']).parent/key)
+            for key, digest in inputs.items() if digest is not None)
+        if ({**binding, 'inputs': inputs} != {key: value for key, value in saved.items()
+                if key != 'output_binding_version'} | {'inputs': inputs}):
             raise ValueError('Prepared publication source or inputs changed')
         hashes = result['artifact_sha256']
         if (data.get('artifact_sha256') != hashes or self.workspace.artifact_hashes(hashes) != hashes
@@ -298,11 +349,12 @@ class PublicationToolGateway:
                 request = ExportRequest.model_validate({key: value for key, value in saved.items()
                     if key not in {'inputs', 'image_binding_version', 'output_binding_version', 'report_identity'}})
                 current = export_input_binding(self.workspace.resolve(saved['markdown']), request,
-                    output_root=self.workspace.workspace / 'publications')
-                if current['inputs'] != saved.get('inputs'):
-                    raise ValueError('Publication authoring inputs changed')
+                    output_root=self.workspace.workspace / 'publications',
+                    image_paths=list(data['manifest']['consumed_inputs']) if 'consumed_inputs' in data['manifest'] else None)
+                inputs = _publication_inputs(self.workspace.resolve(saved['markdown']), request,
+                    saved, data['manifest'], current, output_root=self.workspace.workspace / 'publications')
                 self.workspace.check_artifact_producers(str(self.workspace.resolve(saved['markdown']).parent / key)
-                    for key, digest in current['inputs'].items() if digest is not None)
+                    for key, digest in inputs.items() if digest is not None)
                 if 'pdf' in formats and data['manifest'].get('compiled') is not True:
                     continue
                 if 'tex' in formats:
@@ -337,11 +389,20 @@ class PublicationToolGateway:
             output = self.workspace.resolve(prefix, write=True)
             owner = ArtifactStore(self.root / "tools" / "publications" / identity)
             saved = owner.read_json('request.json') if owner.exists('request.json') else None
+            retained_manifest = ArtifactStore(output).read_json('export.json') if saved is not None and (output/'export.json').is_file() else {}
             binding = export_input_binding(source, request, output_root=self.workspace.workspace / 'publications',
-                include_images=saved is None or 'image_binding_version' in saved)
+                include_images=saved is None or 'image_binding_version' in saved,
+                image_paths=list(retained_manifest['consumed_inputs']) if 'consumed_inputs' in retained_manifest else None)
+            consumed = (retained_manifest.get('consumed_inputs') if saved is not None else
+                export_input_binding(source, request, output_root=self.workspace.workspace / 'publications',
+                    include_images=False)['inputs'])
+            if saved is not None and consumed is not None:
+                consumed = _publication_inputs(source, request, saved, retained_manifest, binding,
+                    output_root=self.workspace.workspace / 'publications')
             producer_cache = {}
             self.workspace.check_artifact_producers((str(source.parent / key)
-                for key, digest in binding['inputs'].items() if digest is not None), cache=producer_cache)
+                for key, digest in (consumed if consumed is not None else binding['inputs']).items()
+                if digest is not None), cache=producer_cache)
             report_identity = self._source_identity(request)
             if report_identity is not None:
                 binding['report_identity'] = report_identity
@@ -352,7 +413,7 @@ class PublicationToolGateway:
                 # Historical exports only pinned the Markdown body. Restore
                 # their recorded version; do not invent missing past bindings.
                 if 'image_binding_version' in saved:
-                    current = binding
+                    current = {**binding, 'inputs': saved['inputs']} if consumed is not None else binding
                 elif 'inputs' in saved:
                     # Old terminal exports retain their recorded coverage;
                     # never upgrade their historical approval after the fact.
@@ -449,6 +510,9 @@ class PublicationToolGateway:
                         digest = hashlib.sha256(path.read_bytes()).hexdigest()
                         if staged_hashes.get(path.relative_to(render_source.parent).as_posix()) != digest:
                             raise ReportExportError('Prepared candidate asset changed during rendering')
+                        key = path.relative_to(render_source.parent).as_posix()
+                        if consumed is not None and key in binding['inputs']:
+                            consumed[key] = binding['inputs'][key]
                         return digest
                     authorized = self.workspace.resolve(str(path))
                     self.workspace.check_artifact_producers([str(authorized)], cache=producer_cache)
@@ -457,6 +521,8 @@ class PublicationToolGateway:
                         digest = hashlib.file_digest(file, 'sha256').hexdigest()
                     if binding['inputs'].get(key) != digest:
                         raise ReportExportError('Figure/template is outside the bound authoring inputs or changed during rendering')
+                    if consumed is not None:
+                        consumed[key] = digest
                     return digest
 
                 try:
@@ -489,10 +555,19 @@ class PublicationToolGateway:
                     raise ValueError('Publication differs from the independently inspected candidate in '
                         + ', '.join(changed) + '; retain both without delivery')
             self.workspace.check_artifact_producers((str(source.parent / key)
-                for key, digest in binding['inputs'].items() if digest is not None), cache=producer_cache, refresh=True)
-            if (self.report_source is not None or request.candidate_result) and export_input_binding(source, request,
-                    output_root=self.workspace.workspace / 'publications')['inputs'] != binding['inputs']:
-                raise ValueError('Publication authoring inputs changed during rendering')
+                for key, digest in (consumed if consumed is not None else binding['inputs']).items()
+                if digest is not None), cache=producer_cache, refresh=True)
+            if saved is None or self.report_source is not None or request.candidate_result:
+                current = export_input_binding(source, request, output_root=self.workspace.workspace / 'publications',
+                    image_paths=list(consumed) if consumed is not None else None)
+                _publication_inputs(source, request, binding,
+                    {'consumed_inputs': consumed} if consumed is not None else {}, current,
+                    output_root=self.workspace.workspace / 'publications')
+            if saved is None and consumed is not None and (output/'export.json').is_file():
+                # Dependency facts belong to the byte-bound publication, not
+                # another mutable task state or a second Markdown parser.
+                manifest['consumed_inputs'] = consumed
+                ArtifactStore(output).write_json('export.json', manifest)
             artifacts = [f"{prefix}/{file}" for file in ("main.tex", "body.tex", "references.bib", "source.md", "export.json", "main.pdf")
                          if (output / file).is_file()]
             completed = manifest['status'] in {'exported', 'compiled'}

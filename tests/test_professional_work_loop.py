@@ -936,6 +936,68 @@ class OperationsWorkLoopTests(unittest.TestCase):
             path.write_bytes(raw)
         self.assertEqual(self._versions(self.inputs),originals)
 
+    def test_publication_consumes_actual_assets_not_unrelated_failed_producer_outputs(self):
+        if not shutil.which('pandoc'):
+            self.skipTest('Real publication requires Pandoc')
+        self._create()
+        self._write('analyze.py', _PROGRAM)
+        self._submit(_action('run_process', argv=['python', 'workspace/analyze.py',
+            'measurements/observations.csv', 'workspace/live'],
+            inputs=['analyze.py', 'measurements/observations.csv'],
+            outputs=['live/table.csv', 'live/summary.json', 'live/figure.png']),
+            approve=lambda call, token: True)
+        self._ok('run_process')
+        self._write('live/report.md', _BODY)
+        self._submit(_action('run_process', argv=['python', '-c',
+            "from pathlib import Path; import shutil; p=Path('live/old output'); p.mkdir(); "
+            "shutil.copyfile('live/figure.png',p/'unused.png'); shutil.copyfile('live/figure.png',p/'missing.png')"],
+            inputs=['live/figure.png'], outputs=['live/old output/unused.png', 'live/old output/missing.png']),
+            approve=lambda call, token: True)
+        self._ok('run_process')
+        self._submit(_action('write_file', path='live/old output/unused.png',
+            content='Changed unrelated bytes',
+            expected_sha256=_digest(self.root/'workspace/live/old output/unused.png')))
+        self._ok('write_file')
+        (self.root/'workspace/live/old output/missing.png').unlink()
+        ledger_before = [row.to_dict() for row in self.app.ledger.entries]
+        exported = self._export('live/report.md')
+        self.assertEqual(exported['status'], 'ok', exported)
+        manifest = exported['data']['manifest']
+        self.assertEqual(set(manifest['consumed_inputs']), {
+            'report.md', 'references.bib', 'figures/figures_manifest.json', 'figure.png'})
+        project = exported['data']['project']
+        self._inspect(['live/report.md'])
+        delivery = self._delivery('live/report.md', project)
+        delivery['report']['formats'] = ['tex']
+        self._submit(_action('deliver_result', **delivery))
+        self._ok('deliver_result')
+        self.assertEqual(self.app.session.manifest.status, 'completed')
+        self.assertEqual([row.to_dict() for row in self.app.ledger.entries][:len(ledger_before)], ledger_before)
+        identity = Path(project).name
+        self._reload()
+        ledger = self.app.ledger.to_dict()
+        (self.root/'workspace/live/unrelated.svg').write_text('<svg/>')
+        cached = self.app.operations.publication.call('export_report',
+            {'markdown':'live/report.md', 'compile_pdf':False}, identity=identity)
+        self.assertEqual(cached.status, 'ok', cached.error)
+        self.assertEqual(cached.data, exported['data'])
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+        script = self.root/'workspace/analyze.py'
+        script_bytes = script.read_bytes()
+        script.write_bytes(script_bytes+b'\n# Changed producer input\n')
+        stale = self.app.operations.publication.call('export_report',
+            {'markdown':'live/report.md', 'compile_pdf':False}, identity=identity)
+        self.assertEqual(stale.status, 'error')
+        self.assertIn('producer inputs/outputs changed', stale.error)
+        script.write_bytes(script_bytes)
+        # Actual consumed bytes still invalidate the receipt; stale unrelated
+        # producers are not an excuse to weaken source/figure provenance.
+        (self.root/'workspace/live/figure.png').write_bytes(b'changed consumed image')
+        rejected = self.app.operations.publication.call('export_report',
+            {'markdown':'live/report.md', 'compile_pdf':False}, identity=identity)
+        self.assertEqual(rejected.status, 'error')
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+
     def test_inspection_finishes_within_shared_capacity_and_returns_to_ordinary_delivery(self):
         self._create()
         self._write('report.md', 'The sample mean is 2.0 across three supplied observations.\n')

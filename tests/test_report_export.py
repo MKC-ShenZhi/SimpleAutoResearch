@@ -832,12 +832,14 @@ class ReportExportTests(unittest.TestCase):
                 figure.write_bytes(b'original figure bytes')
                 self.assertEqual(gateway.call('export_report', request.model_dump(), identity='export').data, published.data)
                 self.assertEqual(processes.call_count, count)
-                # Historical terminal versions restore only the coverage they
-                # actually recorded, never a retroactively stronger approval.
+                # A modern consumed-input receipt cannot be downgraded by
+                # deleting an image from its original approval inventory.
                 saved_request = native / 'tools/publications/export/request.json'
                 historic = json.loads(saved_request.read_text())
-                historic.pop('image_binding_version')
-                historic['inputs'].pop('figures/main.png')
+                changed_approval = {**historic, 'inputs': {key:value for key,value in historic['inputs'].items()
+                    if key != 'figures/main.png'}}
+                saved_request.write_text(json.dumps(changed_approval))
+                self.assertEqual(gateway.call('export_report', request.model_dump(), identity='export').status, 'error')
                 saved_request.write_text(json.dumps(historic))
                 self.assertEqual(gateway.call('export_report', request.model_dump(), identity='export').data, published.data)
                 self.assertEqual(processes.call_count, count)
@@ -970,7 +972,8 @@ class ReportExportTests(unittest.TestCase):
                 markdown_only['sha256'] = saved['inputs']['draft.md']
                 # Older terminal manifests have no caption-owner field. Reading
                 # them must neither migrate their bytes nor infer a new policy.
-                manifest = {key: value for key, value in manifest.items() if key != 'figure_caption_owner'}
+                manifest = {key: value for key, value in manifest.items()
+                    if key not in {'figure_caption_owner', 'consumed_inputs'}}
                 historical_bytes = json.dumps(manifest).encode('utf-8')
                 (output / 'export.json').write_bytes(historical_bytes)
                 for historic in (saved, input_only, markdown_only):
@@ -1702,7 +1705,7 @@ class ProcessArtifactBindingTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'no successful output binding'):
                 workspace.check_artifact_producers(['absent'])
 
-    def test_publication_stops_old_image_when_declared_script_changes_without_rendering(self):
+    def test_publication_stops_consumed_image_when_declared_script_changes(self):
         from simple_ar.tools.workspace import WorkspaceToolGateway
         from simple_ar.tools.publication import PublicationToolGateway
 
@@ -1715,14 +1718,17 @@ class ProcessArtifactBindingTests(unittest.TestCase):
             self.assertTrue(self._run(workspace, 'producer', args, {'figure.png': b'image'}).ok)
             workspace.resolve('arbitrary.source').write_bytes(b'user edit')
             gateway = PublicationToolGateway(root, workspace, None)
-            with patch('simple_ar.tools.publication.export_acm_report') as exporter, \
+            def consume(source, output, **options):
+                options['validate_asset'](workspace.resolve('figure.png'))
+                self.fail('Stale consumed input must be rejected before copying/rendering')
+            with patch('simple_ar.tools.publication.export_acm_report', side_effect=consume) as exporter, \
                     patch('simple_ar.tools.publication.run_process') as runner:
                 result = gateway.call('export_report', {'markdown': 'draft.md', 'compile_pdf': False}, identity='export')
                 self.assertFalse(result.ok)
                 self.assertIn('producer inputs/outputs changed', result.error)
-                exporter.assert_not_called()
+                exporter.assert_called_once()
                 runner.assert_not_called()
-            self.assertFalse((root / 'tools/publications/export/request.json').exists())
+            self.assertTrue((root / 'tools/publications/export/request.json').exists())
 
     def test_failed_latest_producer_and_unsafe_declarations_do_not_certify_outputs(self):
         from simple_ar.tools.workspace import WorkspaceToolGateway

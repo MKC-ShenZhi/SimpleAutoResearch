@@ -13,6 +13,7 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 - Independent inspection uses real read-only tool calls to investigate sources, then submits structured findings separately. Results stay paired with their native calls; malformed or unauthorized operations do not execute. Diagnostics distinguish tool-call responses from reasoning-only output.
 - Each source search inside an inspection retains its own invocation and charge. Unknown child-process usage stops further requests; bounded internal file searches no longer inherit the public arbitrary-command argument-count limit.
 - Inspection stops gathering earlier when capacity is tight, reserving its final opinion and the caller's next decision on the existing ledger. Insufficient evidence remains an explicit finding; it does not become a pass.
+- New publications track the manuscript's actual presentation dependencies. Stale unrelated previews no longer block export or recovery; consumed figures and their producer versions remain checked.
 
 End-to-end initial-draft and feedback acceptance is still in progress. These changes do not establish lower whole-task costs.
 

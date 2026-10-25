@@ -151,6 +151,11 @@ decision, except an explicit terminal batch, a finishing owner or caller takeove
 Inspection separately protects its final opinion while gathering; nested floors compose
 on the same ledger. Token forecasts exclude future source growth and cannot guarantee
 completion, especially with uncapped output. Unknown usage never creates capacity.
+For new publications, approval inventories potential images, while the existing renderer
+records consumed presentation inputs in the byte-bound export manifest. Recovery,
+inspection and delivery check those inputs and their producers. Historical manifests
+keep their recorded inventory semantics; changing an unrelated preview cannot justify
+accepting a stale consumed figure. This does not certify scientific attachment provenance.
 Historical `protected_decision.v1`, `closing_decision.v2` and no-policy tasks
 retain their saved behavior. See [budget ownership](../src/simple_ar/core/budget.py)
 and [configuration](CONFIG_REFERENCE.md) for policy details.
