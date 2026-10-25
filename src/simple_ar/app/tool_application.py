@@ -1671,6 +1671,7 @@ class ToolApplication:
             config['result_investigation'] = 'execution_findings.v1'
         if control_protocol is not None:
             config['report_protocol'] = None
+            config['inspection_protocol'] = 'subjects.v1'
             # Old per-stage contracts belong to saved tasks, not this loop.
             for name in ('professional_inputs','professional_work','producer_completion',
                          'result_investigation','document_source_contract','publication_preparation'):
@@ -1843,7 +1844,7 @@ class ToolApplication:
             # Its previous config is journaled below; old decision receipts keep
             # their original closing obligation. Absent historical fields stay
             # absent unless explicitly supplied, including unrelated supplies.
-            for field in ('completion_policy', 'tool_contracts', 'report_protocol', 'tool_completions',
+            for field in ('completion_policy', 'tool_contracts', 'report_protocol', 'tool_completions', 'inspection_protocol',
                           'document_source_contract'):
                 if field not in supplied:
                     if field in old:

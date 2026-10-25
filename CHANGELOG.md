@@ -14,6 +14,7 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 - Each source search inside an inspection retains its own invocation and charge. Unknown child-process usage stops further requests; bounded internal file searches no longer inherit the public arbitrary-command argument-count limit.
 - Inspection stops gathering earlier when capacity is tight, reserving its final opinion and the caller's next decision on the existing ledger. Insufficient evidence remains an explicit finding; it does not become a pass.
 - New publications track the manuscript's actual presentation dependencies. Stale unrelated previews no longer block export or recovery; consumed figures and their producer versions remain checked.
+- New inspections bind each target's findings and supporting files independently. Editing a sibling no longer discards an unchanged target's pass or required defect; historical grouped inspections retain their saved contract.
 
 End-to-end initial-draft and feedback acceptance is still in progress. These changes do not establish lower whole-task costs.
 

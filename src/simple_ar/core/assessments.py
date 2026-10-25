@@ -53,29 +53,38 @@ def current_assessments(workspace: Any, observations: list[dict]) -> list[Artifa
     """
     result = []
     for observed in observations:
-        value = (observed.get('metadata') or {}).get('assessment')
-        if value is None or not (observed.get('status') == 'ok'
-                or observed.get('status') == 'error' and value.get('verdict') == 'incomplete'):
-            continue
-        assessment = ArtifactAssessment.model_validate(value)
-        try:
-            if workspace.artifact_hashes(assessment.subjects) != assessment.subjects:
+        metadata = observed.get('metadata') or {}
+        if 'assessment' in metadata and 'assessments' in metadata:
+            raise ValueError('Inspection metadata cannot contain both assessment and assessments')
+        modern = 'assessments' in metadata
+        values = metadata['assessments'] if modern else [metadata.get('assessment')]
+        if modern and not isinstance(values, list):
+            raise ValueError('Subject inspection assessments must be a list')
+        for value in values:
+            if value is None or not (observed.get('status') == 'ok'
+                    or observed.get('status') == 'error' and value.get('verdict') == 'incomplete'):
                 continue
-        except (ValueError,OSError):
-            continue  # Missing old versions remain history, not current acceptance.
-        try:
-            evidence_current = workspace.artifact_hashes(assessment.evidence_sha256) == assessment.evidence_sha256
-        except (ValueError,OSError):
-            evidence_current = False
-        if not evidence_current:
-            # A newer review whose evidence changed cannot silently fall back
-            # to an earlier, less-informed pass of the same target bytes.
-            required_findings = [row for row in assessment.findings if row.severity=='required']
-            assessment = assessment.model_copy(update={'coverage':'partial',
-                'verdict':'needs_revision' if required_findings else 'incomplete',
-                'findings':required_findings,
-                'limitations':[*assessment.limitations,'Inspection evidence changed; reassess outstanding concerns against current sources']})
-        result.append(assessment)
+            assessment = ArtifactAssessment.model_validate(value)
+            if modern and len(assessment.subjects) != 1:
+                raise ValueError('Subject inspection requires singleton assessments')
+            try:
+                if workspace.artifact_hashes(assessment.subjects) != assessment.subjects:
+                    continue
+            except (ValueError,OSError):
+                continue  # Missing old versions remain history, not current acceptance.
+            try:
+                evidence_current = workspace.artifact_hashes(assessment.evidence_sha256) == assessment.evidence_sha256
+            except (ValueError,OSError):
+                evidence_current = False
+            if not evidence_current:
+                # A newer review whose evidence changed cannot silently fall back
+                # to an earlier, less-informed pass of the same target bytes.
+                required_findings = [row for row in assessment.findings if row.severity=='required']
+                assessment = assessment.model_copy(update={'coverage':'partial',
+                    'verdict':'needs_revision' if required_findings else 'incomplete',
+                    'findings':required_findings,
+                    'limitations':[*assessment.limitations,'Inspection evidence changed; reassess outstanding concerns against current sources']})
+            result.append(assessment)
     return result
 
 

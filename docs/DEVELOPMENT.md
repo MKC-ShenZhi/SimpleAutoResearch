@@ -66,6 +66,11 @@ New tasks use `operations.v1`: investigation, editing, execution, inspection and
 publication are independently callable, rather than stages of an implicit handoff.
 `OperationTools` composes the registry; it does not run another scheduler. Inspection
 owns version-bound findings and publication owns rendering and export provenance.
+New tasks freeze `inspection_protocol=subjects.v1`: one source investigation can
+inspect several targets, but each decision names its own supporting observations.
+Each target's completeness, findings and evidence versions are evaluated separately;
+cross-file support must be explicit. Saved grouped opinions are not retroactively
+split, and unrelated supplies do not upgrade their inspection contract.
 Formal delivery declares its manuscript and requested formats. Fixed code and
 measurement contracts remain enforced by their original execution owners.
 Historical native tasks without this protocol retain their saved professional

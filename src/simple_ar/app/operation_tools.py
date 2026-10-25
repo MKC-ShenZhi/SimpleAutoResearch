@@ -72,6 +72,7 @@ class OperationTools:
         self.registry.register_package(publication_tool_specs(preparation=False), self.publication, request_visible=True)
         self.inspection = InspectionToolGateway(root, self.workspace,
             client_factory=lambda identity:client_factory(identity, 'writing'),
+            protocol=config.get('inspection_protocol'),
             prior_assessments=lambda:[row.model_dump() for row in
                 current_assessments(self.workspace,observations())])
         self.registry.register_package(inspection_tool_specs(), self.inspection, request_visible=True)

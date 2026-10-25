@@ -98,6 +98,11 @@ def _digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _assessments(result):
+    metadata = result['metadata']
+    return metadata['assessments'] if 'assessments' in metadata else [metadata['assessment']]
+
+
 class OperationsWorkLoopTests(unittest.TestCase):
     def setUp(self):
         self.directory = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
@@ -166,6 +171,30 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 self.inspection_views.append(view)
                 self.inspection_requests.append(deepcopy(request))
                 response = self.review(view)
+                terminal = next(tool['function'] for tool in request['tools']
+                    if tool['function']['name']=='record_inspection')
+                if (isinstance(response,dict) and 'findings' in response
+                        and 'decisions' in terminal['parameters'].get('properties',{})):
+                    # Fixtures describe the same opinions for both frozen contracts.
+                    # Supply actual read IDs, never infer verified evidence from a verdict.
+                    observed = list(view['evidence'])
+                    for message in request['messages']:
+                        if message['role']=='tool':
+                            row = json.loads(message['content']).get('data',{})
+                            if row.get('subject'):
+                                observed.append(row)
+                    decisions = []
+                    for subject in dict.fromkeys([*ids,*(f['subject'] for f in response['findings'])]):
+                        target = next((row for row in view['targets'] if row['subject']==subject),{})
+                        target_text = [w['text'] for w in target.get('text_windows',[])]
+                        decisions.append({'subject':subject,
+                            'findings':[{k:v for k,v in f.items() if k!='subject'}
+                                for f in response['findings'] if f['subject']==subject],
+                            'evidence':list(dict.fromkeys(row['subject'] for row in observed
+                                if row.get('text_windows') and row['subject']!=subject
+                                and [w['text'] for w in row['text_windows']]!=target_text)),
+                            'limitations':response['limitations']})
+                    response = {'decisions':decisions}
                 actions = ([_action('record_inspection', **response)]
                     if isinstance(response, dict) else response)
                 message = {'role': 'assistant', 'content': None,
@@ -278,7 +307,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
 
     def _assessment(self):
         result = self._ok('inspect_artifacts')
-        assessment = result['metadata']['assessment']
+        assessment = _assessments(result)[0]
         ArtifactAssessment.model_validate(assessment)
         for path, digest in assessment['subjects'].items():
             self.assertEqual(_digest(Path(path)), digest)
@@ -677,7 +706,78 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._submit(_action('deliver_result', summary='Observed sample mean checked', artifacts=['analysis.md']))
         self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
         self._reload()
-        self.assertEqual(self._last('inspect_artifacts')['metadata']['assessment']['verdict'], 'passed')
+        self.assertEqual(_assessments(self._last('inspect_artifacts'))[0]['verdict'], 'passed')
+
+    def test_independent_subjects_keep_passes_and_defects_when_a_sibling_changes(self):
+        from simple_ar.core.assessments import assessment_issues
+        self._create()
+        self.assertEqual(self.app.state['config']['inspection_protocol'],'subjects.v1')
+        self._write('report.md','# Results\n\nThe observed mean is 2.0.\n')
+        self._write('layout.py','font_size = 10\n')
+        self._write('incorrect.txt','The observed mean is 9.0.\n')
+        self.review = lambda view: {'decisions':[
+            {'subject':'target-1','evidence':['evidence-1'],'findings':[],'limitations':[]},
+            {'subject':'target-2','evidence':[],'findings':[],'limitations':[]},
+            {'subject':'target-3','evidence':['evidence-1'],
+             'findings':[{'severity':'required','message':'9.0 contradicts the observed mean 2.0.'}],
+             'limitations':[]}]}
+        result = self._inspect(['report.md','layout.py','incorrect.txt'])
+        self.assertEqual([a['verdict'] for a in _assessments(result)],
+            ['passed','passed','needs_revision'])
+        before = deepcopy(result)
+        layout = self._read('layout.py')
+        self._submit(_action('edit_file',path='layout.py',expected_sha256=layout['sha256'],
+            old_text='10',new_text='12'))
+        self._reload()
+        self.assertEqual(self._last('inspect_artifacts'),before)
+        observations = self.app._operation_observations()
+        self.assertEqual(assessment_issues(self.app.workspace,observations,['report.md'],
+            require_pass=['report.md']),[])
+        issues = assessment_issues(self.app.workspace,observations,['incorrect.txt'])
+        self.assertTrue(any('9.0 contradicts' in text for text in issues),issues)
+        self._submit(_action('deliver_result',summary='Incorrect result',artifacts=['incorrect.txt']))
+        self._not_delivered()
+        # A source change invalidates the dependent report without erasing its sibling's defect.
+        original = (self.inputs/'observations.csv').read_bytes()
+        (self.inputs/'observations.csv').write_text('sample,value\na,7\n')
+        observations = self.app._operation_observations()
+        issues = assessment_issues(self.app.workspace,observations,['report.md','incorrect.txt'],
+            require_pass=['report.md'])
+        self.assertTrue(any('lacks a complete' in text for text in issues),issues)
+        self.assertTrue(any('9.0 contradicts' in text for text in issues),issues)
+        (self.inputs/'observations.csv').write_bytes(original)
+        self._submit(_action('deliver_result',**self._delivery('report.md')))
+        self.assertEqual(self.app.session.manifest.status,'completed',self.app.result_snapshot())
+        self.assertEqual(self._last('inspect_artifacts'),before)
+
+    def test_subject_inspection_binds_cross_file_support_without_passing_partial_siblings(self):
+        from simple_ar.core.assessments import assessment_issues
+        self._create()
+        self._write('report.md','# Results\n\nSee the calculation.\n')
+        self._write('calculation.py','mean = (1 + 2 + 3) / 3\n')
+        self.review = lambda view: {'decisions':[
+            {'subject':'target-1','evidence':['target-2'],'findings':[],'limitations':[]},
+            {'subject':'target-2','evidence':[],'findings':[],'limitations':['Only the supplied prefix was reviewed.']}]}
+        result = self._inspect(['report.md',{'path':'calculation.py','max_bytes':8}],[])
+        self.assertEqual([a['verdict'] for a in _assessments(result)],['passed','incomplete'])
+        observations = self.app._operation_observations()
+        self.assertEqual(assessment_issues(self.app.workspace,observations,['report.md'],require_pass=['report.md']),[])
+        source = self._read('calculation.py')
+        self._submit(_action('edit_file',path='calculation.py',expected_sha256=source['sha256'],
+            old_text='1 + 2 + 3',new_text='7 + 8 + 9'))
+        self._reload()
+        issues = assessment_issues(self.app.workspace,self.app._operation_observations(),
+            ['report.md'],require_pass=['report.md'])
+        self.assertTrue(any('lacks a complete' in text for text in issues),issues)
+
+        # Reject an unread source ID rather than silently dropping the dependency.
+        self.review = lambda view: {'decisions':[
+            {'subject':'target-1','evidence':['evidence-999'],'findings':[],'limitations':[]}]}
+        result = self._inspect(['report.md'],[])
+        self.assertEqual(result['status'],'error',result)
+        self.assertTrue(all(a['verdict']=='incomplete' for a in _assessments(result)))
+        self._submit(_action('deliver_result',**self._delivery('report.md')))
+        self._not_delivered()
 
     def test_changed_bytes_and_partial_windows_cannot_inherit_a_passed_inspection(self):
         if not shutil.which('pandoc'):
@@ -876,7 +976,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         record = 'records/'+result['data']['record'].split('/inspection/',1)[0].removeprefix('attempts/')+'/native_result.json'
         presented = self.app._coordination_result(result,record)
         self.assertEqual(result,raw_result)
-        self.assertEqual(presented['metadata']['assessment'],result['metadata']['assessment'])
+        self.assertEqual(_assessments(presented),_assessments(result))
         self.assertTrue(all('windows' not in row for row in presented['data']['evidence']))
         self.assertEqual(presented['data']['source_observations']['record'],record)
         self.assertIn('a,1',json.dumps(result))
@@ -1102,7 +1202,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
                     result = ToolResult.model_validate(self._inspect(['report.md'], []))
                 self.assertFalse(self.transport_errors, self.transport_errors)
                 self.assertEqual(len(self.inspection_requests)-before, 0 if mode=='unknown' else 1)
-                self.assertEqual(result.metadata['assessment']['verdict'],
+                self.assertEqual(_assessments(result.model_dump(mode='json'))[0]['verdict'],
                     'needs_revision' if mode in {'one_request', 'tokens','bounded_prior'} else 'incomplete')
                 self.assertFalse(self._process_receipts())
                 if mode == 'unoffered_read':
@@ -1183,7 +1283,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertFalse(any(call.args[0]=='list_directory' for call in reads.call_args_list))
         self.assertEqual(len(self.inspection_requests)-first_round, 7)
         self.assertEqual(result['status'],'error')
-        self.assertEqual(result['metadata']['assessment']['verdict'],'incomplete')
+        self.assertEqual(_assessments(result)[0]['verdict'],'incomplete')
         identity = Path(result['data']['record']).parts[1]
         saved = self.app.session.store.read_json(f'tools/inspection/{identity}/input.json')
         self.assertTrue(any(row.get('path')==str(self.inputs/'observations.csv') for row in saved['evidence']))
@@ -1232,7 +1332,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertFalse(assessment['evidence_sha256'])
         self.assertIn(limitation, assessment['limitations'])
         self.assertTrue(any('independent' in item.lower() for item in assessment['limitations']))
-        self.assertFalse(self.inspection_views[-1]['evidence'][0]['text_windows'])
+        # A copied target is visible for cross-file comparison, but cannot be
+        # selected as independent support for itself or identical bytes.
+        self.assertTrue(self.inspection_views[-1]['evidence'][0]['text_windows'])
         self.review = lambda view: {'findings': [], 'limitations': []}
         self._inspect(['notes.md'])
         assessment = self._assessment()
