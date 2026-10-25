@@ -10,7 +10,7 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 
 - Inspect the prepared publication view before adoption and reuse a valid view for fresh independent checks of existing drafts. Captions, templates and citation style stay bound to the same version; successful preparation is not final delivery.
 - Keep complete rejected drafts as work candidates for revision or reorganization. A never-dispatched inspection can continue after its original accounting is verified, without redrafting. Failures, unknown requests and historical contracts remain protected.
-- Share source, outline and provenance records across writing, repair and delivery. Prior manuscript directories, derived delivery hints and equivalent attachment copies no longer force reselection; explicitly added materials still require investigation.
+- Share source, outline and provenance across writing, repair and delivery, avoiding reselection for equivalent attachments or prior drafts. Professional selection checks source references against actual document identities; ordinary code and data remain readable materials.
 
 Full unattended draft, feedback and delivery acceptance remains in progress; this engineering update does not establish general success or lower cost.
 

@@ -705,7 +705,7 @@ class WritingCoordinationTests(unittest.TestCase):
                 snapshot = store.read_json('request.json')['delivery_review']
                 self.assertEqual(snapshot.get('declaration_adoption_contract'), policy)
                 selection = store.read_json('selection-input.json')
-                self.assertEqual(selection.get('selection_validation'), 'observed_windows.v1' if policy else None)
+                self.assertEqual(selection.get('selection_validation'), 'observed_inputs.v2' if policy else None)
                 self.assertEqual(selection.get('producer_unit_contract'),
                     'professional_delivery_unit.v1' if policy else None)
                 if policy is None:
@@ -755,9 +755,18 @@ class WritingCoordinationTests(unittest.TestCase):
 
         def answer(system, prompt, **options):
             if options['label'] == 'composition-selection-2':
+                view = json.loads(prompt)
+                self.assertEqual(view['response_schema']['properties']['sources']['maxItems'], 0)
+                return {'title': 'Recorded value and scope', 'sources': [
+                    {'document_record': str(path), 'questions': ['Explain the recorded value']}
+                    for path in (script, table)]}
+            if options['label'] == 'composition-selection-3':
+                view = json.loads(prompt)
+                self.assertIn('sources', view['response_correction']['diagnostic'])
+                self.assertEqual(len(view['observations']), 2, 'A role correction does not retire valid observations')
                 return {'title': 'Recorded value and scope', 'materials': [str(source / 'unselected.txt')],
                     'delivery_artifacts': [str(script), str(table)]}
-            if options['label'] == 'composition-selection-3':
+            if options['label'] == 'composition-selection-4':
                 view = json.loads(prompt)
                 self.assertIn('not inspected', json.dumps(view['read_admission']))
                 self.assertEqual(view['observations'], [], 'The unrelated old ranges were archived, not supplied')
@@ -768,15 +777,16 @@ class WritingCoordinationTests(unittest.TestCase):
         result = writing.call('compose_document', {'goal': 'Explain the selected original evidence',
             'material_roots': [str(source)]}, identity='selection-correction')
         self.assertEqual(result.status, 'ok', result)
-        self.assertEqual(client.ask_json.call_count, 6)
+        self.assertEqual(client.ask_json.call_count, 7)
         store = ArtifactStore(root / 'tools/writing/selection-correction')
-        self.assertEqual(store.read_json('selection-input.json')['selection_validation'], 'observed_windows.v1')
-        archived = store.read_json('selection-steps/2/input.json')['observations']
+        self.assertEqual(store.read_json('selection-input.json')['selection_validation'], 'observed_inputs.v2')
+        self.assertTrue(store.read_json('selection-steps/2/response-error.json')['correction_allowed'])
+        archived = store.read_json('selection-steps/3/input.json')['observations']
         self.assertEqual({row['request']['path'] for row in archived}, {str(script), str(table)})
-        active = store.read_json('selection-steps/4/input.json')['observations']
+        active = store.read_json('selection-steps/5/input.json')['observations']
         self.assertEqual([row['request']['path'] for row in active], [str(table)])
         self.assertEqual(active[0]['data']['sha256'], hashlib.sha256(table.read_bytes()).hexdigest())
-        self.assertEqual(store.read_json('selection-steps/3/response.json'),
+        self.assertEqual(store.read_json('selection-steps/4/response.json'),
             {'read_windows': [{'path': str(table)}]})
         self.assertNotIn(str(source / 'unselected.txt'),
             [row['path'] for row in store.read_json('request.json')['inputs']])
@@ -785,6 +795,47 @@ class WritingCoordinationTests(unittest.TestCase):
             'material_roots': [str(source)]}, identity='selection-correction')
         self.assertEqual(replay.model_dump(mode='json'), result.model_dump(mode='json'))
         self.assertEqual(client.ask_json.call_count, calls)
+
+    def test_source_questions_bind_only_inventoried_original_bundles(self):
+        from simple_ar.report.review_evidence import CLAIM_ADOPTION_V2
+        from simple_ar.research.documents.ingest import DocumentBundle
+        from simple_ar.research.contracts import DocumentRecord, TextChunk
+        root, workspace, writing, source, script, _, client, _ = self._document_work_fixture()
+        writing.declaration_adoption_contract = CLAIM_ADOPTION_V2
+        original = source / 'method.json'
+        bundle = DocumentBundle.from_rows(documents=[DocumentRecord(document_id='method',
+            title='Original definition', source='supporting_material').to_row()], chunks=[TextChunk(
+            chunk_id='definition', document_id='method', text='Value denotes the saved estimate.',
+            line_start=1, line_end=1).to_row()])
+        original.write_text(json.dumps(bundle.to_handoff_dict()), encoding='utf-8')
+        source_ref = {'document_record': workspace.locator(str(original)), 'questions': ['Value definition']}
+        client.ask_json.side_effect = [
+            {'sources': [{'document_record': str(script), 'questions': ['Value definition']}]},
+            {'sources': [source_ref]}]
+        owner = ArtifactStore(root / 'tools/writing/source-roles')
+        request = ComposeRequest(goal='Explain the saved estimate', title='Evidence', material_roots=[str(source)])
+        selected, coverage = writing._select_materials(request, owner, 'source-roles', client,
+            '', None, document_work=True)
+        self.assertEqual(selected.sources[0].document_record, source_ref['document_record'])
+        self.assertEqual(coverage['selected_sources'][0]['questions'], source_ref['questions'])
+        schema = json.loads(client.ask_json.call_args_list[0].args[1])['response_schema']
+        self.assertEqual(set(schema['$defs']['InventoriedSource']['properties']['document_record']['enum']),
+            {str(original), source_ref['document_record']})
+        self.assertTrue(owner.read_json('selection-steps/1/response-error.json')['correction_allowed'])
+        client.ask_json.reset_mock()
+        replay, _ = writing._select_materials(request, owner, 'source-roles', client,
+            '', None, document_work=True)
+        self.assertEqual(replay, selected)
+        client.ask_json.assert_not_called()
+        # A saved historical decision is not reinterpreted or corrected under
+        # the new finite-choice schema, even when it contains the old failure.
+        binding = owner.read_json('selection-input.json')
+        owner.write_json('selection-input.json', {**binding, 'selection_validation': 'observed_windows.v1'})
+        owner.write_json('selection-response.json', {'sources': [
+            {'document_record': str(script), 'questions': ['Value definition']}]})
+        with self.assertRaisesRegex(ValueError, 'authorized original document bundle'):
+            writing._select_materials(request, owner, 'source-roles', client, '', None, document_work=True)
+        client.ask_json.assert_not_called()
 
     def test_registered_professional_unit_is_delivered_whole_without_repackaging(self):
         from types import SimpleNamespace

@@ -10,7 +10,7 @@ from pathlib import Path
 import re
 from typing import Any, Callable, Iterable, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, create_model, model_validator
 
 from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
 from simple_ar.tools.specs import CommonToolSpec, ToolResult
@@ -3187,12 +3187,28 @@ class WritingToolGateway:
             inputs['figure_selection_contract'] = figure_contract
         from simple_ar.report.review_evidence import CLAIM_ADOPTION_V2, SCOPED_DELIVERY_INSPECTION
         selection_validation = (retained.get('selection_validation') if retained is not None else
-            'observed_windows.v1' if document_work and (self.producer_completion == 'goal_findings.v1'
+            'observed_inputs.v2' if document_work and (self.producer_completion == 'goal_findings.v1'
                 or self.declaration_adoption_contract == CLAIM_ADOPTION_V2) else None)
-        if selection_validation not in {None, 'observed_windows.v1'}:
+        if selection_validation not in {None, 'observed_windows.v1', 'observed_inputs.v2'}:
             raise ValueError('Unknown composition selection validation contract')
         if selection_validation is not None:
             inputs['selection_validation'] = selection_validation
+        if selection_validation == 'observed_inputs.v2':
+            # A source question addresses a retained DocumentBundle, not any
+            # readable file. Bind that finite choice in the response schema
+            # before investigation, so a wrong role is corrected within the
+            # same bounded owner rather than failing after selection commits.
+            # Original code, tables and notes retain the observed-window path;
+            # no guessed conversion or source-provenance promotion occurs.
+            source_paths = tuple(dict.fromkeys(path for row in source_views for path in
+                (row['document_record'], str(self.workspace.resolve(row['document_record'])))))
+            source_model = (create_model('InventoriedSource', __base__=SelectedSource,
+                document_record=(Literal[source_paths], ...)) if source_paths else SelectedSource)
+            selection_model = create_model('Inventoried' + selection_model.__name__, __base__=selection_model,
+                sources=(list[source_model], Field(default_factory=list,
+                    max_length=40 if source_paths else 0,
+                    description='Only listed retained DocumentBundles accept source questions. '
+                        'Ordinary authorized files use inspected material windows; their original bytes and roles are preserved.')))
         unit_contract = (retained.get('producer_unit_contract') if retained is not None else
             'professional_delivery_unit.v1' if adopt_units else None)
         if unit_contract not in {None, 'professional_delivery_unit.v1'}:
@@ -3459,7 +3475,7 @@ class WritingToolGateway:
                 coverage['journal_observations'] = material_seed_coverage(inputs['journal_observations'])
             coverage['inspected_inputs'] = [{'path': row['request']['path'], 'sha256': row['data']['sha256']}
                 for row in observations]
-        sources = [*request.sources, *selected.sources]
+        sources = [*request.sources, *(SelectedSource.model_validate(row.model_dump()) for row in selected.sources)]
         if len(sources) > 40:
             raise ValueError('Selected and explicit sources exceed the composition limit')
         updates = {'materials': [window.model_copy(update={'full_digest': candidates})

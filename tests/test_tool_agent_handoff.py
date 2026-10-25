@@ -10917,8 +10917,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 owner = ArtifactStore(app.session.store.root / 'tools/writing' / identity)
                 if historical:
                     legacy_request = ComposeRequest.model_validate(mixed_request).model_dump()
-                    legacy_request.pop('required_headings')
-                    legacy_request.pop('max_cited_sources')
+                    legacy_request.pop('required_headings', None)
+                    legacy_request.pop('max_cited_sources', None)
                     owner.write_json('selection-input.json', {
                         'request': legacy_request,
                         'inventories': [app.workspace.bind_inventory(materials, identity=identity)]})
