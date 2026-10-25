@@ -413,14 +413,19 @@ class BudgetLedger:
             )
             return max(0, remaining)
 
-    def unknown_dimensions(self) -> tuple[str, ...]:
-        """Return dimensions whose prior consumption cannot be reconciled."""
+    def unknown_dimensions(self, *, unbounded_only: bool = False) -> tuple[str, ...]:
+        """Report unknown consumption, optionally excluding retained finite bounds.
+
+        A bounded unknown charge still appears in ordinary accounting and
+        withholds its full reservation; it does not make capacity unknowable.
+        """
 
         with self._lock:
             dimensions = {
                 dimension
                 for entry in self._entries.values()
                 if entry.status == "unknown"
+                and (not unbounded_only or entry.actual_source != "reservation_bound")
                 for dimension in entry.reserved
                 if dimension not in entry.actual
             }

@@ -88,6 +88,9 @@ class BudgetLedgerTests(unittest.TestCase):
                 self.assertIsNone(ledger.remaining("uncertain"))
                 self.assertIsNone(ledger.remaining("unlimited"))
                 self.assertIsNone(ledger.remaining("unconfigured"))
+                self.assertIn('bounded', ledger.unknown_dimensions())
+                self.assertNotIn('bounded', ledger.unknown_dimensions(unbounded_only=True))
+                self.assertIn('uncertain', ledger.unknown_dimensions(unbounded_only=True))
                 # Nested work leaves its own result capacity in addition to
                 # the caller's floor; ordinary scopes keep max-floor semantics.
                 with ledger.protect_remaining({"tokens": 3, "requests": 1}, additional=True):

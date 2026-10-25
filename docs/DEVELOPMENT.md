@@ -151,6 +151,9 @@ decision, except an explicit terminal batch, a finishing owner or caller takeove
 Inspection separately protects its final opinion while gathering; nested floors compose
 on the same ledger. Token forecasts exclude future source growth and cannot guarantee
 completion, especially with uncapped output. Unknown usage never creates capacity.
+Retained finite charge bounds still withhold their full reservation; unrelated bounded
+unknown billing is not unknown capacity. An inspector's own unconfirmed responses or
+source executions remain unavailable for adoption.
 For new publications, approval inventories potential images, while the existing renderer
 records consumed presentation inputs in the byte-bound export manifest. Recovery,
 inspection and delivery check those inputs and their producers. Historical manifests

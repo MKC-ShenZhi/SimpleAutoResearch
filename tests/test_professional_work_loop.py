@@ -1031,10 +1031,41 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(self.app.ledger.to_dict(), ledger)
         self.assertEqual(self.send.call_count, calls)
 
+    def test_bounded_native_retry_keeps_unknown_charge_and_can_review_then_deliver(self):
+        from dataclasses import replace
+        from simple_ar.integrations.llm import LLMStreamError
+        self.services.llm_client = LLMClient(replace(self.services.llm_client._settings,
+            retry_attempts=2, retry_base_delay_sec=0))
+        self._create()
+        self._write('report.md', 'The sample mean is 2.0 across three supplied observations.\n')
+        self.decisions.extend([
+            _action('inspect_artifacts', goal='Check the claim', targets=['report.md'],
+                evidence=['measurements/observations.csv']),
+            _action('deliver_result', **self._delivery('report.md'))])
+        failed = False
+        def provider(*args, **kwargs):
+            nonlocal failed
+            if not failed:
+                failed = True
+                raise LLMStreamError('Controlled opened stream interrupted before complete tool arguments')
+            return self._provider(*args, **kwargs)
+        self.send.side_effect = provider
+        self._run(should_stop=lambda:False)
+        self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
+        lost, = [entry for entry in self.app.ledger.entries if entry.status=='unknown']
+        self.assertEqual(lost.actual_source, 'reservation_bound')
+        self.assertEqual(lost.actual, {'llm_requests':1})
+        self.assertGreater(lost.reserved['total_tokens'], 2048)
+        self.assertEqual(self._assessment()['verdict'], 'passed')
+        ledger = self.app.ledger.to_dict()
+        self._reload()
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+        self.assertEqual(self.send.call_count, 4)
+
     def test_inspection_low_capacity_still_requires_a_real_terminal_opinion(self):
         # Request pressure, token pressure, and unknown prior usage all use
         # the same owner; none may synthesize a successful assessment.
-        for mode in ('one_request', 'tokens', 'unoffered_read', 'unknown'):
+        for mode in ('one_request', 'tokens', 'unoffered_read', 'unknown', 'bounded_prior'):
             with self.subTest(mode=mode):
                 self.root = self.directory/mode
                 self._create()
@@ -1046,9 +1077,12 @@ class OperationsWorkLoopTests(unittest.TestCase):
                     # Direct operation below has no caller floor; its current
                     # input fits once, not a gathering turn plus final opinion.
                     ledger.limits['total_tokens'] = 5000
-                if mode == 'unknown':
+                if mode in {'unknown','bounded_prior'}:
                     ledger.reserve('lost', {'llm_requests': 1, 'total_tokens': 100})
-                    ledger.mark_unknown('lost', reason='Response unavailable', retain_reservation=True)
+                    ledger.mark_unknown('lost', reason='Response unavailable',
+                        known_actual={'llm_requests':1}, retain_reservation=mode=='bounded_prior')
+                    if mode=='bounded_prior':
+                        ledger.limits['llm_requests'] = 3  # charge + caller floor + opinion
                 before = len(self.inspection_requests)
 
                 def review(view):
@@ -1069,13 +1103,13 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 self.assertFalse(self.transport_errors, self.transport_errors)
                 self.assertEqual(len(self.inspection_requests)-before, 0 if mode=='unknown' else 1)
                 self.assertEqual(result.metadata['assessment']['verdict'],
-                    'needs_revision' if mode in {'one_request', 'tokens'} else 'incomplete')
+                    'needs_revision' if mode in {'one_request', 'tokens','bounded_prior'} else 'incomplete')
                 self.assertFalse(self._process_receipts())
                 if mode == 'unoffered_read':
                     identity = Path(result.data['record']).parts[1]
                     trace = self.app.session.store.read_json(f'tools/inspection/{identity}/sources-0.json')
                     self.assertEqual(trace['results'], [])
-                if mode == 'unknown':
+                if mode in {'unknown','bounded_prior'}:
                     self.assertEqual(ledger.entries[0].status, 'unknown')
 
     def test_inspector_rejected_native_batches_reply_without_executing_and_can_recover(self):
