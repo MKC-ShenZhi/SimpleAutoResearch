@@ -88,6 +88,14 @@ class BudgetLedgerTests(unittest.TestCase):
                 self.assertIsNone(ledger.remaining("uncertain"))
                 self.assertIsNone(ledger.remaining("unlimited"))
                 self.assertIsNone(ledger.remaining("unconfigured"))
+                # Nested work leaves its own result capacity in addition to
+                # the caller's floor; ordinary scopes keep max-floor semantics.
+                with ledger.protect_remaining({"tokens": 3, "requests": 1}, additional=True):
+                    self.assertEqual(ledger.remaining("tokens"), 13)
+                    self.assertEqual(ledger.remaining("requests"), 1)
+                    self.assertEqual(ledger.to_dict(), baseline)
+                self.assertEqual(ledger.remaining("tokens"), 16)
+                self.assertEqual(ledger.remaining("requests"), 2)
                 self.assertIs(ledger.reserve("seed", {"tokens": 4, "requests": 1}), seed)
                 with self.assertRaises(BudgetUnknownError):
                     ledger.reserve("unknown-retry", {"uncertain": 1})

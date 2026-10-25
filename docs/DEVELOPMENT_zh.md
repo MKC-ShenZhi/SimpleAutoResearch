@@ -113,6 +113,9 @@ ResearchApplication 已被删除。`research-brief` 仍是 `research-session`
 新原生任务使用 `available_operations.v1`：在实际预算、尝试数和审批限制内保留可用操作，
 不强制最后一次可负担决策只能终结任务，允许保留有用的中间工作。
 只有显式且校验通过的交付才完成请求；耗尽保留工作，不宣告成功。
+工具执行时为上层下一次决定保留预估容量，显式终结批次、可直接交付的负责人和调用方接管除外。
+检查者取材时另保留最终意见的容量，嵌套保护沿同一账本叠加。预估不能预知后续原文增长，
+尤其在不设输出上限时不能保证完成；未知用量不能被解释为新增可用容量。
 历史 `protected_decision.v1`、`closing_decision.v2` 和无策略任务保留已保存行为。
 策略细节见[预算所有者](../src/simple_ar/core/budget.py)和[配置参考](CONFIG_REFERENCE_zh.md)。
 

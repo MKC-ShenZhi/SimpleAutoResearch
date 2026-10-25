@@ -26,7 +26,7 @@ from unittest.mock import patch
 from simple_ar.app.tool_application import ToolApplication
 from simple_ar.core.assessments import ArtifactAssessment
 from simple_ar.integrations.llm import LLMClient, LLMSettings
-from simple_ar.tools.specs import ToolCall
+from simple_ar.tools.specs import ToolCall, ToolResult
 
 
 # A real, dependency-free calculation and raster chart, not prepared output bytes.
@@ -935,6 +935,86 @@ class OperationsWorkLoopTests(unittest.TestCase):
         for path,raw in originals.items():
             path.write_bytes(raw)
         self.assertEqual(self._versions(self.inputs),originals)
+
+    def test_inspection_finishes_within_shared_capacity_and_returns_to_ordinary_delivery(self):
+        self._create()
+        self._write('report.md', 'The sample mean is 2.0 across three supplied observations.\n')
+        self.app.ledger.limits['llm_requests'] = 7
+        originals = self._versions(self.inputs)
+        old_entries = [entry.to_dict() for entry in self.app.ledger.entries]
+
+        def review(view):
+            offered = {row['function']['name'] for row in self.inspection_requests[-1]['tools']}
+            if offered == {'record_inspection'}:
+                self.assertEqual(len(self.inspection_requests), 5)
+                self.assertEqual(self.app.ledger.remaining('llm_requests'), 0)
+                return {'findings': [], 'limitations': ['Only supplied observations support this claim.']}
+            return [_action('read_file', path='measurements/conditions.txt')]
+
+        self.review = review
+        self.decisions.extend([
+            _action('inspect_artifacts', goal='Check the mean and disclose scope.', targets=['report.md'],
+                evidence=['measurements/observations.csv']),
+            _action('deliver_result', **self._delivery('report.md'))])
+        self._run(should_stop=lambda: False)
+        self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
+        self.assertEqual(self.send.call_count, 7)
+        self.assertEqual(self._assessment()['verdict'], 'passed')
+        self.assertEqual(self.app.ledger.remaining('llm_requests'), 0)
+        self.assertFalse(self.app.ledger.over_limit())
+        self.assertEqual([entry.to_dict() for entry in self.app.ledger.entries][:len(old_entries)], old_entries)
+        self.assertEqual(self._versions(self.inputs), originals)
+        calls, ledger = self.send.call_count, self.app.ledger.to_dict()
+        self._reload()
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+        self.assertEqual(self.send.call_count, calls)
+
+    def test_inspection_low_capacity_still_requires_a_real_terminal_opinion(self):
+        # Request pressure, token pressure, and unknown prior usage all use
+        # the same owner; none may synthesize a successful assessment.
+        for mode in ('one_request', 'tokens', 'unoffered_read', 'unknown'):
+            with self.subTest(mode=mode):
+                self.root = self.directory/mode
+                self._create()
+                self._write('report.md', 'The sample mean is 2.0.\n')
+                ledger = self.app.ledger
+                if mode in {'one_request', 'unoffered_read'}:
+                    ledger.limits['llm_requests'] = 2  # caller floor + final opinion
+                if mode == 'tokens':
+                    # Direct operation below has no caller floor; its current
+                    # input fits once, not a gathering turn plus final opinion.
+                    ledger.limits['total_tokens'] = 5000
+                if mode == 'unknown':
+                    ledger.reserve('lost', {'llm_requests': 1, 'total_tokens': 100})
+                    ledger.mark_unknown('lost', reason='Response unavailable', retain_reservation=True)
+                before = len(self.inspection_requests)
+
+                def review(view):
+                    self.assertEqual({row['function']['name'] for row in
+                        self.inspection_requests[-1]['tools']}, {'record_inspection'})
+                    if mode == 'unoffered_read':
+                        return [_action('read_file', path='measurements/conditions.txt')]
+                    return {'findings': [{'subject': 'target-1', 'severity': 'required',
+                        'message': 'The necessary source comparison has not been established.'}],
+                        'limitations': ['Source gathering ended at the available capacity.']}
+
+                self.review = review
+                if mode == 'tokens':
+                    result = self.app.operations.inspection.call('inspect_artifacts', {
+                        'goal': 'Check the claim', 'targets': ['report.md'], 'evidence': []}, 'limited')
+                else:
+                    result = ToolResult.model_validate(self._inspect(['report.md'], []))
+                self.assertFalse(self.transport_errors, self.transport_errors)
+                self.assertEqual(len(self.inspection_requests)-before, 0 if mode=='unknown' else 1)
+                self.assertEqual(result.metadata['assessment']['verdict'],
+                    'needs_revision' if mode in {'one_request', 'tokens'} else 'incomplete')
+                self.assertFalse(self._process_receipts())
+                if mode == 'unoffered_read':
+                    identity = Path(result.data['record']).parts[1]
+                    trace = self.app.session.store.read_json(f'tools/inspection/{identity}/sources-0.json')
+                    self.assertEqual(trace['results'], [])
+                if mode == 'unknown':
+                    self.assertEqual(ledger.entries[0].status, 'unknown')
 
     def test_inspector_rejected_native_batches_reply_without_executing_and_can_recover(self):
         final = _action('record_inspection', findings=[], limitations=[])

@@ -125,10 +125,13 @@ class BudgetLedger:
         self._remaining_protections: dict[object, dict[str, BudgetNumber]] = {}
 
     @contextmanager
-    def protect_remaining(self, amounts: Mapping[str, BudgetNumber]) -> Iterator[None]:
+    def protect_remaining(self, amounts: Mapping[str, BudgetNumber], *,
+                          additional: bool = False) -> Iterator[None]:
         """Temporarily withhold capacity from new reservations on this ledger.
 
         Active scopes protect the maximum requested floor per dimension.
+        An additional scope leaves its own capacity on top of active floors,
+        for nested work that must return a result to its caller.
         Floors are in-memory only: they neither grant capacity nor change
         accounting, unknown consumption, or unlimited dimensions. The lock
         guards scope changes, not the caller's entire context body.
@@ -137,6 +140,9 @@ class BudgetLedger:
         normalized = _normalize_amounts(amounts, field="protection")
         token = object()
         with self._lock:
+            if additional:
+                normalized = {key: value + self._remaining_floor(key)
+                              for key, value in normalized.items()}
             self._remaining_protections[token] = normalized
         try:
             yield

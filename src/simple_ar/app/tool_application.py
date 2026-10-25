@@ -2223,8 +2223,10 @@ class ToolApplication:
                 + estimate_tokens(json.dumps(self.schemas if schemas is None else schemas, ensure_ascii=False))
                 + (client.effective_output_limit() or 0))
 
-    def _completion_floor(self, client: Any, messages: list | None = None) -> dict[str, int]:
-        if client is None or self.state['config'].get('completion_policy') not in _COMPLETION_POLICIES:
+    def _completion_floor(self, client: Any, messages: list | None = None, *,
+                          dispatch: bool = False) -> dict[str, int]:
+        policies = _COMPLETION_POLICIES | ({_OPERATION_COMPLETION} if dispatch else set())
+        if client is None or self.state['config'].get('completion_policy') not in policies:
             return {}
         if messages is None and self.state['turns']:
             # Reuse this decision's recorded reservation estimate instead of
@@ -3531,7 +3533,8 @@ class ToolApplication:
             # A domain's explicit terminal operation already owns its actual
             # result and delivery gate (e.g. final review/export). It needs no
             # subsequent model decision, unlike an ordinary professional call.
-            floor = {} if self._terminal_batch() or self._owner_finishes_request(call) else self._completion_floor(client)
+            floor = ({} if self._terminal_batch() or self._owner_finishes_request(call)
+                or self._caller_takeover() else self._completion_floor(client, dispatch=True))
             if terminal_error:
                 result = ToolResult(tool_name=call['function']['name'], status='blocked',
                     error=terminal_error, data={'executed': False})

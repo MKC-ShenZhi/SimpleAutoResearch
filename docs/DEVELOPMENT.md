@@ -146,7 +146,12 @@ New native tasks use `available_operations.v1`: operations remain available with
 actual budget, attempt and approval limits. The last affordable decision is not
 forced into a terminal-only reply; useful intermediate work can be retained.
 Only explicit, validated delivery completes a request; exhaustion preserves work
-without declaring success. Historical `protected_decision.v1`, `closing_decision.v2` and no-policy tasks
+without declaring success. Tool dispatch withholds estimated capacity for the caller's next
+decision, except an explicit terminal batch, a finishing owner or caller takeover.
+Inspection separately protects its final opinion while gathering; nested floors compose
+on the same ledger. Token forecasts exclude future source growth and cannot guarantee
+completion, especially with uncapped output. Unknown usage never creates capacity.
+Historical `protected_decision.v1`, `closing_decision.v2` and no-policy tasks
 retain their saved behavior. See [budget ownership](../src/simple_ar/core/budget.py)
 and [configuration](CONFIG_REFERENCE.md) for policy details.
 

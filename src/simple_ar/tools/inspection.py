@@ -10,6 +10,7 @@ from typing import Any, Callable, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from simple_ar.core.capabilities import ArtifactStore
+from simple_ar.integrations.llm import estimate_tokens
 from simple_ar.tools.specs import CommonToolSpec, ToolResult
 from simple_ar.tools.workspace import FileWindow, workspace_tool_specs
 
@@ -373,15 +374,33 @@ class InspectionToolGateway:
         messages = [{'role':'system','content':_SYSTEM},
                     {'role':'user','content':json.dumps(self._view(saved,request),ensure_ascii=False)}]
         turn = getattr(client,'tool_turn',None) or client.chat_turn
+        ledger = self.workspace.ledger
+        finish = {'role':'user','content':
+            'Source gathering has ended; no additional reads will execute. Submit record_inspection now. '
+            'For necessary claims not supported by the observed evidence, record concrete required '
+            'findings; disclose other remaining scope in limitations. Do not claim unread sources were checked.'}
+        def tokens(history: list, offered: list) -> int:
+            return (estimate_tokens(json.dumps(history,ensure_ascii=False))
+                + estimate_tokens(json.dumps(offered,ensure_ascii=False))
+                + (client.effective_output_limit() or 0))
         for number in range(7):
             label = f'inspect-artifacts-{identity}' + (f'-sources-{number}' if number else '')
-            if number==6:
-                messages.append({'role':'user','content':
-                    'Source gathering has ended; no additional reads will execute. Submit record_inspection now. '
-                    'For necessary claims not supported by the observed evidence, record concrete required '
-                    'findings; disclose other remaining scope in limitations. Do not claim unread sources were checked.'})
-            response = turn(messages,tools=[*tools,terminal] if number<6 else [terminal],
-                label=label,budget_call_id=label)
+            if {'llm_requests','total_tokens'}.intersection(ledger.unknown_dimensions()):
+                raise ValueError('Inspection capacity is unknown; retain records without further requests')
+            # The caller's floor is already withheld by this same ledger. Own
+            # the final opinion as well: a gathering call (including retries)
+            # may not spend that capacity. Source results and uncapped output
+            # can grow beyond estimates; a floor is not a completion promise.
+            final_tokens = tokens([*messages,finish],[terminal])
+            slots, capacity = ledger.remaining('llm_requests'), ledger.remaining('total_tokens')
+            terminal_only = (number==6 or slots is not None and slots<2
+                or capacity is not None and capacity<final_tokens+tokens(messages,[*tools,terminal]))
+            if terminal_only:
+                messages.append(finish)
+            with ledger.protect_remaining({} if terminal_only else
+                    {'llm_requests':1,'total_tokens':final_tokens},additional=True):
+                response = turn(messages,tools=[terminal] if terminal_only else [*tools,terminal],
+                    label=label,budget_call_id=label)
             trace = self._path(identity,f'sources-{number}')
             results = []
             self.store.write_json(trace,{'response':response,'usage':self._usage(identity),'results':results})
@@ -419,7 +438,7 @@ class InspectionToolGateway:
                     return _Response.model_validate(parsed[0][1]).model_dump(mode='json')
             except (ValueError,KeyError,TypeError) as exc:
                 batch_error = str(exc)
-            if number==6:
+            if terminal_only:
                 raise ValueError('Inspection source investigation bound reached; retain source reads and disclose incomplete scope')
             if not calls:
                 messages.append({'role':'user','content':
