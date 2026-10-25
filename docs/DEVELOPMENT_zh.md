@@ -48,7 +48,7 @@ uv run simple-ar-checks --list
 结构化输入提供领域合同，不另建调度器，也不授予权限。
 
 ```text
-新任务 → ToolApplication → CommonToolGateway → 专业工具
+新任务 → ToolApplication 行动循环 → OperationTools → 独立操作
 显式兼容 API / 已保存的 ResearchApplication 会话
        → ResearchApplication → 类型化能力
 共享   → SessionController、产物、预算与进程记录
@@ -59,7 +59,10 @@ uv run simple-ar-checks --list
 [共同研究创建](../src/simple_ar/app/research_intake.py)、
 [ToolApplication](../src/simple_ar/app/tool_application.py) 和
 [公共工具入口](../src/simple_ar/tools/gateway.py)。
-应用决定跨领域的下一步行动、任务反馈与终态；专业负责人可在授权范围内完成有界的调查、实施、修复与核查，不需要应用逐文件接线。
+新任务使用 `operations.v1`：调查、编辑、执行、检查与出版可独立调用，不再由隐式专业接力决定阶段顺序。
+`OperationTools` 只组装工具注册，不运行另一套调度。检查负责绑定实际版本的意见，出版负责渲染与导出归属；正式交付声明稿件与所需格式。
+显式指定的代码范围、验证器和测量合同仍由原执行负责人约束，不能用通用操作绕过。
+没有该协议的历史原生任务继续按保存的专业控制恢复。Python 中显式传 `control_protocol=None` 用于兼容集成，普通新任务使用新默认值；不要修改旧任务文件强行升级。
 core 保留实际发生的事实，包括尝试、产物、资源消耗与进程结果；专业工作仍使用同一执行与记录基础。
 
 新原生任务展示工作区工具和获授权的能力目录，`load_tools` 经同一注册器
@@ -94,10 +97,10 @@ ResearchApplication 已被删除。`research-brief` 仍是 `research-session`
 行动状态归应用，执行事实归共享账本；专业内部模型调用、重试与工作使用同一计量，
 不增加平行任务状态、费用计数器或全局调度器。
 
-新原生任务在共享预算中保护实际可承担的后续决策机会（`protected_decision.v1`），
-它不是额外费用或额度。已接受的本地工作仍受实际预算、尝试数和审批限制。
+新原生任务使用 `available_operations.v1`：在实际预算、尝试数和审批限制内保留可用操作，
+不强制最后一次可负担决策只能终结任务，允许保留有用的中间工作。
 只有显式且校验通过的交付才完成请求；耗尽保留工作，不宣告成功。
-历史 `closing_decision.v2` 和无策略任务保留已保存行为。
+历史 `protected_decision.v1`、`closing_decision.v2` 和无策略任务保留已保存行为。
 策略细节见[预算所有者](../src/simple_ar/core/budget.py)和[配置参考](CONFIG_REFERENCE_zh.md)。
 
 ### 增加或调整能力

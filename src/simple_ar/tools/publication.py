@@ -45,7 +45,7 @@ class PublicationChecks(BaseModel):
         return self
 
 
-class ExportRequest(BaseModel):
+class PublicationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     markdown: str = Field(description="Workspace Markdown file; local figures and references.bib use its directory.")
     title: str = Field(default="", max_length=500)
@@ -61,15 +61,8 @@ class ExportRequest(BaseModel):
         description="Explicitly render every compiled PDF page with Poppler: at most 12 pages, 120 DPI scaled to a maximum 1600 pixels per dimension. Requires compile_pdf=true. Returns PNG locators for optional inspect_images; rendering is not visual review. Incomplete previews prevent delivery. False preserves historical request bindings.")
     delivery: DeliveryRequest | None = Field(default=None,
         description="Optional explicit final delivery after successful export/compilation. Exported files are added automatically; artifacts selects other already-existing outputs or retained task evidence. Disclose unresolved work. This does not certify scientific or visual quality. Request this operation alone when delivering.")
-    candidate_result: str = Field(default='', max_length=500, exclude_if=lambda value: not value,
-        description='Same-task complete writing-work receipt to prepare for independent publication inspection. '
-            'The writing owner proves candidate provenance and presentation bindings. '
-            'This operation cannot adopt a manuscript or make a final delivery.')
-
     @model_validator(mode="after")
-    def validate_preview(self) -> ExportRequest:
-        if self.candidate_result and self.delivery is not None:
-            raise ValueError('Candidate preparation has no final delivery authority')
+    def validate_preview(self) -> PublicationRequest:
         if self.render_preview and not self.compile_pdf:
             raise ValueError("render_preview requires compile_pdf=true")
         if self.checks is not None and not self.compile_pdf:
@@ -77,10 +70,22 @@ class ExportRequest(BaseModel):
         return self
 
 
-def publication_tool_specs() -> list[CommonToolSpec]:
+class ExportRequest(PublicationRequest):
+    """Saved Writer preparation compatibility; ordinary exports use PublicationRequest."""
+    candidate_result: str = Field(default='',max_length=500,exclude_if=lambda value:not value,
+        description='Same-task writing-work receipt for historical prepared-publication control; not final delivery.')
+
+    @model_validator(mode='after')
+    def validate_candidate(self) -> ExportRequest:
+        if self.candidate_result and self.delivery is not None:
+            raise ValueError('Candidate preparation has no final delivery authority')
+        return self
+
+
+def publication_tool_specs(*, preparation: bool = True) -> list[CommonToolSpec]:
     return [CommonToolSpec(name="export_report", domain="publication", permission_level="execution",
         completion={'field': 'delivery', 'closing': True},
-        risk_level="medium", input_schema=ExportRequest.model_json_schema(),
+        risk_level="medium", input_schema=(ExportRequest if preparation else PublicationRequest).model_json_schema(),
         description="Convert canonical workspace Markdown, bibliography and local figures into an editable TeX project using an explicit trusted Pandoc LaTeX template bundle, or ACM by default. Template bytes and companions share existing approval/recovery bindings. No official template discovery, scripts or shell escape; trusted TeX is not sandboxed. Optional finite user-declared checks use Poppler through the same process ledger: all-page count and exact literals in UTF-8 extracted text, separately reported. Literal absence never certifies anonymity; images, metadata and indirect identity are uncovered. Rendering is not scientific, visual or official compliance review. Optional delivery requires every requested check and preview to pass; failure retains the project without revision or recompilation.")]
 
 

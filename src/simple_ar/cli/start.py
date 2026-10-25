@@ -444,7 +444,7 @@ def _quote(value: str) -> str:
 def native_creation_options(args: argparse.Namespace) -> dict:
     """One projection of native creation access, frozen contracts and budgets."""
     from simple_ar.cli.task_options import native_process_limits
-    return dict(model=args.model or None, report_protocol='canonical_report.v1', professional_inputs=True,
+    return dict(model=args.model or None, control_protocol='operations.v1',
         creation_declarations=getattr(args, '_creation_declarations', {}),
         extensions=getattr(args, 'extensions', []),
         context_protocol='conversation.v1',

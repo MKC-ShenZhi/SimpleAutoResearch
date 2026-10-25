@@ -554,15 +554,24 @@ These controls describe the current development implementation. Saved tasks reta
 | `delivery_files=["**/*.md", "**/*.pdf"]` | Require nonempty workspace outputs for an unqualified completed delivery. Relative patterns check presence, not quality; source PDFs do not count. Requirements are explicit, not inferred from prose; disclosed partial delivery remains possible. |
 | `tool_contracts="on_demand"` (default) | Start with workspace tools and a short capability directory; load professional contracts as needed without user workflow selection or tool-loading approval. Permissions and command approvals still apply. Advanced alternatives: `full`, `outcomes`. |
 | `context_protocol="conversation.v1"` (default) | Retain actual read text/write arguments; evict complete oldest turns. Keep the latest complete turn even above the soft `context_input_tokens` target, record the overrun and enforce the remaining total allowance. The bounded archive index links original records; archived text is not current context, and old observations are not fresh reads. Missing markers or explicit `None` retain the original projection. |
-| `completion_policy="closing_decision.v2"` (default) | The last affordable decision offers direct delivery, a question, or loaded final operations requiring delivery; no operation needing another model call. A new closing reply has one terminal action. Saved replies keep their admission contract; missing/older policies, including `protected_decision.v1`, retain their behavior. Incomplete work stays explicit. |
-| `report_protocol="canonical_report.v1"` | CLI/UI and `create_research_task` use the versioned report contract. Direct `ToolApplication.create` callers opt in; omission keeps the earlier low-level contract. |
-| `professional_inputs=True` | With the report protocol, let the writing owner select evidence from the saved request and authorized roots. CLI/UI and `create_research_task` material reports use this behavior. Explicit expert calls and saved requests retain their input contracts. |
+| `control_protocol="operations.v1"` (default) | Ordinary `start`, structured intake and the creation API combine independent read/write, execution, inspection and publication operations in one action loop. No compulsory professional handoff or Writer adoption stage. Saved tasks are not migrated. Explicit `None` selects compatibility integration. |
+| `completion_policy="available_operations.v1"` (new operations tasks) | Keep operations available within actual resource and approval limits. A last affordable decision may retain useful nonterminal work. Exhaustion pauses with retained outputs; only an explicit validated delivery completes a request. Compatibility creation and saved tasks retain their closing/protected decision policies. |
+| `report={"status":"canonical","manuscript":"report.md","formats":["markdown","pdf"]}` | A delivery identifies its editable manuscript and requested formats. Completed delivery requires an independent inspection of the current manuscript and matching publication when requested; file existence alone is insufficient. |
+| `limitations` / `unresolved` in delivery | Limitations describe bounded research uncertainty or unavailable measurements. Unresolved requested work or required defects make the delivery partial. Neither permits a false quality claim. |
 | `create_research_task(..., allow_vision=True)` | Strict boolean, default `False`. Requires the named vision route and connection; shares `services.budget_limits`. Neither prose nor an injected text client grants inspection. Grants no source network or image generation and changes neither saved permissions nor the return type. |
 | `supply(..., replace_existing=True)` | Caller can explicitly replace `delivery_files`, `tool_contracts` or `completion_policy`. Unrelated supply preserves saved policy and ledger. |
 
-Tool loading and closing decisions do not guarantee completion, scientific quality or a particular cost. See [task budgets and evidence](EVALUATION.md#v210-development-evidence) before sizing a long report.
+`inspect_artifacts` independently reads selected targets and evidence, recording file versions, coverage, required findings and limitations. Editing a target invalidates its previous pass. Changing evidence cannot erase a still-current required finding. `inspect_images` separately requires authorization and a named vision route. Text inspection and successful compilation do not certify visual or scientific correctness.
 
-### Writing, output binding and retained work
+Budgeted image inspection requires an explicit `max_output_tokens` in the vision profile. Choose enough capacity for both reasoning and the review response; this setting is separate from the text profile, which can remain uncapped. See the [model catalog example](../examples/model-profiles/models.toml).
+
+A frozen `report_requirement` still requires a manuscript claim, its fixed outline and citation ceiling. New tasks use independent operations rather than the legacy Writer's draft/review scheduling settings; `target_words` is a writing target, not a mechanically certified minimum.
+
+Tool loading and resource policies do not guarantee completion, scientific quality or a particular cost. See [task budgets and evidence](EVALUATION.md#v210-development-evidence) before sizing a long report.
+
+### Historical writing contracts, output binding and retained work
+
+The `compose_document` options below apply to explicit compatibility integrations and saved professional tasks. New `operations.v1` tasks edit their manuscript directly, inspect the current version and export it; they do not use `report_protocol`, `professional_inputs` or `update_work_plan.report_intent`. Historical writing remains executable on its original ledger.
 
 | Operation / field | Contract |
 | --- | --- |

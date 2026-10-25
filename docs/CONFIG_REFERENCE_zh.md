@@ -595,15 +595,24 @@ app = create_research_task(ResearchBrief(request_text="测量所提供的程序�
 | `delivery_files=["**/*.md", "**/*.pdf"]` | 无保留的完成交付须有非空工作区输出。相对模式只查存在，不认证质量，来源 PDF 不算输出；要求须明确声明，不从文字推导，仍可明确交付部分成果。 |
 | `tool_contracts="on_demand"`（默认） | 先提供工作区工具和简短能力目录，按需加载专业契约，用户无需选工作流或批准加载。权限及命令审批仍适用；高级选项为 `full`、`outcomes`。 |
 | `context_protocol="conversation.v1"`（默认） | 保留真实读取正文和写入参数，按完整轮次移出最旧对话。最近完整轮次可超过 `context_input_tokens` 软目标，记录超出并遵守剩余总额度。有界归档索引链接原记录；归档正文不算当前上下文，旧观察不算新读取。缺标记或显式 `None` 保留原投影。 |
-| `completion_policy="closing_decision.v2"`（默认） | 最后可负担决策只提供交付、询问或已加载且须附交付的末次操作，不提供需再调用模型的操作；新末次响应只有一个终结动作。已保存响应保留原准入合同；缺字段和旧策略（含 `protected_decision.v1`）保留原行为，未完成项须明确。 |
-| `report_protocol="canonical_report.v1"` | CLI/UI 及 `create_research_task` 使用版本化报告合同；直接 `ToolApplication.create` 须显式启用，省略保留原低层合同。 |
-| `professional_inputs=True` | 配合报告协议，由写作模块从保存的请求和授权目录选材。CLI/UI 及 `create_research_task` 材料报告使用此行为，显式专家调用及已存请求保留原输入合同。 |
+| `control_protocol="operations.v1"`（默认） | 普通 `start`、结构化入口和创建 API 在同一行动循环中组合读写、执行、检查与出版，不强制专业接力或 Writer 采用阶段。保存任务不迁移；显式 `None` 选择兼容路径。 |
+| `completion_policy="available_operations.v1"`（新操作任务） | 在实际资源与审批限制内保留可用操作，最后一次可负担决策也能留下有用的中间工作。耗尽暂停并保留成果；只有显式且校验通过的交付才算完成。兼容创建和保存任务保留原末次／保护决策策略。 |
+| `report={"status":"canonical","manuscript":"report.md","formats":["markdown","pdf"]}` | 交付声明可编辑正文及所需格式；完整交付须有当前正文的独立检查，以及需要时与其匹配的出版物，文件存在不足以证明完成。 |
+| 交付中的 `limitations`／`unresolved` | 前者说明研究范围、不确定性或不可得测量；后者说明尚未完成的请求或必改缺陷，并使交付为部分完成。都不能用于虚报质量。 |
 | `create_research_task(..., allow_vision=True)` | 严格布尔值，默认 `False`；须有命名 vision 路由及连接，共用 `services.budget_limits`。文字或注入文本客户端不授权视觉检查；不授予来源联网、图像生成，不改旧权限或返回类型。 |
 | `supply(..., replace_existing=True)` | 调用方可明确替换 `delivery_files`、`tool_contracts` 或 `completion_policy`；无关补齐保留策略及账本。 |
 
-工具加载与末次决策不保证完成、科学质量或特定成本。为长报告定额度前，先看[任务预算与证据](EVALUATION_zh.md#v210-开发证据)。
+`inspect_artifacts` 独立读取指定正文与依据，记录文件版本、覆盖范围、必改意见和局限。目标变化使原通过失效；只改依据不能抹去仍然有效的必改意见。`inspect_images` 是另行授权、使用命名视觉连接的操作。文本检查或编译成功都不认证视觉与科学正确性。
 
-### 写作、输出绑定与保留成果
+预算化图像检查须在视觉 profile 中明确配置 `max_output_tokens`，并为推理和实际检查响应共同留出容量；它与文本 profile 分开，文本仍可不设输出上限。参见[模型目录示例](../examples/model-profiles/models.toml)。
+
+冻结的 `report_requirement` 仍要求明确正文、固定章节和引用上限。新任务通过独立操作完成工作，不使用旧 Writer 的起草／审阅调度设置；`target_words` 是写作目标，不是机械认证的最低字数。
+
+工具加载与资源策略不保证完成、科学质量或特定成本。为长报告定额度前，先看[任务预算与证据](EVALUATION_zh.md#v210-开发证据)。
+
+### 历史写作合同、输出绑定与保留成果
+
+下表的 `compose_document` 选项用于显式兼容集成和保存的专业任务。新的 `operations.v1` 任务直接编辑正文、检查当前版本并导出，不使用 `report_protocol`、`professional_inputs` 或 `update_work_plan.report_intent`；历史写作仍可沿原账本执行恢复。
 
 | 操作／字段 | 合同 |
 | --- | --- |

@@ -48,7 +48,7 @@ class ImplementationDecisionTests(unittest.TestCase):
         return ToolApplication.create(self.base / name, 'Implement from the authorized original inputs',
             model='fixture', sources=sources or {}, services=self.services,
             professional_inputs=True, allow_execution=True, max_turns=12, max_tokens=600000,
-            process_limits={'process_invocations': 3, 'process_wall_seconds': 30})
+            process_limits={'process_invocations': 3, 'process_wall_seconds': 30}, control_protocol=None)
 
     @staticmethod
     def _observations(app):

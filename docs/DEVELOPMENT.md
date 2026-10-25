@@ -50,7 +50,7 @@ backbone. Structured inputs supply domain contracts; they do not create a separa
 scheduler or grant permissions.
 
 ```text
-New tasks → ToolApplication → CommonToolGateway → professional tools
+New tasks → ToolApplication action loop → OperationTools → independent operations
 Explicit compatibility APIs / saved ResearchApplication sessions
           → ResearchApplication → typed capabilities
 Shared    → SessionController, artifacts, budget and process records
@@ -62,7 +62,15 @@ Read [CLI dispatch](../src/simple_ar/cli/main.py),
 [ToolApplication](../src/simple_ar/app/tool_application.py) and
 [the gateway](../src/simple_ar/tools/gateway.py) in that order for a new-task change.
 The application owns cross-domain decisions, task feedback and terminal state.
-Professional owners perform bounded investigation, implementation, repair and checks without coordinator-side file-by-file wiring.
+New tasks use `operations.v1`: investigation, editing, execution, inspection and
+publication are independently callable, rather than stages of an implicit handoff.
+`OperationTools` composes the registry; it does not run another scheduler. Inspection
+owns version-bound findings and publication owns rendering and export provenance.
+Formal delivery declares its manuscript and requested formats. Fixed code and
+measurement contracts remain enforced by their original execution owners.
+Historical native tasks without this protocol retain their saved professional
+control. Explicit `control_protocol=None` in Python is compatibility integration;
+ordinary new tasks use the new default. Never edit a saved task to upgrade it.
 Core retains attempts, artifacts, resource usage and process results through the same shared execution and records.
 
 New native tasks expose workspace tools and an authorized capability catalog;
@@ -104,11 +112,11 @@ Keep action state in the application and execution facts in the shared ledger.
 Nested model calls, retries and professional work use that same accounting;
 do not add parallel task state, fee counters or global schedulers.
 
-New native tasks protect an affordable follow-up decision in the shared budget
-(`protected_decision.v1`). This temporary spending floor is not an extra charge or allowance.
-Accepted local work remains subject to actual budget, attempt and approval limits.
+New native tasks use `available_operations.v1`: operations remain available within
+actual budget, attempt and approval limits. The last affordable decision is not
+forced into a terminal-only reply; useful intermediate work can be retained.
 Only explicit, validated delivery completes a request; exhaustion preserves work
-without declaring success. Historical `closing_decision.v2` and no-policy tasks
+without declaring success. Historical `protected_decision.v1`, `closing_decision.v2` and no-policy tasks
 retain their saved behavior. See [budget ownership](../src/simple_ar/core/budget.py)
 and [configuration](CONFIG_REFERENCE.md) for policy details.
 

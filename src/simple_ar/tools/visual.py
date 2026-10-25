@@ -76,7 +76,10 @@ class VisualToolGateway:
             return ToolResult(tool_name=name, status="error",
                 data={"transport_diagnostics": exc.public_diagnostics()}
                     if isinstance(exc, LLMDeadlineError) and exc.public_diagnostics() else
-                    {"response_status": "rejected"} if isinstance(exc, LLMResponseError) else {},
+                    {"response_status": "rejected", "finish_reason": exc.finish_reason,
+                     "correction_allowed": exc.correction_allowed,
+                     "records": f"workspace/visual-reviews/{identity}"}
+                    if isinstance(exc, LLMResponseError) else {},
                 error="Visual review response rejected; inspect saved records. No automatic replay." if isinstance(exc, LLMResponseError) else
                     str(exc) if isinstance(exc, LLMImageInputError) else
                     f"Visual inspection unavailable ({type(exc).__name__}); inspect saved records and named vision route. No fallback to text.")

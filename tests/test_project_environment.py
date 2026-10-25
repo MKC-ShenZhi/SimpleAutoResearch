@@ -155,15 +155,15 @@ class ProjectEnvironmentTests(unittest.TestCase):
                 self.assertEqual(len(app.ledger.entries), 2)
                 observations = [app.session.store.read_json(item['result'])
                     for turn in app.state['turns'] for item in turn['tools']]
-                self.assertEqual([row['tool_name'] for row in observations],
-                    ['update_work_plan', 'measure_experiment'])
                 self.assertTrue(all(row['status'] == 'ok' for row in observations), observations)
-                self.assertEqual(observations[0]['data']['report_intent']['kind'], 'none')
-                attempts = app.session.list_attempts()
-                self.assertEqual([row.capability for row in attempts], ['native_tool', 'native_tool'])
-                observed = observations[1]
+                # Environment preparation and measurement share the original
+                # execution owner, independently of optional planning tools.
+                measurements = [row for row in observations if row['tool_name'] == 'measure_experiment']
+                self.assertEqual(len(measurements), 1)
+                observed = measurements[0]
                 canonical = app.workspace.resolve(observed['data']['result_ref'])
-                self.assertEqual(canonical.parent.name, attempts[1].attempt_id)
+                attempts = {row.attempt_id: row for row in app.session.list_attempts()}
+                self.assertEqual(attempts[canonical.parent.name].capability, 'native_tool')
                 self.assertEqual({entry.attempt_id for entry in app.ledger.entries}, {canonical.parent.name})
                 measured = json.loads(canonical.read_text(encoding='utf-8'))
                 self.assertEqual(measured['metrics'], {'score': 0.5})

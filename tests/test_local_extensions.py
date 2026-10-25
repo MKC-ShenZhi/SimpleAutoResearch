@@ -198,7 +198,7 @@ type = "object"
                 'def finish_note(arguments, services):\n    return {"handoff": arguments["handoff"]}\n',
                 encoding='utf-8')
             app = ToolApplication.create(root / 'task', 'Deliver the explicit note', model=None,
-                sources={}, extensions=[package], tool_contracts='full')
+                sources={}, extensions=[package], tool_contracts='full', control_protocol=None)
             name = 'research_note__finish_note'
             frozen = app.state['config']['tool_completions'].copy()
             self.assertEqual(frozen[name]['field'], 'handoff')
@@ -257,7 +257,7 @@ type = "object"
             (project / 'observations.txt').write_text('accuracy = 0.91\nlatency = 0.42\n', encoding='utf-8')
             app = ToolApplication.create(root / 'task', 'Inspect two different properties', model=None,
                 sources={'source0': project}, extensions=[package],
-                process_limits={'process_invocations': 2, 'process_wall_seconds': 30})
+                process_limits={'process_invocations': 2, 'process_wall_seconds': 30}, control_protocol=None)
             arguments = {'path': 'source0', 'queries': ['accuracy', 'latency']}
             app.run(actions=[{'tool_name': 'local_notes__count_words', 'arguments': arguments}], progress=lambda _: None)
             observed = app.state['turns'][0]['tools'][0]
@@ -291,7 +291,7 @@ type = "object"
             for professional in (False, True):
                 with self.subTest(professional=professional):
                     app = ToolApplication.create(root / str(professional), 'Read two bibliographic entries', model=None,
-                        sources={'source0': project}, extensions=[package], professional_inputs=professional)
+                        sources={'source0': project}, extensions=[package], professional_inputs=professional, control_protocol=None)
                     app.run(actions=[{'tool_name': 'local_notes__count_words', 'arguments': {
                         'path': 'source0/note.txt', 'publication': title, 'complete_work': True}}
                         for title in ('First paper', 'Second paper')], progress=lambda _: None)
@@ -342,7 +342,7 @@ type = "object"
             with patch('simple_ar.app.tool_application.LLMClient.from_env', return_value=fake):
                 app = ToolApplication.create(run_dir, 'Inspect my note with the local notes skill',
                     model='fixture', sources={'source0': project}, professional_inputs=True,
-                    extensions=args.extensions, max_turns=10)
+                    extensions=args.extensions, max_turns=10, control_protocol=None)
                 self.assertEqual(app.gateway.domain_owner('read_file'), app.workspace)
                 self.assertIs(app.gateway.domain_owner(selected[1]), app.extensions[0])
                 self.assertTrue(app.gateway.registry.request_visible(selected[1]))

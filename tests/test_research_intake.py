@@ -177,18 +177,13 @@ class ResearchIntakeTests(unittest.TestCase):
         content = "# Assessment\nCalibration error 0.12 alone cannot establish robustness.\n"
         request = "Assess the observation: calibration error is 0.12."
         # This request asks for an assessment, not a file or formal report.
-        # The request owner resolves intent and directly delivers its answer;
-        # expert-owned file tools and a Writer workflow are unnecessary.
-        first_reply = _reply("update_work_plan", {"report_intent": {
-            "kind": "none", "request_index": 0, "quote": request}})
+        # The common loop can directly deliver this assessment; no compulsory
+        # report-intent declaration or Writer stage is needed.
         final_reply = _reply("deliver_result", {"summary": content,
             "artifacts": [], "unresolved": []})
-        client = _JSONClient([
-            first_reply,
-            final_reply,
-        ])
+        client = _JSONClient([final_reply])
         services = ResearchApplicationServices(llm_client=client,
-            budget_limits={"llm_requests": 2, "total_tokens": 1000000},
+            budget_limits={"llm_requests": 1, "total_tokens": 1000000},
             config={"research_materials_only": True})
         brief = ResearchBrief(request_text=request,
             requested_outputs=("assessment",))
@@ -199,6 +194,8 @@ class ResearchIntakeTests(unittest.TestCase):
             self.assertIsInstance(app, ToolApplication)
             identity = app.session.manifest.session_id
             self.assertEqual(app.session.manifest.transition_recipe, ToolApplication.RECIPE)
+            self.assertEqual(app.state['config']['control_protocol'], 'operations.v1')
+            self.assertIsNone(app.writing)
             self.assertEqual(app.session.manifest.status, "created")
             self.assertEqual(app.session.list_attempts(), ())
             self.assertEqual(client.calls, [])
@@ -213,22 +210,17 @@ class ResearchIntakeTests(unittest.TestCase):
             observations = [resumed.session.store.read_json(item['result'])
                 for turn in resumed.state['turns'] for item in turn['tools']]
             self.assertEqual([row['tool_name'] for row in observations],
-                ['update_work_plan', 'deliver_result'])
+                ['deliver_result'])
             self.assertTrue(all(row['status'] == 'ok' for row in observations), observations)
-            self.assertEqual(observations[0]['data']['report_intent']['kind'], 'none')
             self.assertIsNone(resumed.state['config'].get('report_requirement'))
             self.assertEqual(result["session_id"], identity)
             delivery = json.loads((root / "delivery.json").read_text(encoding="utf-8"))
             self.assertEqual(delivery["summary"], content)
             self.assertEqual(delivery["artifacts"], [])
             self.assertFalse(any((root / 'workspace').iterdir()))
-            self.assertEqual(len(client.calls), 2)
-            tool_messages = [message for message in client.calls[1][1]["messages"]
-                             if message["role"] == "tool"]
-            self.assertTrue(tool_messages)
-            self.assertEqual(json.loads(tool_messages[-1]["content"])["status"], "ok")
+            self.assertEqual(len(client.calls), 1)
             entries = resumed.ledger.entries
-            self.assertEqual(len(entries), 2)
+            self.assertEqual(len(entries), 1)
             attempts = {a.attempt_id: a for a in resumed.session.list_attempts()}
             for entry in entries:
                 self.assertEqual(entry.session_id, identity)
@@ -247,7 +239,7 @@ class ResearchIntakeTests(unittest.TestCase):
             terminal = ToolApplication.load(root, services=services)
             self.assertEqual(terminal.run(progress=lambda _: None)["status"], "completed")
             self.assertEqual(ToolApplication.load(root).run(progress=lambda _: None)["status"], "completed")
-            self.assertEqual(len(client.calls), 2)
+            self.assertEqual(len(client.calls), 1)
             self.assertEqual(tuple(a.attempt_id for a in terminal.session.list_attempts()), attempts_before)
             self.assertEqual((root / "budget_ledger.json").read_bytes(), ledger_before)
 

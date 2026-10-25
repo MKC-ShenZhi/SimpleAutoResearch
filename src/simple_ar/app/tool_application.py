@@ -49,6 +49,7 @@ _TOOL_CONTRACT_MODES = {'full', 'on_demand', 'outcomes'}
 _DEFERRED_WORKSPACE_TOOLS = {'write_file', 'edit_file', 'run_process'}
 # Terminal shape and closing suitability belong to frozen tool contracts.
 _COMPLETION_POLICIES = {'protected_decision.v1', 'closing_decision.v2'}
+_OPERATION_COMPLETION = 'available_operations.v1'
 _REPORT_PROTOCOL = 'canonical_report.v1'
 _OWNERS = 'owners.v1'
 _SHARED_OWNERS = 'owners.v2'
@@ -252,6 +253,13 @@ class _WorkPlanStep(BaseModel):
         return self
 
 
+class _OperationPlan(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    explanation: str = Field(default='',max_length=1200)
+    steps: list[_WorkPlanStep] = Field(min_length=1,max_length=8)
+    evidence_records: list[str] = Field(default_factory=list,max_length=12)
+
+
 class _ReportIntent(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
     request_index: int = Field(ge=0, description='Zero-based index in actual user requests.')
@@ -369,9 +377,74 @@ class ToolApplication:
         controller.registry.register("native_turn", self._model)
         controller.registry.register("native_tool", self._tool)
 
+    def _configure_operations(self) -> None:
+        from simple_ar.app.operation_tools import OperationTools, PROTOCOL
+        config, root = self.state['config'], self.session.store.root
+        if config['control_protocol'] != PROTOCOL:
+            raise ValueError('Unsupported saved operation control protocol')
+        for alias, snapshot in config.get('source_snapshots', {}).items():
+            source = Path(config['sources'][alias])
+            if (not source.is_file() or source.stat().st_size != snapshot['size_bytes']
+                    or hashlib.sha256(source.read_bytes()).hexdigest() != snapshot['sha256']):
+                raise ValueError('Retained source snapshot changed: '+alias)
+        if config.get('professional_work') is not None or config.get('result_investigation') is not None:
+            raise ValueError('Operation control cannot acquire a historical professional controller')
+        coordination = [CommonToolSpec(name='load_tools',domain='coordination',permission_level='plan',
+            input_schema=_ToolSelection.model_json_schema(),
+            description='Load named optional operation contracts for the next decision; does not grant permission.'),
+            CommonToolSpec(name='read_history',domain='coordination',permission_level='read_only',
+                input_schema=_ReadHistory.model_json_schema(),
+                description='Read original closed native observations from this task, with bounded paging; history is not current file state.')]
+        coordination.append(CommonToolSpec(name='update_work_plan',domain='coordination',permission_level='plan',
+            input_schema=_OperationPlan.model_json_schema(),
+            description='Save a concise optional work plan or replace its unexecuted steps after observations. '
+                'No automatic scheduling, permission, evidence or requirement to use a plan. '
+                'Do not declare report_intent; the actual delivery identifies its manuscript.'))
+        self.operations = OperationTools(root=root,config=config,ledger=self.ledger,
+            session_id=self.session.manifest.session_id,
+            client_factory=lambda identity,purpose:self._client(identity,purpose=purpose,native=False),
+            observations=self._operation_observations,
+            record_artifacts=self._record_artifacts,
+            coordination={'specs':coordination,'owner':self},extension_host=self._extension_host_call,
+            search_registry=getattr(self.services,'search_registry',None))
+        self.workspace, self.gateway = self.operations.workspace, self.operations.gateway
+        self.sources, self.publication = self.operations.sources, self.operations.publication
+        self.extensions = self.operations.extensions
+        self.writing = None
+        self.implementation, self.scientific = self.operations.implementation, self.operations.scientific
+
+    def _operation_observations(self) -> list[dict]:
+        from simple_ar.tools.professional_outcomes import accepted_native_result
+        active = {domain: {id(turn) for turn in self._evidence_turns(domain)}
+                  for domain in ('sources', 'analysis', 'scientific', 'implementation')}
+        result = []
+        for turn in self.state['turns']:
+            calls = {call['id']: call for call in
+                     self.session.store.read_json(turn['reply']).get('tool_calls', [])}
+            for item in turn['tools']:
+                observed = self.session.store.read_json(item['result'])
+                if observed.get('status') == 'ok':
+                    accepted_native_result(self.session.store.root,self.session.manifest.session_id,
+                        observed,Path(item['result']).parent.name,ledger=self.ledger)
+                call = calls[item['id']]
+                spec = self.gateway.registry.get(call['function']['name'])
+                try:
+                    arguments = json.loads(call['function']['arguments'])
+                except (ValueError, TypeError):
+                    arguments = {}
+                result.append({**observed, 'record':item['result'], 'arguments':arguments,
+                    'current_request':turn.get('request_count', 1) == len(self.state['requests']),
+                    'contract_current':spec is None or spec.domain not in active
+                        or id(turn) in active[spec.domain]})
+        return result
+
     def _configure_tools(self) -> None:
         controller = self.session
         config = self.state["config"]
+        self.operations = None
+        if config.get('control_protocol') is not None:
+            self._configure_operations()
+            return
         for alias, snapshot in config.get('source_snapshots', {}).items():
             path = Path(config['sources'][alias])
             if (not path.is_file() or path.stat().st_size != snapshot['size_bytes']
@@ -587,6 +660,9 @@ class ToolApplication:
         # Presentation filtering must never mutate the registry's input contract.
         schemas = json.loads(json.dumps(export_openai_tool_schemas(
             self.gateway.registry, read_only_only=False, policy=self.gateway.policy, names=active)))
+        if self.operations is not None:
+            return [{**row, 'function': {**row['function'],
+                'parameters': compact_json_schema(row['function']['parameters'])}} for row in schemas]
         obligation = self._report_projection()
         for row in schemas:
             if (row['function']['name'] in {'compose_document', 'review_document'}
@@ -729,6 +805,8 @@ class ToolApplication:
         """One partition for active schemas and the existing loadable directory."""
         mode = self.state['config'].get('tool_contracts', 'full')
         selected = self._tool_selection() if mode != 'full' else set()
+        if self.operations is not None:
+            return self.operations.presentation(selected, mode)
         active: set[str] = set()
         catalog: dict[str, dict[str, str]] = {}
         for spec in self.gateway.list_specs():
@@ -1091,6 +1169,11 @@ class ToolApplication:
                 return ToolResult(tool_name=name, data=selection.model_dump(),
                     summary='Selected contracts available to the next decision; no professional work or permission change.')
             if name == 'update_work_plan':
+                if self.operations is not None:
+                    plan = _OperationPlan.model_validate(arguments)
+                    return ToolResult(tool_name=name,data={**plan.model_dump(),
+                        'request_count':len(self.state['requests']),'scope':'intention_not_verified_outcome'},
+                        summary='Optional work plan saved; actual observations and authorization remain authoritative.')
                 plan = _WorkPlan.model_validate(arguments)
                 if not plan.steps and plan.report_intent is None:
                     raise ValueError('Provide work steps or an explicit report intent')
@@ -1158,19 +1241,23 @@ class ToolApplication:
                snapshot_sources: bool = False,
                max_snapshot_bytes: int = 16 * 1024 * 1024,
                tool_contracts: Literal['full', 'on_demand', 'outcomes'] = 'on_demand',
-               completion_policy: str = 'closing_decision.v2',
+               completion_policy: str | None = None, control_protocol: str | None = None,
                delivery_files: list[str] | None = None,
                model_catalogs: dict[str, str | None] | None = None,
                extensions: list[Path] | None = None,
                creation_declarations: dict[str, Any] | None = None,
                retained: bool = False) -> tuple[dict[str, Any], list, dict[str, Any], int]:
         """Validate caller contracts before creation or supply; never execute or persist."""
+        if control_protocol not in {None, 'operations.v1'}:
+            raise ValueError('Unsupported operation control protocol')
+        if completion_policy is None:
+            completion_policy = _OPERATION_COMPLETION if control_protocol is not None else 'closing_decision.v2'
         frozen_extensions = freeze_extensions(extensions or [])
         if report_protocol not in {None, _REPORT_PROTOCOL}:
             raise ValueError('Unsupported report protocol')
         if type(tool_contracts) is not str or tool_contracts not in _TOOL_CONTRACT_MODES:
             raise ValueError('Tool contracts must be full, on_demand or outcomes')
-        if completion_policy not in _COMPLETION_POLICIES:
+        if completion_policy not in _COMPLETION_POLICIES | {_OPERATION_COMPLETION}:
             raise ValueError('Unsupported completion policy')
         if delivery_files is not None:
             from simple_ar.tools.workspace import validate_delivery_patterns
@@ -1367,6 +1454,8 @@ class ToolApplication:
             "max_images": max_images,
             "completion_policy": completion_policy,
             "max_turns": max_turns}
+        if control_protocol is not None:
+            config['control_protocol'] = control_protocol
         if frozen_extensions:
             config['extensions'] = frozen_extensions
             config['extension_host_protocol'] = 'nested_calls.v1'
@@ -1425,10 +1514,15 @@ class ToolApplication:
                max_snapshot_bytes: int = 16 * 1024 * 1024,
                delivery_files: list[str] | None = None,
                tool_contracts: Literal['full', 'on_demand', 'outcomes'] = 'on_demand',
-               completion_policy: str = 'closing_decision.v2', professional_inputs: bool = False,
+               completion_policy: str | None = None, professional_inputs: bool = False,
                investigate_results: bool = True,
+               control_protocol: Literal['operations.v1'] | None = 'operations.v1',
                creation_declarations: dict[str, Any] | None = None,
                context_protocol: Literal['conversation.v1'] | None = 'conversation.v1') -> ToolApplication:
+        """Create operation-composed work; explicit None is legacy integration compatibility.
+
+        Loading a saved task always uses its persisted protocol, never this default.
+        """
         if context_protocol not in {None, 'conversation.v1'}:
             raise ValueError('Unsupported context protocol')
         if creation_declarations is not None and context_protocol != 'conversation.v1':
@@ -1440,22 +1534,30 @@ class ToolApplication:
             research_policy=research_policy, table_analysis=table_analysis, max_output_tokens=max_output_tokens,
             max_attempts=max_attempts, source_operations=source_operations, execution_contract=execution_contract,
             services=services, snapshot_sources=snapshot_sources, max_snapshot_bytes=max_snapshot_bytes,
-            tool_contracts=tool_contracts, completion_policy=completion_policy, delivery_files=delivery_files,
+            tool_contracts=tool_contracts, completion_policy=completion_policy, control_protocol=control_protocol,
+            delivery_files=delivery_files,
             extensions=extensions, creation_declarations=creation_declarations)
         if type(professional_inputs) is not bool:
             raise ValueError('professional_inputs must be boolean')
-        if professional_inputs:
+        if professional_inputs and control_protocol is None:
             config['professional_inputs'] = 'owner.v3'
             config['professional_work'] = _REQUEST_OWNER if code_task is None else 'outcomes.v2'
         if type(investigate_results) is not bool:
             raise ValueError('investigate_results must be boolean')
-        if investigate_results and professional_inputs and code_task is None:
+        if investigate_results and professional_inputs and code_task is None and control_protocol is None:
             config['result_investigation'] = 'execution_findings.v1'
+        if control_protocol is not None:
+            config['report_protocol'] = None
+            # Old per-stage contracts belong to saved tasks, not this loop.
+            for name in ('professional_inputs','professional_work','producer_completion',
+                         'result_investigation','document_source_contract','publication_preparation'):
+                config.pop(name, None)
         if context_protocol is not None:
             config['context_protocol'] = context_protocol
-        config['producer_completion'] = 'goal_findings.v1'
-        config['document_source_contract'] = 'document_source.v1'
-        config['publication_preparation'] = 'bound_candidate.v1'
+        if control_protocol is None:
+            config['producer_completion'] = 'goal_findings.v1'
+            config['document_source_contract'] = 'document_source.v1'
+            config['publication_preparation'] = 'bound_candidate.v1'
         session = SessionController.create(root, session_id=root.name, topic=goal,
             registry=CapabilityRegistry(), budget=BudgetState(max_attempts=attempts, max_no_progress=6))
         session.manifest.transition_recipe = cls.RECIPE
@@ -1584,6 +1686,8 @@ class ToolApplication:
                 creation_declarations=old.get('creation_declarations') if old.get('input_contract') == _DECLARED_INPUTS else None)
             if old.get('professional_inputs') is not None:
                 config['professional_inputs'] = old['professional_inputs']
+            if old.get('control_protocol') is not None:
+                config['control_protocol'] = old['control_protocol']
             if 'context_protocol' in old:
                 config['context_protocol'] = old['context_protocol']
             if 'professional_work' in old:
@@ -1968,6 +2072,9 @@ class ToolApplication:
         return result
 
     def _system_text(self, *, closing: bool = False) -> str:
+        if self.operations is not None:
+            from simple_ar.app.operation_tools import SYSTEM as operations_system
+            return operations_system + ('\n\n'+_CLOSING_DECISION if closing else '')
         # Do not append delegation advice to the old do-everything solver role:
         # professional owners now hold the complete investigation-to-result unit.
         mode = self.state['config'].get('professional_work')
@@ -2807,7 +2914,7 @@ class ToolApplication:
                     'required_tool': 'implement_code_task', 'scope': 'frozen_contracts.code_task',
                     'completion': 'An accepted implementation and validation through this owner is required. '
                         'Ordinary workspace writes or process calls cannot replace the frozen edit/check contract.'}
-        if report['requirement'] is not None:
+        if report['requirement'] is not None and self.operations is None:
             requirement = report['requirement']
             controls = requirement['config']
             context['report_requirement'] = {'method': requirement['method'], 'outline': requirement['outline'],
@@ -2816,6 +2923,15 @@ class ToolApplication:
                 'review': {key: controls[key] for key in ('reviewer', 'document_review', 'review_scope',
                     'max_review_iterations') if key in controls}}
             context['report_delivery'] = BOUND_REPORT_REVISION
+        elif report['requirement'] is not None:
+            requirement = report['requirement']
+            context['requested_report'] = {'outline':requirement['outline'],
+                'target_words':requirement['config'].get('longform',{}).get('target_words',0),
+                'max_cited_sources':requirement['config'].get('max_cited_sources',0),
+                'scope':'Preserve any fixed outline and citation ceiling. Length is a preference; use direct operations, current evidence inspection and same-version publication.'}
+        if self.operations is not None:
+            for name in ('report_protocol','work_focus','work_focus_authority','work_inputs'):
+                context.pop(name,None)
         if config.get('report_protocol') == _REPORT_PROTOCOL and not (declared and closing):
             context['report_protocol']['instruction'] = (
                 'Declare report, original-text conversion or none using update_work_plan.report_intent, '
@@ -3519,6 +3635,8 @@ class ToolApplication:
         A native project returns (path, None, {}): reusable read-only material,
         with no inherited validator, interpreter, permission or budget.
         """
+        if self.implementation is None:
+            return None  # Ordinary outputs remain available through reusable_materials.
         if (self.session.manifest.status not in {'completed', 'partial'}
                 or self.state['pending'] is not None or not self.state['turns']
                 or not self.session.store.exists('delivery.json')):
@@ -3576,7 +3694,7 @@ class ToolApplication:
         New tasks get no old budget or process output directory. The original
         approved argv template retains output placeholders for a fresh run.
         """
-        if (not self.implementation.exact or self.reusable_code_project() is None
+        if (self.implementation is None or not self.implementation.exact or self.reusable_code_project() is None
                 or self.state['config'].get('execution_contract') is None
                 or 'conditions' in self.state['config']['execution_contract']):
             return None
@@ -3632,6 +3750,18 @@ class ToolApplication:
             return 'Request exactly one delivery/question as the last action; this terminal action was not executed.'
         if self._completion(call['function']['name']).kind == 'question':
             return ''
+        if self.operations is not None:
+            try:
+                retained = next((self._delivery(call,self.session.store.read_json(item['result']))
+                    for item in turn['tools'] if item['id']==call['id']),None)
+                delivery = retained or self._delivery_arguments(call)
+                observations = self._operation_observations()
+                proposed = (ToolCall(tool_name=call['function']['name'],
+                    arguments=json.loads(call['function']['arguments'])) if retained is None else None)
+                errors = self.operations.delivery_issues(observations,delivery,proposed=proposed)
+                return '; '.join(errors)
+            except (ValueError,OSError,KeyError,TypeError,RuntimeError) as exc:
+                return str(exc)
         if (self.scientific is not None and self.scientific.execution_contract is not None
                 and not self.implementation.exact):
             try:
@@ -4204,9 +4334,10 @@ class ToolApplication:
             'max_output_tokens', 'reasoning_effort', 'thinking_mode', 'reasoning_output_tokens')
             if key in settings})).effective_output_limit()
         cap = client.effective_output_limit()
-        if saved_cap is None or cap != saved_cap:
-            raise ValueError('Retry requires the saved finite output cap; restore compatible settings without lowering it')
-        if any(entry.status == 'unknown' and entry.reserved['total_tokens'] < saved_cap for entry in entries):
+        if cap != saved_cap:
+            raise ValueError('Retry requires the saved output setting; restore compatible settings without changing it')
+        if any(entry.status == 'unknown' and (saved_cap is None
+                or entry.reserved['total_tokens'] < saved_cap) for entry in entries):
             raise ValueError('Unknown reservation does not cover the saved output cap; inspect before retry')
         budget = self.session.manifest.budget
         requests = self.ledger.remaining('llm_requests')

@@ -36,7 +36,7 @@ class LocalWorkspaceTests(unittest.TestCase):
             unused = base / 'unused.txt'
             unused.write_text('Old raw source', encoding='utf-8')
             app = ToolApplication.create(tasks / 'retained', 'Deliver saved local files', model=None,
-                sources={'source0': unused}, extensions=[package])
+                sources={'source0': unused}, extensions=[package], control_protocol=None)
             app.run(actions=[
                 call('write_file', {'path': 'workspace/report.txt', 'content': 'Visible output'}),
                 call('write_file', {'path': 'workspace/execution.log', 'content': 'Retained process evidence'}),
@@ -264,7 +264,7 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
             runner.write_text('print("original")\n', encoding='utf-8')
             workspace = Workspace(project, [], root / 'tasks')
             app = ToolApplication.create(workspace.task('prepared'), 'Inspect a prepared command',
-                model=None, sources={'source0': project}, allow_execution=True)
+                model=None, sources={'source0': project}, allow_execution=True, control_protocol=None)
             client = Mock()
             client._budget_ledger = None
             client.ask_json.return_value = {'summary': 'Candidate only', 'unresolved': [],
@@ -334,7 +334,7 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
             app = ToolApplication.create(root, 'Inspect retained evidence', model=None,
                 sources={'source0': project, 'source1': source_file, 'source2': project / 'models.toml'},
                 allow_execution=True, max_attempts=80,
-                process_limits={'process_invocations': 1, 'process_wall_seconds': 30})
+                process_limits={'process_invocations': 1, 'process_wall_seconds': 30}, control_protocol=None)
             app.run(actions=[call('write_file', {'path': 'workspace/report.txt', 'content': 'first report',
                 'delivery': {'summary': 'Initial result', 'artifacts': ['workspace/report.txt'],
                              'unresolved': [diagnostic]} })],
@@ -563,7 +563,7 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
     def test_cooperative_boundary_stop_and_resume_preserves_pending(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve() / 'boundary'
-            app = ToolApplication.create(root, 'Bounded caller work', model=None, sources={}, max_attempts=20)
+            app = ToolApplication.create(root, 'Bounded caller work', model=None, sources={}, max_attempts=20, control_protocol=None)
             actions = [call('write_file', {'path': 'workspace/result.txt', 'content': 'retained'}, 'write'),
                        call('ask_user', {'question': 'Please inspect retained result'}, 'question')]
             stopped = app.run(actions=actions, should_stop=lambda: True, progress=lambda _: None)
@@ -734,7 +734,8 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                     migrate_new_start(cli)
                     cli.model = 'profile:a'  # Same named route selection; no provider invocation.
                     options = native_creation_options(cli)
-                    projected = {k: v for k, v in options.items() if k not in {'professional_inputs', 'context_protocol'}}
+                    projected = {k: v for k, v in options.items()
+                        if k not in {'professional_inputs', 'context_protocol'}}
                     expected, _, expected_limits, _ = ToolApplication._configuration(workspace.tasks, cli.request, **projected)
                     self.assertEqual(config_preview['goal'], cli.request)
                     self.assertEqual(config_preview['creation_declarations'], expected['creation_declarations'])
@@ -777,8 +778,9 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                     configured_root = workspace.task(configured['task'])
                     saved_config = json.loads((configured_root / 'actions.json').read_text())['config']
                     self.assertEqual({key: saved_config[key] for key in expected}, expected)
-                    self.assertTrue(saved_config['professional_inputs'])
-                    self.assertTrue(saved_config['professional_work'])
+                    self.assertEqual(saved_config['control_protocol'], 'operations.v1')
+                    self.assertNotIn('professional_inputs', saved_config)
+                    self.assertNotIn('professional_work', saved_config)
                     self.assertEqual(saved_config['input_contract'], 'declared_inputs.v1')
                     self.assertEqual(saved_config['creation_declarations'], config_preview['creation_declarations'])
                     self.assertEqual(json.loads((configured_root / 'actions.json').read_text())['requests'],

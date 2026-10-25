@@ -6,13 +6,16 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 
 ## 2026-10-25 — V2.10 development (unreleased)
 
+### Improved
+
+- New tasks compose investigation, file work, execution, independent inspection and publication in one action loop, replacing compulsory professional handoffs and overlapping Writer control. Ordinary CLI, structured intake and creation APIs use the same default; saved tasks retain their recorded contracts.
+- Formal manuscript checks bind actual target and evidence versions; PDF/TeX delivery checks the corresponding publication. Distinguish unfinished work from research limitations, and keep legacy Writer preparation arguments out of ordinary export contracts. Current required findings, unknown usage and unverified execution still need resolution or explicit disclosure.
+- Consolidate duplicate professional-control tests while retaining execution, approval, feedback, version consistency and historical recovery coverage. Original drafts, failures and accounting remain preserved.
+
 ### Fixed
 
-- Inspect the prepared publication view before adoption and reuse a valid view for fresh independent checks of existing drafts. Captions, templates and citation style stay bound to the same version; successful preparation is not final delivery.
-- Keep complete rejected drafts as work candidates for revision or reorganization. A never-dispatched inspection can continue after its original accounting is verified, without redrafting. Failures, unknown requests and historical contracts remain protected.
-- Share source, outline and provenance across writing, repair and delivery, avoiding reselection for equivalent attachments or prior drafts. Professional selection checks source references against actual document identities; ordinary code and data remain readable materials.
-- Keep professional work phases and artifact roots available after read history is trimmed. Resolve resumed drafts consistently across feedback, repair and delivery; preparation-time notes stay distinct from execution issues, with raw receipts and failures retained.
-- New complete implementation work investigates its actual outputs before returning findings and remaining needs. Findings cite inspected observations; code binds their exact versions and ranges, without asking the model to reconstruct evidence windows or copy quotes. Writing can reuse those materials; delivery requires the current investigation. Source-only work and saved historical contracts retain their behavior.
+- Preserve frozen analysis, research and implementation/measurement obligations through the new action loop. Final writes and approved runs are checked against their actual produced files rather than requiring those files before execution.
+- Rendered-image inspection follows the configured model output limit instead of imposing a separate 3,000-token cap. Explicit recovery of a failed decision with no unknown charges also supports an unchanged, uncapped output setting; unknown charges retain stricter recovery checks.
 
 Full unattended draft, feedback and delivery acceptance remains in progress; this engineering update does not establish general success or lower cost.
 

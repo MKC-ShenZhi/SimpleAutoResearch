@@ -170,7 +170,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             (source / 'paper.pdf').write_bytes(b'original paper')
             app = ToolApplication.create(root / 'task', 'Deliver a document and PDF',
                 model=None, sources={'papers': source}, max_attempts=50,
-                delivery_files=['**/*.md', '**/*.pdf'], tool_contracts='full')
+                delivery_files=['**/*.md', '**/*.pdf'], tool_contracts='full', control_protocol=None)
             self.assertEqual(app.state['config']['completion_policy'], 'closing_decision.v2')
             before = app.ledger.to_dict()
             terms = app.supply(supply_id='upgrade', reason='Use current contracts with the original task',
@@ -185,7 +185,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             for policy in ('protected_decision.v1', None):
                 with self.subTest(historical_policy=policy):
                     historical = ToolApplication.create(root / f'history-{policy}', 'Keep saved policy',
-                        model=None, sources={}, completion_policy='protected_decision.v1')
+                        model=None, sources={}, completion_policy='protected_decision.v1', control_protocol=None)
                     self.assertEqual(historical.state['config']['completion_policy'], 'protected_decision.v1')
                     if policy is None:
                         historical.state['config'].pop('completion_policy')
@@ -602,7 +602,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 'result_schema': {'primary_metric': 'score', 'required_metrics': ['score']},
                 'protocol': {'hypothesis': 'Record the implemented value', 'dataset': 'Supplied local input',
                     'expected_outcome': 'Observed score, not proof of improvement'}}
-                if measurement_command is not None else None))
+                if measurement_command is not None else None), control_protocol=None)
         code = "from pathlib import Path\np = Path('counter.txt')\np.write_text(str(int(p.read_text()) + 1) if p.exists() else '1')\nprint('done')\n"
         code += "# Native history preserves the actual source, not substitute payloads.\n" * 80
         if counter or completed:
@@ -2573,7 +2573,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.enterContext(patch('simple_ar.app.tool_application.LLMClient.from_env', return_value=fake))
         app = ToolApplication.create(root / 'task', 'Collect materials, then measure when authorized',
             model=None, sources={'source0': inputs}, max_turns=0, max_tokens=0, max_attempts=30,
-            process_limits={'process_invocations': process_invocations, 'process_wall_seconds': 30})
+            process_limits={'process_invocations': process_invocations, 'process_wall_seconds': 30}, control_protocol=None)
         return inputs, fake, app
 
     @staticmethod
@@ -3536,7 +3536,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 side_effect=AssertionError('Caller actions must not resolve model credentials')) as client:
             app = ToolApplication.create(root / 'task', 'Measure declared data, then explain the result',
                 model=None, sources={}, allow_execution=True, max_turns=0, max_tokens=0,
-                max_attempts=16, process_limits={'process_invocations': 1, 'process_wall_seconds': 30})
+                max_attempts=16, process_limits={'process_invocations': 1, 'process_wall_seconds': 30}, control_protocol=None)
             def action(name, **arguments):
                 return {'tool_name': name, 'arguments': arguments}
             app.run(actions=[action('write_file', path='workspace/observed.py', content=
@@ -3596,7 +3596,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             client.assert_not_called()
             guarded = ToolApplication.create(root / 'guarded', 'Measure a required observation',
                 model=None, sources={}, allow_execution=True, max_turns=0, max_tokens=0,
-                max_attempts=8, process_limits={'process_invocations': 1, 'process_wall_seconds': 30})
+                max_attempts=8, process_limits={'process_invocations': 1, 'process_wall_seconds': 30}, control_protocol=None)
             guarded.run(actions=[action('write_file', path='workspace/observed.py',
                 content="print('loss: 0.25')\n"), {**request, 'arguments': {**request['arguments'],
                     'result_schema': {'required_metrics': ['missing_measurement']}}}],
@@ -3638,7 +3638,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             contract = freeze_measurement_set(execution)
             app = ToolApplication.create(root / 'task', 'Compare the explicitly declared conditions',
                 model=None, sources={}, allow_execution=True, max_turns=0, max_tokens=0, max_attempts=20,
-                execution_contract=contract, process_limits={'process_invocations': 5, 'process_wall_seconds': 25})
+                execution_contract=contract, process_limits={'process_invocations': 5, 'process_wall_seconds': 25}, control_protocol=None)
             def action(name, **arguments):
                 return {'tool_name': name, 'arguments': arguments}
             batch = [action('measure_experiment', **row['execution'], condition_id=row['id'])
@@ -3743,7 +3743,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 old = ToolApplication.create(root / 'original', 'Record original controls', model=None,
                     sources={}, allow_execution=True, max_turns=0, max_tokens=0, max_attempts=12,
                     execution_contract=contract,
-                    process_limits={'process_invocations': count, 'process_wall_seconds': count * 5})
+                    process_limits={'process_invocations': count, 'process_wall_seconds': count * 5}, control_protocol=None)
                 old.run(actions=[action('measure_experiment', **row['execution'], condition_id=row['id'])
                     for row in baseline_rows], approve=lambda *_: True, progress=lambda _: None)
                 originals = [old.session.store.read_json(item['result']) for turn in old.state['turns']
@@ -3761,7 +3761,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 app = ToolApplication.create(root / 'reused', 'Compare using retained controls', model=None,
                     sources={'prior': old.session.store.root}, allow_execution=True,
                     max_turns=0, max_tokens=0, max_attempts=20, execution_contract=reused,
-                    process_limits={'process_invocations': count, 'process_wall_seconds': count * 5})
+                    process_limits={'process_invocations': count, 'process_wall_seconds': count * 5}, control_protocol=None)
                 frozen = app.scientific.execution_contract
                 rows = measurement_conditions(frozen)
                 imported = [row for row in rows if row.get('reuse_ref')]
@@ -3847,7 +3847,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                         ToolApplication.create(rejected, 'Reject invalid historical baseline', model=None,
                             sources={'bad': supplied, 'prior': old.session.store.root}, allow_execution=True,
                             max_turns=0, max_tokens=0, max_attempts=8, execution_contract=invalid,
-                            process_limits={'process_invocations': count, 'process_wall_seconds': count * 5})
+                            process_limits={'process_invocations': count, 'process_wall_seconds': count * 5}, control_protocol=None)
                     self.assertFalse((rejected / 'actions.json').exists())
                 for asset in (data, evaluator):
                     content = asset.read_bytes()
@@ -3903,7 +3903,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             app = ToolApplication.create(root / 'code-reuse', contract['goal'], model='fixture',
                 sources={'project': project, 'prior': old.session.store.root}, allow_execution=True,
                 max_turns=1, max_tokens=20000, max_attempts=8, code_task=contract, execution_contract=scoped,
-                process_limits={'process_invocations': 8, 'process_wall_seconds': 60})
+                process_limits={'process_invocations': 8, 'process_wall_seconds': 60}, control_protocol=None)
             connection.assert_called_once_with('fixture', fallback_models_config=None)
         preflight.ask_json.assert_not_called()
         preflight.chat.assert_not_called()
@@ -4050,7 +4050,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 app = ToolApplication.create(root / 'task', 'Measure both frozen roles', model=None,
                     sources={}, allow_execution=True, max_turns=0, max_tokens=0, max_attempts=12,
                     execution_contract=contract, process_limits={'process_invocations': 7 if isolated else
-                        2 if scenario == 'budget' else 3, 'process_wall_seconds': 150})
+                        2 if scenario == 'budget' else 3, 'process_wall_seconds': 150}, control_protocol=None)
                 batch = [{'tool_name': 'measure_experiment', 'arguments': {
                     **row['execution'], 'condition_id': row['id']}} for row in contract['conditions']]
                 # A valid frozen contract does not grant permission to execute.
@@ -4119,14 +4119,14 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         with _temporary_run() as root, patch('simple_ar.app.tool_application.LLMClient.from_env',
                 side_effect=AssertionError('No model')):
             app = ToolApplication.create(root / 'task', 'Only read supplied inputs', model=None,
-                sources={}, max_turns=0, max_tokens=0, max_attempts=8)
+                sources={}, max_turns=0, max_tokens=0, max_attempts=8, control_protocol=None)
             for actions in ([], [{'tool_name': 'measure_experiment', 'arguments': {}}],
                     [{'tool_name': 'write_file', 'arguments': {}, 'approval': True}]):
                 with self.subTest(actions=actions), self.assertRaises(ValueError):
                     app.run(actions=actions, progress=lambda _: None)
             self.assertEqual(app.state['turns'], [])
             large = ToolApplication.create(root / 'large', 'Keep the declared set intact', model=None,
-                sources={}, max_turns=0, max_tokens=0, max_attempts=40)
+                sources={}, max_turns=0, max_tokens=0, max_attempts=40, control_protocol=None)
             queued = [{'tool_name': 'ask_user', 'arguments': {'question': 'Confirm remaining scope'}}] * 33
             with self.assertRaisesRegex(ValueError, 'attempt allowance'):
                 large._submit_actions(queued + queued)
@@ -4174,7 +4174,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             self.assertFalse((root / 'task/workspace/unrequested.txt').exists())
 
             exhausted = ToolApplication.create(root / 'exhausted', 'One bounded action', model=None,
-                sources={}, max_turns=0, max_tokens=0, max_attempts=1)
+                sources={}, max_turns=0, max_tokens=0, max_attempts=1, control_protocol=None)
             exhausted.run(actions=[{'tool_name': 'read_history', 'arguments': {}}], progress=lambda _: None)
             for _ in range(2):
                 with self.assertRaises(RuntimeError):
@@ -5569,7 +5569,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     # Exercise the public compatibility override, not a mock
                     # that assumes every new model sees specialist schemas.
                     app = ToolApplication.create(root.parent / f'explicit-{mode}', 'Compatibility control',
-                        model=None, sources={'source0': inputs}, max_attempts=30, tool_contracts=mode)
+                        model=None, sources={'source0': inputs}, max_attempts=30, tool_contracts=mode, control_protocol=None)
                     root = app.session.store.root
                 elif mode is None:
                     app.state['config'].pop('tool_contracts')
@@ -6156,7 +6156,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 native_response_corrections=1, max_output_tokens=512, retry_attempts=1))
             services = SimpleNamespace(llm_client=client)
             app = ToolApplication.create(root, 'Save and deliver the inspected result', model='fixture',
-                sources={}, services=services, max_turns=3, max_tokens=100000)
+                sources={}, services=services, max_turns=3, max_tokens=100000, control_protocol=None)
             self.assertNotIn('model_catalogs', app.state['config'])
             poison = self._native_message('write_file', {'path': 'poison.txt', 'content': 'never adopt'}, 'cut')
             complete = self._native_message('write_file', {'path': 'result.txt', 'content': 'complete result',
@@ -6917,21 +6917,24 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         # unknown charges, saved-cap admission and cached-reply recovery.
         cases = (
             ('task', 'bounded_unknown'), ('task', 'pre_dispatch'),
-            ('task', 'preflight'), ('task', 'cached'),
+            ('task', 'preflight'), ('task', 'uncapped_preflight'), ('task', 'cached'),
             ('code', 'bounded_unknown'), ('code', 'cached'),
             ('writing', 'bounded_unknown'), ('writing', 'cached'),
         )
         for purpose, failure in cases:
             with self.subTest(purpose=purpose, failure=failure):
+                cap = None if failure == 'uncapped_preflight' else 8192
+                if failure == 'uncapped_preflight':
+                    failure = 'preflight'  # No provider call or unknown charge exists to bound.
                 # Retain both the new default and explicit historical policy
                 # across the existing retry/recovery matrix.
                 _, _, _, _, app, _ = self._native_fixture(completed=True, max_turns=8,
                     completion_policy='protected_decision.v1' if purpose != 'task' else None)
                 usages = []
                 client = LLMClient(LLMSettings(api_key='fixture', model='fixture', api_mode='chat',
-                    retry_attempts=1, max_output_tokens=8192), budget_ledger=app.ledger,
+                    retry_attempts=1, max_output_tokens=cap), budget_ledger=app.ledger,
                     usage_callback=usages.append)
-                app.state['config']['model_connection']['settings']['max_output_tokens'] = 8192
+                app.state['config']['model_connection']['settings']['max_output_tokens'] = cap
                 if purpose != 'task':
                     app.state['config']['model_connection'][purpose + '_route'] = {
                         'profile': 'fixture-' + purpose,
@@ -7121,7 +7124,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             side_effect=AssertionError('Recovery must not dispatch')))
         app = ToolApplication.create(root / 'task', 'Inspect the supplied material',
             model='profile:task', sources={}, allow_vision=True, max_images=1,
-            research_policy={'feasibility_connection': 'profile:review'})
+            research_policy={'feasibility_connection': 'profile:review'}, control_protocol=None)
         return root, catalog, text, app, provider
 
     def test_native_catalog_hints_restore_consumers_and_follow_compatible_supply(self):
@@ -11169,10 +11172,18 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             self.assertEqual(result.data["scientific_validity"], "not_assessed")
             self.assertEqual(result.data['input_sha256'], {
                 'source0/figure.webp': hashlib.sha256((inputs / 'figure.webp').read_bytes()).hexdigest()})
+            self.assertEqual(fake.ask_json.call_args.kwargs['max_output_tokens'], 16000)
+            # A reasoning model may spend its output allowance before any JSON.
+            # No caller cap must remain uncapped, not acquire a tool-local 3000.
+            fake.effective_output_limit.return_value = None
+            uncapped = visual.call('inspect_images', {'images': ['source0/figure.webp'],
+                'goal': 'Inspect labels'}, identity='visual-uncapped')
+            self.assertEqual(uncapped.status, 'ok', uncapped.error)
+            self.assertIsNone(fake.ask_json.call_args.kwargs['max_output_tokens'])
             denied = visual.call("inspect_images", {"images": ["source0/.env"],
                 "goal": "Inspect"}, identity="visual-secret")
             self.assertEqual(denied.status, "error")
-            self.assertEqual(inspect.call_count, 1)
+            self.assertEqual(inspect.call_count, 2)
 
     def test_related_feedback_uses_original_checks_and_marks_changed_subjects(self) -> None:
         from PIL import Image
@@ -11270,7 +11281,11 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     fake.ask_json.side_effect = response if isinstance(response, LLMResponseError) else None
                     fake.ask_json.return_value = response
                     malformed = visual.call('inspect_images', arguments, identity=identity)
-                    self.assertEqual(malformed.data, {'response_status': 'rejected'})
+                    self.assertEqual(malformed.status, 'error')
+                    self.assertEqual(malformed.data, {
+                        'response_status': 'rejected', 'finish_reason': None,
+                        'correction_allowed': True,
+                        'records': f'workspace/visual-reviews/{identity}'})
                     records = resumed.workspace.workspace / 'visual-reviews' / identity
                     if isinstance(response, LLMResponseError):
                         self.assertEqual(malformed.status, 'error')
@@ -11344,7 +11359,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             return vision_client if kwargs.get('purpose') == 'vision' else fake
         with patch('simple_ar.integrations.llm.LLMClient.from_env', side_effect=resolve_client):
             pinned = ToolApplication.create(run_dir / 'vision-routing', 'Inspect supplied figure',
-                model='fixture', sources={'source0': inputs}, allow_vision=True)
+                model='fixture', sources={'source0': inputs}, allow_vision=True, control_protocol=None)
             for spec in pinned.gateway.registry.list_specs():
                 if spec.domain == 'sources' and spec.permission_level == 'network':
                     self.assertFalse(pinned.gateway.policy.is_allowed(spec)[0], spec.name)
@@ -11366,7 +11381,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             self.assertFalse(pinned.ledger.entries)
             vision_client.connection_binding.return_value = vision_binding
             initially_text = ToolApplication.create(run_dir / 'vision-grant', 'Analyze supplied material',
-                model='fixture', sources={'source0': inputs})
+                model='fixture', sources={'source0': inputs}, control_protocol=None)
             for owner, available in ((pinned, True), (initially_text, False)):
                 with self.subTest(vision_authorized=available, image_requests=0):
                     before_state, before_ledger = json.dumps(owner.state), owner.ledger.to_dict()
@@ -14117,7 +14132,7 @@ class ConversationContextTests(unittest.TestCase):
     def _fixture(self):
         root, inputs, fake, _, app, _ = self._native_fixture()
         app = ToolApplication.create(root / 'conversation', 'Use original measurements; preserve unknowns.',
-            model='fixture', sources={'source0': inputs}, context_protocol='conversation.v1')
+            model='fixture', sources={'source0': inputs}, context_protocol='conversation.v1', control_protocol=None)
         return inputs, fake, app
 
     def _read(self, app, path, identity, **window):
@@ -14142,7 +14157,7 @@ class ConversationContextTests(unittest.TestCase):
         requirement = freeze_report_requirement({'reviewer': 'disabled'})
         app = ToolApplication.create(old.session.store.root.parent / 'declared', goal,
             model='fixture', sources={'source0': inputs}, creation_declarations=declarations,
-            report_requirement=requirement, report_protocol='canonical_report.v1')
+            report_requirement=requirement, report_protocol='canonical_report.v1', control_protocol=None)
         self.assertEqual(app.state['requests'], [goal])
         self.assertEqual(app.session.manifest.topic, goal)
         before = app.session.store.resolve('actions.json').read_bytes()
@@ -14169,7 +14184,7 @@ class ConversationContextTests(unittest.TestCase):
         exact = ToolApplication.create(old.session.store.root.parent / 'declared-exact', goal,
             model='fixture', sources={'source0': inputs}, allow_execution=True, creation_declarations={},
             code_task={'project_path': 'source0', 'goal': goal, 'allowed_patterns': ['*.py'],
-                'validation_command': ['python', '-c', 'print(1)']})
+                'validation_command': ['python', '-c', 'print(1)']}, control_protocol=None)
         exact_context = json.loads(exact._messages(client=client)[1]['content'])
         self.assertEqual(exact.state['requests'], [goal])
         self.assertEqual(exact_context['existing_code_task']['required_tool'], 'implement_code_task')
@@ -14185,7 +14200,7 @@ class ConversationContextTests(unittest.TestCase):
     def test_declared_feedback_is_once_in_chronology_and_survives_eviction(self):
         inputs, client, old = self._fixture()
         app = ToolApplication.create(old.session.store.root.parent / 'declared-feedback', 'Original user goal',
-            model='fixture', sources={'source0': inputs}, creation_declarations={})
+            model='fixture', sources={'source0': inputs}, creation_declarations={}, control_protocol=None)
         self._read(app, inputs / 'notes.txt', 'first-observation')
         first_turn = app.state['turns'][0]
         first_turn['request_count'] = 1
@@ -14212,7 +14227,7 @@ class ConversationContextTests(unittest.TestCase):
         inputs, client, old = self._fixture()
         app = ToolApplication.create(old.session.store.root.parent / 'declared-closing', 'Explain existing results',
             model='fixture', sources={'source0': inputs}, creation_declarations={}, professional_inputs=True,
-            report_protocol='canonical_report.v1')
+            report_protocol='canonical_report.v1', control_protocol=None)
         schemas = app._closing_schemas()
         messages = app._messages(client=client, closing=True, schemas=schemas)
         header = json.loads(messages[1]['content'])
@@ -14229,7 +14244,7 @@ class ConversationContextTests(unittest.TestCase):
         with _temporary_run() as root:
             for protocol in (None, 'conversation.v1'):
                 app = ToolApplication.create(root / str(protocol), 'Keep the supplied goal', model=None,
-                    sources={}, context_protocol=protocol)
+                    sources={}, context_protocol=protocol, control_protocol=None)
                 self.assertEqual(app.state['config'].get('context_protocol'), protocol)
                 app.supply(supply_id='files', reason='Declare final files', changes={'delivery_files': ['*.txt']})
                 loaded = ToolApplication.load(app.session.store.root)

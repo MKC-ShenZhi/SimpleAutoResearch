@@ -102,6 +102,9 @@ class ReportDelivery(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
     status: Literal['candidate', 'canonical']
     manuscript: str | None = None
+    formats: list[Literal['markdown','tex','pdf']] = Field(default_factory=list,max_length=3,
+        exclude_if=lambda value:not value,
+        description='Requested output formats claimed by this delivery. PDF/TeX require a current publication of this manuscript. Empty retains historical declarations.')
 
 
 class DeliveryRequest(BaseModel):
@@ -109,9 +112,12 @@ class DeliveryRequest(BaseModel):
     summary: str = Field(min_length=1)
     artifacts: list[str] = Field(default_factory=list,
         description="Existing workspace outputs (workspace-relative or explicitly mounted paths) or retained files in this task's evidence mount. Evidence remains read-only and is referenced, not copied or certified. Directories expand to a snapshot of at most 200 accessible files; private paths, virtual environments, Python bytecode caches and symlinks are excluded by the existing inventory rules. Oversized inventories must be narrowed explicitly; this is not an archive or correctness certificate.")
-    unresolved: list[str] = Field(default_factory=list)
+    unresolved: list[str] = Field(default_factory=list,
+        description='Requested work still unfinished or a required defect still unresolved; nonempty makes delivery partial. Put inherent evidence limits in limitations instead.')
+    limitations: list[str] = Field(default_factory=list,exclude_if=lambda value:not value,
+        description='Scope, unavailable evidence and uncertainty honestly stated in the completed work. These do not by themselves mean the requested task is unfinished, and cannot waive required findings.')
     report: ReportDelivery | None = Field(default=None, exclude_if=lambda value: value is None,
-        description='For a versioned report obligation, explicitly deliver a candidate with unresolved work, or a canonical compose_document manuscript and its same-version publication. Candidate status never certifies a scientific report.')
+        description='For a formal report, identify the current editable manuscript and requested formats. Canonical means current required checks passed; candidate means unfinished work disclosed. Publication must match that manuscript; no scientific certification.')
 
 
 class _Write(_Path):
