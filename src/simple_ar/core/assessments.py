@@ -54,7 +54,8 @@ def current_assessments(workspace: Any, observations: list[dict]) -> list[Artifa
     result = []
     for observed in observations:
         value = (observed.get('metadata') or {}).get('assessment')
-        if value is None or observed.get('status') != 'ok':
+        if value is None or not (observed.get('status') == 'ok'
+                or observed.get('status') == 'error' and value.get('verdict') == 'incomplete'):
             continue
         assessment = ArtifactAssessment.model_validate(value)
         try:

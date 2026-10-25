@@ -73,6 +73,31 @@ control. Explicit `control_protocol=None` in Python is compatibility integration
 ordinary new tasks use the new default. Never edit a saved task to upgrade it.
 Core retains attempts, artifacts, resource usage and process results through the same shared execution and records.
 
+New operation tasks save `working.v1` for context. `working_context.py` selects
+recorded observations, coherent recent turns and exact source excerpts. When old
+history volume warrants it, `work_memory.py` uses the same budgeted model to record
+a bounded checkpoint in the native attempt; it creates no second memory store or
+execution loop. Working notes also live in accepted plan receipts; source versions
+and inspection owners remain authoritative. Saved conversation projections retain
+their original behavior. Context retention is not a scientific verification claim.
+Settled unusable summaries retain diagnostics and previous notes without blocking
+the main decision or repeatedly summarizing unchanged history. Unknown charges
+still stop recovery. Checkpoint costs and registered outputs remain part of the
+same attempt through interruption and explicit retry.
+Fulfillment is checked after producer outputs are registered. A byte-bound
+successful operation can return unmet delivery conditions to the same loop;
+it is not replayed or silently marked delivered. Historical receipts remain
+unchanged, and damaged bindings still stop. Publication owns its actual source
+and export inventory; the coordinator does not reconstruct them.
+
+Inspection owns bounded source investigation through the existing workspace read
+contracts, rather than asking the coordinator to assemble each missing window.
+Its final assessment and version rules are unchanged; partial reads and failed
+responses remain in the same inspection records. Publication shares byte-bound
+PDF metadata across checks and previews, forecasts remaining physical process
+slots, and leaves actual charging to core. Sequential timeout sums are upper
+bounds, not minimum wall-time costs.
+
 New native tasks expose workspace tools and an authorized capability catalog;
 `load_tools` loads the contracts needed for the next action through the same registry.
 Contract presentation options and exact defaults belong in the

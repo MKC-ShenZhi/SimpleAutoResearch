@@ -555,7 +555,8 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
                       caption_owner: Literal['manifest', 'markdown'] = 'manifest',
                       template: dict[str, Any] | None = None,
                       citation_style: Literal['numeric', 'template'] | None = None,
-                      checks: dict[str, Any] | None = None) -> dict[str, Any]:
+                      checks: dict[str, Any] | None = None,
+                      preflight: Callable[[dict[str, int]], None] | None = None) -> dict[str, Any]:
     """Compatibility entry point for the shared Pandoc publication converter.
 
     Pandoc and optional TeX/librsvg are external rendering dependencies. No
@@ -596,6 +597,7 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
     ast = json.loads(run([pandoc, "--preserve-tabs", "--from=markdown-raw_tex-raw_html+tex_math_single_backslash", "--to=json"], cwd=root, text=source))
     ast["meta"] = {}  # Input metadata must not supply a TeX preamble or includes.
     captions = {}
+    parsed_captions = {}
     figure_variants = {}
     figure_manifest = root / "figures/figures_manifest.json"
     if figure_manifest.exists() and not figure_manifest.resolve().is_relative_to(root):
@@ -606,8 +608,14 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
                 figure_variants[row["path"]] = row["exports"]
             if not row.get("caption"):
                 continue
-            parsed = json.loads(run([pandoc, "--preserve-tabs", "--from=markdown-raw_tex-raw_html+tex_math_single_backslash", "--to=json"],
-                                     cwd=root, text=row["caption"]))["blocks"]
+            # Parse identical literals once in this export only. Never combine
+            # separate captions into one Markdown document (references/notes
+            # could then change their meaning).
+            literal = row['caption']
+            if literal not in parsed_captions:
+                parsed_captions[literal] = json.loads(run([pandoc, "--preserve-tabs", "--from=markdown-raw_tex-raw_html+tex_math_single_backslash", "--to=json"],
+                    cwd=root, text=literal))["blocks"]
+            parsed = parsed_captions[literal]
             if len(parsed) != 1 or parsed[0].get("t") not in {"Para", "Plain"}:
                 raise ReportExportError("Recorded figure caption must be one Markdown paragraph.")
             if row['path'] in captions and captions[row['path']] != parsed[0]['c']:
@@ -919,19 +927,35 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
             'Compound/nested graphics require separate figures; inspect image readability in all-page previews.\n')
         (output / 'README.txt').write_text(readme, encoding='utf-8')
         manifest["status"] = "exported"
+        # Forecast the bounded PDF suffix without reserving/charging it. Each
+        # physical invocation still goes through the core process ledger.
+        pdf_needs = {'process_invocations': 0, 'process_wall_seconds': 0}
+        if render_preview or (checks is not None and 'max_pages' in checks):
+            pdf_needs['process_invocations'] += 1
+            pdf_needs['process_wall_seconds'] = max(pdf_needs['process_wall_seconds'],30)
+        if checks is not None and 'forbidden_identifiers' in checks:
+            pdf_needs['process_invocations'] += 1
+            pdf_needs['process_wall_seconds'] = max(pdf_needs['process_wall_seconds'],30)
+        if render_preview:
+            pdf_needs['process_invocations'] += 1
+            pdf_needs['process_wall_seconds'] = max(pdf_needs['process_wall_seconds'],90)
         if compile_pdf:
             manifest.update(_compile(output, bool(citations), runner=runner,
+                **({'preflight': preflight, 'following_processes': pdf_needs} if preflight is not None else {}),
                 **({'engine': template.get('engine', 'pdflatex')} if template_files else {})))
+        if manifest['compiled'] and preflight is not None and pdf_needs['process_invocations']:
+            preflight(pdf_needs)
+        pdf_info = {}  # Same-export observations only; never upgrade history.
         if checks is not None:
             if manifest['compiled']:
-                _check_publication_pdf(output, manifest['checks'], runner=run)
+                _check_publication_pdf(output, manifest['checks'], runner=run, pdf_info=pdf_info)
             if manifest['checks']['status'] != 'passed':
                 manifest['status'] = 'checks_failed'
                 manifest['error'] = 'Declared publication checks did not pass; inspect checks.results. Editable project retained; no automatic revision or recompilation.'
         if render_preview:
             if not manifest['compiled']:
                 raise ReportExportError(manifest.get('compile_note') or "PDF compilation did not produce a PDF; requested preview unavailable")
-            manifest['pdf_preview'].update(_render_pdf_preview(output, runner=run))
+            manifest['pdf_preview'].update(_render_pdf_preview(output, runner=run, pdf_info=pdf_info))
     except ReportExportResourceError as exc:
         manifest.update(status='failed', failure_kind=exc.failure_kind, error=str(exc))
         raise ReportExportResourceError(f"Export stopped; retained files and export.json at {output}: {exc}") from exc
@@ -943,7 +967,36 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
     return manifest
 
 
-def _check_publication_pdf(output: Path, receipt: dict[str, Any], *, runner: Callable) -> None:
+def _pdf_information(pdf: Path, *, runner: Callable, cache: dict) -> str:
+    """One byte-bound metadata observation, including failures, per export."""
+    digest = hashlib.sha256(pdf.read_bytes()).hexdigest()
+    if cache:
+        if cache['sha256'] != digest:
+            raise ReportExportError('PDF changed after metadata observation; retain both versions')
+        if 'error' in cache:
+            raise ReportExportError(cache['error'])
+        return cache['text']
+    cache['sha256'] = digest
+    try:
+        executable = shutil.which('pdfinfo')
+        if not executable:
+            raise ReportExportError('Required Poppler tool unavailable: pdfinfo')
+        text = runner([executable, str(pdf)], cwd=pdf.parent, timeout=30, env={'LC_ALL': 'C'})
+        if len(text.encode('utf-8', errors='strict')) > 64_000 or '\ufffd' in text:
+            raise ReportExportError('Poppler output exceeds check bound or contains replacement characters; no complete check')
+        if hashlib.sha256(pdf.read_bytes()).hexdigest() != digest:
+            raise ReportExportError('PDF changed during metadata observation')
+        cache['text'] = text
+        return text
+    except ReportExportResourceError:
+        raise
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        cache['error'] = str(exc)
+        raise
+
+
+def _check_publication_pdf(output: Path, receipt: dict[str, Any], *, runner: Callable,
+                           pdf_info: dict | None = None) -> None:
     """Independent observations through the existing runner and process owner."""
     pdf = output / 'main.pdf'
     results = receipt['results']
@@ -964,14 +1017,16 @@ def _check_publication_pdf(output: Path, receipt: dict[str, Any], *, runner: Cal
     evidence.mkdir()
     for rule, row in results.items():
         try:
-            executable = shutil.which('pdfinfo' if rule == 'max_pages' else 'pdftotext')
-            if not executable:
-                raise ReportExportError('Required Poppler tool unavailable: ' + ('pdfinfo' if rule == 'max_pages' else 'pdftotext'))
-            argv = ([executable, str(pdf)] if rule == 'max_pages' else
-                    [executable, '-enc', 'UTF-8', str(pdf), '-'])
-            text = runner(argv, cwd=output, timeout=30, env={'LC_ALL': 'C'})
+            if rule == 'max_pages':
+                text = _pdf_information(pdf, runner=runner, cache=pdf_info if pdf_info is not None else {})
+            else:
+                executable = shutil.which('pdftotext')
+                if not executable:
+                    raise ReportExportError('Required Poppler tool unavailable: pdftotext')
+                text = runner([executable, '-enc', 'UTF-8', str(pdf), '-'], cwd=output,
+                    timeout=30, env={'LC_ALL': 'C'})
             raw = text.encode('utf-8', errors='strict')
-            if len(raw) > (64_000 if rule == 'max_pages' else 1_000_000) or '\ufffd' in text:
+            if rule != 'max_pages' and (len(raw) > 1_000_000 or '\ufffd' in text):
                 raise ReportExportError('Poppler output exceeds check bound or contains replacement characters; no complete check')
             path = evidence / ('pdfinfo.txt' if rule == 'max_pages' else 'text.txt')
             path.write_bytes(raw)
@@ -1006,15 +1061,16 @@ def _check_publication_pdf(output: Path, receipt: dict[str, Any], *, runner: Cal
                          else 'blocked' if any(row['status'] == 'blocked' for row in results.values()) else 'failed')
 
 
-def _render_pdf_preview(output: Path, *, runner: Callable) -> dict[str, Any]:
+def _render_pdf_preview(output: Path, *, runner: Callable, pdf_info: dict | None = None) -> dict[str, Any]:
     """Render all actual pages under fixed bounds; never infer visual quality."""
-    pdfinfo, pdftoppm = shutil.which('pdfinfo'), shutil.which('pdftoppm')
-    if not pdfinfo or not pdftoppm:
+    pdftoppm = shutil.which('pdftoppm')
+    if not pdftoppm:
         raise ReportExportError("PDF preview requires Poppler pdfinfo and pdftoppm; compiled PDF and editable source retained")
     pdf = output / 'main.pdf'
     if not pdf.is_file() or not pdf.stat().st_size:
         raise ReportExportError("Compiled PDF is missing or empty; requested preview unavailable")
-    info = runner([pdfinfo, str(pdf)], cwd=output, timeout=30, env={'LC_ALL': 'C'})
+    digest = hashlib.sha256(pdf.read_bytes()).hexdigest()
+    info = _pdf_information(pdf, runner=runner, cache=pdf_info if pdf_info is not None else {})
     counts = re.findall(r'^Pages:\s*([0-9]+)\s*$', info, re.M)
     if len(counts) != 1:
         raise ReportExportError("Poppler did not report one PDF page count; no bounded full preview")
@@ -1043,12 +1099,15 @@ def _render_pdf_preview(output: Path, *, runner: Callable) -> dict[str, Any]:
                 image.load()
         except (OSError, SyntaxError, Image.DecompressionBombError) as exc:
             raise ReportExportError(f"Invalid PDF preview PNG; retained page {path.name}: {exc}") from exc
+    if hashlib.sha256(pdf.read_bytes()).hexdigest() != digest:
+        raise ReportExportError('PDF changed during preview rendering; retained pages cannot certify this version')
     return {'rendered': True, 'page_count': page_count,
             'pages': [path.relative_to(output).as_posix() for path in expected]}
 
 
 def _compile(output: Path, has_citations: bool, *, runner: Callable | None = None,
-             engine: str = 'pdflatex') -> dict[str, Any]:
+             engine: str = 'pdflatex', preflight: Callable[[dict[str, int]], None] | None = None,
+             following_processes: dict[str, int] | None = None) -> dict[str, Any]:
     if engine not in {'pdflatex', 'xelatex'}:
         raise ReportExportError('Unsupported TeX engine')
     latex, bibtex = shutil.which(engine), shutil.which("bibtex")
@@ -1059,6 +1118,11 @@ def _compile(output: Path, has_citations: bool, *, runner: Callable | None = Non
     commands = [command, *([[bibtex, "main"]] if has_citations else []), command, command]
     logs: list[str] = []
     try:
+        if preflight is not None:
+            preflight({'process_invocations': len(commands) + (following_processes or {}).get('process_invocations', 0),
+                # Sequential processes settle unused time between invocations;
+                # their timeout sum is not a minimum execution cost.
+                'process_wall_seconds': max(90,(following_processes or {}).get('process_wall_seconds',0))})
         for argv in commands:
             logs.append((runner or _run)(argv, cwd=output, timeout=90, env=env))
     except ReportExportResourceError as exc:

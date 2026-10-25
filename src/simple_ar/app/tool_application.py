@@ -253,11 +253,21 @@ class _WorkPlanStep(BaseModel):
         return self
 
 
+class _WorkNote(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    text: str = Field(min_length=1, max_length=1500,
+        description='Compact working understanding, decision, failed approach or open question; not verified evidence or permission.')
+    records: list[str] = Field(default_factory=list, max_length=16,
+        description='Existing observation record locators supporting this note. The owner binds actual versions; do not copy hashes.')
+
+
 class _OperationPlan(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
     explanation: str = Field(default='',max_length=1200)
-    steps: list[_WorkPlanStep] = Field(min_length=1,max_length=8)
+    steps: list[_WorkPlanStep] = Field(default_factory=list,max_length=8)
     evidence_records: list[str] = Field(default_factory=list,max_length=12)
+    notes: list[_WorkNote] | None = Field(default=None, max_length=16,
+        description='Optional replacement working-note snapshot, retained across feedback. Omit to keep prior notes; [] clears. Summaries do not replace original observations.')
 
 
 class _ReportIntent(BaseModel):
@@ -382,6 +392,8 @@ class ToolApplication:
         config, root = self.state['config'], self.session.store.root
         if config['control_protocol'] != PROTOCOL:
             raise ValueError('Unsupported saved operation control protocol')
+        if config.get('context_protocol') not in {None,'conversation.v1','working.v1'}:
+            raise ValueError('Unsupported saved operation context; no silent migration')
         for alias, snapshot in config.get('source_snapshots', {}).items():
             source = Path(config['sources'][alias])
             if (not source.is_file() or source.stat().st_size != snapshot['size_bytes']
@@ -397,7 +409,8 @@ class ToolApplication:
                 description='Read original closed native observations from this task, with bounded paging; history is not current file state.')]
         coordination.append(CommonToolSpec(name='update_work_plan',domain='coordination',permission_level='plan',
             input_schema=_OperationPlan.model_json_schema(),
-            description='Save a concise optional work plan or replace its unexecuted steps after observations. '
+            description='Save a concise optional work plan and durable working notes after coherent investigation or revision. '
+                'Notes cite existing observation records; recorded versions are bound by the owner and survive context eviction. '
                 'No automatic scheduling, permission, evidence or requirement to use a plan. '
                 'Do not declare report_intent; the actual delivery identifies its manuscript.'))
         self.operations = OperationTools(root=root,config=config,ledger=self.ledger,
@@ -764,7 +777,7 @@ class ToolApplication:
                     'or preselected windows. Explicit adopt_draft independently checks an existing candidate '
                     'rather than regenerating it. No execution, network, visual or scientific certification. '
                     'Returns editable manuscript and review records for the same publication owner.')
-        if self.state['config'].get('context_protocol') == 'conversation.v1':
+        if self.state['config'].get('context_protocol') in {'conversation.v1','working.v1'}:
             schemas = [{**row, 'function': {**row['function'],
                 'parameters': compact_json_schema(row['function']['parameters'])}} for row in schemas]
         return schemas
@@ -892,6 +905,92 @@ class ToolApplication:
                     return {**result['data'],
                         'record': 'records/' + item['result'].removeprefix('attempts/')}
         return None
+
+    def _working_notes(self) -> list[dict]:
+        """Latest explicit snapshot from the original journal, including prior feedback.
+
+        This is model-authored working understanding, never another fact store.
+        """
+        for turn in reversed(self.state['turns']):
+            for item in reversed(turn['tools']):
+                result = self.session.store.read_json(item['result'])
+                data = result.get('data') or {}
+                if (result.get('tool_name') == 'update_work_plan' and result.get('status') == 'ok'
+                        and isinstance(data.get('notes'), list)):
+                    return self.operations.project_notes(data['notes'])
+            checkpoint = self._checkpoint_for_turn(turn)
+            if checkpoint is not None:
+                return self.operations.project_notes(checkpoint['notes'])
+        return []
+
+    def _checkpoint_for_turn(self, turn: dict) -> dict | None:
+        return self._committed_memory_record(turn,'memory_snapshot.json')
+
+    def _committed_memory_record(self, turn: dict, path: str) -> dict | None:
+        store = ArtifactStore(self.session.store.root / Path(turn['reply']).parent)
+        if not store.exists(path):
+            return None
+        manifest, capability = store.read_attempt_manifest(), store.read_capability_result()
+        if (manifest.status != 'completed' or capability.status != 'completed'
+                or not any(ref.path==path
+                    and ref in capability.artifacts for ref in manifest.outputs)):
+            return None
+        refs = self._memory_artifacts(store, manifest.attempt_id)
+        if any(ref not in capability.artifacts or ref not in manifest.outputs for ref in refs):
+            raise ValueError('Retained checkpoint records are not registered attempt outputs')
+        return store.read_json(path)
+
+    def _memory_artifacts(self, store: ArtifactStore, attempt_id: str) -> tuple:
+        if not any(store.exists(path) for path in ('memory_input.json','memory_response.json',
+                'memory_snapshot.json','memory_failure.json')):
+            return ()
+        if self.operations is None:
+            raise ValueError('Working-memory records require the operation-composed loop')
+        view = store.read_json('memory_input.json')
+        through = view.get('archive_through_turn')
+        if through is not None and (type(through) is not int or not 0 < through <= len(self.state['turns'])):
+            raise ValueError('Checkpoint archive input scope exceeds the original journal')
+        for row in view['observations']:
+            turn = row['turn']
+            if (type(turn) is not int or not 0 <= turn < len(self.state['turns'])
+                    or row['record'] not in {'records/'+item['result'].removeprefix('attempts/')
+                        for item in self.state['turns'][turn]['tools']}):
+                raise ValueError('Checkpoint observation disagrees with its original journal position')
+        from simple_ar.app.work_memory import checkpoint_artifacts
+        return checkpoint_artifacts(store=store,ledger=self.ledger,attempt_id=attempt_id,
+            session_id=self.session.manifest.session_id,bind_notes=self.operations.bind_notes)
+
+    def _compact_work(self, context: Any, client: Any, cutoff: int) -> tuple:
+        """Checkpoint old closed work through the same model attempt and ledger."""
+        if self._request_capacity()<2 or not cutoff:
+            return ()
+        previous = next((snapshot for turn in reversed(self.state['turns'])
+            if (snapshot:=self._checkpoint_for_turn(turn)) is not None),
+            {'through_turn':0,'notes':[]})
+        previous = {**previous,'notes':self._working_notes()}
+        delivery_feedback = self._delivery_feedback()
+        failure = next((record for turn in reversed(self.state['turns'])
+            if (record:=self._committed_memory_record(turn,'memory_failure.json')) is not None),None)
+        if failure is not None and failure['attempted_through_turn'] > previous['through_turn']:
+            previous['attempted_through_turn'] = failure['attempted_through_turn']
+        rows = []
+        for number in range(previous['through_turn'],cutoff):
+            turn = self.state['turns'][number]
+            if turn.get('remaining'):
+                break
+            reply = self.session.store.read_json(turn['reply'])
+            calls = {call['id']:call for call in reply.get('tool_calls',[])}
+            for item in turn['tools']:
+                result = self.session.store.read_json(item['result'])
+                indexed = self._history_observation(calls[item['id']],result,item['result'])
+                rows.append({'turn':number,'record':'records/'+item['result'].removeprefix('attempts/'),
+                    'arguments':indexed['arguments'],'result':self._coordination_result(result,indexed['record'],
+                        delivery_feedback=delivery_feedback)})
+        from simple_ar.app.work_memory import compact_work
+        _, refs = compact_work(store=context.store,client=client,requests=self.state['requests'],
+            previous=previous,rows=rows,bind_notes=self.operations.bind_notes,
+            estimate_tokens=estimate_tokens,attempt_id=context.attempt.attempt_id)
+        return refs
 
     def _report_projection(self) -> dict[str, Any]:
         """Effective obligation from frozen configuration and accepted plan receipts."""
@@ -1171,7 +1270,10 @@ class ToolApplication:
             if name == 'update_work_plan':
                 if self.operations is not None:
                     plan = _OperationPlan.model_validate(arguments)
-                    return ToolResult(tool_name=name,data={**plan.model_dump(),
+                    data = plan.model_dump(exclude_none=True)
+                    if plan.notes is not None:
+                        data['notes'] = self.operations.bind_notes([note.model_dump() for note in plan.notes])
+                    return ToolResult(tool_name=name,data={**data,
                         'request_count':len(self.state['requests']),'scope':'intention_not_verified_outcome'},
                         summary='Optional work plan saved; actual observations and authorization remain authoritative.')
                 plan = _WorkPlan.model_validate(arguments)
@@ -1518,15 +1620,19 @@ class ToolApplication:
                investigate_results: bool = True,
                control_protocol: Literal['operations.v1'] | None = 'operations.v1',
                creation_declarations: dict[str, Any] | None = None,
-               context_protocol: Literal['conversation.v1'] | None = 'conversation.v1') -> ToolApplication:
+               context_protocol: Literal['auto', 'conversation.v1', 'working.v1'] | None = 'auto') -> ToolApplication:
         """Create operation-composed work; explicit None is legacy integration compatibility.
 
         Loading a saved task always uses its persisted protocol, never this default.
         """
-        if context_protocol not in {None, 'conversation.v1'}:
+        if context_protocol == 'auto':
+            context_protocol = 'working.v1' if control_protocol is not None else 'conversation.v1'
+        if context_protocol not in {None, 'conversation.v1', 'working.v1'}:
             raise ValueError('Unsupported context protocol')
-        if creation_declarations is not None and context_protocol != 'conversation.v1':
-            raise ValueError('Declared inputs require conversation.v1')
+        if context_protocol == 'working.v1' and control_protocol is None:
+            raise ValueError('Working context requires the operation-composed loop')
+        if creation_declarations is not None and context_protocol not in {'conversation.v1','working.v1'}:
+            raise ValueError('Declared inputs require a journal-backed conversation context')
         config, reused, limits, attempts = cls._configuration(root, goal, model=model, sources=sources,
             allow_execution=allow_execution, allow_network=allow_network, allow_vision=allow_vision,
             max_turns=max_turns, max_tokens=max_tokens, max_images=max_images, project_python=project_python,
@@ -2065,8 +2171,13 @@ class ToolApplication:
         self._save()
         return True
 
-    def _coordination_result(self, result: dict, record: str) -> dict:
+    def _coordination_result(self, result: dict, record: str, *, delivery_feedback: dict | None = None) -> dict:
         """Owner-authored presentation; never mutate the canonical observation."""
+        if self.operations is not None:
+            presented = workspace_observation_view(self.gateway.coordination_result(result,record),record=record)
+            if delivery_feedback is not None and delivery_feedback['record']==record:
+                return {**presented,'delivery_check':delivery_feedback}
+            return presented
         if self.state['config'].get('professional_work') in _PROFESSIONAL_WORK:
             return self.gateway.coordination_result(result, record)
         return result
@@ -2254,11 +2365,12 @@ class ToolApplication:
             json.dumps(turns, ensure_ascii=False)) else turns
 
     def _messages(self, *, client: LLMClient | None = None, closing: bool = False,
-                  native_history_start_turn: int | None = None, schemas: list | None = None) -> list[dict[str, Any]]:
+                  native_history_start_turn: int | None = None, schemas: list | None = None,
+                  working_notes: list[dict] | None = None) -> list[dict[str, Any]]:
         protocol = self.state['config'].get('context_protocol')
-        if protocol == 'conversation.v1':
+        if protocol in {'conversation.v1','working.v1'}:
             return self._conversation_messages(client=client, closing=closing,
-                native_history_start_turn=native_history_start_turn, schemas=schemas)
+                native_history_start_turn=native_history_start_turn, schemas=schemas,working_notes=working_notes)
         if protocol is not None:
             raise ValueError('Unknown saved context protocol; no projection migration')
         config = self.state["config"]
@@ -2840,7 +2952,7 @@ class ToolApplication:
 
     def _conversation_messages(self, *, client: LLMClient | None = None, closing: bool = False,
                                native_history_start_turn: int | None = None,
-                               schemas: list | None = None) -> list[dict[str, Any]]:
+                               schemas: list | None = None, working_notes: list[dict] | None = None) -> list[dict[str, Any]]:
         """One chronological working set; receipts retain their actual text once.
 
         This is historical conversation, not a revalidated evidence cache. Tool
@@ -2848,6 +2960,7 @@ class ToolApplication:
         No file discovery, source reads, model calls or new persisted state.
         """
         config, turns = self.state['config'], self.state['turns']
+        working_mode = config.get('context_protocol')=='working.v1'
         declared = config.get('input_contract') == _DECLARED_INPUTS
         client = client or self._client()
         focus = self._work_focus()
@@ -2866,7 +2979,7 @@ class ToolApplication:
         report = self._report_projection()
         plan = self._work_plan()
         context = {
-            'context_protocol': 'conversation.v1', 'requests': self.state['requests'],
+            'context_protocol': config['context_protocol'], 'requests': self.state['requests'],
             'mounts': config['sources'], 'workspace': str(self.workspace.workspace),
             'authorized_roots': {name: str(path) for name, path in self.workspace.mounts.items()},
             'permissions': sorted(self.gateway.policy.allowed_permissions),
@@ -2932,6 +3045,9 @@ class ToolApplication:
         if self.operations is not None:
             for name in ('report_protocol','work_focus','work_focus_authority','work_inputs'):
                 context.pop(name,None)
+            delivery_feedback = self._delivery_feedback()
+            if delivery_feedback:
+                context['last_delivery_check'] = delivery_feedback
         if config.get('report_protocol') == _REPORT_PROTOCOL and not (declared and closing):
             context['report_protocol']['instruction'] = (
                 'Declare report, original-text conversion or none using update_work_plan.report_intent, '
@@ -2948,6 +3064,7 @@ class ToolApplication:
         columns = ['turn', 'request_count', 'reply', 'operations']
         operation_columns = ['id', 'tool', 'arguments', 'record', 'status', 'error', 'artifacts', 'outcome']
         blocks, index, supplies, request_blocks = [], [], [], []
+        working_rows = []
         professional_outcomes = []
         count = 1
         for position, turn in enumerate(turns):
@@ -2968,7 +3085,8 @@ class ToolApplication:
                 item = results.get(call_id)
                 result = self.session.store.read_json(item['result']) if item else {'status': 'not_executed'}
                 record = 'records/' + item['result'].removeprefix('attempts/') if item else None
-                presented = self._coordination_result(result, record) if item else result
+                presented = self._coordination_result(result, record,
+                    delivery_feedback=delivery_feedback if self.operations is not None else None) if item else result
                 if item:
                     presented_results[call_id] = presented
                 indexed = self._history_observation(call, result, item['result'] if item else turn['reply'])
@@ -2989,11 +3107,19 @@ class ToolApplication:
                             'call_id': call_id, 'field': 'function.arguments.content', 'role': 'write_context',
                             'path': arguments.get('path'), 'text_bytes': len(text.encode('utf-8')),
                             'text_characters': len(text), 'version_scope': 'Authored payload, not evidence or current file state'})
+                        if config.get('context_protocol') == 'working.v1' and item and result.get('status') == 'ok':
+                            data = result.get('data') or {}
+                            working_rows.append({**supplied[-1], 'text':text,
+                                **{key:data[key] for key in ('absolute_path','sha256') if key in data}})
                 if item:
                     block.append({'role': 'tool', 'tool_call_id': call_id,
                         'content': json.dumps(presented,
                             ensure_ascii=False, separators=(',', ':'))})
                     data = result.get('data') or {}
+                    if working_mode and not isinstance(data.get('text'),str) and call['function']['name']!='write_file':
+                        working_rows.append({'turn':position,'record':record,'kind':'operation_result',
+                            'tool':call['function']['name'],'text':json.dumps(presented,ensure_ascii=False,separators=(',',':')),
+                            'version_scope':'Historical operation result, not proof of current output bytes or new permission'})
                     text_rows = [(data, 'data.text')]
                     text_rows.extend((row.get('data') or {}, f'data.inputs.{number}.data.text')
                         for number, row in enumerate(data.get('inputs') or []) if isinstance(row, dict))
@@ -3012,6 +3138,8 @@ class ToolApplication:
                                 'next_offset_bytes', 'has_more', 'chunk_id') if key in row},
                             'text_bytes': len(text.encode('utf-8')), 'text_characters': len(text),
                             'version_scope': 'Recorded observation; current bytes not revalidated by conversation projection'})
+                        if config.get('context_protocol') == 'working.v1':
+                            working_rows.append({**supplied[-1], 'text':text})
             index.append([position, current, 'records/' + turn['reply'].removeprefix('attempts/'), operations])
             if complete:
                 professional_outcomes.extend({'turn': position, 'request_count': current,
@@ -3030,11 +3158,43 @@ class ToolApplication:
             supplies.append(supplied)
             if turn.get('origin') == 'caller' or not complete:
                 boundary = max(boundary, position + 1)
+        if self.operations is not None and self._unacted_reply_count():
+            blocks[-1].append({'role':'system','content':
+                'The preceding assistant text did not execute an operation or record delivery. '
+                'Use an offered operation or submit a valid delivery/question under the original goal and permissions. '
+                'Preserve completed work; textual completion claims are not a saved delivery.'})
         feedback = [{'role': 'user', 'content': (json.dumps({'user_request': {'index': number, 'text': self.state['requests'][number]}},
             ensure_ascii=False) if declared else self.state['requests'][number])} for number in range(count, len(self.state['requests']))]
         prefix = [{'role': 'system', 'content': self._system_text(closing=closing)},
                   {'role': 'user', 'content': ''}]
         schema_cost = estimate_tokens(json.dumps(self.schemas if schemas is None else schemas, ensure_ascii=False))
+        if config.get('context_protocol') == 'working.v1':
+            from simple_ar.app.working_context import select_working_context
+            context.pop('requests',None)  # Requests are retained verbatim as messages, once.
+            context['current_request_index'] = len(self.state['requests'])-1
+            context['history_archive'] = {'total_turns':len(turns), 'access':'read_history',
+                'native_history_start_turn':boundary,
+                'scope':'All original replies and receipts remain available; no generated summary replaces them.'}
+            def version(path):
+                try:
+                    return self.workspace.artifact_hashes([path])[path]
+                except (ValueError,OSError):
+                    return None
+            messages, selection = select_working_context(user_requests=self.state['requests'],
+                system_text=prefix[0]['content'],base_context=context,
+                turn_blocks=[block if position>=boundary else [] for position,block in enumerate(blocks)],
+                observations=working_rows, schema_tokens=schema_cost,context_token_target=target,
+                estimate_tokens=estimate_tokens,work_notes=(self._working_notes() if working_notes is None else working_notes),
+                selected_records=(plan or {}).get('evidence_records',[]),version_resolver=version,
+                block_request_counts=[turn.get('request_count',1) for turn in turns])
+            cost = estimate_tokens(json.dumps(messages,ensure_ascii=False))+schema_cost
+            if remaining is not None and cost+output>remaining:
+                raise ValueError('Current working view exceeds the remaining token allowance; no request sent')
+            if getattr(client._settings, 'thinking_mode', '') == 'enabled' and any(
+                    message['role'] == 'assistant' and not any(isinstance(message.get(key), str)
+                        for key in ('reasoning_content', 'reasoning')) for message in messages):
+                raise ValueError('Native history lacks reasoning_content or reasoning; explicitly switch models to start a new native session')
+            return messages
         start = boundary
 
         def project() -> tuple[list, int]:
@@ -3199,6 +3359,25 @@ class ToolApplication:
     def _model(self, *, context: Any) -> CapabilityResult:
         client = self._client(context.attempt.attempt_id)
         messages = self._messages(client=client)
+        memory_refs = ()
+        working_notes = None
+        if (self.state['config'].get('context_protocol')=='working.v1'
+                and not (self.state.get('pending') or {}).get('skip_memory_checkpoint')):
+            projection = json.loads(messages[1]['content'])
+            cutoff = projection.get('working_context',{}).get('recent_start_turn',0)
+            # Optional continuity work must leave the actual decision affordable.
+            with self.ledger.protect_remaining({'llm_requests':1,
+                    'total_tokens':self._decision_tokens(client,messages)}):
+                memory_refs = self._compact_work(context,client,cutoff)
+            if context.store.exists('memory_snapshot.json'):
+                snapshot = context.store.read_json('memory_snapshot.json')
+                # The checkpoint belongs to this attempt, not a second mutable
+                # task state. Present it for this decision, then adopt only when
+                # the native turn and its registered outputs commit normally.
+                working_notes = self.operations.project_notes(snapshot['notes'])
+            if memory_refs:
+                memory_refs = self._memory_artifacts(context.store,context.attempt.attempt_id)
+                messages = self._messages(client=client,working_notes=working_notes)
         floor = self._completion_floor(client, messages)
         remaining = self.ledger.remaining('total_tokens')
         # A last affordable decision can deliver/question, but its retry must
@@ -3211,7 +3390,7 @@ class ToolApplication:
         if closing:
             # Include the closing contract before context trimming/reservation,
             # not as an unbudgeted suffix added to a capacity-fitted request.
-            messages = self._messages(client=client, closing=True, schemas=schemas)
+            messages = self._messages(client=client, closing=True, schemas=schemas,working_notes=working_notes)
             floor = {'llm_requests': 1, 'total_tokens': self._decision_tokens(client, messages, schemas=schemas)}
         # Every new decision records its actual offer, even when no completion
         # reservation applies. Old replies without the marker remain unchanged.
@@ -3225,8 +3404,8 @@ class ToolApplication:
                 if self.state['config'].get('professional_work') == _REQUEST_OWNER else {}),
             **({'document_request': 'work.v2'}
                 if self.state['config'].get('professional_inputs') == 'owner.v3' else {}),
-            **({'context_protocol': 'conversation.v1'}
-                if self.state['config'].get('context_protocol') == 'conversation.v1' else {}),
+            **({'context_protocol': self.state['config']['context_protocol']}
+                if self.state['config'].get('context_protocol') in {'conversation.v1','working.v1'} else {}),
             **({'closing_action_contract': 'single_terminal.v1'} if closing else {}),
             'input_projection': {
                 'resources': projection['resources'],
@@ -3234,6 +3413,8 @@ class ToolApplication:
                     if 'professional_outcomes' in projection else {}),
                 'tool_names': [row['function']['name'] for row in schemas],
                 'material_supply': projection['material_supply'],
+                **({'working_context':projection['working_context']}
+                    if 'working_context' in projection else {}),
                 'supplied': [{key: row[key] for key in ('path', 'sha256', 'record', 'role', 'evidence_role',
                         'offset_bytes', 'next_offset_bytes', 'version_scope', 'overlap_scope') if key in row}
                     | ({'passage_range': {key: row['passage'][key] for key in
@@ -3241,7 +3422,7 @@ class ToolApplication:
                         if 'passage' in row else {})
                     for row in [*projection['retained_text_windows'], *projection['retained_source_passages'],
                         *(projection['material_supply']['native_context']
-                            if projection.get('context_protocol') == 'conversation.v1' else [])]],
+                            if projection.get('context_protocol') in {'conversation.v1','working.v1'} else [])]],
                 'work_inputs': [{key: value for key, value in row.items() if key != 'data'} |
                     {'data': {key: value for key, value in row.get('data', {}).items() if key != 'text'}}
                     for row in projection.get('work_inputs', {}).get('windows', [])]},
@@ -3251,7 +3432,7 @@ class ToolApplication:
             message = client.chat_turn(messages, tools=schemas,
                 label="native-turn", budget_call_id=context.attempt.attempt_id)
         ref = context.store.write_json("native_result.json", message, kind="native_reply")
-        return CapabilityResult(status="completed", artifacts=(ref,))
+        return CapabilityResult(status="completed", artifacts=(*memory_refs,ref))
 
     def _tool(self, *, context: Any, call: dict[str, Any]) -> CapabilityResult:
         refusal = self._offered_tool_refusal(call)
@@ -3865,6 +4046,44 @@ class ToolApplication:
             return f'Accepted actions have unresolved failures ({", ".join(failed)}); inspect results or disclose unresolved work before delivery.'
         return ''
 
+    def _unacted_reply_count(self) -> int:
+        count = 0
+        for turn in reversed(self.state['turns']):
+            if turn.get('request_count',1) != len(self.state['requests']) or turn['tools'] or turn['remaining']:
+                break
+            reply = self.session.store.read_json(turn['reply'])
+            if reply.get('tool_calls') or not isinstance(reply.get('content'),str) or not reply['content'].strip():
+                break
+            count += 1
+        return count
+
+    def _delivery_feedback(self) -> dict | None:
+        """Current fulfillment check of the latest proposal, not another task state."""
+        observations = self._operation_observations()
+        for turn in reversed(self.state['turns']):
+            calls = {row['id']:row for row in self.session.store.read_json(turn['reply']).get('tool_calls',[])}
+            for item in reversed(turn['tools']):
+                call = calls[item['id']]
+                payload = self.session.store.read_json(item['result'])
+                delivery = self._delivery(call,payload)
+                if payload.get('status') != 'ok' or delivery is None:
+                    continue
+                request_count = turn.get('request_count',1)
+                if (request_count != len(self.state['requests']) and self.session.store.exists('delivery.json')
+                        and self.session.store.read_json('delivery.json') == delivery):
+                    return None  # Accepted prior work is not a new revision's unfinished proposal.
+                try:
+                    issues = self.operations.delivery_issues(observations,delivery)
+                except (ValueError,OSError,KeyError,TypeError,RuntimeError) as exc:
+                    issues = [str(exc)]
+                return {'record':'records/'+item['result'].removeprefix('attempts/'),
+                    'request_count':request_count,
+                    'status':'rejected' if issues else 'conditions_met',
+                    'issues':issues,'scope':'Current check of the previous delivery proposal; execution success is not acceptance. '
+                        'Preserve completed work; the current user request determines whether to continue or replace this proposal. '
+                        'This grants no permission and does not add requirements to a new goal.'}
+        return None
+
     def _commit_terminal(self, progress: Callable[[str], None]) -> bool:
         """Consume a closed current-revision observation before any new decision."""
         if not self.state['turns'] or self.state['pending'] is not None:
@@ -3881,9 +4100,23 @@ class ToolApplication:
         payload = self.session.store.read_json(observed['result'])
         if not self._terminal_intent(call) or payload.get('status') != 'ok':
             return False
+        if self.operations is not None and self._completion(call['function']['name']).kind == 'delivery':
+            # Execution and fulfillment have different owners. Only a closed,
+            # byte-bound result may return a semantic rejection to the loop;
+            # corruption or unconfirmed work still stops without replay.
+            delivery = self._delivery(call,payload)
+            hashes = (payload.get('metadata') or {}).get('delivery_hashes')
+            if delivery is None or hashes is None or self.workspace.artifact_hashes(
+                    delivery['artifacts']) != hashes:
+                raise ValueError('Delivery version is unbound or changed; inspect retained results before continuing')
         terminal_error = self._terminal_error(call)
         if terminal_error:
-            raise ValueError(f'Retained terminal observation cannot be committed: {terminal_error}')
+            if self.operations is None or self.session.manifest.status in {'completed','partial'}:
+                raise ValueError(f'Retained terminal observation cannot be committed: {terminal_error}')
+            if self.session.manifest.status == 'paused':
+                self.session.continue_with_revision('Continue after rejected delivery; completed producer work is not replayed')
+            progress('Delivery not accepted; completed work retained: '+terminal_error)
+            return False
         if self._completion(call['function']['name']).kind == 'question':
             data = validate_workspace_arguments('ask_user', payload['data']).model_dump()
             self.session.pause(data['question'])
@@ -3982,9 +4215,10 @@ class ToolApplication:
                     raise ValueError('Saved native observation disagrees with its retained domain result')
             if not store.exists("capability_result.json"):
                 store.write_capability_result(recovered or CapabilityResult(status="completed",
-                    artifacts=self._native_artifacts(store, store.read_json('native_result.json'),
+                    artifacts=(*(self._memory_artifacts(store,identity) if capability == 'native_turn' else ()),
+                        *self._native_artifacts(store, store.read_json('native_result.json'),
                         name=pending.get('call', {}).get('function', {}).get('name', ''),
-                        kind='native_result' if capability == 'native_turn' else 'native_observation')))
+                        kind='native_result' if capability == 'native_turn' else 'native_observation'))))
             self.session.reconcile_attempt(identity)
         else:
             result = self.session.execute_attempt(capability, attempt_id=identity,
@@ -4180,7 +4414,10 @@ class ToolApplication:
         if not store.exists('capability_result.json') or not store.exists('native_result.json'):
             return None
         result = store.read_capability_result('capability_result.json')
-        if result.status != 'completed' or [ref.path for ref in result.artifacts] != ['native_result.json']:
+        memory_refs = self._memory_artifacts(store,identity)
+        if (result.status != 'completed'
+                or [ref for ref in result.artifacts if ref.path != 'native_result.json'] != list(memory_refs)
+                or sum(ref.path == 'native_result.json' for ref in result.artifacts) != 1):
             return None
         return attempt
 
@@ -4314,9 +4551,21 @@ class ToolApplication:
         replacement = None
         if model_selector:
             client, replacement = self._replacement_text_client(model_selector, attempt_id=attempt.attempt_id)
+            if self.state['config'].get('max_output_tokens') is not None:
+                client = client.with_output_limit(self.state['config']['max_output_tokens'])
         else:
             client = self._client(pending['attempt'])
         entries = [entry for entry in self.ledger.entries if entry.attempt_id == attempt.attempt_id]
+        from simple_ar.app.work_memory import checkpoint_entries, MEMORY_PURPOSES
+        memory_entries = []
+        if any(entry.logical_call_id == 'working-memory-'+attempt.attempt_id
+                or entry.purpose in MEMORY_PURPOSES for entry in entries):
+            store = ArtifactStore(self.session.store.root / 'attempts' / attempt.attempt_id)
+            store.require('memory_input.json')
+            memory_entries = checkpoint_entries(self.ledger,attempt.attempt_id,self.session.manifest.session_id)
+            if store.exists('memory_snapshot.json') or store.exists('memory_failure.json'):
+                self._memory_artifacts(store,attempt.attempt_id)
+        entries = [entry for entry in entries if entry not in memory_entries]
         for entry in entries:
             if (entry.purpose != 'native-turn' or entry.logical_call_id != attempt.attempt_id
                     or entry.session_id != self.session.manifest.session_id):
@@ -4330,9 +4579,12 @@ class ToolApplication:
         settings = self._work_connection(binding, self._coordinator_purpose()).get('connection')
         if not settings:
             raise ValueError('Saved model output cap is unavailable; cannot safely retry')
-        saved_cap = LLMClient(LLMSettings(api_key=client._settings.api_key, **{key: settings[key] for key in (
+        saved_client = LLMClient(LLMSettings(api_key=client._settings.api_key, **{key: settings[key] for key in (
             'max_output_tokens', 'reasoning_effort', 'thinking_mode', 'reasoning_output_tokens')
-            if key in settings})).effective_output_limit()
+            if key in settings}))
+        if self.state['config'].get('max_output_tokens') is not None:
+            saved_client = saved_client.with_output_limit(self.state['config']['max_output_tokens'])
+        saved_cap = saved_client.effective_output_limit()
         cap = client.effective_output_limit()
         if cap != saved_cap:
             raise ValueError('Retry requires the saved output setting; restore compatible settings without changing it')
@@ -4368,7 +4620,8 @@ class ToolApplication:
                     'native_history_start_turn': len(self.state['turns']),
                     'reason': 'Explicit --retry-model --model continuation; original task, access and budget retained',
                 }]}
-        self.state['pending'] = {'kind': 'model', 'attempt': identity}
+        self.state['pending'] = {'kind': 'model', 'attempt': identity,
+            **({'skip_memory_checkpoint':True} if memory_entries else {})}
         self._save()
 
     def result_snapshot(self) -> dict[str, Any]:
@@ -4510,7 +4763,9 @@ class ToolApplication:
                     pending = self.state['pending']
                     if pending is None and self.session.manifest.status_reason != 'Caller requested boundary stop':
                         turns = self.state['turns']
-                        if (not turns or turns[-1].get('origin') != 'professional'
+                        correctable_text = (self.operations is not None and self._unacted_reply_count()==1
+                            and not any(entry.status in {'unknown','reserved'} for entry in self.ledger.entries))
+                        if not correctable_text and (not turns or turns[-1].get('origin') != 'professional'
                                 or turns[-1].get('request_count', 1) != len(self.state['requests'])):
                             return self.result_snapshot()
                         retained = self.session.store.read_json(turns[-1]['reply'])
@@ -4520,7 +4775,7 @@ class ToolApplication:
                         # require owner-proven handback or resource continuation.
                         completed_outcome = (turns[-1]['tools'] and not turns[-1]['remaining']
                             and not retained.get('owner_stop'))
-                        if not completed_outcome and not self._professional_stop_can_resume(retained):
+                        if not correctable_text and not completed_outcome and not self._professional_stop_can_resume(retained):
                             return self.result_snapshot()
                     attempts = self.session.list_attempts()
                     if pending is None or not any(a.attempt_id == pending['attempt'] and a.status == 'running' for a in attempts):
@@ -4623,6 +4878,11 @@ class ToolApplication:
                 self.state["pending"] = None
                 self._save()
                 if not calls:
+                    if (self.operations is not None and self._unacted_reply_count()==1
+                            and self._request_capacity()>0
+                            and not any(entry.status in {'unknown','reserved'} for entry in self.ledger.entries)):
+                        progress('Assistant text retained without a delivery; one action correction uses the same budget, no operation replay')
+                        continue
                     self.session.pause("Model returned prose without a delivery or question; inspect the saved reply before continuing")
                     return
                 continue

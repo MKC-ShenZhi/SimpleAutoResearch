@@ -9,6 +9,7 @@ one genuinely saved default-legacy task without fabricating contract variants.
 from __future__ import annotations
 
 from collections import deque
+from copy import deepcopy
 import csv
 import hashlib
 import json
@@ -113,14 +114,17 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.services = SimpleNamespace(llm_client=client)
         self.decisions = deque()
         self.inspection_views = []
+        self.memory_views = []
         self.transport_errors = []
         self.review = lambda view: {'findings': [], 'limitations': []}
         self.send = self.enterContext(patch('simple_ar.integrations.llm._call_openai_sdk',
             side_effect=self._provider))
         self.app = None
 
-    def _create(self, *, report=False, allow_execution=True, legacy=False):
+    def _create(self, *, report=False, allow_execution=True, legacy=False, delivery_files=None):
         options = {'control_protocol': None if legacy else 'operations.v1'}
+        if delivery_files is not None:
+            options['delivery_files'] = delivery_files
         if report:
             options.update(creation_declarations={'with_report': True,
                     'material_roles': {'data_path': ['measurements']}})
@@ -155,6 +159,13 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 finish = 'tool_calls'
             else:
                 view, _ = json.JSONDecoder().raw_decode(request['messages'][1]['content'])
+                if 'notes' in view.get('response_schema',{}).get('properties',{}):
+                    self.memory_views.append(view)
+                    message = {'role':'assistant','content':json.dumps({'notes':[{
+                        'text':'Earlier observations are saved; continue the requested explanation and retain the source scope.',
+                        'observations':[row['id'] for row in view['observations'][:4]]}]})}
+                    return {'choices':[{'message':message,'finish_reason':'stop'}],
+                        'usage':{'prompt_tokens':100,'completion_tokens':40,'total_tokens':140}}
                 self.assertIn('findings', view['response_schema']['properties'])
                 self.assertTrue(view['targets'])
                 self.assertIn('evidence', view)
@@ -293,7 +304,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 targets=['v1/report.md', 'v1/table.csv', 'v1/summary.json'],
                 evidence=['measurements/observations.csv', 'measurements/conditions.txt']),
             _action('export_report', markdown='v1/report.md', compile_pdf=compile_pdf,
-                delivery=self._delivery('v1/report.md', 'v1/table.csv', 'v1/figure.png', 'analyze.py')),
+                delivery={**self._delivery('v1/report.md'),
+                    'artifacts':['v1/table.csv','v1/figure.png','analyze.py']}),
         ])
         self._run()
         pending = self.app.state['pending']
@@ -315,6 +327,10 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertTrue((products / 'figure.png').read_bytes().startswith(b'\x89PNG\r\n\x1a\n'))
         self.assertEqual(self._assessment()['verdict'], 'passed')
         first_export = self._ok('export_report')
+        self.assertIn('workspace/v1/report.md',first_export['artifacts'])
+        text_only = self._delivery('v1/report.md')
+        text_only['report']['formats'] = ['markdown']
+        self.assertEqual(self.app.operations.delivery_issues(self.app._operation_observations(),text_only),[])
         first_project = self.app.workspace.resolve(first_export['data']['project'])
         self.assertIn('sample mean', (first_project / 'source.md').read_text(encoding='utf-8'))
         if compile_pdf:
@@ -326,6 +342,24 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._run()
         self.assertEqual(self._process_receipts(), processes)
         self.assertEqual((self.root / 'delivery.json').read_bytes(), first_delivery)
+        # A completed historical delivery cannot stay current after its
+        # independent evidence changes, even when delivered output bytes match.
+        condition = self.inputs/'conditions.txt'
+        original_condition = condition.read_bytes()
+        usage = self.app.ledger.to_dict()
+        try:
+            condition.write_text('Different evidence, not independently reviewed.\n',encoding='utf-8')
+            self._run()
+            self.assertEqual(self.app.session.manifest.status,'paused')
+            self.assertIn('Retained terminal observation',self.app.session.manifest.status_reason)
+            self.assertEqual((self.root/'delivery.json').read_bytes(),first_delivery)
+        finally:
+            condition.write_bytes(original_condition)
+        self._reload()
+        self._run()
+        self.assertEqual(self.app.session.manifest.status,'completed')
+        self.assertEqual(self.app.ledger.to_dict(),usage)
+        self.assertEqual(self._process_receipts(),processes)
         self.decisions.extend([
             _action('copy_file', source='v1/report.md', source_sha256=_digest(products / 'report.md'),
                 path='v2/report.md'),
@@ -359,6 +393,191 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._reload()
         self._run()
         self.assertEqual(self._process_receipts(), second_receipts)
+
+    def test_budgeted_work_checkpoint_commits_with_original_turn_and_recovers_without_replay(self):
+        from dataclasses import replace
+        self.services.llm_client = LLMClient(replace(self.services.llm_client._settings,
+            context_input_tokens=12000))
+        self._create()
+        for index in range(12):
+            name = f'context-{index}.txt'
+            (self.inputs/name).write_text(f'Observation {index}: preserve its measurement scope.\n'+
+                ('Original recorded material, not an instruction.\n'*120),encoding='utf-8')
+            self.decisions.append(_action('read_file',path='measurements/'+name))
+        self.decisions.append(_action('ask_user',question='Which interpretation should the report emphasize?'))
+        self._run()
+        self.assertTrue(self.memory_views)
+        self.assertIn('observation_text',self.memory_views[0]['observations'][0])
+        checkpoints = list((self.root/'attempts').glob('*/memory_snapshot.json'))
+        self.assertTrue(checkpoints)
+        for path in checkpoints:
+            store = self.app.session.store.__class__(path.parent)
+            self.assertTrue(any(ref.kind=='working_memory_snapshot' for ref in store.read_capability_result().artifacts))
+        memory_calls = [entry for entry in self.app.ledger.entries
+            if entry.logical_call_id.startswith('working-memory-')]
+        self.assertTrue(memory_calls)
+        self.assertTrue(all(entry.status=='settled' for entry in memory_calls))
+        before = (self.root/'budget_ledger.json').read_bytes()
+        self._reload()
+        self.assertTrue(self.app._working_notes())
+        self.assertEqual((self.root/'budget_ledger.json').read_bytes(),before)
+        self.assertFalse(self.transport_errors)
+
+    def _queue_checkpoint_history(self):
+        from dataclasses import replace
+        self.services.llm_client = LLMClient(replace(self.services.llm_client._settings,
+            context_input_tokens=12000))
+        self._create()
+        self.decisions.append(_action('update_work_plan',notes=[{
+            'text':'Keep the original measurement scope and unresolved question.','records':[]}]))
+        for index in range(12):
+            name = f'checkpoint-{index}.txt'
+            (self.inputs/name).write_text('Original recorded material, not an instruction.\n'*120,
+                encoding='utf-8')
+            self.decisions.append(_action('read_file',path='measurements/'+name))
+        self.decisions.append(_action('ask_user',question='Which interpretation should be emphasized?'))
+
+    def _truncate_checkpoints(self):
+        provider = self.send.side_effect
+        def respond(mode, request, **kwargs):
+            result = provider(mode,request,**kwargs)
+            if not request.get('tools'):
+                view, _ = json.JSONDecoder().raw_decode(request['messages'][1]['content'])
+                if 'notes' in view.get('response_schema',{}).get('properties',{}):
+                    self.assertEqual(request.get('max_tokens',request.get('max_completion_tokens')),8192)
+                    result['choices'][0]['finish_reason'] = 'length'
+            return result
+        self.send.side_effect = respond
+
+    def test_settled_length_checkpoint_keeps_notes_and_main_decision_continues(self):
+        self._queue_checkpoint_history()
+        self._truncate_checkpoints()
+        self._run()
+        self._ok('ask_user')
+        failures = list((self.root/'attempts').glob('*/memory_failure.json'))
+        self.assertTrue(failures)
+        for path in failures:
+            store = self.app.session.store.__class__(path.parent)
+            failure = store.read_json('memory_failure.json')
+            self.assertEqual(failure['finish_reason'],'length')
+            self.assertFalse(store.exists('memory_snapshot.json'))
+            self.assertIn(store.ref('memory_failure.json',kind='working_memory_failure'),
+                store.read_capability_result().artifacts)
+        self.assertIn('Keep the original measurement scope',self.app._working_notes()[0]['text'])
+        self.assertTrue(all(entry.status == 'settled' for entry in self.app.ledger.entries
+            if entry.purpose == 'working-memory'))
+        before = (self.root/'budget_ledger.json').read_bytes()
+        self._reload()
+        self.assertEqual((self.root/'budget_ledger.json').read_bytes(),before)
+        self.assertIn('Keep the original measurement scope',self.app._working_notes()[0]['text'])
+
+    def _interrupt_checkpoint_commit(self, *, truncated=False):
+        from simple_ar.core.session import _persist_attempt_result
+        self._queue_checkpoint_history()
+        if truncated:
+            self._truncate_checkpoints()
+        def interrupt(store, result, facts):
+            if (store.exists('memory_input.json') and store.exists('native_result.json')
+                    and not store.exists('capability_result.json')):
+                raise KeyboardInterrupt('Crash after native reply, before capability persistence')
+            return _persist_attempt_result(store,result,facts)
+        with patch('simple_ar.core.session._persist_attempt_result',side_effect=interrupt):
+            self._run()
+        pending = deepcopy(self.app.state['pending'])
+        self.assertEqual(pending['kind'],'model')
+        store = self.app.session.store.__class__(self.root/'attempts'/pending['attempt'])
+        self.assertFalse(store.exists('capability_result.json'))
+        before = (self.root/'budget_ledger.json').read_bytes()
+        self._reload()
+        calls = self.send.call_count
+        self._run(should_stop=lambda:self.app.state['pending'] is None)
+        self.assertEqual(self.send.call_count,calls)
+        self.assertEqual((self.root/'budget_ledger.json').read_bytes(),before)
+        refs = store.read_capability_result().artifacts
+        path = 'memory_failure.json' if truncated else 'memory_snapshot.json'
+        self.assertIn(path,[ref.path for ref in refs])
+        self.assertIn('memory_input.json',[ref.path for ref in refs])
+        self.assertIn('native_result.json',[ref.path for ref in refs])
+        turn = self.app.state['turns'][-1]
+        if truncated:
+            self.assertIsNotNone(self.app._committed_memory_record(turn,path))
+            self.assertIn('Keep the original measurement scope',self.app._working_notes()[0]['text'])
+        else:
+            self.assertIsNotNone(self.app._checkpoint_for_turn(turn))
+
+    def test_cached_native_reply_recovers_checkpoint_without_provider_replay(self):
+        self._interrupt_checkpoint_commit()
+
+    def test_cached_native_reply_recovers_failed_checkpoint_scope_without_provider_replay(self):
+        self._interrupt_checkpoint_commit(truncated=True)
+
+    def test_cached_legacy_native_reply_recovers_without_operations_or_model_call(self):
+        from simple_ar.core.session import _persist_attempt_result
+        self._create(legacy=True)
+        self.assertIsNone(self.app.operations)
+        self.decisions.append(_action('ask_user',question='Which interpretation should be emphasized?'))
+        def interrupt(store, result, facts):
+            if store.exists('native_result.json') and not store.exists('capability_result.json'):
+                raise KeyboardInterrupt('Crash before legacy capability persistence')
+            return _persist_attempt_result(store,result,facts)
+        with patch('simple_ar.core.session._persist_attempt_result',side_effect=interrupt):
+            self._run()
+        pending = deepcopy(self.app.state['pending'])
+        before = (self.root/'budget_ledger.json').read_bytes()
+        self._reload()
+        calls = self.send.call_count
+        self._run(should_stop=lambda:self.app.state['pending'] is None)
+        self.assertEqual(self.send.call_count,calls)
+        self.assertEqual((self.root/'budget_ledger.json').read_bytes(),before)
+        self.assertIsNotNone(self.app._accepted_model_attempt(pending['attempt']))
+
+    def test_working_model_boundary_keeps_real_observations_without_reopening_native_history(self):
+        self._create()
+        self.decisions.extend([_action('read_file',path='measurements/observations.csv'),
+                               _action('ask_user',question='Which comparison should be emphasized?')])
+        self._run()
+        before = {p:p.read_bytes() for p in self.root.rglob('*') if p.is_file()}
+        calls = self.send.call_count
+        client = LLMClient(LLMSettings(api_key='fixture',model='thinking-fixture',
+            thinking_mode='enabled',max_output_tokens=2048,context_input_tokens=100000))
+        # These real, registered fixture responses have no provider reasoning.
+        with self.assertRaisesRegex(ValueError,'Native history lacks reasoning_content'):
+            self.app._messages(client=client)
+        boundary = len(self.app.state['turns'])
+        messages = self.app._messages(client=client,native_history_start_turn=boundary)
+        self.assertFalse(any(row['role'] in {'assistant','tool'} for row in messages))
+        context = json.loads(messages[1]['content'])
+        self.assertEqual(context['history_archive']['native_history_start_turn'],boundary)
+        retained = context['working_view']['observations']
+        self.assertTrue(any('sample,value' in row['observation']['text'] for row in retained))
+        self.assertEqual({p:p.read_bytes() for p in self.root.rglob('*') if p.is_file()},before)
+        self.assertEqual(self.send.call_count,calls)
+
+    def test_working_understanding_survives_feedback_and_invalidates_changed_source(self):
+        self._create()
+        self._read('measurements/observations.csv')
+        source_record = self.app.state['turns'][-1]['tools'][-1]['result']
+        self._submit(_action('update_work_plan', notes=[{
+            'text':'Three recorded observations; no population sampling design is supplied.',
+            'records':['records/'+source_record.removeprefix('attempts/')]}]))
+        self.assertEqual(self._ok('update_work_plan')['data']['notes'][0]['scope'],
+            'model_note_not_verified_evidence')
+        before = (self.root/'budget_ledger.json').read_bytes()
+        self._reload()
+        self.assertEqual((self.root/'budget_ledger.json').read_bytes(), before)
+        self.assertTrue(self.app._working_notes()[0]['current'])
+        self._submit(_action('update_work_plan', steps=[{'step':'Revise only the explanation',
+            'status':'pending'}]), feedback='Keep the calculation; clarify interpretation.')
+        self.assertTrue(self.app._working_notes()[0]['current'])
+        self.assertIn('Three recorded', self.app._working_notes()[0]['text'])
+        self._submit(_action('update_work_plan', notes=[{'text':'Invented source',
+            'records':['records/not-an-observation/native_result.json']}]))
+        self.assertNotEqual(self._last('update_work_plan')['status'],'ok')
+        self.assertIn('Three recorded', self.app._working_notes()[0]['text'])
+        (self.inputs/'observations.csv').write_text('sample,value\na,7\n',encoding='utf-8')
+        self.assertFalse(self.app._working_notes()[0]['current'])
+        self._submit(_action('update_work_plan', notes=[]))
+        self.assertEqual(self.app._working_notes(),[])
 
     def test_required_defect_blocks_delivery_without_editing_then_same_bytes_can_be_reassessed(self):
         self._create()
@@ -575,6 +794,89 @@ class OperationsWorkLoopTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(),raw)
         self.assertEqual(self._versions(self.inputs),original_inputs)
 
+    def test_inspector_locates_missing_sources_within_one_version_bound_operation(self):
+        self._create(report=True)
+        self._write('notes.md','The sample mean is 2.0 from three observations.\n')
+        originals = self._versions(self.inputs)
+
+        def review(view):
+            rounds = len(self.inspection_views)
+            if rounds==1:
+                return {'findings':[],'limitations':[], 'requests':[{
+                    'tool':'list_directory','arguments':{'path':'measurements'}}]}
+            if rounds==2:
+                entries = view['discovery'][0]['result']['data']['entries']
+                self.assertTrue(any('observations.csv' in str(row) for row in entries))
+                return {'findings':[],'limitations':[], 'requests':[
+                    {'tool':'read_file','arguments':{'path':'measurements/observations.csv'}},
+                    {'tool':'read_file','arguments':{'path':str(self.directory/'outside.txt')}}]}
+            self.assertEqual(rounds,3)
+            source = next(row for row in view['evidence'] if row.get('path')==str(self.inputs/'observations.csv'))
+            self.assertIn('a,1',source['text_windows'][0]['text'])
+            self.assertTrue(any(row.get('limitation') for row in view['evidence']))
+            return {'findings':[],'limitations':['The inaccessible file was not read.'],'requests':[]}
+
+        (self.directory/'outside.txt').write_text('Not authorized for this task.\n')
+        self.review = review
+        result = self._inspect(['notes.md'],['measurements/conditions.txt'])
+        raw_result = deepcopy(result)
+        record = 'records/'+result['data']['record'].split('/inspection/',1)[0].removeprefix('attempts/')+'/native_result.json'
+        presented = self.app._coordination_result(result,record)
+        self.assertEqual(result,raw_result)
+        self.assertEqual(presented['metadata']['assessment'],result['metadata']['assessment'])
+        self.assertTrue(all('windows' not in row for row in presented['data']['evidence']))
+        self.assertEqual(presented['data']['source_observations']['record'],record)
+        self.assertIn('a,1',json.dumps(result))
+        self.assertNotIn('a,1',json.dumps(presented))
+        assessment = self._assessment()
+        self.assertEqual(assessment['verdict'],'passed')
+        self.assertEqual(assessment['evidence_sha256'][str(self.inputs/'observations.csv')],
+                         _digest(self.inputs/'observations.csv'))
+        self.assertNotIn(str(self.directory/'outside.txt'),assessment['evidence_sha256'])
+        self.assertNotIn('Not authorized for this task',json.dumps(self.inspection_views))
+        self.assertEqual(self.send.call_count,3)
+        identity = Path(result['data']['record']).parts[1]
+        self._reload()
+        cached = self.app.operations.inspection.call('inspect_artifacts',{
+            'goal':'Check the claims against supplied observations','targets':['notes.md'],
+            'evidence':['measurements/conditions.txt']},identity)
+        self.assertEqual(cached.status,'ok',cached.error)
+        self.assertEqual(self.send.call_count,3)
+        (self.inputs/'observations.csv').write_text('sample,value\na,9\n')
+        self.assertFalse(self.app.operations.inspection.can_reconcile('inspect_artifacts',identity))
+        for path,raw in originals.items():
+            path.write_bytes(raw)
+        self.assertEqual(self._versions(self.inputs),originals)
+
+    def test_incomplete_source_investigation_supersedes_prior_pass_and_retains_completed_reads(self):
+        self._create(report=True)
+        self._write('report.md','The sample mean is 2.0.\n')
+        self._inspect(['report.md'])
+        self.assertEqual(self._assessment()['verdict'],'passed')
+        self.review = lambda view: {'findings':[],'limitations':[], 'requests':[
+            {'tool':'read_file','arguments':{'path':'measurements/observations.csv'}},
+            {'tool':'read_file','arguments':{'path':'measurements/conditions.txt','max_bytes':-1}}]}
+        result = self._inspect(['report.md'],['measurements/conditions.txt'])
+        self.assertEqual(result['status'],'error')
+        self.assertEqual(result['metadata']['assessment']['verdict'],'incomplete')
+        identity = Path(result['data']['record']).parts[1]
+        saved = self.app.session.store.read_json(f'tools/inspection/{identity}/input.json')
+        self.assertTrue(any(row.get('path')==str(self.inputs/'observations.csv') for row in saved['evidence']))
+        trace = self.app.session.store.read_json(f'tools/inspection/{identity}/sources-0.json')
+        self.assertEqual(len(trace['results']),1)
+        self.assertEqual(trace['results'][0]['tool'],'read_file')
+        calls = self.send.call_count
+        self._reload()
+        self._submit(_action('deliver_result',**self._delivery('report.md')))
+        self._not_delivered()
+        self.assertIn('lacks a complete independent inspection',self._last('deliver_result')['error'])
+        self.assertEqual(self.send.call_count,calls)
+        self.review = lambda view: {'findings':[],'limitations':[]}
+        self._inspect(['report.md'])
+        self._submit(_action('deliver_result',**self._delivery('report.md')))
+        self._ok('deliver_result')
+        self.assertEqual(self.app.session.manifest.status,'completed')
+
     def test_text_inspection_preserves_scope_and_does_not_promote_a_copy_to_evidence(self):
         self._create(report=True)
         missing = self._inspect(['missing.md'])
@@ -647,12 +949,55 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._run()
         self.assertEqual(self.send.call_count,calls)
 
+    def test_complete_prose_gets_one_accounted_action_correction_without_implicit_delivery(self):
+        provider = self._provider
+        for count, legacy in ((1,False),(2,False),(1,True)):
+            with self.subTest(text_replies=count,legacy=legacy):
+                self.root = self.directory/('prose-'+str(count)+'-'+str(legacy))
+                self._create(legacy=legacy)
+                texts = deque(['Claimed complete without a delivery action.']*count)
+                if count==1 and not legacy:
+                    self.decisions.append(_action('ask_user',question='Which comparison is intended?'))
+                def respond(mode,request,**kwargs):
+                    if request.get('tools') and texts:
+                        return {'choices':[{'message':{'role':'assistant','content':texts.popleft()},
+                            'finish_reason':'stop'}],
+                            'usage':{'prompt_tokens':100,'completion_tokens':10,'total_tokens':110}}
+                    self.assertEqual(request['messages'][-1]['role'],'system')
+                    self.assertIn('did not execute an operation',request['messages'][-1]['content'])
+                    self.assertEqual(request['messages'][-2]['role'],'assistant')
+                    return provider(mode,request,**kwargs)
+                self.send.side_effect = respond
+                before = self.send.call_count
+                self._run()
+                self.assertEqual(self.send.call_count-before,2 if not legacy else 1)
+                self.assertFalse(self.app.session.store.exists('delivery.json'))
+                calls = [entry for entry in self.app.ledger.entries if entry.reserved.get('llm_requests')]
+                self.assertEqual(len(calls),2 if not legacy else 1)
+                self.assertTrue(all(entry.status=='settled' for entry in calls))
+                self.assertIn('Claimed complete',self.app.session.store.read_json(
+                    self.app.state['turns'][0]['reply'])['content'])
+                if count==1 and not legacy:
+                    self._ok('ask_user')
+                else:
+                    self.assertIn('Model returned prose',self.app.session.manifest.status_reason)
+                self._reload()
+                if count==2:
+                    calls = self.send.call_count
+                    self._run()
+                    self.assertEqual(self.send.call_count,calls)
+
     def test_inspection_transport_unknown_survives_reload_without_replay_or_free_usage(self):
         import httpx
 
         self._create()
         self._write('report.md', 'The sample mean is 2.0.\n')
-        self.review = lambda view: (_ for _ in ()).throw(httpx.ReadTimeout('Response lost after dispatch'))
+        def lose_followup(view):
+            if len(self.inspection_views)==1:
+                return {'findings':[],'limitations':[], 'requests':[
+                    {'tool':'list_directory','arguments':{'path':'measurements'}}]}
+            raise httpx.ReadTimeout('Response lost after dispatch')
+        self.review = lose_followup
         self._inspect(['report.md'])
         row = self._last('inspect_artifacts')
         self.assertNotEqual(row['status'], 'ok', row)
@@ -823,11 +1168,17 @@ class OperationsWorkLoopTests(unittest.TestCase):
         for kind in ('write','process'):
             with self.subTest(producer=kind):
                 self.root = self.directory / ('inline-'+kind)
-                self._create()
+                self._create(delivery_files=['final.txt','conditions.txt'] if kind=='write' else None)
                 delivery = {'summary':'Actual final output','artifacts':['final.txt']}
                 if kind == 'write':
                     self._submit(_action('write_file',path='final.txt',content='finished\n',delivery=delivery))
                     self._ok('write_file')
+                    self._not_delivered()
+                    self.assertIn('conditions.txt','; '.join(self.app._delivery_feedback()['issues']))
+                    self._write('conditions.txt','Execution and interpretation are distinct.\n')
+                    self._submit(_action('deliver_result',summary='Actual final output',
+                        artifacts=['final.txt','conditions.txt']))
+                    self._ok('deliver_result')
                 else:
                     self._write('produce.py',
                         "from pathlib import Path\nPath('final.txt').write_text('old\\n')\n")
@@ -897,9 +1248,25 @@ class OperationsWorkLoopTests(unittest.TestCase):
         version = self._read('report.md')['sha256']
         self._submit(_action('write_file',path='report.md',expected_sha256=version,
             content='The sample mean is 9.0.\n',delivery=self._delivery('report.md')))
-        self.assertIn('lacks a complete independent inspection',self.app.session.manifest.status_reason)
+        self.assertIn('lacks a complete independent inspection','; '.join(self.app._delivery_feedback()['issues']))
         self._ok('write_file')  # Actual work is retained; its old review cannot certify new bytes.
         self._not_delivered()
+        receipt = self.app.state['turns'][-1]['tools'][-1]['result']
+        original = (self.root/receipt).read_bytes()
+        self._reload()
+        self._run()
+        self.assertEqual((self.root/receipt).read_bytes(),original)
+        self.assertNotIn('Retained terminal observation cannot be committed',self.app.session.manifest.status_reason)
+        self._submit(_action('read_file',path='report.md'),feedback='Continue the original task, preserving completed work.')
+        self.assertEqual(self.app._delivery_feedback()['request_count'],1)
+        version = self._ok('read_file')['data']['sha256']
+        self._submit(_action('write_file',path='report.md',expected_sha256=version,
+            content='The sample mean is 2.0.\n'))
+        self._ok('write_file')
+        self._inspect(['report.md'],['measurements/observations.csv'])
+        self._submit(_action('deliver_result',**self._delivery('report.md')))
+        self._ok('deliver_result')
+        self.assertEqual(self.app.session.manifest.status,'completed')
 
     def test_prepared_measurements_feed_exact_work_and_delivery_tracks_current_revision(self):
         from simple_ar.code_task.runtime.state import (

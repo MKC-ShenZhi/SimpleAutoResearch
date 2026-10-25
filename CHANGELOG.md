@@ -8,17 +8,22 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 
 ### Improved
 
+- Independent inspection can locate and read missing sources within authorized roots, retaining each read and charge. Coordination receives findings and source locators; full observations remain in the original receipt. An incomplete reassessment cannot inherit an older pass.
+- Publication shares byte-bound PDF metadata between checks and previews, parses identical captions once and forecasts process capacity before compilation. Actual usage remains charged per physical process.
+- New operation tasks retain a bounded, version-aware working view and receipt-backed notes across feedback. Material selection and model-visible metadata share one input budget; original sources and history remain available. Saved tasks retain their original context protocol.
 - New tasks compose investigation, file work, execution, independent inspection and publication in one action loop, replacing compulsory professional handoffs and overlapping Writer control. Ordinary CLI, structured intake and creation APIs use the same default; saved tasks retain their recorded contracts.
 - Formal manuscript checks bind actual target and evidence versions; PDF/TeX delivery checks the corresponding publication. Distinguish unfinished work from research limitations, and keep legacy Writer preparation arguments out of ordinary export contracts. Current required findings, unknown usage and unverified execution still need resolution or explicit disclosure.
 - Consolidate duplicate professional-control tests while retaining execution, approval, feedback, version consistency and historical recovery coverage. Original drafts, failures and accounting remain preserved.
 
 ### Fixed
 
+- Separate completed production from delivery acceptance: retain execution results and surface unmet delivery conditions, including the editable manuscript in terminal publication. Changed bindings and unconfirmed execution still stop safely.
+- Retain prose replies without treating completion claims as delivery. Settled, affordable work permits one action correction on the same ledger; consecutive replies without an action stop explicitly.
 - Republishing a revised manuscript at the same path validates the publication actually delivered; retained older exports no longer veto a valid current version. PDF-only delivery does not acquire an implicit TeX requirement.
 - Preserve frozen analysis, research and implementation/measurement obligations through the new action loop. Final writes and approved runs are checked against their actual produced files rather than requiring those files before execution.
 - Rendered-image inspection follows the configured model output limit instead of imposing a separate 3,000-token cap. Explicit recovery of a failed decision with no unknown charges also supports an unchanged, uncapped output setting; unknown charges retain stricter recovery checks.
 
-Full unattended draft, feedback and delivery acceptance remains in progress; this engineering update does not establish general success or lower cost.
+Earlier development recovery delivered an initial draft but not the feedback revision. A later cold start from the original materials also stopped before formal delivery within its fixed budget. Unassisted acceptance has not passed; these engineering changes do not establish general success or lower whole-task costs.
 
 ## 2026-10-24 — V2.10 development (unreleased)
 

@@ -860,7 +860,7 @@ class ReportExportTests(unittest.TestCase):
                     {'path': display_image, 'exports': {'svg': 'figures/vector.svg'}}]}), encoding='utf-8')
                 bound_request = {**delivery_request, 'compile_pdf': True}
 
-                def compile_project(output, has_citations, *, runner):
+                def compile_project(output, has_citations, *, runner, **forecast):
                     (output / 'main.pdf').write_bytes(b'original compiled PDF')
                     return {'status': 'compiled', 'compiled': True}
 
@@ -990,10 +990,11 @@ class ReportExportTests(unittest.TestCase):
     def test_requested_pdf_preview_renders_all_pages_or_retains_failed_request(self):
         from PIL import Image
 
-        cases = ('complete', 'twelve_pages', 'missing_poppler', 'too_many_pages', 'zero_pages',
+        cases = ('complete', 'checked', 'twelve_pages', 'missing_poppler', 'too_many_pages', 'zero_pages',
             'missing_count', 'duplicate_count', 'renderer_failure', 'renderer_timeout',
             'partial_pages', 'unexpected_page', 'large_dimensions', 'large_file', 'invalid_png',
-            'missing_tex', 'missing_pdf')
+            'missing_tex', 'missing_pdf', 'checked_bad_count', 'checked_metadata_failure',
+            'changed_during_metadata', 'changed_after_checks', 'changed_during_render')
         for case in cases:
             with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
@@ -1015,8 +1016,16 @@ class ReportExportTests(unittest.TestCase):
                     if argv[0] == 'pdfinfo':
                         self.assertEqual(kwargs['env'], {'LC_ALL': 'C'})
                         self.assertEqual(kwargs['timeout'], 30)
+                        if case == 'checked_metadata_failure':
+                            raise ReportExportError('Metadata renderer failed; retain its receipt')
+                        if case == 'changed_during_metadata':
+                            (output / 'main.pdf').write_bytes(b'changed during metadata')
                         return ('No page count\n' if case == 'missing_count' else
-                            'Pages: 2\nPages: 3\n' if case == 'duplicate_count' else f'Pages: {page_count}\n')
+                            'Pages: 2\nPages: 3\n' if case in {'duplicate_count', 'checked_bad_count'} else f'Pages: {page_count}\n')
+                    if argv[0] == 'pdftotext':
+                        if case == 'changed_after_checks':
+                            (output / 'main.pdf').write_bytes(b'changed during text extraction')
+                        return 'Visible text without the forbidden literal'
                     if argv[0] == 'pdftoppm':
                         self.assertEqual(argv[1:11], ['-png', '-r', '120', '-scale-to', '1600',
                             '-f', '1', '-l', str(page_count), str(output / 'main.pdf')])
@@ -1025,6 +1034,8 @@ class ReportExportTests(unittest.TestCase):
                             raise ReportExportError('Poppler rendering failed')
                         if case == 'renderer_timeout':
                             raise subprocess.TimeoutExpired(argv, 90)
+                        if case == 'changed_during_render':
+                            (output / 'main.pdf').write_bytes(b'changed during rendering')
                         for page in range(1, page_count + (2 if case == 'unexpected_page' else 1)):
                             if case == 'partial_pages' and page == page_count:
                                 continue
@@ -1043,8 +1054,10 @@ class ReportExportTests(unittest.TestCase):
 
                 with patch('simple_ar.report.export.shutil.which', side_effect=which), patch(
                         'simple_ar.report.export._compile', side_effect=compile_project):
-                    if case in {'complete', 'twelve_pages'}:
-                        manifest = export_acm_report(source, output, compile_pdf=True, render_preview=True, runner=render)
+                    options = {'checks': {'max_pages': 12, 'forbidden_identifiers': ['PRIVATE']}} if (
+                        case.startswith('checked') or case == 'changed_after_checks') else {}
+                    if case in {'complete', 'checked', 'twelve_pages'}:
+                        manifest = export_acm_report(source, output, compile_pdf=True, render_preview=True, runner=render, **options)
                         preview = manifest['pdf_preview']
                         self.assertEqual(manifest['status'], 'compiled')
                         self.assertTrue(preview['rendered'])
@@ -1053,7 +1066,7 @@ class ReportExportTests(unittest.TestCase):
                         self.assertTrue(all((output / path).is_file() for path in preview['pages']))
                     else:
                         with self.assertRaises(ReportExportError):
-                            export_acm_report(source, output, compile_pdf=True, render_preview=True, runner=render)
+                            export_acm_report(source, output, compile_pdf=True, render_preview=True, runner=render, **options)
                         manifest = json.loads((output / 'export.json').read_text())
                         self.assertEqual(manifest['status'], 'failed')
                         self.assertFalse(manifest['pdf_preview']['rendered'])
@@ -1067,8 +1080,20 @@ class ReportExportTests(unittest.TestCase):
                         {'max_pages': 12, 'dpi': 120, 'max_dimension_px': 1600})
                     self.assertEqual((source / 'report_body.md').read_bytes(), original)
                     self.assertTrue((output / 'main.tex').is_file())
+                    # Page count is shared with checks, while every page still
+                    # comes from a single real all-page conversion command.
+                    self.assertLessEqual(sum(argv[0] == 'pdfinfo' for argv, _ in calls), 1)
+                    self.assertLessEqual(sum(argv[0] == 'pdftoppm' for argv, _ in calls), 1)
+                    if case == 'checked':
+                        self.assertEqual(manifest['checks']['status'], 'passed')
+                        row = manifest['checks']['results']['max_pages']
+                        raw = (output / row['evidence']).read_bytes()
+                        self.assertEqual(hashlib.sha256(raw).hexdigest(), row['evidence_sha256'])
+                        self.assertEqual(manifest['checks']['pdf_sha256'],
+                            hashlib.sha256((output / 'main.pdf').read_bytes()).hexdigest())
                     if case in {'missing_poppler', 'too_many_pages', 'zero_pages', 'missing_count',
-                            'duplicate_count', 'missing_tex', 'missing_pdf'}:
+                            'duplicate_count', 'missing_tex', 'missing_pdf', 'checked_bad_count',
+                            'checked_metadata_failure', 'changed_during_metadata', 'changed_after_checks'}:
                         self.assertFalse(any(argv[0] == 'pdftoppm' for argv, _ in calls))
                         self.assertFalse((output / 'previews').exists())
 
@@ -1084,6 +1109,92 @@ class ReportExportTests(unittest.TestCase):
                 with self.assertRaisesRegex(ReportExportError, 'checks requires compile_pdf=true'):
                     export_acm_report(source, root / 'acm', checks={'max_pages': 1})
                 run.assert_not_called()
+
+    def test_compound_pdf_forecast_uses_core_accounting_without_aggregate_charges(self):
+        from contextlib import nullcontext
+        from types import SimpleNamespace
+        from PIL import Image
+        from simple_ar.core.budget import BudgetLedger
+        from simple_ar.tools.workspace import WorkspaceToolGateway
+        from simple_ar.tools.publication import PublicationToolGateway
+
+        # Keep the real core reservation/settlement path; replace only physical
+        # execution. Four Pandoc calls, four TeX/BibTeX calls and three Poppler
+        # calls must fit exactly, regardless of the number of preview pages.
+        for mode in ('fits', 'slots', 'wall', 'floor', 'unknown_after_compile'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                ledger = BudgetLedger({'process_invocations': 10 if mode == 'slots' else 11,
+                    'process_wall_seconds': 80 if mode == 'wall' else 1000},
+                    storage_path=root / 'budget.json')
+                workspace = WorkspaceToolGateway(root, {}, ledger)
+                source = workspace.resolve('draft.md')
+                source.write_text('# Evidence\n\nBody [@p1].', encoding='utf-8')
+                source.with_name('references.bib').write_text('@misc{p1,title={Evidence}}', encoding='utf-8')
+                request = {'markdown': 'draft.md', 'compile_pdf': True, 'render_preview': True,
+                    'checks': {'max_pages': 12, 'forbidden_identifiers': ['PRIVATE']}}
+                latex_calls = 0
+                unresolved = None
+
+                def execute(spec, **kwargs):
+                    nonlocal latex_calls, unresolved
+                    spec.output_dir.mkdir(parents=True, exist_ok=True)
+                    executable = spec.argv[0]
+                    if executable == 'pdflatex':
+                        latex_calls += 1
+                        (spec.cwd / 'main.pdf').write_bytes(b'%PDF-fixed-compiled-version')
+                        if mode == 'unknown_after_compile' and latex_calls == 3:
+                            ledger.reserve('unresolved', {'process_wall_seconds': 1})
+                            ledger.mark_unknown('unresolved', reason='Interrupted unrelated process')
+                            unresolved = ledger.entries[-1].to_dict()
+                    if executable == 'pdfinfo':
+                        text = 'Pages: 12\n'
+                    elif executable == 'pdftotext':
+                        text = 'Visible text'
+                    elif executable == 'pdftoppm':
+                        for page in range(1, 13):
+                            Image.new('RGB', (8, 12)).save(f'{spec.argv[-1]}-{page:02d}.png')
+                        text = ''
+                    else:
+                        text = json.dumps(_ast()) if '--to=json' in spec.argv else 'rendered source'
+                    (spec.output_dir / 'stdout.log').write_text(text, encoding='utf-8')
+                    record = {'status': 'finished', 'invocation_id': spec.invocation_id,
+                        'duration_sec': 1, 'streams': {'stdout': {'log_bytes_discarded': 0}}}
+                    (spec.output_dir / 'invocation.json').write_text(json.dumps(record), encoding='utf-8')
+                    return SimpleNamespace(returncode=0, stop_reason=None, record=record)
+
+                scope = ledger.protect_remaining({'process_invocations': 1}) if mode == 'floor' else nullcontext()
+                with scope, patch('simple_ar.report.export.shutil.which', side_effect=lambda name: name), \
+                        patch('simple_ar.core.process._run_process', side_effect=execute) as physical:
+                    gateway = PublicationToolGateway(root, workspace, ledger)
+                    result = gateway.call('export_report', request, identity='bounded')
+                    self.assertEqual(result.ok, mode == 'fits', result.error)
+                    expected_calls = 11 if mode == 'fits' else 8 if mode == 'unknown_after_compile' else 4
+                    self.assertEqual(physical.call_count, expected_calls)
+                    manifest = result.data['manifest']
+                    self.assertEqual(manifest['compiled'], mode in {'fits', 'unknown_after_compile'})
+                    project = workspace.resolve(result.data['project'])
+                    self.assertTrue((project / 'main.tex').is_file())
+                    if mode != 'fits':
+                        self.assertEqual(result.data['failure_kind'], 'resource_exhausted')
+                        self.assertFalse(manifest['pdf_preview']['rendered'])
+                        self.assertNotIn('delivery', result.data)
+                    if mode == 'unknown_after_compile':
+                        self.assertEqual((project / 'main.pdf').read_bytes(), b'%PDF-fixed-compiled-version')
+                        self.assertEqual(next(entry.to_dict() for entry in ledger.entries
+                            if entry.reservation_id == 'unresolved'), unresolved)
+                    charged = [entry for entry in ledger.entries if entry.purpose == 'local_process']
+                    self.assertEqual(len(charged), expected_calls)
+                    self.assertEqual(len(ledger.entries), expected_calls + int(unresolved is not None))
+                    for entry in charged:
+                        self.assertEqual(entry.actual, {'process_invocations': 1, 'process_wall_seconds': 1})
+                        self.assertEqual(entry.status, 'settled')
+                        self.assertEqual(entry.actual_source, 'executor_wall_clock')
+                    frozen = {path: path.read_bytes() for path in root.rglob('*') if path.is_file()}
+                    restored = PublicationToolGateway(root, workspace, BudgetLedger.load(root / 'budget.json'))
+                    self.assertEqual(restored.call('export_report', request, identity='bounded').data, result.data)
+                    self.assertEqual(physical.call_count, expected_calls)
+                    self.assertEqual({path: path.read_bytes() for path in frozen}, frozen)
 
     def test_finite_checks_keep_independent_observations_when_text_is_unavailable(self):
         from copy import deepcopy
@@ -1123,7 +1234,8 @@ class ReportExportTests(unittest.TestCase):
             caption = [{'t': 'Str', 'c': 'Recorded comparison.'}]
             (source / "figures/figures_manifest.json").write_text(json.dumps({"figures": [
                 {"path": "original.png", "caption": 'Recorded comparison.',
-                    "exports": {"svg": "original.svg"}}]}), encoding="utf-8")
+                    "exports": {"svg": "original.svg"}},
+                {"path": "original.png", "caption": 'Recorded comparison.'}]}), encoding="utf-8")
             document = _ast(image="original.png")
             document['blocks'][-1]['c'][0]['c'][1] = [{'t': 'Str', 'c': 'Generic image description'}]
             # Actual repeated prose is not an adjacent exact caption duplicate.
@@ -1517,8 +1629,14 @@ class ProcessArtifactBindingTests(unittest.TestCase):
             workspace.resolve('source.any').write_bytes(b'v2')
             cache = {}
             for _ in range(2):
-                with self.assertRaisesRegex(ValueError, 'changed'):
+                with self.assertRaisesRegex(ValueError, 'changed') as failure:
                     workspace.check_artifact_producers(['figure.png'], cache=cache)
+                diagnostic = str(failure.exception)
+                self.assertIn('"producer": "a"', diagnostic)
+                self.assertIn('"changed_inputs": ["workspace/source.any"]', diagnostic)
+                self.assertIn('workspace/middle.any', diagnostic)
+                self.assertIn('workspace/sibling.any', diagnostic)
+                self.assertIn('explicitly approved', diagnostic)
             self.assertTrue(self._run(workspace, 'c', args, {'middle.any': b'new intermediate'}).ok)
             with self.assertRaisesRegex(ValueError, 'changed'):
                 workspace.check_artifact_producers(['figure.png'])

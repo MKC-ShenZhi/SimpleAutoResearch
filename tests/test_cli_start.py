@@ -810,6 +810,7 @@ class StartTests(unittest.TestCase):
                 bound.apply_defaults()
                 self.assertEqual(bound.arguments['tool_contracts'], 'on_demand')
                 self.assertEqual(bound.arguments['control_protocol'], 'operations.v1')
+                self.assertEqual(bound.arguments['context_protocol'], 'auto')
                 self.assertFalse(bound.arguments['professional_inputs'])
                 self.assertEqual(kwargs["model"], "profile:chosen")
                 self.assertEqual(kwargs["max_turns"], 7)

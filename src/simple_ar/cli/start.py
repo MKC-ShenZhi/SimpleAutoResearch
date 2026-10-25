@@ -447,7 +447,7 @@ def native_creation_options(args: argparse.Namespace) -> dict:
     return dict(model=args.model or None, control_protocol='operations.v1',
         creation_declarations=getattr(args, '_creation_declarations', {}),
         extensions=getattr(args, 'extensions', []),
-        context_protocol='conversation.v1',
+        context_protocol='auto',
         sources={f'source{index}': path for index, path in enumerate(args.source)},
         allow_execution=args.allow_execution, allow_network=args.allow_network, allow_vision=args.allow_vision,
         max_turns=args.max_turns, max_tokens=args.max_tokens, max_images=args.max_images,

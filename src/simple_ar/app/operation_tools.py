@@ -29,6 +29,11 @@ SYSTEM = (
     "You may read, write and edit the working project directly. Prefer one coherent script/run to "
     "repeated inventory probes. Scientific method and material semantics require judgment, not guessed "
     "parameters. Ask only indispensable questions about semantics, scope, resources or permission. "
+    "After a coherent investigation or revision, retain compact working understanding, decisions, failures "
+    "and open questions with update_work_plan.notes citing actual observation records. Reuse this work "
+    "across feedback instead of reinventorying materials. Notes are model judgments; original observations "
+    "remain evidence. Work in complete useful units: investigate enough, implement and run, interpret the "
+    "result, then inspect and deliver; do not repeatedly recheck an unchanged result without a concrete gap. "
     "For a formal report, keep one editable manuscript, independently inspect it against actual original "
     "evidence using inspect_artifacts, and export that same version if PDF/TeX is requested. A canonical "
     "report claim identifies the inspected manuscript and requested formats in the delivery. Fix actual required findings; "
@@ -138,6 +143,38 @@ class OperationTools:
                 catalog[spec.name] = {'domain':spec.domain, 'description':spec.description.split('. ',1)[0][:200]}
         return active, catalog
 
+    def bind_notes(self, notes: list[dict]) -> list[dict]:
+        """Bind model notes to real observations without granting truth or authority."""
+        observations = {row['record'].removeprefix('attempts/'):row for row in self.observations()}
+        result = []
+        for note in notes:
+            bindings, records = {}, []
+            for locator in note['records']:
+                key = locator.removeprefix('records/').removeprefix('attempts/')
+                row = observations.get(key)
+                if row is None:
+                    raise ValueError('Working notes require existing observation records: '+locator)
+                records.append('records/'+key)
+                data = row.get('data') or {}
+                if isinstance(data.get('absolute_path'), str) and isinstance(data.get('sha256'), str):
+                    bindings[data['absolute_path']] = data['sha256']
+            result.append({'text':note['text'],'records':list(dict.fromkeys(records)),
+                'observed_versions':bindings,'scope':'model_note_not_verified_evidence'})
+        return result
+
+    def project_notes(self, notes: list[dict]) -> list[dict]:
+        result = []
+        for note in notes:
+            bindings = note.get('observed_versions', {})
+            try:
+                current = not bindings or self.workspace.artifact_hashes(bindings) == bindings
+            except (ValueError,OSError):
+                current = False
+            result.append({**note,'current':current,
+                'version_scope':'Bound observations unchanged' if bindings and current else
+                    'Unversioned working judgment' if current else 'Referenced files changed; reassess before reuse'})
+        return result
+
     @staticmethod
     def _measurement_refs(observations: list[dict]) -> list[str]:
         return [row['data']['result_ref'] for row in observations
@@ -161,6 +198,10 @@ class OperationTools:
         issues = self.gateway.delivery_issues(owned,proposed=proposed,delivery=delivery)
         resolved = self.workspace.resolve_delivery(request)
         self.workspace.check_artifact_producers(resolved['artifacts'])
+        from simple_ar.tools.workspace import missing_delivery_files
+        missing = missing_delivery_files(self.workspace,resolved['artifacts'],self.config.get('delivery_files') or [])
+        if missing:
+            issues.append('Delivery is missing required workspace outputs: '+', '.join(missing))
         required = []
         report = request.report
         if report is not None:
@@ -205,8 +246,8 @@ class OperationTools:
         # Export owns all version/provenance checks; no Writer identity is needed.
         published = [row for row in observations if row.get('tool_name')=='export_report'
             and row.get('status')=='ok' and row.get('data',{}).get('project')
-            and {self.workspace.resolve(path) for path in row.get('artifacts',[])}.intersection(
-                self.workspace.resolve(path) for path in resolved['artifacts'])]
+            and any(self.workspace.resolve(path).is_relative_to(self.workspace.resolve(row['data']['project']))
+                for path in resolved['artifacts'])]
         if report is not None and (published or set(report.formats)-{'markdown'}):
             try:
                 self.publication.check_report_delivery(observations,None,resolved['artifacts'],

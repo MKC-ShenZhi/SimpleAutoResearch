@@ -594,7 +594,8 @@ app = create_research_task(ResearchBrief(request_text="测量所提供的程序�
 | --- | --- |
 | `delivery_files=["**/*.md", "**/*.pdf"]` | 无保留的完成交付须有非空工作区输出。相对模式只查存在，不认证质量，来源 PDF 不算输出；要求须明确声明，不从文字推导，仍可明确交付部分成果。 |
 | `tool_contracts="on_demand"`（默认） | 先提供工作区工具和简短能力目录，按需加载专业契约，用户无需选工作流或批准加载。权限及命令审批仍适用；高级选项为 `full`、`outcomes`。 |
-| `context_protocol="conversation.v1"`（默认） | 保留真实读取正文和写入参数，按完整轮次移出最旧对话。最近完整轮次可超过 `context_input_tokens` 软目标，记录超出并遵守剩余总额度。有界归档索引链接原记录；归档正文不算当前上下文，旧观察不算新读取。缺标记或显式 `None` 保留原投影。 |
+| `context_protocol="auto"`（创建默认） | 新操作任务保存 `working.v1`：按顺序保留要求、连续近期工作、按版本核对的观察和沿原记录保存的笔记。旧工作量达到阈值时沿同一预算模型压缩，检查点输出上限8192tokens，不限制科研正文输出。摘录标明实际范围，笔记是判断，不是验证或权限。`update_work_plan.notes` 可替换快照；省略跨反馈保留，`[]` 清空。 |
+| `context_protocol="conversation.v1"`（保存／兼容任务） | 保留时间顺序投影和原始记录，旧任务不静默升级；显式 `None` 保留原legacy投影。工作集目标是软限制，实际共享token额度仍受约束。 |
 | `control_protocol="operations.v1"`（默认） | 普通 `start`、结构化入口和创建 API 在同一行动循环中组合读写、执行、检查与出版，不强制专业接力或 Writer 采用阶段。保存任务不迁移；显式 `None` 选择兼容路径。 |
 | `completion_policy="available_operations.v1"`（新操作任务） | 在实际资源与审批限制内保留可用操作，最后一次可负担决策也能留下有用的中间工作。耗尽暂停并保留成果；只有显式且校验通过的交付才算完成。兼容创建和保存任务保留原末次／保护决策策略。 |
 | `report={"status":"canonical","manuscript":"report.md","formats":["markdown","pdf"]}` | 交付声明可编辑正文及所需格式；完整交付须有当前正文的独立检查，以及需要时与其匹配的出版物，文件存在不足以证明完成。 |
@@ -602,7 +603,7 @@ app = create_research_task(ResearchBrief(request_text="测量所提供的程序�
 | `create_research_task(..., allow_vision=True)` | 严格布尔值，默认 `False`；须有命名 vision 路由及连接，共用 `services.budget_limits`。文字或注入文本客户端不授权视觉检查；不授予来源联网、图像生成，不改旧权限或返回类型。 |
 | `supply(..., replace_existing=True)` | 调用方可明确替换 `delivery_files`、`tool_contracts` 或 `completion_policy`；无关补齐保留策略及账本。 |
 
-`inspect_artifacts` 独立读取指定正文与依据，记录文件版本、覆盖范围、必改意见和局限。目标变化使原通过失效；只改依据不能抹去仍然有效的必改意见。`inspect_images` 是另行授权、使用命名视觉连接的操作。文本检查或编译成功都不认证视觉与科学正确性。
+`inspect_artifacts` 承担一次有界的独立调查。初始依据只是起点：检查者可通过共同读取工具，在已有授权目录中自行定位、补读所需来源，沿原账本计费。每次响应与已完成读取保留，最多六轮批量取材后形成最终意见；完整意见不另设完成阶段。目标变化使原通过失效，新核查未完成不能退回旧通过，只改依据也不能抹去当前必改。未知用量停止后续请求。`inspect_images` 另行授权、使用命名视觉连接。文本检查或编译成功都不认证视觉与科学正确性。
 
 预算化图像检查须在视觉 profile 中明确配置 `max_output_tokens`，并为推理和实际检查响应共同留出容量；它与文本 profile 分开，文本仍可不设输出上限。参见[模型目录示例](../examples/model-profiles/models.toml)。
 

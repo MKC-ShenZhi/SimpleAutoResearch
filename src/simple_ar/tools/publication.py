@@ -309,6 +309,10 @@ class PublicationToolGateway:
                     required.update(self.workspace.resolve(path) for path in hashes)
                 if required.issubset(delivered) and all(path.is_file() for path in required):
                     return {self.workspace.resolve(path) for path in hashes}
+                missing = sorted(str(path.relative_to(self.workspace.workspace)) for path in required-delivered)
+                if missing:
+                    failures.append('Requested report formats need the complete publication files: '
+                        + ', '.join(missing) + '. Deliver the publication project directory for an editable TeX project.')
             except (ValueError,OSError,KeyError,TypeError,RuntimeError) as exc:
                 # Rejected candidates remain history, not a veto over another
                 # genuinely current publication delivered for the same source.
@@ -397,6 +401,22 @@ class PublicationToolGateway:
                     render_source = staged / source.name
                 count = 0
 
+                def preflight(amounts):
+                    # Read the existing ledger's spendable capacity, including
+                    # its active floors and unresolved prior usage. This is a
+                    # forecast, not another reservation or an allowance grant.
+                    if self.ledger is None:
+                        return
+                    for dimension, needed in amounts.items():
+                        if not needed or self.ledger.limits.get(dimension) is None:
+                            continue
+                        available = self.ledger.remaining(dimension)
+                        if available is None or available < needed:
+                            reason = 'prior consumption is unknown' if available is None else f'{available} remaining'
+                            raise ReportExportResourceError(
+                                f'Publication requires capacity for {needed} {dimension} before the next compound rendering stage; {reason}. '
+                                'Retain the editable project and process receipts; no aggregate charge or automatic retry.')
+
                 def render(argv, *, cwd, text=None, timeout=60, env=None):
                     nonlocal count
                     count += 1
@@ -442,6 +462,7 @@ class PublicationToolGateway:
                 try:
                     manifest = export_acm_report(render_source.parent, output, title=request.title or None,
                         body_name=source.name, compile_pdf=request.compile_pdf, render_preview=request.render_preview, runner=render,
+                        preflight=preflight,
                         validate_asset=validate_asset,
                         caption_owner=(report_identity or {}).get('figure_caption_owner', 'markdown'),
                         **({'citation_style': request.citation_style} if request.citation_style is not None else {}),
@@ -494,9 +515,17 @@ class PublicationToolGateway:
                 # records and instructions, rather than a second filename list.
                 artifacts = self.workspace.resolve_delivery(DeliveryRequest(
                     summary='Editable publication project', artifacts=[prefix]))['artifacts']
+                # A terminal publication owns its actual editable source too.
+                # Retained inventories, including older exports, stay exact.
+                source_locator = self.workspace.locator(str(source))
+                retained = owner.read_json('result.json').get('artifact_sha256') if saved is not None else None
+                claim = request.delivery.report if request.delivery is not None else None
+                if ((saved is None and claim is not None and claim.status == 'canonical'
+                        and claim.manuscript and self.workspace.resolve(claim.manuscript) == source)
+                        or retained is not None and source_locator in retained):
+                    artifacts.append(source_locator)
                 hashes = self.workspace.artifact_hashes(artifacts)
                 if saved is not None:
-                    retained = owner.read_json('result.json').get('artifact_sha256')
                     if not retained or retained != hashes:
                         raise ValueError('Publication project files changed or are missing; saved rendering applies only to the original byte-bound version, not this project. Preserve both versions; no replay')
                 else:

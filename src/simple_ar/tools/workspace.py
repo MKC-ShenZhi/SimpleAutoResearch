@@ -628,8 +628,15 @@ class WorkspaceToolGateway:
             current = self.process_artifact_binding(binding['request'], identity=identity)
             if current != binding:
                 raise ValueError('Approved implementation snapshot changed')
-        elif self._version_hashes(binding['inputs']) != binding['inputs']:
-            raise ValueError('Declared producer inputs/outputs changed; no current publication or automatic rerun')
+        else:
+            current = self._version_hashes(binding['inputs'])
+            changed = [name for name, digest in binding['inputs'].items() if current.get(name) != digest]
+            if changed:
+                raise ValueError('Declared producer inputs/outputs changed: ' + json.dumps({
+                    'producer': identity, 'changed_inputs': changed,
+                    'declared_outputs': binding['outputs']}, ensure_ascii=False)
+                    + '. Regenerate the affected outputs from current inputs in an explicitly approved '
+                    'process declaring those outputs; no current publication or automatic rerun')
 
     def check_artifact_producers(self, locators: Iterable[str], *, cache: dict | None = None,
                                  refresh: bool = False) -> None:
@@ -675,8 +682,13 @@ class WorkspaceToolGateway:
                     or set(output.get('outputs', {})) != set(binding['outputs'])):
                 raise ValueError(f'Declared producer has no successful output binding: {path.name}; inspect receipt, no replay')
             self._check_process_inputs(binding, identity=record['invocation_id'])
-            if self._version_hashes(output['outputs']) != output['outputs']:
-                raise ValueError(f'Declared producer outputs changed for {path.name}; no current publication or automatic rerun')
+            current = self._version_hashes(output['outputs'])
+            changed = [name for name, digest in output['outputs'].items() if current.get(name) != digest]
+            if changed:
+                raise ValueError('Declared producer outputs changed: ' + json.dumps({
+                    'producer': record['invocation_id'], 'changed_outputs': changed,
+                    'declared_inputs': list(binding['inputs']), 'declared_outputs': binding['outputs']}, ensure_ascii=False)
+                    + '; no current publication or automatic rerun')
             visiting.add(path)
             try:
                 for locator in binding['inputs']:
