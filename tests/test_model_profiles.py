@@ -502,6 +502,14 @@ class ModelProfileTests(unittest.TestCase):
         self.assertNotEqual(tuned, binding)
         self.assertTrue(model_connections_compatible(binding, tuned))
         self.assertTrue(model_connections_compatible(tuned, binding))
+        # Streaming is transport, not a model/protocol/route change. The
+        # original snapshot remains intact when transport is retuned.
+        self.path.write_text(self.path.read_text(encoding='utf-8').replace(
+            'stream = true', 'stream = false'), encoding='utf-8')
+        nonstream = LLMClient.from_env()
+        self.assertFalse(nonstream._settings.stream)
+        self.assertTrue(model_connections_compatible(binding, nonstream.connection_binding()))
+        self.assertTrue(model_connections_compatible(nonstream.connection_binding(), binding))
         self.assertEqual(tuned["settings"]["connect_timeout_sec"], 45.0)
         self.assertEqual(tuned["code_route"]["connection"]["connect_timeout_sec"], 45.0)
         self.assertEqual(LLMClient.from_env()._settings.context_input_tokens, 64000)
@@ -533,6 +541,11 @@ class ModelProfileTests(unittest.TestCase):
         self.assertNotEqual(writing_binding, retuned_binding)
         self.assertTrue(model_connections_compatible(writing_binding, retuned_binding))
         self.assertTrue(model_connections_compatible(retuned_binding, writing_binding))
+        writing_transport = json.loads(json.dumps(writing_binding))
+        for settings in (writing_transport['settings'], writing_transport['code_route']['connection'],
+                         writing_transport['writing_route']['connection']):
+            settings['stream'] = not settings.get('stream', False)
+        self.assertTrue(model_connections_compatible(writing_binding, writing_transport))
         self.assertEqual(LLMClient.for_task(client=retuned, purpose="writing")._settings.connect_timeout_sec, 90.0)
         self.path.write_text(self.path.read_text(encoding="utf-8").replace(
             "https://writer.example/v1", "https://other.example/v1"), encoding="utf-8")

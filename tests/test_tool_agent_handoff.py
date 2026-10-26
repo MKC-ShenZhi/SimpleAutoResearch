@@ -6686,6 +6686,10 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         previous_cwd = Path.cwd()
         self.addCleanup(os.chdir, previous_cwd)
         os.chdir(elsewhere)
+        # A transport-only catalog retune preserves all saved model identities
+        # and routes; loading it does not dispatch or rewrite the task journal.
+        catalog.write_text(text.replace('retry_attempts=1\n',
+            'retry_attempts=1\nstream=true\n'), encoding='utf-8')
         from simple_ar.tools.images import ImageToolGateway
         with patch('simple_ar.tools.images.ImageToolGateway', wraps=ImageToolGateway) as images:
             restored = ToolApplication.load(app.session.store.root)
@@ -6694,6 +6698,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         for purpose in ('task', 'code', 'writing', 'vision'):
             with self.subTest(consumer=purpose):
                 self.assertEqual(restored._client('restore', purpose=purpose).model, purpose)
+                self.assertTrue(restored._client('restore', purpose=purpose)._settings.stream)
         self.assertEqual(restored._feasibility_client('restore').model, 'review')
         self._assert_native_snapshot(restored, before)
         # First explicit role grants can use the already selected task file,

@@ -12,6 +12,7 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 - Working notes and independent inspection reuse recorded observations through bounded inputs. Findings bind individual targets and source versions; partial reads, failed summaries and malformed calls cannot claim completed work. Original material and historical contracts remain available.
 - Ordinary tasks can delegate coherent source creation or revision using existing materials and candidates. Editable source capacity is separate from immutable input copies. Completely read, version-bound editable originals accept full-file revisions as well as exact replacements; approval and input protections still apply.
 - Publication checks the manuscript's actual presentation dependencies. Unused older previews no longer block current export or recovery; consumed figures and their producer versions remain checked.
+- Named connections can retune streaming without replacing the saved model or receiver. A failed call still requires explicit recovery; historical settings and unknown charges remain unchanged.
 
 ### Fixed
 

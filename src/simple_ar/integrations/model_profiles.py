@@ -23,7 +23,7 @@ def model_connections_compatible(saved: dict, current: dict) -> bool:
     never the identity of the model used for the saved scientific task.
     Missing correction authorization means strict zero, never an implicit opt-in.
     """
-    operational = {"request_timeout_sec", "connect_timeout_sec", "max_output_tokens", "retry_attempts", "connect_retry_attempts",
+    operational = {"stream", "request_timeout_sec", "connect_timeout_sec", "max_output_tokens", "retry_attempts", "connect_retry_attempts",
                    "retry_base_delay_sec", "retry_max_delay_sec", "context_input_tokens"}
 
     def identity(value):
