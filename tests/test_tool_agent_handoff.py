@@ -7196,6 +7196,62 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             self.assertEqual(restored.ledger.remaining('total_tokens'), 100000)
             provider.assert_not_called()
 
+    def test_native_retry_switch_retains_closed_professional_charges(self):
+        import httpx
+
+        root, catalog, text, app, provider = self._local_catalog_task()
+        provider.side_effect = None
+        provider.return_value = {'choices': [{'message': {'content': json.dumps({
+            'files': [{'path': 'worker.py', 'content': "print('prepared')\n"}],
+            'execution_plan': {'argv': ['python', 'worker.py'],
+                'outputs': ['answer.txt'], 'timeout_sec': 3}})}}],
+            'usage': {'prompt_tokens': 100, 'completion_tokens': 10, 'total_tokens': 110}}
+        app.run(actions=[{'tool_name': 'prepare_implementation', 'arguments': {
+            'goal': 'Create worker.py that prints prepared; do not execute it'}},
+            {'tool_name': 'ask_user', 'arguments': {'question': 'Await next request'}}],
+            progress=lambda _: None)
+        tool = app.state['turns'][-1]['tools'][0]
+        observation = app.session.store.read_json(tool['result'])
+        self.assertEqual(observation['status'], 'ok', observation)
+        identity = Path(tool['result']).parent.name
+        completed_call = next(row.logical_call_id for row in app.ledger.entries
+            if row.attempt_id == identity and row.status == 'settled')
+        app.ledger.reserve('closed-professional', {'llm_requests': 1, 'total_tokens': 100},
+            session_id=app.session.manifest.session_id, attempt_id=identity,
+            logical_call_id=completed_call, purpose='implementation')
+        charge = app.ledger.mark_unknown('closed-professional', reason='Closed physical request without usage',
+            known_actual={'llm_requests': 1}, retain_reservation=True)
+        self.assertTrue(app._closed_llm_charge(charge))
+        provider.side_effect = httpx.ReadError('terminated decision without usage')
+        app.run(feedback='Continue the prepared work', progress=lambda _: None)
+        self.assertEqual(app.state['pending']['kind'], 'model')
+        self.assertIsNotNone(app._failed_model_attempt(app.state['pending']))
+        before = self._native_snapshot(app)
+        envelope_path = app.session.store.root / f'attempts/{identity}/capability_result.json'
+        envelope = read_json(envelope_path)
+        replacement = root / 'replacement.toml'
+        replacement.write_text(text.replace('model="task"', 'model="replacement"'), encoding='utf-8')
+        provider.reset_mock()
+        with patch.dict(os.environ, {'SIMPLE_AR_MODELS_CONFIG': str(replacement)}):
+            with _changed_record(envelope_path, {**envelope, 'artifacts': []}), self.assertRaises(ValueError):
+                app.run(retry_model=True, retry_model_selector='profile:task', progress=lambda _: None)
+            self._assert_native_snapshot(app, before)
+            provider.assert_not_called()
+            provider.side_effect = None
+            provider.return_value = {'choices': [{'message': self._native_message(
+                'ask_user', {'question': 'Prepared work retained; what next?'}, 'retained-work')}],
+                'usage': {'prompt_tokens': 100, 'completion_tokens': 10, 'total_tokens': 110}}
+            app.run(retry_model=True, retry_model_selector='profile:task', progress=lambda _: None)
+        provider.assert_called_once()
+        with patch.dict(os.environ, {'SIMPLE_AR_MODELS_CONFIG': str(replacement)}):
+            restored = ToolApplication.load(app.session.store.root)
+            self.assertEqual(restored._client().model, 'replacement')
+        self.assertEqual(restored.ledger.to_dict()['entries'][:-1], before['ledger']['entries'])
+        self.assertEqual(restored.ledger.limits, before['ledger']['limits'])
+        self.assertEqual(restored.state['requests'], before['state']['requests'])
+        self.assertEqual(restored.state['turns'][:-1], before['state']['turns'])
+        self.assertEqual(self._native_receipts(restored, before['state']['turns']), before['receipts'])
+
     def test_explicit_resource_allowance_keeps_closed_unknown_llm_history_and_blocks_current_unknown(self):
         with self._model_rebinding_fixture(outcome='ongoing') as (app, provider, _):
             identity = Path(app.state['turns'][-1]['reply']).parent.name

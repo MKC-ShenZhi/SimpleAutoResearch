@@ -4491,8 +4491,9 @@ class ToolApplication:
             raise ValueError('Replacement must be a named Chat connection; no protocol conversion')
         client = self._text_client(parent, self._coordinator_purpose())
         attempts = self.session.list_attempts()
-        # Retry keeps its original failure-only contract. Explicit switching
-        # also admits accepted, locally closed calls; all charges stay held.
+        # Historical retry keeps its failure-only contract. Modern explicit
+        # recovery and switching share the same proof of closed model work;
+        # neither settles charges or replays the professional operation.
         if allow_completed_unknown:
             self._check_authorization_operations(allow_closed_model_charges=True)
         for entry in (() if allow_completed_unknown else self.ledger.entries):
@@ -4597,7 +4598,8 @@ class ToolApplication:
             raise ValueError('Cannot prove a terminated failed native_turn without accepted outputs')
         replacement = None
         if model_selector:
-            client, replacement = self._replacement_text_client(model_selector, attempt_id=attempt.attempt_id)
+            client, replacement = self._replacement_text_client(model_selector, attempt_id=attempt.attempt_id,
+                allow_completed_unknown=self.operations is not None)
             if self.state['config'].get('max_output_tokens') is not None:
                 client = client.with_output_limit(self.state['config']['max_output_tokens'])
         else:

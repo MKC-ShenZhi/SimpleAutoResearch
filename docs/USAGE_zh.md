@@ -181,6 +181,7 @@ uv run simple-ar start --resume-task "SESSION"
 符合条件的已终止模型失败，可单独使用 `--resume-task SESSION --retry-model`，
 不要同时提交反馈或新授权。失败费用保留，并使用剩余预算；
 见[恢复条件](CLI_REFERENCE_zh.md#原生任务入口实验性)。
+普通操作任务可加 `--model profile:another` 明确更换文本连接；已核实终止的专业调用，其有界未知费用继续保留，不单独阻断换连接。在途、无上界费用或损坏记录仍须先核对；历史任务沿原恢复条件。
 追加额度与更多恢复选项见 CLI 参考。
 
 ## 配置一次，围绕成果继续

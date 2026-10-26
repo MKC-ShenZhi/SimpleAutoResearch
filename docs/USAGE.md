@@ -192,6 +192,7 @@ continuing; in-flight operations and unknown side effects must not be blindly re
 For an eligible terminated model failure, use `--resume-task SESSION --retry-model`
 separately from feedback or new authorization. It retains failed charges and
 uses remaining budget; see the [recovery conditions](CLI_REFERENCE.md#native-task-entry-experimental).
+For ordinary operation tasks, add `--model profile:another` to explicitly replace the text connection. Proven closed professional calls retain their bounded unknown charges without independently blocking that change. In-flight work, unbounded charges and damaged records still require reconciliation; historical tasks keep their saved recovery conditions.
 See the CLI reference for additional allowances and recovery options.
 
 ## Configure once and continue from the result
