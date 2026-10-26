@@ -77,7 +77,8 @@ def inspection_tool_specs(*, progressive: bool = False, adaptive: bool = False) 
         artifact_outputs=['artifact_assessment.v1'],
         description=('Independently inspect concrete current claims or changes against authorized evidence. '
             'Choose primary deliverables as targets; source files and execution logs can be supporting '
-            'evidence instead of separate certification tasks. Start with bounded previews and read '
+            'evidence instead of separate certification tasks. Supplied whole-file targets that fit '
+            'the current input budget are provided directly; otherwise start with bounded previews and read '
             'necessary ranges through real tools. The current model input target bounds each working '
             'view; complete original observations remain recorded. Supplementary same-version windows '
             'can complete a target; partial targets cannot pass. '
@@ -85,7 +86,7 @@ def inspection_tool_specs(*, progressive: bool = False, adaptive: bool = False) 
                 'unfinished investigation can be returned explicitly without inventing a defect. '
                 if adaptive else 'At most six batched source rounds and a final opinion share this task ledger; ')
             + 'total decoded reads remain bounded at '
-            '512000 bytes. Initial string targets receive 512-byte previews, with actual ranges '
+            '512000 bytes. Targets that need paging retain actual ranges '
             'and next offsets supplied for further reads. No edits, execution, delivery, visual or '
             'scientific certification; same identity never requests again.' if progressive else
             'Independently inspect current authorized target files against evidence. '
@@ -717,7 +718,8 @@ class InspectionToolGateway:
         return view
 
     def _working_messages(self, saved: dict, request: InspectionRequest, history: list,
-                          offered: list, client: Any, *, finish: dict | None = None) -> tuple[list, dict]:
+                          offered: list, client: Any, *, finish: dict | None = None,
+                          validate_capacity: bool = True) -> tuple[list, dict]:
         """Reuse the common pure projector; original read/response records stay intact."""
         from simple_ar.core.working_context import select_working_context
 
@@ -774,10 +776,49 @@ class InspectionToolGateway:
             context_token_target=target,estimate_tokens=estimate_tokens,
             history_access='read_file at the recorded authorized source path and range',
             trailing_messages=[finish] if finish is not None else [])
-        if metadata['estimated_input_tokens'] > target:
+        if validate_capacity and metadata['estimated_input_tokens'] > target:
             raise ValueError('Inspection working view cannot fit its model input target; '
                 'retain observations and narrow the requested inspection scope')
         return messages, metadata
+
+    def _prime_targets(self, saved: dict, request: InspectionRequest, identity: str,
+                       remaining: list[int], client: Any, offered: list) -> None:
+        """Supply required small inputs once, without asking the reviewer to page them.
+
+        Only a whole-file request may expand. The ordinary projector admits the
+        actual decoded bytes; reading them neither concludes nor passes a review.
+        A cached inspection never enters this fresh-work path.
+        """
+        if not self.progressive:
+            return
+        for index, value in enumerate(request.targets):
+            row = saved['targets'][index]
+            if not isinstance(value, str) or row.get('complete') or not row.get('readable'):
+                continue
+            _, projection = self._working_messages(saved, request, [], offered, client)
+            headroom = projection['input_token_target'] - projection['estimated_input_tokens']
+            window = row['windows'][-1]
+            size, cursor = window['size_bytes'], window['review_next_offset_bytes']
+            count = size - cursor
+            # One normal read at most. A conservative byte bound avoids spending
+            # the shared read allowance probing files unlikely to fit the view.
+            if not 0 < count <= min(64000, remaining[0], headroom):
+                continue
+            tail = self._observe(FileWindow(path=row['path'], offset_bytes=cursor, max_bytes=count),
+                row['subject'], identity, remaining)
+            if not tail.get('readable') or tail.get('sha256') != row.get('sha256'):
+                raise ValueError('Inspection target changed or became unreadable while supplying its text')
+            candidate = deepcopy(saved)
+            merged = candidate['targets'][index]
+            merged['windows'].extend(tail['windows'])
+            merged['complete'] = self._complete_target(merged, [merged])
+            if merged['complete']:
+                merged.pop('limitation', None)
+            _, admitted = self._working_messages(candidate, request, [], offered, client,
+                validate_capacity=False)
+            if admitted['estimated_input_tokens'] <= admitted['input_token_target']:
+                saved['targets'][index] = merged
+        self.store.write_json(self._path(identity, 'input'), saved)
 
     def _inspect(self, saved: dict[str, Any], request: InspectionRequest, identity: str,
                  remaining: list[int], client: Any) -> dict:
@@ -792,6 +833,7 @@ class InspectionToolGateway:
             'description':'Finish this inspection with findings and scope limitations. '
                 'Return this alone after reading evidence; it executes no external operation.',
             'parameters':response_model.model_json_schema()}}
+        self._prime_targets(saved, request, identity, remaining, client, [*tools, terminal])
         messages = [{'role':'system','content':_REVIEW_SYSTEM if self.adaptive else _SUBJECT_SYSTEM if self.protocol else _SYSTEM},
                     {'role':'user','content':json.dumps(self._view(saved,request),ensure_ascii=False)}]
         turn = getattr(client,'tool_turn',None) or client.chat_turn

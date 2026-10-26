@@ -10,13 +10,14 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 
 - New tasks present complete professional operations first, with low-level editing and process contracts available on demand. Tool loading does not expand permissions; saved modes remain unchanged.
 - Actual source windows read during inspection join shared material reuse after receipt, permission, version and range checks. Later work can reuse supporting text, including reads retained after a failed opinion, without inheriting its verdict.
+- Fresh inspections directly supply small whole-file targets within the current input budget. Large files remain paged, explicit windows keep their scope, and reading the full text does not imply a completed or passing review.
 
 ### Fixed
 
 - Independent inspection identifies invalid source references and can bind an omitted target only when its identity is uniquely determined. Rejected comments remain explicitly unverified, with their original trace available; ambiguous identities and invalid evidence still fail. The one-correction limit and historical receipts remain unchanged.
 - Final inspection instructions share the same context selection budget as source material, preventing an otherwise usable working view from overflowing at conclusion time. Historical records and model charges remain unchanged.
 
-An earlier candidate delivered an initial report, but the latest comparison ended with partial artifacts before feedback. P1 acceptance and an overall coordination-cost improvement remain unconfirmed.
+Unassisted initial-draft and substantive-feedback acceptance, and an overall coordination-cost improvement, remain unconfirmed.
 
 ## 2026-10-26 — V2.10 development (unreleased)
 

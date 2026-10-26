@@ -946,6 +946,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._not_delivered()
         self.assertEqual(self._last('inspect_artifacts'), bound)
         self._inspect([{'path': 'report.md', 'max_bytes': 8}])
+        self.assertEqual(self.inspection_views[-1]['targets'][0]['observed_ranges'], [[0, 8]])
         self.assertEqual(self._assessment()['verdict'], 'incomplete')
         self._submit(_action('deliver_result', **delivery))
         self._not_delivered()
@@ -1084,6 +1085,76 @@ class OperationsWorkLoopTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(),raw)
         self.assertEqual(self._versions(self.inputs),original_inputs)
 
+    def test_progressive_inspection_primes_small_targets_for_one_final_response(self):
+        self._create()
+        texts = {
+            'records.csv': 'record,category\n' + ''.join(f'{index},group-{index % 3}\n' for index in range(90)),
+            'review-notes.md': '# Recorded scope\n\n' + 'Only supplied records are described.\n'*35,
+        }
+        for path, text in texts.items():
+            self._write(path, text)
+
+        def review(view):
+            self.assertEqual(view['evidence'], [])
+            self.assertEqual(len(view['targets']), len(texts))
+            for target in view['targets']:
+                text = texts[Path(target['path']).name]
+                self.assertTrue(target['complete'])
+                self.assertEqual(''.join(w['text'] for w in target['text_windows']), text)
+            # Complete reading does not choose the reviewer's conclusion.
+            return {'decisions':[{'subject':target['subject'], 'conclusion':'incomplete',
+                'findings':[], 'evidence':[], 'limitations':['Further interpretation is needed.']}
+                for target in view['targets']]}
+
+        self.review = review
+        result = self._inspect(list(texts), [])
+        self.assertFalse(self.transport_errors, self.transport_errors)
+        self.assertEqual(result['status'], 'ok', result)
+        self.assertEqual(len(self.inspection_requests), 1)
+        self.assertEqual([call['function']['name'] for call in
+            self.inspection_messages[0]['tool_calls']], ['record_inspection'])
+        assessments = _assessments(result)
+        self.assertEqual(len(assessments), len(texts))
+        self.assertTrue(all(row['coverage']=='partial' and row['verdict']=='incomplete'
+            and not row['evidence_sha256'] for row in assessments))
+
+    def test_progressive_inspection_large_target_under_tight_capacity_still_allows_paging(self):
+        from dataclasses import replace
+
+        self.services.llm_client = LLMClient(replace(self.services.llm_client._settings,
+            context_input_tokens=9000))
+        self._create()
+        text = 'record,description\n' + ''.join(
+            f'{index},Authorized record with limited interpretation.\n' for index in range(3500))
+        self._write('large-records.csv', text)
+
+        def review(view):
+            target = view['targets'][0]
+            self.assertFalse(target['complete'])
+            if len(self.inspection_requests) == 1:
+                self.assertIn('read_file', {tool['function']['name']
+                    for tool in self.inspection_requests[-1]['tools']})
+                cursor = max(end for _, end in target['observed_ranges'])
+                return [_action('read_file', path=target['path'], offset_bytes=cursor, max_bytes=1024)]
+            return {'findings':[], 'limitations':['Only the supplied pages were reviewed.']}
+
+        self.review = review
+        result = self._inspect(['large-records.csv'], [])
+        self.assertFalse(self.transport_errors, self.transport_errors)
+        self.assertEqual(result['status'], 'ok', result)
+        self.assertEqual(len(self.inspection_requests), 2)
+        assessment = _assessments(result)[0]
+        self.assertEqual(assessment['coverage'], 'partial')
+        self.assertEqual(assessment['verdict'], 'incomplete')
+        identity = Path(result['data']['record']).parts[1]
+        for index in range(2):
+            trace = self.app.session.store.read_json(f'tools/inspection/{identity}/sources-{index}.json')
+            self.assertLessEqual(trace['working_input']['projection']['estimated_input_tokens'], 9000)
+            if index == 0:
+                self.assertEqual(len(trace['results']), 1)
+                self.assertEqual(trace['results'][0]['result']['status'], 'ok')
+                self.assertTrue(trace['results'][0]['result']['data']['text_windows'])
+
     def test_progressive_inspection_keeps_bounded_context_and_cumulative_decoded_coverage(self):
         from dataclasses import replace
         from simple_ar.tools.workspace import FileWindow
@@ -1102,14 +1173,17 @@ class OperationsWorkLoopTests(unittest.TestCase):
             if visible['complete']:
                 self.assertEqual(''.join(w['text'] for w in visible['text_windows']), text)
                 self.assertEqual(view['evidence'], [])
-            response = self._review_complete_targets(view)
+            # Explicit caller scope stays bounded initially; this reviewer then
+            # deliberately requests the rest through the normal read tool.
+            with patch.object(self, 'inspection_partial_targets', set()):
+                response = self._review_complete_targets(view)
             if isinstance(response, list):
                 for action in response:
                     action['arguments']['max_bytes'] = min(8192, action['arguments']['max_bytes'])
             return response
 
         self.review = review
-        result = self._inspect(['progressive.md'], [])
+        result = self._inspect([{'path':'progressive.md', 'max_bytes':512}], [])
         self.assertEqual(result['status'], 'ok', result)
         self.assertEqual(self._assessment()['coverage'], 'complete')
         self.assertEqual(self._assessment()['verdict'], 'passed')
@@ -1218,7 +1292,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
         owner = self.app.operations.inspection
         # Freeze the earlier allocation of supplementary target reads to evidence.
         # Loading it must verify the original records, not migrate material roles.
-        with patch.object(owner, '_target_observation', return_value=None):
+        with patch.object(owner, '_prime_targets', return_value=None), patch.object(
+                owner, '_target_observation', return_value=None):
             result = self._inspect(['retained.txt'], ['retained.txt'])
         self.assertEqual(result['status'], 'ok', result)
         self.assertEqual(_assessments(result)[0]['verdict'], 'passed')

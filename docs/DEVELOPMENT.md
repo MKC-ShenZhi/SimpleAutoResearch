@@ -79,8 +79,10 @@ explicitly remain incomplete; reading all target bytes alone does not complete a
 Unfinished or failed reviews revoke an older pass and retain outstanding required findings;
 only a conclusive complete reassessment can replace them. Saved protocols retain their
 reading contracts and receipts; load and unrelated supplies do not upgrade them.
-The inspector starts with bounded previews and reads necessary ranges through real
-tools. The common context selector bounds each presented view; original observations
+For a fresh inspection, whole-file targets that fit the current input budget are
+supplied directly; large files retain bounded paging and explicit windows retain
+their requested scope. This removes mandatory model requests just to fetch small
+required inputs, without choosing the opinion. The common context selector bounds each presented view; original observations
 and native call/result pairs remain recorded. Cumulative decoded byte ranges from the
 same current file version can complete a target; gaps, changed bytes and binary reads
 cannot. Owner-computed file digests are available for provenance checks, not scientific
