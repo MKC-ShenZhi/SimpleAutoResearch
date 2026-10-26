@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from simple_ar.app.working_context import select_working_context
+from simple_ar.core.working_context import select_working_context
 from simple_ar.app.work_memory import compact_work, checkpoint_artifacts, checkpoint_entries, summary_coverage
 from simple_ar.app.tool_application import ToolApplication
 from simple_ar.core.budget import BudgetLedger

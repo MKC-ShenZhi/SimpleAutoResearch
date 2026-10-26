@@ -123,7 +123,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.inspection_messages = []
         self.memory_views = []
         self.transport_errors = []
-        self.review = lambda view: {'findings': [], 'limitations': []}
+        self.review = self._review_complete_targets
+        self.inspection_partial_targets = set()
         self.send = self.enterContext(patch('simple_ar.integrations.llm._call_openai_sdk',
             side_effect=self._provider))
         self.app = None
@@ -147,6 +148,29 @@ class OperationsWorkLoopTests(unittest.TestCase):
     def _reload(self):
         self.app = ToolApplication.load(self.root, services=self.services)
         return self.app
+
+    def _review_complete_targets(self, view):
+        """Default text review reads missing bytes; custom callbacks own their reads."""
+        reads = []
+        for target in view['targets']:
+            if (target['complete'] or not target.get('sha256') or not target['text_windows']
+                    or target['path'] in self.inspection_partial_targets):
+                continue
+            rows = [row for row in [*view['targets'], *view['evidence']]
+                if row.get('path') == target['path'] and row.get('sha256') == target['sha256']]
+            cursor = 0
+            for start, end in sorted(span for row in rows for span in row.get('observed_ranges', [])):
+                if start > cursor:
+                    break
+                cursor = max(cursor, end)
+            size = target['text_windows'][0]['size_bytes']
+            if cursor < size:
+                reads.append(_action('read_file', path=target['path'], offset_bytes=cursor,
+                    max_bytes=min(64000, size-cursor)))
+        offered = {tool['function']['name'] for tool in self.inspection_requests[-1]['tools']}
+        if reads and 'read_file' in offered:
+            return reads[:8]
+        return {'findings': [], 'limitations': ['Target reading remains partial.'] if reads else []}
 
     def _provider(self, mode, request, **kwargs):
         # A single controlled seam for both the native model and independent review.
@@ -192,6 +216,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
                                 for f in response['findings'] if f['subject']==subject],
                             'evidence':list(dict.fromkeys(row['subject'] for row in observed
                                 if row.get('text_windows') and row['subject']!=subject
+                                and row.get('path')!=target.get('path')
+                                and (not row.get('sha256') or row.get('sha256')!=target.get('sha256'))
                                 and [w['text'] for w in row['text_windows']]!=target_text)),
                             'limitations':response['limitations']})
                     response = {'decisions':decisions}
@@ -300,9 +326,13 @@ class OperationsWorkLoopTests(unittest.TestCase):
         return self._ok('read_file')['data']
 
     def _inspect(self, targets, evidence=None):
-        self._submit(_action('inspect_artifacts', goal='Check the claims against supplied observations',
-            targets=targets, evidence=evidence if evidence is not None else [
-                'measurements/observations.csv', 'measurements/conditions.txt']))
+        # Explicit FileWindows intentionally preserve their caller-selected scope.
+        # The default reviewer may finish string targets; custom reviews remain untouched.
+        partial = {str(self.app.workspace.resolve(row['path'])) for row in targets if isinstance(row, dict)}
+        with patch.object(self, 'inspection_partial_targets', partial):
+            self._submit(_action('inspect_artifacts', goal='Check the claims against supplied observations',
+                targets=targets, evidence=evidence if evidence is not None else [
+                    'measurements/observations.csv', 'measurements/conditions.txt']))
         return self._last('inspect_artifacts')
 
     def _assessment(self):
@@ -711,7 +741,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
     def test_independent_subjects_keep_passes_and_defects_when_a_sibling_changes(self):
         from simple_ar.core.assessments import assessment_issues
         self._create()
-        self.assertEqual(self.app.state['config']['inspection_protocol'],'subjects.v1')
+        self.assertEqual(self.app.state['config']['inspection_protocol'],'subjects.v2')
         self._write('report.md','# Results\n\nThe observed mean is 2.0.\n')
         self._write('layout.py','font_size = 10\n')
         self._write('incorrect.txt','The observed mean is 9.0.\n')
@@ -941,6 +971,97 @@ class OperationsWorkLoopTests(unittest.TestCase):
         for path,raw in {**old_bytes,**old_records}.items():
             self.assertEqual(path.read_bytes(),raw)
         self.assertEqual(self._versions(self.inputs),original_inputs)
+
+    def test_progressive_inspection_keeps_bounded_context_and_cumulative_decoded_coverage(self):
+        from dataclasses import replace
+        from simple_ar.tools.workspace import FileWindow
+
+        self.services.llm_client = LLMClient(replace(self.services.llm_client._settings,
+            context_input_tokens=12000))
+        self._create()
+        text = 'A'*511+'\u6d4b\n'+('Observed record; scope is text only.\n'*800)
+        self._write('progressive.md', text)
+        target = self.root/'workspace/progressive.md'
+        original = target.read_bytes()
+        before = len(self.inspection_requests)
+
+        def review(view):
+            response = self._review_complete_targets(view)
+            if isinstance(response, list):
+                for action in response:
+                    action['arguments']['max_bytes'] = min(8192, action['arguments']['max_bytes'])
+            return response
+
+        self.review = review
+        result = self._inspect(['progressive.md'], [])
+        self.assertEqual(result['status'], 'ok', result)
+        self.assertEqual(self._assessment()['coverage'], 'complete')
+        self.assertEqual(self._assessment()['verdict'], 'passed')
+        requests = self.inspection_requests[before:]
+        self.assertGreater(len(requests), 3)
+        self.assertLessEqual(len(requests), 7)
+        first, _ = json.JSONDecoder().raw_decode(requests[0]['messages'][1]['content'])
+        self.assertFalse(first['targets'][0]['complete'])
+        self.assertEqual(first['targets'][0]['observed_ranges'], [[0, 511]])
+        self.assertEqual(first['targets'][0]['text_windows'][0]['text'], 'A'*511)
+        final, _ = json.JSONDecoder().raw_decode(requests[-1]['messages'][1]['content'])
+        self.assertTrue(final['targets'][0]['complete'])
+        self.assertGreater(final['working_view']['history']['archive_end_turn'], 0)
+
+        identity = Path(result['data']['record']).parts[1]
+        store = self.app.session.store
+        saved = store.read_json(f'tools/inspection/{identity}/input.json')
+        rows = [*saved['targets'], *saved['evidence']]
+        self.assertGreater(len(rows), 3)
+        self.assertTrue(all(not row['complete'] for row in rows))
+        self.assertEqual({row['sha256'] for row in rows}, {_digest(target)})
+        windows = sorted((window for row in rows for window in row['windows']),
+            key=lambda window: window['offset_bytes'])
+        cursor, decoded = 0, []
+        for window in windows:
+            self.assertEqual(window['offset_bytes'], cursor)
+            self.assertNotIn('\ufffd', window['review_text'])
+            decoded.append(window['review_text'])
+            cursor = window['review_next_offset_bytes']
+        self.assertEqual(cursor, len(original))
+        self.assertEqual(''.join(decoded).encode('utf-8'), original)
+        traces = [store.read_json(f'tools/inspection/{identity}/sources-{index}.json')
+            for index in range(len(requests))]
+        for trace in traces:
+            projection = trace['working_input']['projection']
+            self.assertEqual(projection['input_token_target'], 12000)
+            self.assertLessEqual(projection['estimated_input_tokens'], 12000)
+            self.assertTrue(trace['completed'])
+        self.assertEqual(sum(len(trace['results']) for trace in traces), len(rows)-1)
+        self.assertTrue(any(not row['text_windows'] and row['observed_ranges']
+            for row in final['evidence']))
+        owner = self.app.operations.inspection
+        self.assertTrue(owner._complete_target(rows[0], rows))
+        # A real tail starting after the split character leaves a decoded-byte gap.
+        tail = owner._observe(FileWindow(path='progressive.md', offset_bytes=514, max_bytes=64000),
+            'gap-tail', 'progressive-gap', [512000])
+        self.assertTrue(tail['readable'], tail)
+        self.assertFalse(owner._complete_target(rows[0], [rows[0], tail]))
+        # Read the otherwise complementary tail from a changed file: it must not
+        # complete the old preview or inherit that version's passed assessment.
+        target.write_bytes(b'B'+original[1:])
+        changed = owner._observe(FileWindow(path='progressive.md', offset_bytes=511, max_bytes=64000),
+            'changed-tail', 'progressive-version', [512000])
+        self.assertTrue(changed['readable'], changed)
+        self.assertNotEqual(changed['sha256'], rows[0]['sha256'])
+        self.assertFalse(owner._complete_target(rows[0], [rows[0], changed]))
+        with self.assertRaisesRegex(ValueError, 'version changed'):
+            owner._check_versions(rows, 'progressive-stale')
+        self.assertFalse(owner.can_reconcile('inspect_artifacts', identity))
+        target.write_bytes(original)
+        calls, ledger = self.send.call_count, self.app.ledger.to_dict()
+        records = self._versions(self.root/f'tools/inspection/{identity}')
+        self._reload()
+        cached = self.app.operations.inspection.call('inspect_artifacts', saved['arguments'], identity)
+        self.assertEqual(cached.status, 'ok', cached)
+        self.assertEqual(self.send.call_count, calls)
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+        self.assertEqual(self._versions(self.root/f'tools/inspection/{identity}'), records)
 
     def test_inspector_locates_missing_sources_within_one_version_bound_operation(self):
         self._create(report=True)
@@ -1625,6 +1746,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
             self._ok('write_file')
             self._inspect(['report.md'])
             self._ok('inspect_artifacts')
+            self.assertEqual(self._assessment()['coverage'], 'complete')
             self._reload()
             self._submit(_action('deliver_result',**canonical))
             if error:

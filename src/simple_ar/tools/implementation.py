@@ -461,6 +461,7 @@ class ImplementationToolGateway:
                  professional_requests: bool = False,
                  preparation_only: bool = False,
                  input_contract: str | None = None,
+                 source_edit_contract: str | None = None,
                  measurement: dict[str, Any] | None = None,
                  measurement_supplier: Callable[[], dict[str, Any] | None] | None = None,
                  exact: dict[str, Any] | None = None) -> None:
@@ -468,6 +469,8 @@ class ImplementationToolGateway:
             raise ValueError('Preparation-only source generation cannot use the exact code-task contract')
         from simple_ar.code_task.generation.selection import preserved_input_limits
         preserved_input_limits(input_contract)
+        if source_edit_contract not in (None, 'bound_content.v1'):
+            raise ValueError('Unknown source edit contract')
         if input_contract is not None and not preparation_only:
             raise ValueError('Independent input admission requires ordinary source preparation')
         self.root, self.workspace, self.ledger = root, workspace, ledger
@@ -476,6 +479,7 @@ class ImplementationToolGateway:
         self.professional_requests = professional_requests
         self.preparation_only = preparation_only
         self.input_contract = input_contract
+        self.source_edit_contract = source_edit_contract
         self.client_factory = client_factory
         self.execution_observations = execution_observations
         self.candidate_outputs = candidate_outputs
@@ -1573,6 +1577,8 @@ class ImplementationToolGateway:
                 PROFESSIONAL_GENERATION, REGISTERED_PROJECT_GENERATION, prepare_work,
             )
             method = owner.read_json('request.json').get('generation_method') if owner.exists('request.json') else None
+            if owner.exists('request.json') and owner.read_json('request.json').get('source_edit_contract') not in (None, 'bound_content.v1'):
+                raise ValueError('Unknown retained source edit contract')
             historical = owner.root.exists() and any(owner.root.iterdir())
             if owner.exists('request.json') and owner.read_json('request.json').get('project_snapshot'):
                 from simple_ar.code_task.generation.selection import registered_project_files
@@ -1754,11 +1760,15 @@ class ImplementationToolGateway:
                 **({'selection': selection} if selection else {}),
                 **({'material_selection': material_selection} if material_selection else {})}
             if not owner.exists('request.json'):
+                if self.source_edit_contract is not None:
+                    binding['source_edit_contract'] = self.source_edit_contract
                 binding['argv_semantics'] = 'candidate_relative.v2'
                 if request.producer_completion == 'goal_findings.v1':
                     binding['material_contract'] = 'authoring_context.v1'
             elif 'argv_semantics' in saved_binding:
                 binding['argv_semantics'] = saved_binding['argv_semantics']
+            if owner.exists('request.json') and 'source_edit_contract' in saved_binding:
+                binding['source_edit_contract'] = saved_binding['source_edit_contract']
             if owner.exists('request.json') and 'material_contract' in saved_binding:
                 binding['material_contract'] = saved_binding['material_contract']
             if retained and retained.get('preserved_files'):

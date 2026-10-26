@@ -21,6 +21,7 @@ def select_working_context(
     version_resolver: Callable[[str], str | None] | None = None,
     block_request_counts: Sequence[int] | None = None,
     summarized_through_turn: int = 0,
+    history_access: str = 'read_history',
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Return messages and decision-budget metadata without modifying inputs.
 
@@ -212,7 +213,7 @@ def select_working_context(
                 *[locator(row['observation']) for row in view['observations']]],
             'omitted':[{'record':state['source'].get('record'),'status':state['status']}
                 for state in states if state['status'] not in {'native','working_view'}][-16:],
-            'scope':'Selected exact observations; archival receipts remain available through read_history.'}
+            'scope':'Selected exact observations; archival receipts remain available through '+history_access+'.'}
         cost = 0
         while True:
             context['working_context'] = {'latest_atomic_turn':latest,

@@ -640,19 +640,22 @@ class ImplementationDecisionTests(unittest.TestCase):
 
     def test_registered_project_copy_separates_complete_members_from_bounded_edits(self):
         import hashlib
+        from simple_ar.code_task.generation.selection import ImplementationSources
+        from simple_ar.code_task.generation.writer import _decode_implementation_response
         from simple_ar.code_task.workspace.copy import _materialize_selection
-        from simple_ar.tools.implementation_run import execution_binding
+        from simple_ar.tools.implementation_run import candidate_source, execution_binding
 
         app, previous, files = self._registered_large_project('large-project')
+        app.implementation.source_edit_contract = 'bound_content.v1'
         candidate = Path(previous.data['project_dir'])
         runtime = candidate / 'observations/result.txt'
         runtime.parent.mkdir()
         runtime.write_bytes(b'historical result\n')
         record = app.workspace.resolve(previous.data['prepared_result'])
+        self.assertNotIn('source_edit_contract', json.loads((record.parent / 'request.json').read_bytes()))
         historical = {path: path.read_bytes() for path in
             (record, record.parent / 'request.json', record.parent.parent / 'native_result.json', runtime)}
-        proposal = {'files': [{'path': 'package/worker.py', 'replacements': [
-                {'old_text': 'value = 7', 'new_text': 'value = 8'}]}],
+        proposal = {'files': [{'path': 'package/worker.py', 'content': 'value = 8\n'}],
                 'summary': 'Change the selected source', 'unresolved': [],
                 'execution_plan': previous.data['execution_plan']}
         self.responses = [
@@ -683,6 +686,7 @@ class ImplementationDecisionTests(unittest.TestCase):
         binding = json.loads(frozen)
         self.assertEqual(binding['generation_method'], 'professional_project.v1')
         self.assertEqual(binding['argv_semantics'], 'candidate_relative.v2')
+        self.assertEqual(binding['source_edit_contract'], 'bound_content.v1')
         self.assertEqual(set(binding['original_files']), {'package/worker.py'})
         report = json.loads((binding_path.parent / 'candidate_validation.json').read_bytes())
         self.assertEqual(set(report['file_sha256']), set(files))
@@ -713,6 +717,47 @@ class ImplementationDecisionTests(unittest.TestCase):
         self.assertEqual(binding_path.read_bytes(), frozen)
         self.assertEqual(restored.ledger.to_dict(), ledger)
         self.assertEqual(self.send.call_count, calls)
+        # Recovery keeps the producing contract even under a legacy gateway.
+        self.assertEqual(json.loads(binding_path.read_bytes())['source_edit_contract'], 'bound_content.v1')
+        original = binding['original_files']
+        decode = dict(planned=None, original_files=original, legacy=False,
+            artifact_dir=None, attempt=1, validate_destination=lambda _: None)
+        for policy, row in (
+                (None, proposal['files'][0]),
+                ('bound_content.v1', {**proposal['files'][0], 'replacements': []}),
+                ('unknown', proposal['files'][0])):
+            with self.subTest(policy=policy, row=row), self.assertRaises(ValueError):
+                _decode_implementation_response({'files': [row]}, edit_contract=policy, **decode)
+        replacements, _ = _decode_implementation_response({'files': [
+            {'path': 'package/worker.py', 'replacements': [
+                {'old_text': 'value = 7', 'new_text': 'value = 8'}]}]},
+            edit_contract='bound_content.v1', **decode)
+        self.assertEqual(replacements['package/worker.py'], 'value = 8\n')
+        # Unknown policies fail both accepted candidate and cached recovery,
+        # without dispatch or silently adopting the gateway's current policy.
+        binding_path.write_text(json.dumps({**binding, 'source_edit_contract': 'unknown'}), encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'Unknown retained source edit contract'):
+            candidate_source(restored.implementation, prepared['data']['prepared_result'])
+        rejected = restored.implementation.call('prepare_implementation', binding['request'],
+            identity=binding_path.parents[1].name)
+        self.assertEqual(rejected.status, 'error', rejected)
+        self.assertIn('Unknown retained source edit contract', rejected.error)
+        binding_path.write_bytes(frozen)
+        self.assertEqual(restored.ledger.to_dict(), ledger)
+        self.assertEqual(self.send.call_count, calls)
+        # A source owner cannot rebind stale supplied originals to newer bytes.
+        sources = ImplementationSources(workspace=app.workspace, project=candidate,
+            roots=[], windows=[], originals=dict(original), identity='stale-content',
+            edit_contract='bound_content.v1')
+        with self.assertRaisesRegex(ValueError, 'completely read'):
+            unread = ImplementationSources(workspace=app.workspace, project=candidate,
+                roots=[], windows=[], originals={}, identity='unread-content',
+                edit_contract='bound_content.v1')
+            unread.bind_response(proposal)
+        (candidate / 'package/worker.py').write_bytes(b'value = 9\n')
+        with self.assertRaisesRegex(ValueError, 'changed'):
+            sources.bind_response(proposal)
+        (candidate / 'package/worker.py').write_bytes(b'value = 7\n')
         (candidate / 'assets/calibration.bin').write_bytes(b'changed')
         with self.assertRaisesRegex(ValueError, 'Registered project inputs changed'):
             execution_binding(restored.implementation, {'prepared_result': prepared['data']['prepared_result']},

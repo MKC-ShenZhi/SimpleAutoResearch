@@ -8,18 +8,13 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 
 ### Improved
 
-- Working summaries can replace repeated history input after complete recorded operations and original arguments have been supplied. Required replacement notes remain visible, while original receipts stay available for rereading.
-- Empty, partial or interrupted summaries retain prior understanding and costs. Historical prefix summaries remain readable without acquiring coverage they never established.
-- Independent inspection uses real read-only tool calls to investigate sources, then submits structured findings separately. Results stay paired with their native calls; malformed or unauthorized operations do not execute. Diagnostics distinguish tool-call responses from reasoning-only output.
-- Each source search inside an inspection retains its own invocation and charge. Unknown child-process usage stops further requests; bounded internal file searches no longer inherit the public arbitrary-command argument-count limit.
-- Inspection stops gathering earlier when capacity is tight, reserving its final opinion and the caller's next decision on the existing ledger. Insufficient evidence remains an explicit finding; it does not become a pass.
-- New publications track the manuscript's actual presentation dependencies. Stale unrelated previews no longer block export or recovery; consumed figures and their producer versions remain checked.
-- New inspections bind each target's findings and supporting files independently. Editing a sibling no longer discards an unchanged target's pass or required defect; historical grouped inspections retain their saved contract.
-- Ordinary tasks can request a coherent source candidate and execution proposal from the existing code generator, reuse observed materials, and revise the registered candidate. Execution remains separately approved; this does not restore automatic professional handoffs or require an existing repository.
+- Working summaries reuse complete recorded operations and original arguments. Required replacement notes stay visible; empty, partial or interrupted summaries retain prior understanding, records and costs.
+- Independent inspection uses real read-only calls and a separate structured opinion. Calls, results and charges remain paired; malformed or unauthorized operations do not execute. Capacity checks preserve a final opinion and the caller's next decision without treating missing evidence as a pass.
+- Each inspection target binds its own findings and evidence versions. New inspections present bounded working views and combine actual same-version read ranges; gaps or changed files cannot inherit full coverage. Original observations remain available, and historical inspections retain their saved contracts.
+- Ordinary tasks can delegate coherent source creation or revision using existing materials and candidates. Editable source capacity is separate from immutable input copies. Completely read, version-bound editable originals accept full-file revisions as well as exact replacements; approval and input protections still apply.
+- Publication checks the manuscript's actual presentation dependencies. Unused older previews no longer block current export or recovery; consumed figures and their producer versions remain checked.
 
-- New preparations separate editable source capacity from immutable input copies, retaining original data bytes across execution and feedback without changing historical task admission.
-
-End-to-end initial-draft and feedback acceptance is still in progress. These changes do not establish lower whole-task costs.
+Unassisted initial-draft and feedback acceptance has not passed. Offline input reductions and engineering checks do not establish lower whole-task costs or general task success.
 
 ## 2026-10-25 — V2.10 development (unreleased)
 

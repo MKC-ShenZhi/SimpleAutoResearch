@@ -96,22 +96,24 @@ class OperationTools:
             protocol=config.get('inspection_protocol'),
             prior_assessments=lambda:[row.model_dump() for row in
                 current_assessments(self.workspace,observations())])
-        self.registry.register_package(inspection_tool_specs(), self.inspection, request_visible=True)
+        self.registry.register_package(inspection_tool_specs(progressive=config.get('inspection_protocol')=='subjects.v2'),
+            self.inspection, request_visible=True)
         self.registry.register_package(analysis_tool_specs(),
             AnalysisToolGateway(root,self.workspace,contract=config.get('table_analysis')))
         self.implementation = self.scientific = None
         preparation = config.get('source_generation_protocol')
-        if preparation not in {None,'prepared.v1','prepared.v2'}:
+        if preparation not in {None,'prepared.v1','prepared.v2','prepared.v3'}:
             raise ValueError('Unsupported source generation protocol')
         exact = config.get('code_task') is not None
         self.system = (_SOURCE_COORDINATION + _WORK_PRINCIPLES
-            if not exact and preparation == 'prepared.v2' else SYSTEM)
+            if not exact and preparation in {'prepared.v2','prepared.v3'} else SYSTEM)
         if exact or preparation is not None and config['model'] is not None:
             from simple_ar.tools.implementation import ImplementationToolGateway, implementation_tool_specs
             self.implementation = ImplementationToolGateway(root,self.workspace,ledger,config['model'],session_id,
                 client_factory=lambda identity:client_factory(identity,'code'), exact=config.get('code_task'),
                 preparation_only=not exact,
-                input_contract='bounded_inputs.v2' if not exact and preparation == 'prepared.v2' else None,
+                input_contract='bounded_inputs.v2' if not exact and preparation in {'prepared.v2','prepared.v3'} else None,
+                source_edit_contract='bound_content.v1' if not exact and preparation == 'prepared.v3' else None,
                 execution_observations=execution_observations if not exact else None,
                 work_context=work_context if not exact else None,
                 material_observations=material_observations if not exact else None,

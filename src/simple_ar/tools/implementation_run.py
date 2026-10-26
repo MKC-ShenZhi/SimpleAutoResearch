@@ -65,6 +65,8 @@ def candidate_source(owner: Any, locator: str) -> tuple[Path, dict, dict]:
     if Path(data['source_binding']).resolve() != binding_path.resolve():
         raise ValueError('Prepared source binding is not its producing request')
     source = ArtifactStore(record.parent).read_json('request.json')
+    if source.get('source_edit_contract') not in (None, 'bound_content.v1'):
+        raise ValueError('Unknown retained source edit contract')
     from simple_ar.code_task.generation.selection import preserved_input_limits
     preserved_input_limits(source.get('preserved_input_contract'))
     completion = source['request'].get('producer_completion')

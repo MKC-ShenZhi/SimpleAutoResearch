@@ -54,18 +54,28 @@ class _SubjectResponse(BaseModel):
     decisions: list[_SubjectDecision]
 
 
-def inspection_tool_specs() -> list[CommonToolSpec]:
+def inspection_tool_specs(*, progressive: bool = False) -> list[CommonToolSpec]:
     return [CommonToolSpec(name='inspect_artifacts', domain='inspection',
         permission_level='read_only', risk_level='low',
         input_schema=InspectionRequest.model_json_schema(),
         artifact_outputs=['artifact_assessment.v1'],
-        description='Independently inspect current authorized target files against evidence. '
+        description=('Independently inspect concrete current claims or changes against authorized evidence. '
+            'Choose primary deliverables as targets; source files and execution logs can be supporting '
+            'evidence instead of separate certification tasks. Start with bounded previews and read '
+            'necessary ranges through real tools. The current model input target bounds each working '
+            'view; complete original observations remain recorded. Supplementary same-version windows '
+            'can complete a target; partial targets cannot pass. At most six batched source rounds '
+            'and a final opinion share this task ledger; total decoded reads remain bounded at '
+            '512000 bytes. Initial string targets receive 512-byte previews, with actual ranges '
+            'and next offsets supplied for further reads. No edits, execution, delivery, visual or '
+            'scientific certification; same identity never requests again.' if progressive else
+            'Independently inspect current authorized target files against evidence. '
             'The inspector locates and reads missing sources within the same authorized roots and '
             'task ledger, with at most six batched source-gathering rounds and a final decision. '
             'Strings request full text up to 256000 bytes per '
             'file; FileWindow requests exactly that range. Total returned text is bounded at '
             '512000 bytes. Partial/binary targets cannot pass. No edits, execution, delivery, '
-            'visual inspection or scientific certification. Same identity never requests again.')]
+            'visual inspection or scientific certification. Same identity never requests again.'))]
 
 
 _SYSTEM_INTRO = (
@@ -127,12 +137,16 @@ class InspectionToolGateway:
     def __init__(self, root: Path, workspace: Any, client_factory: Callable[[str], Any],
                  *, prior_assessments: Callable[[], list[dict]] | None = None,
                  protocol: str | None = None) -> None:
-        if protocol not in (None, 'subjects.v1'):
+        if protocol not in (None, 'subjects.v1', 'subjects.v2'):
             raise ValueError('Unknown inspection protocol')
         self.root, self.workspace = Path(root), workspace
         self.store, self.client_factory = ArtifactStore(root), client_factory
         self.prior_assessments = prior_assessments
         self.protocol = protocol
+
+    @property
+    def progressive(self) -> bool:
+        return self.protocol == 'subjects.v2'
 
     def _path(self, identity: str, leaf: str) -> str:
         if not isinstance(identity, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', identity):
@@ -232,9 +246,13 @@ class InspectionToolGateway:
             return False
 
     def _observe(self, value: FileWindow | str, subject: str, identity: str,
-                 remaining: list[int]) -> dict[str, Any]:
+                 remaining: list[int], *, read_limit: int | None = None) -> dict[str, Any]:
         full = isinstance(value, str)
         window = FileWindow(path=value) if full else value
+        if self.progressive:
+            window = window.model_copy(update={'max_bytes': 512 if full else
+                min(window.max_bytes, read_limit or window.max_bytes)})
+            full = False
         row: dict[str, Any] = {'subject': subject, 'request': window.model_dump(exclude_unset=True),
                                'complete': False, 'windows': []}
         try:
@@ -265,7 +283,7 @@ class InspectionToolGateway:
                 next_offset = data['next_offset_bytes']
                 # read_file decodes each byte window separately. Re-read a cut
                 # UTF-8 suffix rather than mistaking it for binary content.
-                if full and data['has_more'] and text.endswith('\ufffd') and '\ufffd' not in text[:-1]:
+                if (full or self.progressive) and data['has_more'] and text.endswith('\ufffd') and '\ufffd' not in text[:-1]:
                     prefix = text[:-1]
                     trailing = count - len(prefix.encode('utf-8'))
                     if 0 < trailing <= 3:
@@ -295,6 +313,24 @@ class InspectionToolGateway:
         else:
             row['readable'] = True
         return row
+
+    def _complete_target(self, target: dict, rows: list[dict]) -> bool:
+        """Actual decoded ranges, not a model declaration or a matching copy."""
+        if not self.progressive:
+            return bool(target['complete'] and target.get('readable'))
+        windows = [window for row in rows if row.get('readable') and row.get('path') == target.get('path')
+            and row.get('sha256') == target.get('sha256') for window in row['windows']]
+        if not windows:
+            return False
+        sizes = {window['size_bytes'] for window in windows}
+        if len(sizes) != 1:
+            return False
+        cursor = 0
+        for start, end in sorted((w['offset_bytes'], w['review_next_offset_bytes']) for w in windows):
+            if start > cursor:
+                return False
+            cursor = max(cursor, end)
+        return cursor == next(iter(sizes))
 
     def _check_versions(self, rows: list[dict[str, Any]], identity: str) -> None:
         for row in rows:
@@ -350,14 +386,16 @@ class InspectionToolGateway:
                 continue  # Unbound files cannot receive an assessment or a pass.
             decision = decisions.get(target['subject'])
             sources = [observed[key] for key in decision.evidence] if decision else []
+            target_complete = self._complete_target(target, list(observed.values()))
             limitations = [f"{row['subject']}: {row['limitation']}"
-                for row in [target, *sources] if row.get('limitation')]
+                for row in [target, *sources] if row.get('limitation')
+                    and not (self.progressive and row is target and target_complete)]
             if not sources:
                 limitations.append('No independently read source evidence; scope is target-text review only')
             limitations.extend(decision.limitations if decision else [error])
             findings = [{'subjects': {target['path']: target['sha256']},
                 'severity': row.severity, 'message': row.message} for row in decision.findings] if decision else []
-            complete = bool(not error and target['complete'] and target.get('readable'))
+            complete = bool(not error and target_complete)
             verdict = ('incomplete' if error else
                 'needs_revision' if any(row['severity'] == 'required' for row in findings) else
                 'passed' if complete else 'incomplete')
@@ -490,7 +528,7 @@ class InspectionToolGateway:
             if not row['independent']:
                 row['limitation'] = 'Target itself or identical bytes cannot be independent evidence'
 
-    def _view(self, saved: dict[str, Any], request: InspectionRequest) -> dict[str, Any]:
+    def _view(self, saved: dict[str, Any], request: InspectionRequest, *, source_result: bool = False) -> dict[str, Any]:
         view = {'goal':request.goal,
             'prior_required':saved['prior_required'],
             'prior_scope':'Reassess these concerns against the current full targets and evidence; '
@@ -503,9 +541,59 @@ class InspectionToolGateway:
                     'text':window.get('review_text',window['text'])} for window in row['windows']]
                     if row.get('readable') and (self.protocol or role=='targets' or row['independent']) else []}
                 for row in saved[role]]
+            if self.progressive:
+                all_rows = [*saved['targets'], *saved['evidence']]
+                for original, visible in zip(saved[role], view[role]):
+                    visible['sha256'] = original.get('sha256')
+                    visible['version_scope'] = 'Owner-computed current full-file digest, not a scientific opinion'
+                    visible['observed_ranges'] = [[w['offset_bytes'], w['review_next_offset_bytes']]
+                        for w in original['windows']]
+                    if role == 'targets':
+                        visible['complete'] = self._complete_target(original, all_rows)
+                        if visible['complete']:
+                            visible['limitation'] = ''
+                    if not source_result and original['subject'] not in saved.get('initial_subjects', []):
+                        visible['text_windows'] = []
         view.update(authorized_roots={name:str(path) for name,path in self.workspace.mounts.items()},
             source_rounds_remaining=6-len(saved.get('source_rounds',[])))
         return view
+
+    def _working_messages(self, saved: dict, request: InspectionRequest, history: list,
+                          offered: list, client: Any, *, finish: dict | None = None) -> tuple[list, dict]:
+        """Reuse the common pure projector; original read/response records stay intact."""
+        from simple_ar.core.working_context import select_working_context
+
+        target = getattr(getattr(client, '_settings', None), 'context_input_tokens', 24000)
+        if type(target) is not int or target <= 0:
+            target = 24000
+        blocks, current = [], []
+        for message in history[2:]:
+            if message['role'] == 'assistant' and current:
+                blocks.append(current)
+                current = []
+            current.append(message)
+        if current:
+            blocks.append(current)
+        base = self._view(saved, request)
+        base.pop('goal', None)
+        base['reading_scope'] = ('Only the supplied decoded windows were observed. Retired source bodies '
+            'remain in the original inspection records; read an authorized original path/range again '
+            'when its text is needed. Full-file hashes are computed by the read owner. Source opinions '
+            'and self-reported manifests do not replace actual source versions or scientific reasoning.')
+        system = _SUBJECT_SYSTEM
+        messages, metadata = select_working_context(user_requests=[request.goal],system_text=system,
+            base_context=base,turn_blocks=blocks,observations=[],
+            schema_tokens=estimate_tokens(json.dumps(offered,ensure_ascii=False)),
+            context_token_target=target,estimate_tokens=estimate_tokens,
+            history_access='read_file at the recorded authorized source path and range')
+        if finish is not None:
+            messages.append(finish)
+            metadata['estimated_input_tokens'] = (estimate_tokens(json.dumps(messages,ensure_ascii=False))
+                + estimate_tokens(json.dumps(offered,ensure_ascii=False)))
+        if metadata['estimated_input_tokens'] > target:
+            raise ValueError('Inspection working view cannot fit its model input target; '
+                'retain observations and narrow the requested inspection scope')
+        return messages, metadata
 
     def _inspect(self, saved: dict[str, Any], request: InspectionRequest, identity: str,
                  remaining: list[int], client: Any) -> dict:
@@ -540,20 +628,40 @@ class InspectionToolGateway:
             # the final opinion as well: a gathering call (including retries)
             # may not spend that capacity. Source results and uncapped output
             # can grow beyond estimates; a floor is not a completion promise.
-            final_tokens = tokens([*messages,finish],[terminal])
+            projected = messages
+            final_history = [*messages,finish]
+            projection = None
+            final_projection = None
+            if self.progressive:
+                projected, projection = self._working_messages(saved,request,messages,[*tools,terminal],client)
+                final_history, final_projection = self._working_messages(saved,request,messages,[terminal],client,finish=finish)
+            final_tokens = tokens(final_history,[terminal])
             slots, capacity = ledger.remaining('llm_requests'), ledger.remaining('total_tokens')
             terminal_only = (number==6 or slots is not None and slots<2
-                or capacity is not None and capacity<final_tokens+tokens(messages,[*tools,terminal]))
+                or capacity is not None and capacity<final_tokens+tokens(projected,[*tools,terminal]))
             if terminal_only:
                 messages.append(finish)
+            offered = [terminal] if terminal_only else [*tools,terminal]
+            call_messages = final_history if terminal_only else projected
+            trace = self._path(identity,f'sources-{number}')
+            working_input = {'messages':call_messages,
+                'projection':final_projection if terminal_only else projection} if self.progressive else {}
+            if self.progressive:
+                self.store.write_json(trace,{'working_input':working_input,'results':[],
+                    'usage':self._usage(identity),'completed':False})
+                saved.setdefault('source_rounds',[]).append(self._digest(trace))
+                self.store.write_json(input_path,saved)
             with ledger.protect_remaining({} if terminal_only else
                     {'llm_requests':1,'total_tokens':final_tokens},additional=True):
-                response = turn(messages,tools=[terminal] if terminal_only else [*tools,terminal],
+                response = turn(call_messages,tools=offered,
                     label=label,budget_call_id=label)
-            trace = self._path(identity,f'sources-{number}')
             results = []
-            self.store.write_json(trace,{'response':response,'usage':self._usage(identity),'results':results})
-            saved.setdefault('source_rounds',[]).append(self._digest(trace))
+            self.store.write_json(trace,{'response':response,'usage':self._usage(identity),'results':results,
+                **({'working_input':working_input,'completed':True} if self.progressive else {})})
+            if self.progressive:
+                saved['source_rounds'][-1] = self._digest(trace)
+            else:
+                saved.setdefault('source_rounds',[]).append(self._digest(trace))
             self.store.write_json(input_path,saved)
             usage = self._usage(identity)
             if (any(row['status'] in {'reserved','unknown'} for row in usage)
@@ -595,6 +703,11 @@ class InspectionToolGateway:
             if not calls:
                 messages.append({'role':'user','content':
                     'Use the offered read tools for needed sources, or record_inspection for the final result.'})
+            read_limit = None
+            if self.progressive:
+                _, base_projection = self._working_messages(saved,request,messages[:2],[*tools,terminal],client)
+                available = max(0,base_projection['input_token_target']-base_projection['estimated_input_tokens'])
+                read_limit = max(256,min(64000,available*4//(2*max(1,len(calls)))))
             for index,call in enumerate(calls):
                 name,arguments = parsed[index] if index<len(parsed) else ('',{})
                 try:
@@ -606,10 +719,11 @@ class InspectionToolGateway:
                     self.store.write_json(input_path,saved)
                     if name=='read_file':
                         row = self._observe(FileWindow.model_validate(arguments),
-                            f"evidence-{len(saved['evidence'])+1}",source_identity,remaining)
+                            f"evidence-{len(saved['evidence'])+1}",source_identity,remaining,read_limit=read_limit)
                         saved['evidence'].append(row)
                         self._mark_evidence(saved)
-                        visible = self._view({**saved,'targets':[], 'evidence':[row]},request)['evidence'][0]
+                        visible = self._view({**saved,'targets':[], 'evidence':[row]},request,
+                            source_result=True)['evidence'][0]
                         result = ToolResult(tool_name=name, status='ok' if row.get('readable') else 'error',
                             data=visible,error='' if row.get('readable') else row.get('limitation','Read failed'))
                     else:
@@ -621,7 +735,8 @@ class InspectionToolGateway:
                 messages.append({'role':'tool','tool_call_id':call['id'],
                     'content':json.dumps(result.model_dump(mode='json'),ensure_ascii=False)})
                 self._mark_evidence(saved)
-                self.store.write_json(trace,{'response':response,'usage':self._usage(identity),'results':results})
+                self.store.write_json(trace,{'response':response,'usage':self._usage(identity),'results':results,
+                    **({'working_input':working_input,'completed':True} if self.progressive else {})})
                 saved['source_rounds'][-1] = self._digest(trace)
                 self.store.write_json(input_path,saved)
                 if any(row['status'] in {'reserved','unknown'} for row in self._usage(identity)):
@@ -654,6 +769,8 @@ class InspectionToolGateway:
                                 for i, value in enumerate(request.targets)]
             saved['evidence'] = [self._observe(value, f'evidence-{i + 1}', identity, remaining)
                                  for i, value in enumerate(request.evidence)]
+            if self.progressive:
+                saved['initial_subjects'] = [row['subject'] for row in [*saved['targets'],*saved['evidence']]]
             self._mark_evidence(saved)
             saved['prior_required'] = self._prior(saved['targets'])
             self.store.write_json(input_path, saved)

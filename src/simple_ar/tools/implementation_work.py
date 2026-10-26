@@ -82,6 +82,8 @@ def prepare_work(owner: Any, request: Any, store: ArtifactStore, output: Path,
     request_data = request.model_dump()
     if store.exists('request.json'):
         saved = store.read_json('request.json')
+        if saved.get('source_edit_contract') not in (None, 'bound_content.v1'):
+            raise ValueError('Unknown retained source edit contract')
         if saved['generation_method'] not in {PROFESSIONAL_GENERATION, REGISTERED_PROJECT_GENERATION} or saved['request'] != request_data:
             raise ValueError('Professional generation request changed; preserve the original attempt')
         if not store.exists('result.json'):
@@ -203,7 +205,8 @@ def prepare_work(owner: Any, request: Any, store: ArtifactStore, output: Path,
         preserved_files=retained.get('preserved_files') if retained else None,
         registered_project=retained, diagnostic_context=bounded_reuse,
         inherited_observations=inherited, inherited_coverage=inherited_coverage,
-        source_owner_paths=source_owner_paths, input_contract=owner.input_contract)
+        source_owner_paths=source_owner_paths, input_contract=owner.input_contract,
+        edit_contract=owner.source_edit_contract)
     sources.requested_files = [row.model_dump() for row in request.files]
     if owner.work_context is not None and not bounded_reuse:
         # Historical fresh work keeps its original context placement. Cached

@@ -1673,8 +1673,8 @@ class ToolApplication:
             config['result_investigation'] = 'execution_findings.v1'
         if control_protocol is not None:
             config['report_protocol'] = None
-            config['inspection_protocol'] = 'subjects.v1'
-            config['source_generation_protocol'] = 'prepared.v2'
+            config['inspection_protocol'] = 'subjects.v2'
+            config['source_generation_protocol'] = 'prepared.v3'
             # Old per-stage contracts belong to saved tasks, not this loop.
             for name in ('professional_inputs','professional_work','producer_completion',
                          'result_investigation','document_source_contract','publication_preparation'):
@@ -3191,7 +3191,7 @@ class ToolApplication:
                   {'role': 'user', 'content': ''}]
         schema_cost = estimate_tokens(json.dumps(self.schemas if schemas is None else schemas, ensure_ascii=False))
         if config.get('context_protocol') == 'working.v1':
-            from simple_ar.app.working_context import select_working_context
+            from simple_ar.core.working_context import select_working_context
             context.pop('requests',None)  # Requests are retained verbatim as messages, once.
             context['current_request_index'] = len(self.state['requests'])-1
             context['history_archive'] = {'total_turns':len(turns), 'access':'read_history',

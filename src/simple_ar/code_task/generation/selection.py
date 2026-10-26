@@ -367,9 +367,12 @@ class ImplementationSources:
                  inherited_observations: list[dict] | None = None,
                  inherited_coverage: dict | None = None,
                  source_owner_paths: set[str] | None = None,
-                 input_contract: str | None = None) -> None:
+                 input_contract: str | None = None, edit_contract: str | None = None) -> None:
         from simple_ar.tools.materials import material_inventories, material_observation_seed
         preserved_input_limits(input_contract)
+        if edit_contract not in (None, 'bound_content.v1'):
+            raise ValueError('Unknown source edit contract')
+        self.edit_contract = edit_contract
         self.input_contract = input_contract
         self.workspace, self.project, self.identity = workspace, project, identity
         if project is not None and registered_project is None and not retained and preserved_files is None:
@@ -531,6 +534,8 @@ class ImplementationSources:
         binding['investigation'] = self.context()
         if self.input_contract:
             binding['preserved_input_contract'] = self.input_contract
+        if self.edit_contract is not None:
+            binding['source_edit_contract'] = self.edit_contract
         owner.write_json('request.json', binding)
 
     def focus(self, references: list[str]) -> None:
@@ -552,7 +557,8 @@ class ImplementationSources:
         if self.working_set and coverage is not None:
             coverage['details'] = 'request.json:journal_observations.coverage'
             coverage['reference_coverage'] = self.seed_coverage['reference_coverage']
-        return {**({'preserved_input_contract': self.input_contract,
+        return {**({'source_edit_contract': self.edit_contract} if self.edit_contract is not None else {}),
+            **({'preserved_input_contract': self.input_contract,
                     'preserved_input_limits': dict(zip(('files', 'bytes'),
                         preserved_input_limits(self.input_contract)))} if self.input_contract else {}),
             'inventories': [{'root': self.workspace.locator(row['project_path']),
@@ -621,6 +627,8 @@ class ImplementationSources:
 
     def bind_response(self, response: dict, *, commit: bool = True) -> tuple[dict, dict]:
         """Validate bindings locally; the writer commits only an admitted candidate."""
+        if self.edit_contract is not None:
+            self.validate()
         rows = response.get('files')
         preserve = _preserve_selections(response.get('preserve_files', []), contract=self.input_contract)
         if not isinstance(rows, list):
@@ -694,6 +702,35 @@ class ImplementationSources:
             specs.append({'path': name, 'source_path': path,
                 'source_sha256': self.workspace.artifact_hashes([path])[path]})
         bound = bind_implementation_originals(specs, resolve_source=self.workspace.resolve)
+        if self.edit_contract is not None:
+            from simple_ar.tools.materials import observed_window_key
+            from simple_ar.tools.workspace import FileWindow
+            for row in rows:
+                name = row.get('path')
+                if not isinstance(name, str) or name not in bound or 'content' not in row:
+                    continue
+                original = bound[name]
+                if name in self.originals:
+                    if original != self.originals[name]:
+                        raise ValueError('Bound editable original changed; no content revision')
+                    continue
+                # Inventory membership alone never grants a whole-file rewrite.
+                # Require complete owner-observed byte coverage of this version.
+                ranges = []
+                for observed in self.observations:
+                    if 'request' not in observed:
+                        continue
+                    path, start, end, digest = observed_window_key(self.workspace,
+                        FileWindow.model_validate(observed['request']), observed)
+                    if path == original['path'] and digest == original['sha256']:
+                        ranges.append((start, end))
+                covered = 0
+                for start, end in sorted(ranges):
+                    if start > covered:
+                        break
+                    covered = max(covered, end)
+                if not ranges or covered < self.workspace.resolve(original['path']).stat().st_size:
+                    raise ValueError('Full content requires a completely read, bound editable original')
         originals = ({name: row for name, row in self.originals.items() if name in {*legacy, *names}}
             if self.registered_project is not None else dict(self.originals))
         originals.update(bound)

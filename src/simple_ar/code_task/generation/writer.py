@@ -38,9 +38,27 @@ _IMPLEMENTATION_HEADER = (
     'Return one JSON object with summary, unresolved (list of concrete gaps), and files '
     '(a list of {path, content}); '
 )
-_IMPLEMENTATION_BODY = (
-    'For paths in original_files, return {path, replacements: [{old_text, new_text}]} instead '
-    'of content. Each old_text must match once in the complete original; replacements cannot '
+_IMPLEMENTATION_EDIT_PROMPTS = {
+    None: {
+        'originals': 'For paths in original_files, return {path, replacements: [{old_text, new_text}]} instead '
+            'of content. ',
+        'feedback': 'Return only existing files needing exact replacements (replacements: [] is allowed), ',
+        'investigation': 'exact replacements, never content; the owner checks complete current originals. ',
+        'project': 'use exact replacements for existing_project_paths. ',
+    },
+    'bound_content.v1': {
+        'originals': 'For paths in original_files, return either {path, content} with the complete revised '
+            'file or {path, replacements: [{old_text, new_text}]}, never both. Prefer full content '
+            'when edits cover a coherent small file. ',
+        'feedback': 'Return only existing files needing revision (replacements: [] is allowed), ',
+        'investigation': 'exact replacements or complete content under source_edit_contract=bound_content.v1; '
+            'full content requires an owner-bound original or complete current-file reads first. '
+            'The owner checks complete current originals. ',
+        'project': 'use exact replacements or complete content for completely read, owner-bound existing_project_paths. ',
+    },
+}
+_IMPLEMENTATION_GUIDANCE = (
+    'Each old_text must match once in the complete original; replacements cannot '
     'overlap. If a selected existing file needs no change, return replacements: [] to preserve '
     'it exactly; do not manufacture edits to satisfy the selection. Preserve unrelated code '
     'and documentation. New files still require full content. '
@@ -63,23 +81,25 @@ _IMPLEMENTATION_BODY = (
     'copy data only through an explicitly supported owner preserve mapping, never by rewriting it as content. '
     'The calling task will review and execute separately; runnable candidate is not verified success.'
 )
-IMPLEMENTATION_SYSTEM = (_IMPLEMENTATION_HEADER
-    + 'include exactly every planned file, no additional files. ' + _IMPLEMENTATION_BODY)
-DIRECT_IMPLEMENTATION_SYSTEM = (_IMPLEMENTATION_HEADER
-    + 'choose 1-12 necessary editable textual source files as one coherent unit. '
+_IMPLEMENTATION_BODY = _IMPLEMENTATION_EDIT_PROMPTS[None]['originals'] + _IMPLEMENTATION_GUIDANCE
+_IMPLEMENTATION_PLANNED = 'include exactly every planned file, no additional files. '
+_IMPLEMENTATION_DIRECT = (
+    'choose 1-12 necessary editable textual source files as one coherent unit. '
     'No input project or frozen filename plan was supplied. Runtime-produced images, '
     'tables and documents belong in execution_plan.outputs, not as invented file content. '
-    'Do not precompute a binary image as text or create placeholders for outputs. '
-    + _IMPLEMENTATION_BODY)
-FEEDBACK_IMPLEMENTATION_SYSTEM = (_IMPLEMENTATION_HEADER
-    + 'Correct the registered candidate using the complete owner-verified original_files. '
-    'Return only existing files needing exact replacements (replacements: [] is allowed), '
+    'Do not precompute a binary image as text or create placeholders for outputs. ')
+_IMPLEMENTATION_FEEDBACK = 'Correct the registered candidate using the complete owner-verified original_files. '
+_IMPLEMENTATION_FEEDBACK_RETENTION = (
     'and necessary new editable textual source files with full content. Unmentioned originals '
     'are retained byte-for-byte; never delete them. The union of originals and returned files '
     'must contain at most 12 files. Return files: [] only for a plan-only correction, with an '
     'execution_plan in the same response. Runtime-produced images, tables and documents belong '
     'in execution_plan.outputs, not textual sources or placeholders. Outputs must not overlap '
-    'any retained original or returned source. No execution has occurred for this proposal. '
+    'any retained original or returned source. No execution has occurred for this proposal. ')
+IMPLEMENTATION_SYSTEM = _IMPLEMENTATION_HEADER + _IMPLEMENTATION_PLANNED + _IMPLEMENTATION_BODY
+DIRECT_IMPLEMENTATION_SYSTEM = _IMPLEMENTATION_HEADER + _IMPLEMENTATION_DIRECT + _IMPLEMENTATION_BODY
+FEEDBACK_IMPLEMENTATION_SYSTEM = (_IMPLEMENTATION_HEADER + _IMPLEMENTATION_FEEDBACK
+    + _IMPLEMENTATION_EDIT_PROMPTS[None]['feedback'] + _IMPLEMENTATION_FEEDBACK_RETENTION
     + _IMPLEMENTATION_BODY)
 
 
@@ -112,6 +132,10 @@ def write_implementation_unit(
     without authorizing execution.
     """
     original_files = original_files if original_files is not None else {}
+    edit_contract = (investigation.edit_contract if investigation is not None else
+        (command_source_binding or {}).get('source_edit_contract'))
+    if edit_contract not in (None, 'bound_content.v1'):
+        raise ValueError('Unknown source edit contract')
     dependency_observation = None
     if candidate_admission:
         from simple_ar.code_task.generation.dependencies import build_dependency_advice, dependency_observation_view
@@ -127,8 +151,12 @@ def write_implementation_unit(
             or any(not p for p in planned) or len(set(planned)) != len(planned)))
             or (planned is None and (len(original_files) > 12 or validate_destination is None))):
         raise ValueError('Implementation requires distinct safe relative output paths')
-    system = ((FEEDBACK_IMPLEMENTATION_SYSTEM if original_files else DIRECT_IMPLEMENTATION_SYSTEM)
-        if planned is None else IMPLEMENTATION_SYSTEM)
+    edit_prompt = _IMPLEMENTATION_EDIT_PROMPTS[edit_contract]
+    implementation_body = edit_prompt['originals'] + _IMPLEMENTATION_GUIDANCE
+    unit_prompt = (_IMPLEMENTATION_PLANNED if planned is not None else
+        _IMPLEMENTATION_FEEDBACK + edit_prompt['feedback'] + _IMPLEMENTATION_FEEDBACK_RETENTION
+        if original_files else _IMPLEMENTATION_DIRECT)
+    system = _IMPLEMENTATION_HEADER + unit_prompt + implementation_body
     if investigation is not None:
         system = (_IMPLEMENTATION_HEADER +
             'You own investigation and implementation in the same decision flow. '
@@ -142,7 +170,7 @@ def write_implementation_unit(
             'max_bytes (1-64000), optional start_line/max_lines; '
             'continue at next_offset_bytes for unread tails. Windows do not establish full coverage; '
             'never infer unseen contents from inventory. For every existing_project_paths entry use '
-            'exact replacements, never content; the owner checks complete current originals. Optional '
+            + edit_prompt['investigation'] + 'Optional '
             'preserve_files accepts existing project-relative UTF-8 dependency paths, or '
             '{source: exact authorized inventory locator, path: candidate-relative destination} mappings '
             '(a dictionary of source locator to destination is equivalent) '
@@ -166,7 +194,7 @@ def write_implementation_unit(
                 'runtime-output copying. Unmentioned original_files remain unchanged. Choose at most 12 '
                 'total source files including preserved dependencies. ')
             + 'Explicit requested_files remain '
-            'required candidate paths. Never combine read_windows and candidate fields. ' + _IMPLEMENTATION_BODY)
+            'required candidate paths. Never combine read_windows and candidate fields. ' + implementation_body)
         if investigation.working_set:
             system += (' The professional_working_set.v1 contract separates active presentation from '
                 'the immutable actual-read ledger. To make room for fresh investigation, return '
@@ -183,11 +211,15 @@ def write_implementation_unit(
             system += (' Bound-project retention is separate from that bounded edit unit: the owner '
                 'copies every admitted member before overlaying admitted edits. Do not list '
                 'unchanged members in preserve_files or retransmit their bytes. Choose at most 12 editable '
-                'text sources; use exact replacements for existing_project_paths. files: [] with an '
+                'text sources; ' + edit_prompt['project'] + 'files: [] with an '
                 'execution_plan is allowed. The full registered project survives even when it exceeds '
                 '12 files or includes binary/large dependencies. Unread members remain uninspected. '
                 'Only the selected editable subtree grants edit authority; outputs cannot overlap any '
                 'registered member. Additional individual preserve mappings retain their existing limits.')
+    if edit_contract == 'bound_content.v1':
+        system += (' The bound_content.v1 policy grants no edits to immutable inputs, unread or '
+            'unbound existing paths. Preserve unrelated code and documentation in full content. '
+            'Do not supply source hashes; the owner derives original identities and guards concurrent changes.')
     if execution_requested:
         system += (' The caller explicitly set execution_requested=true: execution_plan is required '
             'in this response and must satisfy the plan contract. This requests planning only; '
@@ -310,9 +342,12 @@ def _decode_implementation_response(
     candidate_admission: bool = False,
     registered_paths: list[str] | None = None,
     input_contract: str | None = None,
+    edit_contract: str | None = None,
 ) -> tuple[dict[str, str], dict[str, str]]:
     from simple_ar.code_task.generation.selection import preserved_input_limits
     preserved_input_limits(input_contract)
+    if edit_contract not in (None, 'bound_content.v1'):
+        raise ValueError('Unknown source edit contract')
     modes: dict[str, str] = {}
     rows = response.get('files')
     if (not isinstance(rows, list) or (len(rows) != len(planned) if planned is not None
@@ -333,8 +368,14 @@ def _decode_implementation_response(
             _validate_text_source(path, validate_destination)
         elif validate_destination is not None:
             validate_destination(path)
-        if path in original_files:
+        if path in original_files and not legacy and edit_contract == 'bound_content.v1' and 'content' in row:
+            if set(row) != {'path', 'content'} or not isinstance(row['content'], str):
+                raise ValueError('Bound content requires only path and textual content, mutually exclusive with replacements')
+            content = row['content']
+        elif path in original_files:
             changes = row.get('replacements')
+            if not legacy and edit_contract == 'bound_content.v1' and set(row) != {'path', 'replacements'}:
+                raise ValueError('Bound replacements require only path and replacements; no model source hashes')
             if ('content' in row or not isinstance(changes, list) or not (1 if legacy else 0) <= len(changes) <= 40
                     or any(not isinstance(change, dict) or set(change) != {'old_text', 'new_text'}
                         or not all(isinstance(value, str) for value in change.values()) for change in changes)):
@@ -479,6 +520,8 @@ def _generate_implementation_contents(
                 preserved_files=candidate_preserved,
                 candidate_admission=candidate_admission,
                 input_contract=investigation.input_contract if investigation is not None else None,
+                edit_contract=investigation.edit_contract if investigation is not None else
+                    (command_source_binding or {}).get('source_edit_contract'),
                 registered_paths=list(investigation.registered_files) if investigation is not None else None)
             if not legacy and command_source_binding is not None and 'execution_plan' in response:
                 if candidate_root is None:

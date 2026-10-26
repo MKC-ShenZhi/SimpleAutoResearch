@@ -66,12 +66,18 @@ New tasks use `operations.v1`: investigation, editing, execution, inspection and
 publication are independently callable, rather than stages of an implicit handoff.
 `OperationTools` composes the registry; it does not run another scheduler. Inspection
 owns version-bound findings and publication owns rendering and export provenance.
-New tasks freeze `inspection_protocol=subjects.v1`: one source investigation can
+New tasks freeze `inspection_protocol=subjects.v2`: one source investigation can
 inspect several targets, but each decision names its own supporting observations.
 Each target's completeness, findings and evidence versions are evaluated separately;
 cross-file support must be explicit. Saved grouped opinions are not retroactively
 split, and unrelated supplies do not upgrade their inspection contract.
-`source_generation_protocol=prepared.v2` exposes goal/material/project preparation
+The inspector starts with bounded previews and reads necessary ranges through real
+tools. The common context selector bounds each presented view; original observations
+and native call/result pairs remain recorded. Cumulative decoded byte ranges from the
+same current file version can complete a target; gaps, changed bytes and binary reads
+cannot. Owner-computed file digests are available for provenance checks, not scientific
+certification. Saved `subjects.v1` keeps its original full-target presentation.
+`source_generation_protocol=prepared.v3` exposes goal/material/project preparation
 and approved execution as ordinary operations. The source owner investigates and
 generates the candidate; shared execution retains approval, accounting and provenance.
 Original requests, relevant opinions and admitted parent reads are supplied through
@@ -83,6 +89,10 @@ New preparations separate up to 12 editable sources from immutable input copies
 copies and version-binds those inputs; they do not need to pass through the model
 as rewritten records. Feedback retains their immutable roles. Saved `prepared.v1`
 and unmarked preparations keep their original combined admission limits.
+New `prepared.v3` revisions accept complete content or exact replacements for a bound
+editable original. Whole-file revision requires complete current-file observations;
+inventory membership alone is insufficient. Immutable inputs, concurrent-change guards
+and execution approval remain enforced. Saved `prepared.v2` retains replacement-only edits.
 Formal delivery declares its manuscript and requested formats. Fixed code and
 measurement contracts remain enforced by their original execution owners.
 Historical native tasks without this protocol retain their saved professional
@@ -90,7 +100,7 @@ control. Explicit `control_protocol=None` in Python is compatibility integration
 ordinary new tasks use the new default. Never edit a saved task to upgrade it.
 Core retains attempts, artifacts, resource usage and process results through the same shared execution and records.
 
-New operation tasks save `working.v1` for context. `working_context.py` selects
+New operation tasks save `working.v1` for context. `core/working_context.py` selects
 recorded observations, coherent recent turns and exact source excerpts. When old
 history volume warrants it, `work_memory.py` uses the same budgeted model to record
 a bounded checkpoint in the native attempt; it creates no second memory store or
