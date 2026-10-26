@@ -15,11 +15,28 @@ from simple_ar.app.tool_application import ToolApplication, _runtime_bindings
 
 def load_native_history(root: Path, goal: str, *, config: dict, limits: dict | None = None,
                         max_attempts: int = 300, services=None, absent_fields: tuple[str, ...] = ()):
+    if 'control_protocol' in config:
+        raise ValueError('Historical native fixture has no operation control protocol')
+    return _load_history(root, goal, config=config, limits=limits, max_attempts=max_attempts,
+        services=services, absent_fields=absent_fields)
+
+
+def load_prepared_operation_history(root: Path, goal: str, *, config: dict,
+                                    limits: dict, max_attempts: int = 300, services=None):
+    """Load the saved prepared.v3/native.v1 operation contract, never create it."""
+    return _load_history(root, goal, config={
+        'control_protocol': 'operations.v1', 'source_generation_protocol': 'prepared.v3',
+        'source_decision_protocol': 'native.v1', 'inspection_protocol': 'subjects.v3',
+        'context_protocol': 'working.v1', 'tool_contracts': 'outcomes',
+        'producer_completion': None, 'document_source_contract': None,
+        **config}, limits=limits, max_attempts=max_attempts, services=services)
+
+
+def _load_history(root: Path, goal: str, *, config: dict, limits: dict | None,
+                  max_attempts: int, services, absent_fields: tuple[str, ...] = ()):
     root = Path(root).resolve()
     if root.exists():
         raise FileExistsError(root)
-    if 'control_protocol' in config:
-        raise ValueError('Historical native fixture has no operation control protocol')
     saved = {
         'model': None, 'sources': {}, 'tool_contracts': 'on_demand',
         'model_connection': None, 'vision_connection': None, 'feasibility_connection': None,

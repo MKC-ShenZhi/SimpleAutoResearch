@@ -65,11 +65,11 @@ class ImplementationDecisionTests(unittest.TestCase):
             'usage': {'prompt_tokens': 100, 'completion_tokens': 20, 'total_tokens': 120}}
 
     def _create(self, name='task', sources=None):
-        return ToolApplication.create(self.base / name, 'Implement from the authorized original inputs',
-            model='fixture', sources=sources or {}, services=self.services,
-            allow_execution=True, max_turns=12, max_tokens=600000,
-            process_limits={'process_invocations': 3, 'process_wall_seconds': 30},
-            control_protocol='operations.v1')
+        from tests.native_history_fixture import load_prepared_operation_history
+        return load_prepared_operation_history(self.base / name, 'Implement from the authorized original inputs',
+            config={'model':'fixture', 'sources':sources or {}, 'allow_execution':True, 'max_turns':12},
+            services=self.services, limits={'llm_requests':12, 'total_tokens':600000,
+                'process_invocations':3, 'process_wall_seconds':30, 'source_operations':36}, max_attempts=120)
 
     def _load_history(self, name, *, sources=None, unmarked=False):
         """Explicit saved request-owner or pre-completion source contract."""

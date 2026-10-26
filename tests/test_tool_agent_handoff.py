@@ -232,167 +232,23 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             self.assertEqual(result['status'], 'completed')
             self.assertEqual(app.ledger.to_dict(), before)
 
-    def test_prepared_unit_executes_approved_plan_and_pins_delivery_version(self) -> None:
-        from simple_ar.core.capabilities import ArtifactStore
-        _, inputs, fake, _, app, _ = self._native_fixture(process_limits={
-            'process_invocations': 2, 'process_wall_seconds': 10}, operation_control=True)
-        fake.chat_turn.side_effect = AssertionError('Caller actions must not request coordinator decisions')
-        # Current source work uses native actions; retain this test's candidate
-        # fixtures without returning an unconstrained Mock as a model message.
-        def source_turn(messages, **kwargs):
-            candidate = fake.ask_json(messages[0]['content'], messages[1]['content'])
-            return {'role': 'assistant', 'content': None, 'tool_calls': [{
-                'id': 'source-candidate', 'type': 'function', 'function': {
-                    'name': 'submit_candidate', 'arguments': json.dumps(candidate)}}]}
-        fake.tool_turn.side_effect = source_turn
-        app.implementation.client_factory = lambda _: fake
-        self.assertTrue(app.implementation.preparation_only)
-        self.assertIn('write_file',{spec.name for spec in app.gateway.list_specs()})
-        self.assertIn('run_process',{spec.name for spec in app.gateway.list_specs()})
-        self.assertNotIn('investigate_implementation',{spec.name for spec in app.gateway.list_specs()})
-        rejected = app.implementation.call('prepare_implementation',
-            {'goal':'Create a source unit','complete_work':False},identity='unsupported-controller')
-        self.assertEqual(rejected.status,'error')
-        fake.ask_json.assert_not_called()
-        code = "from pathlib import Path\nPath('result.txt').write_text(str(sum(range(7))))\n"
-        external = app.workspace.workspace / 'caller-runner.py'
-        external.write_text(code)
-        fake.ask_json.return_value = {'summary': 'Compute saved result', 'unresolved': ['Optional CSV input remains unsupported'],
-            'files': [{'path': 'calculate.py', 'content': code}],
-            'execution_plan': {'argv': ['python', str(external)], 'outputs': ['result.txt'], 'timeout_sec': 3}}
-        stop = {'tool_name': 'ask_user', 'arguments': {'question': 'Await next explicit action'}}
-        (inputs/'request.txt').write_text('Save the integer sum of range(7); no training is requested.\n')
-        app.run(actions=[{'tool_name':'read_file','arguments':{'path':'source0/request.txt'}},stop],
-            progress=lambda _:None)
-        app.run(actions=[{'tool_name': 'prepare_implementation', 'arguments': {
-            'goal': 'Compute the integer sum and save its result'}}, stop], progress=lambda _: None)
-        prepared = app.session.store.read_json(app.state['turns'][-1]['tools'][0]['result'])
-        self.assertEqual(prepared['status'], 'ok', prepared.get('error'))
-        self.assertIn('Save the integer sum',json.dumps(_writing_prompt(fake)['source_windows']))
-        locator = prepared['data']['prepared_result']
-        candidate = Path(prepared['data']['project_dir'])
-        self.assertFalse((candidate / 'result.txt').exists())
-        run = {'tool_name': 'execute_implementation', 'arguments': {'prepared_result': locator,
-            'delivery': {'summary': 'Actual saved sum; no scientific certification',
-                'artifacts': [str(candidate / 'result.txt'), str(candidate / 'calculate.py')]}}}
-        app.run(actions=[run], progress=lambda _: None)
-        pending = app.state['pending']
-        self.assertEqual(pending['call']['function']['name'], 'execute_implementation')
-        token = app.approval_token(pending['call'])
-        identity = pending['attempt']
-        external.write_text(code + '# external entry changed\n')
-        self.assertNotEqual(app.approval_token(pending['call']), token)
-        external.write_text(code)
-        # No capability context or borrowed directory can authorize a run.
-        rejected = app.gateway.call('execute_implementation', run['arguments'])
-        self.assertEqual(rejected.status, 'blocked')
-        self.assertFalse((candidate / 'result.txt').exists())
-        # A changed helper/source is caught even when absent from argv.
-        (candidate / 'calculate.py').write_text(code + '# changed\n')
-        with self.assertRaises(ValueError):
-            app.approval_token(pending['call'])
-        (candidate / 'calculate.py').write_text(code)
-        app = ToolApplication.load(app.session.store.root)
-        status = app.run(approved_execution=token, progress=lambda _: None)
-        self.assertEqual(status['status'], 'completed', status)
-        observed = app.session.store.read_json(f'attempts/{identity}/native_result.json')
-        self.assertEqual(observed['status'], 'ok', observed.get('error'))
-        self.assertEqual(observed['data']['returncode'], 0)
-        self.assertEqual(observed['data']['status'], 'run_succeeded')
-        # Current goal-scoped completion does not turn an optional future
-        # feature into a required failure. Keep the author's original note as
-        # a review lead; historical unmarked approvals are covered separately.
-        self.assertEqual(observed['data']['producer_completion'], 'goal_findings.v1')
-        self.assertEqual(observed['data']['unresolved'], ['Optional CSV input remains unsupported'])
-        self.assertEqual(observed['data']['delivery']['unresolved'], [])
-        self.assertEqual((candidate / 'result.txt').read_text(), '21')
-        self.assertIn('no independent', observed['data']['verification'])
-        ledger = app.ledger.to_dict()
-        store = ArtifactStore(app.session.store.root / 'attempts' / identity)
-        saved = store.read_json('candidate_execution.json')
-        from simple_ar.tools.implementation_run import execute_prepared
-        context = SimpleNamespace(attempt=store.read_attempt_manifest(), store=store)
-        with patch.object(app.workspace, 'call', side_effect=AssertionError('No physical replay')):
-            recovered = execute_prepared(app.implementation, context, run['arguments'], approval=saved['approval'])
-        self.assertEqual(recovered.data, observed['data'])
-        self.assertEqual(app.ledger.to_dict(), ledger)
-        with _changed_record(store.root / 'candidate_execution.json', None), \
-                patch('simple_ar.tools.workspace.run_process', side_effect=AssertionError('No physical replay')):
-            interrupted = execute_prepared(app.implementation, context, run['arguments'], approval=saved['approval'])
-            self.assertEqual(interrupted.status, 'blocked')
-            self.assertEqual(interrupted.data['status'], 'unbound_outputs_after_interruption')
-            self.assertNotIn('delivery', interrupted.data)
-            self.assertEqual(app.ledger.to_dict(), ledger)
-        # Later delivery cannot certify this old output against new source.
-        external.write_text(code + '# new unexecuted entry\n')
-        with self.assertRaises(ValueError):
-            app.workspace.check_artifact_producers([str(candidate / 'result.txt')])
-        # A registered candidate is also the feedback base after a run. Runtime
-        # outputs are not editable originals and cannot leak into the next unit.
-        fake.ask_json.return_value = {'summary': 'Change execution entry only',
-            'unresolved': ['Optional CSV input remains unsupported'], 'files': [],
-            'execution_plan': {'argv': ['python', 'calculate.py'], 'outputs': ['result.txt'], 'timeout_sec': 3}}
-        app.implementation.client_factory = lambda _: fake  # Restore the injected professional client after load.
-        app.run(feedback='Keep the source; use its portable entry for the next run', actions=[
-            {'tool_name': 'prepare_implementation', 'arguments': {
-                'goal': 'Change only the execution entry', 'project_path': str(candidate)}},
-            {'tool_name': 'ask_user', 'arguments': {'question': 'Review the new proposal before running'}}],
-            progress=lambda _: None)
-        revised = app.session.store.read_json(app.state['turns'][-1]['tools'][0]['result'])
-        self.assertEqual(revised['status'], 'ok', revised.get('error'))
-        self.assertEqual((Path(revised['data']['project_dir']) / 'calculate.py').read_text(), code)
-        self.assertFalse((Path(revised['data']['project_dir']) / 'result.txt').exists())
-        self.assertEqual(sorted(_writing_prompt(fake)['original_files']), ['calculate.py'])
-        self.assertIsNone(_writing_prompt(fake)['planned_files'])
-        context = [row['work_context'] for row in _writing_prompt(fake)['source_windows']
-            if row.get('role')=='user_request_and_accepted_feedback_not_source_or_authority']
-        self.assertEqual(context[0]['user_requests'][-1],
-            'Keep the source; use its portable entry for the next run')
-        # Recover through the exact frozen owner request, including internal
-        # completion semantics supplied by the application on the first call.
-        revision_args = {'goal':'Change only the execution entry','project_path':str(candidate)}
-        revision_id = Path(revised['data']['project_dir']).name
-        repeated = app.implementation.call('prepare_implementation', revision_args, identity=revision_id)
-        self.assertEqual(repeated.data, revised['data'])
-        extra = candidate / 'unlisted-source.txt'
-        extra.write_text('A new source requires investigation, not silent omission.\n')
-        try:
-            # The registered source unit does not acquire an unrelated file
-            # merely because it appeared in the enclosing runtime directory.
-            repeated = app.implementation.call('prepare_implementation', revision_args, identity=revision_id)
-            self.assertEqual(repeated.data,revised['data'])
-            self.assertFalse((Path(revised['data']['project_dir'])/extra.name).exists())
-            bound = candidate/'calculate.py'
-            bound.write_text(code+'# actual registered source changed\n')
-            rejected = app.implementation.call('prepare_implementation', revision_args, identity=revision_id)
-            self.assertEqual(rejected.status,'error')
-        finally:
-            extra.unlink()
-        fake.chat_turn.assert_not_called()
-        self.assertEqual(fake.ask_json.call_count, 2)
-
-    def test_ordinary_source_generation_can_deliver_code_without_requesting_execution(self):
-        _, _, fake, _, app, _ = self._native_fixture(operation_control=True)
-        fake.chat_turn.side_effect = AssertionError('No coordinator or execution is requested')
-        app.implementation.client_factory = lambda _:fake
-        fake.ask_json.return_value = {'summary':'Editable source only','unresolved':[],
-            'files':[{'path':'utility.py','content':'def total(values):\n    return sum(values)\n'}]}
+    def test_ordinary_source_only_delivery_uses_common_workspace_without_a_model(self):
+        _, _, fake, _, app, _ = self._native_fixture(allow_execution=False)
+        fake.chat_turn.side_effect = AssertionError('Caller-directed source work needs no model')
         before = app.ledger.to_dict()
-        app.run(actions=[{'tool_name':'prepare_implementation','arguments':{
-            'goal':'Provide an editable utility without running it','execution_requested':False}},
-            {'tool_name':'ask_user','arguments':{'question':'Ready for source review'}}],progress=lambda _:None)
-        result = app.session.store.read_json(app.state['turns'][-1]['tools'][0]['result'])
-        self.assertEqual(result['status'],'ok',result)
-        self.assertFalse(result['data']['executable'])
-        self.assertNotIn('next_operation',result['data'])
-        self.assertEqual(app.ledger.to_dict(),before)
-        app = ToolApplication.load(app.session.store.root)
-        app.run(actions=[{'tool_name':'deliver_result','arguments':{
-            'summary':'Editable source; execution was not requested',
-            'artifacts':[str(Path(result['data']['project_dir'])/'utility.py')]}}],progress=lambda _:None)
+        code = 'def total(values):\n    return sum(values)\n'
+        app.run(actions=[{'tool_name':'write_file','arguments':{
+            'path':'utility.py','content':code,'delivery':{
+                'summary':'Editable utility; execution was not requested','artifacts':['utility.py']}}}],
+            progress=lambda _:None)
         self.assertEqual(app.session.manifest.status,'completed',app.result_snapshot())
+        self.assertIsNone(app.implementation)
+        self.assertEqual((app.workspace.workspace/'utility.py').read_text(),code)
+        restored = ToolApplication.load(app.session.store.root)
+        self.assertEqual(restored.session.manifest.status,'completed')
+        self.assertEqual(restored.ledger.to_dict(),before)
         fake.chat_turn.assert_not_called()
-        self.assertEqual(fake.ask_json.call_count,1)
+        fake.ask_json.assert_not_called()
 
     def test_prepared_execution_failure_supplies_real_diagnosis_and_feedback_version(self) -> None:
         _, inputs, fake, _, app, _ = self._historical_native_fixture(process_limits={
@@ -6806,7 +6662,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             provider.return_value = response
             yield app, provider, resolve
 
-    def _local_catalog_task(self):
+    def _local_catalog_task(self, *, prepared_history=False):
         """Real local selection and application guards, with no provider transport."""
         root = self.enterContext(_temporary_run()).resolve()
         catalog = root / 'project-models.toml'
@@ -6825,9 +6681,26 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.enterContext(patch('simple_ar.integrations.llm.load_dotenv'))
         provider = self.enterContext(patch('simple_ar.integrations.llm._call_openai_sdk',
             side_effect=AssertionError('Recovery must not dispatch')))
-        app = ToolApplication.create(root / 'task', 'Inspect the supplied material',
-            model='profile:task', sources={}, allow_vision=True, max_images=1,
-            research_policy={'feasibility_connection': 'profile:review'})
+        if prepared_history:
+            from simple_ar.integrations.llm import LLMClient
+            from simple_ar.tools.sources import SourcePolicy
+            from tests.native_history_fixture import load_prepared_operation_history
+            # Preserve the saved operation controller and native source protocol,
+            # including the independent bindings of the original catalog task.
+            app = load_prepared_operation_history(root / 'task', 'Inspect the supplied material',
+                config={'model':'profile:task',
+                    'model_connection':LLMClient.from_env('profile:task').connection_binding(),
+                    'vision_connection':ToolApplication._vision_binding(LLMClient.from_env(purpose='vision')),
+                    'feasibility_connection':LLMClient.from_env('profile:review').connection_binding(),
+                    'research_policy':SourcePolicy(feasibility_connection='profile:review').model_dump(mode='json'),
+                    'allow_vision':True, 'max_images':1, 'completion_policy':'available_operations.v1',
+                    'model_catalogs':{purpose:str(catalog.resolve())
+                        for purpose in ('task','vision','feasibility','image')}},
+                limits={'image_requests':1})
+        else:
+            app = ToolApplication.create(root / 'task', 'Inspect the supplied material',
+                model='profile:task', sources={}, allow_vision=True, max_images=1,
+                research_policy={'feasibility_connection': 'profile:review'})
         return root, catalog, text, app, provider
 
     def test_native_catalog_hints_restore_consumers_and_follow_compatible_supply(self):
@@ -7360,12 +7233,14 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
     def test_native_retry_switch_retains_closed_professional_charges(self):
         import httpx
 
-        root, catalog, text, app, provider = self._local_catalog_task()
+        root, catalog, text, app, provider = self._local_catalog_task(prepared_history=True)
         provider.side_effect = None
-        provider.return_value = {'choices': [{'message': {'content': json.dumps({
+        provider.return_value = {'choices': [{'message': self._native_message('submit_candidate', {
+            'summary':'Prepared editable source without execution', 'unresolved':[],
             'files': [{'path': 'worker.py', 'content': "print('prepared')\n"}],
             'execution_plan': {'argv': ['python', 'worker.py'],
-                'outputs': ['answer.txt'], 'timeout_sec': 3}})}}],
+                'outputs': ['answer.txt'], 'timeout_sec': 3}}, 'prepared-source'),
+            'finish_reason':'tool_calls'}],
             'usage': {'prompt_tokens': 100, 'completion_tokens': 10, 'total_tokens': 110}}
         app.run(actions=[{'tool_name': 'prepare_implementation', 'arguments': {
             'goal': 'Create worker.py that prints prepared; do not execute it'}},
@@ -11254,7 +11129,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             return vision_client if kwargs.get('purpose') == 'vision' else fake
         with patch('simple_ar.integrations.llm.LLMClient.from_env', side_effect=resolve_client):
             pinned = ToolApplication.create(run_dir / 'vision-routing', 'Inspect supplied figure',
-                model='fixture', sources={'source0': inputs}, allow_vision=True)
+                model='fixture', sources={'source0': inputs}, allow_vision=True, tool_contracts='on_demand')
             for spec in pinned.gateway.registry.list_specs():
                 if spec.domain == 'sources' and spec.permission_level == 'network':
                     self.assertFalse(pinned.gateway.policy.is_allowed(spec)[0], spec.name)
@@ -11276,7 +11151,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             self.assertFalse(pinned.ledger.entries)
             vision_client.connection_binding.return_value = vision_binding
             initially_text = ToolApplication.create(run_dir / 'vision-grant', 'Analyze supplied material',
-                model='fixture', sources={'source0': inputs})
+                model='fixture', sources={'source0': inputs}, tool_contracts='on_demand')
             for owner, available in ((pinned, True), (initially_text, False)):
                 with self.subTest(vision_authorized=available, image_requests=0):
                     before_state, before_ledger = json.dumps(owner.state), owner.ledger.to_dict()

@@ -19,6 +19,125 @@ from tests.native_history_fixture import load_native_history
 
 
 class StartTests(unittest.TestCase):
+    def _ordinary_project_delivery(self, root, *, projects=1, deliver_count=None, execute=False,
+                                   archive=False, omitted=False, partial=False):
+        from simple_ar.app.tool_application import ToolApplication
+        root = root.resolve()
+        app = ToolApplication.create(root, 'Create editable source and a complete portable project',
+            model=None, sources={}, allow_execution=execute,
+            process_limits={'process_invocations':2, 'process_wall_seconds':10})
+        code = "from pathlib import Path\nPath('result.txt').write_text('computed')\n"
+        actions = [{'tool_name':'write_file', 'arguments':{'path':'working/compute.py','content':code}}]
+        if execute:
+            actions.append({'tool_name':'run_process', 'arguments':{'argv':['python','compute.py'],
+                'cwd':'working', 'inputs':['working/compute.py'], 'outputs':['working/result.txt'], 'timeout_sec':3}})
+        # A copy with actual omissions must not acquire a completeness claim.
+        if omitted:
+            (app.workspace.workspace/'working').mkdir(parents=True)
+            (app.workspace.workspace/'working/.env').write_text('private fixture', encoding='utf-8')
+        for index in range(projects):
+            actions.append({'tool_name':'copy_project', 'arguments':{'source':'working',
+                'path':f'package-{index}', **({'archive_name':'project.zip'} if archive else {})}})
+        count = projects if deliver_count is None else deliver_count
+        artifacts = [f'package-{index}/compute.py' if partial else f'package-{index}' for index in range(count)]
+        actions.append({'tool_name':'deliver_result', 'arguments':{
+            'summary':'Source snapshot, without inherited execution authority or quality certification',
+            'artifacts':artifacts}})
+        result = app.run(actions=actions, approve=lambda *_:True, progress=lambda _:None)
+        self.assertEqual(result['status'],'completed',result)
+        copies = [app.session.store.read_json(item['result']) for turn in app.state['turns']
+            for item in turn['tools'] if app.session.store.read_json(item['result'])['tool_name']=='copy_project']
+        self.assertTrue(all(row['status']=='ok' for row in copies),copies)
+        return app, [Path(row['data']['absolute_path']) for row in copies]
+
+    def test_ordinary_project_reuse_uses_terminal_copy_inventory_without_inherited_authority(self):
+        from simple_ar.app.tool_application import ToolApplication
+        from simple_ar.cli.start import native_creation_options, session_materials
+        with tempfile.TemporaryDirectory() as directory:
+            app, projects = self._ordinary_project_delivery(Path(directory)/'ordinary', archive=True)
+            root, project = app.session.store.root, projects[0]
+            before = {path:path.read_bytes() for path in root.rglob('*') if path.is_file()}
+            self.assertIsNone(app.implementation)
+            self.assertFalse({'source_generation_protocol','source_decision_protocol'} & app.state['config'].keys())
+            self.assertEqual(app.reusable_code_project(),(project,None,{}))
+            self.assertEqual(ToolApplication.load(root).reusable_code_project(),(project,None,{}))
+            self.assertEqual(session_materials(root)['code_project'],[project])
+            args = build_parser().parse_args(['start','--from-session',str(root),'--reuse','code_project',
+                '--goal','Revise the supplied project','--prepare-only'])
+            with patch('sys.stdin.isatty',return_value=False), patch('simple_ar.cli.main._run_native_start'):
+                prepare_start(args)
+            options = native_creation_options(args)
+            self.assertIn(project,options['sources'].values())
+            for key in ('code_task','execution_contract','project_python','process_limits'):
+                self.assertIsNone(options[key])
+            self.assertFalse(options['allow_execution'])
+            self.assertFalse(options['allow_network'])
+            self.assertEqual(options['max_turns'],30)
+            self.assertEqual(options['max_tokens'],600000)
+            self.assertIsNone(app.reusable_execution())
+            self.assertEqual({path:path.read_bytes() for path in root.rglob('*') if path.is_file()},before)
+
+    def test_ordinary_project_reuse_rejects_ambiguity_missing_members_omissions_and_unsettled_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            app, _ = self._ordinary_project_delivery(base/'ambiguous', projects=2)
+            with self.assertRaisesRegex(ValueError,'Ambiguous'):
+                app.reusable_code_project()
+            selected, projects = self._ordinary_project_delivery(base/'selected', projects=2, deliver_count=1)
+            self.assertEqual(selected.reusable_code_project(),(projects[0],None,{}))
+            for label, options, pattern in (
+                ('partial',{'partial':True,'archive':True},'every copied project member'),
+                ('omitted',{'omitted':True},'omissions'),
+            ):
+                app, _ = self._ordinary_project_delivery(base/label, **options)
+                with self.subTest(case=label), self.assertRaisesRegex(ValueError,pattern):
+                    app.reusable_code_project()
+            for status in ('reserved','unknown'):
+                app, _ = self._ordinary_project_delivery(base/status)
+                app.ledger.reserve('unsettled-work',{'process_invocations':1},attempt_id='unsettled-work')
+                if status=='unknown':
+                    app.ledger.mark_unknown('unsettled-work',reason='Retained unknown usage')
+                before = app.ledger.to_dict()
+                with self.subTest(status=status), self.assertRaisesRegex(ValueError,'unsettled'):
+                    app.reusable_code_project()
+                self.assertEqual(app.ledger.to_dict(),before)
+
+    def test_ordinary_project_reuse_rejects_changed_bytes_membership_and_absent_copy_proof(self):
+        from simple_ar.app.tool_application import ToolApplication
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            for label in ('changed','added','receipt','unpinned'):
+                app, projects = self._ordinary_project_delivery(base/label)
+                if label=='changed':
+                    (projects[0]/'compute.py').write_text('print("changed")\n',encoding='utf-8')
+                elif label=='added':
+                    (projects[0]/'extra.py').write_text('EXTRA = True\n',encoding='utf-8')
+                elif label=='receipt':
+                    copy = next(item for turn in app.state['turns'] for item in turn['tools']
+                        if app.session.store.read_json(item['result'])['tool_name']=='copy_project')
+                    (app.session.store.root/Path(copy['result']).parent/'project-copy.json').unlink()
+                else:
+                    terminal = app.state['turns'][-1]['tools'][-1]['result']
+                    saved = app.session.store.read_json(terminal)
+                    saved['metadata'].pop('delivery_hashes')
+                    app.session.store.write_json(terminal,saved)
+                with self.subTest(case=label), self.assertRaises((ValueError,OSError)):
+                    app.reusable_code_project()
+            app = ToolApplication.create(base/'files-only','Provide a source file',model=None,sources={})
+            app.run(actions=[{'tool_name':'write_file','arguments':{'path':'compute.py','content':'print(1)\n',
+                'delivery':{'summary':'Single source file','artifacts':['compute.py']}}}],progress=lambda _:None)
+            self.assertIsNone(app.reusable_code_project())  # No explicit complete project was declared.
+
+    def test_ordinary_project_reuse_checks_existing_process_edges_without_replay(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app, projects = self._ordinary_project_delivery(Path(directory)/'executed',execute=True)
+            self.assertEqual(app.reusable_code_project(),(projects[0],None,{}))
+            (app.workspace.workspace/'working/compute.py').write_text('print("revised")\n',encoding='utf-8')
+            before = {path:path.read_bytes() for path in app.session.store.root.rglob('*') if path.is_file()}
+            with self.assertRaisesRegex(ValueError,'inputs/outputs changed'):
+                app.reusable_code_project()
+            self.assertEqual({path:path.read_bytes() for path in app.session.store.root.rglob('*') if path.is_file()},before)
+
     def _native_project_delivery(self, root, *, execute=False, planned=False, projects=1, deliver_count=None,
                                 external_input=None):
         from simple_ar.app.tool_application import ToolApplication

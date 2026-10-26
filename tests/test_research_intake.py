@@ -63,13 +63,12 @@ def _reply(name, arguments):
 
 
 class ResearchIntakeTests(unittest.TestCase):
-    def test_ordinary_outcomes_loads_primitives_and_delivers_chinese_markdown(self):
+    def test_ordinary_outcomes_directly_edits_and_delivers_chinese_markdown(self):
         request = '仅依据所给材料整理 Markdown 摘要，不生成 PDF。'
         content = '# 材料摘要\n单次观察不能证明稳定性。\n'
         raw = {'write_file', 'edit_file', 'run_process'}
         permitted_raw = raw - {'run_process'}
         client = _JSONClient([
-            _reply('load_tools', {'names': sorted(permitted_raw)}),
             _reply('write_file', {'path': 'workspace/summary.md', 'content': content}),
             _reply('deliver_result', {'summary': '已交付材料摘要。',
                 'artifacts': ['workspace/summary.md'], 'unresolved': []}),
@@ -87,20 +86,22 @@ class ResearchIntakeTests(unittest.TestCase):
                 root=base / 'task', services=services)
             self.assertEqual(app.state['config']['tool_contracts'], 'outcomes')
             permissions = set(app.gateway.policy.allowed_permissions)
-            self.assertEqual(set(app._specialist_catalog()), permitted_raw)
+            self.assertEqual(set(app._specialist_catalog()), set())
+            self.assertIsNone(app.implementation)
+            self.assertFalse({'source_generation_protocol', 'source_decision_protocol'} & app.state['config'].keys())
             result = app.run(progress=lambda _: None)
             self.assertEqual(result['status'], 'completed', result)
             first = {row['function']['name'] for row in client.calls[0][1]['tools']}
-            self.assertTrue({'prepare_implementation', 'read_file', 'list_directory',
+            self.assertTrue({'read_file', 'list_directory',
                 'ask_user', 'deliver_result', 'inspect_artifacts'} <= first)
-            self.assertFalse(raw & first)
-            second = {row['function']['name'] for row in client.calls[1][1]['tools']}
-            self.assertTrue(permitted_raw <= second)
+            self.assertTrue(permitted_raw <= first)
+            self.assertNotIn('run_process', first)
+            self.assertNotIn('prepare_implementation', first)
             self.assertEqual(app.gateway.policy.allowed_permissions, permissions)
             observations = [app.session.store.read_json(item['result'])
                 for turn in app.state['turns'] for item in turn['tools']]
             self.assertEqual([row['tool_name'] for row in observations],
-                ['load_tools', 'write_file', 'deliver_result'])
+                ['write_file', 'deliver_result'])
             self.assertTrue(all(row['status'] == 'ok' for row in observations), observations)
             self.assertEqual((base / 'task/workspace/summary.md').read_text(encoding='utf-8'), content)
             self.assertEqual(note.read_bytes(), original)
@@ -128,9 +129,9 @@ class ResearchIntakeTests(unittest.TestCase):
                     allowed = {spec.name for spec in app.gateway.list_specs()
                         if app.gateway.policy.is_allowed(spec)[0]}
                     if mode == 'outcomes':
-                        self.assertEqual(expected, allowed - raw)
-                        self.assertEqual(set(app._specialist_catalog()), raw)
-                        self.assertTrue({'execute_implementation', 'export_report',
+                        self.assertEqual(expected, allowed)
+                        self.assertEqual(set(app._specialist_catalog()), set())
+                        self.assertTrue({'write_file', 'edit_file', 'run_process', 'export_report',
                             'read_file', 'inspect_artifacts'} <= expected)
                     elif mode in ('full', None):
                         self.assertEqual(expected, allowed)

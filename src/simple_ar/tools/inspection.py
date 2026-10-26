@@ -171,6 +171,7 @@ class InspectionToolGateway:
     def __init__(self, root: Path, workspace: Any, client_factory: Callable[[str], Any],
                  *, prior_assessments: Callable[[], list[dict]] | None = None,
                  material_observations: Callable[[list[str]], list[dict]] | None = None,
+                 user_requests: Callable[[], list[str]] | None = None,
                  protocol: str | None = None) -> None:
         if protocol not in (None, 'subjects.v1', 'subjects.v2', 'subjects.v3'):
             raise ValueError('Unknown inspection protocol')
@@ -178,6 +179,7 @@ class InspectionToolGateway:
         self.store, self.client_factory = ArtifactStore(root), client_factory
         self.prior_assessments = prior_assessments
         self.material_observations = material_observations
+        self.user_requests = user_requests
         self.protocol = protocol
 
     @property
@@ -690,6 +692,13 @@ class InspectionToolGateway:
             'prior_required':saved['prior_required'],
             'prior_scope':'Reassess these concerns against the current full targets and evidence; '
                           'earlier opinions are not source evidence or adoption decisions.'}
+        if 'user_requests' in saved:
+            view['user_requests'] = saved['user_requests']
+            view['user_request_scope'] = (
+                'Exact original task requests and feedback in journal order, not source evidence or '
+                'permission. The separate goal selects this inspection scope. Use relevant user '
+                'requirements to judge the selected targets; a narrow check does not certify the '
+                'whole task or require review of unrelated work.')
         for role in ('targets','evidence'):
             view[role] = [{'subject':row['subject'], 'path':row.get('path'), 'complete':row['complete'],
                 'limitation':row.get('limitation',''),
@@ -764,14 +773,22 @@ class InspectionToolGateway:
             for row in saved['evidence'] if row.get('readable')
             for index, window in enumerate(row['windows'])
             if row['subject'] not in saved.get('initial_subjects', []) or window.get('source_reference')]
-        base.pop('goal', None)
+        if 'user_requests' in saved:
+            # The shared projector pins exact user text; the coordinator's local
+            # inspection goal stays a separately labelled scope in base context.
+            base.pop('user_requests', None)
+        else:
+            base.pop('goal', None)  # Historical input retains its original view.
         base['reading_scope'] = ('Only the supplied decoded windows were observed. Retired source bodies '
             'remain in the original inspection records; read an authorized original path/range again '
             'when its text is needed. Full-file hashes are computed by the read owner. Source opinions '
             'and self-reported manifests do not replace actual source versions or scientific reasoning.')
         system = _REVIEW_SYSTEM if self.adaptive else _SUBJECT_SYSTEM
-        messages, metadata = select_working_context(user_requests=[request.goal],system_text=system,
+        messages, metadata = select_working_context(
+            user_requests=saved.get('user_requests', [request.goal]),system_text=system,
             base_context=base,turn_blocks=blocks,observations=observations,
+            block_request_counts=([len(saved['user_requests'])] * len(blocks)
+                if 'user_requests' in saved else None),
             schema_tokens=estimate_tokens(json.dumps(offered,ensure_ascii=False)),
             context_token_target=target,estimate_tokens=estimate_tokens,
             history_access='read_file at the recorded authorized source path and range',
@@ -1088,6 +1105,11 @@ class InspectionToolGateway:
                         for row in unavailable))
             # Freeze accepted inputs before evidence investigation or any model
             # request. Existing started work takes the historical cache above.
+            if self.user_requests is not None:
+                originals = self.user_requests()
+                if not isinstance(originals, list) or any(not isinstance(text, str) for text in originals):
+                    raise ValueError('Inspection context requires original journal request strings')
+                saved['user_requests'] = list(originals)
             self.store.write_json(input_path, saved)
             saved['evidence'] = [self._observe(value, f'evidence-{i + 1}', identity, remaining)
                                  for i, value in enumerate(request.evidence)]

@@ -177,8 +177,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._create()
         self.assertEqual(self.app.state['config']['control_protocol'],'operations.v1')
         self.assertIsNone(self.app.writing)
-        self.assertTrue(self.app.implementation.preparation_only)
-        self.assertFalse({'professional_work','result_investigation','document_source_contract'}
+        self.assertIsNone(self.app.implementation)
+        self.assertFalse({'professional_work','result_investigation','document_source_contract',
+            'source_generation_protocol','source_decision_protocol'}
             & self.app.state['config'].keys())
 
     def _reload(self):
@@ -1085,6 +1086,48 @@ class OperationsWorkLoopTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(),raw)
         self.assertEqual(self._versions(self.inputs),original_inputs)
 
+    def test_inspection_freezes_original_requests_separately_from_narrow_goal_and_cached_replay(self):
+        self._create()
+        self._write('note.md', 'Only this selected text is reviewed.\n'*12)
+        feedback = '  保留原文，只检查所选文字。\n其他工作稍后处理。  '
+        goal = 'Check only the selected text for internal consistency'
+        expected = [*self.app.state['requests'], feedback]
+
+        def review(view):
+            self.assertEqual(view['goal'], goal)
+            self.assertIn('narrow check does not certify',view['user_request_scope'])
+            messages = self.inspection_requests[-1]['messages']
+            supplied = [message['content'] for message in messages if message['role']=='user']
+            for text in expected:
+                self.assertEqual(supplied.count(text),1)
+            self.assertNotIn(goal,supplied)  # Coordinator scope is labelled in the view.
+            self.assertEqual(len(view['targets']),1)
+            self.assertTrue(view['targets'][0]['complete'])
+            return {'decisions':[{'subject':'target-1','conclusion':'complete',
+                'findings':[],'evidence':[],'limitations':[]}]}
+
+        self.review = review
+        self._submit(_action('inspect_artifacts',goal=goal,targets=['note.md'],evidence=[]),feedback=feedback)
+        result = self._ok('inspect_artifacts')
+        identity = Path(result['data']['record']).parts[1]
+        saved = self.app.session.store.read_json(f'tools/inspection/{identity}/input.json')
+        self.assertEqual(saved['user_requests'],expected)
+        self.assertEqual(saved['arguments']['goal'],goal)
+        self.assertEqual(_assessments(result)[0]['verdict'],'passed')
+        records = self._versions(self.root/f'tools/inspection/{identity}')
+        self._submit(_action('ask_user',question='Retain work for the next selected check'),
+            feedback='A later user request must not rewrite the earlier inspection input.')
+        calls, ledger = self.send.call_count,self.app.ledger.to_dict()
+        self._reload()
+        with patch.object(self.app.operations.inspection,'user_requests',
+                side_effect=AssertionError('Cached inspection must not refreeze current requests')):
+            cached = self.app.operations.inspection.call('inspect_artifacts',saved['arguments'],identity)
+        self.assertEqual(cached.status,'ok',cached.error)
+        self.assertEqual(cached.metadata['assessments'],_assessments(result))
+        self.assertEqual(self.send.call_count,calls)
+        self.assertEqual(self.app.ledger.to_dict(),ledger)
+        self.assertEqual(self._versions(self.root/f'tools/inspection/{identity}'),records)
+
     def test_progressive_inspection_primes_small_targets_for_one_final_response(self):
         self._create()
         texts = {
@@ -1292,13 +1335,14 @@ class OperationsWorkLoopTests(unittest.TestCase):
         owner = self.app.operations.inspection
         # Freeze the earlier allocation of supplementary target reads to evidence.
         # Loading it must verify the original records, not migrate material roles.
-        with patch.object(owner, '_prime_targets', return_value=None), patch.object(
+        with patch.object(owner, 'user_requests', None), patch.object(owner, '_prime_targets', return_value=None), patch.object(
                 owner, '_target_observation', return_value=None):
             result = self._inspect(['retained.txt'], ['retained.txt'])
         self.assertEqual(result['status'], 'ok', result)
         self.assertEqual(_assessments(result)[0]['verdict'], 'passed')
         identity = Path(result['data']['record']).parts[1]
         saved = self.app.session.store.read_json(f'tools/inspection/{identity}/input.json')
+        self.assertNotIn('user_requests',saved)
         self.assertFalse(saved['targets'][0]['complete'])
         self.assertGreater(len(saved['evidence']), 1)
         expected = self.app.session.store.read_json(f'tools/inspection/{identity}/result.json')
@@ -2444,7 +2488,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 self._ok('deliver_result')
                 self.assertEqual(self.app.session.manifest.status,'completed',self.app.result_snapshot())
 
-    def test_registered_source_edit_uses_current_producer_and_preserves_consumed_old_proof(self):
+    def test_direct_source_edit_uses_current_producer_and_preserves_consumed_old_proof(self):
         self._create()
         originals = self._versions(self.inputs)
         raw = str(self.inputs/'observations.csv')
@@ -2453,37 +2497,16 @@ class OperationsWorkLoopTests(unittest.TestCase):
             "raw = Path(sys.argv[1]).read_text(encoding='utf-8')\n"
             "Path('final.txt').write_text('old:' + raw, encoding='utf-8')\n"
             "Path('retained.txt').write_text('old:' + raw, encoding='utf-8')\n")
-        proposal = {'summary':'Compute two results from the supplied raw observations', 'unresolved':[],
-            'files':[{'path':'produce.py','content':code}],
-            'execution_plan':{'argv':['python','produce.py',raw],
-                'outputs':['final.txt','retained.txt'],'timeout_sec':5}}
-
-        def source_response(mode, request, **kwargs):
-            self.assertEqual(mode,'chat')
-            self.assertIn('submit_candidate', {tool['function']['name'] for tool in request['tools']})
-            self.assertIn('Implement one coherent, bounded code work unit',request['messages'][0]['content'])
-            return {'choices':[{'message':{'role':'assistant','content':None, 'tool_calls': [{
-                'id':'candidate', 'type':'function', 'function': {
-                    'name':'submit_candidate', 'arguments':json.dumps(proposal)}}]},
-                'finish_reason':'tool_calls'}],
-                'usage':{'prompt_tokens':100,'completion_tokens':40,'total_tokens':140}}
-
-        # Only source generation is mocked; admission, execution, receipts and
-        # accounting all pass through the ordinary public operations.
-        with patch.object(self.send,'side_effect',source_response):
-            self._submit(_action('prepare_implementation',
-                goal='Compute two text results from the supplied raw observations'))
-        prepared = self._ok('prepare_implementation')['data']
-        self.send.assert_called_once()
-        self._submit(_action('execute_implementation',prepared_result=prepared['prepared_result']),
-            approve=lambda *_:True)
-        executed = self._ok('execute_implementation')['data']
-        self.assertEqual(executed['status'],'run_succeeded')
-        candidate = Path(prepared['project_dir'])
+        self._submit(_action('write_file',path='produce.py',content=code))
+        self._ok('write_file')
+        candidate = self.app.workspace.workspace
         source, final, retained = (str(candidate/name) for name in ('produce.py','final.txt','retained.txt'))
-        execution_record = self.app.workspace.resolve(executed['execution_ref'])
-        old_records = {**self._versions(self.app.workspace.resolve(prepared['prepared_result']).parent.parent),
-            **self._versions(execution_record.parent)}
+        self._submit(_action('run_process',argv=['python',source,raw],
+            inputs=[source,'measurements/observations.csv'],outputs=[final,retained],timeout_sec=5),
+            approve=lambda *_:True)
+        executed = self._ok('run_process')['data']
+        execution_record = self.root/executed['receipt']
+        old_records = self._versions(execution_record.parent)
         old_receipts = self._process_receipts()
         old_usage = [row.to_dict() for row in self.app.ledger.entries]
         retained_bytes = Path(retained).read_bytes()
@@ -2542,7 +2565,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(self.app.session.store.read_json('delivery.json'),bound)
         self.assertEqual(self._process_receipts(),receipts)
         self.assertEqual(self.app.ledger.to_dict(),usage)
-        self.send.assert_called_once()
+        self.send.assert_not_called()
 
     def test_inline_producers_validate_actual_outputs_and_repair_stale_process_edges(self):
         self._create(delivery_files=['final.txt','conditions.txt'])

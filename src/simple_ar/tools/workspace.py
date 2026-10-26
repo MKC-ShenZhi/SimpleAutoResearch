@@ -512,6 +512,91 @@ class RetainedDelivery:
             raise ValueError('Task changed during retained delivery inspection')
         return available
 
+    def reusable_code_project(self, *, check_producers: Any) -> Path | None:
+        """Offer one delivered complete copy, without inventing a project root.
+
+        The terminal pins current bytes; a completed copy operation supplies the
+        explicit root and complete member list. Neither proves code correctness,
+        a checker, an environment or permission to execute in the next task.
+        """
+        available = self.reusable_materials()
+        if not available:
+            return None
+        terminal_item = self.state['turns'][-1]['tools'][-1]
+        terminal = self.record(terminal_item['result'])
+        pinned = terminal.get('metadata', {}).get('delivery_hashes')
+        if pinned is None:
+            raise ValueError('Project reuse requires a hash-bound terminal delivery')
+        delivered = {self.resolve(name): digest for name, digest in pinned.items()}
+        candidates, records, source_members = {}, {}, []
+        for turn in self.state['turns']:
+            calls = {call['id']: call for call in self.record(turn['reply']).get('tool_calls', [])}
+            for item in turn['tools']:
+                call = calls.get(item['id'])
+                if call is None or call['function']['name'] != 'copy_project':
+                    continue
+                observed = self.record(item['result'])
+                if observed.get('status') != 'ok' or observed.get('tool_name') != 'copy_project':
+                    continue
+                request = _CopyProject.model_validate(json.loads(call['function']['arguments']))
+                project = self.resolve(request.path)
+                # Ignore unrelated copies, including old snapshots not delivered.
+                if not any(path.is_relative_to(project) for path in delivered):
+                    continue
+                data = observed['data']
+                attempt = Path(item['result']).parent
+                record_path = (attempt / 'project-copy.json').as_posix()
+                receipt = self.record(record_path)
+                if (receipt != {'request': request.model_dump(), 'data': data}
+                        or data['absolute_path'] != str(project)
+                        or not project.is_relative_to(self.mounts['workspace'])
+                        or project == self.mounts['workspace']):
+                    raise ValueError('Delivered project copy has inconsistent ownership')
+                if data['copy']['skipped_count']:
+                    raise ValueError('Delivered project copy has omissions; no complete project proof')
+                files = data['files']
+                if not files:
+                    raise ValueError('Delivered project copy has no member inventory')
+                expected = {self.resolve(str(project / name)): digest for name, digest in files.items()}
+                if any(not path.is_relative_to(project) for path in expected):
+                    raise ValueError('Project copy inventory escapes its explicit root')
+                if not expected.keys() <= delivered.keys():
+                    raise ValueError('Deliver every copied project member before offering code_project')
+                if any(delivered[path] != digest for path, digest in expected.items()):
+                    raise ValueError('Delivered project changed since copying; create a final snapshot')
+                inventory = bind_project_inventory(project, resolve=lambda value: self.resolve(value))
+                if {Path(name): digest for name, digest in inventory['file_hashes'].items()} != expected:
+                    raise ValueError('Delivered project inventory changed since copying')
+                if project in candidates and candidates[project] != expected:
+                    raise ValueError('Ambiguous copy inventories for the delivered project')
+                candidates[project] = expected
+                records[record_path] = receipt
+                # Copies do not erase known failed/stale process edges on their
+                # source members. No import scan or inferred dependency is used.
+                source_members.extend(str(Path(data['source']) / name) for name in files
+                    if name != request.archive_name)
+        if not candidates:
+            return None  # Portable files alone do not declare a complete project.
+        if len(candidates) != 1:
+            raise ValueError('Ambiguous delivery contains multiple code projects')
+        ledger_record = self.record('budget_ledger.json')
+        if any(entry['status'] in {'reserved', 'unknown'} for entry in ledger_record['entries']):
+            raise ValueError('Project work has unsettled resource usage; no reusable project')
+        project, files = next(iter(candidates.items()))
+        check_producers([*[str(path) for path in files], *source_members])
+        # Freshness and terminal checks are read-only, and cannot grant authority
+        # or settle/replay a process. Detect concurrent changes before returning.
+        if (self.record('session_manifest.json') != self.manifest
+                or self.record('actions.json') != self.state
+                or self.record('budget_ledger.json') != ledger_record
+                or self.record(terminal_item['result']) != terminal
+                or any(self.record(name) != receipt for name, receipt in records.items())
+                or self.hashes(pinned) != pinned
+                or bind_project_inventory(project, resolve=lambda value: self.resolve(value))['file_hashes']
+                    != {str(path): digest for path, digest in files.items()}):
+            raise ValueError('Task changed during project reuse inspection')
+        return project
+
 
 class WorkspaceToolGateway:
     def has_started(self, identity: str) -> bool:

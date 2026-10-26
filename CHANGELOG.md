@@ -8,7 +8,9 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 
 ### Improved
 
-- New tasks present complete professional operations first, with low-level editing and process contracts available on demand. Tool loading does not expand permissions; saved modes remain unchanged.
+- Ordinary source work uses shared editing and execution operations without a mandatory preparation controller. Explicit code-task constraints and saved preparation recovery remain unchanged.
+- Independent inspection receives the original user requirements and feedback separately from its local scope; a narrow review still does not certify the whole task.
+- Ordinary tasks can reuse a delivered complete project snapshot without a preparation controller. Incomplete or changed snapshots are rejected, and execution authority is not inherited.
 - Actual source windows read during inspection join shared material reuse after receipt, permission, version and range checks. Later work can reuse supporting text, including reads retained after a failed opinion, without inheriting its verdict.
 - Fresh inspections directly supply small whole-file targets within the current input budget. Large files remain paged, explicit windows keep their scope, and reading the full text does not imply a completed or passing review.
 

@@ -421,6 +421,7 @@ class ToolApplication:
             coordination={'specs':coordination,'owner':self},extension_host=self._extension_host_call,
             execution_observations=self._execution_observations, work_context=self._work_context,
             material_observations=self._material_observations,
+            user_requests=self._inspection_requests,
             search_registry=getattr(self.services,'search_registry',None))
         self.workspace, self.gateway = self.operations.workspace, self.operations.gateway
         self.sources, self.publication = self.operations.sources, self.operations.publication
@@ -1112,6 +1113,10 @@ class ToolApplication:
         return {'report_intent': data, **({'report_requirement': requirement} if requirement else {}),
             **({'conversion_source': conversion} if conversion else {})}
 
+    def _inspection_requests(self) -> list[str]:
+        """Original journal requests, separate from a coordinator's review goal."""
+        return list(self.state['requests'])
+
     def _material_observations(self, targets: list[str]) -> list[dict[str, Any]]:
         """Locate successful parent reads, without transferring bodies or authority.
 
@@ -1668,8 +1673,6 @@ class ToolApplication:
             delivery_files=delivery_files,
             extensions=extensions, creation_declarations=creation_declarations)
         config['inspection_protocol'] = 'subjects.v3'
-        config['source_generation_protocol'] = 'prepared.v3'
-        config['source_decision_protocol'] = 'native.v1'
         if context_protocol is not None:
             config['context_protocol'] = context_protocol
         session = SessionController.create(root, session_id=root.name, topic=goal,
@@ -3846,7 +3849,12 @@ class ToolApplication:
         with no inherited validator, interpreter, permission or budget.
         """
         if self.implementation is None:
-            return None  # Ordinary outputs remain available through reusable_materials.
+            if self.operations is not None and self.state['config'].get('source_generation_protocol') is None:
+                from simple_ar.tools.workspace import RetainedDelivery
+                candidate = RetainedDelivery(self.session.store.root).reusable_code_project(
+                    check_producers=self.workspace.check_artifact_producers)
+                return (candidate, None, {}) if candidate is not None else None
+            return None
         if (self.session.manifest.status not in {'completed', 'partial'}
                 or self.state['pending'] is not None or not self.state['turns']
                 or not self.session.store.exists('delivery.json')):

@@ -66,10 +66,15 @@ New tasks use `operations.v1`: investigation, editing, execution, inspection and
 publication are independently callable, rather than stages of an implicit handoff.
 `OperationTools` composes the registry; it does not run another scheduler. Inspection
 owns version-bound findings and publication owns rendering and export provenance.
-New creation defaults to `tool_contracts="outcomes"`: complete professional operations
-are visible, while low-level mutation/process contracts are explicitly loadable when
-useful. Loading changes presentation, never authority. Explicit modes and saved
-tasks keep their original contracts.
+New creation defaults to `tool_contracts="outcomes"`, with workspace editing and
+permitted process operations available alongside inspection and publication. Ordinary
+source work uses the shared action loop, without a mandatory preparation controller.
+Saved preparation contracts retain their original presentation and executable recovery;
+loading tools changes presentation, never authority.
+Project reuse requires a terminal delivery and one explicit complete `copy_project`
+inventory with matching current hashes. Portable file groups alone do not establish
+a project root. Reuse grants no execution authority, environment or inherited validator;
+ambiguous, incomplete, stale or unsettled work remains unavailable as `code_project`.
 New tasks freeze `inspection_protocol=subjects.v3`: one source investigation can
 inspect several targets, but each decision names its own supporting observations.
 Each target's completeness, findings and evidence versions are evaluated separately;
@@ -103,14 +108,15 @@ successful reads inside failed opinions. Supporting evidence can reuse these win
 only after the original receipt and current permission/version/range checks. Target
 reading and verdicts are not inherited. Reused bodies are optional observations in
 the same context selector, not another pinned input block or memory store.
-`source_generation_protocol=prepared.v3` exposes goal/material/project preparation
-and approved execution as ordinary operations. The source owner investigates and
-generates the candidate; shared execution retains approval, accounting and provenance.
-Original requests, relevant opinions and admitted parent reads are supplied through
-existing context ports. Source-only delivery does not acquire an execution obligation.
-Fixed code-task authority still controls its edit/validation scope; ordinary source
-generation does not disable workspace primitives or add an automatic continuation.
-New preparations separate up to 12 editable sources from immutable input copies
+Fresh inspections freeze the original user requests and feedback separately from the
+local inspection goal. The shared context selector accounts for both. Requirements
+are neither evidence nor permission; a narrow inspection does not certify the whole
+task. Cached historical inspections keep their original input contract.
+
+Saved `source_generation_protocol=prepared.v3` tasks retain their preparation and
+approved-execution owner. Ordinary new tasks no longer select this protocol.
+Explicit code tasks retain their exact edit, validation and execution contracts.
+The saved preparation protocol separates up to 12 editable sources from immutable input copies
 (64 explicit files, 256,000 bytes each, 3,072,000 bytes total). The existing owner
 copies and version-binds those inputs; they do not need to pass through the model
 as rewritten records. Feedback retains their immutable roles. Saved `prepared.v1`

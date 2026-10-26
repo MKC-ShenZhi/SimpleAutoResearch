@@ -71,7 +71,8 @@ class OperationTools:
 
     def __init__(self, *, root, config, ledger, session_id, client_factory,
                  record_artifacts, coordination, extension_host, observations, search_registry=None,
-                 execution_observations=None, work_context=None, material_observations=None):
+                 execution_observations=None, work_context=None, material_observations=None,
+                 user_requests=None):
         from simple_ar.tools.inspection import InspectionToolGateway, inspection_tool_specs
         self.root, self.config = root, config
         self.observations = observations
@@ -95,6 +96,7 @@ class OperationTools:
             client_factory=lambda identity:client_factory(identity, 'writing'),
             protocol=config.get('inspection_protocol'),
             material_observations=material_observations,
+            user_requests=user_requests,
             prior_assessments=lambda:[row.model_dump() for row in
                 current_assessments(self.workspace,observations())])
         self.registry.register_package(inspection_tool_specs(progressive=self.inspection.progressive,
@@ -177,10 +179,13 @@ class OperationTools:
         for spec in self.registry.list_specs():
             if not self.gateway.policy.is_allowed(spec)[0]:
                 continue
-            # Outcomes exposes complete operations while keeping low-level
-            # mutation/process contracts available through explicit selection.
-            deferred = (spec.name in {'write_file', 'edit_file', 'run_process'}
-                if mode == 'outcomes' else not self.registry.request_visible(spec.name))
+            # Saved preparation contracts keep their original presentation.
+            # Ordinary source work is owned by these common workspace tools.
+            if mode == 'outcomes':
+                deferred = (self.config.get('source_generation_protocol') is not None
+                    and spec.name in {'write_file', 'edit_file', 'run_process'})
+            else:
+                deferred = not self.registry.request_visible(spec.name)
             if mode == 'full' or not deferred or spec.name in selected:
                 active.add(spec.name)
             else:

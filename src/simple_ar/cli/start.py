@@ -956,7 +956,7 @@ def session_materials(root: Path, *, authorize=None, include_project: bool = Tru
             return {}
         from simple_ar.tools.workspace import RetainedDelivery
         available = RetainedDelivery(root).reusable_materials()
-        available.pop('code_project', None)  # Only the implementation owner's project proof can offer this name.
+        available.pop('code_project', None)  # Complete project proof is separate from portable file groups.
         if not include_project:
             return available
         try:
