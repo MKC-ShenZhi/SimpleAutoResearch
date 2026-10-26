@@ -313,8 +313,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             self.assertEqual(app.ledger.to_dict(), ledger)
         # Later delivery cannot certify this old output against new source.
         external.write_text(code + '# new unexecuted entry\n')
-        issues = app.implementation.delivery_issues([{**observed, 'current_request': True}])
-        self.assertTrue(issues)
+        with self.assertRaises(ValueError):
+            app.workspace.check_artifact_producers([str(candidate / 'result.txt')])
         # A registered candidate is also the feedback base after a run. Runtime
         # outputs are not editable originals and cannot leak into the next unit.
         fake.ask_json.return_value = {'summary': 'Change execution entry only',

@@ -14,6 +14,7 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 
 ### Fixed
 
+- Ordinary source preparation no longer judges the whole task by its last prepared execution. Delivery follows current declared producers; changed sources, stale consumed outputs and actual review findings remain checked, while historical controlled-work completion retains its saved behavior.
 - Retain a complete professional response after a configured transport retry succeeds, while keeping the earlier failed attempt's bounded charge unchanged. Pending or unbounded usage still blocks adoption; this does not authorize further automatic correction or replay.
 - Explicit connection changes and new allowances support reconciled professional model operations as well as top-level decisions. Historical unknown charges remain unchanged; in-flight work and uncertain process execution still require reconciliation. Cancelling capped text requests retains their bounded charge without retrying.
 

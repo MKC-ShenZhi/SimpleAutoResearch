@@ -1777,43 +1777,123 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 self._ok('deliver_result')
                 self.assertEqual(self.app.session.manifest.status,'completed',self.app.result_snapshot())
 
+    def test_registered_source_edit_uses_current_producer_and_preserves_consumed_old_proof(self):
+        self._create()
+        originals = self._versions(self.inputs)
+        raw = str(self.inputs/'observations.csv')
+        self._read('measurements/observations.csv')
+        code = ("from pathlib import Path\nimport sys\n"
+            "raw = Path(sys.argv[1]).read_text(encoding='utf-8')\n"
+            "Path('final.txt').write_text('old:' + raw, encoding='utf-8')\n"
+            "Path('retained.txt').write_text('old:' + raw, encoding='utf-8')\n")
+        proposal = {'summary':'Compute two results from the supplied raw observations', 'unresolved':[],
+            'files':[{'path':'produce.py','content':code}],
+            'execution_plan':{'argv':['python','produce.py',raw],
+                'outputs':['final.txt','retained.txt'],'timeout_sec':5}}
+
+        def source_response(mode, request, **kwargs):
+            self.assertEqual(mode,'chat')
+            self.assertFalse(request.get('tools'))
+            self.assertIn('Implement one coherent, bounded code work unit',request['messages'][0]['content'])
+            return {'choices':[{'message':{'role':'assistant','content':json.dumps(proposal)},
+                'finish_reason':'stop'}],
+                'usage':{'prompt_tokens':100,'completion_tokens':40,'total_tokens':140}}
+
+        # Only source generation is mocked; admission, execution, receipts and
+        # accounting all pass through the ordinary public operations.
+        with patch.object(self.send,'side_effect',source_response):
+            self._submit(_action('prepare_implementation',
+                goal='Compute two text results from the supplied raw observations'))
+        prepared = self._ok('prepare_implementation')['data']
+        self.send.assert_called_once()
+        self._submit(_action('execute_implementation',prepared_result=prepared['prepared_result']),
+            approve=lambda *_:True)
+        executed = self._ok('execute_implementation')['data']
+        self.assertEqual(executed['status'],'run_succeeded')
+        candidate = Path(prepared['project_dir'])
+        source, final, retained = (str(candidate/name) for name in ('produce.py','final.txt','retained.txt'))
+        execution_record = self.app.workspace.resolve(executed['execution_ref'])
+        old_records = {**self._versions(self.app.workspace.resolve(prepared['prepared_result']).parent.parent),
+            **self._versions(execution_record.parent)}
+        old_receipts = self._process_receipts()
+        old_usage = [row.to_dict() for row in self.app.ledger.entries]
+        retained_bytes = Path(retained).read_bytes()
+
+        # This current output really consumes an old generated output. Its own
+        # fresh input/output hashes cannot replace the ancestor's source proof.
+        self._submit(_action('run_process',argv=['python','-c',
+            "from pathlib import Path; import sys; "
+            "Path('derived.txt').write_bytes(Path(sys.argv[1]).read_bytes())",retained],
+            inputs=[retained],outputs=['derived.txt'],timeout_sec=5),approve=lambda *_:True)
+        self._ok('run_process')
+        self.app.workspace.check_artifact_producers(['derived.txt'])
+        revised = code.replace("'old:'","'current:'").split("Path('retained.txt')")[0]
+        observed = self._read(source)
+        self._submit(_action('edit_file',path=source,expected_sha256=observed['sha256'],
+            old_text=code,new_text=revised))
+        self._ok('edit_file')
+        for artifact in (final,'derived.txt'):
+            with self.assertRaises(ValueError):
+                self.app.workspace.check_artifact_producers([artifact])
+            self._submit(_action('deliver_result',summary='Unregenerated output',artifacts=[artifact]))
+            self.assertNotEqual(self._last('deliver_result')['status'],'ok')
+            self._not_delivered()
+
+        self._submit(_action('run_process',argv=['python',source,raw],cwd=str(candidate),
+            inputs=[source,'measurements/observations.csv'],outputs=[final],timeout_sec=5),
+            approve=lambda *_:True)
+        self._ok('run_process')
+        self.assertEqual(Path(final).read_text(encoding='utf-8'),
+            'current:'+(self.inputs/'observations.csv').read_text(encoding='utf-8'))
+        producer = self.app.workspace.artifact_provenance([final])[final]['producer']
+        self.assertNotEqual(producer['invocation_id'],execution_record.parent.name)
+        self.assertEqual(self.app.workspace.resolved_versions(producer['inputs']),
+            {Path(source).resolve():_digest(Path(source)),Path(raw).resolve():_digest(Path(raw))})
+        with self.assertRaises(ValueError):
+            self.app.workspace.check_artifact_producers(['derived.txt'])
+        self._submit(_action('deliver_result',summary='Still consumes the old result',artifacts=['derived.txt']))
+        self.assertNotEqual(self._last('deliver_result')['status'],'ok')
+        self._not_delivered()
+        self._submit(_action('deliver_result',summary='Current source and freshly computed result',
+            artifacts=[source,final]))
+        self._ok('deliver_result')
+        self.assertEqual(self.app.session.manifest.status,'completed',self.app.result_snapshot())
+        self.assertEqual(self.app.session.store.read_json('delivery.json')['unresolved'],[])
+        self.assertEqual(Path(retained).read_bytes(),retained_bytes)
+        for path, content in old_records.items():
+            self.assertEqual(path.read_bytes(),content)
+        for path, content in old_receipts.items():
+            self.assertEqual((self.root/path).read_bytes(),content)
+        self.assertEqual([row.to_dict() for row in self.app.ledger.entries][:len(old_usage)],old_usage)
+        self.assertEqual(self._versions(self.inputs),originals)
+        bound = self.app.session.store.read_json('delivery.json')
+        receipts, usage = self._process_receipts(),self.app.ledger.to_dict()
+        self._reload()
+        self._run()
+        self.assertEqual(self.app.session.store.read_json('delivery.json'),bound)
+        self.assertEqual(self._process_receipts(),receipts)
+        self.assertEqual(self.app.ledger.to_dict(),usage)
+        self.send.assert_called_once()
+
     def test_inline_producers_validate_actual_outputs_and_repair_stale_process_edges(self):
-        for kind in ('write','process'):
-            with self.subTest(producer=kind):
-                self.root = self.directory / ('inline-'+kind)
-                self._create(delivery_files=['final.txt','conditions.txt'] if kind=='write' else None)
-                delivery = {'summary':'Actual final output','artifacts':['final.txt']}
-                if kind == 'write':
-                    self._submit(_action('write_file',path='final.txt',content='finished\n',delivery=delivery))
-                    self._ok('write_file')
-                    self._not_delivered()
-                    self.assertIn('conditions.txt','; '.join(self.app._delivery_feedback()['issues']))
-                    self._write('conditions.txt','Execution and interpretation are distinct.\n')
-                    self._submit(_action('deliver_result',summary='Actual final output',
-                        artifacts=['final.txt','conditions.txt']))
-                    self._ok('deliver_result')
-                else:
-                    self._write('produce.py',
-                        "from pathlib import Path\nPath('final.txt').write_text('old\\n')\n")
-                    command = {'argv':['python','produce.py'],'inputs':['produce.py'],'outputs':['final.txt']}
-                    self._submit(_action('run_process',**command),approve=lambda *_:True)
-                    self._ok('run_process')
-                    script = self._read('produce.py')
-                    self._submit(_action('edit_file',path='produce.py',expected_sha256=script['sha256'],
-                        old_text="'old\\n'",new_text="'finished\\n'"))
-                    self._ok('edit_file')
-                    # The previous producer is stale until this approved final
-                    # run succeeds. Preflight must not reject its replacement.
-                    self._submit(_action('run_process',**command,delivery=delivery),approve=lambda *_:True)
-                    self._ok('run_process')
-                self.assertEqual(self.app.session.manifest.status,'completed',self.app.result_snapshot())
-                self.assertEqual((self.root/'workspace/final.txt').read_text(),'finished\n')
-                bound = self.app.session.store.read_json('delivery.json')
-                receipts = self._process_receipts()
-                self._reload()
-                self._run()
-                self.assertEqual(self.app.session.store.read_json('delivery.json'),bound)
-                self.assertEqual(self._process_receipts(),receipts)
+        self._create(delivery_files=['final.txt','conditions.txt'])
+        delivery = {'summary':'Actual final output','artifacts':['final.txt']}
+        self._submit(_action('write_file',path='final.txt',content='finished\n',delivery=delivery))
+        self._ok('write_file')
+        self._not_delivered()
+        self.assertIn('conditions.txt','; '.join(self.app._delivery_feedback()['issues']))
+        self._write('conditions.txt','Execution and interpretation are distinct.\n')
+        self._submit(_action('deliver_result',summary='Actual final output',
+            artifacts=['final.txt','conditions.txt']))
+        self._ok('deliver_result')
+        self.assertEqual(self.app.session.manifest.status,'completed',self.app.result_snapshot())
+        self.assertEqual((self.root/'workspace/final.txt').read_text(),'finished\n')
+        bound = self.app.session.store.read_json('delivery.json')
+        receipts = self._process_receipts()
+        self._reload()
+        self._run()
+        self.assertEqual(self.app.session.store.read_json('delivery.json'),bound)
+        self.assertEqual(self._process_receipts(),receipts)
 
         for program in ("print('no output')","raise SystemExit(2)"):
             with self.subTest(failed_producer=program):

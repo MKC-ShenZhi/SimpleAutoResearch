@@ -390,14 +390,17 @@ class ImplementationToolGateway:
         return []
 
     def delivery_issues(self, observations: list[dict[str, Any]]) -> list[str]:
-        if self.exact is not None and not self.declaration_review:
+        if self.preparation_only or self.exact is not None and not self.declaration_review:
+            # Independent source/execute operations do not own task completion.
+            # The common delivery checks actual current process ancestry, not
+            # whichever prepared execution happened to run most recently.
             return []
         from simple_ar.tools.implementation_run import delivery_issues
         return delivery_issues(self, observations)
 
     def delivery_issues_for(self, observations: list[dict[str, Any]], delivery: dict | None,
                             adoptions: list[dict]) -> list[str]:
-        if self.exact is not None and not self.declaration_review:
+        if self.preparation_only or self.exact is not None and not self.declaration_review:
             return []
         from simple_ar.tools.implementation_run import delivery_issues
         return delivery_issues(self, observations, delivery=delivery, declaration_adoptions=adoptions)
