@@ -857,11 +857,25 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._create()
         self._write('report.md','# Results\n\nSee the calculation.\n')
         self._write('calculation.py','mean = (1 + 2 + 3) / 3\n')
-        self.review = lambda view: {'decisions':[
-            {'subject':'target-1','evidence':['target-2'],'findings':[],'limitations':[]},
-            {'subject':'target-2','evidence':[],'findings':[],'limitations':['Only the supplied prefix was reviewed.']}]}
-        result = self._inspect(['report.md',{'path':'calculation.py','max_bytes':8}],[])
+        self._write('support.txt','The calculation uses three supplied values.\n')
+        def review(view):
+            self.assertNotIn('evidence-1', [row['subject'] for row in view['evidence']])
+            if len(self.inspection_views)==1:
+                self.assertEqual([row['subject'] for row in view['evidence']], ['evidence-2'])
+                return [_action('read_file',path='support.txt')]
+            self.assertEqual([row['subject'] for row in view['evidence']], ['evidence-2','evidence-3'])
+            return {'decisions':[
+                {'subject':'target-1','evidence':['target-2','evidence-3'],'findings':[],'limitations':[]},
+                {'subject':'target-2','evidence':['target-1'],'findings':[],
+                 'limitations':['Only the supplied prefix was reviewed.']}]}
+        self.review = review
+        result = self._inspect([{'path':'report.md','max_bytes':12000},
+            {'path':'calculation.py','max_bytes':8}],
+            [{'path':'./report.md','max_bytes':12000},'measurements/conditions.txt'])
         self.assertEqual([a['verdict'] for a in _assessments(result)],['passed','incomplete'])
+        self.assertEqual([row['subject'] for row in result['data']['evidence']], ['evidence-2','evidence-3'])
+        self.assertEqual(_assessments(result)[1]['evidence_sha256'],
+            {str(self.root/'workspace/report.md'):_digest(self.root/'workspace/report.md')})
         observations = self.app._operation_observations()
         self.assertEqual(assessment_issues(self.app.workspace,observations,['report.md'],require_pass=['report.md']),[])
         source = self._read('calculation.py')
@@ -1055,6 +1069,10 @@ class OperationsWorkLoopTests(unittest.TestCase):
         before = len(self.inspection_requests)
 
         def review(view):
+            visible = view['targets'][0]
+            if visible['complete']:
+                self.assertEqual(''.join(w['text'] for w in visible['text_windows']), text)
+                self.assertEqual(view['evidence'], [])
             response = self._review_complete_targets(view)
             if isinstance(response, list):
                 for action in response:
@@ -1075,14 +1093,18 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(first['targets'][0]['text_windows'][0]['text'], 'A'*511)
         final, _ = json.JSONDecoder().raw_decode(requests[-1]['messages'][1]['content'])
         self.assertTrue(final['targets'][0]['complete'])
-        self.assertGreater(final['working_view']['history']['archive_end_turn'], 0)
+        self.assertEqual(''.join(w['text'] for w in final['targets'][0]['text_windows']), text)
 
         identity = Path(result['data']['record']).parts[1]
         store = self.app.session.store
         saved = store.read_json(f'tools/inspection/{identity}/input.json')
         rows = [*saved['targets'], *saved['evidence']]
-        self.assertGreater(len(rows), 3)
-        self.assertTrue(all(not row['complete'] for row in rows))
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]['complete'])
+        preview = deepcopy(rows[0])
+        preview['windows'] = preview['windows'][:1]
+        preview['complete'] = False
+        self.assertTrue(preview['windows'][0]['text'].endswith('\ufffd'))
         self.assertEqual({row['sha256'] for row in rows}, {_digest(target)})
         windows = sorted((window for row in rows for window in row['windows']),
             key=lambda window: window['offset_bytes'])
@@ -1101,16 +1123,43 @@ class OperationsWorkLoopTests(unittest.TestCase):
             self.assertEqual(projection['input_token_target'], 12000)
             self.assertLessEqual(projection['estimated_input_tokens'], 12000)
             self.assertTrue(trace['completed'])
-        self.assertEqual(sum(len(trace['results']) for trace in traces), len(rows)-1)
-        self.assertTrue(any(not row['text_windows'] and row['observed_ranges']
-            for row in final['evidence']))
+        self.assertEqual(sum(len(trace['results']) for trace in traces), len(windows)-1)
+        self.assertTrue(all(result['result']['data']['subject']=='target-1'
+            for trace in traces for result in trace['results']))
+        projected_reads = [json.loads(message['content']) for trace in traces
+            for message in trace['working_input']['messages'] if message['role'] == 'tool']
+        self.assertTrue(projected_reads)
+        for result in projected_reads:
+            self.assertNotIn('text_windows', result['data'])
+            self.assertEqual(result['data']['text_window_owner'], 'target-1')
+        self.assertTrue(all(result['result']['data']['text_windows']
+            for trace in traces for result in trace['results']))
+        self.assertEqual(final['evidence'], [])
         owner = self.app.operations.inspection
         self.assertTrue(owner._complete_target(rows[0], rows))
         # A real tail starting after the split character leaves a decoded-byte gap.
         tail = owner._observe(FileWindow(path='progressive.md', offset_bytes=514, max_bytes=64000),
             'gap-tail', 'progressive-gap', [512000])
         self.assertTrue(tail['readable'], tail)
-        self.assertFalse(owner._complete_target(rows[0], [rows[0], tail]))
+        self.assertFalse(owner._complete_target(preview, [preview, tail]))
+        self._write('same-bytes.txt', text)
+        copy = owner._observe(FileWindow(path='same-bytes.txt', max_bytes=64000),
+            'copy', 'progressive-copy', [512000])
+        self.assertEqual(copy['sha256'], preview['sha256'])
+        self.assertIsNone(owner._target_observation({'targets':[preview]}, copy))
+        self.assertFalse(owner._complete_target(preview, [preview, copy]))
+        for filename, raw in (('bad-text.txt', b'valid prefix\xff'),
+                              ('control-text.txt', b'valid prefix\x00'),
+                              ('disguised.bin', b'plain text')):
+            with self.subTest(filename=filename):
+                self._write(filename, 'placeholder')
+                (self.root/'workspace'/filename).write_bytes(raw)
+                invalid = owner._observe(filename, 'invalid', 'progressive-invalid', [512000])
+                self.assertFalse(invalid['readable'])
+                self.assertFalse(owner._complete_target(invalid, [invalid]))
+                self.assertIsNone(owner._target_observation({'targets':[invalid]}, invalid))
+        unread = owner._observe('absent.txt', 'unread', 'progressive-unread', [512000])
+        self.assertFalse(owner._complete_target(unread, [unread]))
         # Read the otherwise complementary tail from a changed file: it must not
         # complete the old preview or inherit that version's passed assessment.
         target.write_bytes(b'B'+original[1:])
@@ -1118,7 +1167,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
             'changed-tail', 'progressive-version', [512000])
         self.assertTrue(changed['readable'], changed)
         self.assertNotEqual(changed['sha256'], rows[0]['sha256'])
-        self.assertFalse(owner._complete_target(rows[0], [rows[0], changed]))
+        self.assertFalse(owner._complete_target(preview, [preview, changed]))
+        self.assertIsNone(owner._target_observation({'targets':[preview]}, changed))
         with self.assertRaisesRegex(ValueError, 'version changed'):
             owner._check_versions(rows, 'progressive-stale')
         self.assertFalse(owner.can_reconcile('inspect_artifacts', identity))
@@ -1128,6 +1178,32 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._reload()
         cached = self.app.operations.inspection.call('inspect_artifacts', saved['arguments'], identity)
         self.assertEqual(cached.status, 'ok', cached)
+        self.assertEqual(self.send.call_count, calls)
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+        self.assertEqual(self._versions(self.root/f'tools/inspection/{identity}'), records)
+
+    def test_progressive_historical_material_roles_and_conclusions_survive_cached_load(self):
+        self._create()
+        text = 'Earlier retained observation.\n'*40
+        self._write('retained.txt', text)
+        owner = self.app.operations.inspection
+        # Freeze the earlier allocation of supplementary target reads to evidence.
+        # Loading it must verify the original records, not migrate material roles.
+        with patch.object(owner, '_target_observation', return_value=None):
+            result = self._inspect(['retained.txt'], ['retained.txt'])
+        self.assertEqual(result['status'], 'ok', result)
+        self.assertEqual(_assessments(result)[0]['verdict'], 'passed')
+        identity = Path(result['data']['record']).parts[1]
+        saved = self.app.session.store.read_json(f'tools/inspection/{identity}/input.json')
+        self.assertFalse(saved['targets'][0]['complete'])
+        self.assertGreater(len(saved['evidence']), 1)
+        expected = self.app.session.store.read_json(f'tools/inspection/{identity}/result.json')
+        records = self._versions(self.root/f'tools/inspection/{identity}')
+        calls, ledger = self.send.call_count, self.app.ledger.to_dict()
+        self._reload()
+        cached = self.app.operations.inspection.call('inspect_artifacts', saved['arguments'], identity)
+        self.assertEqual(cached.model_dump(mode='json'), expected)
+        self.assertEqual(cached.metadata['assessments'], _assessments(result))
         self.assertEqual(self.send.call_count, calls)
         self.assertEqual(self.app.ledger.to_dict(), ledger)
         self.assertEqual(self._versions(self.root/f'tools/inspection/{identity}'), records)
@@ -1548,6 +1624,15 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.review = lambda view: {'findings': [], 'limitations': [limitation]}
         self._inspect([{'path': 'notes.md', 'start_line': 1, 'max_lines': 10}], [])
         self.assertEqual(self._assessment()['verdict'], 'passed')
+        # A full same-file initial evidence window belongs to the partial target;
+        # its body stays visible without supplying a second evidence identity.
+        self._inspect([{'path':'notes.md','max_bytes':8}],
+            [{'path':'./notes.md','max_bytes':12000}])
+        self.assertEqual(self._assessment()['verdict'], 'passed')
+        view = self.inspection_views[-1]
+        self.assertEqual(view['evidence'], [])
+        self.assertIn((self.root/'workspace/notes.md').read_text(),
+            [window['text'] for window in view['targets'][0]['text_windows']])
         self.assertFalse(self._process_receipts())
         pdf_delivery = self._delivery('notes.md')
         pdf_delivery['report']['formats'] = ['pdf']

@@ -533,6 +533,19 @@ class InspectionToolGateway:
             if not row['independent']:
                 row['limitation'] = 'Target itself or identical bytes cannot be independent evidence'
 
+    def _target_observation(self, saved: dict[str, Any], row: dict) -> dict | None:
+        """Assign decoded same-file windows to their target, only for new progressive work."""
+        if not self.progressive or not row.get('readable') or not row.get('sha256'):
+            return None
+        owners = [target for target in saved['targets'] if target.get('readable')
+            and target.get('path') == row.get('path') and target.get('sha256') == row['sha256']]
+        for target in owners:
+            target['windows'].extend(window for window in row['windows'] if window not in target['windows'])
+            target['complete'] = self._complete_target(target, [target])
+            if target['complete']:
+                target.pop('limitation', None)
+        return owners[0] if owners else None
+
     def _view(self, saved: dict[str, Any], request: InspectionRequest, *, source_result: bool = False) -> dict[str, Any]:
         view = {'goal':request.goal,
             'prior_required':saved['prior_required'],
@@ -571,15 +584,29 @@ class InspectionToolGateway:
         target = getattr(getattr(client, '_settings', None), 'context_input_tokens', 24000)
         if type(target) is not int or target <= 0:
             target = 24000
+        base = self._view(saved, request)
+        pinned = {(row['path'], row['sha256']): row for role in ('targets', 'evidence')
+            for row in base[role] if row.get('text_windows')}
         blocks, current = [], []
         for message in history[2:]:
             if message['role'] == 'assistant' and current:
                 blocks.append(current)
                 current = []
+            if message['role'] == 'tool':
+                result = json.loads(message['content'])
+                data = result.get('data', {})
+                owner = pinned.get((data.get('path'), data.get('sha256')))
+                if (result.get('tool_name') == 'read_file' and result.get('status') == 'ok'
+                        and owner and data.get('text_windows')
+                        and all(window in owner['text_windows'] for window in data['text_windows'])):
+                    # Keep the atomic tool reply, but supply its exact body once
+                    # through its current material owner. Raw receipts stay intact.
+                    data = {key: value for key, value in data.items() if key != 'text_windows'}
+                    data['text_window_owner'] = owner['subject']
+                    message = {**message, 'content': json.dumps({**result, 'data': data}, ensure_ascii=False)}
             current.append(message)
         if current:
             blocks.append(current)
-        base = self._view(saved, request)
         base.pop('goal', None)
         base['reading_scope'] = ('Only the supplied decoded windows were observed. Retired source bodies '
             'remain in the original inspection records; read an authorized original path/range again '
@@ -724,12 +751,18 @@ class InspectionToolGateway:
                     saved.setdefault('source_invocations',[]).append(source_identity)
                     self.store.write_json(input_path,saved)
                     if name=='read_file':
+                        evidence_number = (max((int(item['subject'].split('-')[1])
+                            for item in saved['evidence']), default=0) if self.progressive else len(saved['evidence'])) + 1
                         row = self._observe(FileWindow.model_validate(arguments),
-                            f"evidence-{len(saved['evidence'])+1}",source_identity,remaining,read_limit=read_limit)
-                        saved['evidence'].append(row)
+                            f'evidence-{evidence_number}',source_identity,remaining,read_limit=read_limit)
+                        owner = self._target_observation(saved, row)
+                        if owner is None:
+                            saved['evidence'].append(row)
                         self._mark_evidence(saved)
-                        visible = self._view({**saved,'targets':[], 'evidence':[row]},request,
-                            source_result=True)['evidence'][0]
+                        role = 'targets' if owner else 'evidence'
+                        observed = {**row, 'subject':owner['subject']} if owner else row
+                        visible = self._view({**saved,'targets':[], 'evidence':[], role:[observed]},request,
+                            source_result=True)[role][0]
                         result = ToolResult(tool_name=name, status='ok' if row.get('readable') else 'error',
                             data=visible,error='' if row.get('readable') else row.get('limitation','Read failed'))
                     else:
@@ -776,6 +809,8 @@ class InspectionToolGateway:
             saved['evidence'] = [self._observe(value, f'evidence-{i + 1}', identity, remaining)
                                  for i, value in enumerate(request.evidence)]
             if self.progressive:
+                saved['evidence'] = [row for row in saved['evidence']
+                    if self._target_observation(saved, row) is None]
                 saved['initial_subjects'] = [row['subject'] for row in [*saved['targets'],*saved['evidence']]]
             self._mark_evidence(saved)
             saved['prior_required'] = self._prior(saved['targets'])
