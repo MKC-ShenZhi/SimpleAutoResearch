@@ -17,6 +17,7 @@ from simple_ar.cli.start import native_creation_options
 from simple_ar.core.capabilities import ArtifactStore
 from simple_ar.tools.extensions import LocalExtension, freeze_extensions
 from simple_ar.tools.specs import ToolCall, ToolResult
+from tests.native_history_fixture import load_native_history
 
 
 class LocalExtensionContractTests(unittest.TestCase):
@@ -198,7 +199,7 @@ type = "object"
                 'def finish_note(arguments, services):\n    return {"handoff": arguments["handoff"]}\n',
                 encoding='utf-8')
             app = ToolApplication.create(root / 'task', 'Deliver the explicit note', model=None,
-                sources={}, extensions=[package], tool_contracts='full', control_protocol=None)
+                sources={}, extensions=[package], tool_contracts='full')
             name = 'research_note__finish_note'
             frozen = app.state['config']['tool_completions'].copy()
             self.assertEqual(frozen[name]['field'], 'handoff')
@@ -222,18 +223,19 @@ type = "object"
             with self.assertRaisesRegex(ValueError, 'delivered files changed'):
                 RetainedDelivery(root / 'task').reusable_materials()
             note.write_bytes(original)
-            # Saved old sessions do not silently acquire extension completion.
-            loaded.state['config'].pop('tool_completions')
-            loaded.state['config'].pop('document_source_contract')
-            loaded._save()
-            loaded.supply(supply_id='legacy-config', reason='An unrelated supply preserves absent contracts',
+            # Load an actual older wire shape rather than stripping contracts
+            # from a newly created operations task to manufacture old history.
+            historical = load_native_history(root/'historical', 'Retain the saved extension contract',
+                config={'extensions':freeze_extensions([package]),'extension_host_protocol':'nested_calls.v1'},
+                absent_fields=('tool_completions','document_source_contract'))
+            historical.supply(supply_id='legacy-config', reason='An unrelated supply preserves absent contracts',
                 changes={'allow_network': True})
-            self.assertNotIn('tool_completions', loaded.state['config'])
-            self.assertNotIn('document_source_contract', loaded.state['config'])
-            loaded.supply(supply_id='document-source', reason='Explicitly adopt new source handling for subsequent work',
+            self.assertNotIn('tool_completions', historical.state['config'])
+            self.assertNotIn('document_source_contract', historical.state['config'])
+            historical.supply(supply_id='document-source', reason='Explicitly adopt new source handling for subsequent work',
                 changes={'document_source_contract': 'document_source.v1'})
-            self.assertEqual(loaded.state['config']['document_source_contract'], 'document_source.v1')
-            self.assertFalse(loaded._terminal_intent({'function': {'name': name, 'arguments': '{}'}}))
+            self.assertEqual(historical.state['config']['document_source_contract'], 'document_source.v1')
+            self.assertFalse(historical._terminal_intent({'function': {'name': name, 'arguments': '{}'}}))
 
     @unittest.skipUnless(shutil.which('rg'), 'Nested search uses the existing ripgrep tool')
     def test_nested_host_searches_have_distinct_recoverable_receipts(self):
@@ -257,7 +259,7 @@ type = "object"
             (project / 'observations.txt').write_text('accuracy = 0.91\nlatency = 0.42\n', encoding='utf-8')
             app = ToolApplication.create(root / 'task', 'Inspect two different properties', model=None,
                 sources={'source0': project}, extensions=[package],
-                process_limits={'process_invocations': 2, 'process_wall_seconds': 30}, control_protocol=None)
+                process_limits={'process_invocations': 2, 'process_wall_seconds': 30})
             arguments = {'path': 'source0', 'queries': ['accuracy', 'latency']}
             app.run(actions=[{'tool_name': 'local_notes__count_words', 'arguments': arguments}], progress=lambda _: None)
             observed = app.state['turns'][0]['tools'][0]
@@ -288,16 +290,14 @@ type = "object"
             project = root / 'project'
             project.mkdir()
             (project / 'note.txt').write_text('one two three', encoding='utf-8')
-            for professional in (False, True):
-                with self.subTest(professional=professional):
-                    app = ToolApplication.create(root / str(professional), 'Read two bibliographic entries', model=None,
-                        sources={'source0': project}, extensions=[package], professional_inputs=professional, control_protocol=None)
-                    app.run(actions=[{'tool_name': 'local_notes__count_words', 'arguments': {
-                        'path': 'source0/note.txt', 'publication': title, 'complete_work': True}}
-                        for title in ('First paper', 'Second paper')], progress=lambda _: None)
-                    rows = [app.session.store.read_json(item['result']) for turn in app.state['turns'] for item in turn['tools']]
-                    self.assertEqual([row['status'] for row in rows], ['ok', 'ok'], rows)
-                    self.assertEqual([row['data']['words'] for row in rows], [3, 3])
+            app = ToolApplication.create(root / 'task', 'Read two bibliographic entries', model=None,
+                sources={'source0': project}, extensions=[package])
+            app.run(actions=[{'tool_name': 'local_notes__count_words', 'arguments': {
+                'path': 'source0/note.txt', 'publication': title, 'complete_work': True}}
+                for title in ('First paper', 'Second paper')], progress=lambda _: None)
+            rows = [app.session.store.read_json(item['result']) for turn in app.state['turns'] for item in turn['tools']]
+            self.assertEqual([row['status'] for row in rows], ['ok', 'ok'], rows)
+            self.assertEqual([row['data']['words'] for row in rows], [3, 3])
 
     def test_local_package_consumer_recovery_and_identity(self):
         # Separate package/project/task roots: no repository edit or auto-discovery.
@@ -341,16 +341,15 @@ type = "object"
             run_dir = root / 'saved'
             with patch('simple_ar.app.tool_application.LLMClient.from_env', return_value=fake):
                 app = ToolApplication.create(run_dir, 'Inspect my note with the local notes skill',
-                    model='fixture', sources={'source0': project}, professional_inputs=True,
-                    extensions=args.extensions, max_turns=10, control_protocol=None)
+                    model='fixture', sources={'source0': project},
+                    extensions=args.extensions, max_turns=10)
                 self.assertEqual(app.gateway.domain_owner('read_file'), app.workspace)
                 self.assertIs(app.gateway.domain_owner(selected[1]), app.extensions[0])
                 self.assertTrue(app.gateway.registry.request_visible(selected[1]))
-                self.assertTrue(app.gateway.registry.request_visible('compose_document'))
-                self.assertFalse(app.gateway.registry.request_visible('write_file'))
-                self.assertFalse(app.gateway.registry.request_visible('execute_implementation'))
-                self.assertIn(selected[1], app._specialist_catalog())
-                self.assertNotIn(selected[1], {row['function']['name'] for row in app.schemas})
+                self.assertIsNone(app.gateway.registry.get('compose_document'))
+                self.assertTrue(app.gateway.registry.request_visible('write_file'))
+                self.assertTrue(app.gateway.registry.request_visible('execute_implementation'))
+                self.assertIn(selected[1], {row['function']['name'] for row in app.schemas})
                 # Resume after the result is durable but before controller commit.
                 original = ArtifactStore.write_json
 
@@ -377,9 +376,9 @@ type = "object"
                 self.assertEqual(fake.chat_turn.call_count, 4)
                 calls = fake.chat_turn.call_args_list
                 initial = json.loads(calls[0].args[0][1]['content'])
-                self.assertIn(selected[0], initial['available_specialists'])
                 self.assertNotIn('instructions grant no access', json.dumps(initial).lower())
-                self.assertNotIn(selected[1], {row['function']['name'] for row in calls[0].kwargs['tools']})
+                self.assertIn(selected[0], {row['function']['name'] for row in calls[0].kwargs['tools']})
+                self.assertIn(selected[1], {row['function']['name'] for row in calls[0].kwargs['tools']})
                 self.assertIn(selected[1], {row['function']['name'] for row in calls[1].kwargs['tools']})
                 skill_result = restored.session.store.read_json(restored.state['turns'][1]['tools'][0]['result'])
                 self.assertIn('These instructions grant no access', skill_result['data']['instructions'])

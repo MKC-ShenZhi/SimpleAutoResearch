@@ -596,12 +596,14 @@ app = create_research_task(ResearchBrief(request_text="测量所提供的程序�
 | `tool_contracts="on_demand"`（默认） | 先提供工作区工具和简短能力目录，按需加载专业契约，用户无需选工作流或批准加载。权限及命令审批仍适用；高级选项为 `full`、`outcomes`。 |
 | `context_protocol="auto"`（创建默认） | 新操作任务保存 `working.v1`：按顺序保留要求、连续近期工作、按版本核对的观察和沿原记录保存的笔记。旧工作量达到阈值时沿同一预算模型压缩，检查点输出上限8192tokens，不限制科研正文输出。摘录标明实际范围，笔记是判断，不是验证或权限。`update_work_plan.notes` 可替换快照；省略跨反馈保留，`[]` 清空。 |
 | `context_protocol="conversation.v1"`（保存／兼容任务） | 保留时间顺序投影和原始记录，旧任务不静默升级；显式 `None` 保留原legacy投影。工作集目标是软限制，实际共享token额度仍受约束。 |
-| `control_protocol="operations.v1"`（默认） | 普通 `start`、结构化入口和创建 API 在同一行动循环中组合读写、执行、检查与出版，不强制专业接力或 Writer 采用阶段。保存任务不迁移；显式 `None` 选择兼容路径。 |
-| `completion_policy="available_operations.v1"`（新操作任务） | 在实际资源与审批限制内保留可用操作，最后一次可负担决策也能留下有用的中间工作。耗尽暂停并保留成果；只有显式且校验通过的交付才算完成。兼容创建和保存任务保留原末次／保护决策策略。 |
+| `control_protocol="operations.v1"`（新任务） | 普通 `start`、结构化入口与 `ToolApplication.create` 在同一行动循环中组合读写、执行、检查与出版。新建拒绝 `None` 及旧专业控制选项；历史任务通过 `load`、`supply` 沿原合同继续。 |
+| `completion_policy="available_operations.v1"`（新操作任务） | 在实际资源与审批限制内保留可用操作，最后一次可负担决策也能留下有用的中间工作。耗尽暂停并保留成果；只有显式且校验通过的交付才算完成。保存任务保留原末次／保护决策策略。 |
 | `report={"status":"canonical","manuscript":"report.md","formats":["markdown","pdf"]}` | 交付声明可编辑正文及所需格式；完整交付须有当前正文的独立检查，以及需要时与其匹配的出版物，文件存在不足以证明完成。 |
 | 交付中的 `limitations`／`unresolved` | 前者说明研究范围、不确定性或不可得测量；后者说明尚未完成的请求或必改缺陷，并使交付为部分完成。都不能用于虚报质量。 |
 | `create_research_task(..., allow_vision=True)` | 严格布尔值，默认 `False`；须有命名 vision 路由及连接，共用 `services.budget_limits`。文字或注入文本客户端不授权视觉检查；不授予来源联网、图像生成，不改旧权限或返回类型。 |
 | `supply(..., replace_existing=True)` | 调用方可明确替换 `delivery_files`、`tool_contracts` 或 `completion_policy`；无关补齐保留策略及账本。 |
+
+按任务需要交付：中文 Markdown 说明、源码或表格均可成为最终成果，无须声明正式报告；需要时再请求 PDF／TeX。明确声明正式报告仍须检查当前稿件，请求的出版物须与之同版。这不代表自动选择格式或整项任务成功率已获验证。
 
 `inspect_artifacts` 承担一次有界的独立调查。初始依据只是起点：检查者可通过共同读取工具，在已有授权目录中自行定位、补读所需来源，沿原账本计费。每次响应与已完成读取保留，最多六轮批量取材后形成最终意见；完整意见不另设完成阶段。目标变化使原通过失效，新核查未完成不能退回旧通过，只改依据也不能抹去当前必改。未知用量停止后续请求。`inspect_images` 另行授权、使用命名视觉连接。文本检查或编译成功都不认证视觉与科学正确性。
 

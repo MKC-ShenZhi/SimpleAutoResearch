@@ -15,6 +15,7 @@ from urllib.parse import quote
 from unittest.mock import Mock, patch
 
 from simple_ar.app.tool_application import ToolApplication
+from tests.native_history_fixture import load_native_history
 from simple_ar.core.budget import BudgetLedger
 from simple_ar.integrations.llm import LLMClient
 from simple_ar.research.documents.ingest import DocumentBundle
@@ -36,7 +37,7 @@ class LocalWorkspaceTests(unittest.TestCase):
             unused = base / 'unused.txt'
             unused.write_text('Old raw source', encoding='utf-8')
             app = ToolApplication.create(tasks / 'retained', 'Deliver saved local files', model=None,
-                sources={'source0': unused}, extensions=[package], control_protocol=None)
+                sources={'source0': unused}, extensions=[package])
             app.run(actions=[
                 call('write_file', {'path': 'workspace/report.txt', 'content': 'Visible output'}),
                 call('write_file', {'path': 'workspace/execution.log', 'content': 'Retained process evidence'}),
@@ -263,8 +264,8 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
             runner = project / 'runner.py'
             runner.write_text('print("original")\n', encoding='utf-8')
             workspace = Workspace(project, [], root / 'tasks')
-            app = ToolApplication.create(workspace.task('prepared'), 'Inspect a prepared command',
-                model=None, sources={'source0': project}, allow_execution=True, control_protocol=None)
+            app = load_native_history(workspace.task('prepared'), 'Inspect a saved prepared command',
+                config={'model':None, 'sources':{'source0':project}, 'allow_execution':True})
             client = Mock()
             client._budget_ledger = None
             client.ask_json.return_value = {'summary': 'Candidate only', 'unresolved': [],
@@ -334,7 +335,7 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
             app = ToolApplication.create(root, 'Inspect retained evidence', model=None,
                 sources={'source0': project, 'source1': source_file, 'source2': project / 'models.toml'},
                 allow_execution=True, max_attempts=80,
-                process_limits={'process_invocations': 1, 'process_wall_seconds': 30}, control_protocol=None)
+                process_limits={'process_invocations': 1, 'process_wall_seconds': 30})
             app.run(actions=[call('write_file', {'path': 'workspace/report.txt', 'content': 'first report',
                 'delivery': {'summary': 'Initial result', 'artifacts': ['workspace/report.txt'],
                              'unresolved': [diagnostic]} })],
@@ -563,7 +564,7 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
     def test_cooperative_boundary_stop_and_resume_preserves_pending(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve() / 'boundary'
-            app = ToolApplication.create(root, 'Bounded caller work', model=None, sources={}, max_attempts=20, control_protocol=None)
+            app = ToolApplication.create(root, 'Bounded caller work', model=None, sources={}, max_attempts=20)
             actions = [call('write_file', {'path': 'workspace/result.txt', 'content': 'retained'}, 'write'),
                        call('ask_user', {'question': 'Please inspect retained result'}, 'question')]
             stopped = app.run(actions=actions, should_stop=lambda: True, progress=lambda _: None)

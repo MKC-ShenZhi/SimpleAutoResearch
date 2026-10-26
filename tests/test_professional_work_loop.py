@@ -24,6 +24,7 @@ import unittest
 from unittest.mock import patch
 
 from simple_ar.app.tool_application import ToolApplication
+from tests.native_history_fixture import load_native_history
 from simple_ar.core.assessments import ArtifactAssessment
 from simple_ar.integrations.llm import LLMClient, LLMSettings
 from simple_ar.tools.specs import ToolCall, ToolResult
@@ -129,8 +130,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
             side_effect=self._provider))
         self.app = None
 
-    def _create(self, *, report=False, allow_execution=True, legacy=False, delivery_files=None):
-        options = {'control_protocol': None if legacy else 'operations.v1'}
+    def _create(self, *, report=False, allow_execution=True, delivery_files=None):
+        options = {'control_protocol': 'operations.v1'}
         if delivery_files is not None:
             options['delivery_files'] = delivery_files
         if report:
@@ -145,9 +146,77 @@ class OperationsWorkLoopTests(unittest.TestCase):
             process_limits={'process_invocations': 48, 'process_wall_seconds': 360}, **options)
         return self.app
 
+    def _load_history(self):
+        """Exercise the saved native controller through its wire-format loader."""
+        self.app = load_native_history(self.root,
+            'Explain the supplied observations with an editable report, table and figure; '
+            'preserve originals and disclose the limits of the evidence.',
+            config={'model':'fixture', 'sources':{'measurements':self.inputs},
+                'allow_execution':True, 'tool_contracts':'full', 'max_turns':70,
+                'model_connection':self.services.llm_client.connection_binding()},
+            limits={'llm_requests':70, 'total_tokens':900000,
+                'process_invocations':48, 'process_wall_seconds':360, 'source_operations':210},
+            max_attempts=180, services=self.services)
+        return self.app
+
+    def test_creation_rejects_historical_controllers_before_persisting_or_resolving_models(self):
+        for name, options in (
+            ('old-control', {'control_protocol':None}),
+            ('professional-owner', {'professional_inputs':True}),
+            ('old-result-controller', {'investigate_results':False}),
+            ('writer-controller', {'report_protocol':'canonical_report.v1'}),
+        ):
+            with self.subTest(contract=name), patch(
+                    'simple_ar.app.tool_application.LLMClient.from_env') as resolve:
+                target = self.directory/name
+                with self.assertRaisesRegex(ValueError, 'load'):
+                    ToolApplication.create(target, 'Use the ordinary action loop',
+                        model='fixture', sources={}, **options)
+                resolve.assert_not_called()
+                self.assertFalse(target.exists())
+        self._create()
+        self.assertEqual(self.app.state['config']['control_protocol'],'operations.v1')
+        self.assertIsNone(self.app.writing)
+        self.assertTrue(self.app.implementation.preparation_only)
+        self.assertFalse({'professional_work','result_investigation','document_source_contract'}
+            & self.app.state['config'].keys())
+
     def _reload(self):
         self.app = ToolApplication.load(self.root, services=self.services)
         return self.app
+
+    def test_chinese_markdown_feedback_delivers_without_a_report_or_publication_contract(self):
+        self.app = ToolApplication.create(self.root,
+            '把已有观察整理成简短的中文 Markdown 说明，保留适用范围即可。',
+            model='fixture', sources={'measurements':self.inputs}, services=self.services,
+            allow_execution=False, max_turns=10, max_tokens=200000, tool_contracts='full')
+        first = '# 结果说明\n\n这些是已提供的观察，尚不支持总体推断。\n'
+        self.decisions.extend([
+            _action('write_file',path='说明.md',content=first),
+            _action('deliver_result',summary='已整理中文说明。',artifacts=['说明.md']),
+        ])
+        self._run()
+        self.assertEqual(self.app.session.manifest.status,'completed',self.app.result_snapshot())
+        delivery = self.app.session.store.read_json('delivery.json')
+        self.assertIsNone(delivery.get('report'))
+        old_delivery = (self.root/'delivery.json').read_bytes()
+        ledger = self.app.ledger.to_dict()['entries']
+        self._reload()
+        revised = first + '\n后续需要扩大样本并确认采样方式。\n'
+        self.decisions.extend([
+            _action('read_file',path='说明.md'),
+            _action('write_file',path='修订说明.md',content=revised),
+            _action('deliver_result',summary='已补充后续建议。',artifacts=['修订说明.md']),
+        ])
+        self._run(feedback='保留原说明，另存一个版本，加一句后续建议。仍然用中文 Markdown。')
+        self.assertEqual(self.app.session.manifest.status,'completed',self.app.result_snapshot())
+        self.assertEqual((self.root/'workspace/说明.md').read_text(encoding='utf-8'),first)
+        self.assertEqual((self.root/'workspace/修订说明.md').read_text(encoding='utf-8'),revised)
+        self.assertNotEqual((self.root/'delivery.json').read_bytes(),old_delivery)
+        self.assertEqual(self.app.ledger.to_dict()['entries'][:len(ledger)],ledger)
+        self.assertFalse(self._process_receipts())
+        self.assertFalse(self._observations('inspect_artifacts'))
+        self.assertFalse(self._observations('export_report'))
 
     def _review_complete_targets(self, view):
         """Default text review reads missing bytes; custom callbacks own their reads."""
@@ -617,7 +686,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
 
     def test_cached_legacy_native_reply_recovers_without_operations_or_model_call(self):
         from simple_ar.core.session import _persist_attempt_result
-        self._create(legacy=True)
+        self._load_history()
         self.assertIsNone(self.app.operations)
         self.decisions.append(_action('ask_user',question='Which interpretation should be emphasized?'))
         def interrupt(store, result, facts):
@@ -1514,7 +1583,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         for count, legacy, historical in ((1,False,False),(2,False,False),(1,True,False),(1,False,True)):
             with self.subTest(text_replies=count,legacy=legacy,historical=historical):
                 self.root = self.directory/('prose-'+str(count)+'-'+str(legacy)+'-'+str(historical))
-                self._create(legacy=legacy)
+                self._load_history() if legacy else self._create()
                 if historical:
                     self.app.ledger.reserve('old-charge', {'llm_requests':1,'total_tokens':100})
                     self.app.ledger.mark_unknown('old-charge', reason='Prior allowance response unavailable')
@@ -2158,7 +2227,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.send.assert_not_called()
 
     def test_saved_default_legacy_approval_resumes_real_process_without_upgrade_or_replay(self):
-        self._create(legacy=True)
+        self._load_history()
         self.assertNotIn('control_protocol', self.app.state['config'])
         self._write('count.py', "from pathlib import Path\np = Path('count.txt')\n"
             "p.write_text(p.read_text() + 'ran\\n' if p.exists() else 'ran\\n')\n")

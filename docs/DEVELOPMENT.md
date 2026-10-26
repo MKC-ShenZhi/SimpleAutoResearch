@@ -96,8 +96,14 @@ and execution approval remain enforced. Saved `prepared.v2` retains replacement-
 Formal delivery declares its manuscript and requested formats. Fixed code and
 measurement contracts remain enforced by their original execution owners.
 Historical native tasks without this protocol retain their saved professional
-control. Explicit `control_protocol=None` in Python is compatibility integration;
-ordinary new tasks use the new default. Never edit a saved task to upgrade it.
+control through `load` and `supply`. New `ToolApplication.create` calls require
+`operations.v1`; `None` and old professional-controller options fail before task
+creation. Historical compatibility tests load explicit saved wire fixtures rather
+than creating new legacy controllers. Never edit a saved task to upgrade it.
+
+Delivery need not be a formal report. Plain explanations and Chinese Markdown
+artifacts use the same delivery and feedback loop; publication is optional.
+Explicit report claims and requested PDF/TeX retain their inspection/version checks.
 Core retains attempts, artifacts, resource usage and process results through the same shared execution and records.
 
 New operation tasks save `working.v1` for context. `core/working_context.py` selects

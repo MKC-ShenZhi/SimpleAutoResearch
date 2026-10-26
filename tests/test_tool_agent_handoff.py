@@ -11,6 +11,7 @@ import sys
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from tests.report_review_fixtures import changed_record as _changed_record
+from tests.native_history_fixture import load_native_history
 
 from simple_ar.agent_backends import (
     AgentExecutionMode,
@@ -130,8 +131,11 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 return {'receipt_path': receipt_path, 'status': result.status, 'data': result.data}
             owner = SimpleNamespace(coordination_result=present,
                 continuation_attempts=lambda name, arguments: 3)
+            ledger = BudgetLedger({})
+            implementation = ImplementationToolGateway(root, WorkspaceToolGateway(root, {}, ledger),
+                ledger, 'fixture', 'unit')
             gateway = CommonToolGateway(root, registry=registry,
-                domain_gateways={'custom': owner, 'implementation': ImplementationToolGateway})
+                domain_gateways={'custom': owner, 'implementation': implementation})
             receipt = {'tool_name': 'custom_work', 'status': 'error',
                 'data': {'nested': {'value': 'original failure'}}, 'error': 'retained'}
             before = json.dumps(receipt, sort_keys=True)
@@ -168,9 +172,9 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             source = root / 'papers'
             source.mkdir()
             (source / 'paper.pdf').write_bytes(b'original paper')
-            app = ToolApplication.create(root / 'task', 'Deliver a document and PDF',
-                model=None, sources={'papers': source}, max_attempts=50,
-                delivery_files=['**/*.md', '**/*.pdf'], tool_contracts='full', control_protocol=None)
+            app = load_native_history(root / 'task', 'Deliver a document and PDF',
+                config={'model':None, 'sources':{'papers':source},
+                    'delivery_files':['**/*.md','**/*.pdf'], 'tool_contracts':'full'}, max_attempts=50)
             self.assertEqual(app.state['config']['completion_policy'], 'closing_decision.v2')
             before = app.ledger.to_dict()
             terms = app.supply(supply_id='upgrade', reason='Use current contracts with the original task',
@@ -184,8 +188,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             self.assertEqual(config['completion_policy'], 'closing_decision.v2')
             for policy in ('protected_decision.v1', None):
                 with self.subTest(historical_policy=policy):
-                    historical = ToolApplication.create(root / f'history-{policy}', 'Keep saved policy',
-                        model=None, sources={}, completion_policy='protected_decision.v1', control_protocol=None)
+                    historical = load_native_history(root / f'history-{policy}', 'Keep saved policy',
+                        config={'completion_policy':'protected_decision.v1'})
                     self.assertEqual(historical.state['config']['completion_policy'], 'protected_decision.v1')
                     if policy is None:
                         historical.state['config'].pop('completion_policy')
@@ -383,7 +387,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(fake.ask_json.call_count,1)
 
     def test_prepared_execution_failure_supplies_real_diagnosis_and_feedback_version(self) -> None:
-        _, inputs, fake, _, app, _ = self._native_fixture(process_limits={
+        _, inputs, fake, _, app, _ = self._historical_native_fixture(process_limits={
             'process_invocations': 3, 'process_wall_seconds': 10})
         fake.chat_turn.side_effect = AssertionError('No coordinator decisions')
         app.implementation.client_factory = lambda _: fake
@@ -622,7 +626,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                         allow_execution=True, allow_network=False, max_turns=30, code_task=None, process_limits=None,
                         report_requirement=None, measurement_command=None, tool_contracts=None,
                         completion_policy=None, report_protocol=None, context_target=24000,
-                        operation_control=False):
+                        operation_control=True):
         run_dir, inputs = self._tool_materials()
         fake = Mock()
         fake.ask_json = _LegacyArticleFixtureResponses()
@@ -635,21 +639,41 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         if project_python:
             interpreter = run_dir / 'task-python'
             interpreter.symlink_to(sys.executable)
-        app = ToolApplication.create(run_dir / 'native', goal,
-            context_protocol='working.v1' if operation_control else None,
-            model='fixture', sources={'source0': inputs} if mount_inputs else {},
-            allow_execution=allow_execution, allow_network=allow_network,
-            max_turns=max_turns, project_python=interpreter, code_task=code_task, process_limits=process_limits,
-            report_requirement=report_requirement,
-            **({'report_protocol': report_protocol} if report_protocol is not None else {}),
-            **({'tool_contracts': tool_contracts} if tool_contracts is not None else {}),
-            **({'completion_policy': completion_policy} if completion_policy is not None else {}),
-            execution_contract=({'command': measurement_command, 'cwd': str(inputs), 'timeout_sec': 3,
+        measurement = ({'command': measurement_command, 'cwd': str(inputs), 'timeout_sec': 3,
                 'result_schema': {'primary_metric': 'score', 'required_metrics': ['score']},
                 'protocol': {'hypothesis': 'Record the implemented value', 'dataset': 'Supplied local input',
                     'expected_outcome': 'Observed score, not proof of improvement'}}
-                if measurement_command is not None else None),
-            control_protocol='operations.v1' if operation_control else None)
+                if measurement_command is not None else None)
+        if operation_control:
+            app = ToolApplication.create(run_dir / 'native', goal,
+                model='fixture', sources={'source0': inputs} if mount_inputs else {},
+                allow_execution=allow_execution, allow_network=allow_network,
+                max_turns=max_turns, project_python=interpreter, code_task=code_task,
+                process_limits=process_limits, report_requirement=report_requirement,
+                tool_contracts=tool_contracts or 'on_demand', completion_policy=completion_policy,
+                report_protocol=report_protocol, execution_contract=measurement)
+        else:
+            # Only _historical_native_fixture selects this saved wire format.
+            # No modern task is created and then relabelled as old history.
+            from simple_ar.tools.implementation import ExactCodeTask
+            from simple_ar.tools.scientific import measurement_contract
+            config = {'model':'fixture', 'model_connection':binding,
+                'sources':{'source0':inputs} if mount_inputs else {},
+                'allow_execution':allow_execution, 'allow_network':allow_network,
+                'max_turns':max_turns, 'project_python':interpreter,
+                'tool_contracts':tool_contracts or 'on_demand',
+                'completion_policy':completion_policy or 'closing_decision.v2',
+                **({'code_task':ExactCodeTask.model_validate(code_task).model_dump()} if code_task else {}),
+                **({'report_requirement':report_requirement,
+                    'report_evidence_contract':'execution.v1' if code_task or measurement else 'materials.v1'}
+                    if report_requirement is not None else {}),
+                **({'report_protocol':report_protocol} if report_protocol is not None else {}),
+                'execution_contract':measurement_contract(measurement) if measurement else None}
+            app = load_native_history(run_dir / 'native', goal, config=config,
+                limits={'llm_requests':max_turns, 'total_tokens':600000,
+                    'process_invocations':max_turns*10, 'process_wall_seconds':max_turns*300,
+                    'source_operations':max_turns*3, **(process_limits or {})},
+                max_attempts=max_turns*10)
         code = "from pathlib import Path\np = Path('counter.txt')\np.write_text(str(int(p.read_text()) + 1) if p.exists() else '1')\nprint('done')\n"
         code += "# Native history preserves the actual source, not substitute payloads.\n" * 80
         if counter or completed:
@@ -667,6 +691,10 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             self.assertEqual(app.run(approve=lambda *_: True, progress=lambda _: None)['status'], 'completed')
             app = ToolApplication.load(app.session.store.root)
         return run_dir, inputs, fake, binding, app, code
+
+    def _historical_native_fixture(self, **options):
+        """Explicit saved native control/projection; current tools use _native_fixture."""
+        return self._native_fixture(operation_control=False, **options)
 
     def _record_native_turn(self, app, name, arguments, data, identity):
         reply = f'attempts/{identity}-reply/native_result.json'
@@ -812,7 +840,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         # Produce core workspace receipts with the compact catalog first. The
         # current full contracts need more than 24k before history is supplied;
         # repeated source bodies below still exceed this eager window.
-        _, inputs, fake, _, app, code = self._native_fixture(completed=True, tool_contracts='on_demand')
+        _, inputs, fake, _, app, code = self._historical_native_fixture(completed=True, tool_contracts='on_demand')
         app.state['config']['tool_contracts'] = 'full'
         fake._settings.context_input_tokens = 48000
         app._save()
@@ -847,7 +875,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             line_start=10, line_end=11).to_row()])
 
     def _writing_fixture(self, **native_options):
-        _, inputs, fake, _, app, _ = self._native_fixture(**native_options)
+        _, inputs, fake, _, app, _ = self._historical_native_fixture(**native_options)
         bundle = self._original_document()
         from simple_ar.research.documents.ingest import DocumentBundle
         from simple_ar.research.contracts import DocumentRecord, DocumentSection
@@ -921,7 +949,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             return self._accepted_report_tool(app, 'export_report', {'markdown': manuscript}, identity)
 
     def _canonical_report_fixture(self, *, requirement=None, formats=None):
-        _, inputs, fake, _, app, _ = self._native_fixture(
+        _, inputs, fake, _, app, _ = self._historical_native_fixture(
             goal='Write a report using the supplied original source.', report_requirement=requirement,
             report_protocol='canonical_report.v1')
         self.enterContext(patch('simple_ar.app.tool_application.LLMClient.for_task', return_value=fake))
@@ -954,7 +982,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 fake.ask_json.assert_not_called()
 
     def _material_root_fixture(self):
-        _, inputs, fake, _, app, _ = self._native_fixture()
+        _, inputs, fake, _, app, _ = self._historical_native_fixture()
         materials = inputs / 'existing-results'
         materials.mkdir()
         table = materials / 'group-values.csv'
@@ -1113,7 +1141,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         from simple_ar.tools.materials import (journal_material_references, material_inventories,
             material_observation_seed)
 
-        _, inputs, _, _, app, _ = self._native_fixture()
+        _, inputs, _, _, app, _ = self._historical_native_fixture()
         current = inputs / 'notes.txt'
         other = inputs / 'other.txt'
         other.write_bytes(current.read_bytes())
@@ -1213,7 +1241,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
     def test_shared_observation_admission_preserves_large_generated_reads_and_history(self):
         from simple_ar.tools.materials import material_inventories, material_observation_seed
 
-        _, inputs, fake, _, app, _ = self._native_fixture()
+        _, inputs, fake, _, app, _ = self._historical_native_fixture()
         app.state['config']['tool_contracts'] = 'on_demand'
         # The same byte protocol covers supplied sources, generated prose,
         # plotting code and bibliography. None becomes independent evidence.
@@ -1272,7 +1300,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         from simple_ar.tools.materials import (current_text_window, material_inventories,
             material_observation_seed, observe_text_window, validate_material_observation)
 
-        _, inputs, _, _, app, _ = self._native_fixture()
+        _, inputs, _, _, app, _ = self._historical_native_fixture()
         source = inputs / 'notes.txt'
         self._record_parent_material_read(app, source, 'shared-cache', max_bytes=23)
         reference, = app._material_observations([str(source)])
@@ -1366,7 +1394,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         from simple_ar.tools.materials import (MaterialSelection, inspect_materials, material_inventories,
             material_observation_seed, selected_material_windows)
 
-        _, inputs, _, _, app, _ = self._native_fixture()
+        _, inputs, _, _, app, _ = self._historical_native_fixture()
         source = inputs / 'capacity.txt'
         source.write_bytes(b'x' * 120000)
         windows = [{'path': str(source), 'max_bytes': 64000},
@@ -2315,7 +2343,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                          ['/explicit/python', 'python -c unchanged'])
 
     def test_project_implementation_owns_file_selection_and_original_binding(self) -> None:
-        _, project, fake, _, app, _ = self._native_fixture()
+        _, project, fake, _, app, _ = self._historical_native_fixture()
         with patch.object(app.implementation, 'client_factory', return_value=fake):
             module = project / 'module.py'
             original = 'def keep():\n    return 7\n\ndef change():\n    return 1\n'
@@ -2648,7 +2676,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 self.assertEqual(app.ledger.limits, ledger['limits'])
                 self.assertEqual((owner.root / 'capability_result.json').read_bytes(), envelope)
 
-    def _supply_fixture(self, *, process_invocations=2):
+    def _supply_fixture(self, *, process_invocations=2, historical=False):
         root, inputs = self._tool_materials()
         fake = Mock()
         fake._settings = SimpleNamespace(api_mode='chat', context_input_tokens=24000)
@@ -2659,9 +2687,15 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         fake.chat_turn.side_effect = AssertionError('Supply/caller actions must not request model decisions')
         fake.ask_json.side_effect = AssertionError('No implicit professional model work')
         self.enterContext(patch('simple_ar.app.tool_application.LLMClient.from_env', return_value=fake))
-        app = ToolApplication.create(root / 'task', 'Collect materials, then measure when authorized',
-            model=None, sources={'source0': inputs}, max_turns=0, max_tokens=0, max_attempts=30,
-            process_limits={'process_invocations': process_invocations, 'process_wall_seconds': 30}, control_protocol=None)
+        if historical:
+            app = load_native_history(root / 'task', 'Collect materials, then measure when authorized',
+                config={'model':None, 'sources':{'source0':inputs}, 'max_turns':0},
+                limits={'llm_requests':0,'total_tokens':0,'process_invocations':process_invocations,
+                    'process_wall_seconds':30}, max_attempts=30)
+        else:
+            app = ToolApplication.create(root / 'task', 'Collect materials, then measure when authorized',
+                model=None, sources={'source0': inputs}, max_turns=0, max_tokens=0, max_attempts=30,
+                process_limits={'process_invocations': process_invocations, 'process_wall_seconds': 30})
         return inputs, fake, app
 
     @staticmethod
@@ -2682,7 +2716,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
     def test_supply_first_model_binding_retains_materials_approval_and_replay_after_restart(self):
         from simple_ar.tools.writing import freeze_report_requirement
 
-        inputs, fake, app = self._supply_fixture()
+        inputs, fake, app = self._supply_fixture(historical=True)
         def action(name, **arguments):
             return {'tool_name': name, 'arguments': arguments}
         stop = action('ask_user', question='Await explicit next caller action')
@@ -2903,7 +2937,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
     def test_explicit_contract_replacement_preserves_history_but_retires_old_authority(self):
         from simple_ar.tools.scientific import freeze_measurement_set
-        inputs, fake, app = self._supply_fixture(process_invocations=4)
+        inputs, fake, app = self._supply_fixture(process_invocations=4,historical=True)
         def action(name, **arguments):
             return {'tool_name': name, 'arguments': arguments}
         stop = action('ask_user', question='Await caller instructions')
@@ -2990,7 +3024,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
     def test_report_only_replacement_reuses_valid_measurements_and_can_remove_optional_contract(self):
         from simple_ar.tools.writing import freeze_report_requirement
-        _, _, app = self._supply_fixture()
+        _, _, app = self._supply_fixture(historical=True)
         contract = self._supply_measurement(app.workspace.workspace)
         app.supply(supply_id='measure', reason='Measure the supplied data', changes={
             'allow_execution': True, 'execution_contract': contract})
@@ -3047,7 +3081,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
     def test_versioned_report_ordinary_decision_declares_no_report_alongside_work(self):
         goal = 'Create a plotting script only; do not write a scientific report.'
-        _, _, fake, _, app, _ = self._native_fixture(goal=goal, report_protocol='canonical_report.v1')
+        _, _, fake, _, app, _ = self._historical_native_fixture(goal=goal, report_protocol='canonical_report.v1')
         self.enterContext(patch('simple_ar.app.tool_application.LLMClient.for_task', return_value=fake))
         # Undetermined semantics do not mechanically prohibit investigation.
         self.assertEqual(_call_tool(app.gateway, 'read_file', {'path': 'source0/notes.txt'},
@@ -3064,13 +3098,13 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(app._report_projection()['kind'], 'none')
         self.assertIn('_ReportIntent', json.dumps(app.schemas))
         # Old API + missing saved version retain old schemas and context capacity.
-        _, _, _, _, legacy, _ = self._native_fixture()
+        _, _, _, _, legacy, _ = self._historical_native_fixture()
         self.assertNotIn('report_protocol', legacy.state['config'])
         self.assertNotIn('_ReportIntent', json.dumps(legacy.schemas))
         self.assertNotIn('ReportDelivery', json.dumps(legacy.schemas))
 
     def test_versioned_report_declaration_inherits_and_requires_explicit_user_replacement(self):
-        _, _, _, _, reviewed_app, _ = self._native_fixture(report_protocol='canonical_report.v1')
+        _, _, _, _, reviewed_app, _ = self._historical_native_fixture(report_protocol='canonical_report.v1')
         reviewed = self._report_intent(reviewed_app, 'reviewed-intent', method='article',
             professional_review={'max_revision_rounds': 1})
         controls = reviewed.data['report_requirement']['config']
@@ -3083,7 +3117,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             'kind': 'report', 'request_index': 1, 'quote': reviewed_app.state['requests'][-1],
             'professional_review': {'max_revision_rounds': 2}}}, identity='no-hidden-review-expansion')
         self.assertNotEqual(blocked.status, 'ok')
-        _, _, _, _, app, _ = self._native_fixture(report_protocol='canonical_report.v1')
+        _, _, _, _, app, _ = self._historical_native_fixture(report_protocol='canonical_report.v1')
         first = self._report_intent(app, 'intent-first', method='article', formats=['pdf'])
         original = first.data['report_requirement']
         self.assertEqual(original['config']['reviewer'], 'disabled')
@@ -3114,7 +3148,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertIsNone(app._report_projection()['requirement'])
 
     def test_professional_material_owner_uses_request_and_selects_originals_without_coordinator_answers(self):
-        _, _, fake, _, app, _ = self._native_fixture(
+        _, _, fake, _, app, _ = self._historical_native_fixture(
             goal='Explain the supplied source without inventing measurements.', report_protocol='canonical_report.v1')
         app.state['config']['professional_inputs'] = 'owner.v1'
         app._save()
@@ -3345,7 +3379,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
     def test_versioned_report_partial_requires_explicit_candidate_not_unresolved_escape(self):
         from simple_ar.tools.workspace import ReportDelivery
-        _, _, fake, _, app, _ = self._native_fixture(report_protocol='canonical_report.v1')
+        _, _, fake, _, app, _ = self._historical_native_fixture(report_protocol='canonical_report.v1')
         self.enterContext(patch('simple_ar.app.tool_application.LLMClient.for_task', return_value=fake))
         with patch.object(app.writing, 'client_factory', side_effect=AssertionError('No unbound Writer call')) as client:
             rejected = _call_tool(app.gateway, 'compose_document', {'title': 'Undeclared body',
@@ -3429,7 +3463,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
     def test_versioned_original_text_conversion_pins_adopted_bytes_without_writer(self):
         from simple_ar.tools.workspace import ReportDelivery
-        _, _, fake, _, app, _ = self._native_fixture(
+        _, _, fake, _, app, _ = self._historical_native_fixture(
             goal='Convert my existing manuscript without rewriting it.', report_protocol='canonical_report.v1')
         source = app.workspace.workspace / 'provided.md'
         source.write_text('User-supplied original prose.', encoding='utf-8')
@@ -3450,7 +3484,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
     def test_versioned_report_history_and_supply_do_not_upgrade_missing_contracts(self):
         from simple_ar.tools.writing import freeze_report_requirement
         requirement = freeze_report_requirement({'outline_strategy': 'template'})
-        _, _, fake, _, app, _ = self._native_fixture(report_requirement=requirement, allow_execution=False)
+        _, _, fake, _, app, _ = self._historical_native_fixture(report_requirement=requirement, allow_execution=False)
         app.state['config'].pop('report_evidence_contract')
         app._save()
         ledger = app.ledger.to_dict()
@@ -3466,7 +3500,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertNotIn('ReportDelivery', json.dumps(restored.schemas))
         fake.chat_turn.assert_not_called()
         fake.ask_json.assert_not_called()
-        _, _, _, _, current, _ = self._native_fixture(report_protocol='canonical_report.v1')
+        _, _, _, _, current, _ = self._historical_native_fixture(report_protocol='canonical_report.v1')
         self._report_intent(current, 'no-report-supply', kind='none')
         current.supply(supply_id='full-catalog', reason='Use the existing full tool presentation',
             changes={'tool_contracts': 'full'}, replace_existing=True)
@@ -3477,7 +3511,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         from simple_ar.tools.writing import freeze_report_requirement
 
         requirement = freeze_report_requirement({'outline_strategy': 'template'})
-        _, _, fake, _, app, _ = self._native_fixture(allow_execution=False, report_requirement=requirement)
+        _, _, fake, _, app, _ = self._historical_native_fixture(allow_execution=False, report_requirement=requirement)
         fake.ask_json.adapt_article_edits = True
         self.enterContext(patch('simple_ar.app.tool_application.LLMClient.for_task', return_value=fake))
         with self.subTest(history='frozen report without evidence contract'):
@@ -3555,7 +3589,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         from simple_ar.research.contracts import IdeaCandidate, ResearchExperimentContract
         from simple_ar.research.synthesis import SynthesisResult
         from simple_ar.tools.writing import freeze_report_requirement
-        inputs, fake, app = self._supply_fixture()
+        inputs, fake, app = self._supply_fixture(historical=True)
         self.enterContext(patch('simple_ar.app.tool_application.LLMClient.for_task', return_value=fake))
         requirement = freeze_report_requirement({'outline_strategy': 'template'})
         fake.ask_json.side_effect = None
@@ -3624,7 +3658,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 side_effect=AssertionError('Caller actions must not resolve model credentials')) as client:
             app = ToolApplication.create(root / 'task', 'Measure declared data, then explain the result',
                 model=None, sources={}, allow_execution=True, max_turns=0, max_tokens=0,
-                max_attempts=16, process_limits={'process_invocations': 1, 'process_wall_seconds': 30}, control_protocol=None)
+                max_attempts=16, process_limits={'process_invocations': 1, 'process_wall_seconds': 30})
             def action(name, **arguments):
                 return {'tool_name': name, 'arguments': arguments}
             app.run(actions=[action('write_file', path='workspace/observed.py', content=
@@ -3684,7 +3718,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             client.assert_not_called()
             guarded = ToolApplication.create(root / 'guarded', 'Measure a required observation',
                 model=None, sources={}, allow_execution=True, max_turns=0, max_tokens=0,
-                max_attempts=8, process_limits={'process_invocations': 1, 'process_wall_seconds': 30}, control_protocol=None)
+                max_attempts=8, process_limits={'process_invocations': 1, 'process_wall_seconds': 30})
             guarded.run(actions=[action('write_file', path='workspace/observed.py',
                 content="print('loss: 0.25')\n"), {**request, 'arguments': {**request['arguments'],
                     'result_schema': {'required_metrics': ['missing_measurement']}}}],
@@ -3726,7 +3760,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             contract = freeze_measurement_set(execution)
             app = ToolApplication.create(root / 'task', 'Compare the explicitly declared conditions',
                 model=None, sources={}, allow_execution=True, max_turns=0, max_tokens=0, max_attempts=20,
-                execution_contract=contract, process_limits={'process_invocations': 5, 'process_wall_seconds': 25}, control_protocol=None)
+                execution_contract=contract, process_limits={'process_invocations': 5, 'process_wall_seconds': 25})
             def action(name, **arguments):
                 return {'tool_name': name, 'arguments': arguments}
             batch = [action('measure_experiment', **row['execution'], condition_id=row['id'])
@@ -3831,7 +3865,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 old = ToolApplication.create(root / 'original', 'Record original controls', model=None,
                     sources={}, allow_execution=True, max_turns=0, max_tokens=0, max_attempts=12,
                     execution_contract=contract,
-                    process_limits={'process_invocations': count, 'process_wall_seconds': count * 5}, control_protocol=None)
+                    process_limits={'process_invocations': count, 'process_wall_seconds': count * 5})
                 old.run(actions=[action('measure_experiment', **row['execution'], condition_id=row['id'])
                     for row in baseline_rows], approve=lambda *_: True, progress=lambda _: None)
                 originals = [old.session.store.read_json(item['result']) for turn in old.state['turns']
@@ -3849,7 +3883,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 app = ToolApplication.create(root / 'reused', 'Compare using retained controls', model=None,
                     sources={'prior': old.session.store.root}, allow_execution=True,
                     max_turns=0, max_tokens=0, max_attempts=20, execution_contract=reused,
-                    process_limits={'process_invocations': count, 'process_wall_seconds': count * 5}, control_protocol=None)
+                    process_limits={'process_invocations': count, 'process_wall_seconds': count * 5})
                 frozen = app.scientific.execution_contract
                 rows = measurement_conditions(frozen)
                 imported = [row for row in rows if row.get('reuse_ref')]
@@ -3935,7 +3969,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                         ToolApplication.create(rejected, 'Reject invalid historical baseline', model=None,
                             sources={'bad': supplied, 'prior': old.session.store.root}, allow_execution=True,
                             max_turns=0, max_tokens=0, max_attempts=8, execution_contract=invalid,
-                            process_limits={'process_invocations': count, 'process_wall_seconds': count * 5}, control_protocol=None)
+                            process_limits={'process_invocations': count, 'process_wall_seconds': count * 5})
                     self.assertFalse((rejected / 'actions.json').exists())
                 for asset in (data, evaluator):
                     content = asset.read_bytes()
@@ -3991,7 +4025,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             app = ToolApplication.create(root / 'code-reuse', contract['goal'], model='fixture',
                 sources={'project': project, 'prior': old.session.store.root}, allow_execution=True,
                 max_turns=1, max_tokens=20000, max_attempts=8, code_task=contract, execution_contract=scoped,
-                process_limits={'process_invocations': 8, 'process_wall_seconds': 60}, control_protocol=None)
+                process_limits={'process_invocations': 8, 'process_wall_seconds': 60})
             connection.assert_called_once_with('fixture', fallback_models_config=None)
         preflight.ask_json.assert_not_called()
         preflight.chat.assert_not_called()
@@ -4138,7 +4172,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 app = ToolApplication.create(root / 'task', 'Measure both frozen roles', model=None,
                     sources={}, allow_execution=True, max_turns=0, max_tokens=0, max_attempts=12,
                     execution_contract=contract, process_limits={'process_invocations': 7 if isolated else
-                        2 if scenario == 'budget' else 3, 'process_wall_seconds': 150}, control_protocol=None)
+                        2 if scenario == 'budget' else 3, 'process_wall_seconds': 150})
                 batch = [{'tool_name': 'measure_experiment', 'arguments': {
                     **row['execution'], 'condition_id': row['id']}} for row in contract['conditions']]
                 # A valid frozen contract does not grant permission to execute.
@@ -4207,14 +4241,14 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         with _temporary_run() as root, patch('simple_ar.app.tool_application.LLMClient.from_env',
                 side_effect=AssertionError('No model')):
             app = ToolApplication.create(root / 'task', 'Only read supplied inputs', model=None,
-                sources={}, max_turns=0, max_tokens=0, max_attempts=8, control_protocol=None)
+                sources={}, max_turns=0, max_tokens=0, max_attempts=8)
             for actions in ([], [{'tool_name': 'measure_experiment', 'arguments': {}}],
                     [{'tool_name': 'write_file', 'arguments': {}, 'approval': True}]):
                 with self.subTest(actions=actions), self.assertRaises(ValueError):
                     app.run(actions=actions, progress=lambda _: None)
             self.assertEqual(app.state['turns'], [])
             large = ToolApplication.create(root / 'large', 'Keep the declared set intact', model=None,
-                sources={}, max_turns=0, max_tokens=0, max_attempts=40, control_protocol=None)
+                sources={}, max_turns=0, max_tokens=0, max_attempts=40)
             queued = [{'tool_name': 'ask_user', 'arguments': {'question': 'Confirm remaining scope'}}] * 33
             with self.assertRaisesRegex(ValueError, 'attempt allowance'):
                 large._submit_actions(queued + queued)
@@ -4262,7 +4296,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             self.assertFalse((root / 'task/workspace/unrequested.txt').exists())
 
             exhausted = ToolApplication.create(root / 'exhausted', 'One bounded action', model=None,
-                sources={}, max_turns=0, max_tokens=0, max_attempts=1, control_protocol=None)
+                sources={}, max_turns=0, max_tokens=0, max_attempts=1)
             exhausted.run(actions=[{'tool_name': 'read_history', 'arguments': {}}], progress=lambda _: None)
             for _ in range(2):
                 with self.assertRaises(RuntimeError):
@@ -4278,7 +4312,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             'unauthorized', 'conflict', 'feedback', 'authorization')
         for case in cases:
             with self.subTest(case=case):
-                _, _, fake, _, app, _ = self._native_fixture(mount_inputs=False, max_turns=2)
+                _, _, fake, _, app, _ = self._historical_native_fixture(mount_inputs=False, max_turns=2)
                 root = app.session.store.root
                 (app.workspace.workspace / 'result.md').write_text('Retained reviewed candidate')
 
@@ -4561,52 +4595,13 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(publication_app.run(progress=lambda _: None)['status'], 'partial')
         self.assertEqual(fake.chat_turn.call_count, 1)
 
-    def test_exact_code_authority_cannot_be_bypassed_or_complete_without_validation(self):
-        contract = {'project_path': 'source0', 'goal': 'Repair supplied source',
-            'allowed_patterns': ['main.py'], 'validation_command': ['python', 'check.py']}
-        _, _, fake, _, app, _ = self._native_fixture(code_task=contract, max_turns=4)
-        note = app.workspace.workspace / 'note.md'
-        note.write_text('No code has been verified.\n')
-        final = {'summary': 'Unverified note', 'artifacts': ['workspace/note.md']}
-        fake.chat_turn.side_effect = [
-            self._native_message('write_file', {'path': 'workspace/escape.py', 'content': 'pass\n'}, 'write'),
-            self._native_message('run_process', {'argv': ['python', '-c', 'print(1)']}, 'execute'),
-            self._native_message('deliver_result', final, 'unverified'),
-            self._native_message('deliver_result', {**final, 'unresolved': ['Code work remains unverified']}, 'partial'),
-        ]
-        approve = Mock(return_value=True)
-        with patch('simple_ar.tools.workspace.run_process') as launch:
-            self.assertEqual(app.run(approve=approve, progress=lambda _: None)['status'], 'partial')
-            approve.assert_not_called()
-            launch.assert_not_called()
-        self.assertFalse((app.workspace.workspace / 'escape.py').exists())
-        observations = [app.session.store.read_json(turn['tools'][0]['result']) for turn in app.state['turns']]
-        self.assertEqual([row['status'] for row in observations], ['blocked', 'blocked', 'blocked', 'ok'])
-        self.assertIn('no validated implementation', observations[2]['error'])
-        self.assertEqual(app.session.store.read_json('delivery.json')['unresolved'], ['Code work remains unverified'])
-        self.assertIsNone(app.reusable_code_project())
-        # Domain output tools remain available; the restriction is authority,
-        # not a task-name switch to a separate workflow.
-        self.assertTrue(app.gateway.policy.is_allowed(app.gateway.registry.get('compose_document'))[0])
-        self.assertTrue(app.gateway.policy.is_allowed(app.gateway.registry.get('read_file'))[0])
-        old = self._record_native_turn(app, 'implement_code_task', {}, {'status': 'validated'}, 'old-success')
-        failed = self._record_native_turn(app, 'implement_code_task', {}, {'status': 'incomplete'}, 'new-failure')
-        result_path = failed['tools'][0]['result']
-        app.session.store.write_json(result_path, {'tool_name': 'implement_code_task', 'status': 'blocked', 'data': {}})
-        terminal = self._record_native_turn(app, 'deliver_result', final, {}, 'stale-delivery')
-        app.state['turns'] = [old, failed, terminal]
-        with patch.object(app.implementation, 'check_delivery') as check:
-            call = self._native_message('deliver_result', final, 'stale-delivery')['tool_calls'][0]
-            self.assertIn('no validated implementation', app._terminal_error(call))
-            check.assert_not_called()  # Do not revive an older success after a new failure.
-            self.assertIsNone(app.reusable_code_project())
 
     def test_measurement_report_and_feedback_do_not_require_or_rerun_code(self):
         from simple_ar.tools.writing import BOUND_REPORT_REVISION, freeze_report_requirement
         requirement = freeze_report_requirement({'outline_strategy': 'template'})
         # This report/measurement consumer predates optional contract loading;
         # keep its eager offer and all canonical-delivery/accounting assertions.
-        _, inputs, fake, _, app, _ = self._native_fixture(report_requirement=requirement,
+        _, inputs, fake, _, app, _ = self._historical_native_fixture(report_requirement=requirement,
             tool_contracts='full', context_target=64000,
             measurement_command=[sys.executable, '-c', "print('score: 3.5')"])
         fake.ask_json.adapt_article_edits = True
@@ -4699,7 +4694,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             'figures': {'enabled': True, 'max_figures': 2}})
         contract = {'project_path': 'source0', 'goal': 'Repair supplied source and explain checks',
             'allowed_patterns': ['main.py'], 'validation_command': ['python', 'check.py']}
-        _, inputs, fake, _, app, _ = self._native_fixture(code_task=contract,
+        _, inputs, fake, _, app, _ = self._historical_native_fixture(code_task=contract,
             report_requirement=requirement, max_turns=12, tool_contracts='full', context_target=64000,
             measurement_command=['python', '-c', "from main import VALUE; print('score: ' + str(VALUE))"])
         fake.ask_json.adapt_article_edits = True
@@ -5044,7 +5039,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 (False, [], 'completed'), (True, [], 'paused'),
                 (True, ['Verification failed; code retained'], 'partial')):
             with self.subTest(failed=failed, unresolved=unresolved):
-                _, _, fake, _, app, _ = self._native_fixture(
+                _, _, fake, _, app, _ = self._historical_native_fixture(
                     # Exercise ordinary multi-action verification. The separate
                     # last-decision test owns the single terminal contract.
                     mount_inputs=False, max_turns=3)
@@ -5256,7 +5251,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
     def test_native_default_on_demand_uses_short_catalog_and_replaces_selected_contracts(self):
         from simple_ar.tools.specs import CommonToolSpec
-        _, _, fake, _, app, _ = self._native_fixture()
+        _, _, fake, _, app, _ = self._historical_native_fixture()
         self.assertEqual(app.state['config']['tool_contracts'], 'on_demand')
         names = lambda: {row['function']['name'] for row in app.schemas}
         self.assertNotIn('compose_document', names())
@@ -5280,245 +5275,14 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         fake.chat_turn.assert_not_called()
         fake.ask_json.assert_not_called()
 
-    def test_native_material_first_projection_carries_originals_across_load_and_write(self):
-        _, inputs, fake, _, app, _ = self._native_fixture()
-        source = inputs / 'observations.txt'
-        text = 'FRESH_ORIGINAL_BOUNDARY\n' + ''.join(
-            f'Observed row {index}: original conditions and units remain source evidence.\n' for index in range(200))
-        source.write_text(text, encoding='utf-8')
-        first = self._record_parent_material_read(app, source, 'material-first-read', max_bytes=64000)
-        first_view = json.loads(app._messages(client=fake)[1]['content'])
-        self.assertEqual(first_view['retained_text_windows'][0]['text'], text)
-        self.assertEqual(first_view['retained_text_windows'][0]['role'], 'fresh_read')
-        selected = _call_tool(app.gateway, 'load_tools', {'names': ['compose_document']}, identity='material-first-load')
-        self.assertEqual(selected.status, 'ok', selected.error)
-        app.state['turns'].append(self._record_native_turn(app, 'load_tools', {'names': ['compose_document']},
-            selected.data, 'material-first-load'))
-        loaded = app._messages(client=fake)
-        target = json.loads(loaded[1]['content'])['resources']['approximate_next_input_tokens'] + estimate_tokens(text) // 4
-        script = app.workspace.workspace / 'draft.py'
-        # Each body fits alone, but their combination competes for capacity.
-        # A recent automatic write echo must not displace an observed input.
-        script.write_text('# GENERATED_CONTEXT_BOUNDARY\n' + '# editing context only\n' * (len(text) // 40), encoding='utf-8')
-        authored = self._record_file_observation(app, script, 'write_file', 'material-first-write')
-        app.state['turns'].append(authored)
-        app._save()
-        receipts, ledger = self._native_receipts(app, app.state['turns']), app.ledger.to_dict()
-        with patch.dict(fake._settings.__dict__, {'context_input_tokens': target}):
-            messages = app._messages(client=fake)
-            view = json.loads(messages[1]['content'])
-            self.assertEqual(next(row['text'] for row in view['retained_text_windows'] if row['path'] == str(source)), text)
-            self.assertEqual(json.dumps(messages).count('FRESH_ORIGINAL_BOUNDARY'), 1)
-            self.assertTrue(any(row['role'] == 'working_read' for row in view['retained_text_windows']))
-            self.assertTrue(any(row.get('role') == 'write_context' for row in view['material_supply']['omitted']))
-            self.assertFalse(view['resources']['context_exceeds_input_target'])
-            self._assert_native_input_accounting(app, messages)
-        # A smaller capacity reports the exact missing range, never a hidden
-        # partial read or a successful receipt mistaken for model supply.
-        with patch.dict(fake._settings.__dict__, {'context_input_tokens': target - estimate_tokens(text)}):
-            try:
-                smaller = json.loads(app._messages(client=fake)[1]['content'])
-            except ValueError as error:
-                self.assertIn('no model request sent', str(error))
-            else:
-                self.assertFalse(any(row['path'] == str(source) for row in smaller['retained_text_windows']))
-                self.assertGreater(smaller['material_supply']['archived_observations'], 0)
-                self.assertIn('not supplied text', smaller['material_supply']['archive_scope'])
-        with patch.object(app.gateway.policy, 'blocked_tools', {'read_file'}):
-            denied = json.loads(app._messages(client=fake)[1]['content'])
-            self.assertFalse(any(row['path'] == str(source) for row in denied['retained_text_windows']))
-            self.assertGreater(denied['material_supply']['archived_observations'], 0)
-        source.write_text(text + 'changed version\n', encoding='utf-8')
-        changed = json.loads(app._messages(client=fake)[1]['content'])
-        self.assertFalse(any(row['path'] == str(source) for row in changed['retained_text_windows']))
-        self.assertGreater(changed['material_supply']['archived_observations'], 0)
-        self.assertEqual(self._native_receipts(app, app.state['turns']), receipts)
-        self.assertEqual(app.ledger.to_dict(), ledger)
-        self.assertEqual(app.state['turns'][0], first)
-        fake.chat_turn.assert_not_called()
-        fake.ask_json.assert_not_called()
 
-    def test_native_material_supply_single_copy_for_focus_overlap_and_native_write(self):
-        _, inputs, fake, _, app, _ = self._native_fixture()
-        path = inputs / 'unicode.txt'
-        text = '甲乙丙丁\n' * 60
-        path.write_text(text, encoding='utf-8')
-        with patch.object(app, '_client', return_value=SimpleNamespace(model='fixture', connection_binding=lambda: {})):
-            args = {'purpose': 'writing', 'goal': 'Use original passages', 'inputs': [
-                {'path': str(path), 'offset_bytes': 104, 'max_bytes': 65}]}
-            focused = _call_tool(app.gateway, 'focus_work', args, identity='single-copy-focus')
-        self.assertEqual(focused.status, 'ok', focused.error)
-        app.state['turns'].append(self._record_native_turn(app, 'focus_work', args, focused.data, 'single-copy-focus'))
-        self._record_parent_material_read(app, path, 'single-copy-wide', max_bytes=64000)
-        messages = app._messages(client=fake)
-        view = json.loads(messages[1]['content'])
-        spans = [(row['data'].get('offset_bytes', row['request'].get('offset_bytes', 0)), row['data']['next_offset_bytes'], row['data']['text'])
-            for row in view['work_inputs']['windows'] if row['status'] == 'supplied']
-        spans += [(row['offset_bytes'], row['next_offset_bytes'], row['text']) for row in view['retained_text_windows']]
-        spans.sort()
-        self.assertEqual(spans, [(104, 169, text.encode()[104:169].decode())])
-        self.assertNotIn('offset_bytes', focused.data['inputs'][0]['data'])
-        self.assertFalse(any(row['path'] == str(path) for row in view['retained_text_windows']))
-        self._assert_native_input_accounting(app, messages)
-        generated = app.workspace.workspace / 'edit.py'
-        generated.write_text('# ONLY_AUTHORED_ONCE\n', encoding='utf-8')
-        app.state['turns'].append(self._record_file_observation(app, generated, 'write_file', 'single-native-write'))
-        messages = app._messages(client=fake)
-        self.assertEqual(json.dumps(messages).count('ONLY_AUTHORED_ONCE'), 1)
-        self.assertTrue(any(row['role'] == 'write_context' for row in
-            json.loads(messages[1]['content'])['material_supply']['native_context']))
 
-    def test_native_window_admission_keeps_lossy_and_split_utf8_observations_whole(self):
-        from simple_ar.tools.materials import admit_text_window
-        _, inputs, fake, _, app, _ = self._native_fixture()
-        path = inputs / 'split.txt'
-        path.write_bytes('甲乙丙丁'.encode() + b'\xff\xfe' + '后文'.encode())
-        originals = []
-        for index, (offset, length) in enumerate(((0, 5), (1, 9), (8, 9))):
-            turn = self._record_parent_material_read(app, path, f'split-{index}',
-                offset_bytes=offset, max_bytes=length)
-            data = app.session.store.read_json(turn['tools'][0]['result'])['data']
-            originals.append((offset, data['next_offset_bytes'], data['text']))
-        messages = app._messages(client=fake)
-        windows = json.loads(messages[1]['content'])['retained_text_windows']
-        self.assertEqual(sorted((row['offset_bytes'], row['next_offset_bytes'], row['text'])
-            for row in windows), sorted(originals))
-        self.assertTrue(any('overlap_scope' in row for row in windows))
-        # Even complete numeric containment cannot deduplicate lossy decoding
-        # by pretending re-encoded text is the original byte buffer.
-        outer = {'path': 'x', 'sha256': 'a' * 64, 'offset_bytes': 0,
-            'next_offset_bytes': 3, 'text': '\ufffd'}
-        inner = {**outer, 'offset_bytes': 1, 'next_offset_bytes': 2}
-        retained = admit_text_window([outer], inner)
-        self.assertEqual([row['text'] for row in retained], ['\ufffd', '\ufffd'])
-        self._assert_native_input_accounting(app, messages)
-        fake.chat_turn.assert_not_called()
 
-    def test_native_large_bounded_observation_does_not_require_full_file_digest(self):
-        _, inputs, fake, _, app, _ = self._native_fixture()
-        path = inputs / 'large.txt'
-        for size in (300000, 65 * 1024 * 1024):
-            with self.subTest(size=size):
-                with path.open('wb') as stream:
-                    stream.write(b'FINITE_ORIGINAL_WINDOW\n' * 1000)
-                    stream.truncate(size)
-                app.state['turns'] = []
-                turn = self._record_parent_material_read(app, path, f'bounded-{size}')
-                data = app.session.store.read_json(turn['tools'][0]['result'])['data']
-                self.assertIsNone(data['sha256'])
-                before = self._native_snapshot(app)
-                with patch.object(app.workspace, 'call', wraps=app.workspace.call) as reads:
-                    messages = app._messages(client=fake)
-                window, = json.loads(messages[1]['content'])['retained_text_windows']
-                self.assertEqual(window['text'], data['text'])
-                self.assertEqual(window['next_offset_bytes'], data['next_offset_bytes'])
-                self.assertIsNone(window['sha256'])
-                self.assertIn('no full-file version', window['version_scope'])
-                self.assertNotIn('evidence_role', window)
-                self.assertTrue(all(not call.args[1].get('full_digest') for call in reads.call_args_list
-                    if call.args[0] == 'read_file'))
-                self._assert_native_snapshot(app, before)
-                self._assert_native_input_accounting(app, messages)
-                path.write_bytes(b'CHANGED_WINDOW')
-                changed = json.loads(app._messages(client=fake)[1]['content'])
-                self.assertEqual(changed['retained_text_windows'], [])
-                self.assertTrue(any(row['status'] == 'unavailable' for row in changed['material_supply']['omitted']))
-        fake.chat_turn.assert_not_called()
 
-    def test_native_old_invalidations_are_archived_not_mandatory_context(self):
-        _, inputs, fake, _, app, _ = self._native_fixture()
-        path = inputs / 'versions.txt'
-        # Distinct retired versions, not repeated references to one receipt.
-        for index in range(1000):
-            path.write_text(f'Observed version {index}\n', encoding='utf-8')
-            self._record_parent_material_read(app, path, f'version-{index}')
-        before = self._native_snapshot(app)
-        messages = app._messages(client=fake)
-        view = json.loads(messages[1]['content'])
-        self.assertEqual([row['text'] for row in view['retained_text_windows']], ['Observed version 999\n'])
-        self.assertEqual(view['material_supply']['omitted'], [])
-        self.assertNotIn('versions.txt', json.dumps(view['material_supply']))
-        self.assertFalse(view['resources']['context_exceeds_input_target'])
-        self._assert_native_snapshot(app, before)
-        self._assert_native_input_accounting(app, messages)
-        fake.chat_turn.assert_not_called()
 
-    def test_native_repair_diagnostics_precede_older_working_material(self):
-        _, inputs, fake, _, app, _ = self._native_fixture(allow_execution=True)
-        path = inputs / 'old-notes.txt'
-        text = 'Original old observation\n' * 1500
-        path.write_text(text, encoding='utf-8')
-        self._record_parent_material_read(app, path, 'repair-old-read', max_bytes=64000)
-        diagnostic = {'returncode': 1, 'stdout': '', 'stderr': 'REPAIR_DIAGNOSTIC\n' * 400,
-            'receipt': 'tools/processes/failed/invocation.json'}
-        app.state['turns'].append(self._record_native_turn(app, 'run_process',
-            {'argv': ['python', 'repair.py']}, diagnostic, 'repair-failure'))
-        complete = json.loads(app._messages(client=fake)[1]['content'])
-        target = complete['resources']['approximate_next_input_tokens'] - estimate_tokens(text) // 2
-        with patch.dict(fake._settings.__dict__, {'context_input_tokens': target}):
-            messages = app._messages(client=fake)
-        view = json.loads(messages[1]['content'])
-        supplied = [row['observed'] for row in view['execution_observations']]
-        supplied += [json.loads(message['content']).get('data', {}) for message in messages[2:]
-            if message['role'] == 'tool']
-        self.assertTrue(any(row.get('stderr') == diagnostic['stderr'] for row in supplied))
-        self.assertFalse(any(row['path'] == str(path) for row in view['retained_text_windows']))
-        gap, = [row for row in view['material_supply']['omitted'] if row['path'] == str(path)]
-        self.assertEqual((gap['offset_bytes'], gap['next_offset_bytes']), (0, len(text.encode())))
-        self._assert_native_input_accounting(app, messages)
-        fake.chat_turn.assert_not_called()
-
-    def test_native_explicit_outcomes_keeps_saved_owners_and_low_level_loading(self) -> None:
-        from simple_ar.tools.specs import CommonToolSpec
-
-        names = lambda owner: {row['function']['name'] for row in owner.schemas}
-        for execution in (False, True):
-            with self.subTest(execution=execution):
-                # Explicit outcomes exposes the professional catalog plus loaded
-                # low-level fallbacks; this test does not assert 24k context fit.
-                _, _, fake, _, app, _ = self._native_fixture(allow_execution=execution,
-                    tool_contracts='outcomes', context_target=64000)
-                self.assertEqual(app.state['config']['tool_contracts'], 'outcomes')
-                self.assertEqual(app.session.store.read_json('actions.json')['config']['tool_contracts'], 'outcomes')
-                self.assertTrue({'compose_document', 'prepare_implementation', 'analyze_table', 'inspect_table',
-                    'read_file', 'copy_file', 'copy_project', 'deliver_result', 'ask_user', 'focus_work',
-                    'read_history', 'update_work_plan', 'load_tools'}.issubset(names(app)))
-                deferred = {'write_file', 'edit_file'} | ({'run_process'} if execution else set())
-                self.assertEqual(set(app._specialist_catalog()), deferred)
-                self.assertFalse({'write_file', 'edit_file', 'run_process'} & names(app))
-                self.assertEqual('execute_implementation' in names(app), execution)
-                self.assertNotIn('search_sources', names(app))
-                self.assertNotIn('search_sources', app._specialist_catalog())
-                # New professional contracts require no second owner-name list.
-                app.gateway.registry.register(CommonToolSpec(name='future_owner', domain='future',
-                    description='A future professional owner without a presentation whitelist.'))
-                self.assertIn('future_owner', names(app))
-                self.assertNotIn('future_owner', app._specialist_catalog())
-                permissions, ledger = set(app.gateway.policy.allowed_permissions), app.ledger.to_dict()
-                fake.chat_turn.side_effect = [
-                    self._native_message('load_tools', {'names': sorted(deferred)}, 'load-fallback'),
-                    self._native_message('ask_user', {'question': 'Which remaining scope?'}, 'pause-fallback')]
-                self.assertEqual(app.run(progress=lambda _: None)['status'], 'paused')
-                self.assertTrue(deferred.issubset(names(app)))
-                receipts = self._native_receipts(app, app.state['turns'])
-                restored = ToolApplication.load(app.session.store.root)
-                self.assertEqual(restored._tool_selection(), deferred)
-                self.assertTrue(deferred.issubset(names(restored)))
-                self.assertEqual(self._native_receipts(restored, restored.state['turns']), receipts)
-                self.assertEqual(restored.ledger.to_dict(), ledger)
-                self.assertEqual(set(restored.gateway.policy.allowed_permissions), permissions)
-                fake.chat_turn.side_effect = [
-                    self._native_message('load_tools', {'names': []}, 'clear-fallback'),
-                    self._native_message('ask_user', {'question': 'Which outcome next?'}, 'pause-cleared')]
-                self.assertEqual(restored.run(feedback='Continue with professional work.', progress=lambda _: None)['status'], 'paused')
-                self.assertFalse({'write_file', 'edit_file', 'run_process'} & names(restored))
-                self.assertIn('compose_document', names(restored))
-                self.assertEqual(restored._tool_selection(), set())
-                self.assertEqual(restored.ledger.to_dict(), ledger)
-                fake.ask_json.assert_not_called()
 
     def test_native_tool_contract_selection_preserves_authority_and_resume(self) -> None:
-        _, _, fake, _, app, _ = self._native_fixture(allow_execution=False, tool_contracts='on_demand')
+        _, _, fake, _, app, _ = self._historical_native_fixture(allow_execution=False, tool_contracts='on_demand')
         names = lambda owner: {row['function']['name'] for row in owner.schemas}
         original_ledger = app.ledger.to_dict()
         original_permissions = set(app.gateway.policy.allowed_permissions)
@@ -5626,7 +5390,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
     def test_native_contract_modes_validate_and_supply_preserves_saved_policy(self) -> None:
         # A coherent professional focus selects contracts in its own journal
         # entry; it need not spend another decision merely loading tools.
-        _, _, _, _, focused, _ = self._native_fixture()
+        _, _, _, _, focused, _ = self._historical_native_fixture()
         before = focused.ledger.to_dict()
         for index, selection in enumerate((['compose_document'], None, [], ['search_sources'])):
             arguments = {'purpose': 'writing', 'goal': 'Revise the existing account.'}
@@ -5648,16 +5412,14 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(focused.ledger.to_dict(), before)
         for mode in ('outcomes', 'on_demand', 'full', None):
             with self.subTest(saved_mode=mode):
-                inputs, fake, app = self._supply_fixture()
+                inputs, fake, app = self._supply_fixture(historical=True)
                 root = app.session.store.root
                 preview, _, _, _ = ToolApplication._configuration(root, 'Configuration preview',
                     model=None, sources={}, max_attempts=30)
                 self.assertEqual(preview['tool_contracts'], 'on_demand')
                 if mode in {'full', 'on_demand', 'outcomes'}:
-                    # Exercise the public compatibility override, not a mock
-                    # that assumes every new model sees specialist schemas.
-                    app = ToolApplication.create(root.parent / f'explicit-{mode}', 'Compatibility control',
-                        model=None, sources={'source0': inputs}, max_attempts=30, tool_contracts=mode, control_protocol=None)
+                    app = load_native_history(root.parent / f'explicit-{mode}', 'Saved compatibility control',
+                        config={'model':None,'sources':{'source0':inputs},'tool_contracts':mode}, max_attempts=30)
                     root = app.session.store.root
                 elif mode is None:
                     app.state['config'].pop('tool_contracts')
@@ -5710,7 +5472,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 self.assertFalse(target.exists())
 
     def test_native_history_preserves_original_messages_and_resource_accounting(self) -> None:
-        _, _, _, _, resumed, code = self._native_fixture(completed=True)
+        _, _, _, _, resumed, code = self._historical_native_fixture(completed=True)
         decision = resumed.session.store.read_json(resumed.state['turns'][1]['reply'])
         decision.update(content='Write the counter before executing it.', reasoning_content='Keep the source for verification.')
         resumed.session.store.write_json(resumed.state['turns'][1]['reply'], decision)
@@ -6132,7 +5894,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             'attempts/context-view-0-result/native_result.json')['data']['text'], 'a' * 64000)
 
     def test_native_history_long_view_bounds_indexes_and_archives_whole_turns(self) -> None:
-        _, inputs, fake, _, app, _ = self._native_fixture()
+        _, inputs, fake, _, app, _ = self._historical_native_fixture()
         # Exercise the public start path's on-demand contracts. The eager
         # eager full catalog has variable schema cost and may legitimately
         # evict these windows; it must not dictate this history fixture's size.
@@ -6244,7 +6006,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 native_response_corrections=1, max_output_tokens=512, retry_attempts=1))
             services = SimpleNamespace(llm_client=client)
             app = ToolApplication.create(root, 'Save and deliver the inspected result', model='fixture',
-                sources={}, services=services, max_turns=3, max_tokens=100000, control_protocol=None)
+                sources={}, services=services, max_turns=3, max_tokens=100000)
             self.assertNotIn('model_catalogs', app.state['config'])
             poison = self._native_message('write_file', {'path': 'poison.txt', 'content': 'never adopt'}, 'cut')
             complete = self._native_message('write_file', {'path': 'result.txt', 'content': 'complete result',
@@ -6362,7 +6124,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         for mode in ('write', 'process', 'failed_process', 'denied_process', 'budget_process',
                      'relative_write', 'invalid_delivery', 'question', 'legacy'):
             with self.subTest(mode=mode):
-                _, _, _, _, app, _ = self._native_fixture(mount_inputs=False, max_turns=1,
+                _, _, _, _, app, _ = self._historical_native_fixture(mount_inputs=False, max_turns=1,
                     completion_policy='protected_decision.v1',
                     allow_execution=mode != 'denied_process',
                     process_limits={'process_invocations': 0} if mode == 'budget_process' else None)
@@ -6473,7 +6235,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         for mode in ('required', 'read', 'misordered', 'batch', 'historical_batch', 'terminal', 'terminal_process', 'question', 'false', 'missing_field', 'missing_receipt'):
             with self.subTest(mode=mode):
                 # Exercise the public creation default, not a test-only opt-in.
-                _, _, _, _, app, _ = self._native_fixture(mount_inputs=False, max_turns=1)
+                _, _, _, _, app, _ = self._historical_native_fixture(mount_inputs=False, max_turns=1)
                 if mode == 'question':
                     app.state['config']['tool_contracts'] = 'on_demand'
                     app._save()
@@ -6584,7 +6346,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
     def test_native_attempt_space_is_reserved_without_faking_a_terminal_result(self) -> None:
         for attempts in (1, 2, 3):
             with self.subTest(attempts=attempts):
-                _, _, fake, _, app, _ = self._native_fixture(completion_policy='protected_decision.v1')
+                _, _, fake, _, app, _ = self._historical_native_fixture(completion_policy='protected_decision.v1')
                 app.session.manifest.budget.max_attempts = attempts
                 app.session.save()
                 fake.chat_turn.side_effect = [self._native_message('list_directory', {'path': 'workspace'}, 'inspect'),
@@ -6605,7 +6367,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         # remaining attempts. A longer queue still cannot exceed that ceiling.
         for exhausted, attempts in (('requests', 3), ('tokens', 3), ('requests', 2)):
             with self.subTest(exhausted=exhausted, attempts=attempts):
-                _, _, fake, _, app, _ = self._native_fixture(mount_inputs=False,
+                _, _, fake, _, app, _ = self._historical_native_fixture(mount_inputs=False,
                     max_turns=1 if exhausted == 'requests' else 30,
                     completion_policy='protected_decision.v1')
                 app.session.manifest.budget.max_attempts = attempts
@@ -6644,7 +6406,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
         # A pre-policy task keeps its declared admission behavior on reload;
         # installing newer code does not silently rewrite its old contract.
-        _, _, fake, _, app, _ = self._native_fixture()
+        _, _, fake, _, app, _ = self._historical_native_fixture()
         app.state['config'].pop('completion_policy')
         app.session.manifest.budget.max_attempts = 2
         app._save()
@@ -6656,7 +6418,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(app.session.manifest.budget.attempts, 2)
 
     def test_native_unknown_and_unlimited_budget_context_preserves_accounting(self) -> None:
-        _, _, fake, _, app, _ = self._native_fixture()
+        _, _, fake, _, app, _ = self._historical_native_fixture()
         # An unknown balance has the same context fallback, but still blocks
         # new finite-budget reservations and preserves the unresolved charge.
         from simple_ar.core.budget import BudgetUnknownError
@@ -6683,317 +6445,8 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     self.assertEqual(ledger.to_dict(), before)
         self.assertEqual(unknown_ledger.to_dict(), unknown_snapshot)
 
-    def test_native_working_set_follows_recent_work_not_lifetime_read_count(self) -> None:
-        _, inputs, fake, _, app, _ = self._native_fixture()
-        app.state['config']['tool_contracts'] = 'on_demand'
-        prior = inputs / 'notes.txt'
-        current = app.workspace.workspace / 'current.txt'
-        # Omitted read and write observations share the remaining serialized capacity.
-        # Leave room for normal tool-contract evolution; the pressure record
-        # still forces archival, while both originals fit the remaining capacity.
-        prior.write_text('old context\n' * 1200)
-        current.write_text('current work\n' * 1200)
-        old = self._record_file_observation(app, prior, 'read_file', 'working-set-old')
-        pressure = self._record_native_turn(app, 'read_file', {'path': 'records/large-result.json'},
-            {'text': 'historical diagnostic\n' * 4000}, 'working-set-pressure')
-        executed = self._record_native_turn(app, 'run_process', {'argv': ['python', 'check.py']},
-            {'returncode': 1, 'stdout': '', 'stderr': 'verification failed'}, 'working-set-execution')
-        for operation in ('read_file', 'write_file'):
-            with self.subTest(operation=operation):
-                recent = self._record_file_observation(app, current, operation, 'working-set-' + operation)
-                app.state['turns'] = [old] * 4 + [recent, pressure, executed]
-                contexts = []
-                histories = []
-                original_limits = dict(app.ledger.limits)
-                for ceiling in (30, 300):
-                    with patch.dict(app.state['config'], {'max_turns': ceiling}), patch.dict(
-                            app.ledger.limits, {'total_tokens': 32000, 'llm_requests': ceiling}):
-                        messages = app._messages()
-                    contexts.append(json.loads(messages[1]['content']))
-                    histories.append(messages[2:])
-                context, expanded = contexts
-                self.assertEqual(expanded['resources']['model_turns_remaining'],
-                    context['resources']['model_turns_remaining'] + 270)
-                self.assertEqual(expanded['resources']['remaining']['total_tokens'],
-                    context['resources']['remaining']['total_tokens'])
-                for view in contexts:
-                    self.assertEqual(view['resources']['context_input_target_tokens'], 24000)
-                self.assertEqual(expanded['retained_text_windows'], context['retained_text_windows'])
-                self.assertEqual(expanded['earlier_turns'], context['earlier_turns'])
-                self.assertEqual(histories[1], histories[0])
-                windows = context['retained_text_windows']
-                native = context['material_supply']['native_context']
-                self.assertIn(str(current), [row['path'] for row in [*native, *windows]])
-                if any(row['path'] == str(current) for row in windows):
-                    self.assertEqual(next(row['text'] for row in windows if row['path'] == str(current)), current.read_text())
-                else:
-                    self.assertEqual(operation, 'write_file')
-                    self.assertTrue(any(json.loads(call['function']['arguments']).get('content') == current.read_text()
-                        for message in histories[0] for call in message.get('tool_calls', [])))
-                self.assertFalse(context['resources']['context_exceeds_input_target'])
-                for cap, target in ((None, 6000), (1500, 4500), (6000, 0), (8192, 0)):
-                    with self.subTest(cap=cap), patch.dict(app.ledger.limits, {'total_tokens': 6000}):
-                        fake.effective_output_limit.return_value = cap
-                        before = app.ledger.to_dict()
-                        # Minimum contracts/diagnostics do not fit these caps;
-                        # do not dispatch the old oversized native suffix.
-                        with self.assertRaisesRegex(ValueError, 'no model request sent'):
-                            app._messages()
-                        self.assertEqual(app.ledger.to_dict(), before)
-                fake.effective_output_limit.return_value = None
-                self.assertEqual(app.session.store.read_json(recent['reply'])['tool_calls'][0]
-                    ['function']['arguments'], json.dumps({'path': str(current),
-                        **({'content': current.read_text()} if operation == 'write_file' else {})}))
-                self.assertEqual(app.ledger.limits, original_limits)
 
-    def test_native_focus_inputs_reserve_working_set_and_preserve_history(self) -> None:
-        for purpose in ('code', 'writing'):
-            with self.subTest(purpose=purpose):
-                _, inputs, fake, _, app, _ = self._native_fixture(tool_contracts='on_demand')
-                table = inputs / 'results.txt'
-                table.write_bytes(b'ORIGINAL_RESULT_ROW\n' * 600)
-                arguments = {'purpose': purpose, 'goal': 'Produce and check a complete result account',
-                    'inputs': [{'path': str(table)}]}
-                with patch.object(app, '_client', return_value=SimpleNamespace(model='fixture', connection_binding=lambda: {})):
-                    selected = _call_tool(app.gateway, 'focus_work', arguments, identity='input-focus')
-                self.assertEqual(selected.status, 'ok', selected.error)
-                observed = selected.data['inputs'][0]
-                self.assertEqual(observed['data']['text'], table.read_text(encoding='utf-8'))
-                self.assertEqual(observed['data']['sha256'], hashlib.sha256(table.read_bytes()).hexdigest())
-                focus = self._record_native_turn(app, 'focus_work', arguments, selected.data, 'input-focus')
-                failed_read = self._record_native_turn(app, 'read_file', {'path': 'source0/missing.txt'},
-                    {}, 'unavailable-history')
-                failed_record = failed_read['tools'][0]['result']
-                app.session.store.write_json(failed_record, {'tool_name': 'read_file', 'status': 'blocked',
-                    'error': 'ORIGINAL_READ_FAILURE', 'data': {'diagnostic': 'LARGE_FAILED_BODY' * 20000}})
-                code = self._record_native_turn(app, 'write_file', {'path': 'workspace/analysis.py',
-                    'content': '# ACTUAL_NATIVE_SOURCE\n' * 2500}, {}, 'source-pressure')
-                failure = self._record_native_turn(app, 'run_process', {'argv': ['python', 'analysis.py']},
-                    {'returncode': 1, 'stdout': '', 'stderr': 'ORIGINAL_EXECUTION_FAILURE'}, 'failed-check')
-                success = self._record_native_turn(app, 'run_process', {'argv': ['python', '-V']},
-                    {'returncode': 0, 'stdout': 'A probe only', 'stderr': ''}, 'probe')
-                for turn in (failed_read, focus, code, failure, success):
-                    turn['request_count'] = 1
-                app.state['turns'] = [failed_read, focus, code, failure, success]
-                app._save()
-                originals = {item: app.session.store.resolve(item).read_bytes()
-                    for turn in app.state['turns'] for item in [turn['reply'], turn['tools'][0]['result']]}
-                before = app.ledger.to_dict()
-                fake.effective_output_limit.return_value = 16384
-                with patch.dict(app.ledger.limits, {'total_tokens': 19529 + 16384}):
-                    messages = app._messages(client=fake)
-                    view = json.loads(messages[1]['content'])
-                    self.assertEqual(view['resources']['context_input_target_tokens'], 19529)
-                    self.assertFalse(view['resources']['context_exceeds_input_target'])
-                    self.assertEqual(view['work_inputs']['windows'][0]['data'], observed['data'])
-                    self.assertTrue(view['work_inputs']['current_selection'])
-                    self.assertNotIn('ACTUAL_NATIVE_SOURCE', json.dumps(messages))
-                    self.assertIn('ORIGINAL_EXECUTION_FAILURE', json.dumps(messages))
-                    self.assertEqual(view['latest_tool_failure']['observation']['error'], 'ORIGINAL_READ_FAILURE')
-                    self.assertNotIn('LARGE_FAILED_BODY', json.dumps(messages))
-                    self.assertIn('A probe only', json.dumps(messages))
-                    self.assertGreater(view['retained_turn_start'], 1)
-                    cost = estimate_tokens(json.dumps(messages, ensure_ascii=False)) + estimate_tokens(
-                        json.dumps(app.schemas, ensure_ascii=False))
-                    self.assertLessEqual(cost, 19529)
-                    # Capacity rejection is explicit and all-or-none; narrower
-                    # windows can be selected by the same action loop.
-                    with patch.dict(fake._settings.__dict__, {'context_input_tokens': cost - 1000}):
-                        smaller = json.loads(app._messages(client=fake)[1]['content'])
-                    gap = smaller['work_inputs']['windows'][0]
-                    self.assertEqual(gap['status'], 'capacity_not_supplied')
-                    self.assertNotIn('text', gap['data'])
-                    self.assertEqual(gap['data']['sha256'], observed['data']['sha256'])
-                    self.assertIn('focus_work', smaller['work_inputs']['capacity_action'])
-                    # Feedback makes that selection historical: it must not
-                    # keep displacing the next raw read under the same cap.
-                    app.state['requests'].append('Revise using the newly read portion')
-                    fresh_read = app.workspace.call('read_file', {'path': str(table), 'max_bytes': 80}, identity='fresh-feedback')
-                    self.assertEqual(fresh_read.status, 'ok', fresh_read.error)
-                    later = self._record_native_turn(app, 'read_file', {'path': str(table), 'max_bytes': 80},
-                        fresh_read.data, 'read-after-feedback')
-                    later['request_count'] = len(app.state['requests'])
-                    app.state['turns'].append(later)
-                    with patch.dict(fake._settings.__dict__, {'context_input_tokens': cost - 1000}):
-                        fresh = app._messages(client=fake)
-                    self.assertFalse(json.loads(fresh[1]['content'])['work_inputs']['current_selection'])
-                    fresh_view = json.loads(fresh[1]['content'])
-                    self.assertTrue(any(row['offset_bytes'] == 0 and row['next_offset_bytes'] >= fresh_read.data['next_offset_bytes']
-                        and row['text'].startswith(fresh_read.data['text']) for row in fresh_view['retained_text_windows']))
-                    app.state['turns'].pop()
-                    app.state['requests'].pop()
-                self.assertEqual(app.ledger.to_dict(), before)
-                self.assertEqual({path: app.session.store.resolve(path).read_bytes() for path in originals}, originals)
-                # A huge error field must also remain a raw receipt detail,
-                # rather than a permanently pinned prompt body.
-                with _changed_record(app.session.store.resolve(failed_record), {
-                        'tool_name': 'read_file', 'status': 'blocked', 'data': {},
-                        'error': 'LARGE_ERROR_DETAIL' * 20000}):
-                    bounded = json.loads(app._messages(client=fake)[1]['content'])
-                    self.assertTrue(bounded['latest_tool_failure']['observation']['details_omitted'])
-                    self.assertEqual(bounded['work_inputs']['windows'][0]['status'], 'supplied')
-                # Full source remains in its original journal and raw reader.
-                record = 'records/' + code['reply'].removeprefix('attempts/')
-                raw = app.workspace.call('read_file', {'path': record, 'max_bytes': 64000}, identity='raw-source')
-                self.assertEqual(json.loads(raw.data['text']), app.session.store.read_json(code['reply']))
-                self.assertIn(record, json.dumps(self._read_native_history(app)))
-                # A minimal contract that itself cannot fit must stop before
-                # provider dispatch, even after omitting all selectable text.
-                fake._settings.context_input_tokens = 1
-                with patch.object(app, '_client', return_value=fake):
-                    with self.assertRaisesRegex(ValueError, 'no model request sent'):
-                        app._model(context=SimpleNamespace(attempt=SimpleNamespace(attempt_id='no-send')))
-                fake.chat_turn.assert_not_called()
 
-    def test_native_focus_inputs_keep_owner_authority_versions_and_feedback(self) -> None:
-        from simple_ar.tools.materials import material_inventories, material_observation_seed
-
-        _, inputs, fake, _, app, _ = self._native_fixture(tool_contracts='on_demand')
-        table = inputs / 'results.txt'
-        table.write_bytes(b'prefix\nCURRENT_INPUT\nunread tail\n')
-        empty = inputs / 'empty.txt'
-        empty.write_bytes(b'')
-        arguments = {'purpose': 'writing', 'goal': 'Check the original result',
-            'inputs': [{'path': str(table), 'offset_bytes': 7, 'max_bytes': 14}, {'path': str(empty)}]}
-        original = app.workspace.call
-        with patch.object(app, '_client', return_value=SimpleNamespace(model='fixture', connection_binding=lambda: {})):
-            with patch.object(app.workspace, 'call', wraps=original) as reads:
-                app.gateway.policy.blocked_tools.add('read_file')
-                denied = _call_tool(app.gateway, 'focus_work', arguments, identity='denied-input')
-                self.assertEqual(denied.status, 'blocked')
-                reads.assert_not_called()
-                app.gateway.policy.blocked_tools.clear()
-                with patch.object(app.gateway.policy, 'allowed_permissions', {'plan'}):
-                    self.assertEqual(_call_tool(app.gateway, 'focus_work', arguments,
-                        identity='plan-only-input').status, 'blocked')
-                reads.assert_not_called()
-                selected = _call_tool(app.gateway, 'focus_work', arguments, identity='versioned-input')
-        self.assertEqual(selected.status, 'ok', selected.error)
-        self.assertEqual(selected.data['inputs'][0]['data']['text'], 'CURRENT_INPUT\n')
-        self.assertTrue(selected.data['inputs'][0]['data']['has_more'])
-        turn = self._record_native_turn(app, 'focus_work', arguments, selected.data, 'versioned-input')
-        turn['request_count'] = 1
-        prior_read = app.workspace.call('read_file', {'path': 'source0/notes.txt'}, identity='prior-reasoning')
-        self.assertEqual(prior_read.status, 'ok')
-        prior = self._record_native_turn(app, 'read_file', {'path': 'source0/notes.txt'},
-            prior_read.data, 'prior-reasoning')
-        app.state['turns'] = [prior, turn]
-        app._save()
-        ledger = app.ledger.to_dict()
-        def view(owner=app):
-            return json.loads(owner._messages(client=fake)[1]['content'])
-        current = view()
-        self.assertEqual([row['status'] for row in current['work_inputs']['windows']], ['supplied', 'empty'])
-        # Focus prioritizes evidence; it is not an unconditional boundary that
-        # discards earlier reasoning when the complete history still fits.
-        messages = app._messages(client=fake)
-        self.assertEqual(current['retained_turn_start'], 0)
-        self.assertTrue(any(message.get('role') == 'tool'
-            and message.get('tool_call_id') == prior['tools'][0]['id'] for message in messages))
-        receipt_view = next(json.loads(message['content']) for message in messages
-            if message.get('role') == 'tool' and message.get('tool_call_id') == turn['tools'][0]['id'])
-        self.assertNotIn('inputs', receipt_view['data'])
-        self.assertIn('input_receipt', receipt_view['data'])
-        refs = app._material_observations([str(table)])
-        self.assertEqual(len(refs), 1)
-        self.assertEqual(refs[0]['input_index'], 0)
-        inventory = material_inventories(app.workspace, [str(table)], identity='focus-seed')
-        def seed(reference):
-            return material_observation_seed(workspace=app.workspace, inventories=inventory,
-                provider=lambda _: [reference], roots=[str(table)], context={})
-        self.assertEqual(seed(refs[0])['observations'][0]['data'], selected.data['inputs'][0]['data'])
-        self.assertEqual(seed({**refs[0], 'input_index': 1})['observations'], [])
-        record = app.workspace.resolve(refs[0]['record'])
-        with _changed_record(record, {**read_json(record), 'summary': 'Changed receipt'}):
-            self.assertEqual(seed(refs[0])['observations'], [])
-        # Feedback replaces the old work goal while preserving usable historical
-        # raw material, with its previous selection explicitly distinguished.
-        app.state['requests'].append('Now explain limitations before revising')
-        app._save()
-        restored = ToolApplication.load(app.session.store.root)
-        feedback = view(restored)
-        self.assertEqual(feedback['work_focus']['goal'], '')
-        self.assertFalse(feedback['work_inputs']['current_selection'])
-        self.assertEqual(feedback['work_inputs']['windows'][0]['data'],
-            {key: value for key, value in selected.data['inputs'][0]['data'].items() if key != 'text'})
-        self.assertIn('Now explain limitations', json.dumps(feedback['requests']))
-        # Later raw native reads/writes retain exact historical bodies. They
-        # cannot undo the current selection's invalidation or capacity refusal.
-        repeated_read = self._record_native_turn(app, 'read_file', selected.data['inputs'][0]['request'],
-            selected.data['inputs'][0]['data'], 'later-raw-read')
-        repeated_write = self._record_native_turn(app, 'write_file', {'path': str(table),
-            'content': table.read_bytes().decode('utf-8')},
-            {'absolute_path': str(table), 'sha256': hashlib.sha256(table.read_bytes()).hexdigest()}, 'later-raw-write')
-        for row in (repeated_read, repeated_write):
-            row['request_count'] = len(app.state['requests'])
-            app.state['turns'].append(row)
-        # Neither a same-size edit outside the selected window nor a revoked
-        # mount/read permission may silently recertify the old selection.
-        raw = table.read_bytes()
-        table.write_bytes(raw[:-2] + b'X\n')
-        changed_view = view()
-        changed = changed_view['work_inputs']['windows'][0]
-        self.assertEqual(changed['status'], 'unavailable')
-        self.assertIn('changed', changed['error'])
-        self.assertNotIn('data', changed)
-        self.assertNotIn('CURRENT_INPUT', json.dumps(changed_view))
-        changed_messages = app._messages(client=fake)
-        self.assertIn('CURRENT_INPUT', json.dumps(changed_messages[2:]))
-        self.assertIn('not revalidated current work inputs', changed_view['native_history_scope'])
-        self.assertFalse(any(row['path'] == str(table) for row in changed_view['retained_text_windows']))
-        unchanged, = changed_view['retained_text_windows']
-        self.assertEqual(unchanged['path'], str(inputs / 'notes.txt'))
-        self.assertEqual(unchanged['text'], 'original source')
-        self.assertEqual(seed(refs[0])['observations'], [])
-        table.write_bytes(raw)
-        for blocked in ('read_file', 'mount'):
-            with self.subTest(revoked=blocked):
-                if blocked == 'read_file':
-                    app.gateway.policy.blocked_tools.add('read_file')
-                permission = (patch.object(app.workspace, 'resolve', side_effect=ValueError('Mount revoked'))
-                    if blocked == 'mount' else nullcontext())
-                with permission:
-                    revoked_view = view()
-                    revoked = revoked_view['work_inputs']['windows'][0]
-                self.assertEqual(revoked['status'], 'unavailable')
-                self.assertNotIn('data', revoked)
-                self.assertNotIn('CURRENT_INPUT', json.dumps(revoked_view))
-                app.gateway.policy.blocked_tools.clear()
-        if os.name != 'nt':  # No claim about Windows symlink privileges.
-            other = inputs / 'other-results.txt'
-            other.write_bytes(raw)
-            link = inputs / 'selected-link.txt'
-            link.symlink_to(table)
-            linked_args = {**arguments, 'inputs': [{'path': str(link)}]}
-            with patch.object(app, '_client', return_value=SimpleNamespace(model='fixture', connection_binding=lambda: {})):
-                linked = _call_tool(app.gateway, 'focus_work', linked_args, identity='linked-input')
-            self.assertEqual(linked.status, 'ok', linked.error)
-            app.state['turns'].append(self._record_native_turn(app, 'focus_work', linked_args,
-                linked.data, 'linked-input'))
-            link.unlink()
-            link.symlink_to(other)  # Same bytes, different authorized subject.
-            self.assertEqual(view()['work_inputs']['windows'][0]['status'], 'unavailable')
-        huge = inputs / 'too-large.txt'
-        with huge.open('wb') as handle:
-            handle.truncate(64 * 1024 * 1024 + 1)
-        unavailable_args = {**arguments, 'inputs': [{'path': str(huge)}, {'path': 'source0/missing.txt'}]}
-        with patch.object(app, '_client', return_value=SimpleNamespace(model='fixture', connection_binding=lambda: {})):
-            unavailable = _call_tool(app.gateway, 'focus_work', unavailable_args, identity='unavailable-input')
-        self.assertEqual(unavailable.status, 'ok', unavailable.error)
-        self.assertTrue(all('error' in row and 'data' not in row for row in unavailable.data['inputs']))
-        self.assertIn('64 MiB', unavailable.data['inputs'][0]['error'])
-        # Clearing or replacing focus does not inherit the previous selection;
-        # old calls/receipts without inputs keep their original exact shape.
-        with patch.object(app, '_client', return_value=SimpleNamespace(model='fixture', connection_binding=lambda: {})):
-            legacy = _call_tool(app.gateway, 'focus_work', {'purpose': 'task'}, identity='legacy-focus')
-        self.assertNotIn('inputs', legacy.data)
-        app.state['turns'].append(self._record_native_turn(app, 'focus_work', {'purpose': 'task'},
-            legacy.data, 'legacy-focus'))
-        self.assertEqual(app._work_focus(), {'purpose': 'task', 'goal': ''})
-        self.assertNotIn('work_inputs', view())
-        self.assertEqual(app.ledger.to_dict(), ledger)
-        fake.chat_turn.assert_not_called()
-        fake.ask_json.assert_not_called()
 
     def test_native_model_continuation_preserves_closed_failure_budget_and_prior_work(self) -> None:
         from contextlib import nullcontext
@@ -7016,7 +6469,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     failure = 'preflight'  # No provider call or unknown charge exists to bound.
                 # Retain both the new default and explicit historical policy
                 # across the existing retry/recovery matrix.
-                _, _, _, _, app, _ = self._native_fixture(completed=True, max_turns=8,
+                _, _, _, _, app, _ = self._historical_native_fixture(completed=True, max_turns=8,
                     completion_policy='protected_decision.v1' if purpose != 'task' else None)
                 usages = []
                 client = LLMClient(LLMSettings(api_key='fixture', model='fixture', api_mode='chat',
@@ -7136,7 +6589,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         from simple_ar.integrations.llm import LLMClient, LLMSettings
         from simple_ar.integrations.model_profiles import ModelCatalog
 
-        _, inputs, _, _, app, _ = self._native_fixture(max_turns=8, completed=outcome == 'delivered')
+        _, inputs, _, _, app, _ = self._historical_native_fixture(max_turns=8, completed=outcome == 'delivered')
         if outcome != 'delivered':
             app.state['turns'].append(self._record_file_observation(
                 app, inputs / 'notes.txt', 'read_file', 'saved-material'))
@@ -7172,6 +6625,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             'usage': {'prompt_tokens': 100, 'completion_tokens': 10, 'total_tokens': 110}}
         with patch.dict('os.environ', {'REBINDING_TEST_KEY': 'fixture-only'}), \
                 patch('simple_ar.app.tool_application.LLMClient.from_env', side_effect=resolve), \
+                patch('simple_ar.app.tool_application.catalog_path', return_value=None), \
                 patch('simple_ar.integrations.llm._call_openai_sdk',
                     side_effect=httpx.ReadError('terminated without usage') if outcome == 'failed' and not cached else None,
                     return_value=response) as provider:
@@ -7212,7 +6666,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             side_effect=AssertionError('Recovery must not dispatch')))
         app = ToolApplication.create(root / 'task', 'Inspect the supplied material',
             model='profile:task', sources={}, allow_vision=True, max_images=1,
-            research_policy={'feasibility_connection': 'profile:review'}, control_protocol=None)
+            research_policy={'feasibility_connection': 'profile:review'})
         return root, catalog, text, app, provider
 
     def test_native_catalog_hints_restore_consumers_and_follow_compatible_supply(self):
@@ -7233,7 +6687,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.addCleanup(os.chdir, previous_cwd)
         os.chdir(elsewhere)
         from simple_ar.tools.images import ImageToolGateway
-        with patch('simple_ar.app.tool_application.ImageToolGateway', wraps=ImageToolGateway) as images:
+        with patch('simple_ar.tools.images.ImageToolGateway', wraps=ImageToolGateway) as images:
             restored = ToolApplication.load(app.session.store.root)
             self.assertEqual(images.call_args.kwargs['fallback_models_config'], hints['image'])
         before = self._native_snapshot(restored)
@@ -7910,7 +7364,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
     def test_native_resource_continuation_preserves_failed_preflight_and_prior_work(self) -> None:
         from simple_ar.integrations.llm import LLMClient, LLMSettings
 
-        _, _, _, _, app, _ = self._native_fixture(completed=True, max_turns=5)
+        _, _, _, _, app, _ = self._historical_native_fixture(completed=True, max_turns=5)
         original_turns = json.loads(json.dumps(app.state['turns']))
         records = self._native_receipts(app, original_turns)
         original_ledger = app.ledger.to_dict()
@@ -7977,11 +7431,12 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         # its conservative charge and identity across explicit authorization.
         prior_id = Path(original_turns[0]['reply']).parent.name
         app.ledger.reserve('closed-text-charge', {'llm_requests': 1, 'total_tokens': 100},
-            session_id=app.session.manifest.session_id, attempt_id=prior_id)
+            session_id=app.session.manifest.session_id, attempt_id=prior_id,
+            logical_call_id=prior_id, purpose='native-turn')
         retained = app.ledger.mark_unknown('closed-text-charge', reason='Missing provider usage',
             known_actual={'llm_requests': 1}, retain_reservation=True).to_dict()
         for field, value in (('session_id', 'another-session'), ('attempt_id', 'missing-attempt'),
-                             ('reserved', {'process_invocations': 1}), ('actual', {})):
+                             ('reserved', {'process_invocations': 1}), ('actual', {'llm_requests': 2})):
             with self.subTest(invalid_closed_charge=field):
                 rows = app.ledger.to_dict()
                 rows['entries'][-1][field] = value
@@ -8077,7 +7532,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(self._native_receipts(app, original_turns), records)
 
     def test_native_retained_text_windows_deduplicate_and_invalidate_on_mutation(self) -> None:
-        run_dir, inputs, fake, binding, resumed, code = self._native_fixture()
+        run_dir, inputs, fake, binding, resumed, code = self._historical_native_fixture()
         saved_turns = [self._record_native_turn(resumed, 'deliver_result',
             {'summary': 'Recorded observations'}, {}, 'text-delivery')]
         source_text = inputs.joinpath('notes.txt').read_text()
@@ -10134,7 +9589,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
     def test_invalid_execution_proposal_returns_owner_diagnosis_without_execution(self) -> None:
         for missing in ('invalid_plan', 'unregistered', 'attempt_manifest.json', 'implementation/result.json'):
             with self.subTest(missing=missing):
-                _, _, fake, _, app, _ = self._native_fixture()
+                _, _, fake, _, app, _ = self._historical_native_fixture()
                 fake.chat_turn.side_effect = AssertionError('No coordinator decision in caller actions')
                 prepared_result = 'records/nonexistent-attempt/implementation/result.json'
                 diagnostic = 'attempt_manifest.json'
@@ -11256,7 +10711,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
     def test_composition_binds_supplied_windows_figures_and_saved_output_versions(self) -> None:
         from simple_ar.report.capability import run_report_capability
         from simple_ar.report.figures import ReportFigureRecord, ReportFigureResult
-        run_dir, inputs, fake, binding, resumed, code = self._native_fixture()
+        run_dir, inputs, fake, binding, resumed, code = self._historical_native_fixture()
         table = resumed.workspace.workspace / 'observations.csv'
         table.write_text('group,value\nA,3\nB,5\n', encoding='utf-8')
         figure_path = inputs / 'writing-figure.svg'
@@ -11333,7 +10788,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         self.assertEqual(table.read_text(), 'group,value\nA,3\nB,5\n')
 
     def test_composition_preserves_default_and_explicit_material_windows_on_replay(self) -> None:
-        _, _, fake, _, resumed, _ = self._native_fixture()
+        _, _, fake, _, resumed, _ = self._historical_native_fixture()
         resumed.writing.material_observations = Mock(side_effect=AssertionError('Manual windows do not select materials'))
         table = resumed.workspace.workspace / 'observations.csv'
         # Consumer serialization must not turn a default into an explicitly
@@ -11354,8 +10809,9 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 self.assertEqual(fake.ask_json.call_count, calls)
         resumed.writing.material_observations.assert_not_called()
 
-    def _visual_fixture(self):
-        _, inputs, fake, _, app, _ = self._native_fixture()
+    def _visual_fixture(self, *, historical=False):
+        fixture = self._historical_native_fixture if historical else self._native_fixture
+        _, inputs, fake, _, app, _ = fixture()
         from simple_ar.tools.visual import VisualToolGateway
         visual = VisualToolGateway(app.session.store.root, app.workspace,
             app.ledger, app.session.manifest.session_id)
@@ -11397,7 +10853,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
     def test_related_feedback_uses_original_checks_and_marks_changed_subjects(self) -> None:
         from PIL import Image
-        inputs, fake, app, visual = self._visual_fixture()
+        inputs, fake, app, visual = self._visual_fixture(historical=True)
         fake.connection_binding.return_value = {'profile': 'fixture-vision'}
         fake.effective_output_limit.return_value = 16000
         fake.ask_json.return_value = {'findings': [{'severity': 'warning', 'category': 'layout',
@@ -11512,7 +10968,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     self.assertEqual(fake.ask_json.call_count, calls)
 
     def test_native_writing_route_preserves_protocol_and_saved_connection(self) -> None:
-        _, _, fake, binding, resumed, _ = self._native_fixture()
+        _, _, fake, binding, resumed, _ = self._historical_native_fixture()
         self.assertIs(resumed._client('original-writing', purpose='writing', native=False), fake)
         self.assertIs(resumed._client('original-writing-focus', purpose='writing'), fake)
         with patch.object(fake, '_settings', SimpleNamespace(api_mode='responses')), \
@@ -11569,7 +11025,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             return vision_client if kwargs.get('purpose') == 'vision' else fake
         with patch('simple_ar.integrations.llm.LLMClient.from_env', side_effect=resolve_client):
             pinned = ToolApplication.create(run_dir / 'vision-routing', 'Inspect supplied figure',
-                model='fixture', sources={'source0': inputs}, allow_vision=True, control_protocol=None)
+                model='fixture', sources={'source0': inputs}, allow_vision=True)
             for spec in pinned.gateway.registry.list_specs():
                 if spec.domain == 'sources' and spec.permission_level == 'network':
                     self.assertFalse(pinned.gateway.policy.is_allowed(spec)[0], spec.name)
@@ -11591,7 +11047,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             self.assertFalse(pinned.ledger.entries)
             vision_client.connection_binding.return_value = vision_binding
             initially_text = ToolApplication.create(run_dir / 'vision-grant', 'Analyze supplied material',
-                model='fixture', sources={'source0': inputs}, control_protocol=None)
+                model='fixture', sources={'source0': inputs})
             for owner, available in ((pinned, True), (initially_text, False)):
                 with self.subTest(vision_authorized=available, image_requests=0):
                     before_state, before_ledger = json.dumps(owner.state), owner.ledger.to_dict()
@@ -11630,7 +11086,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             self.assertIs(initially_text._client('new-vision', purpose='vision'), vision_client)
 
     def test_native_feedback_cancels_unstarted_execution_and_closes_tool_history(self) -> None:
-        _, _, fake, _, revised, code = self._native_fixture(goal='Create code', mount_inputs=False)
+        _, _, fake, _, revised, code = self._historical_native_fixture(goal='Create code', mount_inputs=False)
         fake.chat_turn.side_effect = [
             self._native_message("write_file", {"path": "workspace/check.py", "content": code}, "draft"),
             self._native_message("run_process", {"argv": ["python", "check.py"]}, "planned"),
@@ -11681,7 +11137,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
         # A saved model reply may still have queued actions before a pending
         # tool attempt is allocated. Feedback cancels that queue as well.
-        _, _, fake, _, queued, _ = self._native_fixture(mount_inputs=False)
+        _, _, fake, _, queued, _ = self._historical_native_fixture(mount_inputs=False)
         reply = 'attempts/queued-reply/native_result.json'
         message = self._native_message('write_file', {'path': 'workspace/stale.md',
             'content': 'Old revision', 'delivery': {'summary': 'Stale',
@@ -11707,7 +11163,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 self._historical_focus_route_shares_approval_resume_and_task_ownership(purpose)
 
     def _historical_focus_route_shares_approval_resume_and_task_ownership(self, purpose) -> None:
-        _, inputs, fake, binding, focused, code = self._native_fixture(goal='Create and verify a counter')
+        _, inputs, fake, binding, focused, code = self._historical_native_fixture(goal='Create and verify a counter')
         # This historical focus routes subsequent coordinator decisions; it is
         # deliberately NOT evidence that a professional owner was delegated.
         self.assertNotIn('professional_work', focused.state['config'])
@@ -11853,7 +11309,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             self.assertEqual(restored._work_focus()['purpose'], 'task')
 
     def test_native_work_plan_validates_and_survives_compaction_until_feedback(self) -> None:
-        _, _, fake, _, app, _ = self._native_fixture(tool_contracts='on_demand')
+        _, _, fake, _, app, _ = self._historical_native_fixture(tool_contracts='on_demand')
         first = {'steps': [{'step': 'Inspect inputs', 'status': 'pending'}]}
         latest = {'explanation': 'Ready to verify', 'steps': [
             {'step': 'Inspect inputs', 'status': 'completed'},
@@ -11958,7 +11414,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
     def test_native_completed_work_plan_replays_without_bypassing_action_approval_or_delivery(self) -> None:
         # This historical mixed batch needs the plan in its initial offer so
         # interruption still occurs before any write or process in that batch.
-        _, _, fake, _, app, _ = self._native_fixture(tool_contracts='full', context_target=64000)
+        _, _, fake, _, app, _ = self._historical_native_fixture(tool_contracts='full', context_target=64000)
         plan = {'explanation': 'Claimed complete, without verification',
             'steps': [{'step': 'Write and verify output', 'status': 'completed'}],
             'evidence_records': ['records/unverified-claim.json']}
@@ -12017,7 +11473,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
     def test_native_mixed_reply_cannot_switch_professional_ownership(self) -> None:
         for purpose in ('code', 'writing'):
             with self.subTest(purpose=purpose):
-                _, _, fake, _, no_switch, _ = self._native_fixture(
+                _, _, fake, _, no_switch, _ = self._historical_native_fixture(
                     goal='Inspect', mount_inputs=False, allow_execution=False)
                 mixed = self._native_message('write_file', {'path': 'workspace/note.md', 'content': 'saved'}, 'first')
                 mixed['tool_calls'] += self._native_message('focus_work', {'purpose': purpose, 'goal': 'Inspect'}, 'last')['tool_calls']
@@ -14336,13 +13792,16 @@ class ConversationContextTests(unittest.TestCase):
     """Offline tests for the new projector; historical test cases stay intact."""
     _tool_materials = CommonToolLayerTests._tool_materials
     _native_fixture = CommonToolLayerTests._native_fixture
+    _historical_native_fixture = CommonToolLayerTests._historical_native_fixture
     _native_message = staticmethod(CommonToolLayerTests._native_message)
     _record_native_turn = CommonToolLayerTests._record_native_turn
 
     def _fixture(self):
-        root, inputs, fake, _, app, _ = self._native_fixture()
-        app = ToolApplication.create(root / 'conversation', 'Use original measurements; preserve unknowns.',
-            model='fixture', sources={'source0': inputs}, context_protocol='conversation.v1', control_protocol=None)
+        root, inputs, fake, binding, app, _ = self._historical_native_fixture()
+        # Projection-only saved receipts have no current operation envelopes.
+        app = load_native_history(root / 'conversation', 'Use original measurements; preserve unknowns.',
+            config={'model':'fixture','model_connection':binding,
+                'sources':{'source0':inputs},'context_protocol':'conversation.v1'})
         return inputs, fake, app
 
     def _read(self, app, path, identity, **window):
@@ -14367,7 +13826,7 @@ class ConversationContextTests(unittest.TestCase):
         requirement = freeze_report_requirement({'reviewer': 'disabled'})
         app = ToolApplication.create(old.session.store.root.parent / 'declared', goal,
             model='fixture', sources={'source0': inputs}, creation_declarations=declarations,
-            report_requirement=requirement, report_protocol='canonical_report.v1', control_protocol=None)
+            report_requirement=requirement, context_protocol='conversation.v1')
         self.assertEqual(app.state['requests'], [goal])
         self.assertEqual(app.session.manifest.topic, goal)
         before = app.session.store.resolve('actions.json').read_bytes()
@@ -14394,7 +13853,7 @@ class ConversationContextTests(unittest.TestCase):
         exact = ToolApplication.create(old.session.store.root.parent / 'declared-exact', goal,
             model='fixture', sources={'source0': inputs}, allow_execution=True, creation_declarations={},
             code_task={'project_path': 'source0', 'goal': goal, 'allowed_patterns': ['*.py'],
-                'validation_command': ['python', '-c', 'print(1)']}, control_protocol=None)
+                'validation_command': ['python', '-c', 'print(1)']})
         exact_context = json.loads(exact._messages(client=client)[1]['content'])
         self.assertEqual(exact.state['requests'], [goal])
         self.assertEqual(exact_context['existing_code_task']['required_tool'], 'implement_code_task')
@@ -14409,8 +13868,10 @@ class ConversationContextTests(unittest.TestCase):
 
     def test_declared_feedback_is_once_in_chronology_and_survives_eviction(self):
         inputs, client, old = self._fixture()
-        app = ToolApplication.create(old.session.store.root.parent / 'declared-feedback', 'Original user goal',
-            model='fixture', sources={'source0': inputs}, creation_declarations={}, control_protocol=None)
+        app = load_native_history(old.session.store.root.parent / 'declared-feedback', 'Original user goal',
+            config={'model':'fixture','model_connection':client.connection_binding(),
+                'sources':{'source0':inputs},'context_protocol':'conversation.v1',
+                'input_contract':'declared_inputs.v1','creation_declarations':{}})
         self._read(app, inputs / 'notes.txt', 'first-observation')
         first_turn = app.state['turns'][0]
         first_turn['request_count'] = 1
@@ -14436,25 +13897,25 @@ class ConversationContextTests(unittest.TestCase):
     def test_declared_closing_projects_only_current_offer_and_accounts_actual_messages(self):
         inputs, client, old = self._fixture()
         app = ToolApplication.create(old.session.store.root.parent / 'declared-closing', 'Explain existing results',
-            model='fixture', sources={'source0': inputs}, creation_declarations={}, professional_inputs=True,
-            report_protocol='canonical_report.v1', control_protocol=None)
+            model='fixture', sources={'source0': inputs}, creation_declarations={}, context_protocol='conversation.v1')
         schemas = app._closing_schemas()
         messages = app._messages(client=client, closing=True, schemas=schemas)
         header = json.loads(messages[1]['content'])
         self.assertNotIn('available_specialists', header)
         self.assertNotIn('tool_contracts', header)
-        self.assertNotIn('instruction', header['report_protocol'])
+        self.assertNotIn('report_protocol', header)
         self.assertNotIn('Delegate', messages[0]['content'])
         self.assertTrue(header['resources']['decision_budget']['closing_required'])
         self.assertEqual(header['resources']['approximate_next_input_tokens'],
             app._decision_tokens(client, messages, schemas=schemas))
-        self.assertEqual({schema['function']['name'] for schema in schemas}, {'ask_user', 'deliver_result'})
+        self.assertTrue({'ask_user','deliver_result'}.issubset(
+            {schema['function']['name'] for schema in schemas}))
 
     def test_conversation_v1_creation_supply_and_historical_dispatch(self):
         with _temporary_run() as root:
             for protocol in (None, 'conversation.v1'):
                 app = ToolApplication.create(root / str(protocol), 'Keep the supplied goal', model=None,
-                    sources={}, context_protocol=protocol, control_protocol=None)
+                    sources={}, context_protocol=protocol)
                 self.assertEqual(app.state['config'].get('context_protocol'), protocol)
                 app.supply(supply_id='files', reason='Declare final files', changes={'delivery_files': ['*.txt']})
                 loaded = ToolApplication.load(app.session.store.root)

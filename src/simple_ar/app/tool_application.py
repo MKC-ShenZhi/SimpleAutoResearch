@@ -1637,19 +1637,24 @@ class ToolApplication:
                tool_contracts: Literal['full', 'on_demand', 'outcomes'] = 'on_demand',
                completion_policy: str | None = None, professional_inputs: bool = False,
                investigate_results: bool = True,
-               control_protocol: Literal['operations.v1'] | None = 'operations.v1',
+               control_protocol: Literal['operations.v1'] = 'operations.v1',
                creation_declarations: dict[str, Any] | None = None,
                context_protocol: Literal['auto', 'conversation.v1', 'working.v1'] | None = 'auto') -> ToolApplication:
-        """Create operation-composed work; explicit None is legacy integration compatibility.
+        """Create work on the operation-composed loop.
 
-        Loading a saved task always uses its persisted protocol, never this default.
+        Historical professional controllers are load-only. Loading and supply
+        retain their saved contracts, approvals and ledger without migration.
         """
+        if control_protocol != 'operations.v1':
+            raise ValueError('New tasks require control_protocol="operations.v1"; use load() for a saved historical task')
+        if type(professional_inputs) is not bool or type(investigate_results) is not bool:
+            raise ValueError('professional_inputs and investigate_results must be boolean')
+        if professional_inputs or not investigate_results or report_protocol is not None:
+            raise ValueError('Professional controller options are load-only; new tasks use source operations, inspect_artifacts and export_report')
         if context_protocol == 'auto':
-            context_protocol = 'working.v1' if control_protocol is not None else 'conversation.v1'
+            context_protocol = 'working.v1'
         if context_protocol not in {None, 'conversation.v1', 'working.v1'}:
             raise ValueError('Unsupported context protocol')
-        if context_protocol == 'working.v1' and control_protocol is None:
-            raise ValueError('Working context requires the operation-composed loop')
         if creation_declarations is not None and context_protocol not in {'conversation.v1','working.v1'}:
             raise ValueError('Declared inputs require a journal-backed conversation context')
         config, reused, limits, attempts = cls._configuration(root, goal, model=model, sources=sources,
@@ -1662,29 +1667,10 @@ class ToolApplication:
             tool_contracts=tool_contracts, completion_policy=completion_policy, control_protocol=control_protocol,
             delivery_files=delivery_files,
             extensions=extensions, creation_declarations=creation_declarations)
-        if type(professional_inputs) is not bool:
-            raise ValueError('professional_inputs must be boolean')
-        if professional_inputs and control_protocol is None:
-            config['professional_inputs'] = 'owner.v3'
-            config['professional_work'] = _REQUEST_OWNER if code_task is None else 'outcomes.v2'
-        if type(investigate_results) is not bool:
-            raise ValueError('investigate_results must be boolean')
-        if investigate_results and professional_inputs and code_task is None and control_protocol is None:
-            config['result_investigation'] = 'execution_findings.v1'
-        if control_protocol is not None:
-            config['report_protocol'] = None
-            config['inspection_protocol'] = 'subjects.v2'
-            config['source_generation_protocol'] = 'prepared.v3'
-            # Old per-stage contracts belong to saved tasks, not this loop.
-            for name in ('professional_inputs','professional_work','producer_completion',
-                         'result_investigation','document_source_contract','publication_preparation'):
-                config.pop(name, None)
+        config['inspection_protocol'] = 'subjects.v2'
+        config['source_generation_protocol'] = 'prepared.v3'
         if context_protocol is not None:
             config['context_protocol'] = context_protocol
-        if control_protocol is None:
-            config['producer_completion'] = 'goal_findings.v1'
-            config['document_source_contract'] = 'document_source.v1'
-            config['publication_preparation'] = 'bound_candidate.v1'
         session = SessionController.create(root, session_id=root.name, topic=goal,
             registry=CapabilityRegistry(), budget=BudgetState(max_attempts=attempts, max_no_progress=6))
         session.manifest.transition_recipe = cls.RECIPE

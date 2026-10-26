@@ -15,6 +15,7 @@ from simple_ar.cli.parser import build_parser
 from simple_ar.cli.research_config import research_defaults
 from simple_ar.cli.start import prepare_start
 from simple_ar.code_task.runtime.config import load_code_task_init_options, load_code_task_execute_options
+from tests.native_history_fixture import load_native_history
 
 
 class StartTests(unittest.TestCase):
@@ -22,11 +23,13 @@ class StartTests(unittest.TestCase):
                                 external_input=None):
         from simple_ar.app.tool_application import ToolApplication
         from unittest.mock import Mock
-        app = ToolApplication.create(root, 'Prepare code and retain actual results', model=None,
-            control_protocol=None,
-            sources={'source0': external_input} if external_input is not None else {},
-            allow_execution=execute, allow_network=True, project_python=Path(sys.executable),
-            max_turns=10, max_tokens=10000, max_attempts=30)
+        # Reuse must also work for delivered projects from the saved controller.
+        app = load_native_history(root, 'Prepare code and retain actual results',
+            config={'model':None,
+                'sources':{'source0':external_input} if external_input is not None else {},
+                'allow_execution':execute, 'allow_network':True,
+                'project_python':Path(sys.executable), 'max_turns':10},
+            limits={'llm_requests':10,'total_tokens':10000}, max_attempts=30)
         fake = Mock()
         fake.effective_output_limit.return_value = None
         app.implementation.client_factory = lambda _: fake
@@ -334,12 +337,12 @@ class StartTests(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()) as output:
             root = Path(temporary).resolve()
             app = ToolApplication.create(root / 'a-task', 'Explain [saved] results', model=None,
-                sources={}, control_protocol=None)
+                sources={})
             app.session.manifest.status = 'partial'
             app.session.save()
-            ToolApplication.create(root / 'b-task', 'A second goal', model=None, sources={}, control_protocol=None)
+            ToolApplication.create(root / 'b-task', 'A second goal', model=None, sources={})
             ToolApplication.create(root / 'nested' / 'hidden', 'Never scanned recursively', model=None,
-                sources={}, control_protocol=None)
+                sources={})
             for name, content in (('broken', '{'), ('oversized', ' ' * (256 * 1024 + 1))):
                 (root / name).mkdir()
                 (root / name / 'session_manifest.json').write_text(content, encoding='utf-8')
@@ -435,7 +438,7 @@ class StartTests(unittest.TestCase):
             configured._explicit_start_destinations = {'task_config'}
             with self.assertRaisesRegex(ValueError, 'distinct nonempty'):
                 apply_task_config(configured)
-            outside = ToolApplication.create(root / 'outside', 'Outside goal', model=None, sources={}, control_protocol=None)
+            outside = ToolApplication.create(root / 'outside', 'Outside goal', model=None, sources={})
             project = root / 'project'
             project.mkdir()
             try:
@@ -1031,7 +1034,7 @@ class StartTests(unittest.TestCase):
             from simple_ar.app.tool_application import ToolApplication
             from simple_ar.cli.main import main
             app = ToolApplication.create(root / "native", "Reuse results", model=None, sources={},
-                max_turns=0, max_tokens=0, max_attempts=4, control_protocol=None)
+                max_turns=0, max_tokens=0, max_attempts=4)
             native = app.session
             native.store.write_text("workspace/note.md", "Saved results, not new measurements.")
             app.run(actions=[{'tool_name': 'deliver_result', 'arguments': {

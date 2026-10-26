@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from simple_ar.app.tool_application import ToolApplication
+from tests.native_history_fixture import load_native_history
 from simple_ar.integrations.llm import LLMClient, LLMSettings
 
 
@@ -44,12 +45,30 @@ class ImplementationDecisionTests(unittest.TestCase):
         return {'choices': [{'message': {'role': 'assistant', 'content': content}, 'finish_reason': finish}],
             'usage': {'prompt_tokens': 100, 'completion_tokens': 20, 'total_tokens': 120}}
 
-    def _create(self, name='task', sources=None, *, operations=False):
+    def _create(self, name='task', sources=None):
         return ToolApplication.create(self.base / name, 'Implement from the authorized original inputs',
             model='fixture', sources=sources or {}, services=self.services,
-            professional_inputs=True, allow_execution=True, max_turns=12, max_tokens=600000,
+            allow_execution=True, max_turns=12, max_tokens=600000,
             process_limits={'process_invocations': 3, 'process_wall_seconds': 30},
-            control_protocol='operations.v1' if operations else None)
+            control_protocol='operations.v1')
+
+    def _load_history(self, name, *, sources=None, unmarked=False):
+        """Explicit saved request-owner or pre-completion source contract."""
+        return load_native_history(self.base / name, 'Implement from the authorized original inputs',
+            config={'model':'fixture', 'sources':sources or {}, 'allow_execution':True,
+                'max_turns':12,
+                **({'producer_completion':None} if unmarked else {
+                    'professional_inputs':'owner.v3', 'professional_work':'requests.v1',
+                    'result_investigation':'execution_findings.v1'})},
+            limits={'llm_requests':12, 'total_tokens':600000,
+                'process_invocations':3, 'process_wall_seconds':30, 'source_operations':36},
+            max_attempts=120, services=self.services)
+
+    @staticmethod
+    def _preparation_arguments(binding):
+        """Replay the public source operation, never its private owner markers."""
+        return {key:value for key, value in binding['request'].items()
+            if key in {'goal', 'project_path', 'material_roots', 'execution_requested'}}
 
     @staticmethod
     def _observations(app):
@@ -98,7 +117,7 @@ class ImplementationDecisionTests(unittest.TestCase):
             with self.subTest(root=root):
                 self.responses = [proposal]
                 prepared = self._prepare(app, {'goal': 'Change one module and preserve the project',
-                    'project_path': root, 'complete_work': True}, preceding=preceding)
+                    'project_path': root}, preceding=preceding)
                 self.assertEqual(prepared['status'], 'ok', prepared)
                 candidate = Path(prepared['data']['project_dir'])
                 self.assertEqual({path.name for path in candidate.iterdir()}, set(expected))
@@ -122,7 +141,7 @@ class ImplementationDecisionTests(unittest.TestCase):
                         stream.truncate(size)
                 app = self._create('capacity-' + name, sources={'code': project})
                 result = self._prepare(app, {'goal': 'Preserve the complete project',
-                    'project_path': 'code', 'complete_work': True})
+                    'project_path': 'code'})
                 self.assertEqual(result['status'], 'error', result)
                 self.assertFalse(app.ledger.entries)
                 self.send.assert_not_called()
@@ -137,7 +156,7 @@ class ImplementationDecisionTests(unittest.TestCase):
         self.responses = [{'summary': 'Keep members and propose execution', 'unresolved': [],
             'files': [], 'execution_plan': previous.data['execution_plan']}]
         prepared = self._prepare(app, {'goal': 'Run the existing project',
-            'project_path': previous.data['project_dir'], 'complete_work': True})
+            'project_path': previous.data['project_dir']})
         self.assertEqual(prepared['status'], 'ok', prepared)
         binding = execution_binding(app.implementation,
             {'prepared_result': prepared['data']['prepared_result']}, identity='capacity-probe')
@@ -186,7 +205,7 @@ class ImplementationDecisionTests(unittest.TestCase):
         self.responses = [{'files': [], 'summary': 'Execute the complete snapshot',
             'unresolved': [], 'execution_plan': plan}]
         prepared = self._prepare(app, {'goal': 'Run the complete project snapshot',
-            'project_path': previous.data['project_dir'], 'complete_work': True})
+            'project_path': previous.data['project_dir']})
         self.assertEqual(prepared['status'], 'ok', prepared)
         app.run(actions=[{'tool_name': 'execute_implementation', 'arguments': {
             'prepared_result': prepared['data']['prepared_result']}}], progress=lambda _: None)
@@ -230,7 +249,7 @@ class ImplementationDecisionTests(unittest.TestCase):
         self.responses = [{'files': [], 'summary': 'Prepare a fresh execution', 'unresolved': [],
             'execution_plan': previous.data['execution_plan']}]
         prepared = self._prepare(app, {'goal': 'Run the complete project snapshot',
-            'project_path': previous.data['project_dir'], 'complete_work': True})
+            'project_path': previous.data['project_dir']})
         app.run(actions=[{'tool_name': 'execute_implementation', 'arguments': {
             'prepared_result': prepared['data']['prepared_result']}}], progress=lambda _: None)
         token = app.approval_token(app.state['pending']['call'])
@@ -321,7 +340,7 @@ class ImplementationDecisionTests(unittest.TestCase):
             rejected, rejected, accepted]
         app = self._create(sources={'code': project, 'materials': materials})
         arguments = {'goal': 'Save the existing helper value', 'project_path': 'code',
-            'material_roots': ['materials'], 'complete_work': True}
+            'material_roots': ['materials']}
         result = self._prepare(app, arguments)
         self.assertEqual(result['status'], 'ok', result)
         candidate = Path(result['data']['project_dir'])
@@ -335,7 +354,7 @@ class ImplementationDecisionTests(unittest.TestCase):
         store = Path(result['data']['source_binding']).parent
         binding = json.loads((store / 'request.json').read_text())
         self.assertEqual(binding['generation_method'], 'professional_decision.v1')
-        self.assertEqual(binding['request']['max_repairs'], 1)
+        self.assertNotIn('max_repairs', binding['request'])
         self.assertEqual(set(binding['original_files']), {'calculate.py', 'helper.py'})
         preserved = {'inputs/records.json': {'path': str(data.resolve()),
             'sha256': hashlib.sha256(raw).hexdigest(), 'size_bytes': len(raw)}}
@@ -367,17 +386,11 @@ class ImplementationDecisionTests(unittest.TestCase):
         request_path = store / 'request.json'
         frozen_request = request_path.read_bytes()
         recovery_arguments = json.loads(frozen_request)['request']
-        self.assertEqual(recovery_arguments['work_contract'], 'shared.v2')
+        self.assertNotIn('work_contract', recovery_arguments)
         self.assertEqual(recovery_arguments['candidate_admission'], 'python_candidate_admission.v1')
-        # A direct gateway consumer must restore the exact saved owner request;
-        # public arguments acquire their internal markers only in the app.
-        omitted = restored.implementation.call('prepare_implementation', arguments, identity=identity)
-        self.assertEqual(omitted.status, 'error', omitted)
-        self.assertIn('Professional generation request changed', omitted.error)
-        self.assertEqual(request_path.read_bytes(), frozen_request)
-        self.assertEqual(restored.ledger.to_dict(), ledger)
-        self.assertEqual(self.send.call_count, 4)
-        replay = restored.implementation.call('prepare_implementation', recovery_arguments, identity=identity)
+        # Current source operations reconstruct their own internal markers;
+        # callers replay the original public request without private contracts.
+        replay = restored.implementation.call('prepare_implementation', arguments, identity=identity)
         self.assertEqual(replay.status, 'ok', replay)
         self.assertEqual(replay.data, result['data'])
         self.assertEqual(request_path.read_bytes(), frozen_request)
@@ -418,7 +431,7 @@ class ImplementationDecisionTests(unittest.TestCase):
         self.responses = [{'summary': 'Keep the candidate and its inputs', 'unresolved': [], 'files': [],
             'execution_plan': result['data']['execution_plan']}]
         revised = restored.implementation.call('prepare_implementation', {
-            'goal': arguments['goal'], 'project_path': str(candidate), 'complete_work': True},
+            'goal': arguments['goal'], 'project_path': str(candidate)},
             identity='copy-feedback')
         self.assertEqual(revised.status, 'ok', revised)
         self.assertEqual((Path(revised.data['project_dir']) / 'inputs/records.json').read_bytes(), raw)
@@ -429,7 +442,7 @@ class ImplementationDecisionTests(unittest.TestCase):
         data.write_bytes(raw + b'\n')
         before = restored.ledger.to_dict()
         changed = restored.implementation.call('prepare_implementation',
-            json.loads(request_path.read_bytes())['request'], identity=identity)
+            self._preparation_arguments(json.loads(request_path.read_bytes())), identity=identity)
         self.assertEqual(changed.status, 'error')
         self.assertIn('Preserved input changed', changed.error)
         self.assertEqual(request_path.read_bytes(), frozen_request)
@@ -451,7 +464,7 @@ class ImplementationDecisionTests(unittest.TestCase):
         proposal = self._candidate(code)
         proposal['preserve_files'] = mappings
         self.responses = [{'read_windows': [{'path': 'inputs/0.json'}]}, proposal]
-        app = self._create('independent-inputs', sources={'inputs': materials}, operations=True)
+        app = self._create('independent-inputs', sources={'inputs': materials})
         prepared = self._prepare(app, {'goal': 'Sum the recorded values without rewriting inputs',
             'material_roots': ['inputs']})
         self.assertEqual(prepared['status'], 'ok', prepared)
@@ -511,7 +524,7 @@ class ImplementationDecisionTests(unittest.TestCase):
         for index in range(65):
             (material / f'{index}.bin').write_bytes(b'\x00\xff')
         (material / 'large.bin').write_bytes(b'x' * 240000)
-        app = self._create('input-capacity', sources={'inputs': material}, operations=True)
+        app = self._create('input-capacity', sources={'inputs': material})
         source = ImplementationSources(workspace=app.workspace, project=None, roots=['inputs'],
             windows=[], originals={}, identity='capacity', input_contract='bounded_inputs.v2')
         code = self._candidate('print(7)\n')
@@ -543,64 +556,62 @@ class ImplementationDecisionTests(unittest.TestCase):
             'execution_plan': {'argv': ['python', 'package/worker.py'],
                 'outputs': ['observations/result.txt'], 'timeout_sec': 3}}]
         result = self._prepare(app, {'goal': 'Prepare the complete calculation unit',
-            'complete_work': True, 'source_windows': [{'path': 'materials/notes.txt', 'full_digest': True}],
-            'material_roots': ['materials']})
+            'material_roots': ['materials']}, preceding=[{'tool_name':'read_file',
+                'arguments':{'path':'materials/notes.txt','full_digest':True}}])
         self.assertEqual(result['status'], 'ok', result)
         return app, result, raw
 
     def test_registered_subtree_feedback_preserves_unit_and_historical_evidence(self):
         from simple_ar.tools.implementation_run import execution_binding
 
-        for complete in (True, False):
-            with self.subTest(complete_work=complete):
-                app, result, raw = self._registered_subtree(f'subtree-{complete}')
-                candidate = Path(result['data']['project_dir'])
-                # A retained runtime member is historical material, never a
-                # source or fresh output of the next preparation.
-                historical = candidate / 'observations/result.txt'
-                historical.parent.mkdir()
-                historical.write_text('historical observation\n', encoding='utf-8')
-                record = app.workspace.resolve(result['data']['prepared_result'])
-                proof = {path: path.read_bytes() for path in
-                    (record, record.parent / 'request.json', record.parent.parent / 'native_result.json', historical)}
-                self.responses = [{'summary': 'Change only selected source', 'unresolved': [],
-                    'files': [{'path': 'package/worker.py',
-                        'replacements': [{'old_text': 'value = 7', 'new_text': 'value = 8'}]},
-                        {'path': 'package/extra.py', 'content': 'extra = 1\n'}],
-                    'execution_plan': result['data']['execution_plan']}]
-                identity = f'feedback-{complete}'
-                revised = app.implementation.call('prepare_implementation', {
-                    'goal': 'Revise the selected source subtree', 'project_path': str(candidate / 'package'),
-                    'complete_work': complete, 'execution_requested': True}, identity=identity)
-                self.assertEqual(revised.status, 'ok', revised)
-                output = Path(revised.data['project_dir'])
-                self.assertEqual((output / 'package/worker.py').read_text(), 'value = 8\n')
-                self.assertEqual((output / 'support/helper.py').read_bytes(), (candidate / 'support/helper.py').read_bytes())
-                self.assertEqual((output / 'inputs/calibration.bin').read_bytes(), raw)
-                self.assertFalse((output / 'observations/result.txt').exists())
-                prompt = self.prompts[-1]
-                self.assertEqual(set(prompt['original_files']), {'package/worker.py'})
-                self.assertIn('support/helper.py', prompt['investigation']['registered_project']['members'])
-                self.assertTrue(any(row.get('text') == 'Keep the calibration input unchanged.\n'
-                    for row in prompt['source_windows']))
-                binding = json.loads((record.parents[2] / identity / 'implementation/request.json').read_text())
-                self.assertEqual(binding['prior_candidate']['result_ref'], result['data']['prepared_result'])
-                self.assertEqual(binding['prior_candidate']['editable_project'], str(candidate / 'package'))
-                self.assertEqual({path: path.read_bytes() for path in proof}, proof)
-                calls = self.send.call_count
-                replay = app.implementation.call('prepare_implementation', binding['request'], identity=identity)
-                self.assertEqual(replay.status, 'ok', replay)
-                self.assertEqual(replay.data, revised.data)
-                self.assertEqual(self.send.call_count, calls)
-                # Registering this new preparation is required before it can
-                # authorize any process; old success cannot supply that right.
-                with self.assertRaises((ValueError, OSError)):
-                    execution_binding(app.implementation, {'prepared_result': revised.data['prepared_result']},
-                        identity='unregistered-run')
-                self.assertEqual(app.workspace.artifact_provenance([str(output / 'package/worker.py')])[
-                    str(output / 'package/worker.py')]['producer'], None)
-                self.assertEqual((candidate / 'package/worker.py').read_text(), 'value = 7\n')
-                self.assertFalse((candidate / 'package/extra.py').exists())
+        app, result, raw = self._registered_subtree('subtree')
+        candidate = Path(result['data']['project_dir'])
+        # A retained runtime member is historical material, never a
+        # source or fresh output of the next preparation.
+        historical = candidate / 'observations/result.txt'
+        historical.parent.mkdir()
+        historical.write_text('historical observation\n', encoding='utf-8')
+        record = app.workspace.resolve(result['data']['prepared_result'])
+        proof = {path: path.read_bytes() for path in
+            (record, record.parent / 'request.json', record.parent.parent / 'native_result.json', historical)}
+        self.responses = [{'summary': 'Change only selected source', 'unresolved': [],
+            'files': [{'path': 'package/worker.py',
+                'replacements': [{'old_text': 'value = 7', 'new_text': 'value = 8'}]},
+                {'path': 'package/extra.py', 'content': 'extra = 1\n'}],
+            'execution_plan': result['data']['execution_plan']}]
+        identity = 'subtree-feedback'
+        revised = app.implementation.call('prepare_implementation', {
+            'goal': 'Revise the selected source subtree', 'project_path': str(candidate / 'package'),
+            'execution_requested': True}, identity=identity)
+        self.assertEqual(revised.status, 'ok', revised)
+        output = Path(revised.data['project_dir'])
+        self.assertEqual((output / 'package/worker.py').read_text(), 'value = 8\n')
+        self.assertEqual((output / 'support/helper.py').read_bytes(), (candidate / 'support/helper.py').read_bytes())
+        self.assertEqual((output / 'inputs/calibration.bin').read_bytes(), raw)
+        self.assertFalse((output / 'observations/result.txt').exists())
+        prompt = self.prompts[-1]
+        self.assertEqual(set(prompt['original_files']), {'package/worker.py'})
+        self.assertIn('support/helper.py', prompt['investigation']['registered_project']['members'])
+        self.assertTrue(any(row.get('text') == 'Keep the calibration input unchanged.\n'
+            for row in prompt['source_windows']))
+        binding = json.loads((record.parents[2] / identity / 'implementation/request.json').read_text())
+        self.assertEqual(binding['prior_candidate']['result_ref'], result['data']['prepared_result'])
+        self.assertEqual(binding['prior_candidate']['editable_project'], str(candidate / 'package'))
+        self.assertEqual({path: path.read_bytes() for path in proof}, proof)
+        calls = self.send.call_count
+        replay = app.implementation.call('prepare_implementation', self._preparation_arguments(binding), identity=identity)
+        self.assertEqual(replay.status, 'ok', replay)
+        self.assertEqual(replay.data, revised.data)
+        self.assertEqual(self.send.call_count, calls)
+        # Registering this new preparation is required before it can
+        # authorize any process; old success cannot supply that right.
+        with self.assertRaises((ValueError, OSError)):
+            execution_binding(app.implementation, {'prepared_result': revised.data['prepared_result']},
+                identity='unregistered-run')
+        self.assertEqual(app.workspace.artifact_provenance([str(output / 'package/worker.py')])[
+            str(output / 'package/worker.py')]['producer'], None)
+        self.assertEqual((candidate / 'package/worker.py').read_text(), 'value = 7\n')
+        self.assertFalse((candidate / 'package/extra.py').exists())
 
     def _registered_large_project(self, name, *, binary_bytes=600000):
         """Admit the original project through the public preparation consumer."""
@@ -628,7 +639,7 @@ class ImplementationDecisionTests(unittest.TestCase):
         self.responses = [{'files': [], 'execution_plan': plan,
             'summary': 'Retain the complete project without edits', 'unresolved': []}]
         observed = self._prepare(app, {'goal': 'Retain the existing copied project',
-            'project_path': 'code', 'complete_work': False})
+            'project_path': 'code'})
         self.assertEqual(observed['status'], 'ok', observed)
         from simple_ar.tools.specs import ToolResult
         result = ToolResult.model_validate(observed)
@@ -646,13 +657,13 @@ class ImplementationDecisionTests(unittest.TestCase):
         from simple_ar.tools.implementation_run import candidate_source, execution_binding
 
         app, previous, files = self._registered_large_project('large-project')
-        app.implementation.source_edit_contract = 'bound_content.v1'
         candidate = Path(previous.data['project_dir'])
         runtime = candidate / 'observations/result.txt'
         runtime.parent.mkdir()
         runtime.write_bytes(b'historical result\n')
         record = app.workspace.resolve(previous.data['prepared_result'])
-        self.assertNotIn('source_edit_contract', json.loads((record.parent / 'request.json').read_bytes()))
+        self.assertEqual(json.loads((record.parent / 'request.json').read_bytes())['source_edit_contract'],
+            'bound_content.v1')
         historical = {path: path.read_bytes() for path in
             (record, record.parent / 'request.json', record.parent.parent / 'native_result.json', runtime)}
         proposal = {'files': [{'path': 'package/worker.py', 'content': 'value = 8\n'}],
@@ -667,7 +678,7 @@ class ImplementationDecisionTests(unittest.TestCase):
             proposal]
         with patch('simple_ar.code_task.workspace.copy._materialize_selection', wraps=_materialize_selection) as copier:
             prepared = self._prepare(app, {'goal': 'Change the selected source',
-                'project_path': str(candidate / 'package'), 'complete_work': True})
+                'project_path': str(candidate / 'package')})
         self.assertEqual(prepared['status'], 'ok', prepared)
         copier.assert_called_once()
         self.assertEqual(self.send.call_count, 4)
@@ -711,7 +722,7 @@ class ImplementationDecisionTests(unittest.TestCase):
         self.assertFalse((app.session.store.root / 'tools/processes').exists())
         calls, ledger = self.send.call_count, app.ledger.to_dict()
         restored = ToolApplication.load(app.session.store.root, services=self.services)
-        replay = restored.implementation.call('prepare_implementation', binding['request'], identity=binding_path.parents[1].name)
+        replay = restored.implementation.call('prepare_implementation', self._preparation_arguments(binding), identity=binding_path.parents[1].name)
         self.assertEqual(replay.status, 'ok', replay)
         self.assertEqual(replay.data, prepared['data'])
         self.assertEqual(binding_path.read_bytes(), frozen)
@@ -738,7 +749,7 @@ class ImplementationDecisionTests(unittest.TestCase):
         binding_path.write_text(json.dumps({**binding, 'source_edit_contract': 'unknown'}), encoding='utf-8')
         with self.assertRaisesRegex(ValueError, 'Unknown retained source edit contract'):
             candidate_source(restored.implementation, prepared['data']['prepared_result'])
-        rejected = restored.implementation.call('prepare_implementation', binding['request'],
+        rejected = restored.implementation.call('prepare_implementation', self._preparation_arguments(binding),
             identity=binding_path.parents[1].name)
         self.assertEqual(rejected.status, 'error', rejected)
         self.assertIn('Unknown retained source edit contract', rejected.error)
@@ -792,20 +803,19 @@ class ImplementationDecisionTests(unittest.TestCase):
                     registered_paths=list(files), validate_destination=lambda name:
                         app.implementation._feedback_destination(app.workspace.workspace / 'scope-target', name, retained))
         self.assertEqual(sources.originals, {})
-        for complete in (False, True):
-            self.responses = [{'files': [], 'summary': 'Only update the execution plan', 'unresolved': [],
-                'execution_plan': previous.data['execution_plan']}]
-            result = app.implementation.call('prepare_implementation', {'goal': 'Plan-only correction',
-                'project_path': str(selected), 'complete_work': complete,
-                'execution_requested': True}, identity=f'large-plan-{complete}')
-            self.assertEqual(result.status, 'ok', result)
-            output = Path(result.data['project_dir'])
-            self.assertEqual({row['path']: row['sha256'] for row in result.data['files']}, files)
-            self.assertEqual((output / 'assets/reference').read_bytes(), (candidate / 'assets/reference').read_bytes())
+        self.responses = [{'files': [], 'summary': 'Only update the execution plan', 'unresolved': [],
+            'execution_plan': previous.data['execution_plan']}]
+        result = app.implementation.call('prepare_implementation', {'goal': 'Plan-only correction',
+            'project_path': str(selected),
+            'execution_requested': True}, identity='large-plan-feedback')
+        self.assertEqual(result.status, 'ok', result)
+        output = Path(result.data['project_dir'])
+        self.assertEqual({row['path']: row['sha256'] for row in result.data['files']}, files)
+        self.assertEqual((output / 'assets/reference').read_bytes(), (candidate / 'assets/reference').read_bytes())
         self.responses = [{'files': [{'path': f'package/new-{index}.py', 'content': f'value = {index}\n'}
             for index in range(12)], 'summary': 'A bounded additional edit unit', 'unresolved': []}]
         expanded = app.implementation.call('prepare_implementation', {'goal': 'Add the bounded source unit',
-            'project_path': str(selected)}, identity='large-additions')
+            'project_path': str(selected), 'execution_requested':False}, identity='large-additions')
         self.assertEqual(expanded.status, 'ok', expanded)
         self.assertEqual(len(expanded.data['files']), len(files) + 12)
         with self.assertRaisesRegex(ValueError, '12 source files'):
@@ -835,7 +845,7 @@ class ImplementationDecisionTests(unittest.TestCase):
         self.assertEqual((candidate / 'assets/calibration.bin').read_bytes(), original)
         request = app.session.store.root / 'attempts/incomplete-copy/implementation/request.json'
         frozen, calls = request.read_bytes(), self.send.call_count
-        replay = app.implementation.call('prepare_implementation', json.loads(frozen)['request'],
+        replay = app.implementation.call('prepare_implementation', self._preparation_arguments(json.loads(frozen)),
             identity='incomplete-copy')
         self.assertEqual(replay.status, 'error', replay)
         self.assertIn('Interrupted professional decision', replay.error)
@@ -923,7 +933,7 @@ class ImplementationDecisionTests(unittest.TestCase):
         calls = self.send.call_count
         rejected = app.implementation.call('prepare_implementation', {
             'goal': 'Continue selected sources', 'project_path': str(candidate / 'package'),
-            'complete_work': True}, identity='changed-receipt')
+            'execution_requested': True}, identity='changed-receipt')
         self.assertEqual(rejected.status, 'error', rejected)
         self.assertIn('accepted native observation', rejected.error)
         self.assertEqual(self.send.call_count, calls)
@@ -936,7 +946,7 @@ class ImplementationDecisionTests(unittest.TestCase):
         self.responses = [self._candidate("from pathlib import Path\nPath('result.txt').write_text('ready')\n")]
         app = self._create(sources={'inputs': inputs})
         result = self._prepare(app, {'goal': 'Implement the supplied instruction',
-            'complete_work': True, 'material_roots': ['inputs']}, preceding=[
+            'material_roots': ['inputs']}, preceding=[
                 {'tool_name': 'read_file', 'arguments': {'path': 'inputs/notes.txt', 'full_digest': True}}])
         self.assertEqual(result['status'], 'ok', result)
         self.assertEqual(self.send.call_count, 1)
@@ -1078,7 +1088,7 @@ class ImplementationDecisionTests(unittest.TestCase):
             {'focus_observations': [], 'read_windows': [{'path': str(paths[1]), 'max_bytes': 60000}]},
             self._candidate("from pathlib import Path\nPath('result.txt').write_text('ready')\n")]
         arguments = {'goal': 'Save a bounded result', 'material_roots': ['inputs'],
-            'complete_work': True, 'producer_completion': 'goal_findings.v1'}
+            }
         result = self._prepare(app, arguments)
         self.assertEqual(result['status'], 'ok', result)
         self.assertEqual(self.send.call_count, 3)
@@ -1107,7 +1117,7 @@ class ImplementationDecisionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'changed before execution'):
             execution_binding(app.implementation, {'prepared_result': result['data']['prepared_result']},
                 identity='retired-approval')
-        replay = app.implementation.call('prepare_implementation', binding['request'],
+        replay = app.implementation.call('prepare_implementation', self._preparation_arguments(binding),
             identity=record.parent.parent.name)
         self.assertEqual(replay.status, 'error', replay)
         self.assertIn('source inputs changed', replay.error)
@@ -1141,7 +1151,7 @@ class ImplementationDecisionTests(unittest.TestCase):
     def test_professional_diagnoses_share_the_same_six_decisions(self):
         for name, count, succeeds in (('corrected', 2, True), ('bounded', 6, False),
                 ('contract-corrected', 4, True), ('contract-bounded', 6, False),
-                ('read-corrected', 4, True), ('read-bounded', 6, False), ('historical-contract', 2, False)):
+                ('read-corrected', 4, True), ('read-bounded', 6, False)):
             with self.subTest(name=name):
                 start = self.send.call_count
                 broken = self._candidate('def broken(:\n    pass\n')
@@ -1153,15 +1163,10 @@ class ImplementationDecisionTests(unittest.TestCase):
                 if succeeds:
                     self.responses.append(self._candidate("from pathlib import Path\nPath('result.txt').write_text('ready')\n"))
                 app = self._create(name)
-                arguments = {'goal': 'Save a syntactically valid script', 'complete_work': True}
-                if name == 'historical-contract':
-                    arguments.update(complete_work=False, files=[{'path': 'calculate.py', 'purpose': 'Exact source-only request'}])
+                arguments = {'goal': 'Save a syntactically valid script'}
                 result = self._prepare(app, arguments)
                 self.assertEqual(result['status'], 'ok' if succeeds else 'error', result)
                 self.assertEqual(self.send.call_count - start, count)
-                if name == 'historical-contract':
-                    self.assertTrue(all('investigation' not in prompt for prompt in self.prompts[start:]))
-                    continue
                 for index, prompt in enumerate(self.prompts[start:]):
                     self.assertEqual(len(prompt['validation_observations']), index)
                     self.assertEqual(prompt['investigation']['decisions_remaining'], 6 - index)
@@ -1178,7 +1183,7 @@ class ImplementationDecisionTests(unittest.TestCase):
                 self.assertEqual((store / 'result.json').exists(), succeeds)
                 self.assertFalse((app.session.store.root / 'tools/processes').exists())
 
-    def test_budget_authorization_resumes_only_undispatched_preparation(self):
+    def test_saved_request_owner_budget_resumes_only_undispatched_preparation(self):
         from simple_ar.core.budget import BudgetExceededError
 
         for paid in (False, True):
@@ -1187,8 +1192,8 @@ class ImplementationDecisionTests(unittest.TestCase):
                 inputs = self.base / f'budget-inputs-{paid}'
                 inputs.mkdir()
                 (inputs / 'note.txt').write_text('Save a bounded text result.\n', encoding='utf-8')
-                app = self._create(f'budget-{paid}', sources={'inputs': inputs})
-                arguments = {'goal': 'Save a bounded text result', 'complete_work': True,
+                app = self._load_history(f'budget-{paid}', sources={'inputs': inputs})
+                arguments = {'goal': 'Save a bounded text result', 'complete_work':True,
                     'material_roots': ['inputs']}
                 self.responses = ([{'read_windows': [{'path': 'inputs/note.txt'}]}] if paid else [])
                 reserve, count = app.ledger.reserve, 0
@@ -1256,7 +1261,7 @@ class ImplementationDecisionTests(unittest.TestCase):
                 start = self.send.call_count
                 self.responses = [response]
                 app = self._create(name)
-                arguments = {'goal': 'Retain failed generation without replay', 'complete_work': True}
+                arguments = {'goal': 'Retain failed generation without replay'}
                 guard = (patch('simple_ar.code_task.generation.writer.response_accounting_known', return_value=False)
                     if name == 'unknown' else nullcontext())
                 with guard:
@@ -1268,7 +1273,7 @@ class ImplementationDecisionTests(unittest.TestCase):
                 request_path = app.session.store.root / 'attempts' / identity / 'implementation/request.json'
                 frozen_request = request_path.read_bytes()
                 repeated = restored.implementation.call('prepare_implementation',
-                    json.loads(frozen_request)['request'], identity=identity)
+                    self._preparation_arguments(json.loads(frozen_request)), identity=identity)
                 self.assertEqual(repeated.status, 'error')
                 self.assertIn('no blind replay', repeated.error)
                 self.assertEqual(request_path.read_bytes(), frozen_request)
@@ -1284,7 +1289,7 @@ class ImplementationDecisionTests(unittest.TestCase):
         for valid in (True, False):
             with self.subTest(valid=valid):
                 start = self.send.call_count
-                app = self._create('bounded-source-'+str(valid), operations=True)
+                app = self._create('bounded-source-'+str(valid))
                 self.responses = [LLMStreamError('Controlled opened source stream interruption'),
                     self._candidate('value = 7\n') if valid else
                     {'summary': 'Unusable completed response', 'files': 'not a source list', 'unresolved': []}]
@@ -1312,26 +1317,21 @@ class ImplementationDecisionTests(unittest.TestCase):
         material = self.base / 'input'
         material.mkdir()
         (material / 'note.txt').write_text('Authorized source, not an executable', encoding='utf-8')
-        for prefix, semantics in (('workspace', 'candidate_relative.v2'), ('materials', 'candidate_relative.v1')):
+        for prefix in ('workspace', 'materials'):
             with self.subTest(prefix=prefix):
                 path = prefix + '/nested runner.py'
                 self.responses = [{'summary': 'Create a nested executable', 'unresolved': [],
                     'files': [{'path': path, 'content': "from pathlib import Path\nPath('result.txt').write_text('7')\n"}],
                     'execution_plan': {'argv': ['python', path], 'outputs': ['result.txt'], 'timeout_sec': 3}}]
                 app = self._create('literal-' + prefix, sources={'materials': material})
-                result = self._prepare(app, {'goal': 'Save a value from a nested entry point', 'complete_work': True})
+                result = self._prepare(app, {'goal': 'Save a value from a nested entry point'})
                 self.assertEqual(result['status'], 'ok', result)
                 source = json.loads(Path(result['data']['source_binding']).read_text())
                 self.assertEqual(source['argv_semantics'], 'candidate_relative.v2')
-                if semantics == 'candidate_relative.v1':
-                    # Reconstruct a historical literal-argv preparation before
-                    # approval, while the other existing case exercises v2.
-                    source['argv_semantics'] = semantics
-                    Path(result['data']['source_binding']).write_text(json.dumps(source), encoding='utf-8')
                 app.run(actions=[{'tool_name': 'execute_implementation', 'arguments': {
                     'prepared_result': result['data']['prepared_result']}}], progress=lambda _: None)
                 binding = app._owner_execution_binding(app.state['pending']['call'])
-                self.assertEqual(binding['argv_semantics'], semantics)
+                self.assertEqual(binding['argv_semantics'], 'candidate_relative.v2')
                 self.assertEqual(binding['argv'][1], path)
                 self.assertEqual(Path(binding['cwd']), Path(result['data']['project_dir']))
                 token = app.approval_token(app.state['pending']['call'])
@@ -1352,19 +1352,13 @@ class ImplementationDecisionTests(unittest.TestCase):
                 self.assertEqual(self._observations(restored)[-1], executed)
         self.coordinator.assert_not_called()
 
-    def test_explicit_code_only_owner_keeps_unmarked_generation_on_reload(self):
+    def test_saved_code_only_owner_keeps_unmarked_generation_on_reload(self):
         import hashlib
         from simple_ar.core.capabilities import ArtifactStore
         from simple_ar.tools.implementation_run import execution_binding
         self.responses = [self._candidate("from pathlib import Path\nPath('result.txt').write_text('7')\n")]
-        app = self._create()
-        # Freeze a historical task before preparation: this fixture directly
-        # replays unmarked owner arguments and reconstructs pre-literal-argv
-        # approvals below. It must not first create a new completion contract.
-        app.state['config'].pop('producer_completion')
-        app._save()
-        app = ToolApplication.load(app.session.store.root, services=self.services)
-        arguments = {'goal': 'Source only', 'complete_work': False,
+        app = self._load_history('unmarked-source', unmarked=True)
+        arguments = {'goal': 'Source only', 'complete_work':False,
             'files': [{'path': 'calculate.py', 'purpose': 'A code-only entry'}]}
         result = self._prepare(app, arguments)
         self.assertEqual(result['status'], 'ok', result)
