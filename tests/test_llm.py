@@ -1301,14 +1301,45 @@ class LLMParsingTests(unittest.TestCase):
         self.assertEqual(observed[0].source, "estimated")
 
     def test_cancelled_provider_request_does_not_remain_inflight_or_retry(self):
-        ledger = BudgetLedger({"llm_requests": 3})
-        client = LLMClient(LLMSettings(api_key="test", api_mode="chat", retry_attempts=3),
-                           budget_ledger=ledger)
-        with patch("simple_ar.integrations.llm._call_openai_sdk", side_effect=KeyboardInterrupt) as call:
-            with self.assertRaises(KeyboardInterrupt):
-                client.ask("system", "user")
-        self.assertEqual(call.call_count, 1)
-        self.assertEqual(ledger.entries[0].status, "unknown")
+        from simple_ar.integrations.model_profiles import ModelCatalog, ModelProfile
+
+        catalog = ModelCatalog(profiles={'vision': ModelProfile(api='openai_chat',
+            model='fixture-vision', base_url='https://fixture.invalid/v1',
+            api_key_env='FIXTURE_KEY', capabilities=['vision'])}, routes={'vision': 'vision'})
+        with tempfile.TemporaryDirectory() as folder:
+            image = Path(folder) / 'input.png'
+            Image.new('RGB', (8, 8), 'white').save(image)
+            for label, output_limit, images in (
+                    ('capped-text', 10, ()), ('uncapped-text', None, ()),
+                    ('capped-vision', 10, (image,))):
+                with self.subTest(call=label):
+                    ledger = BudgetLedger({'llm_requests': 3, 'total_tokens': 40000},
+                        storage_path=Path(folder) / f'{label}.json')
+                    client = LLMClient(LLMSettings(api_key='test', api_mode='chat',
+                        retry_attempts=3, max_output_tokens=output_limit), budget_ledger=ledger,
+                        **({'model_catalog': catalog, 'profile_name': 'vision', 'purpose': 'vision'}
+                           if images else {}))
+                    with patch('simple_ar.integrations.llm._call_openai_sdk',
+                               side_effect=KeyboardInterrupt) as call:
+                        with self.assertRaises(KeyboardInterrupt):
+                            client.ask('system', 'user', image_paths=images)
+                    call.assert_called_once()
+                    self.assertEqual(len(ledger.entries), 1)
+                    entry = ledger.entries[0]
+                    self.assertEqual(entry.status, 'unknown')
+                    self.assertEqual(entry.actual, {'llm_requests': 1})
+                    self.assertEqual(ledger.remaining('llm_requests'), 2)
+                    self.assertEqual(ledger.unknown_dimensions(), ('total_tokens',))
+                    if label == 'capped-text':
+                        self.assertEqual(entry.actual_source, 'reservation_bound')
+                        self.assertEqual(ledger.unknown_dimensions(unbounded_only=True), ())
+                        self.assertEqual(ledger.remaining('total_tokens'),
+                            40000 - entry.reserved['total_tokens'])
+                    else:
+                        self.assertIsNone(entry.actual_source)
+                        self.assertEqual(ledger.unknown_dimensions(unbounded_only=True), ('total_tokens',))
+                        self.assertIsNone(ledger.remaining('total_tokens'))
+                    self.assertEqual(BudgetLedger.load(ledger.storage_path).to_dict(), ledger.to_dict())
 
     def test_sdk_client_lives_until_stream_consumed_and_closes_on_failure(self):
         for fail in (False, True):

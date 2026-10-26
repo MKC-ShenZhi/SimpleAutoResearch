@@ -122,7 +122,9 @@ Ordinary resume consumes saved boundaries. A completed task with no pending work
 
 Adding sources/network/execution/vision needs confirmation. Invalid additions leave mounts, permissions and ledger unchanged. Existing model/interpreter/work/budgets remain. On resume, prepare-only previews without applying access or resources. Confirm grants separately from command approval.
 
-New remaining allowances are future capacity, not historical totals. ID/reason without allowances fails. Replaying an ID does not replenish spent capacity; ordinary max-turns/max-tokens cannot add resources on resume. History and bounded unknown charges remain reserved. In-flight calls, unbounded unknown use or unconfirmed side effects require reconciliation before continuation.
+New remaining allowances are future capacity, not historical totals. ID/reason without allowances fails. Replaying an ID does not replenish spent capacity; ordinary max-turns/max-tokens cannot add resources on resume. Original charges remain in the ledger. After a model operation is confirmed closed and recorded in the task journal, explicit authorization can establish a new allowance without resolving its historical bill. Unknown use in the current allowance still blocks capacity. In-flight calls, unaccepted results and unconfirmed process side effects must be reconciled first.
+
+At a reconciled boundary, `--switch-model profile:NAME --switch-id ID --switch-reason TEXT` records a text/code/writing connection change without requests, feedback or budget renewal. This also supports closed professional model calls; it does not require their uncertain historical fees to be relabelled as known. Saved vision bindings remain unchanged. Use ordinary resume separately; switching never replays an interrupted tool.
 
 Retry-model permits a new decision only after a terminated failure without an accepted reply, using saved finite output cap and remaining capacity. It does not replay tools or whole tasks. Cached replies use ordinary recovery; in-flight requests, unconfirmed reservations, unbounded charges and pending tools refuse retry. Use it separately from feedback, grants and command approval.
 

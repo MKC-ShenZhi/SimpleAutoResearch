@@ -1511,10 +1511,17 @@ class OperationsWorkLoopTests(unittest.TestCase):
 
     def test_complete_prose_gets_one_accounted_action_correction_without_implicit_delivery(self):
         provider = self._provider
-        for count, legacy in ((1,False),(2,False),(1,True)):
-            with self.subTest(text_replies=count,legacy=legacy):
-                self.root = self.directory/('prose-'+str(count)+'-'+str(legacy))
+        for count, legacy, historical in ((1,False,False),(2,False,False),(1,True,False),(1,False,True)):
+            with self.subTest(text_replies=count,legacy=legacy,historical=historical):
+                self.root = self.directory/('prose-'+str(count)+'-'+str(legacy)+'-'+str(historical))
                 self._create(legacy=legacy)
+                if historical:
+                    self.app.ledger.reserve('old-charge', {'llm_requests':1,'total_tokens':100})
+                    self.app.ledger.mark_unknown('old-charge', reason='Prior allowance response unavailable')
+                    old = self.app.ledger.entries[-1].to_dict()
+                    self.app.ledger.authorize_remaining({key:self.app.ledger.limits[key]
+                        for key in ('llm_requests','total_tokens')},
+                        authorization_id='later-allowance', reason='Explicitly continue without clearing old fees')
                 texts = deque(['Claimed complete without a delivery action.']*count)
                 if count==1 and not legacy:
                     self.decisions.append(_action('ask_user',question='Which comparison is intended?'))
@@ -1532,7 +1539,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 self._run()
                 self.assertEqual(self.send.call_count-before,2 if not legacy else 1)
                 self.assertFalse(self.app.session.store.exists('delivery.json'))
-                calls = [entry for entry in self.app.ledger.entries if entry.reserved.get('llm_requests')]
+                calls = [entry for entry in self.app.ledger.entries if entry.reserved.get('llm_requests')
+                    and entry.actual_source!='user_authorization' and entry.reservation_id!='old-charge']
                 self.assertEqual(len(calls),2 if not legacy else 1)
                 self.assertTrue(all(entry.status=='settled' for entry in calls))
                 self.assertIn('Claimed complete',self.app.session.store.read_json(
@@ -1542,6 +1550,10 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 else:
                     self.assertIn('Model returned prose',self.app.session.manifest.status_reason)
                 self._reload()
+                if historical:
+                    self.assertEqual(self.app.ledger.entries[0].to_dict(),old)
+                    self.assertTrue(self.app.ledger.unknown_dimensions())
+                    self.assertFalse(self.app.ledger.unknown_dimensions(current_allowance_only=True))
                 if count==2:
                     calls = self.send.call_count
                     self._run()

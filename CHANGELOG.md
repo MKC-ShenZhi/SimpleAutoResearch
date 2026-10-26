@@ -8,15 +8,14 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 
 ### Improved
 
-- Working summaries reuse complete recorded operations and original arguments. Required replacement notes stay visible; empty, partial or interrupted summaries retain prior understanding, records and costs.
-- Independent inspection uses real read-only calls and a separate structured opinion. Calls, results and charges remain paired; malformed or unauthorized operations do not execute. Capacity checks preserve a final opinion and the caller's next decision without treating missing evidence as a pass.
-- Each inspection target binds its own findings and evidence versions. New inspections present bounded working views and combine actual same-version read ranges; gaps or changed files cannot inherit full coverage. Original observations remain available, and historical inspections retain their saved contracts.
+- Working notes and independent inspection reuse recorded observations through bounded inputs. Findings bind individual targets and source versions; partial reads, failed summaries and malformed calls cannot claim completed work. Original material and historical contracts remain available.
 - Ordinary tasks can delegate coherent source creation or revision using existing materials and candidates. Editable source capacity is separate from immutable input copies. Completely read, version-bound editable originals accept full-file revisions as well as exact replacements; approval and input protections still apply.
 - Publication checks the manuscript's actual presentation dependencies. Unused older previews no longer block current export or recovery; consumed figures and their producer versions remain checked.
 
 ### Fixed
 
 - Retain a complete professional response after a configured transport retry succeeds, while keeping the earlier failed attempt's bounded charge unchanged. Pending or unbounded usage still blocks adoption; this does not authorize further automatic correction or replay.
+- Explicit connection changes and new allowances support reconciled professional model operations as well as top-level decisions. Historical unknown charges remain unchanged; in-flight work and uncertain process execution still require reconciliation. Cancelling capped text requests retains their bounded charge without retrying.
 
 Unassisted initial-draft and feedback acceptance has not passed. Offline input reductions and engineering checks do not establish lower whole-task costs or general task success.
 

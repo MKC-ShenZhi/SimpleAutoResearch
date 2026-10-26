@@ -222,6 +222,10 @@ class BudgetLedgerTests(unittest.TestCase):
                 )
             ledger.reserve("uncertain", {"total_tokens": 35, "llm_requests": 1})
             ledger.mark_unknown("uncertain", reason="provider response lost")
+            historical = ledger.entries[0].to_dict()
+            ledger.authorize_remaining("total_tokens", 50,
+                authorization_id="tokens-only", reason="Authorize tokens independently")
+            self.assertEqual(ledger.unknown_dimensions(current_allowance_only=True), ("llm_requests",))
             ledger.authorize_remaining(
                 {"total_tokens": 50, "llm_requests": 2},
                 authorization_id="continuation-1", reason="Permit one bounded continuation.",
@@ -238,6 +242,8 @@ class BudgetLedgerTests(unittest.TestCase):
             self.assertEqual(loaded.remaining("total_tokens"), 32)
             self.assertEqual(loaded.remaining("llm_requests"), 1)
             self.assertEqual(loaded.unknown_dimensions(), ("llm_requests", "total_tokens"))
+            self.assertEqual(loaded.unknown_dimensions(current_allowance_only=True), ())
+            self.assertEqual(loaded.entries[0].to_dict(), historical)
             with self.assertRaises(BudgetConflictError):
                 loaded.authorize_remaining(
                     {"total_tokens": 60, "llm_requests": 2},
@@ -258,12 +264,33 @@ class BudgetLedgerTests(unittest.TestCase):
             loaded.authorize_remaining("total_tokens", 60, authorization_id="user-1", reason="Replay same authorization")
             self.assertEqual(loaded.entries[0].to_dict(), historical)
             self.assertEqual(loaded.unknown_dimensions(), ("total_tokens",))
+            self.assertEqual(loaded.unknown_dimensions(current_allowance_only=True), ())
             self.assertEqual(loaded.remaining("total_tokens"), 45)
             self.assertEqual(loaded.remaining("llm_requests"), 1)
             with self.assertRaises(BudgetExceededError):
                 loaded.reserve("too-much", {"total_tokens": 46})
             with self.assertRaises(BudgetConflictError):
                 loaded.authorize_remaining("total_tokens", 100, authorization_id="user-1", reason="Changed terms")
+            loaded.reserve("in-flight", {"total_tokens": 10})
+            before = loaded.to_dict()
+            with self.assertRaises(BudgetConflictError):
+                loaded.authorize_remaining("total_tokens", 30,
+                    authorization_id="user-2", reason="Cannot cross an active call")
+            self.assertEqual(loaded.to_dict(), before)
+            loaded.mark_unknown("in-flight", reason="Current allowance response lost")
+            self.assertEqual(loaded.unknown_dimensions(current_allowance_only=True), ("total_tokens",))
+            self.assertEqual(loaded.unknown_dimensions(
+                unbounded_only=True, current_allowance_only=True), ("total_tokens",))
+            with self.assertRaises(BudgetUnknownError):
+                loaded.reserve("blocked-current", {"total_tokens": 1})
+            retained = loaded.to_dict()["entries"]
+            loaded.authorize_remaining("total_tokens", 30,
+                authorization_id="user-2", reason="Explicitly authorize a later allowance")
+            restored = BudgetLedger.load(path)
+            self.assertEqual(restored.unknown_dimensions(), ("total_tokens",))
+            self.assertEqual(restored.unknown_dimensions(current_allowance_only=True), ())
+            self.assertEqual(restored.to_dict()["entries"][:len(retained)], retained)
+            self.assertEqual(restored.entries[0].to_dict(), historical)
 
     def test_bounded_unknown_consumption_retains_capacity_after_reload(self) -> None:
         with TemporaryDirectory() as directory:
@@ -279,6 +306,9 @@ class BudgetLedgerTests(unittest.TestCase):
                 loaded.reserve("too-large", {"llm_requests": 1, "total_tokens": 11})
             loaded.reserve("fits", {"llm_requests": 1, "total_tokens": 10})
             self.assertEqual(loaded.unknown_dimensions(), ("total_tokens",))
+            self.assertEqual(loaded.unknown_dimensions(current_allowance_only=True), ("total_tokens",))
+            self.assertEqual(loaded.unknown_dimensions(
+                unbounded_only=True, current_allowance_only=True), ())
 
     def test_reservation_counts_until_settlement_and_settlement_is_idempotent(self) -> None:
         ledger = BudgetLedger({"llm_requests": 2, "total_tokens": 10})

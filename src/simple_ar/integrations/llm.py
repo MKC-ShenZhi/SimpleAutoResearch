@@ -938,10 +938,10 @@ class LLMClient:
                     if mode_request.get("stream") is True:
                         response = _collect_chat_stream(response)
                     return response, provider_attempts, reservation_id
-                except (KeyboardInterrupt, SystemExit):
-                    self._mark_budget_unknown(
-                        reservation_id, reason="Provider request cancelled; final usage unavailable"
-                    )
+                except (KeyboardInterrupt, SystemExit) as exc:
+                    self._reconcile_failed_budget_attempt(
+                        reservation_id, exc, reserved_total_tokens=reserved_total_tokens,
+                        has_output_cap=output_cap is not None, visual=visual)
                     raise
                 except Exception as exc:
                     last_error = exc
@@ -1031,7 +1031,7 @@ class LLMClient:
     def _reconcile_failed_budget_attempt(
         self,
         reservation_id: str | None,
-        error: Exception,
+        error: BaseException,
         *,
         reserved_total_tokens: int,
         has_output_cap: bool,
@@ -1041,7 +1041,12 @@ class LLMClient:
             return
         reason = 'provider attempt failed: ' + _provider_failure_summary(error)
         try:
-            if _transport_failure_phase(error) == 'not_dispatched':
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                self._budget_ledger.mark_unknown(reservation_id,
+                    reason='Provider request cancelled; final usage unavailable',
+                    known_actual={'llm_requests': 1},
+                    retain_reservation=has_output_cap and not visual)
+            elif _transport_failure_phase(error) == 'not_dispatched':
                 self._budget_ledger.settle(reservation_id,
                     {'llm_requests': 1, 'total_tokens': 0}, actual_source='transport_pre_dispatch',
                     reason='Connection/pool acquisition failed before HTTP dispatch')
@@ -2582,7 +2587,7 @@ def _attempt_summary(mode_attempts: Sequence[tuple[str, int, Exception]]) -> str
     return ", ".join(f"{mode}={attempts}" for mode, attempts, _ in mode_attempts)
 
 
-def _provider_failure_summary(exc: Exception) -> str:
+def _provider_failure_summary(exc: BaseException) -> str:
     """Retain diagnostic facts without retaining raw provider text or causes."""
     details = [type(exc).__name__]
     status = _provider_error_status(exc)
@@ -2750,7 +2755,7 @@ def _is_budget_consumption_unknown(exc: Exception) -> bool:
             or _is_response_transport_disconnect(exc) or _is_timeout_error(exc))
 
 
-def _transport_failure_phase(exc: Exception) -> str:
+def _transport_failure_phase(exc: BaseException) -> str:
     """Use typed transport causes, never an endpoint/body/message heuristic."""
     import httpx
 

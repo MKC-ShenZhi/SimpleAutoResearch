@@ -4357,7 +4357,46 @@ class ToolApplication:
         self._configure_tools()
         return 'User explicitly authorized additional access: ' + '; '.join(changes) + '. Saved budgets are unchanged; individual process commands still need approval.'
 
-    def _check_authorization_operations(self) -> None:
+    def _closed_llm_charge(self, entry: Any) -> bool:
+        """Prove local operation closure, not provider usage or output validity."""
+        if (entry.status != 'unknown' or entry.session_id != self.session.manifest.session_id
+                or not entry.logical_call_id
+                or set(entry.reserved) != {'llm_requests', 'total_tokens'}
+                or entry.reserved['llm_requests'] != 1
+                or type(entry.reserved['total_tokens']) is not int or entry.reserved['total_tokens'] <= 0
+                or any(key not in entry.reserved or type(value) not in {int, float}
+                    or not math.isfinite(value) or not 0 <= value <= entry.reserved[key]
+                    for key, value in entry.actual.items())):
+            return False
+        attempt = next((row for row in self.session.list_attempts()
+                        if row.attempt_id == entry.attempt_id), None)
+        if attempt is None or attempt.status not in {'completed', 'failed'}:
+            return False
+        if attempt.capability == 'native_turn':
+            return (self._accepted_model_attempt(entry.attempt_id) is not None
+                or self._failed_model_attempt({'kind':'model','attempt':entry.attempt_id},
+                    current_only=False) is not None)
+        if attempt.capability != 'native_tool':
+            return False
+        relative = f'attempts/{entry.attempt_id}/native_result.json'
+        if not any(tool.get('result') == relative for turn in self.state['turns']
+                   for tool in turn.get('tools', [])):
+            return False
+        store = ArtifactStore(self.session.store.root / 'attempts' / entry.attempt_id)
+        if not store.exists('capability_result.json') or not store.exists('native_result.json'):
+            return False
+        result = store.read_capability_result('capability_result.json')
+        if result.status != attempt.status:
+            return False
+        if attempt.status == 'failed':
+            observed = store.read_json('native_result.json')
+            return (result.provenance.get('recovery') == 'explicit_interruption'
+                and observed.get('metadata', {}).get('provenance') == dict(result.provenance)
+                and observed.get('metadata', {}).get('capability_result') == self.workspace.locator(
+                    str(store.resolve('capability_result.json'))))
+        return any(ref.path == 'native_result.json' for ref in result.artifacts)
+
+    def _check_authorization_operations(self, *, allow_closed_model_charges: bool = False) -> None:
         """Closed bounded model charges are history, not an in-flight action.
 
         Access and contract grants share the existing resource-grant boundary;
@@ -4369,6 +4408,10 @@ class ToolApplication:
         for entry in self.ledger.entries:
             if entry.status not in {'reserved', 'unknown'}:
                 continue
+            if allow_closed_model_charges:
+                if self._closed_llm_charge(entry):
+                    continue  # Explicit new authority never settles the old liability.
+                raise ValueError('Reconcile in-flight or unknown operations before authorizing resources')
             attempt = attempts.get(entry.attempt_id)
             # An explicit new allowance is not reconciliation or a replay.
             # Closed text calls may retain their finite worst-case charge in
@@ -4392,7 +4435,7 @@ class ToolApplication:
         requests = allowances.get('llm_requests', 0)
         if 'llm_requests' in allowances and (type(requests) is not int or requests <= 0):
             raise ValueError('llm_requests allowance must be a positive integer')
-        self._check_authorization_operations()
+        self._check_authorization_operations(allow_closed_model_charges=True)
         if self.state['config']['model'] is not None:
             self._client()  # Resource authorization cannot change model identity.
         elif not model_binding and set(allowances) & {'llm_requests', 'total_tokens', 'image_requests'}:
@@ -4464,15 +4507,16 @@ class ToolApplication:
         attempts = self.session.list_attempts()
         # Retry keeps its original failure-only contract. Explicit switching
         # also admits accepted, locally closed calls; all charges stay held.
-        for entry in self.ledger.entries:
+        if allow_completed_unknown:
+            self._check_authorization_operations(allow_closed_model_charges=True)
+        for entry in (() if allow_completed_unknown else self.ledger.entries):
             if entry.status == 'unknown' and (
                     entry.purpose != 'native-turn' or entry.actual_source != 'reservation_bound'
                     or type(entry.reserved.get('total_tokens')) is not int
                     or entry.reserved['total_tokens'] <= 0
-                    or not ((any(row.attempt_id == entry.attempt_id and row.status == 'failed'
+                    or not (any(row.attempt_id == entry.attempt_id and row.status == 'failed'
                                  and row.capability == 'native_turn' for row in attempts)
-                             and not self.session.store.exists(f'attempts/{entry.attempt_id}/native_result.json'))
-                            or allow_completed_unknown and self._accepted_model_attempt(entry.attempt_id) is not None)):
+                             and not self.session.store.exists(f'attempts/{entry.attempt_id}/native_result.json'))):
                 raise ValueError('Unconfirmed operation must be reconciled before changing models')
         if self.state['config'].get('allow_vision'):
             vision = LLMClient.from_env(purpose='vision',
@@ -4524,18 +4568,6 @@ class ToolApplication:
                         and f'attempts/{row.attempt_id}/native_result.json' not in accepted for row in attempts)):
                 raise ValueError('Reconcile pending, running, reserved or cached operations before changing models')
             _, replacement = self._replacement_text_client(model_selector, allow_completed_unknown=True)
-            for entry in self.ledger.entries:
-                if entry.status == 'unknown' and (
-                        entry.session_id != self.session.manifest.session_id
-                        or entry.logical_call_id != entry.attempt_id
-                        or (self._failed_model_attempt({'kind': 'model', 'attempt': entry.attempt_id},
-                            current_only=False) is None and self._accepted_model_attempt(entry.attempt_id) is None)
-                        or set(entry.reserved) != {'llm_requests', 'total_tokens'}
-                        or entry.reserved['llm_requests'] != 1 or entry.actual.get('llm_requests') != 1
-                        or any(key not in entry.reserved or type(value) not in {int, float}
-                            or not math.isfinite(value) or not 0 <= value <= entry.reserved[key]
-                            for key, value in entry.actual.items())):
-                    raise ValueError('Unknown model charges have no recognized retained reservation')
             if expected_connection is not None and replacement != expected_connection:
                 raise ValueError('Resolved connection changed after confirmation; inspect and confirm again')
             record = {'switch_id': switch_id, 'reason': reason,
@@ -4793,7 +4825,8 @@ class ToolApplication:
                     if pending is None and self.session.manifest.status_reason != 'Caller requested boundary stop':
                         turns = self.state['turns']
                         correctable_text = (self.operations is not None and self._unacted_reply_count()==1
-                            and not any(entry.status in {'unknown','reserved'} for entry in self.ledger.entries))
+                            and not self.ledger.unknown_dimensions(current_allowance_only=True)
+                            and not any(entry.status == 'reserved' for entry in self.ledger.entries))
                         if not correctable_text and (not turns or turns[-1].get('origin') != 'professional'
                                 or turns[-1].get('request_count', 1) != len(self.state['requests'])):
                             return self.result_snapshot()
@@ -4854,7 +4887,8 @@ class ToolApplication:
                             # model capacity is exhausted. Actual attempt/tool
                             # budgets and approval still gate that work below.
                             and self._request_capacity() > 0
-                            and not {'llm_requests', 'total_tokens'}.intersection(self.ledger.unknown_dimensions())
+                            and not {'llm_requests', 'total_tokens'}.intersection(
+                                self.ledger.unknown_dimensions(current_allowance_only=True))
                             and ((tokens := self.ledger.remaining('total_tokens')) is None
                                 or tokens >= self._completion_floor(self._client())['total_tokens'])):
                         if turns[-1].get('origin') == 'professional':
@@ -4909,7 +4943,8 @@ class ToolApplication:
                 if not calls:
                     if (self.operations is not None and self._unacted_reply_count()==1
                             and self._request_capacity()>0
-                            and not any(entry.status in {'unknown','reserved'} for entry in self.ledger.entries)):
+                            and not self.ledger.unknown_dimensions(current_allowance_only=True)
+                            and not any(entry.status == 'reserved' for entry in self.ledger.entries)):
                         progress('Assistant text retained without a delivery; one action correction uses the same budget, no operation replay')
                         continue
                     self.session.pause("Model returned prose without a delivery or question; inspect the saved reply before continuing")

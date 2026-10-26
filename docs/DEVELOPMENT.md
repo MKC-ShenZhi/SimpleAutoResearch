@@ -121,6 +121,12 @@ successful response is actually settled. Source adoption, current inspection rec
 and accepted native results share the core accounting check. This grants no automatic
 format correction, process replay or release of unknown costs; pending requests,
 unbounded usage and unknown processes still stop.
+Connection switching and explicit resource authorization share proof of local
+operation closure, including professional model calls. This proof does not adopt
+their outputs or settle provider charges. Explicit new allowances retain old
+entries unchanged; admission uses the current allowance while accounting reports
+all historical unknowns. Running or unaccepted operations and uncertain processes
+cannot cross this boundary.
 Fulfillment is checked after producer outputs are registered. A byte-bound
 successful operation can return unmet delivery conditions to the same loop;
 it is not replayed or silently marked delivered. Historical receipts remain

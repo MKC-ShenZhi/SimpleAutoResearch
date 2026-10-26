@@ -436,11 +436,15 @@ class BudgetLedger:
             )
             return max(0, remaining)
 
-    def unknown_dimensions(self, *, unbounded_only: bool = False) -> tuple[str, ...]:
+    def unknown_dimensions(self, *, unbounded_only: bool = False,
+                           current_allowance_only: bool = False) -> tuple[str, ...]:
         """Report unknown consumption, optionally excluding retained finite bounds.
 
         A bounded unknown charge still appears in ordinary accounting and
         withholds its full reservation; it does not make capacity unknowable.
+        Admission may select the current explicit allowance, as remaining()
+        already does. Historical charges remain visible by default and are
+        never settled or removed by a new allowance.
         """
 
         with self._lock:
@@ -452,6 +456,11 @@ class BudgetLedger:
                 for dimension in entry.reserved
                 if dimension not in entry.actual
             }
+            if current_allowance_only:
+                dimensions = {dimension for dimension in dimensions if any(
+                    entry.status == 'unknown' and dimension not in entry.actual
+                    and (not unbounded_only or entry.actual_source != 'reservation_bound')
+                    for entry in self._allowance_entries(dimension))}
             return tuple(sorted(dimensions))
 
     def over_limit(self) -> dict[str, BudgetNumber]:

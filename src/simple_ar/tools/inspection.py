@@ -627,7 +627,8 @@ class InspectionToolGateway:
                 + (client.effective_output_limit() or 0))
         for number in range(7):
             label = f'inspect-artifacts-{identity}' + (f'-sources-{number}' if number else '')
-            if {'llm_requests','total_tokens'}.intersection(ledger.unknown_dimensions(unbounded_only=True)):
+            if {'llm_requests','total_tokens'}.intersection(ledger.unknown_dimensions(
+                    unbounded_only=True, current_allowance_only=True)):
                 raise ValueError('Inspection capacity is unknown; retain records without further requests')
             # The caller's floor is already withheld by this same ledger. Own
             # the final opinion as well: a gathering call (including retries)

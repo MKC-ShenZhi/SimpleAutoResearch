@@ -7597,7 +7597,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 provider.assert_not_called()
 
     def test_native_explicit_switch_rejects_unreconciled_work_without_mutation(self):
-        for case in ('pending', 'running', 'cached', 'queued', 'reserved', 'unknown', 'supply',
+        for case in ('pending', 'running', 'cached', 'queued', 'reserved', 'unknown', 'unknown_process', 'supply',
                      'caller', 'injected', 'confirmed_binding'):
             with self.subTest(case=case), self._model_rebinding_fixture(
                     outcome='failed' if case == 'pending' else 'ongoing', cached=case == 'cached') as (app, provider, resolve):
@@ -7612,6 +7612,12 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     app.ledger.reserve('unconfirmed', {'llm_requests': 1, 'total_tokens': 100})
                     if case == 'unknown':
                         app.ledger.mark_unknown('unconfirmed', reason='Unconfirmed provider work')
+                if case == 'unknown_process':
+                    identity = Path(app.state['turns'][-1]['reply']).parent.name
+                    app.ledger.reserve('unconfirmed-process', {'process_invocations': 1},
+                        session_id=app.session.manifest.session_id, attempt_id=identity,
+                        logical_call_id=identity, purpose='run_process')
+                    app.ledger.mark_unknown('unconfirmed-process', reason='Process outcome unknown')
                 if case == 'supply':
                     app.state['pending_supply'] = {'supply_id': 'unfinished'}
                 if case == 'caller':
@@ -7624,6 +7630,10 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 with self.assertRaises(ValueError):
                     app.switch_model('profile:new', switch_id='connection-1', reason='Change service',
                         expected_connection={} if case == 'confirmed_binding' else None)
+                if case in {'reserved', 'unknown', 'unknown_process'}:
+                    with self.assertRaises(ValueError):
+                        app._authorize_resources({'total_tokens': 100000},
+                            'unsafe-epoch', 'Cannot authorize across unconfirmed work')
                 self._assert_native_snapshot(app, before)
                 self.assertEqual(app.session.manifest.to_dict(), manifest)
                 provider.assert_not_called()
@@ -7660,6 +7670,118 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             self.assertEqual(self._native_receipts(app, app.state['turns']), before['receipts'])
             self.assertEqual(app.state['config']['model'], 'profile:new')
             provider.assert_not_called()
+
+    def test_explicit_switch_retains_closed_specialist_charges_without_replaying_tools(self):
+        with self._model_rebinding_fixture(outcome='ongoing') as (app, provider, resolve):
+            # The normal native tool path writes the core result, observation
+            # and accepted journal entry. Only provider IO uses the fixture.
+            provider.return_value = {'choices': [{'message': {'content': json.dumps({
+                'files': [{'path': 'worker.py',
+                    'content': "from pathlib import Path\nPath('answer.txt').write_text('prepared')\n"}],
+                'execution_plan': {'argv': ['python', 'worker.py'],
+                    'outputs': ['answer.txt'], 'timeout_sec': 3}})}}],
+                'usage': {'prompt_tokens': 100, 'completion_tokens': 10, 'total_tokens': 110}}
+            app.run(actions=[{'tool_name': 'prepare_implementation', 'arguments': {
+                'goal': 'Prepare a small worker without executing it',
+                'files': [{'path': 'worker.py', 'purpose': 'Save the prepared marker'}]}},
+                {'tool_name': 'ask_user', 'arguments': {'question': 'Await the next request'}}],
+                progress=lambda _: None)
+            tool = app.state['turns'][-1]['tools'][0]
+            self.assertEqual(app.session.store.read_json(tool['result'])['status'], 'ok')
+            identity = Path(tool['result']).parent.name
+            attempt = next(row for row in app.session.list_attempts() if row.attempt_id == identity)
+            self.assertEqual((attempt.capability, attempt.status), ('native_tool', 'completed'))
+            envelope_path = app.session.store.root / f'attempts/{identity}/capability_result.json'
+            envelope = read_json(envelope_path)
+            self.assertTrue(any(ref['path'] == 'native_result.json' for ref in envelope['artifacts']))
+            # A previous physical request under this specialist identity lost
+            # usage. Its purpose and logical suffix are not coordinator turns.
+            app.ledger.reserve('specialist-uncertainty', {'llm_requests': 1, 'total_tokens': 100},
+                session_id=app.session.manifest.session_id, attempt_id=identity,
+                logical_call_id=f'{identity}:implementation', purpose='implementation')
+            charge = app.ledger.mark_unknown('specialist-uncertainty',
+                reason='Closed specialist transport without usage', known_actual={'llm_requests': 1})
+            provider.reset_mock()
+            before = self._native_snapshot(app)
+            self.assertTrue(app._closed_llm_charge(charge))
+            self.assertIsNone(charge.actual_source)
+            self.assertIsNone(app._accepted_model_attempt(identity))
+            self.assertIsNone(app._failed_model_attempt({'kind': 'model', 'attempt': identity}, current_only=False))
+            with self.assertRaises(ValueError):
+                app._retry_model('profile:new')
+            with _changed_record(envelope_path, {**envelope, 'artifacts': []}):
+                with self.assertRaises(ValueError):
+                    app.switch_model('profile:new', switch_id='specialist', reason='Continue elsewhere')
+            self._assert_native_snapshot(app, before)
+            tools = app.state['turns'][-1]['tools']
+            app.state['turns'][-1]['tools'] = tools[1:]
+            try:
+                with self.assertRaises(ValueError):
+                    app.switch_model('profile:new', switch_id='specialist', reason='Continue elsewhere')
+            finally:
+                app.state['turns'][-1]['tools'] = tools
+            self._assert_native_snapshot(app, before)
+            app.switch_model('profile:new', switch_id='specialist', reason='Continue elsewhere')
+            restored = ToolApplication.load(app.session.store.root)
+            self.assertEqual(restored.state['config']['model_connection'], resolve('profile:new').connection_binding())
+            self.assertEqual(restored.ledger.to_dict(), before['ledger'])
+            self.assertEqual(restored.state['turns'], before['state']['turns'])
+            self.assertEqual(self._native_receipts(restored, restored.state['turns']), before['receipts'])
+            self.assertEqual((app.session.store.root / 'budget_ledger.json').read_bytes(),
+                before['files']['budget_ledger.json'])
+            restored._authorize_resources({'total_tokens': 100000},
+                'specialist-epoch', 'Explicit allowance after the closed specialist call')
+            self.assertEqual(restored.ledger.to_dict()['entries'][:-1], before['ledger']['entries'])
+            self.assertEqual(restored.ledger.unknown_dimensions(), ('total_tokens',))
+            self.assertEqual(restored.ledger.unknown_dimensions(current_allowance_only=True), ())
+            self.assertEqual(restored.ledger.remaining('total_tokens'), 100000)
+            provider.assert_not_called()
+
+    def test_explicit_resource_allowance_keeps_closed_unknown_llm_history_and_blocks_current_unknown(self):
+        with self._model_rebinding_fixture(outcome='ongoing') as (app, provider, _):
+            identity = Path(app.state['turns'][-1]['reply']).parent.name
+            self.assertIsNotNone(app._accepted_model_attempt(identity))
+            app.ledger.reserve('closed-uncapped', {'llm_requests': 1, 'total_tokens': 100},
+                session_id=app.session.manifest.session_id, attempt_id=identity,
+                logical_call_id=identity, purpose='native-turn')
+            app.ledger.mark_unknown('closed-uncapped', reason='Closed call without usage',
+                known_actual={'llm_requests': 1})
+            before = self._native_snapshot(app)
+            attempts = [row.to_dict() for row in app.session.list_attempts()]
+            app._authorize_resources({'total_tokens': 100000, 'llm_requests': 3},
+                'new-epoch', 'Explicit remaining allowance after the closed call')
+            app = ToolApplication.load(app.session.store.root)
+            retained = app.ledger.to_dict()
+            self.assertEqual(retained['entries'][:-1], before['ledger']['entries'])
+            self.assertEqual(app.ledger.unknown_dimensions(), ('total_tokens',))
+            self.assertEqual(app.ledger.unknown_dimensions(current_allowance_only=True), ())
+            self.assertEqual(app.ledger.remaining('total_tokens'), 100000)
+            self.assertEqual(app.state['turns'], before['state']['turns'])
+            self.assertEqual(self._native_receipts(app, app.state['turns']), before['receipts'])
+            self.assertEqual([row.to_dict() for row in app.session.list_attempts()], attempts)
+            app._authorize_resources({'total_tokens': 100000, 'llm_requests': 3},
+                'new-epoch', 'Explicit remaining allowance after the closed call')
+            self.assertEqual(app.ledger.to_dict(), retained)
+            provider.assert_not_called()
+            app.run(feedback='Continue under the explicitly authorized allowance', progress=lambda _: None)
+            provider.assert_called_once()
+            self.assertEqual(app.ledger.to_dict()['entries'][:len(retained['entries'])], retained['entries'])
+            self.assertEqual(app.ledger.remaining('llm_requests'), 2)
+            current = Path(app.state['turns'][-1]['reply']).parent.name
+            self.assertNotEqual(current, identity)
+            app.ledger.reserve('current-unknown', {'llm_requests': 1, 'total_tokens': 100},
+                session_id=app.session.manifest.session_id, attempt_id=current,
+                logical_call_id=current, purpose='native-turn')
+            app.ledger.mark_unknown('current-unknown', reason='Current epoch usage unknown',
+                known_actual={'llm_requests': 1})
+            self.assertEqual(app.ledger.unknown_dimensions(current_allowance_only=True), ('total_tokens',))
+            self.assertEqual(app.ledger.remaining('llm_requests'), 1)
+            ledger = app.ledger.to_dict()
+            provider.reset_mock()
+            self.assertEqual(app.run(feedback='Request another decision in the same allowance',
+                progress=lambda _: None)['status'], 'paused')
+            provider.assert_not_called()
+            self.assertEqual(app.ledger.to_dict(), ledger)
 
     def test_native_model_rebinding_commits_routes_identity_and_preserves_history_on_resume(self):
         for purpose, selector in (('task', 'profile:new'), ('code', 'route:default'),
