@@ -3607,12 +3607,22 @@ class ToolApplication:
                 except (ValueError, OSError, KeyError, RuntimeError) as exc:
                     payload.update(status='blocked', error=str(exc))
                     return payload
+            hashes = self.workspace.artifact_hashes(delivery['artifacts'])
+            retained = payload['metadata'].get('delivery_hashes')
+            if request.summary_source is not None:
+                try:
+                    if retained is not None and hashes != retained:
+                        raise ValueError('Final work outputs changed before summary binding; no delivery or replay')
+                    # Use this same inventory binding; terminal commit already
+                    # rechecks the files before saving or recovering a delivery.
+                    delivery['summary'] = self.workspace.delivery_summary(delivery, hashes)
+                except (ValueError, OSError) as exc:
+                    payload.update(status='blocked', error=str(exc))
+                    return payload
             if not self._completion(call['function']['name']).field:
                 payload['data'] = delivery
             else:
                 payload['data'][self._completion(call['function']['name']).field] = delivery
-            hashes = self.workspace.artifact_hashes(delivery['artifacts'])
-            retained = payload['metadata'].get('delivery_hashes')
             if retained is not None and hashes != retained:
                 payload['status'] = 'blocked'
                 payload['error'] = 'Final work outputs changed before delivery observation; preserve the pinned version and inspect results. No delivery or replay.'

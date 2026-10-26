@@ -587,7 +587,7 @@ class InspectionToolGateway:
         base = self._view(saved, request)
         pinned = {(row['path'], row['sha256']): row for role in ('targets', 'evidence')
             for row in base[role] if row.get('text_windows')}
-        blocks, current = [], []
+        blocks, current, read_turns = [], [], {}
         for message in history[2:]:
             if message['role'] == 'assistant' and current:
                 blocks.append(current)
@@ -595,6 +595,8 @@ class InspectionToolGateway:
             if message['role'] == 'tool':
                 result = json.loads(message['content'])
                 data = result.get('data', {})
+                if result.get('tool_name') == 'read_file' and result.get('status') == 'ok':
+                    read_turns[data.get('subject')] = len(blocks)
                 owner = pinned.get((data.get('path'), data.get('sha256')))
                 if (result.get('tool_name') == 'read_file' and result.get('status') == 'ok'
                         and owner and data.get('text_windows')
@@ -607,6 +609,19 @@ class InspectionToolGateway:
             current.append(message)
         if current:
             blocks.append(current)
+        # Supplementary evidence uses the same bounded material selector as
+        # ordinary work. Retiring a native turn must not retire its only usable
+        # source body while unused input capacity remains. Original read IDs,
+        # decoded ranges and receipts remain the authority for adoption.
+        observations = [{'record':self._path(saved['identity'], 'input'),
+            'chunk_id':f"{row['subject']}:{index}", 'subject':row['subject'],
+            'path':row['path'], 'sha256':row['sha256'], 'kind':'source_text',
+            'turn':read_turns.get(row['subject']), 'offset_bytes':window['offset_bytes'],
+            'next_offset_bytes':window['review_next_offset_bytes'],
+            'size_bytes':window['size_bytes'], 'text':window.get('review_text',window['text'])}
+            for row in saved['evidence'] if row.get('readable')
+                and row['subject'] not in saved.get('initial_subjects', [])
+            for index, window in enumerate(row['windows'])]
         base.pop('goal', None)
         base['reading_scope'] = ('Only the supplied decoded windows were observed. Retired source bodies '
             'remain in the original inspection records; read an authorized original path/range again '
@@ -614,7 +629,7 @@ class InspectionToolGateway:
             'and self-reported manifests do not replace actual source versions or scientific reasoning.')
         system = _SUBJECT_SYSTEM
         messages, metadata = select_working_context(user_requests=[request.goal],system_text=system,
-            base_context=base,turn_blocks=blocks,observations=[],
+            base_context=base,turn_blocks=blocks,observations=observations,
             schema_tokens=estimate_tokens(json.dumps(offered,ensure_ascii=False)),
             context_token_target=target,estimate_tokens=estimate_tokens,
             history_access='read_file at the recorded authorized source path and range')
@@ -732,7 +747,8 @@ class InspectionToolGateway:
             except (ValueError,KeyError,TypeError) as exc:
                 batch_error = str(exc)
             if terminal_only:
-                raise ValueError('Inspection source investigation bound reached; retain source reads and disclose incomplete scope')
+                raise ValueError('Inspection source investigation bound reached; retain source reads and disclose incomplete scope'
+                    + (f'; final response invalid: {batch_error}' if batch_error else ''))
             if not calls:
                 messages.append({'role':'user','content':
                     'Use the offered read tools for needed sources, or record_inspection for the final result.'})

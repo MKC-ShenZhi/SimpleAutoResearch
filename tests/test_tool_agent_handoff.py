@@ -1471,6 +1471,14 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
     def test_workspace_reads_exact_windows_and_enforces_mount_boundaries(self) -> None:
         run_dir, inputs, standalone = self._workspace_fixture()
+        replacement = standalone.workspace / 'replacement.txt'
+        replacement.write_bytes(b'\xff\xe4\x00')
+        replacement_read = standalone.call('read_file', {'path': 'workspace/replacement.txt'},
+            identity='replacement-window')
+        self.assertEqual(replacement_read.status, 'ok', replacement_read.error)
+        self.assertEqual(replacement_read.data, {'text': '\ufffd\ufffd\x00',
+            'sha256': hashlib.sha256(b'\xff\xe4\x00').hexdigest(), 'size_bytes': 3,
+            'next_offset_bytes': 3, 'has_more': False, 'absolute_path': str(replacement)})
         raw_lines = [f'line-{number}: α\n'.encode() for number in range(240)]
         (inputs / 'many-lines.txt').write_bytes(b''.join(raw_lines))
         line_window = standalone.call('read_file', {'path': 'source0/many-lines.txt',
@@ -1705,6 +1713,101 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             'artifacts': ['delivery-project']}, identity='bare-directory-delivery')
         self.assertEqual(bare.status, 'ok', bare.error)
         self.assertEqual(bare.data['artifacts'], delivered.data['artifacts'])
+        from simple_ar.tools.workspace import DeliveryRequest
+        text = standalone.workspace / 'excerpt.md'
+        text.write_bytes('标题\nrecall: 0.42\nprecision: 0.79\n'.encode('utf-8'))
+        source = {'path': 'workspace/excerpt.md', 'start_line': 2, 'max_lines': 1}
+        request = DeliveryRequest(summary='Unbound precision/recall claim',
+            summary_source=source, artifacts=['workspace/excerpt.md'])
+        self.assertEqual(request.model_dump()['summary_source'], source)
+        resolved = standalone.resolve_delivery(request)
+        hashes = standalone.artifact_hashes(resolved['artifacts'])
+        self.assertEqual(standalone.delivery_summary(resolved, hashes), 'recall: 0.42\n')
+        self.assertEqual(standalone.delivery_summary({**resolved,
+            'summary_source': {'path': 'excerpt.md', 'max_lines': 1}}, hashes), '标题\n')
+        self.assertEqual(standalone.delivery_summary({**resolved, 'summary_source': None}, hashes),
+            request.summary)
+        # Omitted max_lines must survive receipt serialization as omitted.
+        many_lines = standalone.workspace / 'many-lines.md'
+        many_lines.write_bytes(b'x\n' * 201)
+        byte_request = DeliveryRequest(summary='Fallback', artifacts=['workspace/many-lines.md'],
+            summary_source={'path': 'workspace/many-lines.md'})
+        restored_request = DeliveryRequest.model_validate(byte_request.model_dump())
+        self.assertNotIn('max_lines', restored_request.model_dump()['summary_source'])
+        byte_delivery = standalone.resolve_delivery(restored_request)
+        self.assertEqual(standalone.delivery_summary(byte_delivery,
+            standalone.artifact_hashes(byte_delivery['artifacts'])), 'x\n' * 201)
+        for invalid in ({'path': 'workspace/excerpt.md', 'offset_bytes': 1, 'max_bytes': 1},
+                        {'path': 'workspace/excerpt.md', 'offset_bytes': 9999},
+                        {'path': 'workspace/excerpt.md', 'start_line': 9999},
+                        {'path': 'source0/notes.txt'},
+                        {'path': 'workspace/many-lines.md'}):
+            with self.subTest(summary_source=invalid), self.assertRaises((ValueError, OSError)):
+                standalone.delivery_summary({**resolved, 'summary_source': invalid}, hashes)
+        for raw in (b'\xffbinary', b'text\x00binary', b'text\x01', b'text\x08',
+                    b'text\x0b', b'text\x1b', b'text\x7f', 'text\u0085'.encode('utf-8'), b'  \n'):
+            text.write_bytes(raw)
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                standalone.delivery_summary({**resolved,
+                    'summary_source': {'path': 'workspace/excerpt.md'}},
+                    standalone.artifact_hashes(resolved['artifacts']))
+        text.write_bytes(b'text\n\r\t\f')
+        self.assertEqual(standalone.delivery_summary({**resolved,
+            'summary_source': {'path': 'workspace/excerpt.md'}},
+            standalone.artifact_hashes(resolved['artifacts'])), 'text\n\r\t\f')
+        text.write_bytes(b'changed')
+        with self.assertRaisesRegex(ValueError, 'changed'):
+            standalone.delivery_summary(resolved, hashes)
+        # Preflight may name a future final file; it must never read old bytes.
+        future = DeliveryRequest(summary='Fallback', artifacts=['workspace/future.md'],
+            summary_source={'path': 'workspace/future.md'})
+        self.assertEqual(standalone.resolve_delivery(future,
+            writing=standalone.workspace / 'future.md')['summary'], 'Fallback')
+        _, _, _, _, app, _ = self._native_fixture(mount_inputs=False, max_turns=1)
+        from simple_ar.tools.specs import ToolResult
+        for raw, selection in ((b'current', {'path': 'workspace/not-delivered.md'}),
+                               (b'\xffbinary', {'path': 'workspace/current.md'}),
+                               (b'current', {'path': 'workspace/current.md', 'offset_bytes': 99})):
+            with self.subTest(binding_source=selection):
+                (app.workspace.workspace / 'current.md').write_bytes(raw)
+                proposal = {'summary': 'Never display this fallback as a bound result',
+                    'artifacts': ['workspace/current.md'], 'summary_source': selection}
+                call = self._native_message('deliver_result', proposal, 'source-failure')['tool_calls'][0]
+                payload = ToolResult(tool_name='deliver_result', data=proposal).model_dump(mode='json')
+                app._bind_delivery(call, payload, app.session.store)
+                self.assertEqual(payload['status'], 'blocked')
+                self.assertNotIn('delivery_hashes', payload['metadata'])
+                self.assertFalse(app.session.store.exists('delivery.json'))
+        current = app.workspace.workspace / 'current.md'
+        current.write_bytes(b'current')
+        proposal = {'summary': 'Fallback', 'artifacts': ['workspace/current.md'],
+            'summary_source': {'path': 'workspace/current.md'}}
+        call = self._native_message('deliver_result', proposal, 'source-change')['tool_calls'][0]
+        payload = ToolResult(tool_name='deliver_result', data=proposal).model_dump(mode='json')
+        original_summary = app.workspace.delivery_summary
+        def change_after_summary(*args):
+            summary = original_summary(*args)
+            current.write_bytes(b'changed after excerpt')
+            return summary
+        with patch.object(app.workspace, 'delivery_summary', side_effect=change_after_summary):
+            app._bind_delivery(call, payload, app.session.store)
+        # The common terminal commit already rechecks delivery_hashes. Do not
+        # add a second inventory hash here; retain the original bound summary.
+        self.assertEqual(payload['status'], 'ok')
+        self.assertEqual(payload['data']['summary'], 'current')
+        self.assertNotEqual(payload['metadata']['delivery_hashes'],
+            app.workspace.artifact_hashes(proposal['artifacts']))
+        with patch.object(app.workspace, 'delivery_summary', side_effect=AssertionError('Do not refresh a stale bound summary')):
+            app._bind_delivery(call, payload, app.session.store)
+        self.assertEqual(payload['status'], 'blocked')
+        self.assertEqual(payload['data']['summary'], 'current')
+        pinned = app.workspace.artifact_hashes(proposal['artifacts'])
+        current.write_bytes(b'changed after producer pin')
+        payload = ToolResult(tool_name='deliver_result', data=proposal,
+            metadata={'delivery_hashes': pinned}).model_dump(mode='json')
+        with patch.object(app.workspace, 'delivery_summary', side_effect=AssertionError('No new summary for stale output')):
+            app._bind_delivery(call, payload, app.session.store)
+        self.assertEqual(payload['status'], 'blocked')
         listed = standalone.call('list_directory', {'path': 'delivery-project', 'recursive': True}, identity='bare-directory-list')
         self.assertEqual(listed.status, 'ok', listed.error)
         self.assertEqual(standalone.call('deliver_result', {'summary': 'Wrong ownership',
@@ -5168,8 +5271,10 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
     def test_native_terminal_commit_recovers_bound_receipts_and_separates_feedback(self) -> None:
         from simple_ar.tools.specs import ToolResult
-        for name in ('deliver_result', 'write_file', 'export_report', 'run_process', 'ask_user'):
-            with self.subTest(name=name):
+        for name, sourced, overwrite in [(name, sourced, False)
+                for name in ('deliver_result', 'write_file', 'export_report', 'run_process', 'ask_user')
+                for sourced in (False, True) if name != 'ask_user' or not sourced] + [('write_file', True, True)]:
+            with self.subTest(name=name, summary_source=sourced, overwrite=overwrite):
                 # Only the deferred export case requires the historical eager offer.
                 eager = {'tool_contracts': 'full', 'context_target': 64000} if name == 'export_report' else {}
                 _, _, fake, _, app, _ = self._native_fixture(mount_inputs=False, max_turns=1, **eager)
@@ -5177,6 +5282,9 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 draft.write_text('Bound result')
                 delivery = {'summary': 'Retained result', 'artifacts': ['workspace/draft.md'],
                             'unresolved': ['Not reviewed']}
+                if sourced:
+                    delivery['summary_source'] = {'path': 'workspace/published.md'
+                        if name == 'export_report' else 'workspace/draft.md'}
                 args = {'deliver_result': delivery,
                         'write_file': {'path': 'workspace/final.md', 'content': 'Final result',
                             'delivery': {**delivery, 'artifacts': ['workspace/final.md']}},
@@ -5185,51 +5293,96 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                         'run_process': {'argv': ['python', '-c', "from pathlib import Path; Path('draft.md').write_text('Bound result')"],
                             'delivery': delivery},
                         'ask_user': {'question': 'Which result is wanted?'}}[name]
+                if sourced and name == 'write_file':
+                    args['delivery']['summary_source'] = {'path': 'workspace/final.md'}
+                    if overwrite:
+                        (app.workspace.workspace / 'final.md').write_bytes(b'Old output')
+                        args['expected_sha256'] = hashlib.sha256(b'Old output').hexdigest()
+                if sourced and name == 'run_process':
+                    args['argv'][-1] = "from pathlib import Path; Path('draft.md').write_text('Process result')"
                 fake.chat_turn.side_effect = [self._native_message(name, args, 'terminal')]
                 # Interrupt after the native terminal observation and closed queue
                 # are durable. Export is a fixture; real process recovery is covered
                 # by the existing execution test, without running a renderer here.
+                def exported(*_args, **_kwargs):
+                    if sourced:
+                        from simple_ar.tools.workspace import DeliveryRequest
+                        # Real export preflights the original extras, then adds
+                        # its generated files. This source does not exist yet.
+                        app.workspace.resolve_delivery(DeliveryRequest.model_validate(delivery))
+                        (app.workspace.workspace / 'published.md').write_bytes(b'Published result')
+                        result_delivery = {**delivery,
+                            'artifacts': [*delivery['artifacts'], 'workspace/published.md']}
+                    else:
+                        result_delivery = delivery
+                    return ToolResult(tool_name='export_report', data={'delivery': result_delivery})
+
                 with patch('simple_ar.tools.publication.PublicationToolGateway.call',
-                        return_value=ToolResult(tool_name='export_report', data={'delivery': delivery})), \
+                        side_effect=exported), \
                         patch.object(app.session, 'pause' if name == 'ask_user' else 'complete',
                             side_effect=KeyboardInterrupt('interrupt terminal state commit')):
                     self.assertEqual(app.run(approve=lambda *_: True,
                         progress=lambda _: None)['status'], 'paused')
+                observation = app.session.store.root / app.state['turns'][-1]['tools'][-1]['result']
+                observation_bytes = observation.read_bytes()
+                saved_bytes = (app.session.store.root / 'delivery.json').read_bytes() if name != 'ask_user' else None
                 restored = ToolApplication.load(app.session.store.root)
                 before = restored.ledger.snapshot()
-                with patch.object(restored.gateway, 'call', side_effect=AssertionError('Do not reexecute')):
+                with patch.object(restored.gateway, 'call', side_effect=AssertionError('Do not reexecute')), \
+                        patch.object(restored.workspace, 'delivery_summary', side_effect=AssertionError('Do not reextract a closed observation')):
                     self.assertEqual(restored.run(progress=lambda _: None)['status'],
                                      'paused' if name == 'ask_user' else 'partial')
                     self.assertEqual(restored.run(progress=lambda _: None)['status'],
                                      'paused' if name == 'ask_user' else 'partial')
                 self.assertEqual(fake.chat_turn.call_count, 1)
                 self.assertEqual(restored.ledger.snapshot(), before)
+                self.assertEqual(observation.read_bytes(), observation_bytes)
+                if saved_bytes is not None:
+                    self.assertEqual((restored.session.store.root / 'delivery.json').read_bytes(), saved_bytes)
                 if name == 'ask_user':
                     self.assertEqual(restored.session.manifest.status_reason, args['question'])
                 else:
                     self.assertEqual(restored.session.store.read_json('delivery.json')['unresolved'],
                                      delivery['unresolved'])
+                    saved = restored.session.store.read_json('delivery.json')
+                    self.assertEqual(saved['summary'],
+                        {'write_file': 'Final result', 'run_process': 'Process result',
+                            'export_report': 'Published result', 'deliver_result': 'Bound result'}[name]
+                        if sourced else 'Retained result')
+                    self.assertEqual('summary_source' in saved, sourced)
 
         # Changed artifacts cannot acquire a new binding during recovery; a new
         # feedback revision cannot accidentally commit the old terminal receipt.
-        _, _, fake, _, app, _ = self._native_fixture(mount_inputs=False, max_turns=2)
-        result = app.workspace.workspace / 'result.txt'
-        result.write_text('original')
-        fake.chat_turn.side_effect = [self._native_message('deliver_result', {
-            'summary': 'Original', 'artifacts': [str(result)]}, 'old-terminal')]
-        with patch.object(app.session, 'complete', side_effect=KeyboardInterrupt('before complete')):
-            self.assertEqual(app.run(progress=lambda _: None)['status'], 'paused')
-        result.write_text('changed')
-        restored = ToolApplication.load(app.session.store.root)
-        self.assertEqual(restored.run(progress=lambda _: None)['status'], 'paused')
-        self.assertIn('changed', restored.session.manifest.status_reason)
-        self.assertEqual(fake.chat_turn.call_count, 1)
-        fake.chat_turn.side_effect = [self._native_message('ask_user', {
-            'question': 'Inspect the changed result?'}, 'new-question')]
-        self.assertEqual(restored.run(feedback='Inspect the changed result first',
-            progress=lambda _: None)['status'], 'paused')
-        self.assertEqual(restored.session.manifest.status_reason, 'Inspect the changed result?')
-        self.assertEqual(fake.chat_turn.call_count, 2)
+        for sourced in (False, True):
+            with self.subTest(changed_source=sourced):
+                _, _, fake, _, app, _ = self._native_fixture(mount_inputs=False, max_turns=2)
+                result = app.workspace.workspace / 'result.txt'
+                result.write_text('original')
+                delivery = {'summary': 'Original', 'artifacts': [str(result)]}
+                if sourced:
+                    delivery['summary_source'] = {'path': str(result)}
+                fake.chat_turn.side_effect = [self._native_message('deliver_result', delivery, 'old-terminal')]
+                with patch.object(app.session, 'complete', side_effect=KeyboardInterrupt('before complete')):
+                    self.assertEqual(app.run(progress=lambda _: None)['status'], 'paused')
+                saved_bytes = (app.session.store.root / 'delivery.json').read_bytes()
+                observation = app.session.store.root / app.state['turns'][-1]['tools'][-1]['result']
+                observation_bytes = observation.read_bytes()
+                result.write_text('changed')
+                restored = ToolApplication.load(app.session.store.root)
+                with patch.object(restored.workspace, 'delivery_summary', side_effect=AssertionError('Do not overwrite the old summary')):
+                    self.assertEqual(restored.run(progress=lambda _: None)['status'], 'paused')
+                self.assertIn('changed', restored.session.manifest.status_reason)
+                self.assertEqual((restored.session.store.root / 'delivery.json').read_bytes(), saved_bytes)
+                self.assertEqual(observation.read_bytes(), observation_bytes)
+                self.assertEqual(restored.session.store.read_json('delivery.json')['summary'],
+                    'original' if sourced else 'Original')
+                self.assertEqual(fake.chat_turn.call_count, 1)
+                fake.chat_turn.side_effect = [self._native_message('ask_user', {
+                    'question': 'Inspect the changed result?'}, 'new-question')]
+                self.assertEqual(restored.run(feedback='Inspect the changed result first',
+                    progress=lambda _: None)['status'], 'paused')
+                self.assertEqual(restored.session.manifest.status_reason, 'Inspect the changed result?')
+                self.assertEqual(fake.chat_turn.call_count, 2)
 
     def test_disconnected_progress_does_not_abort_or_replay_work(self) -> None:
         for boundary in (1, 2, 3):

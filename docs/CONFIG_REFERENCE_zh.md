@@ -600,6 +600,7 @@ app = create_research_task(ResearchBrief(request_text="测量所提供的程序�
 | `completion_policy="available_operations.v1"`（新操作任务） | 在实际资源与审批限制内保留可用操作，最后一次可负担决策也能留下有用的中间工作。耗尽暂停并保留成果；只有显式且校验通过的交付才算完成。保存任务保留原末次／保护决策策略。 |
 | `report={"status":"canonical","manuscript":"report.md","formats":["markdown","pdf"]}` | 交付声明可编辑正文及所需格式；完整交付须有当前正文的独立检查，以及需要时与其匹配的出版物，文件存在不足以证明完成。 |
 | 交付中的 `limitations`／`unresolved` | 前者说明研究范围、不确定性或不可得测量；后者说明尚未完成的请求或必改缺陷，并使交付为部分完成。都不能用于虚报质量。 |
+| 交付中的 `summary_source={"path":"report.md","offset_bytes":0,"max_bytes":1024}` | 可选的实际交付文本窗口。最终产出成功后，以原文替换自由 `summary`，来源须在本次交付集合内，并沿原交付哈希核版本；缺失、不可读或无效UTF-8窗口不回退自由摘要。省略保留原自由说明合同；摘录不认证科学正确性或代表全文。 |
 | `create_research_task(..., allow_vision=True)` | 严格布尔值，默认 `False`；须有命名 vision 路由及连接，共用 `services.budget_limits`。文字或注入文本客户端不授权视觉检查；不授予来源联网、图像生成，不改旧权限或返回类型。 |
 | `supply(..., replace_existing=True)` | 调用方可明确替换 `delivery_files`、`tool_contracts` 或 `completion_policy`；无关补齐保留策略及账本。 |
 

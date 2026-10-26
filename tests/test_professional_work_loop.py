@@ -1208,6 +1208,52 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(self.app.ledger.to_dict(), ledger)
         self.assertEqual(self._versions(self.root/f'tools/inspection/{identity}'), records)
 
+    def test_inspection_reuses_retired_evidence_in_the_common_working_view(self):
+        from dataclasses import replace
+
+        self.services.llm_client = LLMClient(replace(self.services.llm_client._settings,
+            context_input_tokens=9000))
+        self._create()
+        self._write('notes.md', 'The observed sample mean is 2.0.\n')
+        self._write('basis.txt', 'Observed sample values are 1, 2, 3; their mean is 2.0.\n')
+        for index in range(2):
+            self._write(f'context-{index}.txt', f'Other authorized context {index}.\n'+'Unrelated. '*1600)
+
+        def review(view):
+            number = len(self.inspection_views)
+            if number == 1:
+                return [_action('read_file', path='basis.txt', max_bytes=1024)]
+            if number < 4:
+                return [_action('read_file', path=f'context-{number-2}.txt', max_bytes=16000)]
+            self.assertGreater(view['working_view']['history']['archive_end_turn'], 0)
+            supplied = [row['observation'] for row in view['working_view']['observations']]
+            basis, = [row for row in supplied if row['subject']=='evidence-1']
+            self.assertEqual(basis['text'], 'Observed sample values are 1, 2, 3; their mean is 2.0.\n')
+            self.assertEqual(basis['sha256'], _digest(self.root/'workspace/basis.txt'))
+            self.assertEqual(basis['next_offset_bytes'],len(basis['text'].encode()))
+            return {'decisions':[{'subject':'target-1','evidence':['evidence-1'],
+                'findings':[],'limitations':[]}]}
+
+        self.review = review
+        result = self._inspect([{'path':'notes.md','max_bytes':1024}], [])
+        self.assertEqual(result['status'], 'ok', result.get('error'))
+        self.assertEqual(self._assessment()['verdict'], 'passed')
+        self.assertEqual(self._assessment()['evidence_sha256'],
+            {str(self.root/'workspace/basis.txt'):_digest(self.root/'workspace/basis.txt')})
+        for request in self.inspection_requests:
+            self.assertLessEqual(request['messages'][1]['content'].count('working_view'),1)
+        identity = Path(result['data']['record']).parts[1]
+        retained = self._versions(self.root/f'tools/inspection/{identity}')
+        calls, ledger = self.send.call_count, self.app.ledger.to_dict()
+        self._reload()
+        cached = self.app.operations.inspection.call('inspect_artifacts',
+            {'goal':'Check the claims against supplied observations',
+             'targets':[{'path':'notes.md','max_bytes':1024}], 'evidence':[]}, identity)
+        self.assertEqual(cached.status,'ok',cached.error)
+        self.assertEqual(self.send.call_count,calls)
+        self.assertEqual(self.app.ledger.to_dict(),ledger)
+        self.assertEqual(self._versions(self.root/f'tools/inspection/{identity}'),retained)
+
     def test_inspector_locates_missing_sources_within_one_version_bound_operation(self):
         self._create(report=True)
         self._write('notes.md','The sample mean is 2.0 from three observations.\n')
@@ -1443,13 +1489,13 @@ class OperationsWorkLoopTests(unittest.TestCase):
     def test_inspection_low_capacity_still_requires_a_real_terminal_opinion(self):
         # Request pressure, token pressure, and unknown prior usage all use
         # the same owner; none may synthesize a successful assessment.
-        for mode in ('one_request', 'tokens', 'unoffered_read', 'unknown', 'bounded_prior'):
+        for mode in ('one_request', 'tokens', 'unoffered_read', 'invalid_final', 'unknown', 'bounded_prior'):
             with self.subTest(mode=mode):
                 self.root = self.directory/mode
                 self._create()
                 self._write('report.md', 'The sample mean is 2.0.\n')
                 ledger = self.app.ledger
-                if mode in {'one_request', 'unoffered_read'}:
+                if mode in {'one_request', 'unoffered_read', 'invalid_final'}:
                     ledger.limits['llm_requests'] = 2  # caller floor + final opinion
                 if mode == 'tokens':
                     # Direct operation below has no caller floor; its current
@@ -1468,6 +1514,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
                         self.inspection_requests[-1]['tools']}, {'record_inspection'})
                     if mode == 'unoffered_read':
                         return [_action('read_file', path='measurements/conditions.txt')]
+                    if mode == 'invalid_final':
+                        return {'decisions':[]}
                     return {'findings': [{'subject': 'target-1', 'severity': 'required',
                         'message': 'The necessary source comparison has not been established.'}],
                         'limitations': ['Source gathering ended at the available capacity.']}
@@ -1483,6 +1531,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 self.assertEqual(_assessments(result.model_dump(mode='json'))[0]['verdict'],
                     'needs_revision' if mode in {'one_request', 'tokens','bounded_prior'} else 'incomplete')
                 self.assertFalse(self._process_receipts())
+                if mode == 'invalid_final':
+                    self.assertIn('final response invalid', result.error)
+                    self.assertIn('exactly one decision per target', result.error)
                 if mode == 'unoffered_read':
                     identity = Path(result.data['record']).parts[1]
                     trace = self.app.session.store.read_json(f'tools/inspection/{identity}/sources-0.json')

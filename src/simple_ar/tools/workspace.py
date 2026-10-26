@@ -14,7 +14,7 @@ import tempfile
 import zipfile
 from typing import Any, Iterable, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
 from simple_ar.core.artifacts import read_json, replace_exact_spans
 from simple_ar.core.budget import BudgetError, BudgetLedger
@@ -110,6 +110,8 @@ class ReportDelivery(BaseModel):
 class DeliveryRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     summary: str = Field(min_length=1)
+    summary_source: FileWindow | None = Field(default=None, exclude_if=lambda value: value is None,
+        description='Optional exact UTF-8 window of an actual delivered text file. After final work succeeds, the delivery owner replaces summary with this window and checks its existing delivery byte binding. No semantic representativeness or scientific correctness is certified. Omit to retain the free summary contract.')
     artifacts: list[str] = Field(default_factory=list,
         description="Existing workspace outputs (workspace-relative or explicitly mounted paths) or retained files in this task's evidence mount. Evidence remains read-only and is referenced, not copied or certified. Directories expand to a snapshot of at most 200 accessible files; private paths, virtual environments, Python bytecode caches and symlinks are excluded by the existing inventory rules. Oversized inventories must be narrowed explicitly; this is not an archive or correctness certificate.")
     unresolved: list[str] = Field(default_factory=list,
@@ -118,6 +120,12 @@ class DeliveryRequest(BaseModel):
         description='Scope, unavailable evidence and uncertainty honestly stated in the completed work. These do not by themselves mean the requested task is unfinished, and cannot waive required findings.')
     report: ReportDelivery | None = Field(default=None, exclude_if=lambda value: value is None,
         description='For a formal report, identify the current editable manuscript and requested formats. Canonical means current required checks passed; candidate means unfinished work disclosed. Publication must match that manuscript; no scientific certification.')
+
+    @field_serializer('summary_source')
+    def serialize_summary_source(self, value: FileWindow | None) -> dict[str, Any] | None:
+        # Explicit max_lines bounds byte windows; an omitted default must not
+        # become an explicit bound when a receipt is parsed during recovery.
+        return value.model_dump(exclude_unset=True) if value is not None else None
 
 
 class _Write(_Path):
@@ -890,46 +898,8 @@ class WorkspaceToolGateway:
                                         for p in selected], "next_offset": model.offset + len(selected),
                             "has_more": model.offset + len(selected) < len(children)}
                 elif name == "read_file":
-                    # Digest is streamed; large files are not materialized or sent to the model.
-                    with target.open("rb") as handle:
-                        def version(stat: os.stat_result | None = None) -> tuple:
-                            stat = stat if stat is not None else os.fstat(handle.fileno())
-                            return (str(target), stat.st_dev, stat.st_ino, stat.st_size,
-                                stat.st_mtime_ns, stat.st_ctime_ns)
-
-                        before = version()
-                        size = before[3]
-                        model.validate_read_size(size)
-                        digest = None
-                        if size <= 256000 or model.full_digest:
-                            # An internal caller owns this ephemeral dictionary.
-                            # Cache only an actual digest of this opened version,
-                            # independent of offset/byte/line limits. Every call
-                            # still resolves authority, opens and reads its window.
-                            digest = read_cache.get(before) if read_cache is not None else None
-                            if digest is None:
-                                digest = hashlib.file_digest(handle, "sha256").hexdigest()
-                        offset = model.offset_bytes
-                        if model.start_line is not None:
-                            handle.seek(0)
-                            lines = io.BytesIO(handle.read(256001)).readlines()
-                            offset = sum(map(len, lines[:model.start_line - 1]))
-                            raw = b"".join(lines[model.start_line - 1:model.start_line - 1 + model.max_lines])[:model.max_bytes]
-                        else:
-                            handle.seek(offset)
-                            raw = handle.read(model.max_bytes)
-                            if 'max_lines' in model.model_fields_set:
-                                raw = b''.join(io.BytesIO(raw).readlines()[:model.max_lines])
-                        if (version() != before or self.resolve(model.path) != target
-                                or version(target.stat()) != before):
-                            raise ValueError('File changed during material read; inspect its current window')
-                        if read_cache is not None and digest is not None:
-                            read_cache[before] = digest
-                    data = {"text": raw.decode("utf-8", errors="replace"), "sha256": digest,
-                            "size_bytes": size, "next_offset_bytes": offset + len(raw),
-                            "has_more": offset + len(raw) < size}
-                    if model.start_line is not None:
-                        data.update(start_line=model.start_line, offset_bytes=offset)
+                    raw, data = self._read_file_window(target, model, read_cache=read_cache)
+                    data = {"text": raw.decode("utf-8", errors="replace"), **data}
                 else:
                     delivery = None
                     if name == "write_file" and model.delivery is not None:
@@ -1160,6 +1130,78 @@ class WorkspaceToolGateway:
         if any(path != writing and not path.is_file() for path in paths):
             raise ValueError("Delivery references a missing workspace file")
         return {**request.model_dump(), 'artifacts': artifacts}
+
+    def _read_file_window(self, target: Path, request: FileWindow, *,
+                          read_cache: dict | None = None,
+                          require_digest: bool = False) -> tuple[bytes, dict[str, Any]]:
+        """Read one authorized opened version; no decoding, accounting or records.
+
+        Delivery needs a streamed digest even for a large byte window. Ordinary
+        read_file retains its original optional full-digest policy and cache.
+        """
+        with target.open('rb') as handle:
+            def version(stat: os.stat_result | None = None) -> tuple:
+                stat = stat if stat is not None else os.fstat(handle.fileno())
+                return (str(target), stat.st_dev, stat.st_ino, stat.st_size,
+                    stat.st_mtime_ns, stat.st_ctime_ns)
+
+            before = version()
+            size = before[3]
+            request.validate_read_size(size)
+            digest = None
+            if size <= 256000 or request.full_digest or require_digest:
+                # Cache only this opened version, independently of the window.
+                # Every consumer still resolves authority, opens and reads.
+                digest = read_cache.get(before) if read_cache is not None else None
+                if digest is None:
+                    digest = hashlib.file_digest(handle, 'sha256').hexdigest()
+            offset = request.offset_bytes
+            if request.start_line is not None:
+                handle.seek(0)
+                lines = io.BytesIO(handle.read(256001)).readlines()
+                offset = sum(map(len, lines[:request.start_line - 1]))
+                raw = b''.join(lines[request.start_line - 1:
+                    request.start_line - 1 + request.max_lines])[:request.max_bytes]
+            else:
+                handle.seek(offset)
+                raw = handle.read(request.max_bytes)
+                if 'max_lines' in request.model_fields_set:
+                    raw = b''.join(io.BytesIO(raw).readlines()[:request.max_lines])
+            if (version() != before or self.resolve(request.path) != target
+                    or version(target.stat()) != before):
+                raise ValueError('File changed during material read; inspect its current window')
+            if read_cache is not None and digest is not None:
+                read_cache[before] = digest
+        data = {'sha256': digest, 'size_bytes': size,
+            'next_offset_bytes': offset + len(raw), 'has_more': offset + len(raw) < size}
+        if request.start_line is not None:
+            data.update(start_line=request.start_line, offset_bytes=offset)
+        return raw, data
+
+    def delivery_summary(self, delivery: dict[str, Any], hashes: dict[str, str]) -> str:
+        """Materialize only at the common post-production delivery binding.
+
+        resolve_delivery also serves producer preflight, where a new file may
+        not exist yet. Never read a summary there. The caller supplies the normal
+        delivery hashes, not a second summary version or a new source authority.
+        """
+        if delivery.get('summary_source') is None:
+            return delivery['summary']
+        window = FileWindow.model_validate(delivery['summary_source'])
+        target = self.resolve(window.path)
+        locator = next((value for value in delivery['artifacts'] if self.resolve(value) == target), None)
+        if locator is None:
+            raise ValueError('Summary source must belong to the actual delivery')
+        raw, observed = self._read_file_window(target, window, require_digest=True)
+        if observed['sha256'] != hashes.get(locator):
+            raise ValueError('Summary source changed during delivery binding')
+        # Replacement decoding would silently change the selected bytes. A
+        # split UTF-8 character, binary data or empty window must fail closed.
+        text = raw.decode('utf-8')
+        if not text.strip() or any((ord(char) < 32 or 127 <= ord(char) <= 159)
+                and char not in '\n\r\t\f' for char in text):
+            raise ValueError('Summary source requires a nonempty UTF-8 text window without control characters')
+        return text
 
     def _list_files(self, target: Path, request: _List) -> dict[str, Any]:
         return list_project_files(target, request, resolve=self.resolve, listed_path=self._listed_path)

@@ -9,9 +9,10 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 ### Improved
 
 - `ToolApplication.create` now uses the common operation loop exclusively. Historical professional controllers remain resumable through their saved contracts; new legacy-controller requests are rejected before creation. Chinese Markdown and ordinary artifact delivery do not require PDF publication.
-- Working notes and independent inspection reuse recorded observations through bounded inputs. Supplementary target reads stay with their target without duplicating the same window in the current view or listing the target as its own independent evidence. Partial reads, failed summaries and malformed calls cannot claim completed work. Original material, receipts and historical contracts remain available.
+- Working notes and independent inspection reuse read targets and evidence through the shared bounded view, reducing material loss after history retirement. Windows are not duplicated and targets cannot be their own independent evidence. Partial reads, failed summaries and malformed calls cannot claim completion; original material, receipts and historical contracts remain available.
 - Ordinary tasks can delegate coherent source creation or revision using existing materials and candidates. Editable source capacity is separate from immutable input copies. Completely read, version-bound editable originals accept full-file revisions as well as exact replacements; approval and input protections still apply.
 - Publication checks the manuscript's actual presentation dependencies. Unused older previews no longer block current export or recovery; consumed figures and their producer versions remain checked.
+- Delivery descriptions can quote a text window from an actual delivered artifact, bound by the existing delivery hashes after successful final writing, execution or publication. Ordinary reads and excerpts share one file-window implementation. An excerpt proves its source, not scientific correctness or representativeness.
 - Named connections can retune streaming without replacing the saved model or receiver. A failed call still requires explicit recovery; historical settings and unknown charges remain unchanged.
 
 ### Fixed
