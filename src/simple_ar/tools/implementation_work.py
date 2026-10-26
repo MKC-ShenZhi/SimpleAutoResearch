@@ -82,6 +82,8 @@ def prepare_work(owner: Any, request: Any, store: ArtifactStore, output: Path,
     request_data = request.model_dump()
     if store.exists('request.json'):
         saved = store.read_json('request.json')
+        if saved.get('source_decision_protocol') not in (None, 'native.v1'):
+            raise ValueError('Unknown retained source decision protocol')
         if saved.get('source_edit_contract') not in (None, 'bound_content.v1'):
             raise ValueError('Unknown retained source edit contract')
         if saved['generation_method'] not in {PROFESSIONAL_GENERATION, REGISTERED_PROJECT_GENERATION} or saved['request'] != request_data:
@@ -223,6 +225,7 @@ def prepare_work(owner: Any, request: Any, store: ArtifactStore, output: Path,
         owner.execution_observations() if owner.execution_observations else [])
     binding = {'generation_method': REGISTERED_PROJECT_GENERATION if retained else PROFESSIONAL_GENERATION,
         'request': request_data,
+        **({'source_decision_protocol': owner.decision_protocol} if owner.decision_protocol else {}),
         'argv_semantics': 'candidate_relative.v2',
         'source_windows': windows, 'original_files': originals,
         'execution_observations': observations, 'investigation': sources.context(),
@@ -249,6 +252,7 @@ def prepare_work(owner: Any, request: Any, store: ArtifactStore, output: Path,
         execution_observations=observations, execution_requested=request.execution_requested, investigation=sources,
         candidate_admission=bool(request.candidate_admission), dependency_advice=advice,
         command_source_binding=binding,
+        decision_protocol=owner.decision_protocol,
         validate_destination=lambda name: owner._feedback_destination(output, name, retained))
     sources.validate()
     if retained and owner._retained_candidate(project, identity=identity, complete_project=True) != retained:

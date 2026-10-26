@@ -465,6 +465,7 @@ class ImplementationToolGateway:
                  preparation_only: bool = False,
                  input_contract: str | None = None,
                  source_edit_contract: str | None = None,
+                 decision_protocol: str | None = None,
                  measurement: dict[str, Any] | None = None,
                  measurement_supplier: Callable[[], dict[str, Any] | None] | None = None,
                  exact: dict[str, Any] | None = None) -> None:
@@ -474,6 +475,10 @@ class ImplementationToolGateway:
         preserved_input_limits(input_contract)
         if source_edit_contract not in (None, 'bound_content.v1'):
             raise ValueError('Unknown source edit contract')
+        if decision_protocol not in (None, 'native.v1'):
+            raise ValueError('Unknown source decision protocol')
+        if decision_protocol is not None and not preparation_only:
+            raise ValueError('Native source decisions require ordinary source preparation')
         if input_contract is not None and not preparation_only:
             raise ValueError('Independent input admission requires ordinary source preparation')
         self.root, self.workspace, self.ledger = root, workspace, ledger
@@ -483,6 +488,7 @@ class ImplementationToolGateway:
         self.preparation_only = preparation_only
         self.input_contract = input_contract
         self.source_edit_contract = source_edit_contract
+        self.decision_protocol = decision_protocol
         self.client_factory = client_factory
         self.execution_observations = execution_observations
         self.candidate_outputs = candidate_outputs

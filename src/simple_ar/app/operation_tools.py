@@ -114,6 +114,7 @@ class OperationTools:
                 preparation_only=not exact,
                 input_contract='bounded_inputs.v2' if not exact and preparation in {'prepared.v2','prepared.v3'} else None,
                 source_edit_contract='bound_content.v1' if not exact and preparation == 'prepared.v3' else None,
+                decision_protocol=config.get('source_decision_protocol') if not exact else None,
                 execution_observations=execution_observations if not exact else None,
                 work_context=work_context if not exact else None,
                 material_observations=material_observations if not exact else None,

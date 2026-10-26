@@ -2030,10 +2030,12 @@ class OperationsWorkLoopTests(unittest.TestCase):
 
         def source_response(mode, request, **kwargs):
             self.assertEqual(mode,'chat')
-            self.assertFalse(request.get('tools'))
+            self.assertIn('submit_candidate', {tool['function']['name'] for tool in request['tools']})
             self.assertIn('Implement one coherent, bounded code work unit',request['messages'][0]['content'])
-            return {'choices':[{'message':{'role':'assistant','content':json.dumps(proposal)},
-                'finish_reason':'stop'}],
+            return {'choices':[{'message':{'role':'assistant','content':None, 'tool_calls': [{
+                'id':'candidate', 'type':'function', 'function': {
+                    'name':'submit_candidate', 'arguments':json.dumps(proposal)}}]},
+                'finish_reason':'tool_calls'}],
                 'usage':{'prompt_tokens':100,'completion_tokens':40,'total_tokens':140}}
 
         # Only source generation is mocked; admission, execution, receipts and

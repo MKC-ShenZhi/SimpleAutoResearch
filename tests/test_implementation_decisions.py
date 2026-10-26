@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from simple_ar.app.tool_application import ToolApplication
 from tests.native_history_fixture import load_native_history
@@ -28,21 +28,40 @@ class ImplementationDecisionTests(unittest.TestCase):
         self.services = SimpleNamespace(llm_client=client)
         self.send = self.enterContext(patch('simple_ar.integrations.llm._call_openai_sdk',
             side_effect=self._provider))
-        self.coordinator = self.enterContext(patch.object(LLMClient, 'chat_turn',
-            side_effect=AssertionError('Preparation must not call the coordinator')))
+        self.coordinator = Mock(side_effect=AssertionError('Preparation must not call the coordinator'))
+        native_chat = LLMClient.chat_turn
+        def generation_turn(client, messages, *, tools, **kwargs):
+            names = {tool['function']['name'] for tool in tools}
+            if not names or not names <= {'read_source_windows', 'focus_source_observations', 'submit_candidate'}:
+                return self.coordinator()
+            return native_chat(client, messages, tools=tools, **kwargs)
+        self.enterContext(patch.object(LLMClient, 'chat_turn', generation_turn))
 
     def _provider(self, mode, request, **kwargs):
         self.assertEqual(mode, 'chat')
-        self.assertFalse(request.get('tools'))
         self.assertIn('Implement one coherent, bounded code work unit', request['messages'][0]['content'])
         prompt, _ = json.JSONDecoder().raw_decode(request['messages'][1]['content'])
         self.prompts.append(prompt)
-        self.assertTrue(self.responses, 'Unexpected extra model step: ' + request['messages'][-1]['content'][-2500:])
+        self.assertTrue(self.responses, 'Unexpected extra model step: ' + str(request['messages'][-1])[-2500:])
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
         finish, content = response if isinstance(response, tuple) else ('stop', json.dumps(response))
-        return {'choices': [{'message': {'role': 'assistant', 'content': content}, 'finish_reason': finish}],
+        message = content if isinstance(content, dict) else {'role': 'assistant', 'content': content}
+        if request.get('tools') and not isinstance(response, tuple):
+            if 'read_windows' in response:
+                name = 'read_source_windows'
+                arguments = {'read_windows': response['read_windows'], **({'retain_observation_refs':
+                    response['focus_observations']} if 'focus_observations' in response else {})}
+            elif 'focus_observations' in response:
+                name, arguments = 'focus_source_observations', {'observation_refs': response['focus_observations']}
+            else:
+                name, arguments = 'submit_candidate', response
+            message = {'role': 'assistant', 'content': None, 'tool_calls': [{
+                'id': f'generation-{self.send.call_count}', 'type': 'function',
+                'function': {'name': name, 'arguments': json.dumps(arguments)}}]}
+            finish = 'tool_calls'
+        return {'choices': [{'message': message, 'finish_reason': finish}],
             'usage': {'prompt_tokens': 100, 'completion_tokens': 20, 'total_tokens': 120}}
 
     def _create(self, name='task', sources=None):
@@ -1174,7 +1193,7 @@ class ImplementationDecisionTests(unittest.TestCase):
                 diagnosis = json.loads((store / 'decision-steps/1/validation.json').read_text())
                 if name.startswith(('contract', 'read')):
                     self.assertEqual(diagnosis['kind'], 'professional_contract_failed')
-                    self.assertEqual(diagnosis['operation'], 'read_windows' if name.startswith('read') else 'candidate')
+                    self.assertEqual(diagnosis['operation'], 'read_windows' if name.startswith('read') else 'native_action')
                 else:
                     self.assertEqual(diagnosis['kind'], 'python_syntax_failed')
                     self.assertEqual(diagnosis['filename'], 'calculate.py')
@@ -1182,6 +1201,51 @@ class ImplementationDecisionTests(unittest.TestCase):
                 self.assertEqual(last['stop_reason'], None if succeeds else 'decision_ceiling')
                 self.assertEqual((store / 'result.json').exists(), succeeds)
                 self.assertFalse((app.session.store.root / 'tools/processes').exists())
+
+    def test_native_source_actions_reject_mixed_batches_and_keep_original_protocol_on_reload(self):
+        inputs = self.base / 'action-inputs'
+        inputs.mkdir()
+        (inputs / 'note.txt').write_text('A retained source observation.\n', encoding='utf-8')
+        app = self._create('native-actions', sources={'inputs': inputs})
+        self.assertEqual(app.implementation.decision_protocol, 'native.v1')
+        call = lambda identity, name, arguments: {'id': identity, 'type': 'function',
+            'function': {'name': name, 'arguments': json.dumps(arguments)}}
+        reads = {'read_windows': [{'path': 'inputs/note.txt'}]}
+        mixed = {'role': 'assistant', 'content': None, 'tool_calls': [
+            call('read', 'read_source_windows', reads),
+            call('submit', 'submit_candidate', self._candidate('value = 1\n'))]}
+        self.responses = [('tool_calls', mixed), reads, self._candidate('value = 1\n')]
+        result = self._prepare(app, {'goal': 'Read the source, then save a candidate'})
+        self.assertEqual(result['status'], 'ok', result)
+        store = Path(result['data']['source_binding']).parent
+        first = json.loads((store / 'decision-steps/1/validation.json').read_text())
+        self.assertIn('exactly one', first['message'])
+        self.assertFalse((store / 'decision-steps/1/observations.json').exists())
+        self.assertEqual(self.prompts[-2]['source_windows'], self.prompts[-3]['source_windows'])
+        self.assertTrue(any(row.get('text') == 'A retained source observation.\n'
+            for row in self.prompts[-1]['source_windows']))
+        last = self.send.call_args.kwargs['request'] if 'request' in self.send.call_args.kwargs else self.send.call_args.args[1]
+        history = last['messages'][2:]
+        self.assertEqual([row['role'] for row in history], ['assistant', 'tool'])
+        self.assertEqual(history[0]['tool_calls'][0]['id'], history[1]['tool_call_id'])
+        self.assertEqual(json.loads((store / 'request.json').read_text())['source_decision_protocol'], 'native.v1')
+        self.assertEqual(len(app.ledger.entries), 3)
+
+        # A real saved task missing the new creation marker is not upgraded by
+        # load or an unrelated supply, including a later new source operation.
+        state = app.session.store.read_json('actions.json')
+        state['config'].pop('source_decision_protocol')
+        app.session.store.write_json('actions.json', state)
+        app = ToolApplication.load(app.session.store.root, services=self.services)
+        self.assertIsNone(app.implementation.decision_protocol)
+        app.supply(supply_id='unchanged-execution', reason='Retain the saved work contract',
+            changes={'allow_execution': True})
+        self.assertNotIn('source_decision_protocol', app.state['config'])
+        self.responses = [self._candidate('value = 2\n')]
+        legacy = self._prepare(app, {'goal': 'Another bounded candidate under the saved contract'})
+        self.assertEqual(legacy['status'], 'ok', legacy)
+        request = self.send.call_args.args[1]
+        self.assertFalse(request.get('tools'))
 
     def test_saved_request_owner_budget_resumes_only_undispatched_preparation(self):
         from simple_ar.core.budget import BudgetExceededError

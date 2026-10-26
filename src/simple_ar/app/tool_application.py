@@ -1669,6 +1669,7 @@ class ToolApplication:
             extensions=extensions, creation_declarations=creation_declarations)
         config['inspection_protocol'] = 'subjects.v2'
         config['source_generation_protocol'] = 'prepared.v3'
+        config['source_decision_protocol'] = 'native.v1'
         if context_protocol is not None:
             config['context_protocol'] = context_protocol
         session = SessionController.create(root, session_id=root.name, topic=goal,
@@ -1834,7 +1835,7 @@ class ToolApplication:
             # their original closing obligation. Absent historical fields stay
             # absent unless explicitly supplied, including unrelated supplies.
             for field in ('completion_policy', 'tool_contracts', 'report_protocol', 'tool_completions', 'inspection_protocol',
-                          'document_source_contract', 'source_generation_protocol'):
+                          'document_source_contract', 'source_generation_protocol', 'source_decision_protocol'):
                 if field not in supplied:
                     if field in old:
                         config[field] = old[field]
