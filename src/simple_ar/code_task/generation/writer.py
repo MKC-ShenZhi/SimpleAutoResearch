@@ -486,7 +486,7 @@ def _generate_implementation_contents(
             response_received = True
             if investigation is not None:
                 write_json(artifact_dir / 'decision-steps' / str(attempt) / 'response.json', response)
-                if not response_accounting_known(client, accounting_before):
+                if not response_accounting_known(client, accounting_before, completed_response=True):
                     raise LLMError('Professional response has unknown or reserved physical usage; no continuation or replay')
             if artifact_dir is not None:
                 write_json(artifact_dir / 'proposal.json', response)

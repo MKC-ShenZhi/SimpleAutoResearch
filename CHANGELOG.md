@@ -14,6 +14,10 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 - Ordinary tasks can delegate coherent source creation or revision using existing materials and candidates. Editable source capacity is separate from immutable input copies. Completely read, version-bound editable originals accept full-file revisions as well as exact replacements; approval and input protections still apply.
 - Publication checks the manuscript's actual presentation dependencies. Unused older previews no longer block current export or recovery; consumed figures and their producer versions remain checked.
 
+### Fixed
+
+- Retain a complete professional response after a configured transport retry succeeds, while keeping the earlier failed attempt's bounded charge unchanged. Pending or unbounded usage still blocks adoption; this does not authorize further automatic correction or replay.
+
 Unassisted initial-draft and feedback acceptance has not passed. Offline input reductions and engineering checks do not establish lower whole-task costs or general task success.
 
 ## 2026-10-25 — V2.10 development (unreleased)

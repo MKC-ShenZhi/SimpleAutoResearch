@@ -14,6 +14,49 @@ from simple_ar.core.budget import (
 
 
 class BudgetLedgerTests(unittest.TestCase):
+    def test_completed_response_adopts_only_paired_bounded_attempts_without_releasing_them(self):
+        from types import SimpleNamespace
+        from simple_ar.code_task.generation.agent_step import response_accounting_known, response_accounting_snapshot
+        from simple_ar.core.budget import completed_llm_usage_is_accounted
+
+        ledger = BudgetLedger({'llm_requests': 8, 'total_tokens': 10000})
+        client = SimpleNamespace(_budget_ledger=ledger)
+        before = response_accounting_snapshot(client)
+        ledger.reserve('lost', {'llm_requests': 1, 'total_tokens': 1000}, logical_call_id='one-call')
+        lost = ledger.mark_unknown('lost', reason='Opened stream failed',
+            known_actual={'llm_requests': 1}, retain_reservation=True)
+        original = lost.to_dict()
+        self.assertFalse(response_accounting_known(client, before, completed_response=True))
+        ledger.reserve('reply', {'llm_requests': 1, 'total_tokens': 1000}, logical_call_id='one-call')
+        self.assertFalse(response_accounting_known(client, before, completed_response=True))
+        ledger.settle('reply', {'llm_requests': 1, 'total_tokens': 120}, actual_source='provider')
+        state = ledger.to_dict()
+        self.assertTrue(response_accounting_known(client, before, completed_response=True))
+        self.assertFalse(response_accounting_known(client, before))  # No automatic correction.
+        self.assertFalse(response_accounting_known(client, completed_response=True))
+        self.assertTrue(completed_llm_usage_is_accounted(ledger.to_dict()['entries']))
+        for field, value in (('actual_source', None), ('logical_call_id', 'different-call'),
+                ('reserved', {'llm_requests': 1}), ('status', 'reserved'),
+                ('actual', {'llm_requests': 1, 'total_tokens': 1001})):
+            with self.subTest(field=field):
+                setattr(lost, field, value)
+                self.assertFalse(response_accounting_known(client, before, completed_response=True))
+                setattr(lost, field, original[field])
+        self.assertEqual(lost.to_dict(), original)
+        self.assertEqual(ledger.to_dict(), state)
+        self.assertEqual(ledger.remaining('total_tokens'), 8880)
+        # A previously present settled/reserved entry cannot be relabelled as
+        # a newly failed physical attempt of this response.
+        earlier = response_accounting_snapshot(client)
+        ledger.entries[-1].status = 'unknown'
+        ledger.entries[-1].actual_source = 'reservation_bound'
+        self.assertFalse(response_accounting_known(client, earlier, completed_response=True))
+        ledger.entries[-1].status = 'settled'
+        ledger.entries[-1].actual_source = 'provider'
+        ledger.reserve('process', {'process_invocations': 1}, logical_call_id='one-call')
+        ledger.mark_unknown('process', reason='Execution state unknown', retain_reservation=True)
+        self.assertFalse(response_accounting_known(client, before, completed_response=True))
+
     def test_response_accounting_boundary_requires_unchanged_complete_unknown_records(self) -> None:
         from types import SimpleNamespace
         from simple_ar.code_task.generation.agent_step import (

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -96,6 +96,29 @@ class BudgetEntry:
             created_at=_optional_text(data.get("created_at")),
             updated_at=_optional_text(data.get("updated_at")),
         )
+
+
+def completed_llm_usage_is_accounted(entries: Iterable[Mapping[str, Any]]) -> bool:
+    """Prove completed calls without settling their bounded failed attempts.
+
+    Only a settled response of the same logical call can accompany an unknown
+    LLM attempt. Pending reservations, unknown processes and unbounded charges
+    never qualify. This pure predicate grants no budget, execution or retry.
+    """
+    rows = list(entries)
+    completed = {row['logical_call_id'] for row in rows if row['status'] == 'settled'
+        and row['logical_call_id'] and row['actual'].get('llm_requests', 0) > 0
+        and row['actual'].get('total_tokens', 0) > 0}
+    return all(row['status'] in {'settled', 'released'} or (
+        row['status'] == 'unknown' and row['actual_source'] == 'reservation_bound'
+        and row['logical_call_id'] in completed
+        and set(row['reserved']) == {'llm_requests', 'total_tokens'}
+        and row['reserved']['llm_requests'] == 1
+        and type(row['reserved']['total_tokens']) is int and row['reserved']['total_tokens'] > 0
+        and row['actual'].get('llm_requests') == 1
+        and all(key in row['reserved'] and type(value) in {int, float}
+            and math.isfinite(value) and 0 <= value <= row['reserved'][key]
+            for key, value in row['actual'].items())) for row in rows)
 
 
 class BudgetLedger:

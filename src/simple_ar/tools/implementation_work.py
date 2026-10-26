@@ -270,8 +270,9 @@ def _accepted(owner: Any, observed: dict, identity: str) -> ArtifactStore:
         kind='native_observation', store_root=store.root)
     if store.read_json(ref) != observed:
         raise ValueError('Continuation requires the exact accepted native result')
-    if any(row.attempt_id == identity and row.status in {'reserved', 'unknown'}
-            for row in owner.ledger.entries):
+    from simple_ar.core.budget import completed_llm_usage_is_accounted
+    if not completed_llm_usage_is_accounted(row.to_dict() for row in owner.ledger.entries
+            if row.attempt_id == identity):
         raise ValueError('Accepted work still has unsettled physical accounting')
     return store
 

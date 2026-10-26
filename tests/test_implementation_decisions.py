@@ -1275,6 +1275,39 @@ class ImplementationDecisionTests(unittest.TestCase):
                 self.assertEqual(restored.ledger.to_dict(), ledger)
                 self.assertEqual(self.send.call_count - start, 1)
 
+    def test_complete_source_response_keeps_bounded_retry_cost_without_authorizing_correction(self):
+        from dataclasses import replace
+        from simple_ar.integrations.llm import LLMStreamError
+
+        self.services.llm_client = LLMClient(replace(self.services.llm_client._settings,
+            retry_attempts=2, retry_base_delay_sec=0))
+        for valid in (True, False):
+            with self.subTest(valid=valid):
+                start = self.send.call_count
+                app = self._create('bounded-source-'+str(valid), operations=True)
+                self.responses = [LLMStreamError('Controlled opened source stream interruption'),
+                    self._candidate('value = 7\n') if valid else
+                    {'summary': 'Unusable completed response', 'files': 'not a source list', 'unresolved': []}]
+                arguments = {'goal': 'Generate one bounded source unit', 'execution_requested': True}
+                result = self._prepare(app, arguments)
+                self.assertEqual(result['status'], 'ok' if valid else 'error', result)
+                self.assertEqual(self.send.call_count-start, 2)  # No application correction or replay.
+                lost, = [row for row in app.ledger.entries if row.status == 'unknown']
+                self.assertEqual(lost.actual_source, 'reservation_bound')
+                self.assertEqual(lost.actual, {'llm_requests': 1})
+                snapshot = app.ledger.to_dict()
+                restored = ToolApplication.load(app.session.store.root, services=self.services)
+                self.assertEqual(restored.ledger.to_dict(), snapshot)
+                if valid:
+                    source = Path(result['data']['source_binding'])
+                    repeated = restored.implementation.call('prepare_implementation', arguments,
+                        identity=source.parents[1].name)
+                    self.assertEqual(repeated.status, 'ok', repeated)
+                    self.assertEqual(repeated.data, result['data'])
+                self.assertEqual(self.send.call_count-start, 2)
+                self.assertEqual(restored.ledger.to_dict(), snapshot)
+                self.assertFalse((app.session.store.root/'tools/processes').exists())
+
     def test_professional_plan_uses_literal_candidate_paths_through_physical_execution(self):
         material = self.base / 'input'
         material.mkdir()

@@ -10,6 +10,7 @@ from typing import Any, Callable, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from simple_ar.core.capabilities import ArtifactStore
+from simple_ar.core.budget import completed_llm_usage_is_accounted
 from simple_ar.integrations.llm import estimate_tokens
 from simple_ar.tools.specs import CommonToolSpec, ToolResult
 from simple_ar.tools.workspace import FileWindow, workspace_tool_specs
@@ -180,6 +181,10 @@ class InspectionToolGateway:
     def _digest(self, path: str) -> str:
         return hashlib.sha256(self.store.resolve(path).read_bytes()).hexdigest()
 
+    def _accounted(self, usage: list[dict]) -> bool:
+        return (completed_llm_usage_is_accounted(usage) if self.progressive else
+            not any(row['status'] in {'reserved', 'unknown'} for row in usage))
+
     @staticmethod
     def _response_digest(receipt: dict[str, Any]) -> str:
         payload = {key: value for key, value in receipt.items() if key != 'result_sha256'}
@@ -196,7 +201,7 @@ class InspectionToolGateway:
                     and row.get('logical_call_id') == f'inspect-artifacts-{identity}'
                     and row.get('actual', {}).get('llm_requests', 0) > 0
                     and row.get('actual', {}).get('total_tokens', 0) > 0 for row in usage)
-                or any(row['status'] in {'reserved', 'unknown'} for row in usage)):
+                or not self._accounted(usage)):
             raise ValueError('Inspection provider usage is pending or unknown; no replay')
         return saved
 
@@ -664,7 +669,7 @@ class InspectionToolGateway:
                 saved.setdefault('source_rounds',[]).append(self._digest(trace))
             self.store.write_json(input_path,saved)
             usage = self._usage(identity)
-            if (any(row['status'] in {'reserved','unknown'} for row in usage)
+            if (not self._accounted(usage)
                     or not any(row['status']=='settled' and row.get('logical_call_id')==label
                         for row in usage)):
                 raise ValueError('Inspection source request usage is unsettled; retain records without further requests')
@@ -739,7 +744,7 @@ class InspectionToolGateway:
                     **({'working_input':working_input,'completed':True} if self.progressive else {})})
                 saved['source_rounds'][-1] = self._digest(trace)
                 self.store.write_json(input_path,saved)
-                if any(row['status'] in {'reserved','unknown'} for row in self._usage(identity)):
+                if not self._accounted(self._usage(identity)):
                     raise ValueError('Inspection source usage is unsettled; retain completed observations without further requests')
             self._check_versions([*saved['targets'],*saved['evidence']],identity)
         raise AssertionError('Inspection did not return or disclose its source limit')

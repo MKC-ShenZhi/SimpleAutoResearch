@@ -1260,31 +1260,40 @@ class OperationsWorkLoopTests(unittest.TestCase):
         from simple_ar.integrations.llm import LLMStreamError
         self.services.llm_client = LLMClient(replace(self.services.llm_client._settings,
             retry_attempts=2, retry_base_delay_sec=0))
-        self._create()
-        self._write('report.md', 'The sample mean is 2.0 across three supplied observations.\n')
-        self.decisions.extend([
-            _action('inspect_artifacts', goal='Check the claim', targets=['report.md'],
-                evidence=['measurements/observations.csv']),
-            _action('deliver_result', **self._delivery('report.md'))])
-        failed = False
-        def provider(*args, **kwargs):
-            nonlocal failed
-            if not failed:
-                failed = True
-                raise LLMStreamError('Controlled opened stream interrupted before complete tool arguments')
-            return self._provider(*args, **kwargs)
-        self.send.side_effect = provider
-        self._run(should_stop=lambda:False)
-        self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
-        lost, = [entry for entry in self.app.ledger.entries if entry.status=='unknown']
-        self.assertEqual(lost.actual_source, 'reservation_bound')
-        self.assertEqual(lost.actual, {'llm_requests':1})
-        self.assertGreater(lost.reserved['total_tokens'], 2048)
-        self.assertEqual(self._assessment()['verdict'], 'passed')
-        ledger = self.app.ledger.to_dict()
-        self._reload()
-        self.assertEqual(self.app.ledger.to_dict(), ledger)
-        self.assertEqual(self.send.call_count, 4)
+        for stage in ('native', 'inspection'):
+            with self.subTest(stage=stage):
+                self.root = self.directory/stage
+                self._create()
+                self._write('report.md', 'The sample mean is 2.0 across three supplied observations.\n')
+                self.decisions.extend([
+                    _action('inspect_artifacts', goal='Check the claim', targets=['report.md'],
+                        evidence=['measurements/observations.csv']),
+                    _action('deliver_result', **self._delivery('report.md'))])
+                failed, start = False, self.send.call_count
+                def provider(mode, request, **kwargs):
+                    nonlocal failed
+                    inspecting = any(t['function']['name']=='record_inspection' for t in request.get('tools', []))
+                    if not failed and inspecting == (stage=='inspection'):
+                        failed = True
+                        raise LLMStreamError('Controlled opened stream interrupted before complete tool arguments')
+                    return self._provider(mode, request, **kwargs)
+                self.send.side_effect = provider
+                self._run(should_stop=lambda:False)
+                self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
+                lost, = [entry for entry in self.app.ledger.entries if entry.status=='unknown']
+                self.assertEqual(lost.actual_source, 'reservation_bound')
+                self.assertEqual(lost.actual, {'llm_requests':1})
+                self.assertGreater(lost.reserved['total_tokens'], 2048)
+                inspected = self._ok('inspect_artifacts')
+                self.assertEqual(self._assessment()['verdict'], 'passed')
+                identity = Path(inspected['data']['record']).parts[1]
+                saved = self.app.session.store.read_json(f'tools/inspection/{identity}/input.json')
+                ledger = self.app.ledger.to_dict()
+                self._reload()
+                cached = self.app.operations.inspection.call('inspect_artifacts',saved['arguments'],identity)
+                self.assertEqual(cached.status,'ok',cached)
+                self.assertEqual(self.app.ledger.to_dict(), ledger)
+                self.assertEqual(self.send.call_count-start, 4)
 
     def test_inspection_low_capacity_still_requires_a_real_terminal_opinion(self):
         # Request pressure, token pressure, and unknown prior usage all use

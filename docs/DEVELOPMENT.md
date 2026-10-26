@@ -115,6 +115,12 @@ Settled unusable summaries retain diagnostics and previous notes without blockin
 the main decision or repeatedly summarizing unchanged history. Unknown charges
 still stop recovery. Checkpoint costs and registered outputs remain part of the
 same attempt through interruption and explicit retry.
+An intact completed professional response can retain earlier failed physical attempts
+of that same logical call when their full bounded reservations remain charged and a
+successful response is actually settled. Source adoption, current inspection receipts
+and accepted native results share the core accounting check. This grants no automatic
+format correction, process replay or release of unknown costs; pending requests,
+unbounded usage and unknown processes still stop.
 Fulfillment is checked after producer outputs are registered. A byte-bound
 successful operation can return unmet delivery conditions to the same loop;
 it is not replayed or silently marked delivered. Historical receipts remain

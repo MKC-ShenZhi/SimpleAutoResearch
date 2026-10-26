@@ -60,9 +60,11 @@ def accepted_native_result(root: Path, session_id: str, observed: dict,
     raw = store.resolve(ref).read_bytes()
     if json.loads(raw.decode('utf-8')) != observed:
         raise ValueError('Professional outcome requires the exact accepted native observation')
-    if ledger is not None and any(row.attempt_id == attempt_id
-            and row.status in {'reserved', 'unknown'} for row in ledger.entries):
-        raise ValueError('Professional outcome still has unsettled physical accounting')
+    if ledger is not None:
+        from simple_ar.core.budget import completed_llm_usage_is_accounted
+        if not completed_llm_usage_is_accounted(row.to_dict() for row in ledger.entries
+                if row.attempt_id == attempt_id):
+            raise ValueError('Professional outcome still has unsettled physical accounting')
     return store, hashlib.sha256(raw).hexdigest()
 
 
