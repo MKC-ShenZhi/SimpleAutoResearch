@@ -63,6 +63,107 @@ def _reply(name, arguments):
 
 
 class ResearchIntakeTests(unittest.TestCase):
+    def test_ordinary_outcomes_loads_primitives_and_delivers_chinese_markdown(self):
+        request = '仅依据所给材料整理 Markdown 摘要，不生成 PDF。'
+        content = '# 材料摘要\n单次观察不能证明稳定性。\n'
+        raw = {'write_file', 'edit_file', 'run_process'}
+        permitted_raw = raw - {'run_process'}
+        client = _JSONClient([
+            _reply('load_tools', {'names': sorted(permitted_raw)}),
+            _reply('write_file', {'path': 'workspace/summary.md', 'content': content}),
+            _reply('deliver_result', {'summary': '已交付材料摘要。',
+                'artifacts': ['workspace/summary.md'], 'unresolved': []}),
+        ])
+        services = ResearchApplicationServices(llm_client=client,
+            config={'research_materials_only': True},
+            budget_limits={'llm_requests': 8, 'total_tokens': 1000000})
+        with TemporaryDirectory() as directory:
+            base = Path(directory)
+            note = base / 'notes.md'
+            note.write_text('单次观察不能证明稳定性。', encoding='utf-8')
+            original = note.read_bytes()
+            app = create_research_task(ResearchBrief(request_text=request,
+                requested_outputs=('assessment',), asset_requests=({'locator': str(note)},)),
+                root=base / 'task', services=services)
+            self.assertEqual(app.state['config']['tool_contracts'], 'outcomes')
+            permissions = set(app.gateway.policy.allowed_permissions)
+            self.assertEqual(set(app._specialist_catalog()), permitted_raw)
+            result = app.run(progress=lambda _: None)
+            self.assertEqual(result['status'], 'completed', result)
+            first = {row['function']['name'] for row in client.calls[0][1]['tools']}
+            self.assertTrue({'prepare_implementation', 'read_file', 'list_directory',
+                'ask_user', 'deliver_result', 'inspect_artifacts'} <= first)
+            self.assertFalse(raw & first)
+            second = {row['function']['name'] for row in client.calls[1][1]['tools']}
+            self.assertTrue(permitted_raw <= second)
+            self.assertEqual(app.gateway.policy.allowed_permissions, permissions)
+            observations = [app.session.store.read_json(item['result'])
+                for turn in app.state['turns'] for item in turn['tools']]
+            self.assertEqual([row['tool_name'] for row in observations],
+                ['load_tools', 'write_file', 'deliver_result'])
+            self.assertTrue(all(row['status'] == 'ok' for row in observations), observations)
+            self.assertEqual((base / 'task/workspace/summary.md').read_text(encoding='utf-8'), content)
+            self.assertEqual(note.read_bytes(), original)
+            self.assertIsNone(app.state['config'].get('report_requirement'))
+            self.assertFalse(list((base / 'task/workspace').rglob('*.pdf')))
+
+    def test_operation_contract_modes_and_saved_defaults_preserve_authority(self):
+        raw = {'write_file', 'edit_file', 'run_process'}
+        names = lambda app: {row['function']['name'] for row in app.schemas}
+        with TemporaryDirectory() as directory:
+            base = Path(directory)
+            preview, _, _, _ = ToolApplication._configuration(base / 'preview', 'Preview',
+                model=None, sources={})
+            self.assertEqual(preview['tool_contracts'], 'outcomes')
+            for mode in ('outcomes', 'full', 'on_demand', None):
+                with self.subTest(mode=mode):
+                    services = ResearchApplicationServices(llm_client=_JSONClient())
+                    app = ToolApplication.create(base / str(mode), 'Ordinary work', model='fixture',
+                        sources={}, allow_execution=True, services=services,
+                        tool_contracts=mode if mode is not None else 'full')
+                    if mode is None:
+                        app.state['config'].pop('tool_contracts')
+                        app._save()
+                    expected = names(app)
+                    allowed = {spec.name for spec in app.gateway.list_specs()
+                        if app.gateway.policy.is_allowed(spec)[0]}
+                    if mode == 'outcomes':
+                        self.assertEqual(expected, allowed - raw)
+                        self.assertEqual(set(app._specialist_catalog()), raw)
+                        self.assertTrue({'execute_implementation', 'export_report',
+                            'read_file', 'inspect_artifacts'} <= expected)
+                    elif mode in ('full', None):
+                        self.assertEqual(expected, allowed)
+                    else:
+                        self.assertEqual(expected, {name for name in allowed
+                            if app.gateway.registry.request_visible(name)})
+                        self.assertTrue(raw <= expected)
+                    saved_config = copy.deepcopy(app.state['config'])
+                    saved_bytes = (app.session.store.root / 'actions.json').read_bytes()
+                    restored = ToolApplication.load(app.session.store.root, services=services)
+                    self.assertEqual(restored.state['config'], saved_config)
+                    self.assertEqual(names(restored), expected)
+                    self.assertEqual((app.session.store.root / 'actions.json').read_bytes(), saved_bytes)
+                    if mode == 'outcomes':
+                        permissions = set(restored.gateway.policy.allowed_permissions)
+                        ledger = restored.ledger.to_dict()
+                        restored.run(actions=[
+                            {'tool_name': 'load_tools', 'arguments': {'names': sorted(raw)}},
+                            {'tool_name': 'ask_user', 'arguments': {'question': 'Which operation next?'}}],
+                            progress=lambda _: None)
+                        self.assertTrue(raw <= names(restored))
+                        self.assertEqual(restored.gateway.policy.allowed_permissions, permissions)
+                        self.assertEqual(restored.ledger.to_dict(), ledger)
+                        self.assertEqual(names(ToolApplication.load(restored.session.store.root,
+                            services=services)), names(restored))
+            denied = ToolApplication.create(base / 'denied', 'No execution', model=None, sources={})
+            denied.run(actions=[{'tool_name': 'load_tools', 'arguments': {'names': ['run_process']}}],
+                progress=lambda _: None)
+            receipt = denied.session.store.read_json(denied.state['turns'][0]['tools'][0]['result'])
+            self.assertEqual(receipt['status'], 'blocked')
+            self.assertNotIn('run_process', names(denied))
+            self.assertNotIn('run_process', denied._specialist_catalog())
+
     def test_native_default_attempts_do_not_inherit_legacy_stage_units(self):
         from simple_ar.app.research_application import create_session, load_session
         with TemporaryDirectory() as directory:

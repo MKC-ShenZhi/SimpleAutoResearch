@@ -5577,7 +5577,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 root = app.session.store.root
                 preview, _, _, _ = ToolApplication._configuration(root, 'Configuration preview',
                     model=None, sources={}, max_attempts=30)
-                self.assertEqual(preview['tool_contracts'], 'on_demand')
+                self.assertEqual(preview['tool_contracts'], 'outcomes')
                 if mode in {'full', 'on_demand', 'outcomes'}:
                     app = load_native_history(root.parent / f'explicit-{mode}', 'Saved compatibility control',
                         config={'model':None,'sources':{'source0':inputs},'tool_contracts':mode}, max_attempts=30)
@@ -7910,6 +7910,13 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                     BudgetLedger({'total_tokens': allowance, 'llm_requests': 30})):
                 before = resumed.ledger.to_dict()
                 resumed.state['turns'] = [source_view, source_turn, long_thinking]
+                if allowance == 10000:
+                    # The saved contracts already exceed this allowance before
+                    # optional history. Reject without spending or hiding them.
+                    with self.assertRaisesRegex(ValueError, 'remaining input capacity'):
+                        resumed._messages()
+                    self.assertEqual(resumed.ledger.to_dict(), before)
+                    continue
                 messages = resumed._messages()
                 context = json.loads(messages[1]['content'])
                 self.assertTrue(context['retained_text_windows'])

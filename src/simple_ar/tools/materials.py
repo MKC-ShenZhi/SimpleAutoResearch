@@ -122,12 +122,40 @@ def window_key(workspace: Any, window: FileWindow) -> tuple:
 
 def journal_read_windows(receipt: dict, request: dict) -> list[dict]:
     """Decode successful byte-owner reads; no current access or fact certification."""
+    if receipt.get('tool_name') == 'inspect_artifacts':
+        # A failed professional opinion can still contain actual source reads.
+        # Only decoded byte-owner windows are reusable, never its findings.
+        if receipt.get('status') not in {'ok', 'error'}:
+            return []
+        windows = []
+        for role in ('targets', 'evidence'):
+            for subject_index, subject in enumerate((receipt.get('data') or {}).get(role, [])):
+                if not subject.get('readable'):
+                    continue
+                for window_index, window in enumerate(subject.get('windows', [])):
+                    read_request = window.get('read_request')
+                    if read_request is None:
+                        # Older progressive evidence has one original request;
+                        # merged target windows lack that proof and stay archival.
+                        if len(subject['windows']) != 1:
+                            continue
+                        read_request = {**subject['request'], 'full_digest': True}
+                    data = {key: value for key, value in window.items() if key not in {
+                        'review_text', 'review_next_offset_bytes', 'read_request', 'source_reference'}}
+                    if read_request.get('start_line') is None:
+                        data.pop('offset_bytes', None)  # Inspection owns this derived locator.
+                    if not isinstance(data.get('text'), str) or '\ufffd' in data['text']:
+                        continue
+                    windows.append({'request': read_request, 'data': data,
+                        'input_index': len(windows),
+                        'field': f'data.{role}.{subject_index}.windows.{window_index}.text'})
+        return windows
     if receipt.get('status') != 'ok' or receipt.get('error'):
         return []
     if receipt.get('tool_name') == 'read_file':
-        return [{'request': request, 'data': receipt.get('data') or {}}]
+        return [{'request': request, 'data': receipt.get('data') or {}, 'field': 'data.text'}]
     if receipt.get('tool_name') == 'focus_work':
-        return [{**row, 'input_index': index} for index, row in
+        return [{**row, 'input_index': index, 'field': f'data.inputs.{index}.data.text'} for index, row in
                 enumerate(receipt.get('data', {}).get('inputs', [])) if not row.get('error')]
     return []
 
@@ -140,7 +168,7 @@ def observe_text_window(windows: dict, workspace: Any, name: str, arguments: dic
     Writes invalidate earlier versions but retain authored text as write context.
     The index is transient and never changes journal or selection receipts.
     """
-    if name == 'focus_work':
+    if name in {'focus_work', 'inspect_artifacts'}:
         for row in journal_read_windows({'tool_name': name, 'status': 'ok', 'data': data}, arguments):
             windows = observe_text_window(windows, workspace, 'read_file', row['request'], row['data'],
                 record=record, turn=turn, receipt_sha256=receipt_sha256)
@@ -308,7 +336,7 @@ def journal_material_references(workspace: Any, store: Any, turns: list[dict],
         calls = {call['id']: call for call in store.read_json(turn['reply']).get('tool_calls', [])}
         for item in reversed(turn['tools']):
             call = calls.get(item['id'], {}).get('function', {})
-            if call.get('name') not in {'read_file', 'focus_work'}:
+            if call.get('name') not in {'read_file', 'focus_work', 'inspect_artifacts'}:
                 continue
             try:
                 request = json.loads(call['arguments'])

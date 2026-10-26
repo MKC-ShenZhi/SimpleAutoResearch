@@ -6,6 +6,11 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 
 ## 2026-10-27 — V2.10 development (unreleased)
 
+### Improved
+
+- New tasks present complete professional operations first, with low-level editing and process contracts available on demand. Tool loading does not expand permissions; saved modes remain unchanged.
+- Actual source windows read during inspection join shared material reuse after receipt, permission, version and range checks. Later work can reuse supporting text, including reads retained after a failed opinion, without inheriting its verdict.
+
 ### Fixed
 
 - Independent inspection exposes the exact source references available for each target. Repeated invalid conclusions stop after one correction, retaining observations and unresolved findings instead of spending the entire task allowance on formatting.

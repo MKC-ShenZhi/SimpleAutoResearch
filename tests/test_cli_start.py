@@ -811,7 +811,7 @@ class StartTests(unittest.TestCase):
                 kwargs = create.call_args.kwargs
                 bound = creation_contract.bind(*create.call_args.args, **kwargs)
                 bound.apply_defaults()
-                self.assertEqual(bound.arguments['tool_contracts'], 'on_demand')
+                self.assertEqual(bound.arguments['tool_contracts'], 'outcomes')
                 self.assertEqual(bound.arguments['control_protocol'], 'operations.v1')
                 self.assertEqual(bound.arguments['context_protocol'], 'auto')
                 self.assertFalse(bound.arguments['professional_inputs'])

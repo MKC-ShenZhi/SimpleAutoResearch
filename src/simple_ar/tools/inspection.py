@@ -169,12 +169,14 @@ _BINARY = {'.pdf', '.docx', '.xlsx', '.pptx', '.png', '.jpg', '.jpeg', '.gif',
 class InspectionToolGateway:
     def __init__(self, root: Path, workspace: Any, client_factory: Callable[[str], Any],
                  *, prior_assessments: Callable[[], list[dict]] | None = None,
+                 material_observations: Callable[[list[str]], list[dict]] | None = None,
                  protocol: str | None = None) -> None:
         if protocol not in (None, 'subjects.v1', 'subjects.v2', 'subjects.v3'):
             raise ValueError('Unknown inspection protocol')
         self.root, self.workspace = Path(root), workspace
         self.store, self.client_factory = ArtifactStore(root), client_factory
         self.prior_assessments = prior_assessments
+        self.material_observations = material_observations
         self.protocol = protocol
 
     @property
@@ -314,7 +316,8 @@ class InspectionToolGateway:
                 row['sha256'] = data['sha256']
                 if remaining[0] <= 0:
                     raise ValueError('Inspection total text limit reached; digest only, no text reviewed')
-                row['windows'].append(dict(data))
+                row['windows'].append({**data,
+                    **({'read_request': dict(arguments)} if self.adaptive else {})})
                 start = data.get('offset_bytes', arguments.get('offset_bytes', 0))
                 row['windows'][-1]['offset_bytes'] = start
                 count = data['next_offset_bytes'] - start
@@ -354,6 +357,49 @@ class InspectionToolGateway:
         else:
             row['readable'] = True
         return row
+
+    def _reuse_observations(self, saved: dict, remaining: list[int]) -> None:
+        """Supply prior raw reads through the common byte owner, never prior verdicts."""
+        from simple_ar.tools.materials import material_observation_seed
+
+        # Targets still require this review's actual reading. Reuse supporting
+        # source windows as optional material, never inherit a prior target pass.
+        subjects = [row for row in saved['evidence']
+            if row.get('readable') and row.get('sha256')]
+        paths = list(dict.fromkeys(row['path'] for row in subjects))
+        if not paths or remaining[0] <= 0:
+            return
+        seed = material_observation_seed(workspace=self.workspace,
+            inventories=[{'candidate_files': {row['path']: row['windows'][0]['size_bytes']
+                for row in subjects}}], provider=self.material_observations,
+            roots=paths, context={}, remaining_capacity=min(96000, remaining[0]))
+        for observed in (seed or {}).get('observations', []):
+            data, request = observed['data'], observed['request']
+            path = data.get('absolute_path') or data.get('path') or request['path']
+            text = data['text']
+            if (not text.strip() or '\ufffd' in text or Path(path).suffix.lower() in _BINARY
+                    or any(ord(char) < 32 and char not in '\n\r\t\f' for char in text)):
+                continue
+            start = data.get('offset_bytes', request.get('offset_bytes', 0))
+            end = data['next_offset_bytes']
+            owners = [row for row in subjects if row['path'] == path and row['sha256'] == data['sha256']]
+            if not owners or end-start > remaining[0]:
+                continue
+            admitted = False
+            for row in owners:
+                if any(w['offset_bytes'] <= start and end <= w['review_next_offset_bytes']
+                       for w in row['windows']):
+                    continue
+                row['windows'].append({**data, 'offset_bytes': start, 'review_text': text,
+                    'review_next_offset_bytes': end, 'read_request': request,
+                    'source_reference': {key: value for key, value in observed.items() if key != 'data'}})
+                admitted = True
+            if admitted:
+                remaining[0] -= end-start
+        for row in subjects:
+            row['complete'] = self._complete_target(row, subjects)
+            if row['complete']:
+                row.pop('limitation', None)
 
     def _complete_target(self, target: dict, rows: list[dict]) -> bool:
         """Actual decoded ranges, not a model declaration or a matching copy."""
@@ -603,7 +649,8 @@ class InspectionToolGateway:
                 'limitation':row.get('limitation',''),
                 'text_windows':[{'offset_bytes':window['offset_bytes'],
                     'next_offset_bytes':window['review_next_offset_bytes'], 'size_bytes':window['size_bytes'],
-                    'text':window.get('review_text',window['text'])} for window in row['windows']]
+                    'text':window.get('review_text',window['text'])} for window in row['windows']
+                    if source_result or not window.get('source_reference')]
                     if row.get('readable') and (self.protocol or role=='targets' or row['independent']) else []}
                 for row in saved[role]]
             if self.progressive:
@@ -668,8 +715,8 @@ class InspectionToolGateway:
             'next_offset_bytes':window['review_next_offset_bytes'],
             'size_bytes':window['size_bytes'], 'text':window.get('review_text',window['text'])}
             for row in saved['evidence'] if row.get('readable')
-                and row['subject'] not in saved.get('initial_subjects', [])
-            for index, window in enumerate(row['windows'])]
+            for index, window in enumerate(row['windows'])
+            if row['subject'] not in saved.get('initial_subjects', []) or window.get('source_reference')]
         base.pop('goal', None)
         base['reading_scope'] = ('Only the supplied decoded windows were observed. Retired source bodies '
             'remain in the original inspection records; read an authorized original path/range again '
@@ -932,6 +979,8 @@ class InspectionToolGateway:
             if self.progressive:
                 saved['evidence'] = [row for row in saved['evidence']
                     if self._target_observation(saved, row) is None]
+                if self.adaptive and self.material_observations is not None:
+                    self._reuse_observations(saved, remaining)
                 saved['initial_subjects'] = [row['subject'] for row in [*saved['targets'],*saved['evidence']]]
             self._mark_evidence(saved)
             saved['prior_required'] = self._prior(saved['targets'])

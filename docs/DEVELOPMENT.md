@@ -66,6 +66,10 @@ New tasks use `operations.v1`: investigation, editing, execution, inspection and
 publication are independently callable, rather than stages of an implicit handoff.
 `OperationTools` composes the registry; it does not run another scheduler. Inspection
 owns version-bound findings and publication owns rendering and export provenance.
+New creation defaults to `tool_contracts="outcomes"`: complete professional operations
+are visible, while low-level mutation/process contracts are explicitly loadable when
+useful. Loading changes presentation, never authority. Explicit modes and saved
+tasks keep their original contracts.
 New tasks freeze `inspection_protocol=subjects.v3`: one source investigation can
 inspect several targets, but each decision names its own supporting observations.
 Each target's completeness, findings and evidence versions are evaluated separately;
@@ -87,6 +91,11 @@ one correction before the owner returns an incomplete record. This does not cap 
 source investigation or relax historical receipt recovery. Additional closing instructions
 belong in the shared selector's `trailing_messages`, so their cost participates in material
 selection rather than being appended afterward.
+The shared material decoder also exposes inspection-owned raw windows, including
+successful reads inside failed opinions. Supporting evidence can reuse these windows
+only after the original receipt and current permission/version/range checks. Target
+reading and verdicts are not inherited. Reused bodies are optional observations in
+the same context selector, not another pinned input block or memory store.
 `source_generation_protocol=prepared.v3` exposes goal/material/project preparation
 and approved execution as ordinary operations. The source owner investigates and
 generates the candidate; shared execution retains approval, accounting and provenance.

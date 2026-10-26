@@ -31,7 +31,7 @@ from simple_ar.tools.workspace import (WorkspaceToolGateway, workspace_tool_spec
     DeliveryRequest, FileWindow, validate_workspace_arguments, workspace_observation_view, workspace_history_identity,
     resolve_source_mount)
 from simple_ar.tools.materials import (
-    read_material_window, journal_material_references, observe_text_window,
+    read_material_window, journal_material_references, journal_read_windows, observe_text_window,
     current_text_window, admit_text_window, uncovered_text_ranges, observed_window_key,
 )
 from simple_ar.tools.sources import SourcePolicy, SourceToolGateway, source_tool_specs
@@ -1361,7 +1361,7 @@ class ToolApplication:
                services: Any | None = None,
                snapshot_sources: bool = False,
                max_snapshot_bytes: int = 16 * 1024 * 1024,
-               tool_contracts: Literal['full', 'on_demand', 'outcomes'] = 'on_demand',
+               tool_contracts: Literal['full', 'on_demand', 'outcomes'] = 'outcomes',
                completion_policy: str | None = None, control_protocol: str | None = None,
                delivery_files: list[str] | None = None,
                model_catalogs: dict[str, str | None] | None = None,
@@ -1634,7 +1634,7 @@ class ToolApplication:
                extensions: list[Path] | None = None,
                max_snapshot_bytes: int = 16 * 1024 * 1024,
                delivery_files: list[str] | None = None,
-               tool_contracts: Literal['full', 'on_demand', 'outcomes'] = 'on_demand',
+               tool_contracts: Literal['full', 'on_demand', 'outcomes'] = 'outcomes',
                completion_policy: str | None = None, professional_inputs: bool = False,
                investigate_results: bool = True,
                control_protocol: Literal['operations.v1'] = 'operations.v1',
@@ -3129,9 +3129,12 @@ class ToolApplication:
                         working_rows.append({'turn':position,'record':record,'kind':'operation_result',
                             'tool':call['function']['name'],'text':json.dumps(presented,ensure_ascii=False,separators=(',',':')),
                             'version_scope':'Historical operation result, not proof of current output bytes or new permission'})
-                    text_rows = [(data, 'data.text')]
-                    text_rows.extend((row.get('data') or {}, f'data.inputs.{number}.data.text')
-                        for number, row in enumerate(data.get('inputs') or []) if isinstance(row, dict))
+                    # This projection consumes recorded text only; malformed old
+                    # arguments must not break later context or grant read access.
+                    read_windows = journal_read_windows(result, {})
+                    text_rows = [(row['data'], row['field']) for row in read_windows]
+                    if not read_windows:
+                        text_rows.append((data, 'data.text'))
                     for key in ('matches', 'retained_preview'):
                         text_rows.extend((row, f'data.{key}.{number}.text')
                             for number, row in enumerate(data.get(key) or []) if isinstance(row, dict))

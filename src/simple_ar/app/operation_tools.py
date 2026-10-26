@@ -94,6 +94,7 @@ class OperationTools:
         self.inspection = InspectionToolGateway(root, self.workspace,
             client_factory=lambda identity:client_factory(identity, 'writing'),
             protocol=config.get('inspection_protocol'),
+            material_observations=material_observations,
             prior_assessments=lambda:[row.model_dump() for row in
                 current_assessments(self.workspace,observations())])
         self.registry.register_package(inspection_tool_specs(progressive=self.inspection.progressive,
@@ -176,7 +177,11 @@ class OperationTools:
         for spec in self.registry.list_specs():
             if not self.gateway.policy.is_allowed(spec)[0]:
                 continue
-            if mode == 'full' or self.registry.request_visible(spec.name) or spec.name in selected:
+            # Outcomes exposes complete operations while keeping low-level
+            # mutation/process contracts available through explicit selection.
+            deferred = (spec.name in {'write_file', 'edit_file', 'run_process'}
+                if mode == 'outcomes' else not self.registry.request_visible(spec.name))
+            if mode == 'full' or not deferred or spec.name in selected:
                 active.add(spec.name)
             else:
                 catalog[spec.name] = {'domain':spec.domain, 'description':spec.description.split('. ',1)[0][:200]}

@@ -1293,6 +1293,74 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(self.app.ledger.to_dict(),ledger)
         self.assertEqual(self._versions(self.root/f'tools/inspection/{identity}'),retained)
 
+    def test_inspection_raw_sources_continue_across_failed_opinions_and_later_work(self):
+        from simple_ar.tools.materials import validate_material_observation
+
+        self._create()
+        self._write('draft.md', 'Explain the original measured conditions.\n')
+        self._write('revision.md', 'Explain the revised result against original conditions.\n')
+        basis = 'Original measured value and its experimental conditions.\n' * 36
+        lines = 'Header\nOther header\nFirst measured condition\nSecond measured condition\nTail\n'
+        self._write('basis.txt', basis)
+        self._write('lines.txt', lines)
+        initial = len(self.inspection_requests)
+
+        def unfinished(view):
+            if len(self.inspection_requests) == initial + 1:
+                return [_action('read_file', path='basis.txt', max_bytes=8000),
+                        _action('read_file', path='lines.txt', start_line=3, max_lines=2)]
+            return [_action('record_inspection', decisions=[{
+                'subject': 'target-1', 'findings': [], 'evidence': ['not-an-observed-ID'],
+                'limitations': [], 'conclusion': 'complete'}])]
+
+        self.review = unfinished
+        failed = self._inspect(['draft.md'], ['basis.txt'])
+        self.assertEqual(failed['status'], 'error', failed)
+        self.assertEqual(len(self.inspection_requests)-initial, 3)
+        ledger = self.app.ledger.to_dict()
+        references = self.app._material_observations(['basis.txt', 'lines.txt'])
+        observed = [validate_material_observation(self.app.workspace, row, identity='reuse-check')
+                    for row in references]
+        self.assertTrue(any(row['data']['text'] == basis for row in observed))
+        self.assertTrue(any(row['request'].get('start_line') == 3 and
+            row['data']['text'] == 'First measured condition\nSecond measured condition\n' for row in observed))
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+        self.assertTrue(all(row['record'].endswith('native_result.json') for row in references))
+
+        before = len(self.inspection_requests)
+        def revised(view):
+            messages = self.inspection_requests[-1]['messages']
+            supplied = json.dumps(messages, ensure_ascii=False)
+            self.assertNotIn('not-an-observed-ID', supplied)
+            self.assertEqual(view['targets'][0]['text_windows'][0]['text'],
+                             'Explain the revised result against original conditions.\n')
+            self.assertEqual([row['observation']['text']
+                for row in view['working_view']['observations']].count(basis), 1)
+            return {'findings': [], 'limitations': []}
+        self.review = revised
+        result = self._inspect(['revision.md'], ['basis.txt', 'lines.txt'])
+        self.assertEqual(result['status'], 'ok', result)
+        self.assertEqual(len(self.inspection_requests)-before, 1,
+                         'Previously observed supporting bytes need no new model read requests')
+        self.assertEqual((self.root/'workspace/basis.txt').read_text(), basis)
+        identity = Path(result['data']['record']).parts[1]
+        saved = self.app.session.store.read_json(f'tools/inspection/{identity}/input.json')
+        self.assertFalse(any(w.get('source_reference') for row in saved['targets'] for w in row['windows']))
+        self.assertTrue(any(w.get('source_reference') for row in saved['evidence'] for w in row['windows']))
+
+        # Changed sources retain their old receipts, but not their old bodies in
+        # the next professional view. No verdict or stale content is inherited.
+        self._submit(_action('write_file', path='basis.txt',
+            content='New measured condition.\n' * 70,
+            expected_sha256=_digest(self.root/'workspace/basis.txt')))
+        self._ok('write_file')
+        def changed(view):
+            self.assertNotIn(basis, [row['observation']['text']
+                for row in view['working_view']['observations']])
+            return {'findings': [], 'limitations': []}
+        self.review = changed
+        self._inspect(['revision.md'], ['basis.txt'])
+
     def test_inspector_locates_missing_sources_within_one_version_bound_operation(self):
         self._create(report=True)
         self._write('notes.md','The sample mean is 2.0 from three observations.\n')
