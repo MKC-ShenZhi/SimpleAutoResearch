@@ -19,7 +19,9 @@ from simple_ar.tools.workspace import FileWindow, workspace_tool_specs
 class InspectionRequest(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
     goal: str = Field(min_length=1)
-    targets: list[FileWindow | str] = Field(min_length=1, max_length=32)
+    targets: list[FileWindow | str] = Field(min_length=1, max_length=32,
+        description='Decodable text files or text windows. Rendered images require inspect_images; '
+            'unsupported or unreadable targets reject admission without a model call or assessment.')
     evidence: list[FileWindow | str] = Field(default_factory=list, max_length=32)
 
 
@@ -814,14 +816,30 @@ class InspectionToolGateway:
                         or saved.get('protocol') != self.protocol):
                     raise ValueError('Inspection identity is bound to different arguments; no replay')
                 return self._cached(identity)
-            # Persist admission before reading or requesting. An interruption here never replays.
+            # Observe targets before admitting professional work. Read-only file
+            # observations have their own owner; an unavailable text input is
+            # not a model opinion about the artifact or a required correction.
             saved = {'identity': identity, 'arguments': binding, 'targets': [], 'evidence': []}
             if self.protocol:
                 saved['protocol'] = self.protocol
-            self.store.write_json(input_path, saved)
             remaining = [512000]
             saved['targets'] = [self._observe(value, f'target-{i + 1}', identity, remaining)
                                 for i, value in enumerate(request.targets)]
+            unavailable = [row for row in saved['targets'] if not row.get('readable')]
+            if unavailable:
+                return ToolResult(tool_name=name, status='error',
+                    data={'targets': [{key: row[key] for key in
+                            ('subject', 'path', 'sha256', 'readable', 'limitation') if key in row}
+                            for row in saved['targets']],
+                        'scope': 'Text inspection was not admitted. These are read observations, '
+                            'not assessments; select current decodable text in a new invocation. '
+                            'Use image inspection for rendered images.'},
+                    error='Text inspection requires readable targets: ' + '; '.join(
+                        f"{row['request']['path']}: {row.get('limitation', 'Unavailable text')}"
+                        for row in unavailable))
+            # Freeze accepted inputs before evidence investigation or any model
+            # request. Existing started work takes the historical cache above.
+            self.store.write_json(input_path, saved)
             saved['evidence'] = [self._observe(value, f'evidence-{i + 1}', identity, remaining)
                                  for i, value in enumerate(request.evidence)]
             if self.progressive:

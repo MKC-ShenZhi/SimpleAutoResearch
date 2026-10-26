@@ -17,6 +17,7 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 
 ### Fixed
 
+- Text inspection rejects unreadable targets before model dispatch, preserving prior valid reviews without turning unsupported image input into a blocking artifact finding. Historical inspection records retain their original behavior.
 - Explicit model replacement after a failed decision in ordinary operation tasks reuses the existing closure checks for professional calls. Retain their bounded unknown charges, original results and history without replay; historical recovery conditions remain unchanged.
 - Ordinary source preparation no longer judges the whole task by its last prepared execution. Delivery follows current declared producers; changed sources, stale consumed outputs and actual review findings remain checked, while historical controlled-work completion retains its saved behavior.
 - Retain a complete professional response after a configured transport retry succeeds, while keeping the earlier failed attempt's bounded charge unchanged. Pending or unbounded usage still blocks adoption; this does not authorize further automatic correction or replay.

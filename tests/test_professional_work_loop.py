@@ -1699,6 +1699,38 @@ class OperationsWorkLoopTests(unittest.TestCase):
         export = next(row['function'] for row in self.app.schemas if row['function']['name']=='export_report')
         self.assertNotIn('candidate_result',export['parameters']['properties'])
 
+    def test_unreadable_text_targets_reject_admission_without_poisoning_prior_review(self):
+        from simple_ar.core.assessments import assessment_issues
+
+        self._create(report=True)
+        self._write('notes.md', 'The sample mean is 2.0 from three observations.\n')
+        self._inspect(['notes.md'])
+        self.assertEqual(self._assessment()['verdict'], 'passed')
+        for name, content in (('figure.png', b'\x89PNG\r\n\x1a\n'),
+                              ('unreadable.txt', b'\xffinvalid UTF-8'),
+                              ('control.txt', b'not\x00text')):
+            with self.subTest(target=name):
+                (self.root/'workspace'/name).write_bytes(content)
+                calls = self.send.call_count
+                ledger = deepcopy(self.app.ledger.to_dict())
+                result = self._inspect(['notes.md', name], [])
+                self.assertEqual(result['status'], 'error', result)
+                self.assertIn('requires readable targets', result['error'])
+                self.assertFalse(result['artifacts'])
+                self.assertFalse(result['metadata'])
+                self.assertEqual(self.send.call_count, calls)
+                self.assertEqual(self.app.ledger.to_dict(), ledger)
+                observation = [row for row in self.app._operation_observations()
+                    if row['tool_name'] == 'inspect_artifacts'][-1]
+                identity = Path(observation['record']).parent.name
+                self.assertFalse(self.app.operations.inspection.has_started(identity))
+                self._reload()
+                self.assertEqual(assessment_issues(self.app.workspace,
+                    self.app._operation_observations(), ['notes.md', name],
+                    require_pass=['notes.md']), [])
+        self._submit(_action('deliver_result', **self._delivery('notes.md')))
+        self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
+
     def test_request_boundary_keeps_real_nonterminal_work_without_forcing_a_delivery(self):
         self.app = ToolApplication.create(self.root,'Prepare a useful note; explain any remaining work.',
             model='fixture',services=self.services,sources={},max_turns=1,max_tokens=100000,
