@@ -8,6 +8,7 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 
 ### Improved
 
+- Independent reviews in new tasks investigate within the shared task budget without a separate six-round deadline, and can explicitly report unfinished checks. Failed or incomplete reassessments retain outstanding required findings instead of clearing them merely because the target was fully read.
 - `ToolApplication.create` now uses the common operation loop exclusively. Historical professional controllers remain resumable through their saved contracts; new legacy-controller requests are rejected before creation. Chinese Markdown and ordinary artifact delivery do not require PDF publication.
 - Working notes and independent inspection reuse read targets and evidence through the shared bounded view, reducing material loss after history retirement. Windows are not duplicated and targets cannot be their own independent evidence. Partial reads, failed summaries and malformed calls cannot claim completion; original material, receipts and historical contracts remain available.
 - Ordinary tasks delegate source investigation and creation/revision through distinct native read, focus and candidate actions in one professional decision loop. This replaces the ambiguous mixed JSON contract for new tasks; saved tasks retain their original protocol. Editable source capacity remains separate from immutable input copies, and completely read, version-bound originals accept full-file revisions or exact replacements under the existing approval and input protections.

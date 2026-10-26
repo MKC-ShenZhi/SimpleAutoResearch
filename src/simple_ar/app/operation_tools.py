@@ -96,7 +96,8 @@ class OperationTools:
             protocol=config.get('inspection_protocol'),
             prior_assessments=lambda:[row.model_dump() for row in
                 current_assessments(self.workspace,observations())])
-        self.registry.register_package(inspection_tool_specs(progressive=config.get('inspection_protocol')=='subjects.v2'),
+        self.registry.register_package(inspection_tool_specs(progressive=self.inspection.progressive,
+            adaptive=self.inspection.adaptive),
             self.inspection, request_visible=True)
         self.registry.register_package(analysis_tool_specs(),
             AnalysisToolGateway(root,self.workspace,contract=config.get('table_analysis')))

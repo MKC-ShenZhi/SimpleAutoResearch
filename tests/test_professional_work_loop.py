@@ -290,6 +290,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
                                 and [w['text'] for w in row['text_windows']]!=target_text)),
                             'limitations':response['limitations']})
                     response = {'decisions':decisions}
+                if isinstance(response, dict) and '_ReviewDecision' in terminal['parameters'].get('$defs', {}):
+                    response = {**response, 'decisions':[
+                        {'conclusion':'complete', **decision} for decision in response.get('decisions', [])]}
                 actions = ([_action('record_inspection', **response)]
                     if isinstance(response, dict) else response)
                 message = {'role': 'assistant', 'content': None,
@@ -810,7 +813,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
     def test_independent_subjects_keep_passes_and_defects_when_a_sibling_changes(self):
         from simple_ar.core.assessments import assessment_issues
         self._create()
-        self.assertEqual(self.app.state['config']['inspection_protocol'],'subjects.v2')
+        self.assertEqual(self.app.state['config']['inspection_protocol'],'subjects.v3')
         self._write('report.md','# Results\n\nThe observed mean is 2.0.\n')
         self._write('layout.py','font_size = 10\n')
         self._write('incorrect.txt','The observed mean is 9.0.\n')
@@ -1489,13 +1492,13 @@ class OperationsWorkLoopTests(unittest.TestCase):
     def test_inspection_low_capacity_still_requires_a_real_terminal_opinion(self):
         # Request pressure, token pressure, and unknown prior usage all use
         # the same owner; none may synthesize a successful assessment.
-        for mode in ('one_request', 'tokens', 'unoffered_read', 'invalid_final', 'unknown', 'bounded_prior'):
+        for mode in ('one_request', 'tokens', 'unfinished', 'unoffered_read', 'invalid_final', 'unknown', 'bounded_prior'):
             with self.subTest(mode=mode):
                 self.root = self.directory/mode
                 self._create()
                 self._write('report.md', 'The sample mean is 2.0.\n')
                 ledger = self.app.ledger
-                if mode in {'one_request', 'unoffered_read', 'invalid_final'}:
+                if mode in {'one_request', 'unfinished', 'unoffered_read', 'invalid_final'}:
                     ledger.limits['llm_requests'] = 2  # caller floor + final opinion
                 if mode == 'tokens':
                     # Direct operation below has no caller floor; its current
@@ -1516,6 +1519,11 @@ class OperationsWorkLoopTests(unittest.TestCase):
                         return [_action('read_file', path='measurements/conditions.txt')]
                     if mode == 'invalid_final':
                         return {'decisions':[]}
+                    if mode == 'unfinished':
+                        self.assertNotIn('For necessary claims', self.inspection_requests[-1]['messages'][-1]['content'])
+                        return {'decisions':[{'subject':'target-1','conclusion':'incomplete',
+                            'findings':[],'evidence':[],
+                            'limitations':['Necessary source investigation remains unfinished at this boundary.']}]}
                     return {'findings': [{'subject': 'target-1', 'severity': 'required',
                         'message': 'The necessary source comparison has not been established.'}],
                         'limitations': ['Source gathering ended at the available capacity.']}
@@ -1585,51 +1593,89 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 self.assertEqual(self._versions(self.inputs), originals)
                 self.assertFalse(self._process_receipts())
 
-    def test_incomplete_source_investigation_supersedes_prior_pass_and_retains_completed_reads(self):
-        self._create(report=True)
-        self._write('report.md','The sample mean is 2.0.\n')
-        self._inspect(['report.md'])
-        self.assertEqual(self._assessment()['verdict'],'passed')
-        first_round = len(self.inspection_requests)
-        def invalid_reads(view):
-            if len(self.inspection_requests)>first_round+1:
-                replies = self._inspection_history()
-                self.assertEqual(len(replies), 2)
-                self.assertNotEqual(replies[1]['status'], 'ok', replies[1])
-            if len(self.inspection_requests)==first_round+7:
-                self.assertEqual({tool['function']['name']
-                    for tool in self.inspection_requests[-1]['tools']}, {'record_inspection'})
-                # The real provider also requested a read after only the final
-                # tool was offered. Exhaustion must not grant another read.
-                return [_action('list_directory', path='measurements')]
-            return [
-                _action('read_file', path='measurements/observations.csv'),
-                _action('read_file', path='measurements/conditions.txt', max_bytes=-1)]
-        self.review = invalid_reads
-        workspace = self.app.operations.inspection.workspace
-        with patch.object(workspace, 'call', wraps=workspace.call) as reads:
-            result = self._inspect(['report.md'],['measurements/conditions.txt'])
-        self.assertFalse(any(call.args[0]=='list_directory' for call in reads.call_args_list))
-        self.assertEqual(len(self.inspection_requests)-first_round, 7)
-        self.assertEqual(result['status'],'error')
-        self.assertEqual(_assessments(result)[0]['verdict'],'incomplete')
+    def test_review_investigates_beyond_six_rounds_and_binds_its_own_conclusion(self):
+        self._create()
+        self._write('notes.md', 'A narrow observation requiring source verification.\n')
+        initial = len(self.inspection_requests)
+        before = self._versions(self.inputs)
+        def investigate(view):
+            self.assertNotIn('source_rounds_remaining', view)
+            if len(self.inspection_requests)-initial <= 8:
+                return [_action('read_file', path='measurements/conditions.txt')]
+            return {'decisions':[{'subject':'target-1', 'conclusion':'incomplete',
+                'findings':[], 'evidence':[], 'limitations':['The necessary comparison is still unresolved.']}]}
+        self.review = investigate
+        result = self._inspect(['notes.md'])
+        self.assertEqual(result['status'], 'ok', result)
+        self.assertEqual(len(self.inspection_requests)-initial, 9)
+        self.assertEqual(self._assessment()['verdict'], 'incomplete')
+        self.assertEqual(self._assessment()['coverage'], 'partial')
+        self.assertFalse(self._assessment()['findings'])
+        self.assertEqual(self._versions(self.inputs), before)
+        self.assertFalse(self.app.ledger.over_limit())
         identity = Path(result['data']['record']).parts[1]
         saved = self.app.session.store.read_json(f'tools/inspection/{identity}/input.json')
-        self.assertTrue(any(row.get('path')==str(self.inputs/'observations.csv') for row in saved['evidence']))
-        trace = self.app.session.store.read_json(f'tools/inspection/{identity}/sources-0.json')
-        self.assertEqual(len(trace['results']),2)
-        self.assertEqual(trace['results'][0]['tool'],'read_file')
-        calls = self.send.call_count
+        ledger, calls = self.app.ledger.to_dict(), self.send.call_count
+        receipts = self._versions(self.root/f'tools/inspection/{identity}')
         self._reload()
-        self._submit(_action('deliver_result',**self._delivery('report.md')))
-        self._not_delivered()
-        self.assertIn('lacks a complete independent inspection',self._last('deliver_result')['error'])
-        self.assertEqual(self.send.call_count,calls)
-        self.review = lambda view: {'findings':[],'limitations':[]}
-        self._inspect(['report.md'])
-        self._submit(_action('deliver_result',**self._delivery('report.md')))
-        self._ok('deliver_result')
-        self.assertEqual(self.app.session.manifest.status,'completed')
+        cached = self.app.operations.inspection.call('inspect_artifacts', saved['arguments'], identity)
+        self.assertTrue(cached.ok, cached)
+        self.assertEqual(cached.metadata['assessments'], result['metadata']['assessments'])
+        self.assertEqual(self.send.call_count, calls)
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+        self.assertEqual(self._versions(self.root/f'tools/inspection/{identity}'), receipts)
+
+    def test_unfinished_review_revokes_pass_but_preserves_existing_required_findings(self):
+        from simple_ar.core.assessments import assessment_issues
+        self._create()
+        self._write('notes.md', 'The sample mean needs verification.\n')
+        self._inspect(['notes.md'])
+        self.assertEqual(self._assessment()['verdict'], 'passed')
+        unfinished = {'decisions':[{'subject':'target-1', 'conclusion':'incomplete',
+            'findings':[], 'evidence':[], 'limitations':['The original measurements need further review.']}]}
+        self.review = lambda _: unfinished
+        self._inspect(['notes.md'])
+        self.assertTrue(assessment_issues(self.app.workspace, self._observations(),
+            ['notes.md'], require_pass=['notes.md']))
+        self.review = lambda view: {'findings':[{'subject':'target-1', 'severity':'required',
+            'message':'The stated claim is not supported by the observed sample.'}], 'limitations':[]}
+        self._inspect(['notes.md'])
+        self.review = lambda _: unfinished
+        self._inspect(['notes.md'])
+        self.assertEqual(self._assessment()['verdict'], 'incomplete')
+        self.assertTrue(assessment_issues(self.app.workspace, self._observations(), ['notes.md']))
+        self.review = lambda _: {'findings':[], 'limitations':[]}
+        self._inspect(['notes.md'])
+        self.assertFalse(assessment_issues(self.app.workspace, self._observations(), ['notes.md']))
+
+    def test_failed_legacy_complete_read_cannot_erase_a_required_opinion(self):
+        from simple_ar.core.assessments import assessment_issues
+        from simple_ar.tools.inspection import InspectionToolGateway
+        self._create()
+        self._write('notes.md', 'A claim requiring correction.\n')
+        gateway = InspectionToolGateway(self.root, self.app.workspace,
+            self.app.operations.inspection.client_factory)
+        args = {'goal':'Check the claim', 'targets':['notes.md']}
+        self.review = lambda _: {'findings':[{'subject':'target-1', 'severity':'required',
+            'message':'The claim contradicts the observed source.'}], 'limitations':[]}
+        negative = gateway.call('inspect_artifacts', args, 'legacy-negative').model_dump(mode='json')
+        self.assertEqual(negative['metadata']['assessment']['verdict'], 'needs_revision')
+        def fail(_):
+            raise ValueError('Controlled failure after complete target read')
+        self.review = fail
+        failed = gateway.call('inspect_artifacts', args, 'legacy-failed').model_dump(mode='json')
+        self.assertEqual(failed['status'], 'error')
+        self.assertEqual(failed['metadata']['assessment']['coverage'], 'complete')
+        self.assertEqual(failed['metadata']['assessment']['verdict'], 'incomplete')
+        self.assertTrue(assessment_issues(self.app.workspace, [negative, failed], ['notes.md']))
+        self.assertTrue(assessment_issues(self.app.workspace, [negative, failed],
+            ['notes.md'], require_pass=['notes.md']))
+        ledger, calls = self.app.ledger.to_dict(), self.send.call_count
+        records = self._versions(self.root/'tools/inspection')
+        gateway.call('inspect_artifacts', args, 'legacy-failed')
+        self.assertEqual(self.send.call_count, calls)
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+        self.assertEqual(self._versions(self.root/'tools/inspection'), records)
 
     def test_text_inspection_preserves_scope_and_does_not_promote_a_copy_to_evidence(self):
         self._create(report=True)

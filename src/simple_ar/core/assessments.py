@@ -90,17 +90,17 @@ def current_assessments(workspace: Any, observations: list[dict]) -> list[Artifa
 
 def assessment_issues(workspace: Any, observations: list[dict], artifacts: list[str],
                       *, require_pass: list[str] = ()) -> list[str]:
-    """Only a later complete inspection can supersede a current required finding."""
+    """Only a conclusive complete inspection can supersede a required finding."""
     delivered = {workspace.resolve(path) for path in artifacts}
     required = {workspace.resolve(path) for path in require_pass}
     passed, problems = set(), {}
     for assessment in current_assessments(workspace, observations):
         subjects = {workspace.resolve(path) for path in assessment.subjects}
-        if assessment.verdict == 'incomplete':
-            passed.difference_update(subjects)
-        if assessment.coverage == 'complete':
+        # Reading the whole target is not a completed review. In particular,
+        # historical failed reviews may retain complete read coverage.
+        passed.difference_update(subjects)
+        if assessment.coverage == 'complete' and assessment.verdict != 'incomplete':
             for path in subjects:
-                passed.discard(path)
                 problems.pop(path, None)
             if assessment.verdict == 'passed':
                 passed.update(subjects)

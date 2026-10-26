@@ -66,11 +66,15 @@ New tasks use `operations.v1`: investigation, editing, execution, inspection and
 publication are independently callable, rather than stages of an implicit handoff.
 `OperationTools` composes the registry; it does not run another scheduler. Inspection
 owns version-bound findings and publication owns rendering and export provenance.
-New tasks freeze `inspection_protocol=subjects.v2`: one source investigation can
+New tasks freeze `inspection_protocol=subjects.v3`: one source investigation can
 inspect several targets, but each decision names its own supporting observations.
 Each target's completeness, findings and evidence versions are evaluated separately;
-cross-file support must be explicit. Saved grouped opinions are not retroactively
-split, and unrelated supplies do not upgrade their inspection contract.
+cross-file support must be explicit. Investigation shares the task budget and reserves
+capacity for its final opinion, without a separate six-round deadline. A decision can
+explicitly remain incomplete; reading all target bytes alone does not complete a review.
+Unfinished or failed reviews revoke an older pass and retain outstanding required findings;
+only a conclusive complete reassessment can replace them. Saved protocols retain their
+reading contracts and receipts; load and unrelated supplies do not upgrade them.
 The inspector starts with bounded previews and reads necessary ranges through real
 tools. The common context selector bounds each presented view; original observations
 and native call/result pairs remain recorded. Cumulative decoded byte ranges from the

@@ -1667,7 +1667,7 @@ class ToolApplication:
             tool_contracts=tool_contracts, completion_policy=completion_policy, control_protocol=control_protocol,
             delivery_files=delivery_files,
             extensions=extensions, creation_declarations=creation_declarations)
-        config['inspection_protocol'] = 'subjects.v2'
+        config['inspection_protocol'] = 'subjects.v3'
         config['source_generation_protocol'] = 'prepared.v3'
         config['source_decision_protocol'] = 'native.v1'
         if context_protocol is not None:
