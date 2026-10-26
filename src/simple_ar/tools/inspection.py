@@ -1,6 +1,7 @@
 """One version-bound inspection; no editing, execution or adoption authority."""
 from __future__ import annotations
 
+from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
@@ -382,6 +383,18 @@ class InspectionToolGateway:
                     or result.data.get('sha256') != row['sha256']):
                 raise ValueError('Inspection target/evidence version changed; use a new identity')
 
+    @staticmethod
+    def _admissible_references(saved: dict[str, Any]) -> dict[str, list[str]]:
+        """Eligible observation subjects; relevance and certification remain review judgments."""
+        observed = {row['subject']: row for row in [*saved['targets'], *saved['evidence']]}
+        readable = {subject: row for subject, row in observed.items()
+            if row.get('sha256') and row.get('readable')
+            and any(window.get('review_text', window['text']).strip() for window in row['windows'])}
+        return {target['subject']: [subject for subject, row in readable.items()
+            if subject != target['subject'] and row['path'] != target['path']
+            and row['sha256'] != target.get('sha256')]
+            for target in saved['targets']}
+
     def _subject_decisions(self, saved: dict[str, Any], value: dict) -> list[_SubjectDecision]:
         model = _ReviewResponse if self.adaptive else _SubjectResponse
         decisions = model.model_validate(value).decisions
@@ -389,7 +402,7 @@ class InspectionToolGateway:
         ids = [decision.subject for decision in decisions]
         if len(ids) != len(set(ids)) or set(ids) != set(targets):
             raise ValueError('Inspection requires exactly one decision per target')
-        observed = {row['subject']: row for row in [*saved['targets'], *saved['evidence']]}
+        admissible = self._admissible_references(saved)
         for decision in decisions:
             target = targets[decision.subject]
             if not target.get('sha256'):
@@ -402,14 +415,9 @@ class InspectionToolGateway:
             if len(decision.evidence) != len(set(decision.evidence)):
                 raise ValueError('Inspection decision repeats an evidence ID')
             for source in decision.evidence:
-                row = observed.get(source)
-                if (row is None or not row.get('sha256') or not row.get('readable')
-                        or not any(window.get('review_text', window['text']).strip()
-                                   for window in row['windows'])):
-                    raise ValueError('Inspection evidence ID was not observed as readable text')
-                if (source == decision.subject or row['path'] == target['path']
-                        or row['sha256'] == target['sha256']):
-                    raise ValueError('Inspection subject cannot be its own evidence')
+                if source not in admissible[decision.subject]:
+                    raise ValueError('Inspection evidence ID was not observed as readable independent text '
+                        'for this subject; use a bare observation subject ID, not a chunk_id, path or citation')
         return decisions
 
     def _subject_assessments(self, saved: dict[str, Any], receipt: dict[str, Any],
@@ -672,11 +680,8 @@ class InspectionToolGateway:
             base_context=base,turn_blocks=blocks,observations=observations,
             schema_tokens=estimate_tokens(json.dumps(offered,ensure_ascii=False)),
             context_token_target=target,estimate_tokens=estimate_tokens,
-            history_access='read_file at the recorded authorized source path and range')
-        if finish is not None:
-            messages.append(finish)
-            metadata['estimated_input_tokens'] = (estimate_tokens(json.dumps(messages,ensure_ascii=False))
-                + estimate_tokens(json.dumps(offered,ensure_ascii=False)))
+            history_access='read_file at the recorded authorized source path and range',
+            trailing_messages=[finish] if finish is not None else [])
         if metadata['estimated_input_tokens'] > target:
             raise ValueError('Inspection working view cannot fit its model input target; '
                 'retain observations and narrow the requested inspection scope')
@@ -713,7 +718,33 @@ class InspectionToolGateway:
                 + estimate_tokens(json.dumps(offered,ensure_ascii=False))
                 + (client.effective_output_limit() or 0))
         number = 0
+        invalid_finals = 0
         while True:
+            if self.adaptive:
+                # Rebuild from cumulative real observations before projection and
+                # capacity estimates, including sources absent from the working view.
+                schema = response_model.model_json_schema()
+                branches = []
+                for subject, references in self._admissible_references(saved).items():
+                    decision = deepcopy(schema['$defs']['_ReviewDecision'])
+                    decision['properties']['subject'].update(const=subject,
+                        description='Bare target observation subject ID; not a chunk_id or file path.')
+                    evidence = decision['properties']['evidence']
+                    evidence['uniqueItems'] = True
+                    evidence['description'] = ('Bare observation subject IDs of sources actually used for '
+                        'this target; never chunk_id values, paths or verbose citations. Eligibility '
+                        'does not establish relevance or scientific certification.')
+                    if references:
+                        evidence['items']['enum'] = references
+                    else:
+                        evidence['maxItems'] = 0
+                    branches.append(decision)
+                schema['properties']['decisions'].update(items={'anyOf': branches},
+                    minItems=len(branches), maxItems=len(branches))
+                # The former item reference has been replaced by inline branches;
+                # their findings still reference the retained _SubjectFinding.
+                del schema['$defs']['_ReviewDecision']
+                terminal['function']['parameters'] = schema
             label = f'inspect-artifacts-{identity}' + (f'-sources-{number}' if number else '')
             if {'llm_requests','total_tokens'}.intersection(ledger.unknown_dimensions(
                     unbounded_only=True, current_allowance_only=True)):
@@ -793,14 +824,19 @@ class InspectionToolGateway:
                     return value
             except (ValueError,KeyError,TypeError) as exc:
                 batch_error = str(exc)
-            if terminal_only:
+            rejected_final = (self.adaptive and bool(batch_error)
+                and any(isinstance(call.get('function'), dict)
+                    and call['function'].get('name') == 'record_inspection' for call in calls))
+            if rejected_final:
+                invalid_finals += 1
+            if terminal_only and not rejected_final:
                 raise ValueError('Inspection source investigation bound reached; retain source reads and disclose incomplete scope'
                     + (f'; final response invalid: {batch_error}' if batch_error else ''))
             if not calls:
                 messages.append({'role':'user','content':
                     'Use the offered read tools for needed sources, or record_inspection for the final result.'})
             read_limit = None
-            if self.progressive:
+            if self.progressive and not rejected_final:
                 _, base_projection = self._working_messages(saved,request,messages[:2],[*tools,terminal],client)
                 available = max(0,base_projection['input_token_target']-base_projection['estimated_input_tokens'])
                 read_limit = max(256,min(64000,available*4//(2*max(1,len(calls)))))
@@ -843,6 +879,12 @@ class InspectionToolGateway:
                 self.store.write_json(input_path,saved)
                 if not self._accounted(self._usage(identity)):
                     raise ValueError('Inspection source usage is unsettled; retain completed observations without further requests')
+            # A malformed opinion gets one corrective response, independently
+            # of legitimate source rounds. Persist every rejection before stopping.
+            if rejected_final and (invalid_finals >= 2 or terminal_only):
+                raise ValueError('Inspection final response invalid; '
+                    + ('one corrective response exhausted' if invalid_finals >= 2 else 'final-only capacity reached')
+                    + '; retain source reads and incomplete scope: ' + batch_error)
             self._check_versions([*saved['targets'],*saved['evidence']],identity)
             number += 1
 

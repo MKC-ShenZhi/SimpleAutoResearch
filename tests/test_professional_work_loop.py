@@ -290,7 +290,10 @@ class OperationsWorkLoopTests(unittest.TestCase):
                                 and [w['text'] for w in row['text_windows']]!=target_text)),
                             'limitations':response['limitations']})
                     response = {'decisions':decisions}
-                if isinstance(response, dict) and '_ReviewDecision' in terminal['parameters'].get('$defs', {}):
+                branches = terminal['parameters'].get('properties', {}).get(
+                    'decisions', {}).get('items', {}).get('anyOf', [])
+                if (isinstance(response, dict) and branches
+                        and all('conclusion' in branch.get('required', []) for branch in branches)):
                     response = {**response, 'decisions':[
                         {'conclusion':'complete', **decision} for decision in response.get('decisions', [])]}
                 actions = ([_action('record_inspection', **response)]
@@ -861,22 +864,45 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._write('report.md','# Results\n\nSee the calculation.\n')
         self._write('calculation.py','mean = (1 + 2 + 3) / 3\n')
         self._write('support.txt','The calculation uses three supplied values.\n')
+        self._write('copy.md','# Results\n\nSee the calculation.\n')
+        self._write('blank.txt',' \n\t')
+        (self.root/'workspace/unreadable.txt').write_bytes(b'\xffinvalid UTF-8')
         def review(view):
+            terminal = next(tool['function']['parameters']
+                for tool in self.inspection_requests[-1]['tools']
+                if tool['function']['name']=='record_inspection')
+            branches = {row['properties']['subject']['const']: row
+                for row in terminal['properties']['decisions']['items']['anyOf']}
+            # Eligibility is per target: another target and a copy of its bytes
+            # can support a sibling, but never that target itself. Blank and
+            # unreadable observations cannot support either decision.
+            extra = ['evidence-6'] if len(self.inspection_views)>1 else []
+            for subject, references in {
+                    'target-1':['target-2','evidence-2',*extra],
+                    'target-2':['target-1','evidence-2','evidence-3',*extra]}.items():
+                branch = branches[subject]
+                self.assertEqual(branch['properties']['evidence']['items']['enum'], references)
+                self.assertIn('conclusion', branch['required'])
+                self.assertIn('chunk_id', branch['properties']['evidence']['description'])
             self.assertNotIn('evidence-1', [row['subject'] for row in view['evidence']])
             if len(self.inspection_views)==1:
-                self.assertEqual([row['subject'] for row in view['evidence']], ['evidence-2'])
+                self.assertEqual([row['subject'] for row in view['evidence']],
+                    ['evidence-2','evidence-3','evidence-4','evidence-5'])
                 return [_action('read_file',path='support.txt')]
-            self.assertEqual([row['subject'] for row in view['evidence']], ['evidence-2','evidence-3'])
+            self.assertEqual([row['subject'] for row in view['evidence']],
+                ['evidence-2','evidence-3','evidence-4','evidence-5','evidence-6'])
             return {'decisions':[
-                {'subject':'target-1','evidence':['target-2','evidence-3'],'findings':[],'limitations':[]},
+                {'subject':'target-1','evidence':['target-2','evidence-6'],'findings':[],'limitations':[]},
                 {'subject':'target-2','evidence':['target-1'],'findings':[],
                  'limitations':['Only the supplied prefix was reviewed.']}]}
         self.review = review
         result = self._inspect([{'path':'report.md','max_bytes':12000},
             {'path':'calculation.py','max_bytes':8}],
-            [{'path':'./report.md','max_bytes':12000},'measurements/conditions.txt'])
+            [{'path':'./report.md','max_bytes':12000},'measurements/conditions.txt',
+                'copy.md','blank.txt','unreadable.txt'])
         self.assertEqual([a['verdict'] for a in _assessments(result)],['passed','incomplete'])
-        self.assertEqual([row['subject'] for row in result['data']['evidence']], ['evidence-2','evidence-3'])
+        self.assertEqual([row['subject'] for row in result['data']['evidence']],
+            ['evidence-2','evidence-3','evidence-4','evidence-5','evidence-6'])
         self.assertEqual(_assessments(result)[1]['evidence_sha256'],
             {str(self.root/'workspace/report.md'):_digest(self.root/'workspace/report.md')})
         observations = self.app._operation_observations()
@@ -1224,6 +1250,16 @@ class OperationsWorkLoopTests(unittest.TestCase):
 
         def review(view):
             number = len(self.inspection_views)
+            terminal = next(tool['function']['parameters']
+                for tool in self.inspection_requests[-1]['tools']
+                if tool['function']['name']=='record_inspection')
+            evidence = terminal['properties']['decisions']['items']['anyOf'][0]['properties']['evidence']
+            if number == 1:
+                self.assertEqual(evidence['maxItems'], 0)
+                self.assertNotIn('enum', evidence['items'])
+            else:
+                self.assertEqual(evidence['items']['enum'],
+                    [f'evidence-{index}' for index in range(1,number)])
             if number == 1:
                 return [_action('read_file', path='basis.txt', max_bytes=1024)]
             if number < 4:
@@ -1559,29 +1595,95 @@ class OperationsWorkLoopTests(unittest.TestCase):
             'multiple_final': [final, final],
             'invalid_shape': [{'tool_name':'read_file', 'arguments':['measurements/conditions.txt']}],
             'too_many_sources': [source]*9,
+            # Raw native calls bypass the fixture's convenience conclusion.
+            'missing_conclusion': [_action('record_inspection', decisions=[{
+                'subject':'target-1','findings':[],'evidence':[],'limitations':[]}])],
         }
+        for name, reference in {
+                'unread_reference':'evidence-999', 'self_reference':'target-1',
+                'chunk_reference':'evidence-1:0', 'path_reference':'basis.txt',
+                'verbose_reference':'evidence-1 (basis.txt, lines 1-2)',
+                'repeated_reference':'evidence-1:0'}.items():
+            cases[name] = [_action('record_inspection', decisions=[{
+                'subject':'target-1','conclusion':'complete','findings':[],
+                'evidence':[reference],'limitations':[]}])]
         for name, batch in cases.items():
             with self.subTest(batch=name):
                 self.root = self.directory/name
                 self._create(report=True)
                 self._write('report.md', 'The sample mean is 2.0.\n')
+                self._write('basis.txt', 'The supplied sample values are 1, 2, 3.\n')
+                evidence = ['basis.txt'] if name.endswith('_reference') else []
+                if name=='repeated_reference':
+                    self.review = lambda _: {'findings':[{'subject':'target-1','severity':'required',
+                        'message':'The claim needs correction against the original observations.'}], 'limitations':[]}
+                    self._inspect(['report.md'], evidence)
                 before = len(self.inspection_requests)
                 originals = self._versions(self.inputs)
+                candidate = (self.root/'workspace/report.md').read_bytes()
 
                 def recover(view):
                     if len(self.inspection_requests)==before+1:
+                        if evidence:
+                            terminal = next(tool['function']['parameters']
+                                for tool in self.inspection_requests[-1]['tools']
+                                if tool['function']['name']=='record_inspection')
+                            branch = terminal['properties']['decisions']['items']['anyOf'][0]
+                            self.assertEqual(branch['properties']['evidence']['items']['enum'], ['evidence-1'])
                         return batch
                     self.assertEqual(len(self.inspection_requests), before+2)
                     replies = self._inspection_history()
                     self.assertEqual(len(replies), len(batch))
                     self.assertTrue(all(reply['status']!='ok' for reply in replies), replies)
+                    if name=='missing_conclusion':
+                        self.assertIn('conclusion', replies[0]['error'])
+                        self.assertIn('Field required', replies[0]['error'])
+                    if evidence:
+                        self.assertIn('bare observation subject ID', replies[0]['error'])
+                    if name=='repeated_reference':
+                        return batch
                     return {'findings':[], 'limitations':[]}
 
                 self.review = recover
                 workspace = self.app.operations.inspection.workspace
                 with patch.object(workspace, 'call', wraps=workspace.call) as reads:
-                    self._inspect(['report.md'], [])
-                self.assertEqual(self._assessment()['verdict'], 'passed')
+                    result = self._inspect(['report.md'], evidence)
+                if name=='repeated_reference':
+                    from simple_ar.core.assessments import assessment_issues
+
+                    self.assertEqual(result['status'], 'error', result)
+                    self.assertIn('one corrective response exhausted', result['error'])
+                    self.assertEqual(_assessments(result)[0]['verdict'], 'incomplete')
+                    self.assertEqual((self.root/'workspace/report.md').read_bytes(), candidate)
+                    self.assertTrue(assessment_issues(self.app.workspace, self._observations(), ['report.md']))
+                    identity = Path(result['data']['record']).parts[1]
+                    saved = self.app.session.store.read_json(f'tools/inspection/{identity}/input.json')
+                    self.assertEqual([row['subject'] for row in saved['evidence']], ['evidence-1'])
+                    self.assertTrue(saved['evidence'][0]['windows'])
+                    self.assertTrue(saved['prior_required'])
+                    self.assertEqual(len(saved['source_rounds']), 2)
+                    for number in range(2):
+                        trace = self.app.session.store.read_json(f'tools/inspection/{identity}/sources-{number}.json')
+                        self.assertEqual(json.loads(trace['response']['tool_calls'][0]['function']['arguments']),
+                            batch[0]['arguments'])
+                        self.assertEqual(trace['results'][0]['result']['status'], 'blocked')
+                        self.assertIn('bare observation subject ID', trace['results'][0]['result']['error'])
+                    receipts = self._versions(self.root/f'tools/inspection/{identity}')
+                    expected = self.app.session.store.read_json(f'tools/inspection/{identity}/result.json')
+                    calls, ledger = self.send.call_count, self.app.ledger.to_dict()
+                    self._reload()
+                    cached = self.app.operations.inspection.call('inspect_artifacts', saved['arguments'], identity)
+                    # An invalid final has no completed professional opinion.
+                    # Recovery must refuse replay, not reinterpret it as a pass.
+                    self.assertEqual(cached.status, 'blocked', cached.error)
+                    self.assertIn('No completed inspection response', cached.error)
+                    self.assertEqual(self.app.session.store.read_json(
+                        f'tools/inspection/{identity}/result.json'), expected)
+                    self.assertEqual(self.send.call_count, calls)
+                    self.assertEqual(self.app.ledger.to_dict(), ledger)
+                    self.assertEqual(self._versions(self.root/f'tools/inspection/{identity}'), receipts)
+                else:
+                    self.assertEqual(self._assessment()['verdict'], 'passed')
                 self.assertEqual(len(self.inspection_requests)-before, 2)
                 # Admission and version checks can read the target; no rejected
                 # batch may reach a source read or a workspace write.

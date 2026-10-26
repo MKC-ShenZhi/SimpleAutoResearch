@@ -43,6 +43,37 @@ def select(**kwargs):
 
 
 class WorkingContextTests(unittest.TestCase):
+    def test_final_instruction_is_admitted_with_material_and_atomic_history(self):
+        latest = block(2, 'Current observed result')
+        rows = [observation(0, 'Original measured source with conditions. ' * 600)]
+        arguments = dict(turn_blocks=[block(0, 'old'), latest], observations=rows,
+                         context_token_target=6000)
+        baseline, before_budget = select(**arguments)
+        tail = [{'role': 'user', 'content': 'Conclude using the retained sources. ' +
+                 'x' * (6000 - before_budget['estimated_input_tokens'] + 512)}]
+        before = deepcopy((arguments, tail))
+        self.assertGreater(len(json.dumps([*baseline, *tail], ensure_ascii=False)) + 30, 6000)
+        messages, budget = select(**arguments, trailing_messages=tail)
+        self.assertEqual(messages[-1], tail[0])
+        self.assertEqual(messages[-4:-2], latest)
+        self.assertLessEqual(budget['estimated_input_tokens'], 6000)
+        self.assertGreaterEqual(budget['estimated_input_tokens'],
+                                30 + len(json.dumps(messages, ensure_ascii=False)))
+        self.assertLessEqual(len(json.dumps(messages[1])), len(json.dumps(baseline[1])))
+        self.assertEqual((arguments, tail), before)
+        messages[-1]['content'] = 'changed returned view'
+        self.assertEqual((arguments, tail), before)
+        # Required instructions cannot be silently dropped when even the
+        # mandatory contract does not fit, nor split a native tool pair.
+        overflow, budget = select(**{**arguments, 'context_token_target': 10}, trailing_messages=tail)
+        self.assertEqual(overflow[-1], tail[0])
+        self.assertEqual(overflow[-4:-2], latest)
+        self.assertTrue(budget['context_exceeds_input_target'])
+        for invalid in ([{'role': 'tool', 'content': 'unpaired result'}],
+                        [{'role': 'assistant', 'content': 'unrecorded work'}]):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                select(trailing_messages=invalid)
+
     def test_source_survives_archive_without_recurring_full_transcript(self):
         source = 'Measured source value = 17.25 with uncertainty 0.5'
         blocks = [block(0, source)] + [block(i, 'unrelated payload ' * 100) for i in range(1, 8)]

@@ -81,6 +81,12 @@ and native call/result pairs remain recorded. Cumulative decoded byte ranges fro
 same current file version can complete a target; gaps, changed bytes and binary reads
 cannot. Owner-computed file digests are available for provenance checks, not scientific
 certification. Saved `subjects.v1` keeps its original full-target presentation.
+V3 derives eligible source IDs once for both the per-request tool schema and runtime
+validation; observation IDs, window IDs and paths are distinct. An invalid final gets
+one correction before the owner returns an incomplete record. This does not cap valid
+source investigation or relax historical receipt recovery. Additional closing instructions
+belong in the shared selector's `trailing_messages`, so their cost participates in material
+selection rather than being appended afterward.
 `source_generation_protocol=prepared.v3` exposes goal/material/project preparation
 and approved execution as ordinary operations. The source owner investigates and
 generates the candidate; shared execution retains approval, accounting and provenance.

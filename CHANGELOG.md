@@ -4,6 +4,15 @@
 
 User-visible changes, newest first, dated when confirmed. Multi-day development may be summarized together rather than assigned invented completion dates. Development-branch work is distinguished from main; engineering checks do not establish task success. See [usage](docs/USAGE.md) for current instructions.
 
+## 2026-10-27 — V2.10 development (unreleased)
+
+### Fixed
+
+- Independent inspection exposes the exact source references available for each target. Repeated invalid conclusions stop after one correction, retaining observations and unresolved findings instead of spending the entire task allowance on formatting.
+- Final inspection instructions share the same context selection budget as source material, preventing an otherwise usable working view from overflowing at conclusion time. Historical records and model charges remain unchanged.
+
+The initial report was formally delivered in the frozen task, but feedback delivery exhausted its original request allowance. P1 acceptance and an overall coordination-cost improvement remain unconfirmed.
+
 ## 2026-10-26 — V2.10 development (unreleased)
 
 ### Improved

@@ -237,6 +237,14 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         _, inputs, fake, _, app, _ = self._native_fixture(process_limits={
             'process_invocations': 2, 'process_wall_seconds': 10}, operation_control=True)
         fake.chat_turn.side_effect = AssertionError('Caller actions must not request coordinator decisions')
+        # Current source work uses native actions; retain this test's candidate
+        # fixtures without returning an unconstrained Mock as a model message.
+        def source_turn(messages, **kwargs):
+            candidate = fake.ask_json(messages[0]['content'], messages[1]['content'])
+            return {'role': 'assistant', 'content': None, 'tool_calls': [{
+                'id': 'source-candidate', 'type': 'function', 'function': {
+                    'name': 'submit_candidate', 'arguments': json.dumps(candidate)}}]}
+        fake.tool_turn.side_effect = source_turn
         app.implementation.client_factory = lambda _: fake
         self.assertTrue(app.implementation.preparation_only)
         self.assertIn('write_file',{spec.name for spec in app.gateway.list_specs()})

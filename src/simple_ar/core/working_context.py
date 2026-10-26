@@ -22,6 +22,7 @@ def select_working_context(
     block_request_counts: Sequence[int] | None = None,
     summarized_through_turn: int = 0,
     history_access: str = 'read_history',
+    trailing_messages: Sequence[Mapping[str, Any]] = (),
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Return messages and decision-budget metadata without modifying inputs.
 
@@ -35,7 +36,9 @@ def select_working_context(
     rows are excluded from material selection and marked in retained native
     work. Excerpts address original character ranges, not invented offsets.
     Context (including any checkpoint/through_turn) and inputs stay unchanged.
-    Schema cost is included; callers enforce hard budgets after selection.
+    Schema cost and mandatory trailing instructions are included in selection;
+    callers enforce hard budgets after selection. Trailing messages cannot add
+    assistant/tool work outside its atomic history block.
     """
     if schema_tokens < 0 or context_token_target < 0:
         raise ValueError('Token costs and target must be nonnegative')
@@ -45,6 +48,11 @@ def select_working_context(
     blocks = deepcopy(list(turn_blocks))
     rows = deepcopy(list(observations))
     notes = deepcopy(list(work_notes))
+    tail = deepcopy(list(trailing_messages))
+    if any(message.get('role') not in {'user', 'system'}
+           or not isinstance(message.get('content'), str)
+           or set(message) != {'role', 'content'} for message in tail):
+        raise ValueError('Trailing instructions must be user/system text messages')
     if type(summarized_through_turn) is not int or not 0 <= summarized_through_turn <= len(blocks):
         raise ValueError('Summary coverage must be within the original journal')
     # Only a usable note snapshot can replace repeated historical presentation.
@@ -229,6 +237,7 @@ def select_working_context(
                 emitted = counts[i]
                 messages.extend(deepcopy(blocks[i]))
             messages.extend({'role':'user','content':text} for text in user_requests[emitted:])
+            messages.extend(deepcopy(tail))
             measured = schema_tokens+estimate_tokens(json.dumps(messages,ensure_ascii=False))
             # A boolean/decimal-width change can reduce the serialized size
             # by one token. Keep the conservative bound rather than oscillate.
