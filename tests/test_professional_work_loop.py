@@ -1653,6 +1653,145 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 if mode in {'unknown','bounded_prior'}:
                     self.assertEqual(ledger.entries[0].status, 'unknown')
 
+    def test_fresh_inspection_binds_only_the_unique_omitted_subject_with_explicit_peers(self):
+        self._create()
+        for index in range(1, 4):
+            self._write(f'target-{index}.md', f'Observed claim {index}.\n')
+        finding = {'severity':'required', 'message':'The population claim lacks a sampling basis.'}
+        decisions = [
+            {'subject':'target-3', 'conclusion':'complete', 'findings':[], 'evidence':[], 'limitations':[]},
+            {'conclusion':'complete', 'findings':[finding], 'evidence':[], 'limitations':[]},
+            {'subject':'target-1', 'conclusion':'complete', 'findings':[], 'evidence':[], 'limitations':[]}]
+        original = deepcopy(decisions)
+        self.review = lambda _: [_action('record_inspection', decisions=decisions)]
+        result = self._inspect([f'target-{index}.md' for index in range(1, 4)], [])
+        self.assertEqual(result['status'], 'ok', result)
+        assessments = _assessments(result)
+        self.assertEqual([row['verdict'] for row in assessments], ['passed', 'needs_revision', 'passed'])
+        self.assertEqual(assessments[1]['findings'][0]['message'], finding['message'])
+        self.assertEqual(decisions, original)
+        identity = Path(result['data']['record']).parts[1]
+        store = self.app.session.store
+        trace = store.read_json(f'tools/inspection/{identity}/sources-0.json')
+        self.assertEqual(json.loads(trace['response']['tool_calls'][0]['function']['arguments']),
+                         {'decisions':original})
+        self.assertEqual(trace['owner_bindings'], [{'decision_index':1, 'subject':'target-2'}])
+        saved = store.read_json(f'tools/inspection/{identity}/input.json')
+        # Historical validation stays strict even when the fresh path could bind it.
+        owner = self.app.operations.inspection
+        with self.assertRaises(ValueError):
+            owner._subject_decisions(saved, {'decisions':original})
+        historical, error = owner._subject_assessments(saved, {'response':{'decisions':original}}, identity, '')
+        self.assertTrue(error)
+        self.assertTrue(all(row['verdict']=='incomplete' and not row['findings'] for row in historical))
+        records = self._versions(self.root/f'tools/inspection/{identity}')
+        calls, ledger = self.send.call_count, self.app.ledger.to_dict()
+        self._reload()
+        cached = self.app.operations.inspection.call('inspect_artifacts', saved['arguments'], identity)
+        self.assertEqual(cached.metadata['assessments'], assessments)
+        self.assertEqual(self.send.call_count, calls)
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+        self.assertEqual(self._versions(self.root/f'tools/inspection/{identity}'), records)
+
+    def test_fresh_inspection_rejects_ambiguous_missing_and_explicit_invalid_subjects(self):
+        for mode in ('ambiguous', 'wrong', 'blank', 'null', 'duplicate', 'short'):
+            with self.subTest(mode=mode):
+                self.root = self.directory/mode
+                self._create()
+                for index in range(1, 4):
+                    self._write(f'target-{index}.md', f'Observed claim {index}.\n')
+                decisions = [{'conclusion':'complete', 'findings':[{
+                    'severity':'required', 'message':'Malformed opinion must not be adopted.'}],
+                    'evidence':[], 'limitations':[]} for _ in range(3)]
+                decisions[0]['subject'] = 'target-1'
+                if mode != 'ambiguous':
+                    decisions[1]['subject'] = {'wrong':'target-999', 'blank':'', 'null':None,
+                        'duplicate':'target-1', 'short':'target-2'}[mode]
+                if mode == 'short':
+                    decisions.pop()
+                self.review = lambda _: [_action('record_inspection', decisions=decisions)]
+                before = len(self.inspection_requests)
+                result = self._inspect([f'target-{index}.md' for index in range(1, 4)], [])
+                self.assertEqual(result['status'], 'error', result)
+                self.assertEqual(len(self.inspection_requests)-before, 2)
+                self.assertTrue(all(row['verdict']=='incomplete' and not row['findings']
+                    for row in _assessments(result)))
+
+    def test_binary_evidence_diagnostics_allow_one_fresh_correction_with_omitted_subject(self):
+        self._create()
+        self._write('report.md', 'A population inference from three observations.\n')
+        evidence = ['basis-1.txt', 'first.png', 'basis-2.txt', 'second.png']
+        for index, filename in enumerate(evidence):
+            self._write(filename, f'Observation {index}: no sampling design.\n')
+        before = len(self.inspection_requests)
+        finding = {'severity':'required', 'message':'The population inference lacks a sampling design.'}
+        def review(_):
+            if len(self.inspection_requests) == before+1:
+                return [_action('record_inspection', decisions=[{
+                    'subject':'target-1', 'conclusion':'complete', 'findings':[finding],
+                    'evidence':[f'evidence-{index}' for index in (1, 2, 3, 4)], 'limitations':[]}])]
+            error = self._inspection_history()[0]['error']
+            diagnostics = json.loads(error[error.index('{'):])
+            subject, = diagnostics['subjects']
+            self.assertEqual(subject['subject'], 'target-1')
+            self.assertEqual(subject['invalid']['ids'], ['evidence-2', 'evidence-4'])
+            self.assertEqual(subject['eligible']['ids'], ['evidence-1', 'evidence-3'])
+            return [_action('record_inspection', decisions=[{'conclusion':'complete',
+                'findings':[finding], 'evidence':['evidence-1', 'evidence-3'], 'limitations':[]}])]
+        self.review = review
+        result = self._inspect(['report.md'], evidence)
+        self.assertEqual(result['status'], 'ok', result)
+        self.assertEqual(len(self.inspection_requests)-before, 2)
+        assessment, = _assessments(result)
+        self.assertEqual(assessment['verdict'], 'needs_revision')
+        self.assertEqual(assessment['findings'][0]['message'], finding['message'])
+        self.assertEqual(set(assessment['evidence_sha256']),
+                         {str(self.root/f'workspace/basis-{index}.txt') for index in (1, 2)})
+        identity = Path(result['data']['record']).parts[1]
+        trace = self.app.session.store.read_json(f'tools/inspection/{identity}/sources-0.json')
+        self.assertEqual(trace['results'][0]['result']['status'], 'blocked')
+        self.assertNotIn('owner_bindings', trace)
+        self.assertEqual(json.loads(trace['response']['tool_calls'][0]['function']['arguments'])
+            ['decisions'][0]['evidence'], [f'evidence-{index}' for index in (1, 2, 3, 4)])
+
+    def test_exhausted_final_retains_only_unadopted_diagnostic_and_authoritative_trace(self):
+        self._create()
+        self._write('report.md', 'A measured result.\n')
+        self._write('figure.png', 'Not eligible text evidence.\n')
+        message = 'An aggregate claim may hide cohort differences.'
+        decisions = [{'subject':'target-1', 'conclusion':'complete',
+            'findings':[{'severity':'required', 'message':message}],
+            'evidence':['evidence-1'], 'limitations':[]}]
+        self.review = lambda _: [_action('record_inspection', decisions=decisions)]
+        before = len(self.inspection_requests)
+        result = self._inspect(['report.md'], ['figure.png'])
+        self.assertEqual(result['status'], 'error', result)
+        self.assertEqual(len(self.inspection_requests)-before, 2)
+        self.assertTrue(all(row['verdict']=='incomplete' and not row['findings']
+            for row in _assessments(result)))
+        diagnostic = result['data']['rejected_opinion']
+        self.assertIn('not an assessment, fact or pass', diagnostic['scope'])
+        self.assertIn('Requires valid reinspection', diagnostic['scope'])
+        self.assertEqual(diagnostic['candidate_excerpt'],
+                         [{'subject':'target-1', 'candidate_messages':[message]}])
+        self.assertIn('evidence-1', diagnostic['validation_error'])
+        self.assertTrue(diagnostic['record'].endswith('/sources-1.json'))
+        trace = self.app.session.store.read_json(diagnostic['record'])
+        self.assertEqual(trace['results'][0]['call_id'], diagnostic['call_id'])
+        self.assertEqual(json.loads(trace['response']['tool_calls'][0]['function']['arguments']),
+                         {'decisions':decisions})
+        self.assertNotIn('rejected_opinion', result['metadata'])
+        identity = Path(result['data']['record']).parts[1]
+        saved = self.app.session.store.read_json(f'tools/inspection/{identity}/input.json')
+        records = self._versions(self.root/f'tools/inspection/{identity}')
+        calls, ledger = self.send.call_count, self.app.ledger.to_dict()
+        self._reload()
+        cached = self.app.operations.inspection.call('inspect_artifacts', saved['arguments'], identity)
+        self.assertEqual(cached.status, 'blocked', cached)
+        self.assertEqual(self.send.call_count, calls)
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+        self.assertEqual(self._versions(self.root/f'tools/inspection/{identity}'), records)
+
     def test_inspector_rejected_native_batches_reply_without_executing_and_can_recover(self):
         final = _action('record_inspection', findings=[], limitations=[])
         source = _action('read_file', path='measurements/conditions.txt')

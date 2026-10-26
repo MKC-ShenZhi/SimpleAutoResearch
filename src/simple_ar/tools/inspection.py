@@ -449,6 +449,7 @@ class InspectionToolGateway:
         if len(ids) != len(set(ids)) or set(ids) != set(targets):
             raise ValueError('Inspection requires exactly one decision per target')
         admissible = self._admissible_references(saved)
+        invalid_references = []
         for decision in decisions:
             target = targets[decision.subject]
             if not target.get('sha256'):
@@ -458,12 +459,26 @@ class InspectionToolGateway:
                 raise ValueError('Inspection findings and limitations must be nonblank')
             if self.adaptive and decision.conclusion == 'incomplete' and not decision.limitations:
                 raise ValueError('Incomplete inspection must explain its remaining scope')
-            if len(decision.evidence) != len(set(decision.evidence)):
-                raise ValueError('Inspection decision repeats an evidence ID')
+            seen, invalid, repeated = set(), [], []
             for source in decision.evidence:
-                if source not in admissible[decision.subject]:
-                    raise ValueError('Inspection evidence ID was not observed as readable independent text '
-                        'for this subject; use a bare observation subject ID, not a chunk_id, path or citation')
+                if source in seen:
+                    repeated.append(source)
+                elif source not in admissible[decision.subject]:
+                    invalid.append(source)
+                seen.add(source)
+            if invalid or repeated:
+                def bounded(ids: list[str]) -> dict:
+                    return {'ids': [key[:120] for key in ids[:16]],
+                        'omitted': max(0, len(ids)-16)}
+                invalid_references.append({'subject': decision.subject,
+                    'invalid': bounded(invalid), 'repeated': bounded(repeated),
+                    'eligible': bounded(admissible[decision.subject])})
+        if invalid_references:
+            raise ValueError('Inspection evidence IDs must be unique and observed as readable independent text '
+                'for each subject; use a bare observation subject ID, not a chunk_id, path or citation. '
+                'Eligibility does not establish relevance or scientific certification. '
+                + json.dumps({'subjects': invalid_references[:8],
+                    'omitted_subjects': max(0, len(invalid_references)-8)}, ensure_ascii=False))
         return decisions
 
     def _subject_assessments(self, saved: dict[str, Any], receipt: dict[str, Any],
@@ -572,9 +587,39 @@ class InspectionToolGateway:
             kind='artifact_assessments' if self.protocol else 'artifact_assessment',
             schema=None if self.protocol else 'artifact_assessment.v1', producer='inspect_artifacts')
         artifact_path = f'attempts/{identity}/{ref.path}'
+        diagnostics = {}
+        if self.adaptive and error and saved.get('source_rounds'):
+            trace_path = self._path(identity, f"sources-{len(saved['source_rounds'])-1}")
+            trace = self.store.read_json(trace_path)
+            finals = [call for call in trace.get('response', {}).get('tool_calls', [])
+                if isinstance(call, dict) and isinstance(call.get('function'), dict)
+                and call['function'].get('name') == 'record_inspection']
+            if finals:
+                call_id = finals[-1].get('id')
+                last = next((row for row in trace.get('results', []) if row.get('call_id') == call_id), {})
+                rejected = last.get('result', {})
+                arguments = last.get('arguments', {})
+                rows = arguments.get('decisions', []) if isinstance(arguments, dict) else []
+                candidates = []
+                for row in rows[:4] if isinstance(rows, list) else []:
+                    if not isinstance(row, dict):
+                        continue
+                    findings = row.get('findings', [])
+                    candidates.append({'subject': str(row.get('subject', '<omitted>'))[:120],
+                        'candidate_messages': [str(item.get('message', ''))[:320]
+                            for item in (findings[:3] if isinstance(findings, list) else [])
+                            if isinstance(item, dict)]})
+                if rejected.get('status') == 'blocked':
+                    diagnostics['rejected_opinion'] = {
+                        'scope': 'Unadopted candidate opinion, not an assessment, fact or pass. '
+                            'Requires valid reinspection; raw source trace is authoritative. '
+                            'Excerpt is bounded to four decisions, three messages each, 320 characters per message.',
+                        'record': trace_path, 'call_id': call_id,
+                        'validation_error': rejected.get('error', failure)[:3000],
+                        'candidate_excerpt': candidates}
         result = ToolResult(tool_name='inspect_artifacts', status='error' if error else 'ok',
             error=error, summary=f'Artifact inspection: {verdict}',
-            data={'record': artifact_path, 'targets': targets, 'evidence': evidence}, artifacts=[artifact_path],
+            data={'record': artifact_path, 'targets': targets, 'evidence': evidence, **diagnostics}, artifacts=[artifact_path],
             metadata={key: assessment, 'capability_artifacts': [ref.to_dict()],
                       'usage': receipt.get('usage', []), 'inspection_binding': {
                           'input_sha256': receipt['input_sha256'],
@@ -865,9 +910,37 @@ class InspectionToolGateway:
                 if len(parsed)>8:
                     raise ValueError('Inspection allows at most eight source calls in one response')
                 if finals:
-                    value = response_model.model_validate(parsed[0][1]).model_dump(mode='json')
+                    value = parsed[0][1]
+                    owner_bindings = []
+                    if self.protocol and isinstance(value.get('decisions'), list):
+                        rows = value['decisions']
+                        missing = [index for index, row in enumerate(rows)
+                            if isinstance(row, dict) and 'subject' not in row]
+                        explicit = [row['subject'] for row in rows
+                            if isinstance(row, dict) and 'subject' in row]
+                        targets = {row['subject'] for row in saved['targets']}
+                        # Only a genuinely absent identity can be supplied by the
+                        # owner, and only in this fresh native admission path.
+                        if (len(missing) == 1 and len(rows) == len(targets)
+                                and len(explicit) == len(rows)-1
+                                and all(isinstance(key, str) and key in targets for key in explicit)
+                                and len(set(explicit)) == len(explicit)
+                                and len(targets-set(explicit)) == 1):
+                            subject = next(iter(targets-set(explicit)))
+                            value = deepcopy(value)
+                            value['decisions'][missing[0]]['subject'] = subject
+                            owner_bindings.append({'decision_index': missing[0], 'subject': subject})
+                    value = response_model.model_validate(value).model_dump(mode='json')
                     if self.protocol:
                         self._subject_decisions(saved, value)
+                    if owner_bindings:
+                        # Keep the provider response above unmodified; retain
+                        # the admitted mapping beside it, bound through the input.
+                        record = self.store.read_json(trace)
+                        record['owner_bindings'] = owner_bindings
+                        self.store.write_json(trace, record)
+                        saved['source_rounds'][-1] = self._digest(trace)
+                        self.store.write_json(input_path, saved)
                     return value
             except (ValueError,KeyError,TypeError) as exc:
                 batch_error = str(exc)

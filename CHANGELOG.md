@@ -13,10 +13,10 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 
 ### Fixed
 
-- Independent inspection exposes the exact source references available for each target. Repeated invalid conclusions stop after one correction, retaining observations and unresolved findings instead of spending the entire task allowance on formatting.
+- Independent inspection identifies invalid source references and can bind an omitted target only when its identity is uniquely determined. Rejected comments remain explicitly unverified, with their original trace available; ambiguous identities and invalid evidence still fail. The one-correction limit and historical receipts remain unchanged.
 - Final inspection instructions share the same context selection budget as source material, preventing an otherwise usable working view from overflowing at conclusion time. Historical records and model charges remain unchanged.
 
-The initial report was formally delivered in the frozen task, but feedback delivery exhausted its original request allowance. P1 acceptance and an overall coordination-cost improvement remain unconfirmed.
+An earlier candidate delivered an initial report, but the latest comparison ended with partial artifacts before feedback. P1 acceptance and an overall coordination-cost improvement remain unconfirmed.
 
 ## 2026-10-26 — V2.10 development (unreleased)
 

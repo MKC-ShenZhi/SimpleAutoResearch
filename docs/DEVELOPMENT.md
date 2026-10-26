@@ -90,7 +90,12 @@ validation; observation IDs, window IDs and paths are distinct. An invalid final
 one correction before the owner returns an incomplete record. This does not cap valid
 source investigation or relax historical receipt recovery. Additional closing instructions
 belong in the shared selector's `trailing_messages`, so their cost participates in material
-selection rather than being appended afterward.
+selection rather than being appended afterward. Fresh final admission may bind one
+omitted target identity only when the supplied decisions determine it uniquely;
+explicit invalid IDs and ambiguous mappings remain errors. The raw response and
+owner binding are recorded separately. Evidence errors identify offending IDs.
+Exhausted finals retain a bounded, explicitly unadopted diagnostic and source trace;
+these are not assessments or facts, and do not upgrade historical invalid receipts.
 The shared material decoder also exposes inspection-owned raw windows, including
 successful reads inside failed opinions. Supporting evidence can reuse these windows
 only after the original receipt and current permission/version/range checks. Target
