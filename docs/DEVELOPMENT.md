@@ -66,11 +66,13 @@ New tasks use `operations.v1`: investigation, editing, execution, inspection and
 publication are independently callable, rather than stages of an implicit handoff.
 `OperationTools` composes the registry; it does not run another scheduler. Inspection
 owns version-bound findings and publication owns rendering and export provenance.
-New creation defaults to `tool_contracts="outcomes"`, with workspace editing and
-permitted process operations available alongside inspection and publication. Ordinary
-source work uses the shared action loop, without a mandatory preparation controller.
-Saved preparation contracts retain their original presentation and executable recovery;
-loading tools changes presentation, never authority.
+New creation defaults to `tool_contracts="on_demand"`: workspace editing, permitted
+process operations and coordination are directly available; optional professional
+contracts are discoverable and loaded when needed. Frozen code, table-analysis and
+measurement contracts expose their required owners directly. Ordinary source work
+uses the shared action loop without a mandatory preparation controller. Saved
+preparation contracts and `outcomes` tasks retain their recorded presentation and
+executable recovery; loading tools changes presentation, never authority.
 Project reuse requires a terminal delivery and one explicit complete `copy_project`
 inventory with matching current hashes. Portable file groups alone do not establish
 a project root. Reuse grants no execution authority, environment or inherited validator;
@@ -131,7 +133,10 @@ guarantee of scientific quality.
 Before dispatching that review, delivery validates the producer's actual result:
 required files, current execution inputs and requested publication formats. An
 invalid delivery retains its produced files and diagnostics without spending a
-content-review call. Current provenance follows the latest owner of each consumed
+content-review call. A canonical proposal may still fail review: the existing
+shared-ledger follow-up floor leaves capacity for a subsequent decision to handle
+findings or explicitly deliver partial work. It grants no allowance and does not
+promise enough capacity to finish every revision. Current provenance follows the latest owner of each consumed
 output; replacing an unused sibling does not invalidate that output. The whole
 process must still have succeeded with a complete output binding, and shared
 inputs remain checked. Same-invocation recovery and retained version history keep

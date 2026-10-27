@@ -5433,7 +5433,7 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
                 root = app.session.store.root
                 preview, _, _, _ = ToolApplication._configuration(root, 'Configuration preview',
                     model=None, sources={}, max_attempts=30)
-                self.assertEqual(preview['tool_contracts'], 'outcomes')
+                self.assertEqual(preview['tool_contracts'], 'on_demand')
                 if mode in {'full', 'on_demand', 'outcomes'}:
                     app = load_native_history(root.parent / f'explicit-{mode}', 'Saved compatibility control',
                         config={'model':None,'sources':{'source0':inputs},'tool_contracts':mode}, max_attempts=30)

@@ -8,6 +8,7 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 
 ### Improved
 
+- New tasks discover optional professional tools through the existing capability directory and load their contracts when needed. Common file/execution tools and owners required by frozen contracts remain directly available; saved modes are unchanged.
 - Formal report delivery in new tasks owns an independent review of the original request, feedback and actual complete delivery. Local consistency checks cannot fulfill this obligation. Review shares the task ledger; saved tasks keep their original contract.
 - Work-owner notes and explicitly referenced source observations replace paid background summaries and unrelated history backfill. Inspection reads also remain reusable after version and permission checks, without inheriting the reviewer's opinion.
 - Ordinary source work uses shared editing and execution, and can reuse a complete delivered project snapshot. Exact code contracts and historical preparation recovery remain unchanged; execution authority is not inherited.
@@ -15,7 +16,7 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 
 ### Fixed
 
-- Interrupted publication recovery reads retained review receipts without dispatching a new inspection. Full delivery reviews bind attachment versions and scope; incomplete or negative opinions are retained and may be reassessed by a new explicit delivery.
+- Interrupted publication recovery reads retained review receipts without dispatching a new inspection. Full delivery reviews bind versions and scope, retain failed opinions, and protect capacity for a subsequent decision to handle the result.
 - Validate actual output and publication readiness before paid delivery review. Replacing an unused co-output no longer invalidates another current output; changed consumed inputs, failed producers and strict historical recovery remain checked.
 - Complete project reuse follows recorded byte versions through copies and edits. Later successful outputs cannot clear an earlier copied version's failure or stale inputs; retired intermediate directories need not remain intact. This does not certify copied code or inherit execution authority.
 - Independent inspection identifies invalid source references and can bind an omitted target only when its identity is uniquely determined. Rejected comments remain explicitly unverified, with their original trace available; ambiguous identities and invalid evidence still fail. The one-correction limit and historical receipts remain unchanged.

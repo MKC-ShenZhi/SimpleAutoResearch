@@ -1377,7 +1377,7 @@ class ToolApplication:
                services: Any | None = None,
                snapshot_sources: bool = False,
                max_snapshot_bytes: int = 16 * 1024 * 1024,
-               tool_contracts: Literal['full', 'on_demand', 'outcomes'] = 'outcomes',
+               tool_contracts: Literal['full', 'on_demand', 'outcomes'] = 'on_demand',
                completion_policy: str | None = None, control_protocol: str | None = None,
                delivery_files: list[str] | None = None,
                model_catalogs: dict[str, str | None] | None = None,
@@ -1650,7 +1650,7 @@ class ToolApplication:
                extensions: list[Path] | None = None,
                max_snapshot_bytes: int = 16 * 1024 * 1024,
                delivery_files: list[str] | None = None,
-               tool_contracts: Literal['full', 'on_demand', 'outcomes'] = 'outcomes',
+               tool_contracts: Literal['full', 'on_demand', 'outcomes'] = 'on_demand',
                completion_policy: str | None = None, professional_inputs: bool = False,
                investigate_results: bool = True,
                control_protocol: Literal['operations.v1'] = 'operations.v1',
@@ -3642,8 +3642,16 @@ class ToolApplication:
                         store.write_json('native_result.json', payload, kind='native_observation')
                     current = self._operation_observation(payload, call,
                         (store.root.relative_to(self.session.store.root) / 'native_result.json').as_posix())
-                    review = self.operations.review_delivery(delivery, store.root.name,
-                        may_start=start_review, current_result=current, current_outputs=outputs)
+                    # A review can reject delivery. It is not a terminal
+                    # success until verified; leave the caller capacity to
+                    # act on the result through this same ledger.
+                    review_floor = (self._completion_floor(self._client(store.root.name), dispatch=True)
+                        if start_review and self.operations.delivery_review is not None
+                            and not request.unresolved and request.report is not None
+                            and request.report.status == 'canonical' else {})
+                    with self.ledger.protect_remaining(review_floor):
+                        review = self.operations.review_delivery(delivery, store.root.name,
+                            may_start=start_review, current_result=current, current_outputs=outputs)
                     if review is not None:
                         metadata = payload.setdefault('metadata', {})
                         retained_review = metadata.get('delivery_review')

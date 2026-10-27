@@ -107,7 +107,7 @@ class OperationTools:
             registry=search_registry)
         self.registry.register_package(source_tool_specs(), self.sources)
         self.publication = PublicationToolGateway(root, self.workspace, ledger)
-        self.registry.register_package(publication_tool_specs(preparation=False), self.publication, request_visible=True)
+        self.registry.register_package(publication_tool_specs(preparation=False), self.publication)
         self.inspection = InspectionToolGateway(root, self.workspace,
             client_factory=lambda identity:client_factory(identity, 'writing'),
             protocol=config.get('inspection_protocol'),
@@ -117,14 +117,15 @@ class OperationTools:
                 current_assessments(self.workspace,observations())])
         self.registry.register_package(inspection_tool_specs(progressive=self.inspection.progressive,
             adaptive=self.inspection.adaptive),
-            self.inspection, request_visible=True)
+            self.inspection)
         self.delivery_review = None
         if config.get('delivery_review_protocol') == 'task.v1':
             from simple_ar.tools.delivery_review import DeliveryReview
             self.delivery_review = DeliveryReview(workspace=self.workspace, inspector=self.inspection,
                 user_requests=user_requests, observations=observations)
         self.registry.register_package(analysis_tool_specs(),
-            AnalysisToolGateway(root,self.workspace,contract=config.get('table_analysis')))
+            AnalysisToolGateway(root,self.workspace,contract=config.get('table_analysis')),
+            request_visible=config.get('table_analysis') is not None)
         self.implementation = self.scientific = None
         preparation = config.get('source_generation_protocol')
         if preparation not in {None,'prepared.v1','prepared.v2','prepared.v3'}:
@@ -154,7 +155,7 @@ class OperationTools:
                 candidate_outputs=(lambda record:self.scientific.candidate_outputs(record) if self.scientific else {})
                     if exact else None)
             self.registry.register_package(implementation_tool_specs(exact=exact,preparation_only=not exact),
-                self.implementation,request_visible=not exact)
+                self.implementation,request_visible=True)
         if config.get('scientific_tools'):
             from simple_ar.tools.scientific import ScientificToolGateway, scientific_tool_specs
             self.scientific = ScientificToolGateway(root,self.workspace,ledger,session_id,
@@ -162,7 +163,8 @@ class OperationTools:
                 execution_contract=config.get('execution_contract'),
                 research_contract=self.sources.accepted_execution_contract,
                 research_requirements=self.sources.execution_issues)
-            self.registry.register_package(scientific_tool_specs(),self.scientific)
+            self.registry.register_package(scientific_tool_specs(),self.scientific,
+                request_visible=config.get('execution_contract') is not None)
         if config.get('allow_vision'):
             from simple_ar.tools.visual import VisualToolGateway, visual_tool_specs
             self.registry.register_package(visual_tool_specs(),VisualToolGateway(root,self.workspace,ledger,

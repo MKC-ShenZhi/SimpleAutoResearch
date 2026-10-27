@@ -84,16 +84,18 @@ class ResearchIntakeTests(unittest.TestCase):
             app = create_research_task(ResearchBrief(request_text=request,
                 requested_outputs=('assessment',), asset_requests=({'locator': str(note)},)),
                 root=base / 'task', services=services)
-            self.assertEqual(app.state['config']['tool_contracts'], 'outcomes')
+            self.assertEqual(app.state['config']['tool_contracts'], 'on_demand')
             permissions = set(app.gateway.policy.allowed_permissions)
-            self.assertEqual(set(app._specialist_catalog()), set())
+            self.assertIn('inspect_artifacts', app._specialist_catalog())
+            self.assertNotIn('export_report', app._specialist_catalog())
             self.assertIsNone(app.implementation)
             self.assertFalse({'source_generation_protocol', 'source_decision_protocol'} & app.state['config'].keys())
             result = app.run(progress=lambda _: None)
             self.assertEqual(result['status'], 'completed', result)
             first = {row['function']['name'] for row in client.calls[0][1]['tools']}
             self.assertTrue({'read_file', 'list_directory',
-                'ask_user', 'deliver_result', 'inspect_artifacts'} <= first)
+                'ask_user', 'deliver_result'} <= first)
+            self.assertNotIn('inspect_artifacts', first)
             self.assertTrue(permitted_raw <= first)
             self.assertNotIn('run_process', first)
             self.assertNotIn('prepare_implementation', first)
@@ -115,7 +117,7 @@ class ResearchIntakeTests(unittest.TestCase):
             base = Path(directory)
             preview, _, _, _ = ToolApplication._configuration(base / 'preview', 'Preview',
                 model=None, sources={})
-            self.assertEqual(preview['tool_contracts'], 'outcomes')
+            self.assertEqual(preview['tool_contracts'], 'on_demand')
             for mode in ('outcomes', 'full', 'on_demand', None):
                 with self.subTest(mode=mode):
                     services = ResearchApplicationServices(llm_client=_JSONClient())

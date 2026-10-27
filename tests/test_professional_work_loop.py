@@ -186,6 +186,87 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.app = ToolApplication.load(self.root, services=self.services)
         return self.app
 
+    def test_default_discovery_loads_optional_tools_and_preserves_frozen_owners(self):
+        self.app = ToolApplication.create(self.root, 'Inspect the supplied table and retain a note.',
+            model='fixture', sources={'measurements':self.inputs}, services=self.services,
+            allow_execution=True, max_turns=12, max_tokens=200000, max_attempts=30)
+        self.assertEqual(self.app.state['config']['tool_contracts'], 'on_demand')
+        core = {row['function']['name'] for row in self.app.schemas}
+        self.assertTrue({'read_file','search_files','write_file','edit_file','run_process',
+            'deliver_result','load_tools','read_history','update_work_plan'} <= core)
+        optional = {'inspect_table','analyze_table','measure_experiment','analyze_measurements',
+            'inspect_artifacts','export_report','find_source_passages'}
+        self.assertFalse(optional & core)
+        view = json.loads(self.app._messages()[1]['content'])
+        self.assertTrue(optional <= view['available_specialists'].keys())
+        self.assertNotIn('search_sources', view['available_specialists'])
+        historical, _ = self.app.operations.presentation(set(), 'outcomes')
+        self.assertTrue(optional <= historical)
+
+        selected = {'inspect_table','inspect_artifacts','export_report'}
+        self._submit(_action('load_tools', names=sorted(selected)))
+        self._ok('load_tools')
+        self._reload()
+        self.assertEqual({row['function']['name'] for row in self.app.schemas}, core | selected)
+        view = json.loads(self.app._messages()[1]['content'])
+        self.assertFalse(selected & view['available_specialists'].keys())
+        self.assertIn('analyze_table', view['available_specialists'])
+
+        # Discovery cannot grant network access, nor replace the last valid selection on failure.
+        self._submit(_action('load_tools', names=['search_sources']))
+        rejected = self._last('load_tools')
+        self.assertEqual(rejected['status'], 'blocked', rejected)
+        self.assertIn('unauthorized', rejected['error'])
+        self._reload()
+        self.assertEqual({row['function']['name'] for row in self.app.schemas}, core | selected)
+        self.send.assert_not_called()
+        self._submit(_action('load_tools', names=['inspect_table']))
+        self._reload()
+        self.assertEqual({row['function']['name'] for row in self.app.schemas}, core | {'inspect_table'})
+        self.decisions.extend([
+            _action('inspect_table', path='measurements/observations.csv'),
+            _action('write_file', path='note.md', content='The supplied table has been inspected.\n',
+                delivery={'summary':'Retained table inspection.', 'artifacts':['note.md']}),
+        ])
+        self._run(should_stop=lambda:False)
+        self.assertEqual(self._ok('inspect_table')['data']['row_count'], 3)
+        self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
+        self.assertFalse(self._process_receipts())
+
+        table = {'path':'measurements/observations.csv',
+            'spec':{'value_columns':['value'],'observation_unit':'one supplied observation'}}
+        execution = {'command':[sys.executable,'-c',"print('score: 1')"],
+            'cwd':str(self.inputs), 'timeout_sec':5,
+            'result_schema':{'primary_metric':'score','required_metrics':['score']}}
+        (self.inputs/'main.py').write_text('VALUE = 1\n', encoding='utf-8')
+        (self.inputs/'check.py').write_text('from main import VALUE\nassert VALUE == 2\n', encoding='utf-8')
+        code = {'project_path':'measurements', 'goal':'Repair the supplied source',
+            'allowed_patterns':['main.py'], 'validation_command':['python','check.py']}
+        for name, contracts, required in (
+            ('table', {'table_analysis':table}, {'inspect_table','analyze_table'}),
+            ('execution', {'execution_contract':execution}, {'measure_experiment','analyze_measurements'}),
+            ('code', {'code_task':code}, {'prepare_code_task','implement_code_task'}),
+        ):
+            with self.subTest(frozen_owner=name):
+                self.root = self.directory / ('discovery-' + name)
+                self.app = ToolApplication.create(self.root, 'Perform the frozen work.',
+                    model='fixture', sources={'measurements':self.inputs}, services=self.services,
+                    allow_execution=True, max_attempts=30, **contracts)
+                self._reload()
+                offered = {row['function']['name'] for row in self.app.schemas}
+                view = json.loads(self.app._messages()[1]['content'])
+                self.assertTrue(required <= offered)
+                self.assertFalse(required & view['available_specialists'].keys())
+                self.assertFalse({'inspect_artifacts','export_report'} & offered)
+                if name == 'code':
+                    self.assertFalse({'write_file','edit_file','run_process'} & offered)
+                else:
+                    self.assertTrue({'write_file','edit_file','run_process'} <= offered)
+                # The frozen table owner remains usable without any optional loading.
+                if name == 'table':
+                    self._submit(_action('analyze_table', **table))
+                    self._ok('analyze_table')
+
     def test_chinese_markdown_feedback_delivers_without_a_report_or_publication_contract(self):
         self.app = ToolApplication.create(self.root,
             '把已有观察整理成简短的中文 Markdown 说明，保留适用范围即可。',
@@ -1719,7 +1800,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         def review(view):
             offered = {row['function']['name'] for row in self.inspection_requests[-1]['tools']}
             if offered == {'record_inspection'}:
-                self.assertEqual(len(self.inspection_requests), 6)
+                self.assertEqual(len(self.inspection_requests), 5)
                 self.assertEqual(self.app.ledger.remaining('llm_requests'), 0)
                 return {'findings': [], 'limitations': ['Only supplied observations support this claim.']}
             return [_action('read_file', path='measurements/conditions.txt')]
@@ -1728,9 +1809,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.decisions.append(_action('deliver_result', **self._delivery('report.md')))
         self._run(should_stop=lambda: False)
         self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
-        self.assertEqual(self.send.call_count, 7)
+        self.assertEqual(self.send.call_count, 6)
         self.assertEqual(self._assessment()['verdict'], 'passed')
-        self.assertEqual(self.app.ledger.remaining('llm_requests'), 0)
+        self.assertEqual(self.app.ledger.remaining('llm_requests'), 1)
         self.assertFalse(self.app.ledger.over_limit())
         self.assertEqual([entry.to_dict() for entry in self.app.ledger.entries][:len(old_entries)], old_entries)
         self.assertEqual(self._versions(self.inputs), originals)
@@ -1738,6 +1819,60 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._reload()
         self.assertEqual(self.app.ledger.to_dict(), ledger)
         self.assertEqual(self.send.call_count, calls)
+
+    def test_terminal_delivery_review_preserves_one_native_partial_delivery_decision(self):
+        self.app = ToolApplication.create(self.root, 'Explain the supplied observations.',
+            model='fixture', sources={'measurements':self.inputs}, services=self.services,
+            tool_contracts='full', max_turns=4, max_tokens=500000, max_attempts=20)
+        self._write('report.md', 'The sample mean is 2.0 across three supplied observations.\n')
+        limits = dict(self.app.ledger.limits)
+
+        def review(view):
+            offered = {row['function']['name'] for row in self.inspection_requests[-1]['tools']}
+            if offered != {'record_inspection'}:
+                self.assertEqual(len(self.inspection_requests), 1)
+                return [_action('read_file', path='measurements/conditions.txt')]
+            self.assertEqual(len(self.inspection_requests), 2)
+            self.assertEqual(self.app.ledger.remaining('llm_requests'), 0)
+            return {'decisions':[{'subject':target['subject'], 'conclusion':'incomplete',
+                'findings':[], 'evidence':[],
+                'limitations':['The necessary interpretation remains unfinished.']}
+                for target in view['targets']]}
+
+        self.review = review
+        self.decisions.append(_action('deliver_result', **self._delivery('report.md')))
+        self._run(should_stop=lambda:len(self.inspection_requests) == 2
+            and self.app.state['pending'] is None)
+        self._not_delivered()
+        reviewed = self._ok('deliver_result')['metadata']['delivery_review']['result']
+        self.assertEqual(_assessments(reviewed)[0]['verdict'], 'incomplete')
+        self.assertEqual(self.send.call_count, 3)
+        self.assertEqual(self.app.ledger.remaining('llm_requests'), 1)
+        charged = [entry.to_dict() for entry in self.app.ledger.entries]
+        ledger = self.app.ledger.to_dict()
+        self._reload()
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+
+        partial = self._delivery('report.md')
+        partial['report']['status'] = 'candidate'
+        partial['unresolved'] = ['The independent review and necessary interpretation remain unfinished.']
+        self.decisions.append(_action('deliver_result', **partial))
+        self._run(should_stop=lambda:False)
+        self.assertEqual(self.app.session.manifest.status, 'partial', self.app.result_snapshot())
+        self.assertEqual(self.app.session.store.read_json('delivery.json')['unresolved'], partial['unresolved'])
+        self.assertEqual(self.send.call_count, 4)
+        self.assertEqual(len(self.inspection_requests), 2)
+        self.assertEqual(self.app.ledger.limits, limits)
+        entries = [entry.to_dict() for entry in self.app.ledger.entries]
+        self.assertEqual(entries[:len(charged)], charged)
+        paid = [entry for entry in entries if entry.get('actual', {}).get('llm_requests')]
+        self.assertEqual(len(paid), 4)
+        self.assertTrue(all(entry['status'] == 'settled' for entry in paid))
+        self.assertEqual(sum(entry['actual']['llm_requests'] for entry in paid), 4)
+        self.assertEqual(sum(entry['actual']['total_tokens'] for entry in paid), 560)
+        self.assertEqual(self.app.ledger.remaining('llm_requests'), 0)
+        self.assertFalse(self.app.ledger.unknown_dimensions())
+        self.assertFalse(self.app.ledger.over_limit())
 
     def test_bounded_native_retry_keeps_unknown_charge_and_can_review_then_deliver(self):
         from dataclasses import replace
