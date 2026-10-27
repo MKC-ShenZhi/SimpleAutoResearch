@@ -12,10 +12,11 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 - Formal report delivery in new tasks owns an independent review of the original request, feedback and actual complete delivery. Local consistency checks cannot fulfill this obligation. Review shares the task ledger; saved tasks keep their original contract.
 - Work-owner notes and explicitly referenced source observations replace paid background summaries and unrelated history backfill. Actual reads from inspection, source generation and document work can be reused after version, permission and range checks.
 - New ordinary tasks can delegate coherent source investigation and creation/revision, editing a candidate incrementally and submitting its actual file hashes before separately approved execution. One response need not contain the whole project. Document work investigates originals and returns an editable draft or revision; inspection, publication and final delivery stay independent. Simple operations remain available, and saved contracts retain their behavior.
-- Shared finish principles distinguish necessary work from optional presentation advice. An official DeepSeek catalog example separates text/code work from visual inspection without changing historical connections.
+- Shared finish principles distinguish necessary work from optional presentation advice. The official DeepSeek example separates text/code work from visual inspection and uses the provider's standard thinking output capacity; saved task settings remain unchanged.
 
 ### Fixed
 
+- Native model failures preserve their completion reason. Truncated tool arguments cannot enter ordinary format correction, and source work can distinguish a response limit from a generic preparation failure.
 - Whole-delivery feedback reaches relevant code and figure work as well as manuscript revisions, retaining the original review scope and versions. Unavailable opinions remain diagnostics without blocking unrelated work; independent acceptance and unknown-charge protections remain enforced.
 - New native publication accepts referenced figures across authorized directories without manual source copying. Approval, rendering and recovery bind the same consumed bytes; standalone conversion and historical scopes remain unchanged.
 - Interrupted publication recovery reads retained review receipts without dispatching a new inspection. Full delivery reviews bind versions and scope, retain failed opinions, and protect capacity for a subsequent decision to handle the result.

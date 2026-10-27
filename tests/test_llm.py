@@ -939,6 +939,8 @@ class LLMParsingTests(unittest.TestCase):
                 self.assertNotIn('private partial thought', diagnostic)
                 self.assertNotIn('{"path":', diagnostic)
                 self.assertEqual(failure.exception.raw_response, '')
+                self.assertEqual(failure.exception.finish_reason, 'length')
+                self.assertFalse(failure.exception.correction_allowed)
         wrong_mode = LLMClient(LLMSettings(api_key="test-key", api_mode="responses"))
         with patch("simple_ar.integrations.llm._call_openai_sdk") as call, self.assertRaises(LLMError):
             wrong_mode.chat_turn(history, tools=tools)

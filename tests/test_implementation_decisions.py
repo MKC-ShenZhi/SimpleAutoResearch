@@ -1240,6 +1240,78 @@ class ImplementationDecisionTests(unittest.TestCase):
     def _draft_hash(prompt, path):
         return next(row['sha256'] for row in prompt['candidate_draft']['files'] if row['path'] == path)
 
+    def test_incremental_context_projects_large_completed_writes_and_reads_within_shared_target(self):
+        from dataclasses import replace
+        from simple_ar.integrations.llm import estimate_tokens
+
+        target = 18000
+        self.services.llm_client = LLMClient(replace(self.services.llm_client._settings,
+            context_input_tokens=target))
+        app = self._create('incremental-bounded-context')
+        owner = self._source_owner(app, contract='source_owner.v2', work_context=lambda roots: {
+            'original_request': 'Preserve original requirements',
+            'professional_findings': [{'kind': 'inspection_feedback', 'current': True,
+                'original_record': {'finding': 'Keep the requested correction'}}]})
+        reasoning = 'Retained raw reasoning. ' * 4000
+        first = 'value = 1\n#' + 'x' * 60000 + '\n'
+
+        def large_action(name, arguments):
+            action = self._draft_action(name, arguments)
+            def response(prompt):
+                finish, message = action(prompt)
+                message['reasoning_content'] = reasoning
+                return finish, message
+            return response
+
+        self.responses = [
+            large_action('write_candidate_file', {'path': 'calculate.py', 'content': first}),
+            large_action('read_candidate_file', {'path': 'calculate.py', 'max_bytes': 64000}),
+            large_action('write_candidate_file', {'path': 'helper.py', 'content': 'helper = 2\n#' + 'y' * 60000}),
+            large_action('read_candidate_file', {'path': 'helper.py', 'max_bytes': 64000}),
+            large_action('write_candidate_file', {'path': 'extra.py', 'content': 'extra = 3\n#' + 'z' * 60000}),
+            large_action('read_candidate_file', {'path': 'calculate.py', 'max_bytes': 64}),
+            large_action('edit_candidate_file', lambda prompt: {'path': 'calculate.py',
+                'expected_sha256': self._draft_hash(prompt, 'calculate.py'),
+                'replacements': [{'old_text': 'value = 1', 'new_text': 'value = 9'}]}),
+            self._draft_submit(),
+        ]
+        result = owner.call('prepare_implementation', {'goal': 'Accumulate and revise related source files'}, identity='bounded')
+        self.assertEqual(result.status, 'ok', result)
+        self.assertEqual(self.send.call_count, 8)
+        self.assertTrue((Path(result.data['project_dir']) / 'calculate.py').read_text().startswith('value = 9\n'))
+        store = Path(result.data['source_binding']).parent
+        self.assertEqual(json.loads((store / 'request.json').read_text())['source_context_contract'], 'working.v1')
+        for index in range(1, 9):
+            step = store / 'decision-steps' / str(index)
+            request = json.loads((step / 'native-request.json').read_text())
+            cost = estimate_tokens(json.dumps(request['messages'], ensure_ascii=False)) + estimate_tokens(
+                json.dumps(request['tools'], ensure_ascii=False))
+            self.assertLessEqual(cost, target)
+            self.assertNotIn(reasoning, json.dumps(request['messages']))
+            self.assertFalse(json.loads((step / 'context-selection.json').read_text())['context_exceeds_input_target'])
+        raw = json.loads((store / 'decision-steps/1/native-response.json').read_text())
+        self.assertEqual(raw['reasoning_content'], reasoning)
+        self.assertEqual(json.loads(raw['tool_calls'][0]['function']['arguments'])['content'], first)
+        raw_read = json.loads((store / 'decision-steps/2/candidate-operation.json').read_text())
+        self.assertEqual(raw_read['result']['data']['text'], first)
+        observed = [row['observation'] for row in self.prompts[6]['working_view']['observations']]
+        self.assertTrue(any(row.get('kind') == 'author_draft_read' and row['text'].startswith('value = 1\n')
+            for row in observed))
+        self.assertTrue(any(row['status'] == 'capacity' for row in
+            self.prompts[6]['material_supply']['references']))
+        self.assertEqual(result.metadata['material_observations'], [])  # Draft reads never become source evidence.
+        # Mandatory contracts/feedback may not be silently clipped to force a
+        # request through. Insufficient input capacity must cost zero calls.
+        self.services.llm_client = LLMClient(replace(self.services.llm_client._settings,
+            context_input_tokens=1))
+        blocked_app = self._create('incremental-required-context-overflow')
+        blocked_owner = self._source_owner(blocked_app, contract='source_owner.v2')
+        before = self.send.call_count
+        blocked = blocked_owner.call('prepare_implementation', {'goal': 'Keep the original requirements'}, identity='overflow')
+        self.assertEqual(blocked.status, 'error')
+        self.assertIn('Required source work context exceeds', blocked.error)
+        self.assertEqual(self.send.call_count, before)
+
     def test_incremental_source_creation_accumulates_bytes_and_repairs_actual_admission(self):
         from simple_ar.code_task.generation.writer import _implementation_actions
 
@@ -1277,13 +1349,22 @@ class ImplementationDecisionTests(unittest.TestCase):
         self.assertFalse((app.session.store.root / 'tools/processes').exists())
 
     def test_incremental_revision_preserves_original_edit_authority_and_untouched_members(self):
+        from dataclasses import replace
+
+        self.services.llm_client = LLMClient(replace(self.services.llm_client._settings,
+            context_input_tokens=14000))
         app = self._create('incremental-revision')
-        first = self._candidate('value = 1\n')
+        original_text = 'value = 1\n#' + 'x' * 60000 + '\n'
+        first = self._candidate(original_text)
         first['files'].append({'path': 'helper.py', 'content': 'helper = 2\n'})
         self.responses = [first]
         prepared = self._prepare(app, {'goal': 'Create original project'})
         original = Path(prepared['data']['project_dir'])
-        owner = self._source_owner(app, contract='source_owner.v2')
+        execution = {'record': 'retained-execution', 'result': {'returncode': 1, 'stderr': 'Original actual failure'}}
+        feedback = {'professional_findings': [{'kind': 'inspection_feedback', 'current': True,
+            'original_record': {'finding': 'Required original correction'}}]}
+        owner = self._source_owner(app, contract='source_owner.v2', work_context=lambda roots: feedback,
+            execution_observations=lambda: [execution])
         write = self._draft_action('write_candidate_file', lambda prompt: {'path': 'calculate.py',
             'expected_sha256': self._draft_hash(prompt, 'calculate.py'), 'content': 'value = 3\n'})
         self.responses = [self._draft_action('stage_candidate_file', {'path': 'calculate.py'}),
@@ -1299,13 +1380,21 @@ class ImplementationDecisionTests(unittest.TestCase):
         self.assertEqual(result.status, 'ok', result)
         candidate = Path(result.data['project_dir'])
         self.assertEqual((candidate / 'calculate.py').read_text(), 'value = 3\n')
-        self.assertEqual((original / 'calculate.py').read_text(), 'value = 1\n')
+        self.assertEqual((original / 'calculate.py').read_text(), original_text)
         self.assertEqual((candidate / 'helper.py').read_bytes(), (original / 'helper.py').read_bytes())
         store = Path(result.data['source_binding']).parent
         self.assertIn('complete actual original-read', json.loads(
             (store / 'decision-steps/4/validation.json').read_text())['message'])
         self.assertEqual(len(result.metadata['material_observations']), 1)
         self.assertEqual(result.metadata['material_observations'][0]['request']['path'], str(original / 'calculate.py'))
+        self.assertEqual(result.metadata['material_observations'][0]['data']['text'], original_text)
+        # The large original can leave presentation, never its byte/version
+        # coverage or the actual failed-write diagnosis needed for correction.
+        final = self.prompts[-1]
+        self.assertNotIn(original_text, json.dumps(final))
+        self.assertEqual(final['execution_observations'], [execution])
+        self.assertIn(feedback, [row['work_context'] for row in final['source_windows'] if 'work_context' in row])
+        self.assertIn('complete actual original-read', final['validation_observations'][0]['message'])
         self.assertTrue(all('text' not in row for row in self.prompts[-1]['original_files'].values()))
 
     def test_incremental_accounted_finalization_and_incomplete_reply_never_replay(self):
@@ -1331,6 +1420,8 @@ class ImplementationDecisionTests(unittest.TestCase):
                 with interruption:
                     failed = owner.call('prepare_implementation', arguments, identity='interrupted')
                 self.assertEqual(failed.status, 'error')
+                if kind == 'truncated':
+                    self.assertEqual(failed.data['owner_stop_reason'], 'response_length')
                 self.assertEqual(self.send.call_count - before, 2)
                 store = app.session.store.root / 'attempts/interrupted/implementation'
                 reply = store / 'decision-steps/2/native-response.json'

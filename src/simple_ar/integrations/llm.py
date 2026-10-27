@@ -529,7 +529,8 @@ class LLMClient:
                 f"completion_tokens={usage[1] if usage else 'unknown'}, "
                 f"output_limit={self.effective_output_limit(max_output_tokens)}")
             raise LLMResponseError("Native Chat turn was truncated (finish_reason=length; "
-                                   + counts + "); do not execute partial tool arguments")
+                                   + counts + "); do not execute partial tool arguments",
+                                   correction_allowed=False, finish_reason='length')
         if corrections and _finish_reason_from_response(response) not in {"stop", "tool_calls"}:
             raise LLMResponseError("Native Chat turn has an unsupported finish reason")
         if not isinstance(message, dict) or not (message.get("content") or message.get("tool_calls")):
@@ -562,7 +563,7 @@ class LLMClient:
             json.dumps(messages,ensure_ascii=False),label=label,budget_call_id=budget_call_id)
         if _finish_reason_from_response(response) in {'length','incomplete','failed','cancelled'}:
             raise LLMResponseError('Native tool response was incomplete; no calls were executed',
-                                   correction_allowed=False)
+                                   correction_allowed=False, finish_reason=_finish_reason_from_response(response))
         choices = _get_value(response,'choices')
         if isinstance(choices,list) and choices:
             message = _get_value(choices[0],'message')

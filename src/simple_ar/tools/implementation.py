@@ -13,7 +13,7 @@ from simple_ar.code_task.editing.budget import VALID_BUDGET_PROFILES, validated_
 from simple_ar.code_task.generation.common import safe_relative_path
 from simple_ar.code_task.generation.writer import write_implementation_unit
 from simple_ar.core.capabilities import ArtifactStore
-from simple_ar.integrations.llm import LLMClient
+from simple_ar.integrations.llm import LLMClient, LLMResponseError
 from simple_ar.tools.specs import CommonToolSpec, ToolResult
 from simple_ar.tools.workspace import FileWindow
 from simple_ar.code_task.generation.selection import select_implementation_files, bind_implementation_originals
@@ -1902,6 +1902,11 @@ class ImplementationToolGateway:
                 reason = ('accounting_unresolved' if any(
                     row.status in {'reserved', 'unknown'} for row in self.ledger.entries)
                     else 'shared_budget_exhausted')
+            elif self.source_owner_contract:
+                completed_failure = next((row for row in causes
+                    if isinstance(row, LLMResponseError) and row.finish_reason), None)
+                if completed_failure is not None:
+                    reason = 'response_' + completed_failure.finish_reason
             entered = isinstance(exc, WorkStopped) and not self.preparation_only
             refusal = None
             if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,100}', identity):

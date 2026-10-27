@@ -82,6 +82,10 @@ hashes, rather than returning the whole project in one response. Drafts cannot
 execute or certify delivery. Existing-source edits retain their read and version
 checks; saved `work.v1` keeps its atomic source contract. Only an accounted,
 complete final reply can recover publication without another model request.
+Modern source work uses the common bounded working view. Completed byte
+operations refer to verified current candidates; raw reasoning, code arguments
+and original read proofs remain in the step records. Retiring their presentation
+does not grant source-read coverage or discard execution diagnostics.
 Professional reader observations use the shared material receipt interface, so later
 work can reuse actual reads after permission, byte-version and range checks. Original
 review opinions retain their inspected versions; unavailable opinions remain diagnostics

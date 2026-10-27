@@ -21,7 +21,9 @@ thinking_mode = "enabled"
 reasoning_effort = "high"
 request_timeout_sec = 600
 connect_timeout_sec = 30
-max_output_tokens = 32768
+# Thinking and tool arguments share the output allowance. Use the provider's
+# standard thinking capacity; lower it deliberately for short operations.
+max_output_tokens = 65536
 context_input_tokens = 48000
 chat_token_limit_param = "max_tokens"
 retry_attempts = 1

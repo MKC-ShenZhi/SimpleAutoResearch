@@ -641,6 +641,14 @@ def _generate_implementation_contents(
         from simple_ar.code_task.generation.candidate_draft import incremental_actions
         tools = incremental_actions(tools)
     history: list[dict[str, Any]] = []
+    native_blocks: list[dict[str, Any]] = []
+    bounded_context = candidate_draft is not None and retained_submission is None
+    if bounded_context and command_source_binding is not None:
+        # Freeze the presentation method for this new invocation. Historical
+        # v1 and retained final submissions never acquire a new contract.
+        command_source_binding['source_context_contract'] = 'working.v1'
+        from simple_ar.core.capabilities import ArtifactStore
+        investigation.retain_binding(command_source_binding, ArtifactStore(artifact_dir))
     feedback = ''
     response: dict[str, Any] = {}
     if not legacy:
@@ -661,6 +669,7 @@ def _generate_implementation_contents(
         response_received = False
         operation = 'candidate'
         native_call_id = None
+        step_diagnosis = None
         action_result = {'status': 'rejected', 'validation': 'See current validation_observations'}
         candidate_originals = original_files or {}
         candidate_preserved = preserved_files
@@ -692,15 +701,38 @@ def _generate_implementation_contents(
                 if retained_submission is not None:
                     message = retained_submission[1]
                 else:
-                    # Supply only the current working presentation. Native calls/results
-                    # retain protocol history without reintroducing retired source bodies.
-                    messages = [{'role': 'system', 'content': system},
-                        {'role': 'user', 'content': prompt}, *history]
+                    selection = None
+                    if bounded_context:
+                        from simple_ar.code_task.generation.source_context import source_messages
+                        from simple_ar.integrations.llm import estimate_tokens
+
+                        # One current byte snapshot supplies the selector. It
+                        # neither rereads files nor substitutes for read guards.
+                        investigation.validate()
+                        candidate_draft.validate()
+                        versions = {key: row['sha256'] for row in investigation.observations
+                            if 'request' in row for key in
+                            (row['request']['path'], row.get('absolute_path', row['request']['path']))}
+                        paths = {name: str(candidate_draft.path(name)) for name in candidate_draft.files}
+                        versions.update({paths[name]: digest for name, digest in candidate_draft.files.items()})
+                        target = client._settings.context_input_tokens
+                        remaining_tokens = ledger.remaining('total_tokens') if isinstance(ledger, BudgetLedger) else None
+                        if remaining_tokens is not None:
+                            target = min(target, max(0, int(remaining_tokens) - (client.effective_output_limit() or 0)))
+                        messages, selection = source_messages(system=system, context=context, blocks=native_blocks,
+                            record_root=str(artifact_dir), draft_paths=paths, versions=versions,
+                            tools=tools, input_target=target, estimate_tokens=estimate_tokens)
+                    else:
+                        # Frozen v1 history remains byte-for-byte native.
+                        messages = [{'role': 'system', 'content': system},
+                            {'role': 'user', 'content': prompt}, *history]
                     if len(json.dumps(messages, ensure_ascii=False).encode('utf-8')) > 4 * 1024 * 1024:
                         raise ValueError('Implementation decision history exceeds 4 MiB')
                     step = artifact_dir / 'decision-steps' / str(attempt)
                     write_json(step / 'native-request.json', {'protocol': decision_protocol,
                         'messages': messages, 'tools': tools})
+                    if selection is not None:
+                        write_json(step / 'context-selection.json', selection)
                     try:
                         message = client.tool_turn(messages, tools=tools, label=f'{label}-decision-{attempt}')
                     except LLMError as exc:
@@ -714,7 +746,8 @@ def _generate_implementation_contents(
                     raise LLMError('Professional response has unknown or reserved physical usage; no continuation or replay')
                 operation = 'native_action'
                 name, arguments, native_call_id = _parse_implementation_action(message, tools)
-                history.append(message)
+                if candidate_draft is None:
+                    history.append(message)
                 if candidate_draft is not None and name in {'stage_candidate_file', 'read_candidate_file',
                         'write_candidate_file', 'edit_candidate_file'}:
                     operation, response = name, arguments
@@ -883,6 +916,7 @@ def _generate_implementation_contents(
                 if isinstance(exc, CandidateAdmissionError):
                     write_json(artifact_dir / 'candidate_validation.json', diagnosis)
                 validation_observations.append(diagnosis)
+                step_diagnosis = diagnosis
                 if investigation is not None:
                     write_json(artifact_dir / 'decision-steps' / str(attempt) / 'validation.json', diagnosis)
                 if isinstance(exc, _SourceInvestigationStopped):
@@ -922,8 +956,13 @@ def _generate_implementation_contents(
                     else json.dumps(response, ensure_ascii=False)) from exc
         finally:
             if native_call_id is not None:
-                history.append({'role': 'tool', 'tool_call_id': native_call_id,
-                    'content': json.dumps(action_result, ensure_ascii=False)})
+                tool_result = {'role': 'tool', 'tool_call_id': native_call_id,
+                    'content': json.dumps(action_result, ensure_ascii=False)}
+                if bounded_context:
+                    native_blocks.append({'step': attempt, 'messages': [message, tool_result],
+                        'diagnosis': step_diagnosis})
+                elif candidate_draft is None:
+                    history.append(tool_result)
             if investigation is not None and command_source_binding is not None and retained_submission is None:
                 # Persist even partial/capacity-refused reads and failed
                 # decisions. Focus must never erase approval/recovery guards.
