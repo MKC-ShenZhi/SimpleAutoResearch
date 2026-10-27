@@ -69,23 +69,19 @@ owns version-bound findings and publication owns rendering and export provenance
 New creation defaults to `tool_contracts="on_demand"`: workspace editing, permitted
 process operations and coordination are directly available; optional professional
 contracts are discoverable and loaded when needed. Frozen code, table-analysis and
-measurement contracts expose their required owners directly. New tasks also freeze
-`professional_operations="work.v2"`: coherent source work uses `prepare_implementation`
-and separately approved execution; `work_document` investigates originals and drafts
-or revises a manuscript. Both share the task ledger and return candidates, while
-inspection, publication and terminal delivery retain their own responsibilities.
-Simple operations remain directly available. Saved
-preparation contracts and `outcomes` tasks retain their recorded presentation and
-executable recovery; loading tools changes presentation, never authority.
-Source work edits a private candidate incrementally and submits its actual file
-hashes, rather than returning the whole project in one response. Drafts cannot
-execute or certify delivery. Existing-source edits retain their read and version
-checks; saved `work.v1` keeps its atomic source contract. Only an accounted,
-complete final reply can recover publication without another model request.
-Modern source work uses the common bounded working view. Completed byte
-operations refer to verified current candidates; raw reasoning, code arguments
-and original read proofs remain in the step records. Retiring their presentation
-does not grant source-read coverage or discard execution diagnostics.
+measurement contracts expose their required owners directly. New tasks freeze
+`professional_operations="work.v3"`: source and document methods use the same native
+decision loop, working view and journal. `select_work_method` selects a goal,
+authorized locations and the existing code/writing route; it does not start a
+subagent or grant permission. Workspace owns actual reads, copies, version-bound
+edits and approved processes. Inspection, publication and delivery stay independent.
+
+New tasks do not register nested `prepare_implementation` or `work_document`
+controllers. Saved `work.v1`/`work.v2`, preparation and `outcomes` contracts keep
+their original owners and executable recovery, including candidate admission and
+accounted final-response recovery. Loading tools or selecting a method cannot
+silently upgrade those contracts. Presentation omission never proves an original
+was read or that repeated access to omitted content was unnecessary.
 Professional reader observations use the shared material receipt interface, so later
 work can reuse actual reads after permission, byte-version and range checks. Original
 review opinions retain their inspected versions; unavailable opinions remain diagnostics

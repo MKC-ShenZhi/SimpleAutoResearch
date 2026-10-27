@@ -21,8 +21,8 @@ from simple_ar.tools.extensions import LocalExtension
 
 
 PROTOCOL = 'operations.v1'
-PROFESSIONAL_CONTRACTS = {'work.v1': 'source_owner.v1', 'work.v2': 'source_owner.v2'}
-CURRENT_PROFESSIONAL_CONTRACT = 'work.v2'
+PROFESSIONAL_CONTRACTS = {'work.v1': 'source_owner.v1', 'work.v2': 'source_owner.v2', 'work.v3': None}
+CURRENT_PROFESSIONAL_CONTRACT = 'work.v3'
 _DIRECT_WORK = (
     "Own the user's research request using the available operations and authorized materials. "
     "Observe relevant files, choose a short useful plan, implement and run when needed, inspect actual "
@@ -136,6 +136,15 @@ class OperationTools:
         if preparation not in {None,'prepared.v1','prepared.v2','prepared.v3'}:
             raise ValueError('Unsupported source generation protocol')
         exact = config.get('code_task') is not None
+        self.shared_native = config.get('professional_operations') == 'work.v3' and not exact
+        if self.shared_native and preparation is not None:
+            raise ValueError('Shared native professional work cannot acquire a historical preparation controller')
+        self.methods = None
+        if self.shared_native:
+            from simple_ar.tools.professional_method import ProfessionalMethodTools, professional_method_specs
+            self.methods = ProfessionalMethodTools(workspace=self.workspace, observations=observations,
+                user_requests=user_requests, work_context=work_context)
+            self.registry.register_package(professional_method_specs(), self.methods, request_visible=True)
         professional = self.professional
         source_owner = (PROFESSIONAL_CONTRACTS[config['professional_operations']]
             if professional and not exact and preparation is None else None)
@@ -167,7 +176,7 @@ class OperationTools:
                 source_owner_contract=source_owner),
                 self.implementation,request_visible=True)
         self.document = None
-        if professional and config['model'] is not None:
+        if professional and config.get('professional_operations') != 'work.v3' and config['model'] is not None:
             from simple_ar.tools.document_work import DocumentWorkToolGateway, document_work_tool_specs
             self.document = DocumentWorkToolGateway(root, self.workspace, ledger, session_id,
                 client_factory=lambda identity: client_factory(identity, 'writing'),
@@ -223,6 +232,12 @@ class OperationTools:
             allowed_permissions=permissions,max_risk_level='high',blocked_tools=blocked))
         self.session_id = session_id
         self.ledger = ledger
+
+    def system_text(self) -> str:
+        return self.system + (self.methods.instructions() if self.methods is not None else '')
+
+    def method_context(self) -> dict | None:
+        return self.methods.context() if self.methods is not None else None
 
     def inspection_feedback(self, targets: list[str]) -> list[dict]:
         """Project original owner-verified opinions through the shared work-input port.

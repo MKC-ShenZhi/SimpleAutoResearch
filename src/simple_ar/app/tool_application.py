@@ -914,6 +914,8 @@ class ToolApplication:
 
     def _coordinator_purpose(self) -> str:
         """Native decisions/retries stay on task; explicit domain clients keep their routes."""
+        if self.operations is not None and self.operations.methods is not None:
+            return self.operations.methods.purpose()
         return ('task' if self.state['config'].get('professional_work') in _OWNER_MODES
             else self._work_focus()['purpose'])
 
@@ -2225,7 +2227,7 @@ class ToolApplication:
 
     def _system_text(self, *, closing: bool = False) -> str:
         if self.operations is not None:
-            return self.operations.system + ('\n\n'+_CLOSING_DECISION if closing else '')
+            return self.operations.system_text() + ('\n\n'+_CLOSING_DECISION if closing else '')
         # Do not append delegation advice to the old do-everything solver role:
         # professional owners now hold the complete investigation-to-result unit.
         mode = self.state['config'].get('professional_work')
@@ -3087,6 +3089,9 @@ class ToolApplication:
         if self.operations is not None:
             for name in ('report_protocol','work_focus','work_focus_authority','work_inputs'):
                 context.pop(name,None)
+            method = self.operations.method_context()
+            if method is not None:
+                context['professional_method'] = method
             delivery_feedback = self._delivery_feedback()
             if delivery_feedback:
                 context['last_delivery_check'] = delivery_feedback

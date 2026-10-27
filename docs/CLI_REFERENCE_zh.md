@@ -948,7 +948,8 @@ simple-ar clean --shared-cache
 | `copy_file` | 复制不超过 64 MiB 的二进制或文本字节，需要源 digest；目标已存在时还需要其已观察 digest。 |
 | `search_files` | 在授权根目录内进行字面 rg 搜索，分页报告已扫描文件覆盖。虽为只读操作，仍消耗进程凭据和额度。 |
 | `inspect_project` 的 `data_paths` | 只读观察依赖、入口、测试、文档和覆盖，并保存完整尝试；不导入或执行项目。 |
-| `prepare_implementation` 的 `goal`、`project_path`、`files` | 可选项目选择会在生成前绑定原文件。未变化的已选文件可返回空替换。完整约束响应最多修正一次；传输失败、结果未知或 Python 语法失败不重放。 |
+| `select_work_method` 的 `method`、`goal`、`material_roots`、`project_path` | 在同一native引擎选择源码、文稿或直接工作及已有模型用途路由。核对位置授权，不生成文件、执行进程或扩大权限。实际文件操作、审批和独立交付检查仍分别负责。 |
+| 保存的准备合同／`work.v1`／`work.v2` 的 `prepare_implementation` | 保留原文件绑定、候选校验和独立批准执行。普通新任务使用共同文件与进程操作，加载历史任务不升级合同。 |
 | `update_work_plan` | 当前请求的计划在压缩和恢复后保留，不另设 planner 或 scheduler。步骤声明不验证工作，也不授权执行。 |
 
 #### 复制项目

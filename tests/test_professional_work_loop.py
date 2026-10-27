@@ -132,7 +132,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
             side_effect=self._provider))
         self.app = None
 
-    def _create(self, *, report=False, allow_execution=True, delivery_files=None, context_protocol='auto'):
+    def _create(self, *, report=False, allow_execution=True, delivery_files=None, context_protocol='auto', goal=None):
         options = {'control_protocol': 'operations.v1', 'context_protocol': context_protocol}
         if delivery_files is not None:
             options['delivery_files'] = delivery_files
@@ -140,8 +140,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
             options.update(creation_declarations={'with_report': True,
                     'material_roles': {'data_path': ['measurements']}})
         self.app = ToolApplication.create(self.root,
-            'Explain the supplied observations with an editable report, table and figure; '
-            'preserve originals and disclose the limits of the evidence.',
+            goal or ('Explain the supplied observations with an editable report, table and figure; '
+            'preserve originals and disclose the limits of the evidence.'),
             model='fixture', sources={'measurements': self.inputs}, services=self.services,
             allow_execution=allow_execution, tool_contracts='full',
             max_turns=70, max_tokens=900000, max_attempts=180,
@@ -179,10 +179,10 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._create()
         self.assertEqual(self.app.state['config']['control_protocol'],'operations.v1')
         self.assertIsNone(self.app.writing)
-        self.assertEqual(self.app.state['config']['professional_operations'], 'work.v2')
-        self.assertEqual(self.app.implementation.source_owner_contract, 'source_owner.v2')
-        self.assertTrue(self.app.implementation.preparation_only)
-        self.assertIsNotNone(self.app.operations.document)
+        self.assertEqual(self.app.state['config']['professional_operations'], 'work.v3')
+        self.assertIsNone(self.app.implementation)
+        self.assertIsNone(self.app.operations.document)
+        self.assertIsNotNone(self.app.operations.methods)
         self.assertFalse({'professional_work','result_investigation','document_source_contract',
             'source_generation_protocol','source_decision_protocol'}
             & self.app.state['config'].keys())
@@ -190,6 +190,92 @@ class OperationsWorkLoopTests(unittest.TestCase):
     def _reload(self):
         self.app = ToolApplication.load(self.root, services=self.services)
         return self.app
+
+    def test_shared_native_methods_own_working_source_diagnostics_and_document_without_nested_generation(self):
+        self._create(goal='Modify a working copy of the project, validate it with the supplied command, '
+            'and retain a Markdown account; preserve the original project.')
+        (self.inputs / 'main.py').write_text('VALUE = 1\n', encoding='utf-8')
+        (self.inputs / 'check.py').write_text(
+            "from main import VALUE\nfrom pathlib import Path\n"
+            "assert VALUE == 3, 'expected requested value'\nPath('result.txt').write_text(str(VALUE))\n",
+            encoding='utf-8')
+        originals = self._versions(self.inputs)
+        command = _action('run_process', argv=['python', 'check.py'], cwd='workspace/working',
+            inputs=['working/main.py', 'working/check.py'], outputs=['working/result.txt'], timeout_sec=5)
+        def edit(value):
+            return _action('edit_file', path='working/main.py', expected_sha256=self._last('read_file')['data']['sha256'],
+                replacements=[{'old_text': 'VALUE = ' + str(value - 1), 'new_text': 'VALUE = ' + str(value)}])
+        def diagnosed_repair():
+            call = self.send.call_args
+            request = call.kwargs.get('request') or call.args[1]
+            self.assertIn('expected requested value', json.dumps(request['messages']))
+            return edit(3)
+        self.decisions.extend([
+            _action('select_work_method', method='source', goal='Revise and validate the actual working project',
+                material_roots=['measurements'], project_path='measurements'),
+            _action('copy_project', source='measurements', path='working'),
+            _action('select_work_method', method='source', goal='Implement the correction and diagnose actual execution',
+                material_roots=['measurements'], project_path='workspace/working'),
+            _action('read_file', path='working/main.py'), lambda: edit(2), command,
+            _action('read_file', path='working/main.py'),
+            _action('read_file', path='working/check.py'),
+            _action('read_file', path='working/main.py'), diagnosed_repair, command,
+            _action('select_work_method', method='document', goal='Retain an editable account of the actual working files',
+                material_roots=['workspace/working'], project_path='workspace/working'),
+            _action('write_file', path='working/note.md', content='Working files retained.\n'),
+            _action('read_file', path='working/note.md'),
+            lambda: _action('edit_file', path='working/note.md',
+                expected_sha256=self._last('read_file')['data']['sha256'],
+                replacements=[{'old_text': 'retained.', 'new_text': 'retained with execution receipts.'}]),
+            _action('deliver_result', summary='Retained actual working files and receipts.',
+                artifacts=['working/main.py', 'working/check.py', 'working/result.txt', 'working/note.md']),
+        ])
+        with patch('simple_ar.code_task.generation.writer.write_implementation_unit',
+                side_effect=AssertionError('No source generator in work.v3')), \
+                patch('simple_ar.tools.document_work.DocumentWorkToolGateway.call',
+                    side_effect=AssertionError('No document generator in work.v3')):
+            self._run()
+            self.assertIsNotNone(self.app.state['pending'])
+            self.assertFalse(self._process_receipts())
+            self.assertEqual(self.app._coordinator_purpose(), 'code')
+            for _ in range(2):
+                token = self.app.approval_token(self.app.state['pending']['call'])
+                self._reload()
+                self.assertEqual(self.app._coordinator_purpose(), 'code')
+                self._run(approved_execution=token)
+        self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
+        processes = self._observations('run_process')
+        self.assertEqual([row['data']['returncode'] for row in processes], [1, 0])
+        self.assertEqual(self._versions(self.inputs), originals)
+        self.assertEqual((self.root / 'workspace/working/result.txt').read_text(), '3')
+        self.assertIn('execution receipts', (self.root / 'workspace/working/note.md').read_text())
+        self.assertEqual(self.app._coordinator_purpose(), 'writing')
+        self.assertFalse(self.document_views)
+        self.assertFalse(any(self._observations(name) for name in ('work_document', 'prepare_implementation')))
+        self.assertFalse((self.root / 'workspace/implementation-drafts').exists())
+
+    def test_shared_method_intent_restores_but_expired_optional_roots_and_feedback_do_not_block_native_input(self):
+        self._create()
+        project = self.root / 'workspace/optional'
+        project.mkdir()
+        self._submit(_action('select_work_method', method='source', goal='Inspect the optional working project',
+            material_roots=['workspace/optional'], project_path='workspace/optional'))
+        self._reload()
+        self.assertEqual(self.app._coordinator_purpose(), 'code')
+        project.rename(project.with_name('moved'))
+        view = json.loads(self.app._messages()[1]['content'])['professional_method']
+        self.assertFalse(view['project_available'])
+        self.assertTrue(view['unavailable_locations'])
+        feedback = 'New request: explain the available original observations directly.'
+        self._submit(_action('read_file', path='measurements/conditions.txt'), feedback=feedback)
+        self._reload()
+        self.assertEqual(self.app._coordinator_purpose(), 'task')
+        messages = self.app._messages()
+        intent = json.loads(messages[1]['content'])['professional_method']
+        self.assertEqual(intent['status'], 'historical')
+        self.assertLess(intent['request_index'], intent['current_request_index'])
+        self.assertIn(feedback, json.dumps(messages))
+        self.send.assert_not_called()
 
     def test_default_discovery_loads_optional_tools_and_preserves_frozen_owners(self):
         self.app = ToolApplication.create(self.root, 'Inspect the supplied table and retain a note.',
@@ -199,7 +285,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
         core = {row['function']['name'] for row in self.app.schemas}
         self.assertTrue({'read_file','search_files','write_file','edit_file','run_process',
             'deliver_result','load_tools','read_history','update_work_plan',
-            'prepare_implementation','execute_implementation','work_document'} <= core)
+            'select_work_method'} <= core)
+        self.assertFalse({'prepare_implementation','execute_implementation','work_document'} & core)
         optional = {'inspect_table','analyze_table','measure_experiment','analyze_measurements',
             'inspect_artifacts','export_report','find_source_passages'}
         self.assertFalse(optional & core)
@@ -1000,10 +1087,16 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertFalse(self._process_receipts())
 
     def test_document_owner_uses_original_reads_across_feedback_and_recovers_without_new_calls(self):
-        self.app = ToolApplication.create(self.root,
+        # Frozen work.v2 keeps its real nested document protocol through load;
+        # work.v3 creation exercises direct native prose authoring separately.
+        from tests.native_history_fixture import load_prepared_operation_history
+        self.app = load_prepared_operation_history(self.root,
             'Explain the supplied observations in an editable Markdown note, preserving the originals.',
-            model='fixture', sources={'measurements': self.inputs}, services=self.services,
-            max_turns=30, max_tokens=300000, max_attempts=70, tool_contracts='full')
+            config={'model': 'fixture', 'sources': {'measurements': self.inputs},
+                'professional_operations': 'work.v2', 'source_generation_protocol': None,
+                'source_decision_protocol': None, 'context_protocol': 'working.v2',
+                'delivery_review_protocol': 'task.v1', 'tool_contracts': 'full', 'max_turns': 30},
+            limits={'llm_requests': 30, 'total_tokens': 300000}, max_attempts=70, services=self.services)
         originals = self._versions(self.inputs)
 
         def author(view):
