@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from pathlib import Path
 from typing import Any, Callable
 
 from simple_ar.core.assessments import assessment_issues
@@ -33,12 +34,12 @@ class DeliveryReview:
         self.user_requests = user_requests
         self.observations = observations
 
-    def _binding(self, delivery: dict) -> dict | None:
+    def _binding(self, delivery: dict, *, current_outputs: tuple[Path, ...] = ()) -> dict | None:
         request = DeliveryRequest.model_validate(delivery)
         if (request.unresolved or request.report is None
                 or request.report.status != 'canonical' or not request.report.manuscript):
             return None
-        resolved = self.workspace.resolve_delivery(request)
+        resolved = self.workspace.resolve_delivery(request, current_outputs=current_outputs)
         # Absolute authorized locators collapse aliases without replacing original bytes
         # with an export, a summary, or a reconstructed manuscript.
         artifacts = sorted({str(self.workspace.resolve(path)) for path in resolved['artifacts']})
@@ -90,8 +91,9 @@ class DeliveryReview:
         return ToolResult(tool_name='inspect_artifacts', status='blocked',
                           error='Delivery inspection started without a completed result; no replay')
 
-    def review(self, delivery: dict, identity: str, *, may_start: bool) -> dict | None:
-        binding = self._binding(delivery)
+    def review(self, delivery: dict, identity: str, *, may_start: bool,
+               current_outputs: tuple[Path, ...] = ()) -> dict | None:
+        binding = self._binding(delivery, current_outputs=current_outputs)
         if binding is None:
             return None
         result = None

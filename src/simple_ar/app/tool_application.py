@@ -446,15 +446,21 @@ class ToolApplication:
                         observed,Path(item['result']).parent.name,ledger=self.ledger)
                 call = calls[item['id']]
                 spec = self.gateway.registry.get(call['function']['name'])
-                try:
-                    arguments = json.loads(call['function']['arguments'])
-                except (ValueError, TypeError):
-                    arguments = {}
-                result.append({**observed, 'record':item['result'], 'arguments':arguments,
-                    'current_request':turn.get('request_count', 1) == len(self.state['requests']),
-                    'contract_current':spec is None or spec.domain not in active
-                        or id(turn) in active[spec.domain]})
+                result.append(self._operation_observation(observed, call, item['result'],
+                    current_request=turn.get('request_count', 1) == len(self.state['requests']),
+                    contract_current=spec is None or spec.domain not in active
+                        or id(turn) in active[spec.domain]))
         return result
+
+    @staticmethod
+    def _operation_observation(payload: dict, call: dict, record: str, *,
+                               current_request: bool = True, contract_current: bool = True) -> dict:
+        try:
+            arguments = json.loads(call['function']['arguments'])
+        except (ValueError, TypeError):
+            arguments = {}
+        return {**payload, 'record':record, 'arguments':arguments,
+                'current_request':current_request, 'contract_current':contract_current}
 
     def _configure_tools(self) -> None:
         controller = self.session
@@ -3625,7 +3631,19 @@ class ToolApplication:
             hashes = self.workspace.artifact_hashes(delivery['artifacts'])
             if self.operations is not None:
                 try:
-                    review = self.operations.review_delivery(delivery, store.root.name, may_start=start_review)
+                    # Domain consumers verify an actual observation record, not
+                    # an anonymous in-memory result. Pin completed production
+                    # before review, so any producer can recover without replay.
+                    if start_review and self.operations.delivery_review is not None:
+                        metadata = payload.setdefault('metadata', {})
+                        if metadata.get('delivery_hashes', hashes) != hashes:
+                            raise ValueError('Completed production differs from its retained delivery binding')
+                        metadata['delivery_hashes'] = hashes
+                        store.write_json('native_result.json', payload, kind='native_observation')
+                    current = self._operation_observation(payload, call,
+                        (store.root.relative_to(self.session.store.root) / 'native_result.json').as_posix())
+                    review = self.operations.review_delivery(delivery, store.root.name,
+                        may_start=start_review, current_result=current, current_outputs=outputs)
                     if review is not None:
                         metadata = payload.setdefault('metadata', {})
                         retained_review = metadata.get('delivery_review')
@@ -4267,6 +4285,20 @@ class ToolApplication:
                     raise RuntimeError("Interrupted operation has no durable result; inspect receipts before any replay")
                 else:
                     recovered = self._tool(context=CapabilityContext(store, existing), call=call, recovering=True)
+            elif (capability == 'native_tool' and self.operations is not None
+                    and self.operations.delivery_review is not None
+                    and (produced := store.read_json('native_result.json')).get('status') == 'ok'
+                    and produced.get('metadata', {}).get('delivery_hashes') is not None
+                    and 'delivery_review' not in produced.get('metadata', {})
+                    and self._terminal_intent(pending['call'])
+                    and self._delivery(pending['call'], produced) is not None):
+                # The existing native observation already proves closed,
+                # byte-bound production. Rebind cached review without calling
+                # the producer again, including non-replayable file writes.
+                bound = self._bind_delivery(pending['call'], produced, store)
+                store.write_json('native_result.json', bound, kind='native_observation')
+                recovered = CapabilityResult(status='completed', artifacts=self._native_artifacts(
+                    store, bound, name=pending['call']['function']['name']))
             elif (capability == 'native_tool'
                     and store.read_json('native_result.json').get('metadata', {}).get('admission') == 'offered.v1'
                     and store.read_json('native_result.json')['metadata'].get('dispatched') is False):

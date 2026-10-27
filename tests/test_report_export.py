@@ -1597,16 +1597,40 @@ class ProcessArtifactBindingTests(unittest.TestCase):
                 'outputs': ['middle.any', 'sibling.any']}
             self.assertTrue(self._run(workspace, 'a', args,
                 {'middle.any': b'intermediate', 'sibling.any': b'sibling'}).ok)
+            # Checking one output must not cache away another output's mutation
+            # in the same receipt, even during a single validation call.
+            version_hashes = workspace._version_hashes
+            def mutate_sibling(locators):
+                hashes = version_hashes(locators)
+                if 'workspace/middle.any' in hashes:
+                    workspace.resolve('sibling.any').write_bytes(b'tampered')
+                return hashes
+            with patch.object(workspace, '_version_hashes', side_effect=mutate_sibling):
+                with self.assertRaisesRegex(ValueError, 'outputs changed'):
+                    workspace.check_artifact_producers(['middle.any', 'sibling.any'])
+            workspace.resolve('sibling.any').write_bytes(b'sibling')
+            # A newer owner can replace a co-output without invalidating the
+            # still-current output of the old multi-output process.
+            sibling_args = {'argv': ['sibling-tool'], 'inputs': ['source.any'],
+                'outputs': ['sibling.any']}
+            self.assertTrue(self._run(workspace, 'a1', sibling_args,
+                {'sibling.any': b'new sibling'}).ok)
+            workspace.check_artifact_producers(['middle.any', 'sibling.any'])
+            workspace.resolve('sibling.any').unlink()
+            workspace.check_artifact_producers(['middle.any'])
+            with self.assertRaisesRegex(ValueError, 'missing'):
+                workspace.check_artifact_producers(['sibling.any'])
+            workspace.resolve('sibling.any').write_bytes(b'new sibling')
             second = {'argv': ['another-tool'], 'inputs': ['middle.any', 'sibling.any'], 'outputs': ['figure.png']}
             self.assertTrue(self._run(workspace, 'b', second, {'figure.png': b'old image'}).ok)
             workspace.resolve('unrelated').write_bytes(b'changed')
             with patch.object(workspace, '_check_process_inputs', wraps=workspace._check_process_inputs) as inputs, \
                     patch.object(workspace, '_version_hashes', wraps=workspace._version_hashes) as hashes:
                 workspace.check_artifact_producers(['figure.png', 'middle.any', 'sibling.any', 'unrelated'])
-                self.assertEqual([call.kwargs['identity'] for call in inputs.call_args_list], ['b', 'a'])
-                self.assertEqual(hashes.call_count, 4)  # All inputs and outputs once per record.
+                self.assertEqual([call.kwargs['identity'] for call in inputs.call_args_list], ['b', 'a', 'a1'])
+                self.assertEqual(hashes.call_count, 6)  # Inputs per owner, outputs per path.
                 workspace.check_artifact_producers(['figure.png'])
-                self.assertEqual(inputs.call_count, 4)  # No implicit cache between calls.
+                self.assertEqual(inputs.call_count, 6)  # No implicit cache between calls.
             cache = {}
             with patch.object(workspace, '_artifact_producers', wraps=workspace._artifact_producers) as receipts, \
                     patch.object(workspace, '_version_hashes', wraps=workspace._version_hashes) as hashes:
@@ -1618,15 +1642,17 @@ class ProcessArtifactBindingTests(unittest.TestCase):
                 workspace.check_artifact_producers(['figure.png'], cache=cache, refresh=True)
                 self.assertEqual(receipts.call_count, 2)
                 self.assertGreater(hashes.call_count, first)
-            # Request only one output; any sibling change must still invalidate it.
+            # Only consumed outputs are checked; shared inputs remain current.
             for name in ('source.any', 'middle.any', 'sibling.any'):
                 with self.subTest(changed=name):
                     path = workspace.resolve(name)
                     original = path.read_bytes()
                     path.write_bytes(b'tampered')
                     try:
-                        with self.assertRaisesRegex(ValueError, 'changed'):
+                        if name == 'sibling.any':
                             workspace.check_artifact_producers(['middle.any'])
+                        with self.assertRaisesRegex(ValueError, 'changed'):
+                            workspace.check_artifact_producers(['figure.png'])
                     finally:
                         path.write_bytes(original)
             workspace.resolve('source.any').write_bytes(b'v2')
@@ -1647,6 +1673,15 @@ class ProcessArtifactBindingTests(unittest.TestCase):
             workspace.check_artifact_producers(['figure.png'])
             workspace.resolve('figure.png').write_bytes(b'tampered')
             with self.assertRaisesRegex(ValueError, 'changed'):
+                workspace.check_artifact_producers(['figure.png'])
+            workspace.resolve('figure.png').write_bytes(b'new image')
+            # A later failed owner cannot fall back to an earlier successful
+            # co-output receipt, even if the output bytes have not changed.
+            self.assertFalse(self._run(workspace, 'e', sibling_args, returncode=1).ok)
+            workspace.check_artifact_producers(['middle.any'])
+            with self.assertRaisesRegex(ValueError, 'no successful output binding'):
+                workspace.check_artifact_producers(['sibling.any'])
+            with self.assertRaisesRegex(ValueError, 'no successful output binding'):
                 workspace.check_artifact_producers(['figure.png'])
 
     def test_distinct_records_with_same_invocation_id_are_checked_independently(self):

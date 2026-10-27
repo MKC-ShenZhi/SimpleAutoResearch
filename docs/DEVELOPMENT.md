@@ -128,6 +128,15 @@ coordination receives compact findings. Saved tasks without this field retain
 their original gate. This read-only review is not numerical execution or a
 guarantee of scientific quality.
 
+Before dispatching that review, delivery validates the producer's actual result:
+required files, current execution inputs and requested publication formats. An
+invalid delivery retains its produced files and diagnostics without spending a
+content-review call. Current provenance follows the latest owner of each consumed
+output; replacing an unused sibling does not invalidate that output. The whole
+process must still have succeeded with a complete output binding, and shared
+inputs remain checked. Same-invocation recovery and retained version history keep
+their strict receipt checks; this is not permission to replay an old process.
+
 Saved `source_generation_protocol=prepared.v3` tasks retain their preparation and
 approved-execution owner. Ordinary new tasks no longer select this protocol.
 Explicit code tasks retain their exact edit, validation and execution contracts.

@@ -16,6 +16,7 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 ### Fixed
 
 - Interrupted publication recovery reads retained review receipts without dispatching a new inspection. Full delivery reviews bind attachment versions and scope; incomplete or negative opinions are retained and may be reassessed by a new explicit delivery.
+- Validate actual output and publication readiness before paid delivery review. Replacing an unused co-output no longer invalidates another current output; changed consumed inputs, failed producers and strict historical recovery remain checked.
 - Complete project reuse follows recorded byte versions through copies and edits. Later successful outputs cannot clear an earlier copied version's failure or stale inputs; retired intermediate directories need not remain intact. This does not certify copied code or inherit execution authority.
 - Independent inspection identifies invalid source references and can bind an omitted target only when its identity is uniquely determined. Rejected comments remain explicitly unverified, with their original trace available; ambiguous identities and invalid evidence still fail. The one-correction limit and historical receipts remain unchanged.
 - Final inspection instructions share the same context selection budget as source material, preventing an otherwise usable working view from overflowing at conclusion time. Historical records and model charges remain unchanged.

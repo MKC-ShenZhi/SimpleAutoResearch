@@ -714,9 +714,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertIsNotNone(self.app._accepted_model_attempt(pending['attempt']))
 
     def test_interrupted_publication_recovery_never_starts_a_delivery_review(self):
-        for reviewed in (False, True):
-            with self.subTest(reviewed=reviewed):
-                self.root = self.directory / ('reviewed-export' if reviewed else 'unreviewed-export')
+        for tool, reviewed in (('export_report', False), ('export_report', True), ('write_file', True)):
+            with self.subTest(tool=tool, reviewed=reviewed):
+                self.root = self.directory / (tool + ('-reviewed' if reviewed else '-unreviewed'))
                 self._create()
                 self._write('report.md', '# Observations\n\nThree supplied values; no population inference.\n')
                 bind = self.app._bind_delivery
@@ -725,21 +725,34 @@ class OperationsWorkLoopTests(unittest.TestCase):
                         bind(call, payload, store, **kwargs)
                     raise KeyboardInterrupt('Crash after durable publication, before native observation')
                 with patch.object(self.app, '_bind_delivery', side_effect=interrupt):
-                    self._submit(_action('export_report', markdown='report.md', compile_pdf=False,
-                        delivery=self._delivery('report.md')), approve=lambda call, token: True)
+                    arguments = ({'markdown':'report.md', 'compile_pdf':False} if tool == 'export_report'
+                        else {'path':'report.md', 'content':'# Observations\n\nThree supplied values; no population inference.\n',
+                              'expected_sha256':_digest(self.root/'workspace/report.md')})
+                    self._submit(_action(tool, **arguments, delivery=self._delivery('report.md')),
+                        approve=lambda call, token: True)
                 pending = deepcopy(self.app.state['pending'])
                 self.assertEqual(pending['kind'], 'tool')
-                self.assertTrue(self.app.gateway.can_reconcile(ToolCall(
-                    tool_name='export_report', trace_id=pending['attempt'])))
-                self.assertFalse((self.root/'attempts'/pending['attempt']/'native_result.json').exists())
+                self.assertEqual(self.app.gateway.can_reconcile(ToolCall(
+                    tool_name=tool, trace_id=pending['attempt'])), tool == 'export_report')
+                retained = self.root/'attempts'/pending['attempt']/'native_result.json'
+                self.assertEqual(retained.exists(), reviewed)
+                if reviewed:
+                    raw = json.loads(retained.read_text())
+                    self.assertEqual(raw['status'], 'ok')
+                    self.assertNotIn('delivery_review', raw['metadata'])
+                    self.assertEqual(raw['metadata']['delivery_hashes'],
+                        self.app.workspace.artifact_hashes(raw['metadata']['delivery_hashes']))
                 ledger, calls = self.app.ledger.to_dict(), self.send.call_count
                 exports = self._versions(self.root/'tools/publication')
                 self._reload()
-                self._run(should_stop=lambda: self.app.state['pending'] is None)
+                with patch.object(self.app.gateway, 'call', wraps=self.app.gateway.call) as dispatch:
+                    self._run(should_stop=lambda: self.app.state['pending'] is None)
+                if reviewed:
+                    dispatch.assert_not_called()
                 self.assertEqual(self.send.call_count, calls)
                 self.assertEqual(self.app.ledger.to_dict(), ledger)
                 self.assertEqual(self._versions(self.root/'tools/publication'), exports)
-                result = self._ok('export_report')
+                result = self._ok(tool)
                 if reviewed:
                     self.assertIn('delivery_review', result['metadata'])
                     self.assertEqual(self.app.session.manifest.status, 'completed')
@@ -2709,6 +2722,75 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._submit(_action('deliver_result',**self._delivery('report.md')))
         self._ok('deliver_result')
         self.assertEqual(self.app.session.manifest.status,'completed')
+
+    def test_delivery_checks_actual_production_before_paid_content_review(self):
+        self._create()
+        self._write('report.md', '# Observations\n\nThree supplied observations.\n')
+        calls = self.send.call_count
+        delivery = self._delivery('report.md')
+        delivery['report']['formats'] = ['markdown', 'pdf']
+        self._submit(_action('export_report', markdown='report.md', compile_pdf=False,
+            delivery=delivery), approve=lambda *_: True)
+        produced = self._ok('export_report')
+        self.assertTrue(self.app.workspace.resolve(produced['data']['project']).is_dir())
+        self.assertIn('Delivery review not started', produced['metadata']['delivery_review_error'])
+        self.assertIn('publication', produced['metadata']['delivery_review_error'].lower())
+        self.assertEqual(self.send.call_count, calls)
+        self.assertFalse((self.root/'tools/inspection').exists())
+        self._not_delivered()
+        ledger = self.app.ledger.to_dict()
+        self._reload()
+        self._run()
+        self.assertEqual(self.send.call_count, calls)
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+
+        # An inline writer can complete production while its proposed result
+        # still consumes a stale executed output. Reject before review here too.
+        self.root = self.directory/'stale-output-admission'
+        self._create()
+        self._write('input.txt', 'first\n')
+        self._submit(_action('run_process', argv=['python', '-c',
+            "from pathlib import Path; Path('value.txt').write_text(Path('input.txt').read_text())"],
+            inputs=['input.txt'], outputs=['value.txt']), approve=lambda *_: True)
+        self._ok('run_process')
+        self._submit(_action('write_file', path='input.txt', content='changed\n',
+            expected_sha256=_digest(self.root/'workspace/input.txt')))
+        calls = self.send.call_count
+        self._submit(_action('write_file', path='report.md', content='# Current report\n',
+            delivery=self._delivery('report.md', 'value.txt')))
+        produced = self._ok('write_file')
+        self.assertEqual((self.root/'workspace/report.md').read_text(), '# Current report\n')
+        self.assertIn('producer inputs/outputs changed', produced['metadata']['delivery_review_error'])
+        self.assertEqual(self.send.call_count, calls)
+        self.assertFalse((self.root/'tools/inspection').exists())
+        self._not_delivered()
+
+        # A successful analysis is also a producer. The admission consumer
+        # receives its retained observation before checking scientific coverage.
+        self.root = self.directory/'analysis-delivery-admission'
+        execution = {'command':[sys.executable,'-c',"print('score: 1')"],
+            'cwd':str(self.inputs), 'timeout_sec':5,
+            'result_schema':{'primary_metric':'score','required_metrics':['score']}}
+        self.app = ToolApplication.create(self.root, 'Measure and explain the supplied control',
+            model='fixture', services=self.services, sources={'measurements':self.inputs},
+            execution_contract=execution, allow_execution=True, tool_contracts='full',
+            max_attempts=30, process_limits={'process_invocations':4,'process_wall_seconds':20})
+        self._submit(_action('measure_experiment', **execution), approve=lambda *_:True)
+        measured = self._ok('measure_experiment')
+        self._write('report.md', '# Control\n\nThe recorded score is 1.\n')
+        with patch.object(self.app.scientific, 'evidence_requirement',
+                wraps=self.app.scientific.evidence_requirement) as check:
+            self._submit(_action('analyze_measurements',
+                result_refs=[measured['data']['result_ref']],
+                delivery=self._delivery('workspace/report.md')))
+        produced = self._ok('analyze_measurements')
+        self.assertNotIn('delivery_review_error', produced['metadata'])
+        self.assertTrue(check.call_args_list)
+        for call in check.call_args_list:
+            self.assertTrue(call.args[1])
+            for record in call.args[1]:
+                self.assertTrue((self.root/record).is_file())
+        self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
 
     def test_prepared_measurements_feed_exact_work_and_delivery_tracks_current_revision(self):
         from simple_ar.code_task.runtime.state import (

@@ -251,7 +251,8 @@ class OperationTools:
         return [row['data']['result_ref'] for row in observations
                 if row.get('tool_name')=='measure_experiment' and row.get('status')=='ok']
 
-    def delivery_issues(self, observations: list[dict], delivery: dict, *, proposed=None):
+    def delivery_issues(self, observations: list[dict], delivery: dict, *, proposed=None,
+                        include_inspection: bool = True, current_outputs: tuple[Path, ...] = ()):
         request = DeliveryRequest.model_validate(delivery)
         if request.unresolved:
             return []  # Existing terminal binding still proves actual partial files.
@@ -267,8 +268,11 @@ class OperationTools:
         if producing:
             return []
         issues = self.gateway.delivery_issues(owned,proposed=proposed,delivery=delivery)
-        resolved = self.workspace.resolve_delivery(request)
-        self.workspace.check_artifact_producers(resolved['artifacts'])
+        resolved = self.workspace.resolve_delivery(request, current_outputs=current_outputs)
+        try:
+            self.workspace.check_artifact_producers(resolved['artifacts'])
+        except (ValueError, OSError, KeyError, RuntimeError) as exc:
+            issues.append(str(exc))
         from simple_ar.tools.workspace import missing_delivery_files
         missing = missing_delivery_files(self.workspace,resolved['artifacts'],self.config.get('delivery_files') or [])
         if missing:
@@ -297,10 +301,10 @@ class OperationTools:
         # Admission need not already have the review it is about to perform.
         # After the operation, local opinions still constrain actual findings,
         # but only the bound whole-delivery review fulfills the report check.
-        if not (scoped_review and proposed is not None):
+        if include_inspection and not (scoped_review and proposed is not None):
             issues.extend(assessment_issues(self.workspace,observations,resolved['artifacts'],
                 require_pass=[] if scoped_review else required))
-        if scoped_review and proposed is None:
+        if include_inspection and scoped_review and proposed is None:
             issues.extend(self.delivery_review.issues(observations, delivery))
         implementation = None
         if self.config.get('code_task') is not None:
@@ -337,10 +341,23 @@ class OperationTools:
                 issues.append(str(exc))
         return issues
 
-    def review_delivery(self, delivery: dict, identity: str, *, may_start: bool) -> dict | None:
+    def review_delivery(self, delivery: dict, identity: str, *, may_start: bool,
+                        current_result: dict | None = None,
+                        current_outputs: tuple[Path, ...] = ()) -> dict | None:
         if self.delivery_review is None:
             return None
-        return self.delivery_review.review(delivery, identity, may_start=may_start)
+        if may_start:
+            # Production has finished; validate its actual inventory before any
+            # paid content investigation. An intended export cannot prove a PDF,
+            # current inputs or successful execution. Prior opinions are omitted
+            # here so a fresh review can legitimately reassess them.
+            observations = [*self.observations(), *([current_result] if current_result is not None else [])]
+            issues = self.delivery_issues(observations, delivery, include_inspection=False,
+                current_outputs=current_outputs)
+            if issues:
+                raise ValueError('Delivery review not started: ' + '; '.join(dict.fromkeys(issues)))
+        return self.delivery_review.review(delivery, identity, may_start=may_start,
+            current_outputs=current_outputs)
 
     def coordination_result(self, result: dict, record: str) -> dict:
         presented = self.gateway.coordination_result(result, record)

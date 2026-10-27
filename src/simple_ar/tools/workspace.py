@@ -789,6 +789,8 @@ class WorkspaceToolGateway:
         Inspect only existing process-owner receipts, never workspace contents.
         The latest declared producer owns each output, including interrupted or
         failed runs. A later successful explicit run can supersede an older one.
+        Each requested output must match its owner; process success and complete
+        output binding still apply to the whole invocation.
         Retained delivery instead follows version edges at their record boundary;
         it never reduces past ownership to the latest path owner.
         """
@@ -807,9 +809,9 @@ class WorkspaceToolGateway:
             cache['producers'] = producers
         visited = cache.setdefault('checked', set())
         visiting = set()
-        # One receipt can own many outputs. Reuse its completed validation only
-        # within this call, by object identity rather than invocation_id. Keep
-        # the caller's path cache and path-based cycle handling unchanged.
+        # Share receipt/input validation within this call, by object identity
+        # rather than invocation_id. Output bytes are checked per owned path:
+        # a sibling may have been superseded or removed since this receipt.
         checked_records = set()
 
         def check(path: Path) -> None:
@@ -819,9 +821,6 @@ class WorkspaceToolGateway:
             if record is None:
                 raise ValueError(f'Ambiguous producer timestamps for {path.name}; no current publication')
             owner = (id(record), id(binding))
-            if owner in checked_records:
-                visited.add(path)
-                return
             if record.get('output_binding_error'):
                 raise ValueError(f"Declared producer has no successful output binding for {path.name}: {record['output_binding_error']}; no replay")
             output = record.get('output_binding') or {}
@@ -829,14 +828,22 @@ class WorkspaceToolGateway:
                     or record.get('stop_reason') or output.get('version') != 1
                     or set(output.get('outputs', {})) != set(binding['outputs'])):
                 raise ValueError(f'Declared producer has no successful output binding: {path.name}; inspect receipt, no replay')
-            self._check_process_inputs(binding, identity=record['invocation_id'])
-            current = self._version_hashes(output['outputs'])
-            changed = [name for name, digest in output['outputs'].items() if current.get(name) != digest]
+            if owner not in checked_records:
+                self._check_process_inputs(binding, identity=record['invocation_id'])
+            owned_outputs = {name: digest for name, digest in output['outputs'].items()
+                             if resolve_mounted_path(self.mounts, name, discovery=True) == path}
+            if not owned_outputs:
+                raise ValueError(f'Declared producer ownership changed for {path.name}')
+            current = self._version_hashes(owned_outputs)
+            changed = [name for name, digest in owned_outputs.items() if current.get(name) != digest]
             if changed:
                 raise ValueError('Declared producer outputs changed: ' + json.dumps({
                     'producer': record['invocation_id'], 'changed_outputs': changed,
                     'declared_inputs': list(binding['inputs']), 'declared_outputs': binding['outputs']}, ensure_ascii=False)
                     + '; no current publication or automatic rerun')
+            if owner in checked_records:
+                visited.add(path)
+                return
             visiting.add(path)
             try:
                 for locator in binding['inputs']:
