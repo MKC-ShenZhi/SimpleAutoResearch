@@ -180,12 +180,15 @@ artifacts use the same delivery and feedback loop; publication is optional.
 Explicit report claims and requested PDF/TeX retain their inspection/version checks.
 Core retains attempts, artifacts, resource usage and process results through the same shared execution and records.
 
-New operation tasks save `working.v2`. The current work owner maintains concise
-understanding through accepted `update_work_plan.notes` receipts. The common
-selector retains recent atomic conversation and supplies explicitly referenced
-earlier observations, without a second summary author or lexical history backfill.
-Original records remain readable; notes cannot certify sources, permission or
-scientific correctness. Missing capacity and changed source versions remain visible.
+New operation tasks save `working.v3`. One measured input budget admits recent
+atomic conversation, work-owner notes, a compact operation overview derived from
+actual receipts, and explicitly referenced earlier observations. Completed work
+therefore remains discoverable without requiring a model-written note. The
+overview preserves separate versions and failures, identifies omitted entries and
+links to original records; it does not supply original evidence bodies or certify
+current file contents, permission or scientific correctness. There is no second
+summary author or persisted memory cache. Saved `working.v2` tasks retain their
+referenced-observation selection without automatically gaining the overview.
 Saved `working.v1` tasks retain their automatic checkpoints, original selection,
 registered outputs and charges. Their summary failures and unknown usage still
 follow the saved recovery contract; new work does not silently change old tasks.

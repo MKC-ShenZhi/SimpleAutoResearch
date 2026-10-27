@@ -962,11 +962,54 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual({p:p.read_bytes() for p in self.root.rglob('*') if p.is_file()},before)
         self.assertEqual(self.send.call_count,calls)
 
+    def test_working_v3_retains_closed_operations_without_notes_after_native_eviction(self):
+        from dataclasses import replace
+        self.services.llm_client = LLMClient(replace(self.services.llm_client._settings,
+            context_input_tokens=20000))
+        self._create(goal='Retain a checked working artifact and inspect the supplied files.')
+        self.assertEqual(self.app.state['config']['context_protocol'], 'working.v3')
+        command = ['python', '-c', "from pathlib import Path; "
+            "Path('retained.txt').write_text('checked'); print('closed execution outcome')"]
+        self.decisions.append(_action('run_process', argv=command, cwd='workspace',
+            inputs=[], outputs=['retained.txt'], timeout_sec=5))
+        for i in range(8):
+            self.decisions.extend([
+                _action('write_file', path=f'working-{i}.txt',
+                    content=f'Authored working file {i}.\n' + 'Recorded payload.\n' * 1200),
+                _action('read_file', path=f'working-{i}.txt', full_digest=True),
+            ])
+        self.decisions.append(_action('ask_user', question='Which retained file should be explained?'))
+        self._run(approve=lambda call, token: True)
+        self._ok('ask_user')
+        self.assertEqual(self._ok('run_process')['data']['returncode'], 0)
+        self.assertFalse(self.app._working_memory()['notes'])
+        self.assertFalse(self.memory_views)
+        self.assertFalse(self._observations('select_work_method'))
+        before = {path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}
+        self._reload()
+        messages = self.app._messages()
+        context = json.loads(messages[1]['content'])
+        self.assertGreater(context['working_context']['recent_start_turn'], 0)
+        overview = context['working_view']['operation_overview']
+        entries = [entry['observation'] for entry in overview['entries']]
+        execution = next(entry for entry in entries if entry['tool'] == 'run_process')
+        self.assertEqual(execution['arguments']['argv'], command)
+        self.assertEqual(execution['observed']['returncode'], 0)
+        self.assertIn('closed execution outcome', json.dumps(execution))
+        self.assertIn('retained.txt', json.dumps(execution))
+        self.assertTrue(any(entry['tool'] == 'write_file' for entry in entries))
+        self.assertFalse(any('closed execution outcome' in json.dumps(message)
+                             for message in messages[2:]))
+        self.assertLessEqual(context['working_context']['estimated_input_tokens'], 20000)
+        self.assertEqual(self.app._working_memory()['notes'], [])
+        self.assertEqual({path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}, before)
+        self.assertFalse(self.transport_errors)
+
     def test_working_understanding_survives_feedback_and_invalidates_changed_source(self):
         from dataclasses import replace
         self.services.llm_client = LLMClient(replace(self.services.llm_client._settings,
             context_input_tokens=12000))
-        self._create()
+        self._create(context_protocol='working.v2')
         self.assertEqual(self.app.state['config']['context_protocol'], 'working.v2')
         self._read('measurements/observations.csv')
         source_record = self.app.state['turns'][-1]['tools'][-1]['result']

@@ -4,6 +4,14 @@
 
 User-visible changes, newest first, dated when confirmed. Multi-day development may be summarized together rather than assigned invented completion dates. Development-branch work is distinguished from main; engineering checks do not establish task success. See [usage](docs/USAGE.md) for current instructions.
 
+## 2026-10-28 — V2.10 development (unreleased)
+
+### Improved
+
+- New tasks retain a bounded overview of actual operations and output locations alongside recent conversation and work notes. Earlier completed work remains discoverable even when no note was written. Separate versions, failed operations and omitted history remain explicit; saved tasks keep their original context contract.
+
+This change passed server engineering and saved-history checks. Unassisted draft, feedback and formal delivery acceptance remains incomplete.
+
 ## 2026-10-27 — V2.10 development (unreleased)
 
 ### Improved

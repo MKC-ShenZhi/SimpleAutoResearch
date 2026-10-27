@@ -485,6 +485,68 @@ class ReferencedWorkingContextTests(unittest.TestCase):
         budget['notes'][0]['records'].append('changed returned metadata')
         self.assertEqual(arguments, before)
 
+    def test_receipt_overview_survives_native_eviction_without_notes_or_current_authority(self):
+        operations, blocks = [], []
+        receipts = [
+            ('run_process', {'argv': ['python', 'worker.py'], 'cwd': 'workspace'},
+             {'returncode': 0, 'stdout': 'Observed execution outcome', 'outputs': ['result.csv']}, 'ok', ''),
+            ('write_file', {'path': 'result.csv', 'content': 'a,' * 5000},
+             {'path': 'result.csv', 'sha256': 'first-version'}, 'ok', ''),
+            ('write_file', {'path': 'result.csv', 'content': 'b,' * 5000},
+             {'path': 'result.csv', 'sha256': 'changed-version'}, 'ok', ''),
+            ('run_process', {'argv': ['python', 'worker.py'], 'cwd': 'workspace'},
+             {'returncode': 1, 'stderr': 'Actual failed validation'}, 'error', 'Execution failed'),
+            ('run_process', {'argv': ['python', 'worker.py'], 'cwd': 'workspace'},
+             {'receipt': 'process/unknown.json'}, 'unknown', 'Execution outcome unknown'),
+        ]
+        receipts += [('read_file', {'path': f'inputs/{i}.txt', 'offset_bytes': 0},
+            {'path': f'inputs/{i}.txt', 'text': 'Unrelated original bytes ' * 1200,
+             'sha256': 'observed-version'}, 'ok', '') for i in range(15)]
+        for i, (name, args, data, status, error) in enumerate(receipts):
+            call = {'id': str(i), 'function': {'name': name, 'arguments': json.dumps(args)}}
+            result = {'status': status, 'data': data, 'error': error,
+                      'artifacts': ['result.csv'] if i in (0, 1, 2) else []}
+            operations.append({'turn': i, 'request_count': 1, 'call_id': str(i),
+                'reply': f'records/turn-{i}/native_result.json',
+                'observation': ToolApplication._history_observation(call, result,
+                    f'attempts/tool-{i}/native_result.json', navigation=True)})
+            blocks.append(block(i, json.dumps(result)))
+        blocks.append(block(len(blocks), 'Current decision'))
+        before = deepcopy((operations, blocks))
+        arguments = dict(material_policy='referenced', turn_blocks=blocks,
+                         context_token_target=24000)
+        messages, budget = select(**arguments, operation_history=operations)
+        view = json.loads(messages[1]['content'])['working_view']
+        overview = view['operation_overview']
+        indexed = [entry['observation'] for entry in overview['entries']]
+        self.assertEqual(view['notes'], [])
+        self.assertGreater(budget['recent_start_turn'], 0)
+        self.assertIn('Observed execution outcome', json.dumps(indexed))
+        self.assertIn('Actual failed validation', json.dumps(indexed))
+        self.assertIn('Execution outcome unknown', json.dumps(indexed))
+        self.assertEqual([entry['observed']['sha256'] for entry in indexed
+                          if entry['tool'] == 'write_file'], ['first-version', 'changed-version'])
+        self.assertEqual(indexed[1]['omitted_fields']['arguments'], ['content'])
+        self.assertNotIn('Unrelated original bytes', json.dumps(overview))
+        self.assertIn('not original text, read coverage', overview['scope'])
+        self.assertFalse(view['observations'])  # Navigation never supplies evidence bodies.
+        self.assertLessEqual(budget['estimated_input_tokens'], 24000)
+        self.assertGreaterEqual(budget['estimated_input_tokens'], 30 + len(json.dumps(messages, ensure_ascii=False)))
+        self.assertEqual((operations, blocks), before)
+        tight, metadata = select(**{**arguments, 'context_token_target': 4500}, operation_history=operations)
+        coverage = json.loads(tight[1]['content'])['working_view']['operation_overview']
+        self.assertGreater(coverage['omitted_entries'], 0)
+        supplied = [i for start, end in coverage['supplied_entry_ranges'] for i in range(start, end)]
+        self.assertEqual(supplied, [entry['entry_index'] for entry in coverage['entries']])
+        self.assertEqual(len(supplied) + coverage['omitted_entries'], len(operations))
+        self.assertLessEqual(metadata['estimated_input_tokens'], 4500)
+        # Saved working.v2 still supplies exactly its referenced view; no auto index.
+        old, _ = select(**arguments)
+        explicit_old, _ = select(**arguments, operation_history=None)
+        self.assertEqual(old, explicit_old)
+        self.assertNotIn('operation_overview', json.loads(old[1]['content'])['working_view'])
+        self.assertNotIn('Observed execution outcome', json.dumps(old))
+
     def test_policy_is_explicit_and_ranked_default_is_unchanged(self):
         arguments = dict(observations=[observation(0, 'Original observed source')],
                          work_notes=[{'text': 'Owner judgment', 'records': []}])

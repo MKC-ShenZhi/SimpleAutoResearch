@@ -24,6 +24,7 @@ def select_working_context(
     history_access: str = 'read_history',
     trailing_messages: Sequence[Mapping[str, Any]] = (),
     material_policy: Literal['ranked', 'referenced'] = 'ranked',
+    operation_history: Sequence[Mapping[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Return messages and decision-budget metadata without modifying inputs.
 
@@ -46,6 +47,12 @@ def select_working_context(
     not certify evidence or replace historical coverage; summarized_through_turn
     has no effect under this policy. Referenced material stays whole or is
     omitted for capacity, without lexical retrieval or automatic backfill.
+    Explicit operation_history enables a compact receipt navigation overview
+    alongside notes, native work and referenced original bodies, all admitted
+    by this selector's same measured input budget. Whole entries retain their
+    original provenance and historical versions; they are never evidence text,
+    read coverage, current certificates or permission. No operation is merged
+    with another receipt, including repeated reads, versions and failures.
     Every requested record has model-visible supply status, including missing
     records and all windows of a partially supplied record.
     """
@@ -61,6 +68,8 @@ def select_working_context(
     rows = deepcopy(list(observations))
     notes = deepcopy(list(work_notes))
     tail = deepcopy(list(trailing_messages))
+    operations = deepcopy(list(operation_history or ()))
+    operation_indices: list[int] = []
     if any(message.get('role') not in {'user', 'system'}
            or not isinstance(message.get('content'), str)
            or set(message) != {'role', 'content'} for message in tail):
@@ -204,6 +213,21 @@ def select_working_context(
         'history': {},
     }
     context['working_view'] = view
+    if operation_history is not None:
+        view['operation_overview'] = {
+            'entries': [], 'total_entries': len(operations),
+            'supplied_entry_ranges': [], 'omitted_entries': len(operations),
+            'access': history_access,
+            'scope': 'Historical receipt navigation only, not original text, read coverage, '
+                     'current file contents, current execution validity, certification or permission. '
+                     'Versions, outputs and diagnostics are recorded at that operation, not revalidated. '
+                     'Arguments describe requests, not proof of produced outputs. '
+                     'Entry ranges are zero-based and end-exclusive over all recorded operations; '
+                     'omitted entries remain in original history. Complete arguments are in reply '
+                     'tool_calls under call_id; full results/data are at observation.record. '
+                     'Omitted fields are not supplied or known absent. No entries are merged.',
+        }
+
     reference_indices: dict[str, list[int]] = {}
     if owner_records:
         for i, row in enumerate(rows):
@@ -235,6 +259,18 @@ def select_working_context(
     def project() -> tuple[list[dict[str, Any]], int]:
         # Selection and model-visible bookkeeping share one admission cost.
         # Callers must not append a second unbudgeted description afterwards.
+        if operation_history is not None:
+            ordered_indices = sorted(operation_indices)
+            ranges: list[list[int]] = []
+            for i in ordered_indices:
+                if ranges and ranges[-1][1] == i:
+                    ranges[-1][1] = i + 1
+                else:
+                    ranges.append([i, i + 1])
+            view['operation_overview'].update(
+                entries=[{'entry_index': i, **operations[i]} for i in ordered_indices],
+                supplied_entry_ranges=ranges,
+                omitted_entries=len(operations) - len(ordered_indices))
         context['material_supply'] = {'native_context':[
                 *[state['source'] for state in states if state['status']=='native'],
                 *[locator(row['observation']) for row in view['observations']]],
@@ -339,6 +375,21 @@ def select_working_context(
         state['estimated_tokens'] = estimate_tokens(dump(supplied))
         state['status'] = 'working_view'
 
+    # Durable receipt navigation competes in the SAME measured projection,
+    # before optional full bodies. Recent native pairs and owner notes remain
+    # intact. Prefer actual diagnostics/outputs over text-window metadata,
+    # without lexical, tool-name, environment or command-specific pinning.
+    def operation_priority(i: int) -> tuple[bool, bool, bool, int]:
+        result = operations[i].get('observation', {})
+        return (bool(result.get('error')) or result.get('status') not in {'ok', 'completed'},
+                bool(result.get('artifacts')) or 'returncode' in result.get('observed', {}),
+                'text' not in result.get('omitted_fields', {}).get('data', []), i)
+
+    for i in sorted(range(len(operations)), key=operation_priority, reverse=True):
+        operation_indices.append(i)
+        if project()[1] > context_token_target:
+            operation_indices.pop()  # Never excerpt a serialized operation.
+
     ordered = ([i for i, row in enumerate(rows) if row.get('record') in references]
                if owner_records else sorted(range(len(rows)), key=priority, reverse=True))
     preferred = {i for i in ordered if rows[i].get('record') in references
@@ -382,4 +433,7 @@ def select_working_context(
         'scope': 'Estimates include schema and message framing; no hard budget admission. '
                  'Archived blocks and original records remain caller-owned and unmodified.',
     }
+    if operation_history is not None:
+        metadata['operation_overview'] = {key: deepcopy(value) for key, value in
+            view['operation_overview'].items() if key != 'entries'}
     return messages, metadata

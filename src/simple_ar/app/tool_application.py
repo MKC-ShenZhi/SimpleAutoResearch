@@ -57,6 +57,10 @@ _SHARED_OWNERS = 'owners.v2'
 _ADOPTING_OWNERS = 'owners.v3'
 _REQUEST_OWNER = 'requests.v1'
 _DECLARED_INPUTS = 'declared_inputs.v1'
+_WORKING_CONTEXT_PROTOCOLS = {'working.v1', 'working.v2', 'working.v3'}
+_REFERENCED_CONTEXT_PROTOCOLS = {'working.v2', 'working.v3'}
+_CONVERSATION_CONTEXT_PROTOCOLS = {'conversation.v1', *_WORKING_CONTEXT_PROTOCOLS}
+_CONTEXT_PROTOCOLS = {None, *_CONVERSATION_CONTEXT_PROTOCOLS}
 _ADOPTING_OWNER_MODES = {_ADOPTING_OWNERS, _REQUEST_OWNER}
 _SHARED_OWNER_MODES = {_SHARED_OWNERS, *_ADOPTING_OWNER_MODES}
 _OWNER_MODES = {_OWNERS, *_SHARED_OWNER_MODES}
@@ -393,7 +397,7 @@ class ToolApplication:
         config, root = self.state['config'], self.session.store.root
         if config['control_protocol'] != PROTOCOL:
             raise ValueError('Unsupported saved operation control protocol')
-        if config.get('context_protocol') not in {None,'conversation.v1','working.v1','working.v2'}:
+        if config.get('context_protocol') not in _CONTEXT_PROTOCOLS:
             raise ValueError('Unsupported saved operation context; no silent migration')
         if config.get('delivery_review_protocol') not in {None, 'task.v1'}:
             raise ValueError('Unsupported saved delivery review protocol; no silent migration')
@@ -799,7 +803,7 @@ class ToolApplication:
                     'or preselected windows. Explicit adopt_draft independently checks an existing candidate '
                     'rather than regenerating it. No execution, network, visual or scientific certification. '
                     'Returns editable manuscript and review records for the same publication owner.')
-        if self.state['config'].get('context_protocol') in {'conversation.v1','working.v1','working.v2'}:
+        if self.state['config'].get('context_protocol') in _CONVERSATION_CONTEXT_PROTOCOLS:
             schemas = [{**row, 'function': {**row['function'],
                 'parameters': compact_json_schema(row['function']['parameters'])}} for row in schemas]
         return schemas
@@ -956,7 +960,7 @@ class ToolApplication:
             # New work has one note author: its current work owner. Historical
             # checkpoint adoption stays confined to the saved earlier protocol.
             checkpoint = (self._checkpoint_for_turn(turn)
-                if self.state['config'].get('context_protocol') != 'working.v2' else None)
+                if self.state['config'].get('context_protocol') not in _REFERENCED_CONTEXT_PROTOCOLS else None)
             if checkpoint is not None:
                 store = ArtifactStore(self.session.store.root / Path(turn['reply']).parent)
                 coverage = summary_coverage(previous=memory,snapshot=checkpoint,
@@ -1672,7 +1676,7 @@ class ToolApplication:
                investigate_results: bool = True,
                control_protocol: Literal['operations.v1'] = 'operations.v1',
                creation_declarations: dict[str, Any] | None = None,
-               context_protocol: Literal['auto', 'conversation.v1', 'working.v1', 'working.v2'] | None = 'auto') -> ToolApplication:
+               context_protocol: Literal['auto', 'conversation.v1', 'working.v1', 'working.v2', 'working.v3'] | None = 'auto') -> ToolApplication:
         """Create work on the operation-composed loop.
 
         Historical professional controllers are load-only. Loading and supply
@@ -1685,10 +1689,10 @@ class ToolApplication:
         if professional_inputs or not investigate_results or report_protocol is not None:
             raise ValueError('Professional controller options are load-only; new tasks use source operations, inspect_artifacts and export_report')
         if context_protocol == 'auto':
-            context_protocol = 'working.v2'
-        if context_protocol not in {None, 'conversation.v1', 'working.v1', 'working.v2'}:
+            context_protocol = 'working.v3'
+        if context_protocol not in _CONTEXT_PROTOCOLS:
             raise ValueError('Unsupported context protocol')
-        if creation_declarations is not None and context_protocol not in {'conversation.v1','working.v1','working.v2'}:
+        if creation_declarations is not None and context_protocol not in _CONVERSATION_CONTEXT_PROTOCOLS:
             raise ValueError('Declared inputs require a journal-backed conversation context')
         config, reused, limits, attempts = cls._configuration(root, goal, model=model, sources=sources,
             allow_execution=allow_execution, allow_network=allow_network, allow_vision=allow_vision,
@@ -2359,7 +2363,7 @@ class ToolApplication:
             and self.session.store.read_json(path).get('closing_required') is True)
 
     @staticmethod
-    def _history_observation(call: dict, result: dict, record: str) -> dict:
+    def _history_observation(call: dict, result: dict, record: str, *, navigation: bool = False) -> dict:
         """One receipt-derived index for both current context and history pages."""
         try:
             arguments = json.loads(call['function']['arguments'])
@@ -2369,10 +2373,12 @@ class ToolApplication:
             arguments = {}
         data = result.get('data') or {}
         name = call['function']['name']
-        indexed_arguments = {key: arguments[key] for key in
+        argument_keys = (arguments.keys() if navigation else
             ('path', 'document_record', 'query', 'offset_bytes', 'start_line', 'max_lines',
-             'argv', 'cwd', 'timeout_sec', 'url', 'paper_id', 'search_record')
-            if key in arguments and len(json.dumps(arguments[key], ensure_ascii=False)) <= 1024}
+             'argv', 'cwd', 'timeout_sec', 'url', 'paper_id', 'search_record'))
+        indexed_arguments = {key: arguments[key] for key in argument_keys
+            if key in arguments and (not navigation or key not in {'content', 'text', 'replacements'})
+            and len(json.dumps(arguments[key], ensure_ascii=False)) <= 1024}
         observed = {key: value for key, value in data.items()
             if key != 'text' and len(json.dumps(value, ensure_ascii=False)) <= 1024
             and not (name == 'focus_work' and key == 'inputs')
@@ -2387,6 +2393,20 @@ class ToolApplication:
             'status': result.get('status'), 'error': result.get('error', ''),
             'arguments': indexed_arguments, 'observed': observed,
             'artifacts': result.get('artifacts', []), 'summary': result.get('summary', '')}
+        if navigation:
+            # Same receipt index, with explicit recovery for omitted payloads.
+            # No inferred facts, rereads or new persisted memory. Legacy/history
+            # callers keep their frozen projection unless explicitly selected.
+            outcome['omitted_fields'] = {
+                'arguments': [key for key in arguments if key not in indexed_arguments],
+                'data': [key for key in data if key not in observed],
+            }
+            for key in ('error', 'summary'):
+                value = outcome[key]
+                if isinstance(value, str) and len(value) > 1024:
+                    outcome[key] = {'preview': value[:1024],
+                        'omitted_characters': len(value) - 1024,
+                        'record': outcome['record'], 'field': key}
         return {key: value for key, value in outcome.items()
             if key in {'arguments', 'observed'}
             or (value is not None and value != '' and value != [] and value != {})}
@@ -2412,7 +2432,7 @@ class ToolApplication:
                   native_history_start_turn: int | None = None, schemas: list | None = None,
                   working_memory: dict | None = None) -> list[dict[str, Any]]:
         protocol = self.state['config'].get('context_protocol')
-        if protocol in {'conversation.v1','working.v1','working.v2'}:
+        if protocol in _CONVERSATION_CONTEXT_PROTOCOLS:
             return self._conversation_messages(client=client, closing=closing,
                 native_history_start_turn=native_history_start_turn, schemas=schemas,working_memory=working_memory)
         if protocol is not None:
@@ -3004,7 +3024,8 @@ class ToolApplication:
         No file discovery, source reads, model calls or new persisted state.
         """
         config, turns = self.state['config'], self.state['turns']
-        working_mode = config.get('context_protocol') in {'working.v1','working.v2'}
+        working_mode = config.get('context_protocol') in _WORKING_CONTEXT_PROTOCOLS
+        operation_history = [] if config.get('context_protocol') == 'working.v3' else None
         declared = config.get('input_contract') == _DECLARED_INPUTS
         client = client or self._client()
         focus = self._work_focus()
@@ -3137,6 +3158,15 @@ class ToolApplication:
                 if item:
                     presented_results[call_id] = presented
                 indexed = self._history_observation(call, result, item['result'] if item else turn['reply'])
+                if operation_history is not None:
+                    history_result = self._history_observation(call, result,
+                        item['result'] if item else turn['reply'], navigation=True)
+                    if not item:
+                        history_result.pop('record', None)  # No result receipt exists yet.
+                    operation_history.append({'turn': position, 'request_count': current,
+                        'turn_complete': complete, 'call_id': call_id,
+                        'reply': 'records/' + turn['reply'].removeprefix('attempts/'),
+                        'observation': history_result})
                 error = result.get('error', '')
                 if isinstance(error, str) and len(error) > 512:
                     error = {'preview': error[:512], 'omitted_characters': len(error) - 512,
@@ -3239,7 +3269,8 @@ class ToolApplication:
                 summarized_through_turn=memory['through_turn'],
                 selected_records=(plan or {}).get('evidence_records',[]),version_resolver=version,
                 block_request_counts=[turn.get('request_count',1) for turn in turns],
-                material_policy='referenced' if config['context_protocol']=='working.v2' else 'ranked')
+                material_policy='referenced' if config['context_protocol'] in _REFERENCED_CONTEXT_PROTOCOLS else 'ranked',
+                operation_history=operation_history)
             cost = estimate_tokens(json.dumps(messages,ensure_ascii=False))+schema_cost
             if remaining is not None and cost+output>remaining:
                 raise ValueError('Current working view exceeds the remaining token allowance; no request sent')
@@ -3462,7 +3493,7 @@ class ToolApplication:
             **({'document_request': 'work.v2'}
                 if self.state['config'].get('professional_inputs') == 'owner.v3' else {}),
             **({'context_protocol': self.state['config']['context_protocol']}
-                if self.state['config'].get('context_protocol') in {'conversation.v1','working.v1','working.v2'} else {}),
+                if self.state['config'].get('context_protocol') in _CONVERSATION_CONTEXT_PROTOCOLS else {}),
             **({'closing_action_contract': 'single_terminal.v1'} if closing else {}),
             'input_projection': {
                 'resources': projection['resources'],
@@ -3470,6 +3501,9 @@ class ToolApplication:
                     if 'professional_outcomes' in projection else {}),
                 'tool_names': [row['function']['name'] for row in schemas],
                 'material_supply': projection['material_supply'],
+                **({'operation_overview': {key: value for key, value in
+                        projection['working_view']['operation_overview'].items() if key != 'entries'}}
+                    if 'operation_overview' in projection.get('working_view', {}) else {}),
                 **({'working_context':projection['working_context']}
                     if 'working_context' in projection else {}),
                 'supplied': [{key: row[key] for key in ('path', 'sha256', 'record', 'role', 'evidence_role',
@@ -3479,7 +3513,7 @@ class ToolApplication:
                         if 'passage' in row else {})
                     for row in [*projection['retained_text_windows'], *projection['retained_source_passages'],
                         *(projection['material_supply']['native_context']
-                            if projection.get('context_protocol') in {'conversation.v1','working.v1','working.v2'} else [])]],
+                            if projection.get('context_protocol') in _CONVERSATION_CONTEXT_PROTOCOLS else [])]],
                 'work_inputs': [{key: value for key, value in row.items() if key != 'data'} |
                     {'data': {key: value for key, value in row.get('data', {}).items() if key != 'text'}}
                     for row in projection.get('work_inputs', {}).get('windows', [])]},
