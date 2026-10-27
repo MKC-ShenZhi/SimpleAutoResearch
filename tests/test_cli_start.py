@@ -19,18 +19,15 @@ from tests.native_history_fixture import load_native_history
 
 
 class StartTests(unittest.TestCase):
-    def _ordinary_project_delivery(self, root, *, projects=1, deliver_count=None, execute=False,
+    def _ordinary_project_delivery(self, root, *, projects=1, deliver_count=None,
                                    archive=False, omitted=False, partial=False):
         from simple_ar.app.tool_application import ToolApplication
         root = root.resolve()
         app = ToolApplication.create(root, 'Create editable source and a complete portable project',
-            model=None, sources={}, allow_execution=execute,
+            model=None, sources={},
             process_limits={'process_invocations':2, 'process_wall_seconds':10})
         code = "from pathlib import Path\nPath('result.txt').write_text('computed')\n"
         actions = [{'tool_name':'write_file', 'arguments':{'path':'working/compute.py','content':code}}]
-        if execute:
-            actions.append({'tool_name':'run_process', 'arguments':{'argv':['python','compute.py'],
-                'cwd':'working', 'inputs':['working/compute.py'], 'outputs':['working/result.txt'], 'timeout_sec':3}})
         # A copy with actual omissions must not acquire a completeness claim.
         if omitted:
             (app.workspace.workspace/'working').mkdir(parents=True)
@@ -129,14 +126,143 @@ class StartTests(unittest.TestCase):
             self.assertIsNone(app.reusable_code_project())  # No explicit complete project was declared.
 
     def test_ordinary_project_reuse_checks_existing_process_edges_without_replay(self):
+        import hashlib
+        from datetime import datetime, timedelta
+        from simple_ar.app.tool_application import ToolApplication
+
         with tempfile.TemporaryDirectory() as directory:
-            app, projects = self._ordinary_project_delivery(Path(directory)/'executed',execute=True)
-            self.assertEqual(app.reusable_code_project(),(projects[0],None,{}))
-            (app.workspace.workspace/'working/compute.py').write_text('print("revised")\n',encoding='utf-8')
-            before = {path:path.read_bytes() for path in app.session.store.root.rglob('*') if path.is_file()}
-            with self.assertRaisesRegex(ValueError,'inputs/outputs changed'):
-                app.reusable_code_project()
-            self.assertEqual({path:path.read_bytes() for path in app.session.store.root.rglob('*') if path.is_file()},before)
+            for label, returncode, replacement, error in (
+                ('successful-alias', 0, 'computed', None),
+                ('failed-alias', 1, 'computed', 'no successful output binding'),
+                ('changed-after-failure', 1, 'repaired', None),
+                ('created-after-missing-output', 1, 'repaired', None),
+                ('stale-input', 0, 'computed', 'inputs/outputs changed'),
+            ):
+                with self.subTest(case=label):
+                    root = Path(directory)/label
+                    app = ToolApplication.create(root, 'Retain the final complete project', model=None, sources={})
+                    working = app.workspace.workspace/'working'
+                    working.mkdir()
+                    (working/'compute.py').write_text('print("source")\n', encoding='utf-8')
+                    recreated = label == 'created-after-missing-output'
+                    if not recreated:
+                        (working/'result.txt').write_bytes(b'computed')
+                    # An existing explicit process receipt, with no physical process
+                    # or model needed to exercise retained-material responsibility.
+                    arguments = {'argv':['python','compute.py'], 'cwd':'working',
+                        'inputs':['working/compute.py'], 'outputs':['working/result.txt']}
+                    binding = app.workspace.process_artifact_binding(arguments)
+                    digest = hashlib.sha256(replacement.encode() if recreated else b'computed').hexdigest()
+                    receipt = {'invocation_id':'producer', 'started_at':'2000-01-01T00:00:00+00:00',
+                        'finished_at':'2000-01-01T00:00:01+00:00',
+                        'status':'finished', 'returncode':returncode, 'stop_reason':None,
+                        'input_binding':{'workspace_artifacts':binding},
+                        **({'output_binding':{'version':1, 'outputs':{binding['outputs'][0]:digest}}}
+                           if returncode == 0 else {})}
+                    app.session.store.write_json('tools/processes/producer/invocation.json', receipt)
+                    if label == 'stale-input':
+                        # The copied inventory, not a later mutable origin,
+                        # establishes that this output already has a stale input.
+                        (working/'compute.py').write_text('print("revised")\n', encoding='utf-8')
+                    (app.workspace.workspace/'alias.txt').write_text(replacement, encoding='utf-8')
+                    alias_digest = hashlib.sha256(replacement.encode('utf-8')).hexdigest()
+                    actions = ([{'tool_name':'write_file', 'arguments':{
+                        'path':'working/result.txt', 'content':replacement}}] if recreated else []) + [
+                        {'tool_name':'copy_project', 'arguments':{'source':'working','path':'first'}},
+                        {'tool_name':'write_file', 'arguments':{'path':'first/result.txt',
+                            'expected_sha256':digest, 'content':replacement}},
+                        {'tool_name':'copy_file', 'arguments':{'source':'alias.txt', 'source_sha256':alias_digest,
+                            'path':'first/result.txt', 'expected_sha256':alias_digest}},
+                        {'tool_name':'copy_project', 'arguments':{'source':'first','path':'second'}},
+                        {'tool_name':'copy_project', 'arguments':{'source':'second','path':'final'}},
+                        {'tool_name':'deliver_result', 'arguments':{
+                            'summary':'Current source material, without verification claims', 'artifacts':['final']}},
+                    ]
+                    result = app.run(actions=actions, progress=lambda _:None)
+                    self.assertEqual(result['status'], 'completed', result)
+                    final = app.workspace.workspace/'final'
+                    # Neither retired intermediate tree is an authority for the
+                    # delivered bytes. Changed and missing intermediates both work.
+                    (app.workspace.workspace/'first/result.txt').write_bytes(b'retired bytes')
+                    for path in (app.workspace.workspace/'second').iterdir():
+                        path.unlink()
+                    (app.workspace.workspace/'second').rmdir()
+                    restored = ToolApplication.load(root)
+
+                    def assert_reuse(expected_error):
+                        before = {path:path.read_bytes() for path in root.rglob('*') if path.is_file()}
+                        with patch.object(restored.workspace, 'call', side_effect=AssertionError('Reuse must not replay tools')):
+                            if expected_error:
+                                with self.assertRaisesRegex(ValueError, expected_error):
+                                    restored.reusable_code_project()
+                            else:
+                                self.assertEqual(restored.reusable_code_project(), (final,None,{}))
+                                output = str(final/'result.txt')
+                                self.assertIsNone(restored.workspace.artifact_provenance([output])[output]['producer'])
+                        self.assertEqual({path:path.read_bytes() for path in root.rglob('*') if path.is_file()}, before)
+
+                    assert_reuse(error)
+                    # Later successful B owns the origin's new bytes, never the
+                    # already copied A. Both prior failures and staleness survive.
+                    (working/'compute.py').write_text('print("later source")\n', encoding='utf-8')
+                    (working/'result.txt').write_bytes(b'newer-result')
+                    binding = restored.workspace.process_artifact_binding(arguments)
+                    last = app.state['turns'][-1]['tools'][-1]['result']
+                    attempt = app.session.store.read_json((Path(last).parent/'attempt_manifest.json').as_posix())
+                    later = datetime.fromisoformat(attempt['updated_at']) + timedelta(seconds=1)
+                    restored.session.store.write_json('tools/processes/new-version/invocation.json', {
+                        **receipt, 'invocation_id':'new-version', 'returncode':0,
+                        'started_at':later.isoformat(), 'finished_at':(later+timedelta(seconds=1)).isoformat(),
+                        'input_binding':{'workspace_artifacts':binding},
+                        'output_binding':{'version':1, 'outputs':{
+                            binding['outputs'][0]:hashlib.sha256(b'newer-result').hexdigest()}}})
+                    assert_reuse(error)
+                    if replacement != 'computed':
+                        # A real modification retires the old responsibility;
+                        # it does not exempt a new declared producer of these bytes.
+                        binding = restored.workspace.process_artifact_binding({**arguments,
+                            'cwd':'final', 'inputs':['final/compute.py'], 'outputs':['final/result.txt']})
+                        restored.session.store.write_json('tools/processes/later/invocation.json', {
+                            **receipt, 'invocation_id':'later', 'input_binding':{'workspace_artifacts':binding},
+                            'started_at':later.isoformat(), 'finished_at':(later+timedelta(seconds=1)).isoformat()})
+                        assert_reuse('no successful output binding')
+
+    def test_ordinary_project_reuse_checks_each_output_in_its_copied_version_context(self):
+        import hashlib
+        from simple_ar.app.tool_application import ToolApplication
+
+        with tempfile.TemporaryDirectory() as directory:
+            app = ToolApplication.create(Path(directory)/'outputs', 'Retain both source snapshots',
+                model=None, sources={})
+            working = app.workspace.workspace/'working'
+            working.mkdir()
+            code = b'print("original")\n'
+            for name, raw in {'compute.py':code, 'result.txt':b'unrelated bytes', 'side.txt':b'computed'}.items():
+                (working/name).write_bytes(raw)
+            binding = app.workspace.process_artifact_binding({'argv':['python','compute.py'], 'cwd':'working',
+                'inputs':['working/compute.py'], 'outputs':['working/result.txt','working/side.txt']})
+            app.session.store.write_json('tools/processes/producer/invocation.json', {
+                'invocation_id':'producer', 'started_at':'2000-01-01T00:00:00+00:00',
+                'finished_at':'2000-01-01T00:00:01+00:00', 'status':'finished', 'returncode':0,
+                'input_binding':{'workspace_artifacts':binding}, 'output_binding':{'version':1, 'outputs':{
+                    binding['outputs'][0]:hashlib.sha256(b'bound result').hexdigest(),
+                    binding['outputs'][1]:hashlib.sha256(b'computed').hexdigest()}}})
+            result = app.run(actions=[
+                {'tool_name':'copy_project', 'arguments':{'source':'working','path':'package/a_valid'}},
+                {'tool_name':'write_file', 'arguments':{'path':'working/compute.py',
+                    'expected_sha256':hashlib.sha256(code).hexdigest(), 'content':'print("revised")\n'}},
+                {'tool_name':'copy_project', 'arguments':{'source':'working','path':'package/z_stale'}},
+                {'tool_name':'copy_project', 'arguments':{'source':'package','path':'final'}},
+                {'tool_name':'deliver_result', 'arguments':{'summary':'Two captured versions', 'artifacts':['final']}},
+            ], progress=lambda _:None)
+            self.assertEqual(result['status'], 'completed', result)
+            # result.txt is unrelated to this process's recorded output version.
+            # side.txt matches in both branches, but their captured inputs differ:
+            # neither the unrelated output nor the valid branch may cache a pass
+            # for the stale branch of this same physical process.
+            with patch.object(app.workspace, 'call', side_effect=AssertionError('Reuse must not replay tools')):
+                with self.assertRaisesRegex(ValueError, 'inputs/outputs changed.*compute.py'):
+                    app.reusable_code_project()
 
     def _native_project_delivery(self, root, *, execute=False, planned=False, projects=1, deliver_count=None,
                                 external_input=None):

@@ -528,38 +528,89 @@ class RetainedDelivery:
         if pinned is None:
             raise ValueError('Project reuse requires a hash-bound terminal delivery')
         delivered = {self.resolve(name): digest for name, digest in pinned.items()}
-        candidates, records, source_members = {}, {}, []
+        candidates, records, history = {}, {}, []
+
+        position = 0
         for turn in self.state['turns']:
-            calls = {call['id']: call for call in self.record(turn['reply']).get('tool_calls', [])}
+            reply = self.record(turn['reply'])
+            records[turn['reply']] = reply
+            calls = {call['id']: call for call in reply.get('tool_calls', [])}
             for item in turn['tools']:
+                position += 1
                 call = calls.get(item['id'])
-                if call is None or call['function']['name'] != 'copy_project':
+                if call is None:
                     continue
                 observed = self.record(item['result'])
-                if observed.get('status') != 'ok' or observed.get('tool_name') != 'copy_project':
+                name = call['function']['name']
+                data = observed.get('data') or {}
+                process_ref = (f'tools/processes/{Path(item["result"]).parent.name}/invocation.json'
+                               if name == 'run_process' else data.get('receipt'))
+                if isinstance(process_ref, str) and process_ref.startswith('tools/processes/'):
+                    records[item['result']] = observed
+                    history.append({'position': position, 'process_ref': process_ref})
+                if observed.get('status') != 'ok' or observed.get('tool_name') != name:
+                    continue
+                arguments = json.loads(call['function']['arguments'])
+                # Normalize version edges once. The graph below reasons about
+                # versions and record boundaries, not a growing tool-name switch.
+                event = None
+                if (name in {'write_file', 'edit_file', 'copy_file'}
+                        and isinstance(data.get('sha256'), str) and data.get('absolute_path')):
+                    # Use the primitive's admitted contract, including omitted
+                    # defaults. A similar-looking payload is not a write owner.
+                    arguments = _TOOLS[name][0].model_validate(arguments).model_dump()
+                    path, digest = self.resolve(arguments['path']), data['sha256']
+                    before = arguments['expected_sha256']
+                    inputs = {path: before} if before else {}
+                    links = {path: [(path, digest)]} if before == digest else {}
+                    if arguments.get('source_sha256') == digest and 'source' in arguments:
+                        source = self.resolve(arguments['source'])
+                        inputs[source] = digest
+                        links.setdefault(path, []).append((source, digest))
+                    event = {'outputs': {path: digest}, 'inputs': inputs, 'links': links,
+                             'consistent': data['absolute_path'] == str(path)}
+                if name != 'copy_project':
+                    if event is not None:
+                        records[item['result']] = observed
+                        attempt_path = (Path(item['result']).parent / 'attempt_manifest.json').as_posix()
+                        attempt = self.record(attempt_path)
+                        records[attempt_path] = attempt
+                        history.append({**event, 'position': position,
+                            'start': attempt['created_at'], 'end': attempt['updated_at']})
                     continue
                 request = _CopyProject.model_validate(json.loads(call['function']['arguments']))
                 project = self.resolve(request.path)
+                data = observed['data']
+                record_path = (Path(item['result']).parent / 'project-copy.json').as_posix()
+                members = {self.resolve(str(project / name)): digest for name, digest in data['files'].items()}
+                source = self.resolve(request.source)
+                links = {path: [(self.resolve(str(source / path.relative_to(project))), digest)]
+                         for path, digest in members.items()
+                         if path.is_relative_to(project) and str(path.relative_to(project)) != request.archive_name}
+                attempt_path = (Path(item['result']).parent / 'attempt_manifest.json').as_posix()
+                attempt = self.record(attempt_path)
+                records[attempt_path] = attempt
+                records[item['result']] = observed
+                event = {'position': position, 'start': attempt['created_at'], 'end': attempt['updated_at'],
+                    'outputs': members, 'inputs': dict(link for group in links.values() for link in group), 'links': links,
+                    'record': record_path, 'expected_record': {'request': request.model_dump(), 'data': data},
+                    'consistent': (data['absolute_path'] == str(project) and data['source'] == str(source)
+                        and project.is_relative_to(self.mounts['workspace']) and project != self.mounts['workspace']
+                        and all(path.is_relative_to(project) for path in members))}
+                history.append(event)
                 # Ignore unrelated copies, including old snapshots not delivered.
                 if not any(path.is_relative_to(project) for path in delivered):
                     continue
-                data = observed['data']
-                attempt = Path(item['result']).parent
-                record_path = (attempt / 'project-copy.json').as_posix()
                 receipt = self.record(record_path)
-                if (receipt != {'request': request.model_dump(), 'data': data}
-                        or data['absolute_path'] != str(project)
-                        or not project.is_relative_to(self.mounts['workspace'])
-                        or project == self.mounts['workspace']):
+                if not event['consistent'] or receipt != event['expected_record']:
                     raise ValueError('Delivered project copy has inconsistent ownership')
+                records[record_path] = receipt
+                expected = members
                 if data['copy']['skipped_count']:
                     raise ValueError('Delivered project copy has omissions; no complete project proof')
                 files = data['files']
                 if not files:
                     raise ValueError('Delivered project copy has no member inventory')
-                expected = {self.resolve(str(project / name)): digest for name, digest in files.items()}
-                if any(not path.is_relative_to(project) for path in expected):
-                    raise ValueError('Project copy inventory escapes its explicit root')
                 if not expected.keys() <= delivered.keys():
                     raise ValueError('Deliver every copied project member before offering code_project')
                 if any(delivered[path] != digest for path, digest in expected.items()):
@@ -570,11 +621,6 @@ class RetainedDelivery:
                 if project in candidates and candidates[project] != expected:
                     raise ValueError('Ambiguous copy inventories for the delivered project')
                 candidates[project] = expected
-                records[record_path] = receipt
-                # Copies do not erase known failed/stale process edges on their
-                # source members. No import scan or inferred dependency is used.
-                source_members.extend(str(Path(data['source']) / name) for name in files
-                    if name != request.archive_name)
         if not candidates:
             return None  # Portable files alone do not declare a complete project.
         if len(candidates) != 1:
@@ -583,7 +629,10 @@ class RetainedDelivery:
         if any(entry['status'] in {'reserved', 'unknown'} for entry in ledger_record['entries']):
             raise ValueError('Project work has unsettled resource usage; no reusable project')
         project, files = next(iter(candidates.items()))
-        check_producers([*[str(path) for path in files], *source_members])
+        # The checker follows these existing receipts at their recorded cutoffs;
+        # later versions of an origin cannot rewrite a copied version's owner.
+        records.update(check_producers([str(path) for path in files],
+            retained_versions=files, retained_history=history))
         # Freshness and terminal checks are read-only, and cannot grant authority
         # or settle/replay a process. Detect concurrent changes before returning.
         if (self.record('session_manifest.json') != self.manifest
@@ -732,13 +781,19 @@ class WorkspaceToolGateway:
                     'process declaring those outputs; no current publication or automatic rerun')
 
     def check_artifact_producers(self, locators: Iterable[str], *, cache: dict | None = None,
-                                 refresh: bool = False) -> None:
+                                 refresh: bool = False,
+                                 retained_versions: dict[Path, str] | None = None,
+                                 retained_history: list[dict] | None = None) -> dict | None:
         """Reject known stale declared edges; untracked files remain unverified.
 
         Inspect only existing process-owner receipts, never workspace contents.
         The latest declared producer owns each output, including interrupted or
         failed runs. A later successful explicit run can supersede an older one.
+        Retained delivery instead follows version edges at their record boundary;
+        it never reduces past ownership to the latest path owner.
         """
+        if retained_versions is not None:
+            return self._check_retained_producers(retained_versions, retained_history or [])
         directory = self.root / 'tools' / 'processes'
         if not directory.is_dir():
             return
@@ -828,8 +883,153 @@ class WorkspaceToolGateway:
             result[name] = row
         return result
 
+    def _check_retained_producers(self, versions: dict[Path, str], history: list[dict]) -> dict:
+        """Traverse a temporary version graph made only from existing receipts.
+
+        A node is a path/version at a record boundary. Copies link equal bytes
+        across paths; real modifications create new, unverified nodes. Process
+        ownership is chosen before that boundary, never from today's path owner.
+        Missing/overlapping timing cannot prove ownership and stays unknown.
+        """
+        from datetime import datetime
+
+        def instant(value):
+            try:
+                parsed = datetime.fromisoformat(value)
+                return parsed if parsed.tzinfo is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        positions = {}
+        for row in history:
+            if 'process_ref' in row:
+                positions.setdefault(row['process_ref'], row['position'])
+        events = [dict(row) for row in history if 'process_ref' not in row]
+        records = {}
+        directory = self.root / 'tools' / 'processes'
+        if directory.is_dir():
+            for receipt, record, binding in self._artifact_producer_records(directory):
+                ref = receipt.relative_to(self.root).as_posix()
+                records[ref] = record
+                output = (record.get('output_binding') or {}).get('outputs', {})
+                events.append({'position': positions.get(ref), 'start': record.get('started_at'),
+                    'end': record.get('finished_at'), 'process': record, 'binding': binding,
+                    'outputs': {resolve_mounted_path(self.mounts, name, write=True, discovery=True): output.get(name)
+                                for name in binding['outputs']},
+                    'inputs': self.resolved_versions(binding['inputs'])})
+        outputs, inputs = {}, {}
+        for event in events:
+            event['start'], event['end'] = instant(event.get('start')), instant(event.get('end'))
+            for path in event['outputs']:
+                outputs.setdefault(path, []).append(event)
+            for path in event['inputs']:
+                inputs.setdefault(path, []).append(event)
+
+        def precedes(left, right):
+            if right is None:
+                return True
+            if left.get('position') is not None and right.get('position') is not None:
+                return left['position'] < right['position']
+            return (left['end'] is not None and right['start'] is not None
+                    and left['end'] < right['start'])
+
+        def latest(candidates):
+            maximal = [row for row in candidates
+                       if not any(other is not row and precedes(row, other) for other in candidates)]
+            return maximal[0] if len(maximal) == 1 else None
+
+        verified = set()
+
+        def verify(event):
+            if id(event) in verified:
+                return
+            if event.get('consistent') is False:
+                raise ValueError('Retained version differs from its recorded owner')
+            if 'record' in event:
+                path = resolve_mounted_path({'workspace': self.root}, event['record'], discovery=True)
+                actual = read_json(path)
+                if not event['consistent'] or actual != event['expected_record']:
+                    raise ValueError('Delivered project copy has inconsistent ownership')
+                records[event['record']] = actual
+            verified.add(id(event))
+
+        # Each copied inventory supplies one immutable context for its sibling
+        # members. Keep later observations when revisiting the same source path.
+        contexts = {0: dict(versions)}
+        projections = {}
+
+        def project(event, context):
+            key = (id(event), context)
+            if key not in projections:
+                projected = len(contexts)
+                contexts[projected] = {**event['inputs'], **contexts[context]}
+                projections[key] = projected
+            return projections[key]
+
+        checked = set()
+
+        def check(path, digest, boundary, context):
+            event = latest([row for row in outputs.get(path, []) if precedes(row, boundary)])
+            if event is None:
+                return  # No uniquely ordered record owns these bytes.
+            key = (path, digest, id(boundary), id(event), context)
+            if key in checked:
+                return
+            verify(event)
+            owned = event['outputs'][path]
+            links = event.get('links', {}).get(path, [])
+            if ((owned is not None and owned != digest)
+                    or 'process' not in event and not links):
+                # A different version or reintroduced content cannot erase an
+                # already observed byte version. Without an earlier observation
+                # or explicit alias edge, newly authored bytes remain unknown.
+                anchor = latest([row for row in inputs.get(path, [])
+                                 if row['inputs'][path] == digest and precedes(row, event)])
+                if anchor is not None:
+                    verify(anchor)
+                    check(path, digest, anchor, context)
+            elif 'process' not in event:
+                for link in links:
+                    check(*link, event, project(event, context))
+                # No link means newly created bytes, not verified computation.
+            else:
+                record, binding = event['process'], event['binding']
+                output = record.get('output_binding') or {}
+                if (record.get('status') != 'finished' or record.get('returncode') != 0
+                        or record.get('stop_reason') or record.get('output_binding_error')
+                        or output.get('version') != 1 or set(output.get('outputs', {})) != set(binding['outputs'])):
+                    raise ValueError(f'Declared producer has no successful output binding: {path.name}; inspect receipt, no replay')
+                for source, expected in event['inputs'].items():
+                    observed = contexts[context].get(source)
+                    if observed is not None and observed != expected:
+                        raise ValueError('Declared producer inputs/outputs changed: ' + str(source)
+                                         + '; no current publication or automatic rerun')
+                    check(source, expected, event, context)
+            # Retained checks are per output/version/boundary/context. A process
+            # with another unrelated output must not short-circuit this node.
+            checked.add(key)
+
+        for path, digest in versions.items():
+            check(path, digest, None, 0)
+        return records
+
     def _artifact_producers(self, directory: Path) -> dict:
-        producers, total = {}, 0
+        producers = {}
+        for _, record, binding in self._artifact_producer_records(directory):
+            order = record.get('started_at', '')
+            for locator in binding['outputs']:
+                path = resolve_mounted_path(self.mounts, locator, write=True, discovery=True)
+                if path not in producers or order > producers[path][0]:
+                    producers[path] = (order, record, binding)
+                elif order == producers[path][0]:
+                    # Wall-clock precision is not a causal ordering guarantee.
+                    # Never let an invocation name break a provenance tie.
+                    producers[path] = (order, None, None)
+        return producers
+
+    def _artifact_producer_records(self, directory: Path) -> Iterable[tuple[Path, dict, dict]]:
+        """One bounded reader for current owners and retained version history."""
+        total = 0
         for count, entry in enumerate(directory.iterdir(), 1):
             if count > 4096:
                 raise ValueError('Process receipt inventory exceeds 4096 entries')
@@ -849,16 +1049,7 @@ class WorkspaceToolGateway:
                 continue  # Never invent historical dependency coverage.
             if binding.get('version') != 1:
                 raise ValueError('Unsupported process artifact binding version')
-            order = record.get('started_at', '')
-            for locator in binding['outputs']:
-                path = resolve_mounted_path(self.mounts, locator, write=True, discovery=True)
-                if path not in producers or order > producers[path][0]:
-                    producers[path] = (order, record, binding)
-                elif order == producers[path][0]:
-                    # Wall-clock precision is not a causal ordering guarantee.
-                    # Never let an invocation name break a provenance tie.
-                    producers[path] = (order, None, None)
-        return producers
+            yield receipt, record, binding
 
     def bind_inventory(self, project: Path, *, identity: str,
                        material_candidates: bool | Literal['implementation'] = False) -> dict:

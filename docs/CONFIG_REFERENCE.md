@@ -62,6 +62,8 @@ writing = "daily"
 
 Replace endpoint/model with supported values and set the referenced credential privately. See [the catalog example](../examples/model-profiles/models.toml). `simple-ar models` checks settings and credential presence without API calls. Interactive `start` offers text profiles; an explicit model is retained. Structured `--prepare-only` can save TOML before credentials exist; native preparation preflights credentials without making calls.
 
+For the official DeepSeek API, [this catalog](../examples/model-profiles/deepseek.toml) uses Flash for text/code and image inspection, with separate effort and output bounds. The provider documents [high effort for agent work](https://api-docs.deepseek.com/guides/thinking_mode/) and [Flash image input](https://api-docs.deepseek.com/guides/vision/); these are API capabilities, not a quality guarantee. Select the catalog before creating a task. Restore a historical task's saved connection when resuming it; changing a default does not authorize switching that task.
+
 | Selector / consumer | Resolution |
 | --- | --- |
 | `env` | Catalog `text`, then `default`; without a catalog, legacy environment connection |

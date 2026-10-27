@@ -62,6 +62,8 @@ writing = "daily"
 
 替换为实际支持的端点与模型，私下设置引用的密钥变量。见[模型目录示例](../examples/model-profiles/models.toml)。`simple-ar models` 只检查配置和凭据是否存在，不调用 API。交互式 `start` 提供文本连接选择，保留明确的模型参数。结构化 `--prepare-only` 可在无密钥时保存 TOML；原生准备仍预检凭据，但不发请求。
 
+使用官方 DeepSeek 时，可选[这份目录](../examples/model-profiles/deepseek.toml)，由 Flash 承担文本／代码和图像检查，分别配置思考强度与输出上限。官方说明了[Agent 工作的 high 档](https://api-docs.deepseek.com/guides/thinking_mode/)及[Flash 图像输入](https://api-docs.deepseek.com/guides/vision/)；这是接口能力，不是成果质量保证。新建任务前选择目录，恢复历史任务时使用其原命名连接；修改默认配置不等于授权切换旧任务。
+
 | 选择器／使用方 | 解析规则 |
 | --- | --- |
 | `env` | 目录 text，再 default；无目录则用旧环境连接 |
