@@ -389,7 +389,7 @@ class ToolApplication:
         controller.registry.register("native_tool", self._tool)
 
     def _configure_operations(self) -> None:
-        from simple_ar.app.operation_tools import OperationTools, PROTOCOL
+        from simple_ar.app.operation_tools import OperationTools, PROTOCOL, PROFESSIONAL_CONTRACTS
         config, root = self.state['config'], self.session.store.root
         if config['control_protocol'] != PROTOCOL:
             raise ValueError('Unsupported saved operation control protocol')
@@ -397,7 +397,7 @@ class ToolApplication:
             raise ValueError('Unsupported saved operation context; no silent migration')
         if config.get('delivery_review_protocol') not in {None, 'task.v1'}:
             raise ValueError('Unsupported saved delivery review protocol; no silent migration')
-        if config.get('professional_operations') not in {None, 'work.v1'}:
+        if config.get('professional_operations') is not None and config['professional_operations'] not in PROFESSIONAL_CONTRACTS:
             raise ValueError('Unsupported saved professional operation contract; no silent migration')
         for alias, snapshot in config.get('source_snapshots', {}).items():
             source = Path(config['sources'][alias])
@@ -451,7 +451,7 @@ class ToolApplication:
                     # those remain the relevant producer/review owner's gates.
                     accepted_native_result(self.session.store.root,self.session.manifest.session_id,
                         observed,Path(item['result']).parent.name,
-                        ledger=None if self.state['config'].get('professional_operations') == 'work.v1' else self.ledger)
+                        ledger=None if self.operations is not None and self.operations.professional else self.ledger)
                 call = calls[item['id']]
                 spec = self.gateway.registry.get(call['function']['name'])
                 result.append(self._operation_observation(observed, call, item['result'],
@@ -1163,7 +1163,7 @@ class ToolApplication:
         selected_hashes = {path: self.workspace.artifact_hashes([str(path)])[str(path)]
             for path in roots if path.is_file()}
         reviews, covered = [], set()
-        professional = self.state['config'].get('professional_operations') == 'work.v1'
+        professional = self.operations is not None and self.operations.professional
         for turn in reversed(self.state['turns']):
             calls = {row['id']: row for row in self.session.store.read_json(turn['reply']).get('tool_calls', [])}
             for item in reversed(turn['tools']):
@@ -1700,7 +1700,8 @@ class ToolApplication:
             extensions=extensions, creation_declarations=creation_declarations)
         config['inspection_protocol'] = 'subjects.v3'
         config['delivery_review_protocol'] = 'task.v1'
-        config['professional_operations'] = 'work.v1'
+        from simple_ar.app.operation_tools import CURRENT_PROFESSIONAL_CONTRACT
+        config['professional_operations'] = CURRENT_PROFESSIONAL_CONTRACT
         if context_protocol is not None:
             config['context_protocol'] = context_protocol
         session = SessionController.create(root, session_id=root.name, topic=goal,

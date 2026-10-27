@@ -122,6 +122,7 @@ def write_implementation_unit(
     command_source_binding: dict | None = None,
     decision_protocol: str | None = None,
     source_owner_contract: str | None = None,
+    retained_submission: tuple[int, dict] | None = None,
 ) -> dict[str, Any]:
     """Generate related files as one scoped unit, without legacy stage planning.
 
@@ -273,11 +274,48 @@ def write_implementation_unit(
             'contain goal/revision guidance, not read source text or new permissions. '
             'Use relevant original inspection findings without treating them as verified facts '
             'or scientific certification; preserve source, execution and verification boundaries.')
+    draft = None
+    if source_owner_contract == 'source_owner.v2':
+        from simple_ar.code_task.generation.candidate_draft import CandidateDraft
+
+        draft = CandidateDraft(investigation, artifact_dir,
+            lambda name: _validate_text_source(name, validate_destination),
+            retained_step=retained_submission[0] if retained_submission else None)
+        # V2 exits the atomic content-response method completely. Existing
+        # original bindings remain owner-held; only their identities enter the
+        # prompt. Read necessary source/draft ranges rather than echoing files.
+        system = (_IMPLEMENTATION_PURPOSE +
+            'You own source investigation and incremental implementation. Call exactly one native '
+            'action per turn. read_source_windows acquires authorized original observations; '
+            'focus_source_observations retires optional presentation. stage_candidate_file binds '
+            'and copies an existing editable source without retransmitting it. read_candidate_file '
+            'reads draft ranges. write_candidate_file creates a new file or replaces a draft using '
+            'its expected_sha256; a staged original permits full writes only after complete actual '
+            'original reads, never merely staging or reading its draft. edit_candidate_file applies exact replacements atomically using '
+            'the current expected_sha256. Accumulate changes across calls; individual intermediate '
+            'files may be incomplete until submission. Paths are literal candidate-relative files. '
+            'Draft reads are authored work context, not original evidence. Original files, immutable '
+            'inputs and unread project members cannot be overwritten. At most 12 editable UTF-8 '
+            'sources, each 256000 bytes, form the edit set. Registered untouched members survive. '
+            'submit_candidate sends summary, unresolved, files [{path, sha256}] naming ALL current '
+            'draft files, optional preserve_files mappings and execution_plan. It NEVER sends content '
+            'or replacements. The owner assembles actual draft bytes and checks source identities, '
+            'syntax and requested admission. Use current candidate_draft hashes from tool results. '
+            'preserve_files may map authorized source files to candidate paths; copied data remains '
+            'immutable and is not source inspection. Use actual diagnostics, original requests and '
+            'current/stale review records for revisions; notes are judgments, not evidence or new '
+            'permissions. Source reads and corrections share this task budget. No actions execute, '
+            'install, approve, deliver or resume interrupted work. Disclose unresolved gaps. '
+            + ('execution_plan is required; it proposes execution from the published candidate_root '
+                'only, with candidate-relative argv paths for copied sources. Execution still needs '
+                'separate explicit approval.' if execution_requested else
+                'Execution planning is optional; source-only work may be submitted.'))
     ledger = getattr(client, '_budget_ledger', None)
     execution_resources = ({name: ledger.remaining(name) for name in
         ('process_invocations', 'process_wall_seconds')} if isinstance(ledger, BudgetLedger) else None)
     prompt = json.dumps({'goal': goal, 'planned_files': files,
-        'source_windows': source_windows, 'original_files': original_files,
+        'source_windows': source_windows, 'original_files': ({name: {key: value for key, value in row.items()
+            if key != 'text'} for name, row in original_files.items()} if draft else original_files),
         **({'preserved_files': preserved_files} if preserved_files else {}),
         **({'dependency_observation': dependency_observation} if dependency_observation is not None else {}),
         'execution_observations': execution_observations or [],
@@ -301,13 +339,15 @@ def write_implementation_unit(
         investigation=investigation, preserved_files=preserved_files,
         decision_protocol=decision_protocol,
         source_owner_contract=source_owner_contract,
+        candidate_draft=draft,
+        retained_submission=retained_submission,
         candidate_admission=candidate_admission, preserve_workspace=preserve_workspace,
         command_source_binding=command_source_binding, candidate_root=project_dir)
     unresolved = response.get('unresolved', [])
     execution_plan = (ImplementationRunPlan.model_validate(response['execution_plan']).model_dump()
         if 'execution_plan' in response else None)
     generated = []
-    with generation_candidate(project_dir) as candidate:
+    with generation_candidate(project_dir, validate=(lambda _: draft.validate()) if draft else None) as candidate:
         registered = investigation.registered_files if investigation is not None else {}
         if registered:
             investigation.validate()
@@ -553,7 +593,7 @@ def _parse_implementation_action(message: dict, tools: list[dict]) -> tuple[str,
 
 
 def _validate_source_owner(contract: str | None, investigation: Any, protocol: str | None) -> None:
-    if contract not in (None, 'source_owner.v1'):
+    if contract not in (None, 'source_owner.v1', 'source_owner.v2'):
         raise ValueError('Unknown implementation source owner contract')
     if contract and (investigation is None or protocol != 'native.v1'):
         raise ValueError('Source ownership requires authorized investigation and native source actions')
@@ -584,13 +624,22 @@ def _generate_implementation_contents(
     candidate_root: Path | None = None,
     decision_protocol: str | None = None,
     source_owner_contract: str | None = None,
+    candidate_draft: Any = None,
+    retained_submission: tuple[int, dict] | None = None,
 ) -> tuple[dict[str, str], dict[str, Any], dict[str, str]]:
     """Use the selected source contract; historical six-decision limits stay frozen."""
     _validate_source_owner(source_owner_contract, investigation, decision_protocol)
+    if retained_submission is not None and source_owner_contract != 'source_owner.v2':
+        raise ValueError('Retained submission finalization is only available to incremental source ownership')
     if decision_protocol not in (None, 'native.v1'):
         raise ValueError('Unknown implementation decision protocol')
     native = investigation is not None and decision_protocol == 'native.v1'
     tools = _implementation_actions(working_set=investigation.working_set) if native else []
+    if source_owner_contract == 'source_owner.v2':
+        if candidate_draft is None:
+            raise ValueError('Incremental source ownership requires the scoped candidate byte owner')
+        from simple_ar.code_task.generation.candidate_draft import incremental_actions
+        tools = incremental_actions(tools)
     history: list[dict[str, Any]] = []
     feedback = ''
     response: dict[str, Any] = {}
@@ -603,8 +652,9 @@ def _generate_implementation_contents(
     validation_observations = []
     previous_rejection = None
     unproductive_reads = 0
+    candidate_reads = set()
     from simple_ar.code_task.generation.validation import CandidateAdmissionError, check_candidate_sources
-    for attempt in count(1):
+    for attempt in ([retained_submission[0]] if retained_submission else count(1)):
         if decisions is not None and attempt > decisions:
             break
         response = {}
@@ -620,6 +670,10 @@ def _generate_implementation_contents(
                 context = json.loads(prompt)
                 context.update(source_windows=investigation.windows, original_files=investigation.originals,
                     investigation=investigation.context())
+                if candidate_draft is not None:
+                    context['original_files'] = {name: {key: value for key, value in row.items() if key != 'text'}
+                        for name, row in investigation.originals.items()}
+                    context['candidate_draft'] = candidate_draft.context()
                 ledger = getattr(client, '_budget_ledger', None)
                 remaining = ledger.remaining('llm_requests') if isinstance(ledger, BudgetLedger) else None
                 available = decisions - attempt + 1 if decisions is not None else None
@@ -632,31 +686,54 @@ def _generate_implementation_contents(
                 prompt = json.dumps(context, ensure_ascii=False)
                 if len(prompt.encode('utf-8')) > 4 * 1024 * 1024:
                     raise ValueError('Implementation decision context exceeds 4 MiB')
-                write_json(artifact_dir / 'decision-steps' / str(attempt) / 'input.json', context)
+                if retained_submission is None:
+                    write_json(artifact_dir / 'decision-steps' / str(attempt) / 'input.json', context)
             if native:
-                # Supply only the current working presentation. Native calls/results
-                # retain protocol history without reintroducing retired source bodies.
-                messages = [{'role': 'system', 'content': system},
-                    {'role': 'user', 'content': prompt}, *history]
-                if len(json.dumps(messages, ensure_ascii=False).encode('utf-8')) > 4 * 1024 * 1024:
-                    raise ValueError('Implementation decision history exceeds 4 MiB')
-                step = artifact_dir / 'decision-steps' / str(attempt)
-                write_json(step / 'native-request.json', {'protocol': decision_protocol,
-                    'messages': messages, 'tools': tools})
-                try:
-                    message = client.tool_turn(messages, tools=tools, label=f'{label}-decision-{attempt}')
-                except LLMError as exc:
-                    write_json(step / 'native-error.json', {'error': str(exc),
-                        'raw_response': getattr(exc, 'raw_response', '')})
-                    # No native transport/partial-response error is an action rejection.
-                    raise LLMError('Native implementation turn failed; no continuation or replay') from exc
-                write_json(step / 'native-response.json', message)
+                if retained_submission is not None:
+                    message = retained_submission[1]
+                else:
+                    # Supply only the current working presentation. Native calls/results
+                    # retain protocol history without reintroducing retired source bodies.
+                    messages = [{'role': 'system', 'content': system},
+                        {'role': 'user', 'content': prompt}, *history]
+                    if len(json.dumps(messages, ensure_ascii=False).encode('utf-8')) > 4 * 1024 * 1024:
+                        raise ValueError('Implementation decision history exceeds 4 MiB')
+                    step = artifact_dir / 'decision-steps' / str(attempt)
+                    write_json(step / 'native-request.json', {'protocol': decision_protocol,
+                        'messages': messages, 'tools': tools})
+                    try:
+                        message = client.tool_turn(messages, tools=tools, label=f'{label}-decision-{attempt}')
+                    except LLMError as exc:
+                        write_json(step / 'native-error.json', {'error': str(exc),
+                            'raw_response': getattr(exc, 'raw_response', '')})
+                        # No native transport/partial-response error is an action rejection.
+                        raise LLMError('Native implementation turn failed; no continuation or replay') from exc
+                    write_json(step / 'native-response.json', message)
                 response_received = True
                 if not response_accounting_known(client, accounting_before, completed_response=True):
                     raise LLMError('Professional response has unknown or reserved physical usage; no continuation or replay')
                 operation = 'native_action'
                 name, arguments, native_call_id = _parse_implementation_action(message, tools)
                 history.append(message)
+                if candidate_draft is not None and name in {'stage_candidate_file', 'read_candidate_file',
+                        'write_candidate_file', 'edit_candidate_file'}:
+                    operation, response = name, arguments
+                    previous_files = dict(candidate_draft.files)
+                    action_result = candidate_draft.call(name, arguments, attempt)
+                    write_json(step / 'response.json', {'action': name, 'arguments': arguments})
+                    data = action_result['data']
+                    read_key = (arguments['path'], data.get('sha256'), data.get('offset_bytes',
+                        arguments.get('offset_bytes', 0)), data.get('next_offset_bytes'))
+                    progress = (candidate_draft.files != previous_files or
+                        name == 'read_candidate_file' and read_key not in candidate_reads)
+                    if name == 'read_candidate_file':
+                        candidate_reads.add(read_key)
+                    unproductive_reads = 0 if progress else unproductive_reads + 1
+                    if unproductive_reads >= 2:
+                        raise _SourceInvestigationStopped('Candidate operations repeated without new '
+                            'edited bytes or observed draft ranges; inspect retained diagnostics')
+                    previous_rejection = None
+                    continue
                 operation = {'read_source_windows': 'read_windows',
                     'focus_source_observations': 'focus_observations', 'submit_candidate': 'candidate'}[name]
                 response = (arguments if operation == 'candidate' else
@@ -671,10 +748,11 @@ def _generate_implementation_contents(
                     feedback=[feedback] if feedback else [], message_callback=message_callback)
                 response_received = True
             if investigation is not None:
-                write_json(artifact_dir / 'decision-steps' / str(attempt) / 'response.json', response)
+                if retained_submission is None:
+                    write_json(artifact_dir / 'decision-steps' / str(attempt) / 'response.json', response)
                 if not response_accounting_known(client, accounting_before, completed_response=True):
                     raise LLMError('Professional response has unknown or reserved physical usage; no continuation or replay')
-            if artifact_dir is not None:
+            if artifact_dir is not None and retained_submission is None:
                 write_json(artifact_dir / 'proposal.json', response)
                 write_agent_step_artifact(artifact_dir, stage=label if legacy else 'implementation',
                     attempt_index=attempt, value={'response': response})
@@ -710,14 +788,16 @@ def _generate_implementation_contents(
                     previous_rejection = None
                     feedback = ''
                     continue
-                candidate_originals, candidate_preserved = investigation.bind_response(response, commit=False)
+                candidate_response = candidate_draft.assemble(response) if candidate_draft is not None else response
+                candidate_originals, candidate_preserved = investigation.bind_response(candidate_response, commit=False)
                 required = {row['path'] for row in json.loads(prompt).get('requested_files') or []}
                 returned = {row.get('path') for row in response.get('files', []) if isinstance(row, dict)}
                 if required - (returned | set(candidate_originals)):
                     raise ValueError('Candidate omits explicit requested files')
             elif not legacy and response.get('preserve_files'):
                 raise ValueError('New preserve selections require the authorized investigation owner')
-            contents, modes = _decode_implementation_response(response, planned=planned,
+            contents, modes = _decode_implementation_response(
+                candidate_response if candidate_draft is not None else response, planned=planned,
                 original_files=candidate_originals, legacy=legacy,
                 artifact_dir=artifact_dir, attempt=attempt, validate_destination=validate_destination,
                 execution_requested=execution_requested,
@@ -768,6 +848,8 @@ def _generate_implementation_contents(
                 investigation.preserved_files = candidate_preserved
             return contents, response, modes
         except (LLMResponseError, ValueError, SyntaxError) as exc:
+            if retained_submission is not None:
+                raise  # Revalidation may fail, but never becomes a new model request.
             if isinstance(exc, LLMResponseError) and not getattr(exc, 'correction_allowed', True):
                 raise
             if not response_received and not isinstance(exc, LLMResponseError):
@@ -842,7 +924,7 @@ def _generate_implementation_contents(
             if native_call_id is not None:
                 history.append({'role': 'tool', 'tool_call_id': native_call_id,
                     'content': json.dumps(action_result, ensure_ascii=False)})
-            if investigation is not None and command_source_binding is not None:
+            if investigation is not None and command_source_binding is not None and retained_submission is None:
                 # Persist even partial/capacity-refused reads and failed
                 # decisions. Focus must never erase approval/recovery guards.
                 from simple_ar.core.capabilities import ArtifactStore

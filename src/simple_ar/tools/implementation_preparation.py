@@ -10,13 +10,14 @@ from simple_ar.core.capabilities import ArtifactStore
 PROFESSIONAL_GENERATION = 'professional_decision.v1'
 REGISTERED_PROJECT_GENERATION = 'professional_project.v1'
 SOURCE_OWNER_CONTRACT = 'source_owner.v1'
+SOURCE_OWNER_CONTRACTS = (SOURCE_OWNER_CONTRACT, 'source_owner.v2')
 
 
 def material_observation_metadata(binding: dict) -> dict:
     """Expose retained reader snapshots, never synthesize reads of authored files."""
     from copy import deepcopy
 
-    if binding.get('source_owner_contract') != SOURCE_OWNER_CONTRACT:
+    if binding.get('source_owner_contract') not in SOURCE_OWNER_CONTRACTS:
         return {}
     return {'material_observations': [
         {'request': deepcopy(row['request']), 'data': deepcopy({key: value
@@ -42,7 +43,7 @@ def prepare_work(owner: Any, request: Any, store: ArtifactStore, output: Path,
     request_data = request.model_dump()
     if store.exists('request.json'):
         saved = store.read_json('request.json')
-        if saved.get('source_owner_contract') not in (None, SOURCE_OWNER_CONTRACT):
+        if saved.get('source_owner_contract') not in (None, *SOURCE_OWNER_CONTRACTS):
             raise ValueError('Unknown retained source owner contract')
         if saved.get('source_decision_protocol') not in (None, 'native.v1'):
             raise ValueError('Unknown retained source decision protocol')
@@ -50,13 +51,14 @@ def prepare_work(owner: Any, request: Any, store: ArtifactStore, output: Path,
             raise ValueError('Unknown retained source edit contract')
         if saved['generation_method'] not in {PROFESSIONAL_GENERATION, REGISTERED_PROJECT_GENERATION} or saved['request'] != request_data:
             raise ValueError('Professional generation request changed; preserve the original attempt')
-        if not store.exists('result.json'):
+        if not store.exists('result.json') and saved.get('source_owner_contract') != 'source_owner.v2':
             raise ValueError('Interrupted professional decision; inspect retained steps and accounting, no blind replay')
-        result = store.read_json('result.json')
-        hashes = {str(output / row['path']): row['sha256'] for row in result['data']['files']}
-        inventory = owner.workspace.bind_inventory(output, identity=identity)
-        if inventory['file_hashes'] != hashes:
-            raise ValueError('Prepared candidate inventory changed; do not replay the professional decision')
+        result = store.read_json('result.json') if store.exists('result.json') else None
+        if result is not None:
+            hashes = {str(output / row['path']): row['sha256'] for row in result['data']['files']}
+            inventory = owner.workspace.bind_inventory(output, identity=identity)
+            if inventory['file_hashes'] != hashes:
+                raise ValueError('Prepared candidate inventory changed; do not replay the professional decision')
         inputs = {row['path']: row['sha256'] for row in saved.get('original_files', {}).values()}
         inputs.update({str(owner.workspace.resolve(row['request']['path'])): row['sha256']
             for row in saved['source_windows'] if 'request' in row})
@@ -72,7 +74,9 @@ def prepare_work(owner: Any, request: Any, store: ArtifactStore, output: Path,
                     or hashlib.sha256((previous.parent / 'request.json').read_bytes()).hexdigest()
                         != prior['source_binding_sha256']):
                 raise ValueError('Prior registered source binding changed')
-        return ToolResult(tool_name='prepare_implementation', **result)
+        if result is not None:
+            return ToolResult(tool_name='prepare_implementation', **result)
+        return _finalize_retained_submission(owner, store, saved, output, identity)
 
     for locator in request.material_roots:
         material = owner.workspace.resolve_material_root(locator)
@@ -229,6 +233,52 @@ def prepare_work(owner: Any, request: Any, store: ArtifactStore, output: Path,
     sources.retain_binding(binding, store)
     result['workspace_scope'] = sources.context()['workspace_scope']
     result['investigation'] = {'observed_windows': sum('request' in row for row in windows),
+        'record': str(store.root / 'request.json'), 'decision_steps': str(store.root / 'decision-steps')}
+    return owner._publish_implementation(identity, store, result)
+
+
+def _finalize_retained_submission(owner: Any, store: ArtifactStore, binding: dict,
+                                  output: Path, identity: str) -> Any:
+    """Revalidate a complete accounted final reply without model or edit replay."""
+    from copy import deepcopy
+    from simple_ar.code_task.generation.candidate_draft import retained_submission
+    from simple_ar.code_task.generation.selection import ImplementationSources
+    from simple_ar.code_task.generation.writer import write_implementation_unit
+
+    step, message, context = retained_submission(store.root, owner.ledger, identity)
+    prior = binding.get('prior_candidate') or binding.get('project_snapshot')
+    project = Path(prior['project_root']) if prior else None
+    windows = deepcopy(context['source_windows'])
+    sources = ImplementationSources(workspace=owner.workspace, project=project,
+        roots=[row['root'] for row in binding['investigation']['inventories']],
+        windows=windows, originals=deepcopy(binding.get('original_files', {})), identity=identity,
+        retained=bool(binding.get('prior_candidate')), registered_project=prior,
+        editable_project=Path(prior['editable_project']) if prior and prior.get('editable_project') else None,
+        preserved_files=(prior.get('preserved_files', {}) if prior else binding.get('preserved_files')),
+        diagnostic_context=True, input_contract=binding.get('preserved_input_contract'),
+        edit_contract=binding.get('source_edit_contract'))
+    # The final input supplies its active presentation; guards still cover all
+    # retained actual reads, including retired observations. No new feedback,
+    # parent-seed choice or source request replaces the interrupted invocation.
+    sources.observations[:] = deepcopy(binding['source_windows'])
+    sources.validate()
+    result = write_implementation_unit(project_dir=output, goal=binding['request']['goal'], files=None,
+        source_windows=sources.windows, original_files=sources.originals, client=owner._client(identity),
+        artifact_dir=store.root, task_python=str(owner.workspace.python), investigation=sources,
+        execution_requested=binding['request'].get('execution_requested', False),
+        execution_observations=binding.get('execution_observations', []),
+        candidate_admission=bool(binding.get('candidate_admission')),
+        dependency_advice=binding.get('dependency_advice'), command_source_binding=binding,
+        decision_protocol='native.v1', source_owner_contract='source_owner.v2',
+        retained_submission=(step, message),
+        validate_destination=lambda name: owner._feedback_destination(output, name, prior))
+    sources.validate()
+    binding['original_files'] = sources.originals
+    if sources.preserved_files:
+        binding['preserved_files'] = sources.preserved_files
+    store.write_json('request.json', binding)
+    result['workspace_scope'] = sources.context()['workspace_scope']
+    result['investigation'] = {'observed_windows': sum('request' in row for row in binding['source_windows']),
         'record': str(store.root / 'request.json'), 'decision_steps': str(store.root / 'decision-steps')}
     return owner._publish_implementation(identity, store, result)
 

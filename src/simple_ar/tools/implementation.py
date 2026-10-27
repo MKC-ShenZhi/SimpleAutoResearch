@@ -269,6 +269,9 @@ def implementation_tool_specs(*, exact: bool = False,
                 'records, gaps and an execution_plan when execution_requested (default true). Execution '
                 'requires a separate explicitly approved execute_implementation. No automatic continuation '
                 'or scientific/visual certification.')
+            if source_owner_contract == 'source_owner.v2':
+                specs[0].description += (' Accumulate candidate file edits within this operation; '
+                    'final submission references current draft versions rather than retransmitting all source.')
         return specs
     from simple_ar.tools.implementation_findings import InvestigationRequest
     return [CommonToolSpec(name='investigate_implementation', domain='implementation',
@@ -287,7 +290,7 @@ def implementation_tool_specs(*, exact: bool = False,
 
 
 def _source_owner_options(contract: str | None, *, preparation_only: bool, exact: bool) -> None:
-    if contract not in (None, 'source_owner.v1'):
+    if contract not in (None, 'source_owner.v1', 'source_owner.v2'):
         raise ValueError('Unknown source owner contract')
     if contract and (not preparation_only or exact):
         raise ValueError('Source ownership requires ordinary preparation-only composition')
@@ -480,8 +483,19 @@ class ImplementationToolGateway:
             from simple_ar.code_task.orchestration.execute import implementation_resume_allowed
             return implementation_resume_allowed(self.workspace.workspace / 'code_tasks' / identity,
                 ledger=self.ledger, attempt_id=identity)
-        return name == 'prepare_implementation' and (
-            self.root / 'attempts' / identity / 'implementation' / 'result.json').is_file()
+        store = ArtifactStore(self.root / 'attempts' / identity / 'implementation')
+        if name == 'prepare_implementation' and store.exists('result.json'):
+            return True
+        if name == 'prepare_implementation' and self.source_owner_contract == 'source_owner.v2':
+            try:
+                if store.read_json('request.json').get('source_owner_contract') != 'source_owner.v2':
+                    return False
+                from simple_ar.code_task.generation.candidate_draft import retained_submission
+                retained_submission(store.root, self.ledger, identity)
+                return True  # Only a completed final reply; call() revalidates all actual bytes.
+            except (OSError, ValueError, KeyError, TypeError):
+                return False
+        return False
 
     def __init__(self, root: Path, workspace: Any, ledger: Any, model: str, session_id: str,
                  *, client_factory: Callable[[str], LLMClient] | None = None,
@@ -1623,7 +1637,8 @@ class ImplementationToolGateway:
                 if prior and prior.get('preserved_files'):
                     raise ValueError('Immutable candidate inputs require registered feedback with files omitted; '
                         'explicit file selection cannot drop or reclassify preserved data')
-            if output.exists() and not owner.exists('result.json'):
+            if output.exists() and not owner.exists('result.json') and not (
+                    self.source_owner_contract == 'source_owner.v2' and owner.exists('request.json')):
                 raise ValueError('Candidate output already exists without a completed receipt; inspect it and use a new identity')
             from simple_ar.tools.implementation_preparation import (
                 PROFESSIONAL_GENERATION, REGISTERED_PROJECT_GENERATION, prepare_work,

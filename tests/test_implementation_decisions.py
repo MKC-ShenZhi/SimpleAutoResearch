@@ -32,7 +32,8 @@ class ImplementationDecisionTests(unittest.TestCase):
         native_chat = LLMClient.chat_turn
         def generation_turn(client, messages, *, tools, **kwargs):
             names = {tool['function']['name'] for tool in tools}
-            if not names or not names <= {'read_source_windows', 'focus_source_observations', 'submit_candidate'}:
+            if not names or not names <= {'read_source_windows', 'focus_source_observations', 'submit_candidate',
+                    'stage_candidate_file', 'read_candidate_file', 'write_candidate_file', 'edit_candidate_file'}:
                 return self.coordinator()
             return native_chat(client, messages, tools=tools, **kwargs)
         self.enterContext(patch.object(LLMClient, 'chat_turn', generation_turn))
@@ -44,6 +45,8 @@ class ImplementationDecisionTests(unittest.TestCase):
         self.prompts.append(prompt)
         self.assertTrue(self.responses, 'Unexpected extra model step: ' + str(request['messages'][-1])[-2500:])
         response = self.responses.pop(0)
+        if callable(response):
+            response = response(prompt)
         if isinstance(response, Exception):
             raise response
         finish, content = response if isinstance(response, tuple) else ('stop', json.dumps(response))
@@ -1202,12 +1205,12 @@ class ImplementationDecisionTests(unittest.TestCase):
                 self.assertEqual((store / 'result.json').exists(), succeeds)
                 self.assertFalse((app.session.store.root / 'tools/processes').exists())
 
-    def _source_owner(self, app, **ports):
+    def _source_owner(self, app, *, contract='source_owner.v1', **ports):
         from simple_ar.tools.implementation import ImplementationToolGateway
 
         return ImplementationToolGateway(app.session.store.root, app.workspace, app.ledger,
             'fixture', app.session.manifest.session_id, preparation_only=True,
-            source_owner_contract='source_owner.v1',
+            source_owner_contract=contract,
             client_factory=app.implementation.client_factory, **ports)
 
     def _assert_source_owner_inventory_authority(self, app, inventories):
@@ -1218,6 +1221,142 @@ class ImplementationDecisionTests(unittest.TestCase):
         for name in ('workspace', 'records'):
             self.assertNotIn(app.workspace.mounts[name].resolve(), roots)
         return roots
+
+    def _draft_action(self, name, arguments):
+        def response(prompt):
+            values = arguments(prompt) if callable(arguments) else arguments
+            return ('tool_calls', {'role': 'assistant', 'content': None, 'tool_calls': [{
+                'id': f'draft-{self.send.call_count}', 'type': 'function',
+                'function': {'name': name, 'arguments': json.dumps(values)}}]})
+        return response
+
+    def _draft_submit(self):
+        return self._draft_action('submit_candidate', lambda prompt: {
+            'summary': 'Submit actual edited source', 'unresolved': [],
+            'files': prompt['candidate_draft']['files'],
+            'execution_plan': self._candidate('unused')['execution_plan']})
+
+    @staticmethod
+    def _draft_hash(prompt, path):
+        return next(row['sha256'] for row in prompt['candidate_draft']['files'] if row['path'] == path)
+
+    def test_incremental_source_creation_accumulates_bytes_and_repairs_actual_admission(self):
+        from simple_ar.code_task.generation.writer import _implementation_actions
+
+        app = self._create('incremental-creation')
+        owner = self._source_owner(app, contract='source_owner.v2')
+        self.responses = [
+            self._draft_action('write_candidate_file', {'path': 'calculate.py', 'content': 'value = (\n'}),
+            self._draft_action('edit_candidate_file', lambda prompt: {'path': 'calculate.py',
+                'expected_sha256': self._draft_hash(prompt, 'calculate.py'),
+                'replacements': [{'old_text': '(\n', 'new_text': 'missing_name\n'}]}),
+            self._draft_action('write_candidate_file', {'path': 'helper.py', 'content': 'helper = 2\n'}),
+            self._draft_submit(),
+            self._draft_action('edit_candidate_file', lambda prompt: {'path': 'calculate.py',
+                'expected_sha256': self._draft_hash(prompt, 'calculate.py'),
+                'replacements': [{'old_text': 'missing_name', 'new_text': '1'}]}),
+            self._draft_submit(),
+        ]
+        result = owner.call('prepare_implementation', {'goal': 'Create editable related sources'}, identity='incremental')
+        self.assertEqual(result.status, 'ok', result)
+        self.assertEqual(self.send.call_count, 6)
+        project = Path(result.data['project_dir'])
+        self.assertEqual((project / 'calculate.py').read_text(), 'value = 1\n')
+        self.assertEqual((project / 'helper.py').read_text(), 'helper = 2\n')
+        store = Path(result.data['source_binding']).parent
+        self.assertEqual(json.loads((store / 'decision-steps/4/validation.json').read_text())['status'], 'rejected')
+        final = json.loads((store / 'decision-steps/6/response.json').read_text())
+        self.assertTrue(all(set(row) == {'path', 'sha256'} for row in final['files']))
+        operation = json.loads((store / 'decision-steps/2/candidate-operation.json').read_text())
+        self.assertEqual((app.session.store.root / 'tools/edits' / operation['identity'] / 'previous').read_text(), 'value = (\n')
+        legacy = next(row['function'] for row in _implementation_actions(working_set=True)
+            if row['function']['name'] == 'submit_candidate')
+        self.assertIn('content', legacy['parameters']['properties']['files']['items']['properties'])
+        self.assertIsNone(owner.continuation(result.model_dump(mode='json'), 'incremental'))
+        self.assertEqual(result.metadata['material_observations'], [])
+        self.assertFalse((app.session.store.root / 'tools/processes').exists())
+
+    def test_incremental_revision_preserves_original_edit_authority_and_untouched_members(self):
+        app = self._create('incremental-revision')
+        first = self._candidate('value = 1\n')
+        first['files'].append({'path': 'helper.py', 'content': 'helper = 2\n'})
+        self.responses = [first]
+        prepared = self._prepare(app, {'goal': 'Create original project'})
+        original = Path(prepared['data']['project_dir'])
+        owner = self._source_owner(app, contract='source_owner.v2')
+        write = self._draft_action('write_candidate_file', lambda prompt: {'path': 'calculate.py',
+            'expected_sha256': self._draft_hash(prompt, 'calculate.py'), 'content': 'value = 3\n'})
+        self.responses = [self._draft_action('stage_candidate_file', {'path': 'calculate.py'}),
+            self._draft_action('read_candidate_file', {'path': 'calculate.py'}),
+            self._draft_action('edit_candidate_file', lambda prompt: {'path': 'calculate.py',
+                'expected_sha256': self._draft_hash(prompt, 'calculate.py'),
+                'replacements': [{'old_text': 'value = 1', 'new_text': 'value = 2'}]}),
+            write,  # Staging and reading draft bytes do not authorize a full original rewrite.
+            {'read_windows': [{'path': str(original / 'calculate.py'), 'max_bytes': 64000}]},
+            write, self._draft_submit()]
+        result = owner.call('prepare_implementation', {'goal': 'Revise existing code',
+            'project_path': str(original)}, identity='incremental-revised')
+        self.assertEqual(result.status, 'ok', result)
+        candidate = Path(result.data['project_dir'])
+        self.assertEqual((candidate / 'calculate.py').read_text(), 'value = 3\n')
+        self.assertEqual((original / 'calculate.py').read_text(), 'value = 1\n')
+        self.assertEqual((candidate / 'helper.py').read_bytes(), (original / 'helper.py').read_bytes())
+        store = Path(result.data['source_binding']).parent
+        self.assertIn('complete actual original-read', json.loads(
+            (store / 'decision-steps/4/validation.json').read_text())['message'])
+        self.assertEqual(len(result.metadata['material_observations']), 1)
+        self.assertEqual(result.metadata['material_observations'][0]['request']['path'], str(original / 'calculate.py'))
+        self.assertTrue(all('text' not in row for row in self.prompts[-1]['original_files'].values()))
+
+    def test_incremental_accounted_finalization_and_incomplete_reply_never_replay(self):
+        for kind in ('complete', 'before-publication', 'truncated', 'unknown', 'changed-draft', 'changed-original'):
+            with self.subTest(kind=kind):
+                sources = {}
+                if kind == 'changed-original':
+                    project = self.base / 'interrupted-original'
+                    project.mkdir()
+                    (project / 'calculate.py').write_text('value = 1\n', encoding='utf-8')
+                    sources = {'code': project}
+                app = self._create('incremental-final-' + kind, sources=sources)
+                owner = self._source_owner(app, contract='source_owner.v2')
+                arguments = {'goal': 'Create source and propose execution', **({'project_path': 'code'} if sources else {})}
+                action = (self._draft_action('stage_candidate_file', {'path': 'calculate.py'}) if sources else
+                    self._draft_action('write_candidate_file', {'path': 'calculate.py', 'content': 'value = 1\n'}))
+                final = self._draft_submit()
+                self.responses = [action, ('length', '{"files":[') if kind == 'truncated' else final]
+                before = self.send.call_count
+                interruption = (patch('simple_ar.code_task.generation.writer.generation_candidate',
+                    side_effect=RuntimeError('Interrupted before publication')) if kind == 'before-publication' else
+                    patch.object(owner, '_publish_implementation', side_effect=RuntimeError('Interrupted publication')))
+                with interruption:
+                    failed = owner.call('prepare_implementation', arguments, identity='interrupted')
+                self.assertEqual(failed.status, 'error')
+                self.assertEqual(self.send.call_count - before, 2)
+                store = app.session.store.root / 'attempts/interrupted/implementation'
+                reply = store / 'decision-steps/2/native-response.json'
+                frozen = reply.read_bytes() if reply.exists() else None
+                if kind == 'unknown':
+                    entry = [row for row in app.ledger.entries if row.attempt_id == 'interrupted'][-1]
+                    entry.status = 'unknown'
+                    entry.actual_source = 'unknown'
+                elif kind == 'changed-draft':
+                    (app.workspace.workspace / 'implementation-drafts/interrupted/calculate.py').write_text('value = 9\n')
+                elif kind == 'changed-original':
+                    (project / 'calculate.py').write_text('value = 9\n')
+                ledger = app.ledger.to_dict()
+                if kind in {'complete', 'before-publication', 'truncated', 'unknown'}:
+                    self.assertEqual(owner.can_reconcile('prepare_implementation', 'interrupted'),
+                        kind in {'complete', 'before-publication'})
+                recovered = owner.call('prepare_implementation', arguments, identity='interrupted')
+                self.assertEqual(recovered.status, 'ok' if kind in {'complete', 'before-publication'} else 'error', recovered)
+                self.assertEqual(self.send.call_count - before, 2)
+                self.assertEqual(app.ledger.to_dict(), ledger)
+                if frozen is not None:
+                    self.assertEqual(reply.read_bytes(), frozen)
+                if kind in {'complete', 'before-publication'}:
+                    self.assertEqual((Path(recovered.data['project_dir']) / 'calculate.py').read_text(), 'value = 1\n')
+                    self.assertTrue(recovered.data['executable'])
+                self.assertFalse((app.session.store.root / 'tools/processes').exists())
 
     def test_source_owner_composes_without_saved_preparation_or_continuation_controls(self):
         from simple_ar.tools.implementation import ImplementationToolGateway, implementation_tool_specs

@@ -21,6 +21,8 @@ from simple_ar.tools.extensions import LocalExtension
 
 
 PROTOCOL = 'operations.v1'
+PROFESSIONAL_CONTRACTS = {'work.v1': 'source_owner.v1', 'work.v2': 'source_owner.v2'}
+CURRENT_PROFESSIONAL_CONTRACT = 'work.v2'
 _DIRECT_WORK = (
     "Own the user's research request using the available operations and authorized materials. "
     "Observe relevant files, choose a short useful plan, implement and run when needed, inspect actual "
@@ -91,6 +93,7 @@ class OperationTools:
                  user_requests=None):
         from simple_ar.tools.inspection import InspectionToolGateway, inspection_tool_specs
         self.root, self.config = root, config
+        self.professional = config.get('professional_operations') in PROFESSIONAL_CONTRACTS
         self.observations = observations
         evidence = root / 'evidence'
         evidence.mkdir(exist_ok=True)
@@ -114,8 +117,7 @@ class OperationTools:
             protocol=config.get('inspection_protocol'),
             material_observations=material_observations,
             user_requests=user_requests,
-            feedback_provider=self.inspection_feedback
-                if config.get('professional_operations') == 'work.v1' else None,
+            feedback_provider=self.inspection_feedback if self.professional else None,
             prior_assessments=lambda:[row.model_dump() for row in
                 current_assessments(self.workspace,observations())])
         self.registry.register_package(inspection_tool_specs(progressive=self.inspection.progressive,
@@ -134,8 +136,9 @@ class OperationTools:
         if preparation not in {None,'prepared.v1','prepared.v2','prepared.v3'}:
             raise ValueError('Unsupported source generation protocol')
         exact = config.get('code_task') is not None
-        professional = config.get('professional_operations') == 'work.v1'
-        source_owner = 'source_owner.v1' if professional and not exact and preparation is None else None
+        professional = self.professional
+        source_owner = (PROFESSIONAL_CONTRACTS[config['professional_operations']]
+            if professional and not exact and preparation is None else None)
         self.system = (_SOURCE_COORDINATION
             if source_owner or not exact and preparation in {'prepared.v2','prepared.v3'} else _DIRECT_WORK) + _work_principles(
                 config.get('delivery_review_protocol') == 'task.v1')
@@ -308,7 +311,7 @@ class OperationTools:
                 data = row.get('data') or {}
                 if isinstance(data.get('absolute_path'), str) and isinstance(data.get('sha256'), str):
                     bindings[data['absolute_path']] = data['sha256']
-                if self.config.get('professional_operations') == 'work.v1':
+                if self.professional:
                     for window in (row.get('metadata') or {}).get('material_observations', []):
                         observed = window['data']
                         if isinstance(observed.get('absolute_path'), str) and isinstance(observed.get('sha256'), str):

@@ -70,13 +70,18 @@ New creation defaults to `tool_contracts="on_demand"`: workspace editing, permit
 process operations and coordination are directly available; optional professional
 contracts are discoverable and loaded when needed. Frozen code, table-analysis and
 measurement contracts expose their required owners directly. New tasks also freeze
-`professional_operations="work.v1"`: coherent source work uses `prepare_implementation`
+`professional_operations="work.v2"`: coherent source work uses `prepare_implementation`
 and separately approved execution; `work_document` investigates originals and drafts
 or revises a manuscript. Both share the task ledger and return candidates, while
 inspection, publication and terminal delivery retain their own responsibilities.
 Simple operations remain directly available. Saved
 preparation contracts and `outcomes` tasks retain their recorded presentation and
 executable recovery; loading tools changes presentation, never authority.
+Source work edits a private candidate incrementally and submits its actual file
+hashes, rather than returning the whole project in one response. Drafts cannot
+execute or certify delivery. Existing-source edits retain their read and version
+checks; saved `work.v1` keeps its atomic source contract. Only an accounted,
+complete final reply can recover publication without another model request.
 Professional reader observations use the shared material receipt interface, so later
 work can reuse actual reads after permission, byte-version and range checks. Original
 review opinions retain their inspected versions; unavailable opinions remain diagnostics

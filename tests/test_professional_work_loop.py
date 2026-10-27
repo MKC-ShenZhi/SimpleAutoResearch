@@ -179,8 +179,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._create()
         self.assertEqual(self.app.state['config']['control_protocol'],'operations.v1')
         self.assertIsNone(self.app.writing)
-        self.assertEqual(self.app.state['config']['professional_operations'], 'work.v1')
-        self.assertEqual(self.app.implementation.source_owner_contract, 'source_owner.v1')
+        self.assertEqual(self.app.state['config']['professional_operations'], 'work.v2')
+        self.assertEqual(self.app.implementation.source_owner_contract, 'source_owner.v2')
         self.assertTrue(self.app.implementation.preparation_only)
         self.assertIsNotNone(self.app.operations.document)
         self.assertFalse({'professional_work','result_investigation','document_source_contract',
