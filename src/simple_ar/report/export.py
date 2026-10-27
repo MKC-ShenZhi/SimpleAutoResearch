@@ -111,12 +111,16 @@ def _nodes(value: Any):
             yield from _nodes(item)
 
 
-def _asset_path(root: Path, target: str) -> Path:
+def _asset_path(root: Path, target: str, *, resolve_image: Callable[[Path], Path] | None = None) -> Path:
     url = urlsplit(target)
-    if url.scheme or url.netloc or url.query or url.fragment:
+    # Native Windows drive paths are local paths, not URL schemes. Only the
+    # explicit authority resolver may admit them (including another drive).
+    native_absolute = resolve_image is not None and len(url.scheme) == 1 and Path(target).is_absolute()
+    if (url.scheme and not native_absolute) or url.netloc or url.query or url.fragment:
         raise ReportExportError(f"Export requires a local image inside the report directory: {target}")
-    path = (root / unquote(url.path)).resolve()
-    if not path.is_relative_to(root) or not path.is_file():
+    candidate = root / unquote(target if native_absolute else url.path)
+    path = resolve_image(candidate) if resolve_image is not None else candidate.resolve()
+    if (resolve_image is None and not path.is_relative_to(root)) or not path.is_file():
         raise ReportExportError(f"Missing or out-of-scope report image: {target}")
     if path.suffix.lower() not in {".svg", ".png", ".jpg", ".jpeg", ".pdf"}:
         raise ReportExportError(f"Unsupported report image format: {path.suffix}")
@@ -145,15 +149,20 @@ def missing_report_images(markdown: str, required: list[str]) -> list[str]:
 
 
 def _copy_image(source: Path, output: Path, index: int | str, *, convert_svg: bool = True,
-                runner: Callable | None = None) -> str:
+                runner: Callable | None = None,
+                validate_asset: Callable[[Path], str | None] | None = None) -> str:
     assets = output / "figures"
     assets.mkdir(exist_ok=True)
     target = assets / f"figure-{index}{source.suffix.lower()}"
-    shutil.copyfile(source, target)
+    digest = validate_asset(source) if validate_asset is not None else None
+    content = source.read_bytes()
+    if digest is not None and hashlib.sha256(content).hexdigest() != digest:
+        raise ReportExportError('Image input changed during copying')
+    target.write_bytes(content)
     if source.suffix.lower() == ".svg":
         # Framework figures are self-contained. Do not follow external image or
         # stylesheet references while converting a supplied SVG.
-        text = source.read_text(encoding="utf-8")
+        text = content.decode('utf-8')
         references = re.findall(r"url\(([^)]*)\)", text, re.I)
         if re.search(r"<!DOCTYPE[^>]*\[|<!ENTITY|@import|<\?xml-stylesheet", text, re.I) or any(
             not css.strip().strip("'\"").startswith("#") for css in references
@@ -552,6 +561,7 @@ def _scientific_unicode_preamble(*fragments: str) -> str:
 def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None = None,
                       compile_pdf: bool = False, render_preview: bool = False, body_name: str = "report_body.md",
                       runner: Callable | None = None, validate_asset: Callable[[Path], str | None] | None = None,
+                      resolve_image: Callable[[Path], Path] | None = None,
                       caption_owner: Literal['manifest', 'markdown'] = 'manifest',
                       template: dict[str, Any] | None = None,
                       citation_style: Literal['numeric', 'template'] | None = None,
@@ -563,6 +573,9 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
     model is called and no upstream evidence or session state is changed.
     Managed report consumers keep manifest captions by default; direct canonical
     workspace publication explicitly selects Markdown ownership.
+    Only an explicit image resolver can extend image authority; validate_asset
+    verifies bytes and never relaxes the default report-directory boundary.
+    Templates retain their separate manuscript-directory trust contract.
     Omitted citation_style retains historical rendering and manifest shape;
     'template' explicitly preserves layout defaults, 'numeric' selects bracketed
     natbib display and a numeric default bibliography style. Records/keys stay intact.
@@ -667,11 +680,27 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
     keys = set(re.findall(r"@\w+\s*\{\s*([^,\s]+)\s*,", bibliography))
     if citations - keys:
         raise ReportExportError("Unresolved bibliography keys: " + ", ".join(sorted(citations - keys)))
-    image_sources = {node["c"][-1][0]: _asset_path(root, node["c"][-1][0])
+    image_sources = {node["c"][-1][0]: _asset_path(root, node["c"][-1][0], resolve_image=resolve_image)
                      for node in _nodes([blocks, abstract]) if node.get("t") == "Image"}
+    variant_sources = {}
+    for url in image_sources:
+        variants = figure_variants.get(url, {})
+        if not isinstance(variants, dict):
+            raise ReportExportError("Recorded figure exports must be a format-to-path map.")
+        variant_sources[url] = {}
+        for format_name, target in variants.items():
+            if format_name not in {"png", "svg", "pdf", "jpg", "jpeg"} or not isinstance(target, str):
+                raise ReportExportError("Unsupported recorded figure export.")
+            asset = _asset_path(root, target, resolve_image=resolve_image)
+            if asset.suffix.lower().lstrip(".") != format_name:
+                raise ReportExportError("Recorded figure export format does not match its file.")
+            variant_sources[url][format_name] = asset
     if validate_asset is not None:
         for path in image_sources.values():
             validate_asset(path)
+        for variants in variant_sources.values():
+            for path in variants.values():
+                validate_asset(path)
     output.mkdir(parents=True)
     manifest: dict[str, Any] = {"schema_version": "report_export.v1", "format": "acmart-manuscript",
                                "source_report": str(body_path), "status": "exporting",
@@ -704,25 +733,16 @@ def export_acm_report(report_dir: Path, output_dir: Path, *, title: str | None =
             manifest['compliance'] = {'official_requirements': 'unverified', 'anonymity': 'unverified',
                 'page_limits': 'unverified', 'visual_layout': 'unverified',
                 'citation_keys': 'checked', 'markdown_image_paths': 'checked'}
-        image_targets = {url: _copy_image(path, output, index, runner=runner)
+        image_targets = {url: _copy_image(path, output, index, runner=runner, validate_asset=validate_asset)
                          for index, (url, path) in enumerate(image_sources.items(), start=1)}
         # The body may prefer a PNG preview while its registered figure has
         # editable vector exports. Preserve those variants without changing
         # the chosen display image or copying unrelated source directories.
         manifest["figure_exports"] = {}
         for index, url in enumerate(image_sources, start=1):
-            variants = figure_variants.get(url, {})
-            if not isinstance(variants, dict):
-                raise ReportExportError("Recorded figure exports must be a format-to-path map.")
-            for format_name, target in variants.items():
-                if format_name not in {"png", "svg", "pdf", "jpg", "jpeg"} or not isinstance(target, str):
-                    raise ReportExportError("Unsupported recorded figure export.")
-                source_asset = _asset_path(root, target)
-                if validate_asset is not None:
-                    validate_asset(source_asset)
-                if source_asset.suffix.lower().lstrip(".") != format_name:
-                    raise ReportExportError("Recorded figure export format does not match its file.")
-                copied = _copy_image(source_asset, output, f"{index}-source-{format_name}", convert_svg=False, runner=runner)
+            for format_name, source_asset in variant_sources[url].items():
+                copied = _copy_image(source_asset, output, f"{index}-source-{format_name}", convert_svg=False,
+                    runner=runner, validate_asset=validate_asset)
                 manifest["figure_exports"].setdefault(url, {})[format_name] = copied
         recorded_links = {node["c"][-1][0] for node in _nodes([blocks, abstract]) if node.get("t") == "Link"}
         copied_records = _copy_experiment_records(root, output) if recorded_links & {

@@ -1739,7 +1739,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
             outputs=['live/table.csv', 'live/summary.json', 'live/figure.png']),
             approve=lambda call, token: True)
         self._ok('run_process')
-        self._write('live/report.md', _BODY)
+        self._write('reports/report.md', _BODY.replace('(figure.png)', '(../live/figure.png)'))
         self._submit(_action('run_process', argv=['python', '-c',
             "from pathlib import Path; import shutil; p=Path('live/old output'); p.mkdir(); "
             "shutil.copyfile('live/figure.png',p/'unused.png'); shutil.copyfile('live/figure.png',p/'missing.png')"],
@@ -1752,14 +1752,20 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._ok('write_file')
         (self.root/'workspace/live/old output/missing.png').unlink()
         ledger_before = [row.to_dict() for row in self.app.ledger.entries]
-        exported = self._export('live/report.md')
+        arguments = {'markdown': 'reports/report.md', 'compile_pdf': False}
+        approved = self.app.operations.publication.approval_binding(arguments, identity='proof')
+        self.assertEqual(approved['image_binding_version'], 2)
+        self._write('reports/unrelated.png', 'Unrelated workspace bytes')
+        self.assertEqual(self.app.operations.publication.approval_binding(arguments, identity='proof'), approved)
+        exported = self._export('reports/report.md')
         self.assertEqual(exported['status'], 'ok', exported)
         manifest = exported['data']['manifest']
         self.assertEqual(set(manifest['consumed_inputs']), {
-            'report.md', 'references.bib', 'figures/figures_manifest.json', 'figure.png'})
+            'report.md', 'references.bib', 'figures/figures_manifest.json', '../live/figure.png'})
+        self.assertFalse((self.root/'workspace/reports/figure.png').exists())
         project = exported['data']['project']
-        self._inspect(['live/report.md'])
-        delivery = self._delivery('live/report.md', project)
+        self._inspect(['reports/report.md'])
+        delivery = self._delivery('reports/report.md', project)
         delivery['report']['formats'] = ['tex']
         self._submit(_action('deliver_result', **delivery))
         self._ok('deliver_result')
@@ -1767,26 +1773,26 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual([row.to_dict() for row in self.app.ledger.entries][:len(ledger_before)], ledger_before)
         identity = Path(project).name
         self._reload()
+        self.assertEqual(self.app.state['config']['publication_assets'], 'referenced.v2')
         ledger = self.app.ledger.to_dict()
         (self.root/'workspace/live/unrelated.svg').write_text('<svg/>')
-        cached = self.app.operations.publication.call('export_report',
-            {'markdown':'live/report.md', 'compile_pdf':False}, identity=identity)
+        with patch('simple_ar.tools.publication.export_acm_report') as renderer:
+            cached = self.app.operations.publication.call('export_report', arguments, identity=identity)
+            renderer.assert_not_called()
         self.assertEqual(cached.status, 'ok', cached.error)
         self.assertEqual(cached.data, exported['data'])
         self.assertEqual(self.app.ledger.to_dict(), ledger)
         script = self.root/'workspace/analyze.py'
         script_bytes = script.read_bytes()
         script.write_bytes(script_bytes+b'\n# Changed producer input\n')
-        stale = self.app.operations.publication.call('export_report',
-            {'markdown':'live/report.md', 'compile_pdf':False}, identity=identity)
+        stale = self.app.operations.publication.call('export_report', arguments, identity=identity)
         self.assertEqual(stale.status, 'error')
         self.assertIn('producer inputs/outputs changed', stale.error)
         script.write_bytes(script_bytes)
         # Actual consumed bytes still invalidate the receipt; stale unrelated
         # producers are not an excuse to weaken source/figure provenance.
         (self.root/'workspace/live/figure.png').write_bytes(b'changed consumed image')
-        rejected = self.app.operations.publication.call('export_report',
-            {'markdown':'live/report.md', 'compile_pdf':False}, identity=identity)
+        rejected = self.app.operations.publication.call('export_report', arguments, identity=identity)
         self.assertEqual(rejected.status, 'error')
         self.assertEqual(self.app.ledger.to_dict(), ledger)
 

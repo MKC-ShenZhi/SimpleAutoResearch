@@ -44,6 +44,112 @@ def _standalone_fixture(document: dict, output: Path) -> str:
 
 
 class ReportExportTests(unittest.TestCase):
+    def test_referenced_image_binding_uses_only_explicit_mounted_dependencies(self):
+        import os
+        from types import SimpleNamespace
+        from simple_ar.report.export import _asset_path
+        from simple_ar.tools.publication import ExportRequest, PublicationToolGateway, PUBLICATION_ASSET_PROTOCOL
+        from simple_ar.tools.workspace import WorkspaceToolGateway
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'task'
+            root.mkdir()
+            granted = Path(tmp) / 'granted'
+            granted.mkdir()
+            (granted / 'external.pdf').write_bytes(b'granted figure')
+            forbidden = Path(tmp) / 'forbidden.pdf'
+            forbidden.write_bytes(b'not granted')
+            workspace = WorkspaceToolGateway(root, {'materials': granted}, None)
+            reports = workspace.workspace / 'reports'
+            reports.mkdir()
+            outputs = workspace.workspace / 'outputs'
+            outputs.mkdir()
+            image = outputs / 'figure.pdf'
+            image.write_bytes(b'approved figure')
+            (outputs / 'figure.svg').write_bytes(b'<svg/>')
+            (reports / 'figures').mkdir()
+            (reports / 'figures/figures_manifest.json').write_text(json.dumps({'figures': [
+                {'path': '../outputs/figure.pdf', 'exports': {'svg': '../outputs/figure.svg'}},
+                {'path': 'unused.png', 'exports': {'pdf': str(forbidden)}}]}), encoding='utf-8')
+            source = reports / 'report.md'
+            source.write_text('![Plot][plot]\n\n[plot]: ../outputs/figure.pdf\n'
+                '\n```markdown\n![](https://example.org/unused.png)\n```\n', encoding='utf-8')
+            arguments = {'markdown': 'reports/report.md', 'compile_pdf': False}
+            gateway = PublicationToolGateway(root, workspace, None, owned_execution=True,
+                asset_protocol=PUBLICATION_ASSET_PROTOCOL)
+            approved = gateway.approval_binding(arguments, identity='export')
+            self.assertEqual(approved['image_binding_version'], 2)
+            self.assertEqual(set(approved['inputs']), {'report.md', 'references.bib',
+                'figures/figures_manifest.json', '../outputs/figure.pdf', '../outputs/figure.svg'})
+            (reports / 'unrelated.png').write_bytes(b'unrelated')
+            (outputs / 'unrelated.pdf').write_bytes(b'unrelated')
+            self.assertEqual(gateway.approval_binding(arguments, identity='export'), approved)
+            historical = PublicationToolGateway(root, workspace, None).approval_binding(arguments, identity='old')
+            self.assertEqual(historical['image_binding_version'], 1)
+            self.assertIn('unrelated.png', historical['inputs'])
+            self.assertNotIn('../outputs/figure.pdf', historical['inputs'])
+            self.assertEqual(gateway.input_binding(source, ExportRequest.model_validate(arguments),
+                saved=historical), historical)
+            image.write_bytes(b'changed figure')
+            context = SimpleNamespace(attempt=SimpleNamespace(attempt_id='export'))
+            with patch('simple_ar.tools.publication.export_acm_report') as renderer:
+                result = gateway.execute_tool('export_report', context, arguments,
+                    approval={'binding': approved})
+                self.assertEqual(result.status, 'blocked')
+                renderer.assert_not_called()
+
+            external = Path(os.path.relpath(granted / 'external.pdf', reports)).as_posix()
+            source.write_text(f'![]({external})\n', encoding='utf-8')
+            self.assertIn(external, gateway.approval_binding(arguments, identity='external')['inputs'])
+            source.write_text(f'![](<{(granted / "external.pdf").as_posix()}>)\n', encoding='utf-8')
+            self.assertIn(external, gateway.approval_binding(arguments, identity='absolute')['inputs'])
+            private = outputs / '.env-secret.png'
+            private.write_bytes(b'private')
+            for target in ('../outputs/.env-secret.png', '../outputs/.env-secret.png/../figure.pdf',
+                           Path(os.path.relpath(forbidden, reports)).as_posix(),
+                           'https://example.org/figure.png', '//example.org/figure.png'):
+                with self.subTest(target=target):
+                    source.write_text(f'![]({target})\n', encoding='utf-8')
+                    with self.assertRaises(ValueError):
+                        gateway.approval_binding(arguments, identity='forbidden')
+            link = outputs / 'linked.pdf'
+            try:
+                link.symlink_to(forbidden)
+            except (OSError, NotImplementedError):
+                pass  # Windows may require explicit symlink privileges.
+            else:
+                source.write_text('![](../outputs/linked.pdf)\n', encoding='utf-8')
+                with self.assertRaisesRegex(ValueError, 'Symlink'):
+                    gateway.approval_binding(arguments, identity='link')
+            with self.assertRaisesRegex(ReportExportError, 'out-of-scope'):
+                _asset_path(reports, '../outputs/figure.pdf')
+
+    def test_validation_callback_cannot_expand_default_renderer_image_scope(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = self._source(root)
+            (root / 'outside.png').write_bytes(b'outside')
+            document = _ast(image='../outside.png')
+            with patch('simple_ar.report.export.shutil.which', return_value='pandoc'), \
+                    patch('simple_ar.report.export._run', return_value=json.dumps(document)), \
+                    patch('simple_ar.report.export._copy_image') as copier:
+                with self.assertRaisesRegex(ReportExportError, 'out-of-scope'):
+                    export_acm_report(source, root / 'export', validate_asset=lambda path: None)
+                copier.assert_not_called()
+
+    def test_image_copy_rejects_bytes_changed_after_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / 'figure.png'
+            source.write_bytes(b'approved image')
+            digest = hashlib.sha256(source.read_bytes()).hexdigest()
+            def validate(path):
+                path.write_bytes(b'changed after validation')
+                return digest
+            with self.assertRaisesRegex(ReportExportError, 'changed during copying'):
+                _copy_image(source, root, 1, validate_asset=validate)
+            self.assertFalse((root / 'figures/figure-1.png').exists())
+
     def test_explicit_template_uses_bound_publication_owner_and_retains_failed_versions(self):
         from types import SimpleNamespace
         from simple_ar.core.budget import BudgetLedger, BudgetUnknownError
@@ -92,11 +198,12 @@ class ReportExportTests(unittest.TestCase):
                 schema['properties']['citation_style']['anyOf'])
             # Exercise the actual native approval consumer, using the old
             # serialized input shape as the expected pre-feature hash.
-            app = SimpleNamespace(workspace=workspace, gateway=SimpleNamespace(session_owner=lambda name: None))
+            gateway = PublicationToolGateway(root, workspace, ledger)
+            app = SimpleNamespace(workspace=workspace, publication=gateway,
+                gateway=SimpleNamespace(session_owner=lambda name: None))
             call = {'function': {'name': 'export_report', 'arguments': json.dumps(arguments)}}
             old_token = hashlib.sha256(json.dumps({'call': call, 'inputs': approved}, sort_keys=True).encode()).hexdigest()
             self.assertEqual(ToolApplication.approval_token(app, call), old_token)
-            gateway = PublicationToolGateway(root, workspace, ledger)
             standalone = []
             failure = False
             check_mode = 'pass'

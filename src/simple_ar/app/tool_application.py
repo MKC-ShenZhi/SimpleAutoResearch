@@ -37,7 +37,8 @@ from simple_ar.tools.materials import (
 from simple_ar.tools.sources import SourcePolicy, SourceToolGateway, source_tool_specs
 from simple_ar.tools.visual import VisualToolGateway, visual_tool_specs
 from simple_ar.tools.images import ImageToolGateway, image_tool_specs
-from simple_ar.tools.publication import PublicationToolGateway, publication_tool_specs, ExportRequest, export_input_binding
+from simple_ar.tools.publication import (PublicationToolGateway, publication_tool_specs, ExportRequest,
+    PUBLICATION_ASSET_PROTOCOL)
 from simple_ar.tools.writing import BOUND_REPORT_REVISION, DocumentWorkRequest, ProfessionalReview, WritingToolGateway, writing_tool_specs
 from simple_ar.tools.implementation import ExactCodeTask, ImplementationWorkRequest, ImplementationToolGateway, implementation_tool_specs
 from simple_ar.tools.analysis import AnalysisToolGateway, analysis_tool_specs
@@ -479,6 +480,8 @@ class ToolApplication:
             raise ValueError('Unknown saved tool-contract mode; do not silently change historical tasks')
         if config.get('report_protocol') not in {None, _REPORT_PROTOCOL}:
             raise ValueError('Unknown saved report protocol; preserve its original contract')
+        if config.get('publication_assets') not in {None, PUBLICATION_ASSET_PROTOCOL}:
+            raise ValueError('Unknown saved publication asset protocol; preserve its original contract')
         if config.get('context_protocol') not in {None, 'conversation.v1'}:
             raise ValueError('Unknown saved context protocol; preserve its original contract')
         if config.get('input_contract') not in {None, _DECLARED_INPUTS}:
@@ -597,6 +600,7 @@ class ToolApplication:
         if publication_contract not in {None, 'bound_candidate.v1'}:
             raise ValueError('Unsupported publication preparation contract')
         self.publication = PublicationToolGateway(controller.store.root, self.workspace, self.ledger,
+            asset_protocol=config.get('publication_assets'),
             candidate_source=self.writing.preparation_source,
             owned_execution=publication_contract == 'bound_candidate.v1',
             report_source=(lambda path: self.writing.publication_source(path,
@@ -1579,6 +1583,7 @@ class ToolApplication:
             profile.resolve_proxy()
             remember_catalog('image')
         config = {"model": model, "tool_contracts": tool_contracts,
+            "publication_assets": PUBLICATION_ASSET_PROTOCOL,
             "model_connection": client.connection_binding() if named_client else None,
             "vision_connection": vision_connection,
             "project_python": str(project_python) if project_python else None,
@@ -1850,7 +1855,7 @@ class ToolApplication:
             # their original closing obligation. Absent historical fields stay
             # absent unless explicitly supplied, including unrelated supplies.
             for field in ('completion_policy', 'tool_contracts', 'report_protocol', 'tool_completions', 'inspection_protocol',
-                          'delivery_review_protocol',
+                          'delivery_review_protocol', 'publication_assets',
                           'document_source_contract', 'source_generation_protocol', 'source_decision_protocol'):
                 if field not in supplied:
                     if field in old:
@@ -4363,8 +4368,7 @@ class ToolApplication:
             request = ExportRequest.model_validate(json.loads(call["function"]["arguments"]))
             source = self.workspace.resolve(request.markdown, write=True)
             return hashlib.sha256(json.dumps({"call": call,
-                "inputs": export_input_binding(source, request,
-                    output_root=self.workspace.workspace / "publications")}, sort_keys=True).encode()).hexdigest()
+                "inputs": self.publication.input_binding(source, request)}, sort_keys=True).encode()).hexdigest()
         # Pin the effective command/environment and directly mentioned text files.
         arguments = validate_workspace_arguments("run_process",
             json.loads(call["function"]["arguments"])).model_dump()

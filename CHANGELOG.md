@@ -16,6 +16,7 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 
 ### Fixed
 
+- New native publication accepts referenced figures across authorized directories without manual source copying. Approval, rendering and recovery bind the same consumed bytes; standalone conversion and historical scopes remain unchanged.
 - Interrupted publication recovery reads retained review receipts without dispatching a new inspection. Full delivery reviews bind versions and scope, retain failed opinions, and protect capacity for a subsequent decision to handle the result.
 - Validate actual output and publication readiness before paid delivery review. Replacing an unused co-output no longer invalidates another current output; changed consumed inputs, failed producers and strict historical recovery remain checked.
 - Complete project reuse follows recorded byte versions through copies and edits. Later successful outputs cannot clear an earlier copied version's failure or stale inputs; retired intermediate directories need not remain intact. This does not certify copied code or inherit execution authority.

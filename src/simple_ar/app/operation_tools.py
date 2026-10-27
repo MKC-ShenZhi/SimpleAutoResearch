@@ -106,7 +106,8 @@ class OperationTools:
             client_factory=(lambda identity:client_factory(identity, 'task')) if config['model'] is not None else None,
             registry=search_registry)
         self.registry.register_package(source_tool_specs(), self.sources)
-        self.publication = PublicationToolGateway(root, self.workspace, ledger)
+        self.publication = PublicationToolGateway(root, self.workspace, ledger,
+            asset_protocol=config.get('publication_assets'))
         self.registry.register_package(publication_tool_specs(preparation=False), self.publication)
         self.inspection = InspectionToolGateway(root, self.workspace,
             client_factory=lambda identity:client_factory(identity, 'writing'),

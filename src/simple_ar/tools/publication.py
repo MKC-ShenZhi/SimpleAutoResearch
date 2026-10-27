@@ -14,9 +14,30 @@ from simple_ar.core.budget import BudgetError
 from simple_ar.core.capabilities import ArtifactStore
 from simple_ar.core.process import ProcessSpec, run_process
 from simple_ar.report.export import (ReportExportError, ReportExportResourceError, export_acm_report,
-    publication_template_inputs, validate_publication_checks)
+    _asset_path, publication_template_inputs, report_image_targets, validate_publication_checks)
 from simple_ar.tools.specs import CommonToolSpec, ToolResult
-from simple_ar.tools.workspace import DeliveryRequest, resolve_mounted_path
+from simple_ar.tools.workspace import DeliveryRequest, _private_name, resolve_mounted_path
+
+
+PUBLICATION_ASSET_PROTOCOL = 'referenced.v2'
+
+
+def _authorized_image(workspace: Any, path: Path) -> Path:
+    """Normalize authored relative paths without erasing forbidden lexical hops."""
+    if any(_private_name(part) for part in path.parts if part not in {'.', '..'}):
+        raise ValueError('Private/runtime publication images are not supported')
+    if any(parent.is_symlink() or parent.is_junction() for parent in (path, *path.parents)):
+        raise ValueError('Symlink publication images are not supported')
+    return workspace.resolve(os.path.abspath(path))
+
+
+def _input_key(root: Path, path: Path) -> str:
+    # An explicit source grant can live on another drive. Absolute keys still
+    # compose with Path / key and never create a new authority grant.
+    try:
+        return Path(os.path.relpath(path, root)).as_posix()
+    except ValueError:
+        return path.as_posix()
 
 
 class PublicationTemplate(BaseModel):
@@ -47,7 +68,7 @@ class PublicationChecks(BaseModel):
 
 class PublicationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    markdown: str = Field(description="Workspace Markdown file; local figures and references.bib use its directory.")
+    markdown: str = Field(description="Workspace Markdown file. Local image paths are relative to it; modern tasks authorize referenced images through existing workspace/source grants. references.bib and trusted templates retain manuscript-directory scope.")
     title: str = Field(default="", max_length=500)
     compile_pdf: bool = True
     citation_style: Literal['numeric', 'template'] | None = Field(default=None,
@@ -90,7 +111,8 @@ def publication_tool_specs(*, preparation: bool = True) -> list[CommonToolSpec]:
 
 
 def export_input_binding(source: Path, request: ExportRequest, *, output_root: Path | None = None,
-                         include_images: bool = True, image_paths: list[str] | None = None) -> dict[str, Any]:
+                         include_images: bool = True, image_paths: list[str] | None = None,
+                         image_binding_version: int = 1, workspace: Any = None) -> dict[str, Any]:
     """Pin authoring inputs once for approval and export recovery, without secrets."""
     root = source.parent.resolve()
     inputs = {}
@@ -111,6 +133,40 @@ def export_input_binding(source: Path, request: ExportRequest, *, output_root: P
                 inputs[authorized.relative_to(root).as_posix()] = hashlib.file_digest(file, 'sha256').hexdigest()
     if not include_images:
         return {**request.model_dump(exclude_none=True), 'inputs': inputs}
+    if image_binding_version not in {1, 2}:
+        raise ValueError('Unsupported publication image binding version; preserve the receipt')
+    if image_binding_version == 2:
+        if workspace is None:
+            raise ValueError('Referenced publication images require workspace authority')
+        targets = report_image_targets(source.read_text(encoding='utf-8'))
+        manifest_path = root / 'figures/figures_manifest.json'
+        variants = {}
+        if manifest_path.is_file():
+            for row in json.loads(manifest_path.read_bytes()).get('figures', []):
+                if row.get('exports'):
+                    variants[row['path']] = row['exports']
+        referenced = list(targets)
+        for target in targets:
+            exports = variants.get(target, {})
+            if not isinstance(exports, dict):
+                raise ValueError('Recorded figure exports must be a format-to-path map')
+            for format_name, variant in exports.items():
+                if format_name not in {'png', 'svg', 'pdf', 'jpg', 'jpeg'} or not isinstance(variant, str):
+                    raise ValueError('Unsupported recorded figure export')
+                referenced.append(variant)
+        total = 0
+        if len(referenced) > 4096:
+            raise ValueError('Publication image input count exceeds 4096')
+        for target in dict.fromkeys(referenced):
+            path = _asset_path(root, target, resolve_image=lambda path: _authorized_image(workspace, path))
+            if output_root is not None and path.is_relative_to(output_root.resolve()):
+                raise ValueError('Derived publication files cannot supply authoring images')
+            total += path.stat().st_size
+            if total > 256_000_000:
+                raise ValueError('Publication image inputs exceed 256 MB')
+            with path.open('rb') as file:
+                inputs[_input_key(root, path)] = hashlib.file_digest(file, 'sha256').hexdigest()
+        return {**request.model_dump(exclude_none=True), 'inputs': inputs, 'image_binding_version': 2}
     if image_paths is not None:
         # Recovery checks the renderer's retained dependencies. New approvals
         # still inventory potential images; existing publications do not depend
@@ -205,10 +261,21 @@ class PublicationToolGateway:
     def __init__(self, root: Path, workspace: Any, ledger: Any, *,
                  report_source: Callable[[str], dict | None] | None = None,
                  candidate_source: Callable[[str, str], dict] | None = None,
-                 owned_execution: bool = False) -> None:
+                 owned_execution: bool = False, asset_protocol: str | None = None) -> None:
+        if asset_protocol not in {None, PUBLICATION_ASSET_PROTOCOL}:
+            raise ValueError('Unsupported publication asset protocol')
         self.root, self.workspace, self.ledger = root, workspace, ledger
         self.report_source = report_source
         self.candidate_source, self.owned_execution = candidate_source, owned_execution
+        self.asset_protocol = asset_protocol
+
+    def input_binding(self, source: Path, request: ExportRequest, *, saved: dict | None = None,
+                      include_images: bool = True, image_paths: list[str] | None = None) -> dict:
+        version = (saved.get('image_binding_version', 1) if saved is not None else
+            2 if self.asset_protocol == PUBLICATION_ASSET_PROTOCOL else 1)
+        return export_input_binding(source, request, output_root=self.workspace.workspace / 'publications',
+            include_images=include_images, image_paths=image_paths,
+            image_binding_version=version, workspace=self.workspace)
 
     def _source_identity(self, request: ExportRequest) -> dict | None:
         if request.candidate_result:
@@ -227,11 +294,10 @@ class PublicationToolGateway:
         return source
 
     def approval_binding(self, arguments: dict, *, identity: str,
-                         image_paths: list[str] | None = None) -> dict:
+                         image_paths: list[str] | None = None, saved: dict | None = None) -> dict:
         request = ExportRequest.model_validate(arguments)
         source = self.workspace.resolve(request.markdown, write=True)
-        binding = export_input_binding(source, request,
-            output_root=self.workspace.workspace / 'publications', image_paths=image_paths)
+        binding = self.input_binding(source, request, saved=saved, image_paths=image_paths)
         if request.candidate_result:
             binding['report_identity'] = self._source_identity(request)
         return binding
@@ -261,11 +327,12 @@ class PublicationToolGateway:
             if key not in {'inputs', 'image_binding_version', 'output_binding_version', 'report_identity'}}
         manifest = ArtifactStore(self.workspace.resolve(data['project'])).read_json('export.json')
         binding = self.approval_binding(request, identity=relative.parts[0],
+            saved=saved,
             image_paths=list(manifest['consumed_inputs']) if 'consumed_inputs' in manifest else None)
         inputs = _publication_inputs(self.workspace.resolve(saved['markdown']),
             ExportRequest.model_validate(request), saved, manifest, binding,
             output_root=self.workspace.workspace / 'publications')
-        self.workspace.check_artifact_producers(str(self.workspace.resolve(saved['markdown']).parent/key)
+        self.workspace.check_artifact_producers(os.path.abspath(self.workspace.resolve(saved['markdown']).parent/key)
             for key, digest in inputs.items() if digest is not None)
         if ({**binding, 'inputs': inputs} != {key: value for key, value in saved.items()
                 if key != 'output_binding_version'} | {'inputs': inputs}):
@@ -348,12 +415,11 @@ class PublicationToolGateway:
                     raise ValueError('Publication project or owner evidence changed')
                 request = ExportRequest.model_validate({key: value for key, value in saved.items()
                     if key not in {'inputs', 'image_binding_version', 'output_binding_version', 'report_identity'}})
-                current = export_input_binding(self.workspace.resolve(saved['markdown']), request,
-                    output_root=self.workspace.workspace / 'publications',
+                current = self.input_binding(self.workspace.resolve(saved['markdown']), request, saved=saved,
                     image_paths=list(data['manifest']['consumed_inputs']) if 'consumed_inputs' in data['manifest'] else None)
                 inputs = _publication_inputs(self.workspace.resolve(saved['markdown']), request,
                     saved, data['manifest'], current, output_root=self.workspace.workspace / 'publications')
-                self.workspace.check_artifact_producers(str(self.workspace.resolve(saved['markdown']).parent / key)
+                self.workspace.check_artifact_producers(os.path.abspath(self.workspace.resolve(saved['markdown']).parent / key)
                     for key, digest in inputs.items() if digest is not None)
                 if 'pdf' in formats and data['manifest'].get('compiled') is not True:
                     continue
@@ -390,7 +456,7 @@ class PublicationToolGateway:
             owner = ArtifactStore(self.root / "tools" / "publications" / identity)
             saved = owner.read_json('request.json') if owner.exists('request.json') else None
             retained_manifest = ArtifactStore(output).read_json('export.json') if saved is not None and (output/'export.json').is_file() else {}
-            binding = export_input_binding(source, request, output_root=self.workspace.workspace / 'publications',
+            binding = self.input_binding(source, request, saved=saved,
                 include_images=saved is None or 'image_binding_version' in saved,
                 image_paths=list(retained_manifest['consumed_inputs']) if 'consumed_inputs' in retained_manifest else None)
             consumed = (retained_manifest.get('consumed_inputs') if saved is not None else
@@ -400,7 +466,7 @@ class PublicationToolGateway:
                 consumed = _publication_inputs(source, request, saved, retained_manifest, binding,
                     output_root=self.workspace.workspace / 'publications')
             producer_cache = {}
-            self.workspace.check_artifact_producers((str(source.parent / key)
+            self.workspace.check_artifact_producers((os.path.abspath(source.parent / key)
                 for key, digest in (consumed if consumed is not None else binding['inputs']).items()
                 if digest is not None), cache=producer_cache)
             report_identity = self._source_identity(request)
@@ -441,6 +507,8 @@ class PublicationToolGateway:
                     for key, digest in binding['inputs'].items():
                         if digest is None:
                             continue
+                        if binding.get('image_binding_version') == 2 and (Path(key).is_absolute() or '..' in Path(key).parts):
+                            continue  # Images retain their explicit original workspace authority.
                         raw = (source.parent / key).read_bytes()
                         if hashlib.sha256(raw).hexdigest() != digest:
                             raise ValueError('Candidate input changed while preparing publication')
@@ -504,7 +572,7 @@ class PublicationToolGateway:
                     return (logs / "stdout.log").read_text(encoding="utf-8", errors="replace")
 
                 def validate_asset(path):
-                    if request.candidate_result:
+                    if request.candidate_result and path.is_relative_to(render_source.parent):
                         if not path.resolve().is_relative_to(render_source.parent.resolve()):
                             raise ReportExportError('Prepared asset escapes its bound source directory')
                         digest = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -516,7 +584,7 @@ class PublicationToolGateway:
                         return digest
                     authorized = self.workspace.resolve(str(path))
                     self.workspace.check_artifact_producers([str(authorized)], cache=producer_cache)
-                    key = authorized.relative_to(source.parent).as_posix()
+                    key = _input_key(source.parent, authorized)
                     with authorized.open('rb') as file:
                         digest = hashlib.file_digest(file, 'sha256').hexdigest()
                     if binding['inputs'].get(key) != digest:
@@ -525,11 +593,21 @@ class PublicationToolGateway:
                         consumed[key] = digest
                     return digest
 
+                def resolve_image(path):
+                    # Candidate staging owns body/template bytes, while images
+                    # retain the original manuscript's explicit path authority.
+                    # Preserve lexical hops until the authority helper sees them.
+                    if request.candidate_result and path.is_relative_to(render_source.parent):
+                        path = source.parent / path.relative_to(render_source.parent)
+                    return _authorized_image(self.workspace, path)
+
                 try:
                     manifest = export_acm_report(render_source.parent, output, title=request.title or None,
                         body_name=source.name, compile_pdf=request.compile_pdf, render_preview=request.render_preview, runner=render,
                         preflight=preflight,
                         validate_asset=validate_asset,
+                        **({'resolve_image': resolve_image}
+                           if binding.get('image_binding_version') == 2 else {}),
                         caption_owner=(report_identity or {}).get('figure_caption_owner', 'markdown'),
                         **({'citation_style': request.citation_style} if request.citation_style is not None else {}),
                         **({'checks': request.checks.model_dump(exclude_none=True)} if request.checks is not None else {}),
@@ -554,11 +632,11 @@ class PublicationToolGateway:
                     changed = sorted(key for key in set(before) | set(after) if before.get(key) != after.get(key))
                     raise ValueError('Publication differs from the independently inspected candidate in '
                         + ', '.join(changed) + '; retain both without delivery')
-            self.workspace.check_artifact_producers((str(source.parent / key)
+            self.workspace.check_artifact_producers((os.path.abspath(source.parent / key)
                 for key, digest in (consumed if consumed is not None else binding['inputs']).items()
                 if digest is not None), cache=producer_cache, refresh=True)
             if saved is None or self.report_source is not None or request.candidate_result:
-                current = export_input_binding(source, request, output_root=self.workspace.workspace / 'publications',
+                current = self.input_binding(source, request, saved=binding,
                     image_paths=list(consumed) if consumed is not None else None)
                 _publication_inputs(source, request, binding,
                     {'consumed_inputs': consumed} if consumed is not None else {}, current,
