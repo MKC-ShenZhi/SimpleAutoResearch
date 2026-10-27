@@ -40,7 +40,7 @@ def select_working_context(
     summarized_through_turn: int = 0,
     history_access: str = 'read_history',
     trailing_messages: Sequence[Mapping[str, Any]] = (),
-    material_policy: Literal['ranked', 'referenced', 'scoped'] = 'ranked',
+    material_policy: Literal['ranked', 'referenced', 'scoped', 'retained'] = 'ranked',
     operation_history: Sequence[Mapping[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Return messages and decision-budget metadata without modifying inputs.
@@ -72,13 +72,22 @@ def select_working_context(
     with another receipt, including repeated reads, versions and failures.
     Every requested record has model-visible supply status, including missing
     records and all windows of a partially supplied record.
+
+    ``retained`` independently considers supplied historical observations with
+    matching file versions and historical operation results, without requiring
+    a note or explicit reference. It keeps whole recorded bodies and admits
+    them before optional navigation under the same input target. The caller's
+    historical_observation role is a provenance claim: a matching file digest
+    does not itself establish that the recorded text is an actual read window.
     """
     if schema_tokens < 0 or context_token_target < 0:
         raise ValueError('Token costs and target must be nonnegative')
-    if material_policy not in ('ranked', 'referenced', 'scoped'):
+    if material_policy not in ('ranked', 'referenced', 'scoped', 'retained'):
         raise ValueError('Unknown working context selection policy')
     scoped_records = material_policy == 'scoped'
+    retained_records = material_policy == 'retained'
     owner_records = material_policy in {'referenced', 'scoped'}
+    whole_records = owner_records or retained_records
     context = deepcopy(dict(base_context))
     if 'working_view' in context:
         raise ValueError('base_context reserves working_view for this selector')
@@ -94,7 +103,7 @@ def select_working_context(
         raise ValueError('Trailing instructions must be user/system text messages')
     if type(summarized_through_turn) is not int or not 0 <= summarized_through_turn <= len(blocks):
         raise ValueError('Summary coverage must be within the original journal')
-    if owner_records:
+    if whole_records:
         summarized_through_turn = 0
     # Only a usable note snapshot can replace repeated historical presentation.
     # This retires model input, never observations, required findings or sources.
@@ -167,8 +176,11 @@ def select_working_context(
     explicit_references = set(selected_records)
     references = set(explicit_references)
     for note in notes:
-        if owner_records or active(note):
+        if whole_records or active(note):
             references.update(note.get('records') or [])
+    # Under retained, note records can guide priority without turning every
+    # optional note reference into mandatory model-visible bookkeeping.
+    reported_references = explicit_references if retained_records else references
     artifacts = set(current_artifacts)
     query = ('' if owner_records else ' '.join(user_requests) + ' ' + ' '.join(
         str(note.get('text', '')) for note in notes if active(note)))
@@ -201,7 +213,17 @@ def select_working_context(
         digest = row.get('sha256')
         version = ('historical' if row.get('kind') == 'operation_result' else
                    'stale' if row.get('current') is False or row.get('status') == 'stale' else 'unchecked')
-        if version != 'historical' and version_resolver is not None and isinstance(path, str):
+        if retained_records and version not in {'historical', 'stale'}:
+            if (version_resolver is None or not isinstance(path, str) or not path
+                    or not isinstance(digest, str) or not digest):
+                version = 'unknown'
+            else:
+                if path not in versions:
+                    versions[path] = version_resolver(path)
+                current = versions[path]
+                version = ('unknown' if not isinstance(current, str) or not current else
+                           'matching' if current == digest else 'stale')
+        elif not retained_records and version != 'historical' and version_resolver is not None and isinstance(path, str):
             if path not in versions:
                 versions[path] = version_resolver(path)
             current = versions[path]
@@ -230,6 +252,10 @@ def select_working_context(
         'observations': [], 'notes': deepcopy(notes) if owner_records or summarized_through_turn else [],
         'history': {},
     }
+    if retained_records:
+        view['scope'] += (' Archived original text requires a supplied historical_observation role '
+                          'and matching file digest; authored payloads are not read observations. '
+                          'The role and text/range provenance are supplied by the caller, not verified here.')
     context['working_view'] = view
     if operation_history is not None:
         view['operation_overview'] = {
@@ -248,11 +274,14 @@ def select_working_context(
                      'columns/rows for groups and observation_columns for each observation schema '
                      'and values; otherwise read the equivalent list of groups.',
         }
+        if retained_records:
+            view['operation_overview']['scope'] += (
+                ' Entries in retained native turns are already supplied there and are not repeated here.')
 
     reference_indices: dict[str, list[int]] = {}
-    if owner_records:
+    if whole_records:
         for i, row in enumerate(rows):
-            if row.get('record') in references:
+            if row.get('record') in reported_references:
                 reference_indices.setdefault(row['record'], []).append(i)
 
     def mark_native() -> None:
@@ -273,10 +302,13 @@ def select_working_context(
                 state['status'] = 'stale'
             elif scoped_records and row.get('record') not in references:
                 state['status'] = 'unreferenced'
-            elif scoped_records and state['version_status'] not in {'matching', 'historical'}:
+            elif (scoped_records or retained_records) and state['version_status'] not in {'matching', 'historical'}:
+                state['status'] = 'unavailable'
+            elif (retained_records and state['version_status'] != 'historical'
+                  and row.get('role') != 'historical_observation'):
                 state['status'] = 'unavailable'
             else:
-                state['status'] = 'not_attempted' if scoped_records else 'capacity'
+                state['status'] = 'not_attempted' if scoped_records or retained_records else 'capacity'
         view['stale_native_observations'] = [state['source'] for state in states
             if state['status'] == 'native' and state['version_status'] == 'stale']
         start = recent[0] if recent and any(blocks[:recent[0]]) else 0
@@ -317,12 +349,15 @@ def select_working_context(
             'omitted':[{'record':state['source'].get('record'),'status':state['status']}
                 for state in states if state['status'] not in {'native','working_view'}][-16:],
             'scope':'Selected exact observations; archival receipts remain available through '+history_access+'.'}
-        if owner_records:
+        if retained_records:
+            context['material_supply']['scope'] += (
+                ' References report explicitly selected records; optional note records can guide priority.')
+        if whole_records:
             # Required bookkeeping is never clipped to the recent omissions.
             # Keep per-window states: one supplied window cannot hide a gap in
             # another window belonging to the same referenced receipt.
             context['material_supply']['references'] = [
-                entry for record in sorted(references)
+                entry for record in sorted(reported_references)
                 for entry in ([{'record': record, 'status': states[i]['status'],
                                 'version_status': states[i]['version_status'],
                                 'source': states[i]['source']}
@@ -357,7 +392,7 @@ def select_working_context(
         mark_native()
     _, required_cost = project()
     # Keep a bounded evidence share beside fresh work.
-    material_ceiling = (context_token_target if owner_records else
+    material_ceiling = (context_token_target if whole_records else
                         min(context_token_target, required_cost + context_token_target // 3))
     note_states = [{'index': i, 'records': deepcopy(note.get('records', [])),
                     'status': 'working_view' if owner_records or summarized_through_turn else 'capacity',
@@ -376,22 +411,22 @@ def select_working_context(
 
     def admit(i: int) -> None:
         state = states[i]
-        if state['status'] != ('not_attempted' if scoped_records else 'capacity'):
+        if state['status'] != ('not_attempted' if scoped_records or retained_records else 'capacity'):
             return
         if keys[i] in represented:
             state['status'] = 'duplicate'
             return
         supplied = deepcopy(rows[i])
-        if owner_records:
+        if whole_records:
             state['status'] = 'working_view'
         # Wrap selector metadata so no supplied field or claim is overwritten.
         view['observations'].append({'observation': supplied,
                                      'version_status': state['version_status']})
         if project()[1] > material_ceiling:
             view['observations'].pop()
-            if owner_records:
+            if whole_records:
                 state['status'] = 'capacity'
-            if owner_records or supplied.get('kind') == 'operation_result':
+            if whole_records or supplied.get('kind') == 'operation_result':
                 return  # Explicit originals and serialized results stay whole.
             from simple_ar.research.contracts import TextChunk
             from simple_ar.research.store.retrieval import source_chunk_views
@@ -424,35 +459,57 @@ def select_working_context(
 
     def admit_navigation() -> None:
         for i in sorted(range(len(operations)), key=operation_priority, reverse=True):
+            if retained_records and operations[i].get('turn') in recent:
+                continue  # Its native block is already present in the input.
             operation_indices.append(i)
             if project()[1] > context_token_target:
                 operation_indices.pop()  # Never excerpt a serialized operation.
 
-    if not scoped_records:
+    if not scoped_records and not retained_records:
         admit_navigation()
 
-    ordered = ([i for i, row in enumerate(rows) if row.get('record') in references]
-               if owner_records else sorted(range(len(rows)), key=priority, reverse=True))
+    if retained_records:
+        # Explicit references and current objects precede the rest; original
+        # text precedes historical operations within each priority group.
+        ordered = sorted(range(len(rows)), key=lambda i: (
+            int(rows[i].get('record') in references or rows[i].get('path') in artifacts
+                or rows[i].get('absolute_path') in artifacts),
+            int(rows[i].get('kind') != 'operation_result'), *priority(i)), reverse=True)
+    else:
+        ordered = ([i for i, row in enumerate(rows) if row.get('record') in references]
+                   if owner_records else sorted(range(len(rows)), key=priority, reverse=True))
     preferred = {i for i in ordered if rows[i].get('record') in references
                  or rows[i].get('path') in artifacts or rows[i].get('absolute_path') in artifacts
                  or rows[i].get('kind') == 'operation_result'}
     # A summary that replaces historical presentation is mandatory context.
     # Optional note admission cannot hide both its history and the notes.
-    for i in ([] if owner_records or summarized_through_turn else sorted(range(len(notes)), key=lambda i: (not active(notes[i]), i))):
-        view['notes'].append(deepcopy(notes[i]))
-        if project()[1] > material_ceiling:
-            view['notes'].pop()
-        else:
-            note_states[i]['status'] = 'working_view'
+    def admit_notes() -> None:
+        for i in sorted(range(len(notes)), key=lambda i: (not active(notes[i]), i)):
+            view['notes'].append(deepcopy(notes[i]))
+            if project()[1] > material_ceiling:
+                view['notes'].pop()
+            else:
+                note_states[i]['status'] = 'working_view'
+
+    if not retained_records and not owner_records and not summarized_through_turn:
+        admit_notes()
     for i in ordered:
-        if i in preferred:
+        if retained_records or i in preferred:
             admit(i)
     for i in ordered:
-        if i not in preferred:
+        if not retained_records and i not in preferred:
             admit(i)
-    if scoped_records:
-        # Actual referenced originals share the same budget and are admitted
-        # before optional receipt navigation; neither source is a new store.
+    if retained_records:
+        # As pending statuses become final, their bookkeeping can shrink; a
+        # later duplicate may also represent a previously oversized window.
+        # Retry against those settled states before spending on optional data.
+        for i in ordered:
+            if states[i]['status'] == 'capacity':
+                states[i]['status'] = 'not_attempted'
+                admit(i)
+        admit_notes()
+    if scoped_records or retained_records:
+        # Original bodies share this budget and precede optional navigation.
         admit_navigation()
 
     messages, cost = project()

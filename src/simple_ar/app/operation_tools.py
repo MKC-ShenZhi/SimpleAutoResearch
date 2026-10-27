@@ -22,8 +22,8 @@ from simple_ar.tools.extensions import LocalExtension
 
 PROTOCOL = 'operations.v1'
 PROFESSIONAL_CONTRACTS = {'work.v1': 'source_owner.v1', 'work.v2': 'source_owner.v2',
-                          'work.v3': None, 'work.v4': None}
-CURRENT_PROFESSIONAL_CONTRACT = 'work.v4'
+                          'work.v3': None, 'work.v4': None, 'work.v5': None}
+CURRENT_PROFESSIONAL_CONTRACT = 'work.v5'
 _DIRECT_WORK = (
     "Own the user's research request using the available operations and authorized materials. "
     "Observe relevant files, choose a short useful plan, implement and run when needed, inspect actual "
@@ -112,7 +112,8 @@ class OperationTools:
         self.registry.register_package(source_tool_specs(), self.sources)
         self.publication = PublicationToolGateway(root, self.workspace, ledger,
             asset_protocol=config.get('publication_assets'))
-        self.registry.register_package(publication_tool_specs(preparation=False), self.publication)
+        self.registry.register_package(publication_tool_specs(preparation=False), self.publication,
+            request_visible=config.get('professional_operations') == 'work.v5')
         self.inspection = InspectionToolGateway(root, self.workspace,
             client_factory=lambda identity:client_factory(identity, 'writing'),
             protocol=config.get('inspection_protocol'),
@@ -137,7 +138,7 @@ class OperationTools:
         if preparation not in {None,'prepared.v1','prepared.v2','prepared.v3'}:
             raise ValueError('Unsupported source generation protocol')
         exact = config.get('code_task') is not None
-        self.shared_native = config.get('professional_operations') in {'work.v3', 'work.v4'} and not exact
+        self.shared_native = config.get('professional_operations') in {'work.v3', 'work.v4', 'work.v5'} and not exact
         if self.shared_native and preparation is not None:
             raise ValueError('Shared native professional work cannot acquire a historical preparation controller')
         self.methods = self.work = None
@@ -146,7 +147,7 @@ class OperationTools:
             self.methods = ProfessionalMethodTools(workspace=self.workspace, observations=observations,
                 user_requests=user_requests, work_context=work_context)
             self.registry.register_package(professional_method_specs(), self.methods, request_visible=True)
-        elif self.shared_native:
+        elif self.shared_native and config.get('professional_operations') == 'work.v4':
             from simple_ar.tools.professional_work import ProfessionalWorkTools, professional_work_specs
             self.work = self.methods = ProfessionalWorkTools(root=root, workspace=self.workspace,
                 observations=observations, user_requests=user_requests, work_context=work_context,

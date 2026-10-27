@@ -61,7 +61,7 @@ uv run simple-ar-checks --list
 [公共工具入口](../src/simple_ar/tools/gateway.py)。
 新任务使用 `operations.v1`：调查、编辑、执行、检查与出版可独立调用，不再由隐式专业接力决定阶段顺序。
 `OperationTools` 只组装工具注册，不运行另一套调度。检查负责绑定实际版本的意见，出版负责渲染与导出归属；正式交付声明稿件与所需格式。
-新建默认 `tool_contracts="on_demand"`：共同文件、编辑和已授权运行工具直接可用，可选专业操作按需加载，冻结合同的必要负责人直接呈现。新建冻结 `professional_operations="work.v4"`：源码与文稿工作使用同一native循环、工作视图和记录。`begin_professional_work` 绑定当前目标及授权位置，后续原生操作沿已有代码／写作用途路由实际完成工作；`finish_professional_work` 返回真实候选版本和缺项，不代表审阅或整项任务完成。修订保留原稿字节，简单任务仍可直接操作。读取、复制、版本约束编辑及获批进程由Workspace负责；检查、出版和交付仍各自独立，不新建嵌套会话。
+新建默认 `tool_contracts="on_demand"`、`professional_operations="work.v5"`：源码与文稿直接使用共同native循环，已读且版本有效的原文可由同一有界selector续用，无须先开scope或写notes；笔记仍是可选的工作判断。已授权的出版契约直接呈现，`export_report(delivery=...)` 可沿现有独立审阅交付同稿导出及其他成果。通用进程生成PDF不等于出版出处成立。读取、复制、版本约束编辑及获批进程仍由Workspace负责，不新建嵌套会话或另一份工作完成状态。历史work.v4的begin／finish、原稿快照和路由切换保留原行为，新建不再注册这些操作。
 
 新任务不再注册嵌套的 `prepare_implementation` 或 `work_document` 控制。保存的 `work.v1`／`work.v2`／`work.v3`、准备合同及 `outcomes` 模式保留原负责人和可执行恢复，包括候选校验和完整已结算回复的发布恢复。加载工具或选择方法不能静默升级旧合同。材料退出当前呈现，既不证明原文已读，也不证明重读被淘汰内容是无效工作。
 

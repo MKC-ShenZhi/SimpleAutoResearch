@@ -9,10 +9,11 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 ### Improved
 
 - New tasks retain a bounded overview of actual operations and output locations alongside recent conversation and work notes. Compact navigation makes more archived work discoverable without requiring a note; detailed transport traces remain in original receipts. Separate versions, failures and omissions remain explicit; saved tasks keep their original context contract.
-- Coherent source and document work now has an explicit scope on the shared action loop and returns actual candidate versions and gaps. Revision retains the original manuscript, while independent inspection, publication and final delivery remain separate.
-- Professional work reuses relevant original reads and historical execution diagnostics through the existing input selector. Explicit originals precede optional navigation; unavailable or stale material is distinguished from capacity omissions.
+- New source and document work uses the shared action loop directly. Scope start/finish steps are no longer part of new tasks; saved scopes retain their original routing, snapshots and recovery.
+- Previously read, version-valid originals can remain available without work notes or an explicit scope. The same bounded selector gives original evidence priority over optional navigation and distinguishes stale, unavailable and capacity-limited material. Generated tool explanations do not become original file reads merely by carrying a path or hash.
+- Authorized publication is directly available in new tasks. Its existing final-delivery option handles the same manuscript, rendered output and independent review; generic compilation does not replace publication provenance.
 
-This change passed server engineering and saved-history checks. Unassisted draft, feedback and formal delivery acceptance remains incomplete.
+Server engineering and saved-history checks do not establish task success. Unassisted draft, feedback and formal delivery acceptance remains incomplete.
 
 ## 2026-10-27 — V2.10 development (unreleased)
 

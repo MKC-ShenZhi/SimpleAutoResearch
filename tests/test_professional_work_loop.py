@@ -132,7 +132,21 @@ class OperationsWorkLoopTests(unittest.TestCase):
             side_effect=self._provider))
         self.app = None
 
-    def _create(self, *, report=False, allow_execution=True, delivery_files=None, context_protocol='auto', goal=None):
+    def _create(self, *, report=False, allow_execution=True, delivery_files=None, context_protocol='auto', goal=None,
+                saved_scope=False):
+        if saved_scope:
+            from tests.native_history_fixture import load_prepared_operation_history
+            self.app = load_prepared_operation_history(self.root, goal or 'Continue the saved professional work.',
+                config={'model':'fixture', 'sources':{'measurements':self.inputs},
+                    'model_connection':self.services.llm_client.connection_binding(),
+                    'professional_operations':'work.v4', 'source_generation_protocol':None,
+                    'source_decision_protocol':None, 'context_protocol':'working.v4',
+                    'delivery_review_protocol':'task.v1', 'publication_assets':'referenced.v2',
+                    'allow_execution':allow_execution, 'tool_contracts':'full', 'max_turns':70},
+                limits={'llm_requests':70, 'total_tokens':900000,
+                    'process_invocations':48, 'process_wall_seconds':360},
+                max_attempts=180, services=self.services)
+            return self.app
         options = {'control_protocol': 'operations.v1', 'context_protocol': context_protocol}
         if delivery_files is not None:
             options['delivery_files'] = delivery_files
@@ -179,10 +193,10 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._create()
         self.assertEqual(self.app.state['config']['control_protocol'],'operations.v1')
         self.assertIsNone(self.app.writing)
-        self.assertEqual(self.app.state['config']['professional_operations'], 'work.v4')
+        self.assertEqual(self.app.state['config']['professional_operations'], 'work.v5')
         self.assertIsNone(self.app.implementation)
         self.assertIsNone(self.app.operations.document)
-        self.assertIsNotNone(self.app.operations.methods)
+        self.assertIsNone(self.app.operations.methods)
         self.assertFalse({'professional_work','result_investigation','document_source_contract',
             'source_generation_protocol','source_decision_protocol'}
             & self.app.state['config'].keys())
@@ -191,8 +205,28 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.app = ToolApplication.load(self.root, services=self.services)
         return self.app
 
+    def test_nonreader_text_does_not_acquire_original_read_provenance(self):
+        from simple_ar.core.working_context import select_working_context
+        self._create()
+        path = self.inputs/'conditions.txt'
+        produced = ToolResult(tool_name='analyze_table', data={
+            'text':'Generated interpretation, not the file bytes.',
+            'absolute_path':str(path), 'sha256':_digest(path)})
+        owner = self.app.operations.registry.domain_gateways()['analysis']
+        with patch.object(owner, 'call', return_value=produced):
+            self._submit(_action('analyze_table', path='measurements/observations.csv',
+                spec={'value_columns':['value'], 'observation_unit':'one recorded observation'}))
+        with patch('simple_ar.core.working_context.select_working_context', wraps=select_working_context) as select:
+            self.app._messages()
+        rows = select.call_args.kwargs['observations']
+        self.assertFalse(any(row.get('role')=='historical_observation' for row in rows))
+        self.assertTrue(any(row.get('kind')=='operation_result'
+            and 'Generated interpretation' in row['text'] for row in rows))
+        self.assertEqual(path.read_text(), 'Three supplied observations; no sampling design or population uncertainty is known.\n')
+        self.send.assert_not_called()
+
     def test_shared_work_returns_actual_source_and_document_on_the_native_loop(self):
-        self._create(goal='Modify a working copy of the project, validate it with the supplied command, '
+        self._create(saved_scope=True, goal='Modify a working copy of the project, validate it with the supplied command, '
             'and retain a Markdown account; preserve the original project.')
         (self.inputs / 'main.py').write_text('VALUE = 1\n', encoding='utf-8')
         (self.inputs / 'check.py').write_text(
@@ -271,7 +305,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertFalse((self.root / 'workspace/implementation-drafts').exists())
 
     def test_work_scope_restores_and_unavailable_roots_can_return_partial_work(self):
-        self._create()
+        self._create(saved_scope=True)
         project = self.root / 'workspace/optional'
         project.mkdir()
         self._submit(_action('begin_professional_work', kind='source', goal='Inspect the optional working project',
@@ -296,7 +330,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.send.assert_not_called()
 
     def test_source_work_from_empty_workspace_and_route_preflight(self):
-        self._create(goal='Create a command-line implementation that sums supplied numbers.')
+        self._create(saved_scope=True, goal='Create a command-line implementation that sums supplied numbers.')
         original_text_client = self.app._text_client
         def routed(client, purpose, *, native=True):
             if purpose == 'writing' and native:
@@ -328,7 +362,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.send.assert_not_called()
 
     def test_revision_keeps_original_bytes_after_undeclared_process_side_effect(self):
-        self._create(goal='Revise the existing manuscript and retain the original.')
+        self._create(saved_scope=True, goal='Revise the existing manuscript and retain the original.')
         original = 'Original manuscript.\n'
         self._write('draft.md', original)
         with patch('simple_ar.tools.professional_work.write_atomically', side_effect=KeyboardInterrupt):
@@ -368,7 +402,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         for replaced in (False, True):
             with self.subTest(replaced=replaced):
                 self.root = self.directory / ('replaced' if replaced else 'intact')
-                self._create()
+                self._create(saved_scope=True)
                 replacement = self._write('old-note.md', 'An unrelated old note.\n')
                 self._submit(_action('begin_professional_work', kind='source',
                     goal='Compute the supplied observations and return the actual analysis.'))
@@ -413,11 +447,11 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(self.app.state['config']['tool_contracts'], 'on_demand')
         core = {row['function']['name'] for row in self.app.schemas}
         self.assertTrue({'read_file','search_files','write_file','edit_file','run_process',
-            'deliver_result','load_tools','read_history','update_work_plan',
-            'begin_professional_work','finish_professional_work'} <= core)
-        self.assertFalse({'select_work_method','prepare_implementation','execute_implementation','work_document'} & core)
+            'deliver_result','load_tools','read_history','update_work_plan','export_report'} <= core)
+        self.assertFalse({'select_work_method','prepare_implementation','execute_implementation','work_document',
+            'begin_professional_work','finish_professional_work'} & core)
         optional = {'inspect_table','analyze_table','measure_experiment','analyze_measurements',
-            'inspect_artifacts','export_report','find_source_passages'}
+            'inspect_artifacts','find_source_passages'}
         self.assertFalse(optional & core)
         view = json.loads(self.app._messages()[1]['content'])
         self.assertTrue(optional <= view['available_specialists'].keys())
@@ -479,7 +513,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 view = json.loads(self.app._messages()[1]['content'])
                 self.assertTrue(required <= offered)
                 self.assertFalse(required & view['available_specialists'].keys())
-                self.assertFalse({'inspect_artifacts','export_report'} & offered)
+                self.assertNotIn('inspect_artifacts', offered)
+                self.assertIn('export_report', offered)
                 if name == 'code':
                     self.assertFalse({'write_file','edit_file','run_process'} & offered)
                 else:
@@ -793,10 +828,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 inputs=['analyze.py', 'measurements/observations.csv'],
                 outputs=['v1/table.csv', 'v1/summary.json', 'v1/figure.png'], timeout_sec=10),
             _action('read_file', path='v1/summary.json'),
-            _action('begin_professional_work', kind='document',
-                goal='Draft the editable report from the actual observations and results.', material_roots=['workspace/v1']),
             _action('write_file', path='v1/report.md', content=_BODY),
-            _action('finish_professional_work', candidate='v1/report.md'),
             _action('export_report', markdown='v1/report.md', compile_pdf=compile_pdf,
                 delivery={**self._delivery('v1/report.md'),
                     'artifacts':['v1/table.csv','v1/figure.png','analyze.py']}),
@@ -855,9 +887,6 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(self.app.ledger.to_dict(),usage)
         self.assertEqual(self._process_receipts(),processes)
         self.decisions.extend([
-            _action('begin_professional_work', kind='document',
-                goal='Revise the interpretation using the current manuscript and feedback.',
-                material_roots=['workspace/v1'], prior_draft='v1/report.md'),
             _action('copy_file', source='v1/report.md', source_sha256=_digest(products / 'report.md'),
                 path='v2/report.md'),
             _action('read_file', path='v2/report.md', full_digest=True),
@@ -866,7 +895,6 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 old_text='The sample mean is 2.0 across 3 supplied observations.', new_text=_SCOPE),
             *[_action('copy_file', source=f'v1/{name}', source_sha256=_digest(products / name),
                 path=f'v2/{name}') for name in ('table.csv', 'summary.json', 'figure.png')],
-            _action('finish_professional_work', candidate='v2/report.md'),
             _action('export_report', markdown='v2/report.md', compile_pdf=compile_pdf,
                 delivery=self._delivery('v2/report.md', 'v2/table.csv', 'v2/figure.png', 'analyze.py')),
         ])
@@ -875,10 +903,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
             approve=lambda call, value: True)
         self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
         self.assertFalse(self.decisions)
-        returned = self._observations('finish_professional_work')
-        self.assertEqual([row['data']['outcome'] for row in returned], ['candidate', 'candidate'])
-        prior = returned[-1]['data']['prior_draft']
-        self.assertEqual(self.app.workspace.resolve(prior['snapshot']).read_bytes(), (products / 'report.md').read_bytes())
+        self.assertFalse(self._observations('begin_professional_work'))
+        self.assertFalse(self._observations('finish_professional_work'))
         self.assertIn('No population inference', (self.root / 'workspace/v2/report.md').read_text())
         self.assertEqual((self.root / 'workspace/execution-count.txt').read_text(), 'calculated\n')
         self.assertEqual(self._versions(self.inputs), original_inputs)

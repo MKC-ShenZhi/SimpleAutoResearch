@@ -399,6 +399,132 @@ class WorkingContextTests(unittest.TestCase):
             select(turn_blocks=[block(0, 'result')[:1]])
 
 
+class RetainedWorkingContextTests(unittest.TestCase):
+    def test_recorded_work_survives_eviction_with_versions_and_one_budget(self):
+        source = 'Original measurement and observed conditions. ' * 45
+        recent_text = 'Recently read original text'
+
+        def read(turn, text, path, **extra):
+            return observation(turn, text, path=path, role='historical_observation',
+                tool='read_file', field='data.text', **extra)
+
+        original = read(0, source, 'inputs/original.txt')
+        failure = {'kind': 'operation_result', 'record': 'records/failure.json', 'turn': 1,
+            'tool': 'run_process', 'path': 'outputs/result.csv', 'sha256': 'old-output-version',
+            'text': json.dumps({'tool_name': 'run_process', 'status': 'error',
+                'data': {'returncode': 1, 'stderr': 'Actual historical execution failure'}})}
+        old_duplicate = read(2, recent_text, 'inputs/recent.txt')
+        pinned = read(3, 'Explicitly referenced original', 'inputs/pinned.txt')
+        current = read(4, 'Current object original', 'inputs/current.txt')
+        stale = read(5, 'Original from a changed file', 'inputs/changed.txt', sha256='old-digest')
+        unknown = read(6, 'Original with an unavailable file', 'inputs/unavailable.txt')
+        missing_digest = read(7, 'Original without a digest', 'inputs/no-digest.txt', sha256=None)
+        authored = observation(8, 'Authored payload is not a read', path='outputs/authored.txt',
+            role='write_context', field='function.arguments.content')
+        large = read(9, 'Whole original too large for the target. ' * 1000, 'inputs/large.txt')
+        recent = read(11, recent_text, 'inputs/recent.txt')
+        rows = [original, failure, old_duplicate, pinned, current, stale, unknown,
+                missing_digest, authored, large, recent]
+        blocks = [block(i, text) for i, text in enumerate([
+            source, failure['text'], recent_text, pinned['text'], current['text'], stale['text'],
+            unknown['text'], missing_digest['text'], authored['text'], large['text'],
+            'Oversized intervening native work. ' * 1000, recent_text])]
+        operations = [{'turn': 0, 'turn_complete': True, 'request_count': 1,
+            'call_id': str(i), 'reply': f'records/navigation-{i}.json',
+            'observation': {'tool': 'read_file', 'record': f'records/navigation-result-{i}.json',
+                'status': 'ok', 'arguments': {'path': f'inputs/{i}.txt', 'detail': 'n' * 700}}}
+            for i in range(12)]
+        operations.append({'turn': 11, 'turn_complete': True, 'request_count': 1,
+            'call_id': 'recent', 'reply': 'records/recent-reply.json',
+            'observation': {'tool': 'read_file', 'record': recent['record'], 'status': 'ok',
+                'arguments': {'path': 'inputs/recent.txt'}}})
+        versions = {row['path']: 'recorded-digest' for row in rows
+                    if row.get('kind') != 'operation_result'}
+        versions['inputs/changed.txt'] = 'changed-digest'
+        versions['inputs/unavailable.txt'] = None
+        calls = []
+
+        def resolver(path):
+            calls.append(path)
+            return versions[path]
+
+        arguments = dict(material_policy='retained', turn_blocks=blocks, observations=rows,
+            selected_records=[pinned['record'], 'records/missing.json'],
+            current_artifacts=[current['path']], version_resolver=resolver,
+            operation_history=operations, context_token_target=10000)
+        before = deepcopy((rows, blocks, operations))
+        messages, budget = select(**arguments)
+        context = json.loads(messages[1]['content'])
+        view = context['working_view']
+        supplied = view['observations']
+        states = {state['source']['record']: state for state in
+                  [*budget['selected_records'], *budget['omitted_records']]}
+
+        self.assertEqual(view['notes'], [])
+        self.assertEqual(budget['selected_turns'], [11])
+        self.assertEqual([entry['observation']['record'] for entry in supplied[:2]],
+                         [pinned['record'], current['record']])
+        self.assertIn({'observation': original, 'version_status': 'matching'}, supplied)
+        self.assertIn({'observation': failure, 'version_status': 'historical'}, supplied)
+        self.assertNotIn('outputs/result.csv', calls)
+        self.assertEqual(states[stale['record']]['status'], 'stale')
+        self.assertEqual(states[stale['record']]['version_status'], 'stale')
+        self.assertEqual(states[unknown['record']]['status'], 'unavailable')
+        self.assertEqual(states[unknown['record']]['version_status'], 'unknown')
+        self.assertEqual(states[missing_digest['record']]['status'], 'unavailable')
+        self.assertEqual(states[authored['record']]['status'], 'unavailable')
+        self.assertEqual(states[large['record']]['status'], 'capacity')
+        self.assertEqual(states[old_duplicate['record']]['status'], 'duplicate')
+        self.assertEqual(states[recent['record']]['status'], 'native')
+        self.assertNotIn('not_attempted', {state['status'] for state in states.values()})
+        self.assertEqual(json.dumps(messages, ensure_ascii=False).count(recent_text), 1)
+        self.assertEqual(json.dumps(messages, ensure_ascii=False).count(source), 1)
+        self.assertNotIn(stale['text'], json.dumps(messages, ensure_ascii=False))
+        self.assertEqual({item['record'] for item in context['material_supply']['references']},
+                         {pinned['record'], 'records/missing.json'})
+        self.assertEqual(next(item for item in context['material_supply']['references']
+                              if item['record'] == 'records/missing.json')['status'], 'missing')
+        overview = view['operation_overview']
+        supplied_navigation = [i for start, end in overview['supplied_entry_ranges'] for i in range(start, end)]
+        self.assertNotIn(12, supplied_navigation)  # Already in the recent native block.
+        self.assertGreater(overview['omitted_entries'], 1)
+        navigation_only, _ = select(**{**arguments, 'observations': []})
+        self.assertLess(json.loads(navigation_only[1]['content'])['working_view']['operation_overview']
+                        ['omitted_entries'], overview['omitted_entries'])
+        for request in ('Compare the source measurements', 'Keep the error bars'):
+            self.assertEqual(messages.count({'role': 'user', 'content': request}), 1)
+        self.assertGreaterEqual(budget['estimated_input_tokens'],
+                                30 + len(json.dumps(messages, ensure_ascii=False)))
+        self.assertLessEqual(budget['estimated_input_tokens'], 10000)
+        self.assertEqual((rows, blocks, operations), before)
+
+        # Optional old notes cannot replace the originals or expand every note
+        # reference into required navigation before the selector can admit them.
+        notes = [{'text': 'Prior working note',
+                  'records': [f'records/note-only-{i}.json' for i in range(200)]}]
+        with_notes, _ = select(**{**arguments, 'work_notes': notes,
+                                   'summarized_through_turn': len(blocks)})
+        noted_context = json.loads(with_notes[1]['content'])
+        self.assertEqual(noted_context['working_view']['history']['notes_through_turn'], 0)
+        self.assertIn(source, json.dumps(with_notes, ensure_ascii=False))
+        self.assertEqual({item['record'] for item in noted_context['material_supply']['references']},
+                         {pinned['record'], 'records/missing.json'})
+
+        versions[original['path']] = 'changed-digest'
+        versions[recent['path']] = 'changed-digest'
+        changed, changed_budget = select(**arguments)
+        self.assertNotIn(source, json.dumps(changed, ensure_ascii=False))
+        self.assertEqual(next(item for item in changed_budget['omitted_records']
+                              if item['source']['record'] == original['record'])['status'], 'stale')
+        self.assertEqual(json.loads(changed[1]['content'])['working_view']['stale_native_observations'][0]
+                         ['record'], recent['record'])
+        unavailable, unavailable_budget = select(**{**arguments, 'version_resolver': None})
+        self.assertNotIn(source, json.dumps(unavailable, ensure_ascii=False))
+        self.assertEqual(next(item for item in unavailable_budget['omitted_records']
+                              if item['source']['record'] == original['record'])['status'], 'unavailable')
+        self.assertIn('Actual historical execution failure', json.dumps(unavailable))
+
+
 class ReferencedWorkingContextTests(unittest.TestCase):
     def test_owner_notes_and_feedback_keep_native_chronology_without_summary_coverage(self):
         requests = ['Initial goal', 'Correct the coordinates', 'Keep uncertainty explicit']

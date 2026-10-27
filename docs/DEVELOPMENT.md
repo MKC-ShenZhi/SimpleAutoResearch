@@ -70,19 +70,20 @@ New creation defaults to `tool_contracts="on_demand"`: workspace editing, permit
 process operations and coordination are directly available; optional professional
 contracts are discoverable and loaded when needed. Frozen code, table-analysis and
 measurement contracts expose their required owners directly. New tasks freeze
-`professional_operations="work.v4"`: coherent source and document work uses the same
-native decision loop, working view and journal. `begin_professional_work` binds the
-current goal and authorized locations; subsequent native turns perform the work
-on the existing code/writing route. `finish_professional_work` returns actual
-candidate versions and remaining gaps, not a review or task-completion certificate.
-Revision retains the original manuscript bytes. Simple tasks may still use direct
-operations. Workspace owns reads, copies, version-bound edits and approved processes;
-inspection, publication and delivery stay independent. No nested session is created.
+`professional_operations="work.v5"`: source and document work uses the shared native
+loop directly. Previously read, version-valid evidence remains eligible for the same
+bounded input selector without first opening a scope or writing notes. Notes remain
+optional working judgments. Publication is directly offered when execution is authorized;
+`export_report(delivery=...)` can export the manuscript and submit the complete package
+through the existing independent review. An arbitrary process-generated PDF does not
+establish publication provenance. Workspace owns reads, copies, version-bound edits and
+approved processes. No nested session or second work-completion state is created.
 
 New tasks do not register nested `prepare_implementation` or `work_document`
-controllers. Saved `work.v1`/`work.v2`/`work.v3`, preparation and `outcomes` contracts keep
+controllers. Saved `work.v1`/`work.v2`/`work.v3`/`work.v4`, preparation and `outcomes` contracts keep
 their original owners and executable recovery, including candidate admission and
-accounted final-response recovery. Loading tools or selecting a method cannot
+accounted final-response recovery. Saved work.v4 also retains its begin/finish scopes,
+original-manuscript snapshots and route transitions. Loading tools or selecting a method cannot
 silently upgrade those contracts. Presentation omission never proves an original
 was read or that repeated access to omitted content was unnecessary.
 Professional reader observations use the shared material receipt interface, so later

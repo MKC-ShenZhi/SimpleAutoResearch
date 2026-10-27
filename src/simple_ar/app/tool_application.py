@@ -3202,19 +3202,22 @@ class ToolApplication:
                         'content': json.dumps(presented,
                             ensure_ascii=False, separators=(',', ':'))})
                     data = result.get('data') or {}
-                    if working_mode and not isinstance(data.get('text'),str) and call['function']['name']!='write_file':
+                    read_windows = journal_read_windows(result, {})
+                    retained_inputs = config.get('professional_operations') == 'work.v5'
+                    if (working_mode and call['function']['name']!='write_file'
+                            and (not isinstance(data.get('text'),str) or retained_inputs and not read_windows)):
                         working_rows.append({'turn':position,'record':record,'kind':'operation_result',
                             'tool':call['function']['name'],'text':json.dumps(presented,ensure_ascii=False,separators=(',',':')),
                             'version_scope':'Historical operation result, not proof of current output bytes or new permission'})
                     # This projection consumes recorded text only; malformed old
                     # arguments must not break later context or grant read access.
-                    read_windows = journal_read_windows(result, {})
                     text_rows = [(row['data'], row['field']) for row in read_windows]
-                    if not read_windows:
+                    if not read_windows and not retained_inputs:
                         text_rows.append((data, 'data.text'))
-                    for key in ('matches', 'retained_preview'):
-                        text_rows.extend((row, f'data.{key}.{number}.text')
-                            for number, row in enumerate(data.get(key) or []) if isinstance(row, dict))
+                    if not retained_inputs:
+                        for key in ('matches', 'retained_preview'):
+                            text_rows.extend((row, f'data.{key}.{number}.text')
+                                for number, row in enumerate(data.get(key) or []) if isinstance(row, dict))
                     for row, field in text_rows:
                         text = row.get('text')
                         if not isinstance(text, str) or not text:
@@ -3288,7 +3291,9 @@ class ToolApplication:
                 summarized_through_turn=memory['through_turn'],
                 selected_records=selected_records,version_resolver=version,
                 block_request_counts=[turn.get('request_count',1) for turn in turns],
-                material_policy=('scoped' if config['context_protocol'] == 'working.v4' else
+                material_policy=('retained' if config.get('professional_operations') == 'work.v5'
+                    and config['context_protocol'] == 'working.v4' else
+                    'scoped' if config['context_protocol'] == 'working.v4' else
                     'referenced' if config['context_protocol'] in _REFERENCED_CONTEXT_PROTOCOLS else 'ranked'),
                 operation_history=operation_history)
             cost = estimate_tokens(json.dumps(messages,ensure_ascii=False))+schema_cost

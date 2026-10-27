@@ -437,7 +437,10 @@ class PublicationToolGateway:
                 failures.append(str(exc))
         if failures:
             raise ValueError('; '.join(dict.fromkeys(failures)))
-        raise ValueError('Requested report formats need a byte-bound publication of the same manuscript, figures and bibliography')
+        raise ValueError('Requested report formats need a byte-bound publication of the same manuscript, figures and bibliography. '
+            'Use export_report with the current Markdown and required assets; its delivery field can include the other '
+            'requested artifacts and finish after actual compilation and independent review. '
+            'Re-running a generic process cannot create this publication receipt.')
 
     def call(self, name: str, arguments: dict[str, Any], *, identity: str) -> ToolResult:
         try:
