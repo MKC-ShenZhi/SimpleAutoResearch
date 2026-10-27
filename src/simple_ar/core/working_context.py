@@ -8,6 +8,23 @@ import re
 from typing import Any, Literal
 
 
+def history_view(turns: list[dict[str, Any]]) -> Any:
+    # Lossless presentation of receipt-derived indexes, never saved memory.
+    columns, rows = [], []
+    for turn in turns:
+        observations = []
+        for observation in turn['observations']:
+            keys = list(observation)
+            if keys not in columns:
+                columns.append(keys)
+            observations.append([columns.index(keys), list(observation.values())])
+        rows.append([turn['reply'], turn['request_count'], observations])
+    table = {'columns': ['reply', 'request_count', 'observations'],
+        'observation_columns': columns, 'rows': rows}
+    return table if len(json.dumps(table, ensure_ascii=False)) < len(
+        json.dumps(turns, ensure_ascii=False)) else turns
+
+
 def select_working_context(
     *, user_requests: Sequence[str], system_text: str,
     base_context: Mapping[str, Any],
@@ -224,8 +241,11 @@ def select_working_context(
                      'Arguments describe requests, not proof of produced outputs. '
                      'Entry ranges are zero-based and end-exclusive over all recorded operations; '
                      'omitted entries remain in original history. Complete arguments are in reply '
-                     'tool_calls under call_id; full results/data are at observation.record. '
-                     'Omitted fields are not supplied or known absent. No entries are merged.',
+                     'tool_calls under call_id; full results/data are at each observation record. '
+                     'Omitted fields are not supplied or known absent. No entries are merged. '
+                     'Entries group observations by reply and request_count. When columnar, read '
+                     'columns/rows for groups and observation_columns for each observation schema '
+                     'and values; otherwise read the equivalent list of groups.',
         }
 
     reference_indices: dict[str, list[int]] = {}
@@ -267,8 +287,19 @@ def select_working_context(
                     ranges[-1][1] = i + 1
                 else:
                     ranges.append([i, i + 1])
+            groups: dict[tuple[str, int], dict[str, Any]] = {}
+            for i in ordered_indices:
+                operation = operations[i]
+                navigation = {'entry_index': i, **{key: operation[key] for key in
+                    ('turn', 'turn_complete', 'call_id') if key in operation}}
+                if navigation.keys() & operation['observation'].keys():
+                    raise ValueError('Operation observation conflicts with navigation fields')
+                group = groups.setdefault((operation['reply'], operation['request_count']),
+                    {'reply': operation['reply'], 'request_count': operation['request_count'],
+                     'observations': []})
+                group['observations'].append({**navigation, **operation['observation']})
             view['operation_overview'].update(
-                entries=[{'entry_index': i, **operations[i]} for i in ordered_indices],
+                entries=history_view(list(groups.values())),
                 supplied_entry_ranges=ranges,
                 omitted_entries=len(operations) - len(ordered_indices))
         context['material_supply'] = {'native_context':[
@@ -375,15 +406,12 @@ def select_working_context(
         state['estimated_tokens'] = estimate_tokens(dump(supplied))
         state['status'] = 'working_view'
 
-    # Durable receipt navigation competes in the SAME measured projection,
-    # before optional full bodies. Recent native pairs and owner notes remain
-    # intact. Prefer actual diagnostics/outputs over text-window metadata,
-    # without lexical, tool-name, environment or command-specific pinning.
-    def operation_priority(i: int) -> tuple[bool, bool, bool, int]:
-        result = operations[i].get('observation', {})
-        return (bool(result.get('error')) or result.get('status') not in {'ok', 'completed'},
-                bool(result.get('artifacts')) or 'returncode' in result.get('observed', {}),
-                'text' not in result.get('omitted_fields', {}).get('data', []), i)
+    # Spend navigation capacity on the archived work absent from native input
+    # first, newest first. Do not permanently privilege old errors or penalize
+    # successful source reads for having original text. All receipts remain
+    # separate, historical and discoverable; native pairs and notes stay intact.
+    def operation_priority(i: int) -> tuple[bool, int]:
+        return (operations[i].get('turn') not in recent, i)
 
     for i in sorted(range(len(operations)), key=operation_priority, reverse=True):
         operation_indices.append(i)

@@ -8,7 +8,7 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 
 ### Improved
 
-- New tasks retain a bounded overview of actual operations and output locations alongside recent conversation and work notes. Earlier completed work remains discoverable even when no note was written. Separate versions, failed operations and omitted history remain explicit; saved tasks keep their original context contract.
+- New tasks retain a bounded overview of actual operations and output locations alongside recent conversation and work notes. Compact navigation makes more archived work discoverable without requiring a note; detailed transport traces remain in original receipts. Separate versions, failures and omissions remain explicit; saved tasks keep their original context contract.
 
 This change passed server engineering and saved-history checks. Unassisted draft, feedback and formal delivery acceptance remains incomplete.
 

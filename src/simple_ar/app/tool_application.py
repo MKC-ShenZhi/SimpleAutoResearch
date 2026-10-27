@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from simple_ar.core.budget import BudgetLedger
+from simple_ar.core.working_context import history_view
 from simple_ar.core.capabilities import ArtifactRef, ArtifactStore, AttemptManifest, CapabilityContext, CapabilityRegistry, CapabilityResult
 from simple_ar.core.session import BudgetState, SessionController
 from simple_ar.integrations.llm import LLMClient, LLMError, LLMSettings, estimate_tokens
@@ -2380,7 +2381,8 @@ class ToolApplication:
             if key in arguments and (not navigation or key not in {'content', 'text', 'replacements'})
             and len(json.dumps(arguments[key], ensure_ascii=False)) <= 1024}
         observed = {key: value for key, value in data.items()
-            if key != 'text' and len(json.dumps(value, ensure_ascii=False)) <= 1024
+            if key != 'text' and not (navigation and key == 'streams')
+            and len(json.dumps(value, ensure_ascii=False)) <= 1024
             and not (name == 'focus_work' and key == 'inputs')
             and not (key in indexed_arguments and value == indexed_arguments[key])
             and not (key == 'absolute_path' and value == indexed_arguments.get('path'))}
@@ -2411,22 +2413,7 @@ class ToolApplication:
             if key in {'arguments', 'observed'}
             or (value is not None and value != '' and value != [] and value != {})}
 
-    @staticmethod
-    def _history_view(turns: list[dict[str, Any]]) -> Any:
-        # Lossless presentation of receipt-derived indexes, never saved memory.
-        columns, rows = [], []
-        for turn in turns:
-            observations = []
-            for observation in turn['observations']:
-                keys = list(observation)
-                if keys not in columns:
-                    columns.append(keys)
-                observations.append([columns.index(keys), list(observation.values())])
-            rows.append([turn['reply'], turn['request_count'], observations])
-        table = {'columns': ['reply', 'request_count', 'observations'],
-            'observation_columns': columns, 'rows': rows}
-        return table if len(json.dumps(table, ensure_ascii=False)) < len(
-            json.dumps(turns, ensure_ascii=False)) else turns
+    _history_view = staticmethod(history_view)
 
     def _messages(self, *, client: LLMClient | None = None, closing: bool = False,
                   native_history_start_turn: int | None = None, schemas: list | None = None,

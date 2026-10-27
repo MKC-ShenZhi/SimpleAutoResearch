@@ -187,7 +187,10 @@ therefore remains discoverable without requiring a model-written note. The
 overview preserves separate versions and failures, identifies omitted entries and
 links to original records; it does not supply original evidence bodies or certify
 current file contents, permission or scientific correctness. There is no second
-summary author or persisted memory cache. Saved `working.v2` tasks retain their
+summary author or persisted memory cache. Navigation reuses the history renderer,
+retains short results, and prioritizes archived work absent from recent conversation.
+Detailed transport traces remain in original receipts; omitted fields are explicit.
+Saved `working.v2` tasks retain their
 referenced-observation selection without automatically gaining the overview.
 Saved `working.v1` tasks retain their automatic checkpoints, original selection,
 registered outputs and charges. Their summary failures and unknown usage still

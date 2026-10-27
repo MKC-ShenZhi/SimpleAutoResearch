@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from simple_ar.core.working_context import select_working_context
+from simple_ar.core.working_context import history_view, select_working_context
 from simple_ar.app.work_memory import compact_work, checkpoint_artifacts, checkpoint_entries, summary_coverage
 from simple_ar.app.tool_application import ToolApplication
 from simple_ar.core.budget import BudgetLedger
@@ -42,7 +42,42 @@ def select(**kwargs):
     return select_working_context(**arguments)
 
 
+def expand_history_view(view):
+    if isinstance(view, list):
+        return view
+    groups = [dict(zip(view['columns'], row)) for row in view['rows']]
+    return [{**group, 'observations': [
+        dict(zip(view['observation_columns'][schema], values))
+        for schema, values in group['observations']]} for group in groups]
+
+
 class WorkingContextTests(unittest.TestCase):
+    def test_shared_history_renderer_keeps_legacy_bytes_and_omits_only_navigation_streams(self):
+        call = {'function': {'name': 'run_process', 'arguments': json.dumps({
+            'argv': ['python', 'worker.py'], 'cwd': 'workspace'})}}
+        data = {'returncode': 0, 'stdout': 'Observed output', 'stderr': '',
+                'streams': {'stdout': {'bytes_seen': 15, 'tail_bytes_discarded': 0}}}
+        result = {'status': 'ok', 'data': data}
+        before = deepcopy(result)
+        historical = ToolApplication._history_observation(call, result, 'attempts/tool/result.json')
+        self.assertEqual(historical['observed'], data)
+        navigation = ToolApplication._history_observation(call, result,
+            'attempts/tool/result.json', navigation=True)
+        self.assertEqual(navigation['observed'], {key: value for key, value in data.items() if key != 'streams'})
+        self.assertEqual(navigation['omitted_fields']['data'], ['streams'])
+        self.assertEqual(result, before)
+        groups = [{'reply': 'records/reply.json', 'request_count': 1,
+                   'observations': [historical] * 8}]
+        expected = {'columns': ['reply', 'request_count', 'observations'],
+            'observation_columns': [list(historical)],
+            'rows': [['records/reply.json', 1, [[0, list(historical.values())]] * 8]]}
+        self.assertIs(ToolApplication._history_view, history_view)
+        self.assertEqual(json.dumps(ToolApplication._history_view(groups), ensure_ascii=False),
+                         json.dumps(expected, ensure_ascii=False))
+        self.assertEqual(expand_history_view(history_view(groups)), groups)
+        small = [{'reply': 'r', 'request_count': 1, 'observations': []}]
+        self.assertEqual(history_view(small), small)
+
     def test_final_instruction_is_admitted_with_material_and_atomic_history(self):
         latest = block(2, 'Current observed result')
         rows = [observation(0, 'Original measured source with conditions. ' * 600)]
@@ -506,7 +541,7 @@ class ReferencedWorkingContextTests(unittest.TestCase):
             call = {'id': str(i), 'function': {'name': name, 'arguments': json.dumps(args)}}
             result = {'status': status, 'data': data, 'error': error,
                       'artifacts': ['result.csv'] if i in (0, 1, 2) else []}
-            operations.append({'turn': i, 'request_count': 1, 'call_id': str(i),
+            operations.append({'turn': i, 'turn_complete': True, 'request_count': 1, 'call_id': str(i),
                 'reply': f'records/turn-{i}/native_result.json',
                 'observation': ToolApplication._history_observation(call, result,
                     f'attempts/tool-{i}/native_result.json', navigation=True)})
@@ -518,7 +553,16 @@ class ReferencedWorkingContextTests(unittest.TestCase):
         messages, budget = select(**arguments, operation_history=operations)
         view = json.loads(messages[1]['content'])['working_view']
         overview = view['operation_overview']
-        indexed = [entry['observation'] for entry in overview['entries']]
+        groups = expand_history_view(overview['entries'])
+        indexed = [entry for group in groups for entry in group['observations']]
+        for group in groups:
+            for entry in group['observations']:
+                original = operations[entry['entry_index']]
+                self.assertEqual((group['reply'], group['request_count']),
+                                 (original['reply'], original['request_count']))
+                self.assertEqual(entry, {'entry_index': entry['entry_index'],
+                    **{key: original[key] for key in ('turn', 'turn_complete', 'call_id')},
+                    **original['observation']})
         self.assertEqual(view['notes'], [])
         self.assertGreater(budget['recent_start_turn'], 0)
         self.assertIn('Observed execution outcome', json.dumps(indexed))
@@ -536,8 +580,14 @@ class ReferencedWorkingContextTests(unittest.TestCase):
         tight, metadata = select(**{**arguments, 'context_token_target': 4500}, operation_history=operations)
         coverage = json.loads(tight[1]['content'])['working_view']['operation_overview']
         self.assertGreater(coverage['omitted_entries'], 0)
+        # Older failures cannot always crowd successful source navigation out
+        # merely because the latter has an omitted original-text body.
+        supplied_entries = [entry for group in expand_history_view(coverage['entries'])
+                            for entry in group['observations']]
+        self.assertTrue(any(entry['tool'] == 'read_file' and entry['status'] == 'ok'
+                            for entry in supplied_entries))
         supplied = [i for start, end in coverage['supplied_entry_ranges'] for i in range(start, end)]
-        self.assertEqual(supplied, [entry['entry_index'] for entry in coverage['entries']])
+        self.assertEqual(supplied, [entry['entry_index'] for entry in supplied_entries])
         self.assertEqual(len(supplied) + coverage['omitted_entries'], len(operations))
         self.assertLessEqual(metadata['estimated_input_tokens'], 4500)
         # Saved working.v2 still supplies exactly its referenced view; no auto index.

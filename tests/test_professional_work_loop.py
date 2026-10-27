@@ -991,7 +991,14 @@ class OperationsWorkLoopTests(unittest.TestCase):
         context = json.loads(messages[1]['content'])
         self.assertGreater(context['working_context']['recent_start_turn'], 0)
         overview = context['working_view']['operation_overview']
-        entries = [entry['observation'] for entry in overview['entries']]
+        groups = overview['entries']
+        if isinstance(groups, dict):
+            table = groups
+            groups = [dict(zip(table['columns'], row)) for row in table['rows']]
+            groups = [{**group, 'observations': [
+                dict(zip(table['observation_columns'][schema], values))
+                for schema, values in group['observations']]} for group in groups]
+        entries = [entry for group in groups for entry in group['observations']]
         execution = next(entry for entry in entries if entry['tool'] == 'run_process')
         self.assertEqual(execution['arguments']['argv'], command)
         self.assertEqual(execution['observed']['returncode'], 0)
