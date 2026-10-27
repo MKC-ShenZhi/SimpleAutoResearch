@@ -9,6 +9,8 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 ### Improved
 
 - New tasks retain a bounded overview of actual operations and output locations alongside recent conversation and work notes. Compact navigation makes more archived work discoverable without requiring a note; detailed transport traces remain in original receipts. Separate versions, failures and omissions remain explicit; saved tasks keep their original context contract.
+- Coherent source and document work now has an explicit scope on the shared action loop and returns actual candidate versions and gaps. Revision retains the original manuscript, while independent inspection, publication and final delivery remain separate.
+- Professional work reuses relevant original reads and historical execution diagnostics through the existing input selector. Explicit originals precede optional navigation; unavailable or stale material is distinguished from capacity omissions.
 
 This change passed server engineering and saved-history checks. Unassisted draft, feedback and formal delivery acceptance remains incomplete.
 

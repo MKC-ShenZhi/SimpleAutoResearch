@@ -793,7 +793,9 @@ File tools accept authorized source0/... and workspace/... locators or observed 
 | copy_file | Binary/text bytes ≤64 MiB, source digest required; existing destination also needs observed digest |
 | search_files | Literal rg search within authorized roots; paginated scanned-file coverage. Consumes process receipt/allowance even though read-only |
 | inspect_project: data_paths | Read-only dependency/entry/test/document/coverage observation and full attempt; no project import or execution |
-| select_work_method: method, goal, material_roots, project_path | Select source, document or direct work on the same native engine and existing model route. Locations are authorization-checked; selection performs no generation, execution or permission change. Actual file operations, approval and independent delivery checks remain separate |
+| begin_professional_work: kind, goal, material_roots, project_path, prior_draft | Accept source or document work in the same native loop and existing model route; later turns perform it. Locations are checked, revision retains original manuscript bytes, and no permission is added. Simple tasks can use direct operations |
+| finish_professional_work: candidate, attachments, gaps | Return actual editable candidate versions and recorded provenance, or explicitly partial work. A start receipt or an unchanged artifact path cannot prove production. Independent review, publication and delivery remain separate |
+| Saved work.v3: select_work_method | Retains its original intent-only selection and routing behavior; loading a saved task does not upgrade it to professional production |
 | prepare_implementation: saved preparation/work.v1/work.v2 tasks | Retains original source binding, candidate admission and separately approved execution. New ordinary tasks use common file and process operations instead; loading a historical task does not upgrade its contract |
 | update_work_plan | Current-request plan persists through compaction/resume; no separate planner/scheduler. Step claims neither verify work nor authorize execution |
 

@@ -8,10 +8,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import re
 from typing import Any, Callable, Literal
-from urllib.parse import unquote, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -22,7 +21,7 @@ from simple_ar.core.capabilities import ArtifactStore
 from simple_ar.tools.materials import (
     freeze_work_context, material_inventories, material_observation_seed,
     read_bound_material_bytes, read_material_window, validate_material_observation,
-    window_key,
+    window_key, relative_image_target,
 )
 from simple_ar.tools.sources import SourceToolGateway
 from simple_ar.tools.specs import CommonToolSpec, ToolResult
@@ -126,13 +125,7 @@ def _digest(value: Any) -> str:
 
 def _relative_image_target(target: str) -> str | None:
     """A safe output-relative spelling for an unchanged local Markdown image."""
-    url = urlsplit(target)
-    value = unquote(url.path)
-    path = PurePosixPath(value)
-    if (url.scheme or url.netloc or url.query or url.fragment or not value
-            or '\\' in value or path.is_absolute() or '..' in path.parts):
-        return None
-    return path.as_posix()
+    return relative_image_target(target)
 
 
 class DocumentWorkToolGateway:

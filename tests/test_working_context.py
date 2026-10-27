@@ -52,6 +52,34 @@ def expand_history_view(view):
 
 
 class WorkingContextTests(unittest.TestCase):
+    def test_scoped_originals_precede_optional_navigation_and_report_real_omissions(self):
+        first = observation(0, 'Original observed measurement and its scope.')
+        unused = observation(1, 'An unrelated, unreferenced observation.')
+        stale = observation(2, 'A stale observation.')
+        stale['sha256'] = 'old-digest'
+        diagnostic = {'kind': 'operation_result', 'record': 'records/process.json', 'turn': 1,
+            'text': json.dumps({'returncode': 1, 'stderr': 'Original execution diagnosis'})}
+        navigation = [{'turn': 0, 'request_count': 1, 'reply': 'records/reply.json',
+            'observation': {'tool': 'list_directory', 'arguments': {'large': 'x' * 5000}}}]
+        messages, metadata = select(material_policy='scoped', context_token_target=4000,
+            turn_blocks=[block(0, 'old native ' * 600), block(1, 'older native ' * 600), block(2, 'latest')],
+            observations=[first, unused, stale, diagnostic],
+            selected_records=[first['record'], stale['record'], diagnostic['record'], 'records/missing.json'],
+            version_resolver=lambda path: 'recorded-digest', operation_history=navigation,
+            block_request_counts=[1, 1, 1])
+        view = json.loads(messages[1]['content'])
+        self.assertIn(first['text'], json.dumps(view['working_view']['observations']))
+        self.assertIn('Original execution diagnosis', json.dumps(view['working_view']['observations']))
+        self.assertTrue(any(row['source']['record'] == diagnostic['record'] and row['version_status'] == 'historical'
+                            for row in metadata['selected_records']))
+        statuses = {row['source']['record']: row['status'] for row in metadata['omitted_records']}
+        self.assertEqual(statuses[unused['record']], 'unreferenced')
+        self.assertEqual(statuses[stale['record']], 'stale')
+        missing = [row for row in view['material_supply']['references'] if row['record'] == 'records/missing.json']
+        self.assertEqual(missing[0]['status'], 'missing')
+        self.assertEqual(view['working_view']['operation_overview']['omitted_entries'], 1)
+        self.assertLessEqual(metadata['estimated_input_tokens'], 4000)
+
     def test_shared_history_renderer_keeps_legacy_bytes_and_omits_only_navigation_streams(self):
         call = {'function': {'name': 'run_process', 'arguments': json.dumps({
             'argv': ['python', 'worker.py'], 'cwd': 'workspace'})}}

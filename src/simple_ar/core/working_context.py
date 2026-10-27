@@ -40,7 +40,7 @@ def select_working_context(
     summarized_through_turn: int = 0,
     history_access: str = 'read_history',
     trailing_messages: Sequence[Mapping[str, Any]] = (),
-    material_policy: Literal['ranked', 'referenced'] = 'ranked',
+    material_policy: Literal['ranked', 'referenced', 'scoped'] = 'ranked',
     operation_history: Sequence[Mapping[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Return messages and decision-budget metadata without modifying inputs.
@@ -75,9 +75,10 @@ def select_working_context(
     """
     if schema_tokens < 0 or context_token_target < 0:
         raise ValueError('Token costs and target must be nonnegative')
-    if material_policy not in ('ranked', 'referenced'):
+    if material_policy not in ('ranked', 'referenced', 'scoped'):
         raise ValueError('Unknown working context selection policy')
-    owner_records = material_policy == 'referenced'
+    scoped_records = material_policy == 'scoped'
+    owner_records = material_policy in {'referenced', 'scoped'}
     context = deepcopy(dict(base_context))
     if 'working_view' in context:
         raise ValueError('base_context reserves working_view for this selector')
@@ -266,8 +267,16 @@ def select_working_context(
                     text = dump(json.loads(text))
                 except ValueError:
                     pass
-            state['status'] = ('native' if row.get('turn') in recent and text in native_texts
-                               else 'stale' if state['version_status'] == 'stale' else 'capacity')
+            if row.get('turn') in recent and text in native_texts:
+                state['status'] = 'native'
+            elif state['version_status'] == 'stale':
+                state['status'] = 'stale'
+            elif scoped_records and row.get('record') not in references:
+                state['status'] = 'unreferenced'
+            elif scoped_records and state['version_status'] not in {'matching', 'historical'}:
+                state['status'] = 'unavailable'
+            else:
+                state['status'] = 'not_attempted' if scoped_records else 'capacity'
         view['stale_native_observations'] = [state['source'] for state in states
             if state['status'] == 'native' and state['version_status'] == 'stale']
         start = recent[0] if recent and any(blocks[:recent[0]]) else 0
@@ -367,7 +376,7 @@ def select_working_context(
 
     def admit(i: int) -> None:
         state = states[i]
-        if state['status'] != 'capacity':
+        if state['status'] != ('not_attempted' if scoped_records else 'capacity'):
             return
         if keys[i] in represented:
             state['status'] = 'duplicate'
@@ -413,10 +422,14 @@ def select_working_context(
     def operation_priority(i: int) -> tuple[bool, int]:
         return (operations[i].get('turn') not in recent, i)
 
-    for i in sorted(range(len(operations)), key=operation_priority, reverse=True):
-        operation_indices.append(i)
-        if project()[1] > context_token_target:
-            operation_indices.pop()  # Never excerpt a serialized operation.
+    def admit_navigation() -> None:
+        for i in sorted(range(len(operations)), key=operation_priority, reverse=True):
+            operation_indices.append(i)
+            if project()[1] > context_token_target:
+                operation_indices.pop()  # Never excerpt a serialized operation.
+
+    if not scoped_records:
+        admit_navigation()
 
     ordered = ([i for i, row in enumerate(rows) if row.get('record') in references]
                if owner_records else sorted(range(len(rows)), key=priority, reverse=True))
@@ -437,6 +450,10 @@ def select_working_context(
     for i in ordered:
         if i not in preferred:
             admit(i)
+    if scoped_records:
+        # Actual referenced originals share the same budget and are admitted
+        # before optional receipt navigation; neither source is a new store.
+        admit_navigation()
 
     messages, cost = project()
     selected = [state for state in states if state['status'] in {'native', 'working_view'}]

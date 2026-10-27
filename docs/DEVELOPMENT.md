@@ -70,14 +70,17 @@ New creation defaults to `tool_contracts="on_demand"`: workspace editing, permit
 process operations and coordination are directly available; optional professional
 contracts are discoverable and loaded when needed. Frozen code, table-analysis and
 measurement contracts expose their required owners directly. New tasks freeze
-`professional_operations="work.v3"`: source and document methods use the same native
-decision loop, working view and journal. `select_work_method` selects a goal,
-authorized locations and the existing code/writing route; it does not start a
-subagent or grant permission. Workspace owns actual reads, copies, version-bound
-edits and approved processes. Inspection, publication and delivery stay independent.
+`professional_operations="work.v4"`: coherent source and document work uses the same
+native decision loop, working view and journal. `begin_professional_work` binds the
+current goal and authorized locations; subsequent native turns perform the work
+on the existing code/writing route. `finish_professional_work` returns actual
+candidate versions and remaining gaps, not a review or task-completion certificate.
+Revision retains the original manuscript bytes. Simple tasks may still use direct
+operations. Workspace owns reads, copies, version-bound edits and approved processes;
+inspection, publication and delivery stay independent. No nested session is created.
 
 New tasks do not register nested `prepare_implementation` or `work_document`
-controllers. Saved `work.v1`/`work.v2`, preparation and `outcomes` contracts keep
+controllers. Saved `work.v1`/`work.v2`/`work.v3`, preparation and `outcomes` contracts keep
 their original owners and executable recovery, including candidate admission and
 accounted final-response recovery. Loading tools or selecting a method cannot
 silently upgrade those contracts. Presentation omission never proves an original
@@ -180,7 +183,7 @@ artifacts use the same delivery and feedback loop; publication is optional.
 Explicit report claims and requested PDF/TeX retain their inspection/version checks.
 Core retains attempts, artifacts, resource usage and process results through the same shared execution and records.
 
-New operation tasks save `working.v3`. One measured input budget admits recent
+New operation tasks save `working.v4`. One measured input budget admits recent
 atomic conversation, work-owner notes, a compact operation overview derived from
 actual receipts, and explicitly referenced earlier observations. Completed work
 therefore remains discoverable without requiring a model-written note. The
@@ -190,6 +193,11 @@ current file contents, permission or scientific correctness. There is no second
 summary author or persisted memory cache. Navigation reuses the history renderer,
 retains short results, and prioritizes archived work absent from recent conversation.
 Detailed transport traces remain in original receipts; omitted fields are explicit.
+Within professional work, its owner locates relevant original reads and historical
+execution diagnostics. Explicit originals precede optional navigation in the same
+selector; unreferenced, unavailable, stale and capacity-omitted material are distinct.
+Historical diagnostics do not become current file facts. Saved context versions keep
+their original selection and recovery behavior.
 Saved `working.v2` tasks retain their
 referenced-observation selection without automatically gaining the overview.
 Saved `working.v1` tasks retain their automatic checkpoints, original selection,

@@ -4,13 +4,25 @@ from __future__ import annotations
 import json
 import hashlib
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Literal
+from urllib.parse import unquote, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from simple_ar.core.budget import BudgetLedger
 from simple_ar.tools.workspace import FileWindow
+
+
+def relative_image_target(target: str) -> str | None:
+    """Resolve only unchanged, local document-relative image spellings."""
+    url = urlsplit(target)
+    value = unquote(url.path)
+    path = PurePosixPath(value)
+    if (url.scheme or url.netloc or url.query or url.fragment or not value
+            or '\\' in value or path.is_absolute() or '..' in path.parts):
+        return None
+    return path.as_posix()
 
 
 _CONTENT_REUSE_MAX_PROBES = 128

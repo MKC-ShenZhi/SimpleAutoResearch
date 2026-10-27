@@ -58,8 +58,8 @@ _SHARED_OWNERS = 'owners.v2'
 _ADOPTING_OWNERS = 'owners.v3'
 _REQUEST_OWNER = 'requests.v1'
 _DECLARED_INPUTS = 'declared_inputs.v1'
-_WORKING_CONTEXT_PROTOCOLS = {'working.v1', 'working.v2', 'working.v3'}
-_REFERENCED_CONTEXT_PROTOCOLS = {'working.v2', 'working.v3'}
+_WORKING_CONTEXT_PROTOCOLS = {'working.v1', 'working.v2', 'working.v3', 'working.v4'}
+_REFERENCED_CONTEXT_PROTOCOLS = {'working.v2', 'working.v3', 'working.v4'}
 _CONVERSATION_CONTEXT_PROTOCOLS = {'conversation.v1', *_WORKING_CONTEXT_PROTOCOLS}
 _CONTEXT_PROTOCOLS = {None, *_CONVERSATION_CONTEXT_PROTOCOLS}
 _ADOPTING_OWNER_MODES = {_ADOPTING_OWNERS, _REQUEST_OWNER}
@@ -432,6 +432,7 @@ class ToolApplication:
             execution_observations=self._execution_observations, work_context=self._work_context,
             material_observations=self._material_observations,
             user_requests=self._inspection_requests,
+            native_route_validator=self._validate_professional_route,
             search_registry=getattr(self.services,'search_registry',None))
         self.workspace, self.gateway = self.operations.workspace, self.operations.gateway
         self.sources, self.publication = self.operations.sources, self.operations.publication
@@ -692,7 +693,8 @@ class ToolApplication:
         return tuple(ArtifactStore(self.session.store.root / 'attempts' / attempt.attempt_id).resolve(ref)
             for attempt in self.session.list_attempts() if attempt.status == 'completed'
             for ref in attempt.outputs if ref.status == 'available'
-            and ref.kind not in {'native_reply', 'native_result', 'native_observation', 'caller_actions'})
+            and ref.kind not in {'native_reply', 'native_result', 'native_observation', 'caller_actions',
+                                 'professional_scope_receipt', 'professional_scope_request', 'professional_prior'})
 
     @property
     def schemas(self) -> list[dict[str, object]]:
@@ -923,6 +925,25 @@ class ToolApplication:
             return self.operations.methods.purpose()
         return ('task' if self.state['config'].get('professional_work') in _OWNER_MODES
             else self._work_focus()['purpose'])
+
+    def _validate_professional_route(self, purpose: str) -> None:
+        """A work scope cannot silently switch protocol or context contract."""
+        if self.state['config'].get('context_protocol') != 'working.v4':
+            raise ValueError('Professional work requires working.v4; this task retains its saved context contract')
+        self._client(purpose=purpose, native=True)
+
+    def _professional_boundary(self) -> int:
+        """Keep native model histories on their original route after scope transitions."""
+        if self.operations is None or self.operations.work is None:
+            return 0
+        record = self.operations.work.transition_record()
+        if record is None:
+            return 0
+        for index in range(len(self.state['turns']) - 1, -1, -1):
+            for item in reversed(self.state['turns'][index]['tools']):
+                if item['result'] == record:
+                    return index + 1
+        return 0
 
     def _work_plan(self) -> dict[str, Any] | None:
         """One view of closed tool receipts; never another mutable plan store."""
@@ -1677,7 +1698,7 @@ class ToolApplication:
                investigate_results: bool = True,
                control_protocol: Literal['operations.v1'] = 'operations.v1',
                creation_declarations: dict[str, Any] | None = None,
-               context_protocol: Literal['auto', 'conversation.v1', 'working.v1', 'working.v2', 'working.v3'] | None = 'auto') -> ToolApplication:
+               context_protocol: Literal['auto', 'conversation.v1', 'working.v1', 'working.v2', 'working.v3', 'working.v4'] | None = 'auto') -> ToolApplication:
         """Create work on the operation-composed loop.
 
         Historical professional controllers are load-only. Loading and supply
@@ -1690,7 +1711,7 @@ class ToolApplication:
         if professional_inputs or not investigate_results or report_protocol is not None:
             raise ValueError('Professional controller options are load-only; new tasks use source operations, inspect_artifacts and export_report')
         if context_protocol == 'auto':
-            context_protocol = 'working.v3'
+            context_protocol = 'working.v4'
         if context_protocol not in _CONTEXT_PROTOCOLS:
             raise ValueError('Unsupported context protocol')
         if creation_declarations is not None and context_protocol not in _CONVERSATION_CONTEXT_PROTOCOLS:
@@ -3012,7 +3033,7 @@ class ToolApplication:
         """
         config, turns = self.state['config'], self.state['turns']
         working_mode = config.get('context_protocol') in _WORKING_CONTEXT_PROTOCOLS
-        operation_history = [] if config.get('context_protocol') == 'working.v3' else None
+        operation_history = [] if config.get('context_protocol') in {'working.v3', 'working.v4'} else None
         declared = config.get('input_contract') == _DECLARED_INPUTS
         client = client or self._client()
         focus = self._work_focus()
@@ -3021,7 +3042,8 @@ class ToolApplication:
             native_history_start_turn = rebindings[-1].get('native_history_start_turn', 0) if rebindings else 0
         if type(native_history_start_turn) is not int or not 0 <= native_history_start_turn <= len(turns):
             raise ValueError('Invalid native history boundary')
-        boundary = max(native_history_start_turn, focus.get('native_history_start_turn', 0))
+        boundary = max(native_history_start_turn, focus.get('native_history_start_turn', 0),
+                       self._professional_boundary())
         output = client.effective_output_limit() or 0
         target = client._settings.context_input_tokens
         remaining = self.ledger.remaining('total_tokens')
@@ -3099,7 +3121,7 @@ class ToolApplication:
                 context.pop(name,None)
             method = self.operations.method_context()
             if method is not None:
-                context['professional_method'] = method
+                context['professional_work' if self.operations.work is not None else 'professional_method'] = method
             delivery_feedback = self._delivery_feedback()
             if delivery_feedback:
                 context['last_delivery_check'] = delivery_feedback
@@ -3248,15 +3270,26 @@ class ToolApplication:
                 except (ValueError,OSError):
                     return None
             memory = self._working_memory() if working_memory is None else working_memory
+            work_notes = memory['notes']
+            selected_records = list((plan or {}).get('evidence_records', []))
+            if self.operations is not None and self.operations.work is not None:
+                scope = self.operations.work.input_view(rows=working_rows, operation_history=operation_history,
+                    boundary=boundary, references=selected_records, notes=work_notes)
+                if scope is not None:
+                    selected_records, work_notes = scope['references'], scope['notes']
+                    operation_history = scope['operation_history']
+                    if scope['diagnostic']:
+                        context['professional_work']['material_diagnostic'] = scope['diagnostic']
             messages, selection = select_working_context(user_requests=self.state['requests'],
                 system_text=prefix[0]['content'],base_context=context,
                 turn_blocks=[block if position>=boundary else [] for position,block in enumerate(blocks)],
                 observations=working_rows, schema_tokens=schema_cost,context_token_target=target,
-                estimate_tokens=estimate_tokens,work_notes=memory['notes'],
+                estimate_tokens=estimate_tokens,work_notes=work_notes,
                 summarized_through_turn=memory['through_turn'],
-                selected_records=(plan or {}).get('evidence_records',[]),version_resolver=version,
+                selected_records=selected_records,version_resolver=version,
                 block_request_counts=[turn.get('request_count',1) for turn in turns],
-                material_policy='referenced' if config['context_protocol'] in _REFERENCED_CONTEXT_PROTOCOLS else 'ranked',
+                material_policy=('scoped' if config['context_protocol'] == 'working.v4' else
+                    'referenced' if config['context_protocol'] in _REFERENCED_CONTEXT_PROTOCOLS else 'ranked'),
                 operation_history=operation_history)
             cost = estimate_tokens(json.dumps(messages,ensure_ascii=False))+schema_cost
             if remaining is not None and cost+output>remaining:
@@ -3591,6 +3624,16 @@ class ToolApplication:
             if terminal_error:
                 result = ToolResult(tool_name=call['function']['name'], status='blocked',
                     error=terminal_error, data={'executed': False})
+            elif (self.operations is not None and self.operations.work is not None
+                    and call['function']['name'] in {'begin_professional_work', 'finish_professional_work'}
+                    and len(self.session.store.read_json(self.state['turns'][-1]['reply']).get('tool_calls', [])) != 1):
+                result = ToolResult(tool_name=call['function']['name'], status='blocked',
+                    error='Begin or return professional work alone so the next native decision uses the correct route.',
+                    data={'executed': False})
+            elif (self.operations is not None and self.operations.work is not None
+                    and (reason := self.operations.work.protect_prior(call['function']['name'], arguments))):
+                result = ToolResult(tool_name=call['function']['name'], status='blocked',
+                    error=reason, data={'executed': False})
             elif (spec is not None
                     and spec.domain == 'scientific' and spec.permission_level == 'execution'
                     and (issues := self.scientific.execution_issues())):
@@ -3748,6 +3791,12 @@ class ToolApplication:
             artifacts += (store.ref('implementation.json', kind='implementation_result', schema='research_implementation.v1'),)
         if name in {'prepare_code_task', 'implement_code_task'} and store.exists('execution.json'):
             artifacts += (store.ref('execution.json', kind='prepared_execution', schema='prepared_execution.v1'),)
+        if name in {'begin_professional_work', 'finish_professional_work'} and store.exists('professional_receipt.json'):
+            artifacts += (store.ref('professional_receipt.json', kind='professional_scope_receipt'),)
+        if name == 'begin_professional_work' and store.exists('professional_begin.json'):
+            artifacts += (store.ref('professional_begin.json', kind='professional_scope_request'),)
+        if name == 'begin_professional_work' and store.exists('professional_prior.md'):
+            artifacts += (store.ref('professional_prior.md', kind='professional_prior'),)
         for row in payload.get('metadata', {}).get('capability_artifacts', []):
             declared = ArtifactRef.from_dict(row)
             store.require(declared)
@@ -4359,6 +4408,16 @@ class ToolApplication:
                 refusal = self._offered_tool_refusal(pending['call'])
                 if refusal is None or store.read_json('native_result.json') != refusal.model_dump(mode='json'):
                     raise ValueError('Saved admission refusal disagrees with the frozen offered contract')
+            elif (capability == 'native_tool' and self.operations is not None and self.operations.work is not None
+                    and pending.get('call', {}).get('function', {}).get('name') in
+                        {'begin_professional_work', 'finish_professional_work'}
+                    and store.read_json('native_result.json').get('status') == 'ok'):
+                if not store.exists('professional_receipt.json'):
+                    raise ValueError('Professional work receipt is missing; no replay')
+                function = pending['call']['function']
+                retained = self.operations.work.call(function['name'], json.loads(function['arguments']), identity=identity)
+                if retained.model_dump(mode='json') != store.read_json('native_result.json'):
+                    raise ValueError('Professional work differs from its retained candidate or request; no replay')
             elif not confirmed and (owner := self.gateway.session_owner(
                     pending.get('call', {}).get('function', {}).get('name', ''))) is not None:
                 observed = owner.execute_tool(pending['call']['function']['name'], CapabilityContext(store, existing),
