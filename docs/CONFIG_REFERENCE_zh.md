@@ -601,13 +601,15 @@ app = create_research_task(ResearchBrief(request_text="测量所提供的程序�
 | `context_protocol="conversation.v1"`（保存／兼容任务） | 保留时间顺序投影和原始记录，旧任务不静默升级；显式 `None` 保留原legacy投影。工作集目标是软限制，实际共享token额度仍受约束。 |
 | `control_protocol="operations.v1"`（新任务） | 普通 `start`、结构化入口与 `ToolApplication.create` 在同一行动循环中组合读写、执行、检查与出版。新建拒绝 `None` 及旧专业控制选项；历史任务通过 `load`、`supply` 沿原合同继续。 |
 | `completion_policy="available_operations.v1"`（新操作任务） | 在实际资源与审批限制内保留可用操作，最后一次可负担决策也能留下有用的中间工作。耗尽暂停并保留成果；只有显式且校验通过的交付才算完成。保存任务保留原末次／保护决策策略。 |
-| `report={"status":"canonical","manuscript":"report.md","formats":["markdown","pdf"]}` | 交付声明可编辑正文及所需格式；完整交付须有当前正文的独立检查，以及需要时与其匹配的出版物，文件存在不足以证明完成。 |
+| `report={"status":"canonical","manuscript":"report.md","formats":["markdown","pdf"]}` | 交付声明可编辑正文及所需格式。新任务绑定 `delivery_review_protocol=task.v1`，由交付操作沿同一账本负责整项请求与实际交付清单的独立核查；窄范围局部检查不能替代。请求的出版物仍须与正文同版。 |
 | 交付中的 `limitations`／`unresolved` | 前者说明研究范围、不确定性或不可得测量；后者说明尚未完成的请求或必改缺陷，并使交付为部分完成。都不能用于虚报质量。 |
 | 交付中的 `summary_source={"path":"report.md","offset_bytes":0,"max_bytes":1024}` | 可选的实际交付文本窗口。最终产出成功后，以原文替换自由 `summary`，来源须在本次交付集合内，并沿原交付哈希核版本；缺失、不可读或无效UTF-8窗口不回退自由摘要。省略保留原自由说明合同；摘录不认证科学正确性或代表全文。 |
 | `create_research_task(..., allow_vision=True)` | 严格布尔值，默认 `False`；须有命名 vision 路由及连接，共用 `services.budget_limits`。文字或注入文本客户端不授权视觉检查；不授予来源联网、图像生成，不改旧权限或返回类型。 |
 | `supply(..., replace_existing=True)` | 调用方可明确替换 `delivery_files`、`tool_contracts` 或 `completion_policy`；无关补齐保留策略及账本。 |
 
 按任务需要交付：中文 Markdown 说明、源码或表格均可成为最终成果，无须声明正式报告；需要时再请求 PDF／TeX。明确声明正式报告仍须检查当前稿件，请求的出版物须与之同版。这不代表自动选择格式或整项任务成功率已获验证。
+
+正式稿准备好后可直接提交交付，事先单独调用 `inspect_artifacts` 只是可选帮助。交付核查保留原始要求、反馈、正文、格式及全部交付文件版本；只有范围及支撑依据仍有效时，才复用完整通过的意见。失败与未完成工作保留，新的明确交付可再次请求核查，恢复不会重放在途或失败调用。没有该保存协议的历史任务继续沿原交付检查恢复。只读核查不执行数值复算，也不认证科学正确性。
 
 `inspect_artifacts` 只接收可解码文字目标；不支持的目标在请求模型前拒绝准入，不产生意见。渲染图片使用 `inspect_images`。检查者可在授权目录中自行定位、补读必要来源，沿原账本计费。新 `subjects.v3` 不设私有六轮上限，保留每次响应与实际读取，为最终意见预留容量，可明确说明未完成；无效最终响应只纠正一次。旧协议保持原限制。
 

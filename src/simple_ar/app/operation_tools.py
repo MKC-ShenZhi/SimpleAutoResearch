@@ -12,7 +12,7 @@ from simple_ar.core.assessments import assessment_issues, current_assessments
 from simple_ar.tools.gateway import CommonToolGateway
 from simple_ar.tools.registry import ToolRegistry
 from simple_ar.tools.permissions import ToolPermissionPolicy
-from simple_ar.tools.specs import CommonToolSpec
+from simple_ar.tools.specs import CommonToolSpec, ToolResult
 from simple_ar.tools.workspace import WorkspaceToolGateway, workspace_tool_specs, DeliveryRequest
 from simple_ar.tools.sources import SourceToolGateway, source_tool_specs
 from simple_ar.tools.publication import PublicationToolGateway, publication_tool_specs
@@ -32,16 +32,25 @@ _DIRECT_WORK = (
     "code behavior through actual callers, resolved configuration and defaults. Ask only indispensable "
     "questions about semantics, scope, resources or permission. "
 )
-_WORK_PRINCIPLES = (
+def _work_principles(owned_delivery: bool = False) -> str:
+    return (
     "After a coherent investigation or revision, retain compact working understanding, decisions, failures "
     "and open questions with update_work_plan.notes citing actual observation records. Reuse this work "
     "across feedback instead of reinventorying materials. Notes are model judgments; original observations "
     "remain evidence. Work in complete useful units: investigate enough, implement and run, interpret the "
     "result, then inspect and deliver; do not repeatedly recheck an unchanged result without a concrete gap. "
-    "For a formal report, keep one editable manuscript, independently inspect it against actual original "
-    "evidence using inspect_artifacts, and export that same version if PDF/TeX is requested. Check the "
-    "claims and methods, not only agreement between generated text and generated tables. A narrow "
-    "consistency check is not a review of the underlying analysis. A canonical "
+    + ("For a formal report, keep one editable manuscript and submit its canonical delivery when the "
+       "requested work is ready; export that same version if PDF/TeX is requested. The delivery owner "
+       "independently reviews the complete requested work and actual delivery inventory before acceptance, "
+       "using this same ledger. Leave shared model capacity for that review. Local inspect_artifacts "
+       "checks are optional aids and cannot substitute for it; do not add a separate review merely to "
+       "satisfy a completion gate. Address genuine required findings, preserving useful outputs. "
+       if owned_delivery else
+       "For a formal report, keep one editable manuscript, independently inspect it against actual original "
+       "evidence using inspect_artifacts, and export that same version if PDF/TeX is requested. Check the "
+       "claims and methods, not only agreement between generated text and generated tables. A narrow "
+       "consistency check is not a review of the underlying analysis. ")
+    + "A canonical "
     "report claim identifies the inspected manuscript and requested formats in the delivery. Fix actual required findings; "
     "a process exit code or files existing is not a scientific or visual certificate. Use image inspection "
     "when available and relevant; never claim visual inspection from text alone. Preserve limitations. "
@@ -53,7 +62,7 @@ _WORK_PRINCIPLES = (
     "delivery or necessary question; disclose unfinished requested work as unresolved. Put inherent "
     "research scope or unavailable measurements in limitations; completed bounded analysis can retain uncertainty."
 )
-SYSTEM = _DIRECT_WORK + _WORK_PRINCIPLES
+SYSTEM = _DIRECT_WORK + _work_principles()
 _SOURCE_COORDINATION = (
     "Coordinate the user's research request as complete useful work units using the available operations "
     "and authorized materials. Choose work from the goal, existing artifacts and concrete gaps; operations "
@@ -109,6 +118,11 @@ class OperationTools:
         self.registry.register_package(inspection_tool_specs(progressive=self.inspection.progressive,
             adaptive=self.inspection.adaptive),
             self.inspection, request_visible=True)
+        self.delivery_review = None
+        if config.get('delivery_review_protocol') == 'task.v1':
+            from simple_ar.tools.delivery_review import DeliveryReview
+            self.delivery_review = DeliveryReview(workspace=self.workspace, inspector=self.inspection,
+                user_requests=user_requests, observations=observations)
         self.registry.register_package(analysis_tool_specs(),
             AnalysisToolGateway(root,self.workspace,contract=config.get('table_analysis')))
         self.implementation = self.scientific = None
@@ -116,8 +130,9 @@ class OperationTools:
         if preparation not in {None,'prepared.v1','prepared.v2','prepared.v3'}:
             raise ValueError('Unsupported source generation protocol')
         exact = config.get('code_task') is not None
-        self.system = (_SOURCE_COORDINATION + _WORK_PRINCIPLES
-            if not exact and preparation in {'prepared.v2','prepared.v3'} else SYSTEM)
+        self.system = (_SOURCE_COORDINATION
+            if not exact and preparation in {'prepared.v2','prepared.v3'} else _DIRECT_WORK) + _work_principles(
+                config.get('delivery_review_protocol') == 'task.v1')
         if exact or preparation is not None and config['model'] is not None:
             from simple_ar.tools.implementation import ImplementationToolGateway, implementation_tool_specs
             self.implementation = ImplementationToolGateway(root,self.workspace,ledger,config['model'],session_id,
@@ -278,7 +293,15 @@ class OperationTools:
                 limit = requirement['config'].get('max_cited_sources',0)
                 if limit and len(body_citation_ids(markdown,set(),include_unknown=True)) > limit:
                     issues.append('Report exceeds frozen max_cited_sources')
-        issues.extend(assessment_issues(self.workspace,observations,resolved['artifacts'],require_pass=required))
+        scoped_review = self.delivery_review is not None and bool(required)
+        # Admission need not already have the review it is about to perform.
+        # After the operation, local opinions still constrain actual findings,
+        # but only the bound whole-delivery review fulfills the report check.
+        if not (scoped_review and proposed is not None):
+            issues.extend(assessment_issues(self.workspace,observations,resolved['artifacts'],
+                require_pass=[] if scoped_review else required))
+        if scoped_review and proposed is None:
+            issues.extend(self.delivery_review.issues(observations, delivery))
         implementation = None
         if self.config.get('code_task') is not None:
             implementation = next((row for row in reversed(owned)
@@ -313,3 +336,22 @@ class OperationTools:
             except (ValueError,OSError,KeyError,RuntimeError) as exc:
                 issues.append(str(exc))
         return issues
+
+    def review_delivery(self, delivery: dict, identity: str, *, may_start: bool) -> dict | None:
+        if self.delivery_review is None:
+            return None
+        return self.delivery_review.review(delivery, identity, may_start=may_start)
+
+    def coordination_result(self, result: dict, record: str) -> dict:
+        presented = self.gateway.coordination_result(result, record)
+        review = (presented.get('metadata') or {}).get('delivery_review')
+        if review is None:
+            return presented
+        from copy import deepcopy
+        presented = deepcopy(presented)
+        review = presented['metadata']['delivery_review']
+        review['result'] = self.inspection.coordination_result(
+            ToolResult.model_validate(review['result']), receipt_path=record)
+        review['result']['data']['source_observations']['fields'] = [
+            'metadata.delivery_review.result.data.targets', 'metadata.delivery_review.result.data.evidence']
+        return presented

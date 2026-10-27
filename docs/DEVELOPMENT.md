@@ -113,6 +113,21 @@ local inspection goal. The shared context selector accounts for both. Requiremen
 are neither evidence nor permission; a narrow inspection does not certify the whole
 task. Cached historical inspections keep their original input contract.
 
+New tasks also freeze `delivery_review_protocol=task.v1`. `DeliveryReview` owns the
+scope of formal delivery and invokes the existing inspector within the terminal
+operation. Its receipt binds exact user requests and feedback, authorized roots,
+requested formats, manuscript and all delivered file hashes. Inspection owns its
+investigation, source reads and opinions; the application retains terminal-state
+and execution responsibilities. A local consistency pass cannot prove whole-task
+acceptance. No second review loop, ledger or material store is introduced.
+Only a verified complete pass is reusable across explicit delivery attempts;
+changed sources or scope invalidate it. Failed or incomplete opinions may be
+reassessed by a new explicit operation, never replayed during recovery. Compound
+receipts expose actual source reads through the existing material decoder, while
+coordination receives compact findings. Saved tasks without this field retain
+their original gate. This read-only review is not numerical execution or a
+guarantee of scientific quality.
+
 Saved `source_generation_protocol=prepared.v3` tasks retain their preparation and
 approved-execution owner. Ordinary new tasks no longer select this protocol.
 Explicit code tasks retain their exact edit, validation and execution contracts.

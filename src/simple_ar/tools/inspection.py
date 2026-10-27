@@ -699,6 +699,20 @@ class InspectionToolGateway:
                 'permission. The separate goal selects this inspection scope. Use relevant user '
                 'requirements to judge the selected targets; a narrow check does not certify the '
                 'whole task or require review of unrelated work.')
+        if 'delivery_context' in saved:
+            delivery = saved['delivery_context']
+            view['user_request_scope'] = (
+                'Exact original task requests and feedback, not evidence or permission. '
+                'This owner requests the complete proposed-delivery review; its fixed goal '
+                'does not narrow this to agreement among generated files.')
+            view['proposed_delivery'] = {
+                'manuscript': delivery['manuscript'], 'formats': delivery['formats'],
+                'artifacts': list(delivery['artifacts']),
+                'scope': 'Owner-bound actual delivery inventory, not proof of correctness. '
+                    'Review the relevant original requests across this work, including methods, '
+                    'supporting source/code/results and interpretations. Generated files agreeing '
+                    'with one another do not establish correctness. Locate and read original '
+                    'evidence as needed; disclose unsupported conclusions or unfinished checks.'}
         for role in ('targets','evidence'):
             view[role] = [{'subject':row['subject'], 'path':row.get('path'), 'complete':row['complete'],
                 'limitation':row.get('limitation',''),
@@ -1067,7 +1081,8 @@ class InspectionToolGateway:
             self._check_versions([*saved['targets'],*saved['evidence']],identity)
             number += 1
 
-    def call(self, name: str, arguments: dict[str, Any], identity: str) -> ToolResult:
+    def call(self, name: str, arguments: dict[str, Any], identity: str, *,
+             delivery_context: dict[str, Any] | None = None) -> ToolResult:
         try:
             if name != 'inspect_artifacts':
                 raise ValueError('Unknown inspection operation')
@@ -1079,7 +1094,8 @@ class InspectionToolGateway:
             if self.has_started(identity):
                 saved = self.store.read_json(input_path)
                 if (saved['identity'] != identity or saved['arguments'] != binding
-                        or saved.get('protocol') != self.protocol):
+                        or saved.get('protocol') != self.protocol
+                        or saved.get('delivery_context') != delivery_context):
                     raise ValueError('Inspection identity is bound to different arguments; no replay')
                 return self._cached(identity)
             # Observe targets before admitting professional work. Read-only file
@@ -1088,6 +1104,11 @@ class InspectionToolGateway:
             saved = {'identity': identity, 'arguments': binding, 'targets': [], 'evidence': []}
             if self.protocol:
                 saved['protocol'] = self.protocol
+            if delivery_context is not None:
+                if (not isinstance(delivery_context, dict)
+                        or delivery_context.get('schema_version') != 'delivery_review.v1'):
+                    raise ValueError('Delivery inspection requires its owner-bound context')
+                saved['delivery_context'] = deepcopy(delivery_context)
             remaining = [512000]
             saved['targets'] = [self._observe(value, f'target-{i + 1}', identity, remaining)
                                 for i, value in enumerate(request.targets)]

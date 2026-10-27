@@ -122,6 +122,14 @@ def window_key(workspace: Any, window: FileWindow) -> tuple:
 
 def journal_read_windows(receipt: dict, request: dict) -> list[dict]:
     """Decode successful byte-owner reads; no current access or fact certification."""
+    review = (receipt.get('metadata') or {}).get('delivery_review')
+    nested = review.get('result') if isinstance(review, dict) else None
+    if (receipt.get('tool_name') != 'inspect_artifacts' and isinstance(nested, dict)
+            and nested.get('tool_name') == 'inspect_artifacts'):
+        # A compound delivery retains the same inspector's raw observations.
+        # Their later byte/range admission remains independent of its verdict.
+        return [{**row, 'field': 'metadata.delivery_review.result.' + row['field']}
+            for row in journal_read_windows(nested, {})]
     if receipt.get('tool_name') == 'inspect_artifacts':
         # A failed professional opinion can still contain actual source reads.
         # Only decoded byte-owner windows are reusable, never its findings.
@@ -336,8 +344,6 @@ def journal_material_references(workspace: Any, store: Any, turns: list[dict],
         calls = {call['id']: call for call in store.read_json(turn['reply']).get('tool_calls', [])}
         for item in reversed(turn['tools']):
             call = calls.get(item['id'], {}).get('function', {})
-            if call.get('name') not in {'read_file', 'focus_work', 'inspect_artifacts'}:
-                continue
             try:
                 request = json.loads(call['arguments'])
                 raw = store.resolve(item['result']).read_bytes()

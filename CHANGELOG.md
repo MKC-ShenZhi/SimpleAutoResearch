@@ -8,17 +8,14 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 
 ### Improved
 
-- New tasks keep work-owner notes and explicitly referenced earlier observations without paid background summaries or unrelated history backfill. Saved context protocols retain their original accounting and recovery; real-task efficiency is still under evaluation.
-- Shared work principles retain the finish policy across ordinary and saved source control: optional presentation advice does not add task obligations. Real completion and cost improvement still require acceptance.
-- An official DeepSeek catalog example separates agent text/code work from visual inspection without adding a provider adapter or changing historical task connections.
-- Ordinary source work uses shared editing and execution operations without a mandatory preparation controller. Explicit code-task constraints and saved preparation recovery remain unchanged.
-- Independent inspection receives the original user requirements and feedback separately from its local scope; a narrow review still does not certify the whole task.
-- Ordinary tasks can reuse a delivered complete project snapshot without a preparation controller. Incomplete or changed snapshots are rejected, and execution authority is not inherited.
-- Actual source windows read during inspection join shared material reuse after receipt, permission, version and range checks. Later work can reuse supporting text, including reads retained after a failed opinion, without inheriting its verdict.
-- Fresh inspections directly supply small whole-file targets within the current input budget. Large files remain paged, explicit windows keep their scope, and reading the full text does not imply a completed or passing review.
+- Formal report delivery in new tasks owns an independent review of the original request, feedback and actual complete delivery. Local consistency checks cannot fulfill this obligation. Review shares the task ledger; saved tasks keep their original contract.
+- Work-owner notes and explicitly referenced source observations replace paid background summaries and unrelated history backfill. Inspection reads also remain reusable after version and permission checks, without inheriting the reviewer's opinion.
+- Ordinary source work uses shared editing and execution, and can reuse a complete delivered project snapshot. Exact code contracts and historical preparation recovery remain unchanged; execution authority is not inherited.
+- Shared finish principles distinguish necessary work from optional presentation advice. An official DeepSeek catalog example separates text/code work from visual inspection without changing historical connections.
 
 ### Fixed
 
+- Interrupted publication recovery reads retained review receipts without dispatching a new inspection. Full delivery reviews bind attachment versions and scope; incomplete or negative opinions are retained and may be reassessed by a new explicit delivery.
 - Complete project reuse follows recorded byte versions through copies and edits. Later successful outputs cannot clear an earlier copied version's failure or stale inputs; retired intermediate directories need not remain intact. This does not certify copied code or inherit execution authority.
 - Independent inspection identifies invalid source references and can bind an omitted target only when its identity is uniquely determined. Rejected comments remain explicitly unverified, with their original trace available; ambiguous identities and invalid evidence still fail. The one-correction limit and historical receipts remain unchanged.
 - Final inspection instructions share the same context selection budget as source material, preventing an otherwise usable working view from overflowing at conclusion time. Historical records and model charges remain unchanged.

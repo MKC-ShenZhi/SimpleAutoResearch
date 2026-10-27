@@ -394,6 +394,8 @@ class ToolApplication:
             raise ValueError('Unsupported saved operation control protocol')
         if config.get('context_protocol') not in {None,'conversation.v1','working.v1','working.v2'}:
             raise ValueError('Unsupported saved operation context; no silent migration')
+        if config.get('delivery_review_protocol') not in {None, 'task.v1'}:
+            raise ValueError('Unsupported saved delivery review protocol; no silent migration')
         for alias, snapshot in config.get('source_snapshots', {}).items():
             source = Path(config['sources'][alias])
             if (not source.is_file() or source.stat().st_size != snapshot['size_bytes']
@@ -1676,6 +1678,7 @@ class ToolApplication:
             delivery_files=delivery_files,
             extensions=extensions, creation_declarations=creation_declarations)
         config['inspection_protocol'] = 'subjects.v3'
+        config['delivery_review_protocol'] = 'task.v1'
         if context_protocol is not None:
             config['context_protocol'] = context_protocol
         session = SessionController.create(root, session_id=root.name, topic=goal,
@@ -1841,6 +1844,7 @@ class ToolApplication:
             # their original closing obligation. Absent historical fields stay
             # absent unless explicitly supplied, including unrelated supplies.
             for field in ('completion_policy', 'tool_contracts', 'report_protocol', 'tool_completions', 'inspection_protocol',
+                          'delivery_review_protocol',
                           'document_source_contract', 'source_generation_protocol', 'source_decision_protocol'):
                 if field not in supplied:
                     if field in old:
@@ -2188,7 +2192,7 @@ class ToolApplication:
     def _coordination_result(self, result: dict, record: str, *, delivery_feedback: dict | None = None) -> dict:
         """Owner-authored presentation; never mutate the canonical observation."""
         if self.operations is not None:
-            presented = workspace_observation_view(self.gateway.coordination_result(result,record),record=record)
+            presented = workspace_observation_view(self.operations.coordination_result(result,record),record=record)
             if delivery_feedback is not None and delivery_feedback['record']==record:
                 return {**presented,'delivery_check':delivery_feedback}
             return presented
@@ -3459,7 +3463,7 @@ class ToolApplication:
         ref = context.store.write_json("native_result.json", message, kind="native_reply")
         return CapabilityResult(status="completed", artifacts=(*memory_refs,ref))
 
-    def _tool(self, *, context: Any, call: dict[str, Any]) -> CapabilityResult:
+    def _tool(self, *, context: Any, call: dict[str, Any], recovering: bool = False) -> CapabilityResult:
         refusal = self._offered_tool_refusal(call)
         if refusal is not None:
             payload = refusal.model_dump(mode='json')
@@ -3593,12 +3597,12 @@ class ToolApplication:
                     result = self.gateway.call(ToolCall(tool_name=call["function"]["name"],
                         arguments=arguments, trace_id=context.attempt.attempt_id))
             payload = result.model_dump(mode="json")
-            self._bind_delivery(call, payload, context.store)
+            self._bind_delivery(call, payload, context.store, start_review=not recovering)
         context.store.write_json("native_result.json", payload, kind="native_observation")
         return CapabilityResult(status='completed', artifacts=self._native_artifacts(
             context.store, payload, name=call['function']['name']))
 
-    def _bind_delivery(self, call: dict, payload: dict, store: ArtifactStore) -> dict:
+    def _bind_delivery(self, call: dict, payload: dict, store: ArtifactStore, *, start_review: bool = False) -> dict:
         """One delivery projection for normal execution and receipt recovery."""
         delivery = self._delivery(call, payload)
         if (payload.get('status') == 'ok' and self._terminal_intent(call)
@@ -3619,6 +3623,31 @@ class ToolApplication:
                     payload.update(status='blocked', error=str(exc))
                     return payload
             hashes = self.workspace.artifact_hashes(delivery['artifacts'])
+            if self.operations is not None:
+                try:
+                    review = self.operations.review_delivery(delivery, store.root.name, may_start=start_review)
+                    if review is not None:
+                        metadata = payload.setdefault('metadata', {})
+                        retained_review = metadata.get('delivery_review')
+                        if retained_review is not None and retained_review != review:
+                            raise ValueError('Retained delivery review differs from its actual receipt')
+                        metadata['delivery_review'] = review
+                        if not review.get('error'):
+                            reviewed = review['result']['metadata']
+                            for key in ('assessments', 'inspection_binding'):
+                                if key in reviewed:
+                                    metadata[key] = reviewed[key]
+                            if review['identity'] == store.root.name:
+                                metadata['capability_artifacts'] = [
+                                    *metadata.get('capability_artifacts', []),
+                                    *[ref for ref in reviewed.get('capability_artifacts', [])
+                                        if ref not in metadata.get('capability_artifacts', [])]]
+                    if hashes != self.workspace.artifact_hashes(delivery['artifacts']):
+                        raise ValueError('Delivery changed during its independent review')
+                except (ValueError, OSError, KeyError, TypeError, RuntimeError) as exc:
+                    # Keep completed production and review diagnostics. The
+                    # terminal gate requires the actual current full-scope proof.
+                    payload.setdefault('metadata', {})['delivery_review_error'] = str(exc)
             retained = payload['metadata'].get('delivery_hashes')
             if request.summary_source is not None:
                 try:
@@ -4237,7 +4266,7 @@ class ToolApplication:
                         ToolCall(tool_name=call["function"]["name"], trace_id=identity)):
                     raise RuntimeError("Interrupted operation has no durable result; inspect receipts before any replay")
                 else:
-                    recovered = self._tool(context=CapabilityContext(store, existing), call=call)
+                    recovered = self._tool(context=CapabilityContext(store, existing), call=call, recovering=True)
             elif (capability == 'native_tool'
                     and store.read_json('native_result.json').get('metadata', {}).get('admission') == 'offered.v1'
                     and store.read_json('native_result.json')['metadata'].get('dispatched') is False):

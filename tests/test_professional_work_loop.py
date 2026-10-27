@@ -412,7 +412,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
         return self._last('inspect_artifacts')
 
     def _assessment(self):
-        result = self._ok('inspect_artifacts')
+        result = next(row for row in reversed(self._observations())
+            if 'assessments' in row.get('metadata', {}) or 'assessment' in row.get('metadata', {}))
+        self.assertEqual(result['status'], 'ok', result)
         assessment = _assessments(result)[0]
         ArtifactAssessment.model_validate(assessment)
         for path, digest in assessment['subjects'].items():
@@ -457,8 +459,14 @@ class OperationsWorkLoopTests(unittest.TestCase):
         def review_actual_text(view):
             targets = '\n'.join(window['text'] for row in view['targets']
                 for window in row['text_windows'])
-            evidence = '\n'.join(window['text'] for row in view['evidence']
-                for window in row['text_windows'])
+            evidence = json.dumps(self.inspection_requests[-1]['messages'])
+            missing = []
+            if not all(text in evidence for text in ('a,1', 'b,2', 'c,3')):
+                missing.append(_action('read_file', path='measurements/observations.csv'))
+            if 'no sampling design' not in evidence:
+                missing.append(_action('read_file', path='measurements/conditions.txt'))
+            if missing:
+                return missing
             self.assertIn('2.0', targets)
             self.assertIn('a,1', evidence)
             self.assertIn('b,2', evidence)
@@ -477,9 +485,6 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 outputs=['v1/table.csv', 'v1/summary.json', 'v1/figure.png'], timeout_sec=10),
             _action('read_file', path='v1/summary.json'),
             _action('write_file', path='v1/report.md', content=_BODY),
-            _action('inspect_artifacts', goal='Check reported numbers and the declared evidence scope',
-                targets=['v1/report.md', 'v1/table.csv', 'v1/summary.json'],
-                evidence=['measurements/observations.csv', 'measurements/conditions.txt']),
             _action('export_report', markdown='v1/report.md', compile_pdf=compile_pdf,
                 delivery={**self._delivery('v1/report.md'),
                     'artifacts':['v1/table.csv','v1/figure.png','analyze.py']}),
@@ -507,7 +512,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertIn('workspace/v1/report.md',first_export['artifacts'])
         text_only = self._delivery('v1/report.md')
         text_only['report']['formats'] = ['markdown']
-        self.assertEqual(self.app.operations.delivery_issues(self.app._operation_observations(),text_only),[])
+        self.assertTrue(self.app.operations.delivery_issues(self.app._operation_observations(),text_only))
         first_project = self.app.workspace.resolve(first_export['data']['project'])
         self.assertIn('sample mean', (first_project / 'source.md').read_text(encoding='utf-8'))
         if compile_pdf:
@@ -546,9 +551,6 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 old_text='The sample mean is 2.0 across 3 supplied observations.', new_text=_SCOPE),
             *[_action('copy_file', source=f'v1/{name}', source_sha256=_digest(products / name),
                 path=f'v2/{name}') for name in ('table.csv', 'summary.json', 'figure.png')],
-            _action('inspect_artifacts', goal='Check the revised inference limitation against original conditions',
-                targets=['v2/report.md', 'v2/table.csv'],
-                evidence=['measurements/observations.csv', 'measurements/conditions.txt']),
             _action('export_report', markdown='v2/report.md', compile_pdf=compile_pdf,
                 delivery=self._delivery('v2/report.md', 'v2/table.csv', 'v2/figure.png', 'analyze.py')),
         ])
@@ -711,6 +713,40 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual((self.root/'budget_ledger.json').read_bytes(),before)
         self.assertIsNotNone(self.app._accepted_model_attempt(pending['attempt']))
 
+    def test_interrupted_publication_recovery_never_starts_a_delivery_review(self):
+        for reviewed in (False, True):
+            with self.subTest(reviewed=reviewed):
+                self.root = self.directory / ('reviewed-export' if reviewed else 'unreviewed-export')
+                self._create()
+                self._write('report.md', '# Observations\n\nThree supplied values; no population inference.\n')
+                bind = self.app._bind_delivery
+                def interrupt(call, payload, store, **kwargs):
+                    if reviewed:
+                        bind(call, payload, store, **kwargs)
+                    raise KeyboardInterrupt('Crash after durable publication, before native observation')
+                with patch.object(self.app, '_bind_delivery', side_effect=interrupt):
+                    self._submit(_action('export_report', markdown='report.md', compile_pdf=False,
+                        delivery=self._delivery('report.md')), approve=lambda call, token: True)
+                pending = deepcopy(self.app.state['pending'])
+                self.assertEqual(pending['kind'], 'tool')
+                self.assertTrue(self.app.gateway.can_reconcile(ToolCall(
+                    tool_name='export_report', trace_id=pending['attempt'])))
+                self.assertFalse((self.root/'attempts'/pending['attempt']/'native_result.json').exists())
+                ledger, calls = self.app.ledger.to_dict(), self.send.call_count
+                exports = self._versions(self.root/'tools/publication')
+                self._reload()
+                self._run(should_stop=lambda: self.app.state['pending'] is None)
+                self.assertEqual(self.send.call_count, calls)
+                self.assertEqual(self.app.ledger.to_dict(), ledger)
+                self.assertEqual(self._versions(self.root/'tools/publication'), exports)
+                result = self._ok('export_report')
+                if reviewed:
+                    self.assertIn('delivery_review', result['metadata'])
+                    self.assertEqual(self.app.session.manifest.status, 'completed')
+                else:
+                    self.assertNotIn('delivery_review', result['metadata'])
+                    self._not_delivered()
+
     def test_working_model_boundary_keeps_real_observations_without_reopening_native_history(self):
         self._create(context_protocol='working.v1')
         self.decisions.extend([_action('read_file',path='measurements/observations.csv'),
@@ -775,6 +811,64 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertFalse(self.app._working_memory()['notes'][0]['current'])
         self._submit(_action('update_work_plan', notes=[]))
         self.assertEqual(self.app._working_memory()['notes'],[])
+
+    def test_report_delivery_owns_full_review_instead_of_promoting_a_local_consistency_pass(self):
+        self._create()
+        self._write('report.md', '# Observations\n\nThe sample mean is 9.0.\n')
+        self._write('table.csv', 'mean\n9.0\n')
+        original_inputs = self._versions(self.inputs)
+
+        def inspect(view):
+            if 'proposed_delivery' not in view:
+                return {'findings': [], 'limitations': ['Local text/table agreement only.']}
+            for original in self.app.state['requests']:
+                self.assertIn({'role': 'user', 'content': original}, self.inspection_requests[-1]['messages'])
+            self.assertIn('entire current report delivery', view['goal'])
+            inventory = view['proposed_delivery']['artifacts']
+            self.assertEqual(set(map(Path, inventory)), {
+                self.root/'workspace/report.md', self.root/'workspace/table.csv'})
+            if not any(row.get('path', '').endswith('observations.csv') for row in view['evidence']):
+                return [_action('read_file', path='measurements/observations.csv')]
+            # This is a controlled inspector response; the real reader and scope
+            # owner must have supplied the independent original, not just table 9.
+            self.assertIn('a,1', json.dumps(self.inspection_requests[-1]['messages']))
+            target = view['targets'][0]
+            text = ''.join(row['text'] for row in target['text_windows'])
+            return {'findings': [{'subject': target['subject'], 'severity': 'required',
+                'message': 'The mean 9.0 contradicts the original observations.'}]
+                if 'mean is 9.0' in text else [], 'limitations': []}
+
+        self.review = inspect
+        self._submit(_action('inspect_artifacts', goal='Check local table/text agreement',
+            targets=['report.md'], evidence=['table.csv']))
+        self.assertEqual(self._assessment()['verdict'], 'passed')
+        self._submit(_action('deliver_result', **self._delivery('report.md', 'table.csv')))
+        self._not_delivered()
+        first = self._last('deliver_result')
+        proof = first['metadata']['delivery_review']
+        self.assertEqual(proof['result']['metadata']['assessments'][0]['verdict'], 'needs_revision',
+            {'error': proof.get('error'), 'inspection_error': proof['result'].get('error')})
+        references = self.app._material_observations([str(self.inputs)])
+        parent_record = self.app.state['turns'][-1]['tools'][0]['result'].replace('attempts/', 'records/', 1)
+        self.assertTrue(any(row['record'] == parent_record for row in references))
+        self.assertIn('contradicts', ' '.join(self.app._delivery_feedback()['issues']))
+        calls = self.send.call_count
+        ledger = (self.root/'budget_ledger.json').read_bytes()
+        self._reload()
+        self.app._bind_delivery(self.app.session.store.read_json(self.app.state['turns'][-1]['reply'])
+            ['tool_calls'][0], deepcopy(first), self.app.session.store.__class__(
+                self.root/'attempts'/Path(self.app.state['turns'][-1]['tools'][0]['result']).parent.name))
+        self.assertEqual(self.send.call_count, calls)
+        self.assertEqual((self.root/'budget_ledger.json').read_bytes(), ledger)
+        for path, content in [('report.md', '# Observations\n\nThe sample mean is 2.0.\n'),
+                              ('table.csv', 'mean\n2.0\n')]:
+            self._submit(_action('write_file', path=path, content=content,
+                expected_sha256=_digest(self.root/'workspace'/path)))
+            self._ok('write_file')
+        self._submit(_action('deliver_result', **self._delivery('report.md', 'table.csv')))
+        self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
+        self.assertEqual(self._versions(self.inputs), original_inputs)
+        self.assertFalse(self._process_receipts())
 
     def test_required_defect_blocks_delivery_without_editing_then_same_bytes_can_be_reassessed(self):
         self._create()
@@ -872,7 +966,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertTrue(any('lacks a complete' in text for text in issues),issues)
         self.assertTrue(any('9.0 contradicts' in text for text in issues),issues)
         (self.inputs/'observations.csv').write_bytes(original)
-        self._submit(_action('deliver_result',**self._delivery('report.md')))
+        self._submit(_action('deliver_result',summary='Checked artifact',artifacts=['report.md']))
         self.assertEqual(self.app.session.manifest.status,'completed',self.app.result_snapshot())
         self.assertEqual(self._last('inspect_artifacts'),before)
 
@@ -941,66 +1035,6 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertTrue(all(a['verdict']=='incomplete' for a in _assessments(result)))
         self._submit(_action('deliver_result',**self._delivery('report.md')))
         self._not_delivered()
-
-    def test_changed_bytes_and_partial_windows_cannot_inherit_a_passed_inspection(self):
-        if not shutil.which('pandoc'):
-            self.skipTest('Isolating stale review from publication requires real Pandoc')
-        self._create(report=True)
-        self._write('report.md', '# Measurements\n\nThe sample mean is 2.0.\n')
-        self._inspect(['report.md'])
-        self.assertEqual(self._assessment()['verdict'], 'passed')
-        bound = self._last('inspect_artifacts')
-        before = self._read('report.md')
-        self._submit(_action('edit_file', path='report.md', expected_sha256=before['sha256'],
-            old_text='2.0', new_text='9.0'))
-        self._ok('edit_file')
-        self._reload()
-        exported = self._export('report.md')
-        self.assertEqual(exported['status'], 'ok', exported)
-        # The current bytes now have their own export. Only the independent
-        # assessment is stale; missing publication cannot explain this refusal.
-        delivery = self._delivery('report.md', *exported['artifacts'])
-        self._submit(_action('deliver_result', **delivery))
-        self._not_delivered()
-        self.assertEqual(self._last('inspect_artifacts'), bound)
-        self._inspect([{'path': 'report.md', 'max_bytes': 8}])
-        self.assertEqual(self.inspection_views[-1]['targets'][0]['observed_ranges'], [[0, 8]])
-        self.assertEqual(self._assessment()['verdict'], 'incomplete')
-        self._submit(_action('deliver_result', **delivery))
-        self._not_delivered()
-        self.assertFalse(self._observations('run_process'))
-        self.assertEqual((self.root / 'workspace/report.md').read_text().count('9.0'), 1)
-
-    def test_independent_evidence_version_and_current_manuscript_export_are_required(self):
-        if not shutil.which('pandoc'):
-            self.skipTest('Real cross-version publication requires Pandoc on the server')
-        self._create(report=True)
-        self._write('v1/report.md', '# Measurements\n\nThe sample mean is 2.0.\n')
-        self._inspect(['v1/report.md'])
-        self.assertEqual(self._assessment()['verdict'], 'passed')
-        old = self._export('v1/report.md')
-        self.assertEqual(old['status'], 'ok', old)
-        retained = self._versions(self.app.workspace.resolve(old['data']['project']))
-        self._write('v2/report.md', '# Measurements\n\nThe sample mean is 2.0; no population inference.\n')
-        self._inspect(['v2/report.md'])
-        self.assertEqual(self._assessment()['verdict'], 'passed')
-        self._submit(_action('deliver_result', **self._delivery('v2/report.md', *old['artifacts'])))
-        self._not_delivered()
-        # A passed target judgment must also retain its independent evidence version.
-        self._write('conditions.txt', 'Only these three observations are in scope.\n')
-        self._inspect(['v2/report.md'], ['conditions.txt', 'measurements/observations.csv'])
-        self.assertEqual(self._assessment()['verdict'], 'passed')
-        current = self._export('v2/report.md')
-        self.assertEqual(current['status'], 'ok', current)
-        evidence = self._read('conditions.txt')
-        self._submit(_action('edit_file', path='conditions.txt', expected_sha256=evidence['sha256'],
-            old_text='Only these three observations', new_text='A different, unobserved dataset'))
-        self._ok('edit_file')
-        self._submit(_action('deliver_result', **self._delivery('v2/report.md', *current['artifacts'])))
-        self._not_delivered()
-        for path, raw in retained.items():
-            self.assertEqual(path.read_bytes(), raw)
-        self.assertEqual(len(self._observations('run_process')), 0)
 
     def test_same_path_republication_selects_current_delivery_and_preserves_history(self):
         if not shutil.which('pandoc'):
@@ -1096,8 +1130,14 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._submit(_action('deliver_result',**delivery))
         self._ok('deliver_result')
         self.assertEqual(self.app.session.manifest.status,'completed',self.app.result_snapshot())
-        self.assertEqual(self.app.ledger.to_dict(),ledger)
-        self.assertEqual(self.send.call_count,calls)
+        added = self.app.ledger.entries[len(ledger['entries']):]
+        self.assertTrue(added)  # The new bundle receives its actual whole-delivery review.
+        self.assertTrue(all(row.purpose.startswith('inspect-artifacts-') for row in added))
+        reviewed, reviewed_calls = self.app.ledger.to_dict(), self.send.call_count
+        self._reload()
+        self._run()
+        self.assertEqual(self.app.ledger.to_dict(),reviewed)
+        self.assertEqual(self.send.call_count,reviewed_calls)
         self.assertEqual([entry.to_dict() for entry in self.app.ledger.entries][:len(old_usage)],old_usage)
         for path,raw in {**old_bytes,**old_records}.items():
             self.assertEqual(path.read_bytes(),raw)
@@ -1666,16 +1706,13 @@ class OperationsWorkLoopTests(unittest.TestCase):
         def review(view):
             offered = {row['function']['name'] for row in self.inspection_requests[-1]['tools']}
             if offered == {'record_inspection'}:
-                self.assertEqual(len(self.inspection_requests), 5)
+                self.assertEqual(len(self.inspection_requests), 6)
                 self.assertEqual(self.app.ledger.remaining('llm_requests'), 0)
                 return {'findings': [], 'limitations': ['Only supplied observations support this claim.']}
             return [_action('read_file', path='measurements/conditions.txt')]
 
         self.review = review
-        self.decisions.extend([
-            _action('inspect_artifacts', goal='Check the mean and disclose scope.', targets=['report.md'],
-                evidence=['measurements/observations.csv']),
-            _action('deliver_result', **self._delivery('report.md'))])
+        self.decisions.append(_action('deliver_result', **self._delivery('report.md')))
         self._run(should_stop=lambda: False)
         self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
         self.assertEqual(self.send.call_count, 7)
@@ -1699,10 +1736,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 self.root = self.directory/stage
                 self._create()
                 self._write('report.md', 'The sample mean is 2.0 across three supplied observations.\n')
-                self.decisions.extend([
-                    _action('inspect_artifacts', goal='Check the claim', targets=['report.md'],
-                        evidence=['measurements/observations.csv']),
-                    _action('deliver_result', **self._delivery('report.md'))])
+                self.decisions.append(_action('deliver_result', **self._delivery('report.md')))
                 failed, start = False, self.send.call_count
                 def provider(mode, request, **kwargs):
                     nonlocal failed
@@ -1718,16 +1752,17 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 self.assertEqual(lost.actual_source, 'reservation_bound')
                 self.assertEqual(lost.actual, {'llm_requests':1})
                 self.assertGreater(lost.reserved['total_tokens'], 2048)
-                inspected = self._ok('inspect_artifacts')
+                inspected = self._ok('deliver_result')['metadata']['delivery_review']['result']
                 self.assertEqual(self._assessment()['verdict'], 'passed')
                 identity = Path(inspected['data']['record']).parts[1]
                 saved = self.app.session.store.read_json(f'tools/inspection/{identity}/input.json')
                 ledger = self.app.ledger.to_dict()
                 self._reload()
-                cached = self.app.operations.inspection.call('inspect_artifacts',saved['arguments'],identity)
+                cached = self.app.operations.inspection.call('inspect_artifacts',saved['arguments'],identity,
+                    delivery_context=saved['delivery_context'])
                 self.assertEqual(cached.status,'ok',cached)
                 self.assertEqual(self.app.ledger.to_dict(), ledger)
-                self.assertEqual(self.send.call_count-start, 4)
+                self.assertEqual(self.send.call_count-start, 3)
 
     def test_inspection_low_capacity_still_requires_a_real_terminal_opinion(self):
         # Request pressure, token pressure, and unknown prior usage all use
@@ -2645,12 +2680,17 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.send.assert_not_called()
         self.root = self.directory/'inline-inspection-version'
         self._create()
+        self.review = lambda view: {'findings': [
+            {'subject': row['subject'], 'severity': 'required',
+             'message': '9.0 contradicts the observed mean 2.0.'}
+            for row in view['targets'] if any('9.0' in window['text'] for window in row['text_windows'])],
+            'limitations': []}
         self._write('report.md','The sample mean is 2.0.\n')
         self._inspect(['report.md'])
         version = self._read('report.md')['sha256']
         self._submit(_action('write_file',path='report.md',expected_sha256=version,
             content='The sample mean is 9.0.\n',delivery=self._delivery('report.md')))
-        self.assertIn('lacks a complete independent inspection','; '.join(self.app._delivery_feedback()['issues']))
+        self.assertIn('9.0 contradicts','; '.join(self.app._delivery_feedback()['issues']))
         self._ok('write_file')  # Actual work is retained; its old review cannot certify new bytes.
         self._not_delivered()
         receipt = self.app.state['turns'][-1]['tools'][-1]['result']
