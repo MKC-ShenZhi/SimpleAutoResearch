@@ -8,6 +8,7 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 
 ### Improved
 
+- New tasks keep work-owner notes and explicitly referenced earlier observations without paid background summaries or unrelated history backfill. Saved context protocols retain their original accounting and recovery; real-task efficiency is still under evaluation.
 - Shared work principles retain the finish policy across ordinary and saved source control: optional presentation advice does not add task obligations. Real completion and cost improvement still require acceptance.
 - An official DeepSeek catalog example separates agent text/code work from visual inspection without adding a provider adapter or changing historical task connections.
 - Ordinary source work uses shared editing and execution operations without a mandatory preparation controller. Explicit code-task constraints and saved preparation recovery remain unchanged.

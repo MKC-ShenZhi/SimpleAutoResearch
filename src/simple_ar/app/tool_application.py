@@ -392,7 +392,7 @@ class ToolApplication:
         config, root = self.state['config'], self.session.store.root
         if config['control_protocol'] != PROTOCOL:
             raise ValueError('Unsupported saved operation control protocol')
-        if config.get('context_protocol') not in {None,'conversation.v1','working.v1'}:
+        if config.get('context_protocol') not in {None,'conversation.v1','working.v1','working.v2'}:
             raise ValueError('Unsupported saved operation context; no silent migration')
         for alias, snapshot in config.get('source_snapshots', {}).items():
             source = Path(config['sources'][alias])
@@ -780,7 +780,7 @@ class ToolApplication:
                     'or preselected windows. Explicit adopt_draft independently checks an existing candidate '
                     'rather than regenerating it. No execution, network, visual or scientific certification. '
                     'Returns editable manuscript and review records for the same publication owner.')
-        if self.state['config'].get('context_protocol') in {'conversation.v1','working.v1'}:
+        if self.state['config'].get('context_protocol') in {'conversation.v1','working.v1','working.v2'}:
             schemas = [{**row, 'function': {**row['function'],
                 'parameters': compact_json_schema(row['function']['parameters'])}} for row in schemas]
         return schemas
@@ -932,7 +932,10 @@ class ToolApplication:
         from simple_ar.app.work_memory import summary_coverage
         memory = {'notes':[], 'through_turn':0}
         for turn in self.state['turns']:
-            checkpoint = self._checkpoint_for_turn(turn)
+            # New work has one note author: its current work owner. Historical
+            # checkpoint adoption stays confined to the saved earlier protocol.
+            checkpoint = (self._checkpoint_for_turn(turn)
+                if self.state['config'].get('context_protocol') != 'working.v2' else None)
             if checkpoint is not None:
                 store = ArtifactStore(self.session.store.root / Path(turn['reply']).parent)
                 coverage = summary_coverage(previous=memory,snapshot=checkpoint,
@@ -1644,7 +1647,7 @@ class ToolApplication:
                investigate_results: bool = True,
                control_protocol: Literal['operations.v1'] = 'operations.v1',
                creation_declarations: dict[str, Any] | None = None,
-               context_protocol: Literal['auto', 'conversation.v1', 'working.v1'] | None = 'auto') -> ToolApplication:
+               context_protocol: Literal['auto', 'conversation.v1', 'working.v1', 'working.v2'] | None = 'auto') -> ToolApplication:
         """Create work on the operation-composed loop.
 
         Historical professional controllers are load-only. Loading and supply
@@ -1657,10 +1660,10 @@ class ToolApplication:
         if professional_inputs or not investigate_results or report_protocol is not None:
             raise ValueError('Professional controller options are load-only; new tasks use source operations, inspect_artifacts and export_report')
         if context_protocol == 'auto':
-            context_protocol = 'working.v1'
-        if context_protocol not in {None, 'conversation.v1', 'working.v1'}:
+            context_protocol = 'working.v2'
+        if context_protocol not in {None, 'conversation.v1', 'working.v1', 'working.v2'}:
             raise ValueError('Unsupported context protocol')
-        if creation_declarations is not None and context_protocol not in {'conversation.v1','working.v1'}:
+        if creation_declarations is not None and context_protocol not in {'conversation.v1','working.v1','working.v2'}:
             raise ValueError('Declared inputs require a journal-backed conversation context')
         config, reused, limits, attempts = cls._configuration(root, goal, model=model, sources=sources,
             allow_execution=allow_execution, allow_network=allow_network, allow_vision=allow_vision,
@@ -2380,7 +2383,7 @@ class ToolApplication:
                   native_history_start_turn: int | None = None, schemas: list | None = None,
                   working_memory: dict | None = None) -> list[dict[str, Any]]:
         protocol = self.state['config'].get('context_protocol')
-        if protocol in {'conversation.v1','working.v1'}:
+        if protocol in {'conversation.v1','working.v1','working.v2'}:
             return self._conversation_messages(client=client, closing=closing,
                 native_history_start_turn=native_history_start_turn, schemas=schemas,working_memory=working_memory)
         if protocol is not None:
@@ -2972,7 +2975,7 @@ class ToolApplication:
         No file discovery, source reads, model calls or new persisted state.
         """
         config, turns = self.state['config'], self.state['turns']
-        working_mode = config.get('context_protocol')=='working.v1'
+        working_mode = config.get('context_protocol') in {'working.v1','working.v2'}
         declared = config.get('input_contract') == _DECLARED_INPUTS
         client = client or self._client()
         focus = self._work_focus()
@@ -3119,7 +3122,7 @@ class ToolApplication:
                             'call_id': call_id, 'field': 'function.arguments.content', 'role': 'write_context',
                             'path': arguments.get('path'), 'text_bytes': len(text.encode('utf-8')),
                             'text_characters': len(text), 'version_scope': 'Authored payload, not evidence or current file state'})
-                        if config.get('context_protocol') == 'working.v1' and item and result.get('status') == 'ok':
+                        if working_mode and item and result.get('status') == 'ok':
                             data = result.get('data') or {}
                             working_rows.append({**supplied[-1], 'text':text,
                                 **{key:data[key] for key in ('absolute_path','sha256') if key in data}})
@@ -3153,7 +3156,7 @@ class ToolApplication:
                                 'next_offset_bytes', 'has_more', 'chunk_id') if key in row},
                             'text_bytes': len(text.encode('utf-8')), 'text_characters': len(text),
                             'version_scope': 'Recorded observation; current bytes not revalidated by conversation projection'})
-                        if config.get('context_protocol') == 'working.v1':
+                        if working_mode:
                             working_rows.append({**supplied[-1], 'text':text})
             index.append([position, current, 'records/' + turn['reply'].removeprefix('attempts/'), operations])
             if complete:
@@ -3183,7 +3186,7 @@ class ToolApplication:
         prefix = [{'role': 'system', 'content': self._system_text(closing=closing)},
                   {'role': 'user', 'content': ''}]
         schema_cost = estimate_tokens(json.dumps(self.schemas if schemas is None else schemas, ensure_ascii=False))
-        if config.get('context_protocol') == 'working.v1':
+        if working_mode:
             from simple_ar.core.working_context import select_working_context
             context.pop('requests',None)  # Requests are retained verbatim as messages, once.
             context['current_request_index'] = len(self.state['requests'])-1
@@ -3203,7 +3206,8 @@ class ToolApplication:
                 estimate_tokens=estimate_tokens,work_notes=memory['notes'],
                 summarized_through_turn=memory['through_turn'],
                 selected_records=(plan or {}).get('evidence_records',[]),version_resolver=version,
-                block_request_counts=[turn.get('request_count',1) for turn in turns])
+                block_request_counts=[turn.get('request_count',1) for turn in turns],
+                material_policy='referenced' if config['context_protocol']=='working.v2' else 'ranked')
             cost = estimate_tokens(json.dumps(messages,ensure_ascii=False))+schema_cost
             if remaining is not None and cost+output>remaining:
                 raise ValueError('Current working view exceeds the remaining token allowance; no request sent')
@@ -3426,7 +3430,7 @@ class ToolApplication:
             **({'document_request': 'work.v2'}
                 if self.state['config'].get('professional_inputs') == 'owner.v3' else {}),
             **({'context_protocol': self.state['config']['context_protocol']}
-                if self.state['config'].get('context_protocol') in {'conversation.v1','working.v1'} else {}),
+                if self.state['config'].get('context_protocol') in {'conversation.v1','working.v1','working.v2'} else {}),
             **({'closing_action_contract': 'single_terminal.v1'} if closing else {}),
             'input_projection': {
                 'resources': projection['resources'],
@@ -3443,7 +3447,7 @@ class ToolApplication:
                         if 'passage' in row else {})
                     for row in [*projection['retained_text_windows'], *projection['retained_source_passages'],
                         *(projection['material_supply']['native_context']
-                            if projection.get('context_protocol') in {'conversation.v1','working.v1'} else [])]],
+                            if projection.get('context_protocol') in {'conversation.v1','working.v1','working.v2'} else [])]],
                 'work_inputs': [{key: value for key, value in row.items() if key != 'data'} |
                     {'data': {key: value for key, value in row.get('data', {}).items() if key != 'text'}}
                     for row in projection.get('work_inputs', {}).get('windows', [])]},

@@ -5,7 +5,7 @@ from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 import json
 import re
-from typing import Any
+from typing import Any, Literal
 
 
 def select_working_context(
@@ -23,6 +23,7 @@ def select_working_context(
     summarized_through_turn: int = 0,
     history_access: str = 'read_history',
     trailing_messages: Sequence[Mapping[str, Any]] = (),
+    material_policy: Literal['ranked', 'referenced'] = 'ranked',
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Return messages and decision-budget metadata without modifying inputs.
 
@@ -39,9 +40,20 @@ def select_working_context(
     Schema cost and mandatory trailing instructions are included in selection;
     callers enforce hard budgets after selection. Trailing messages cannot add
     assistant/tool work outside its atomic history block.
+
+    ``referenced`` retains owner notes beside recent native work and admits
+    archived observations only by selected_records or note records. Notes do
+    not certify evidence or replace historical coverage; summarized_through_turn
+    has no effect under this policy. Referenced material stays whole or is
+    omitted for capacity, without lexical retrieval or automatic backfill.
+    Every requested record has model-visible supply status, including missing
+    records and all windows of a partially supplied record.
     """
     if schema_tokens < 0 or context_token_target < 0:
         raise ValueError('Token costs and target must be nonnegative')
+    if material_policy not in ('ranked', 'referenced'):
+        raise ValueError('Unknown working context selection policy')
+    owner_records = material_policy == 'referenced'
     context = deepcopy(dict(base_context))
     if 'working_view' in context:
         raise ValueError('base_context reserves working_view for this selector')
@@ -55,6 +67,8 @@ def select_working_context(
         raise ValueError('Trailing instructions must be user/system text messages')
     if type(summarized_through_turn) is not int or not 0 <= summarized_through_turn <= len(blocks):
         raise ValueError('Summary coverage must be within the original journal')
+    if owner_records:
+        summarized_through_turn = 0
     # Only a usable note snapshot can replace repeated historical presentation.
     # This retires model input, never observations, required findings or sources.
     if not any(note.get('current') is not False and note.get('status') in
@@ -126,11 +140,11 @@ def select_working_context(
     explicit_references = set(selected_records)
     references = set(explicit_references)
     for note in notes:
-        if active(note):
+        if owner_records or active(note):
             references.update(note.get('records') or [])
     artifacts = set(current_artifacts)
-    query = ' '.join(user_requests) + ' ' + ' '.join(
-        str(note.get('text', '')) for note in notes if active(note))
+    query = ('' if owner_records else ' '.join(user_requests) + ' ' + ' '.join(
+        str(note.get('text', '')) for note in notes if active(note)))
     terms = set(re.findall(r'\w+', query.casefold()))
     versions: dict[str, str | None] = {}
     states: list[dict[str, Any]] = []
@@ -186,10 +200,15 @@ def select_working_context(
                  'Only version_status=matching has a supplied matching digest. '
                  'Operation results are historical raw receipts, never current file facts. '
                  'Historical text is not revalidated when no digest is available.',
-        'observations': [], 'notes': deepcopy(notes) if summarized_through_turn else [],
+        'observations': [], 'notes': deepcopy(notes) if owner_records or summarized_through_turn else [],
         'history': {},
     }
     context['working_view'] = view
+    reference_indices: dict[str, list[int]] = {}
+    if owner_records:
+        for i, row in enumerate(rows):
+            if row.get('record') in references:
+                reference_indices.setdefault(row['record'], []).append(i)
 
     def mark_native() -> None:
         native_texts.clear()
@@ -222,6 +241,17 @@ def select_working_context(
             'omitted':[{'record':state['source'].get('record'),'status':state['status']}
                 for state in states if state['status'] not in {'native','working_view'}][-16:],
             'scope':'Selected exact observations; archival receipts remain available through '+history_access+'.'}
+        if owner_records:
+            # Required bookkeeping is never clipped to the recent omissions.
+            # Keep per-window states: one supplied window cannot hide a gap in
+            # another window belonging to the same referenced receipt.
+            context['material_supply']['references'] = [
+                entry for record in sorted(references)
+                for entry in ([{'record': record, 'status': states[i]['status'],
+                                'version_status': states[i]['version_status'],
+                                'source': states[i]['source']}
+                               for i in reference_indices.get(record, [])]
+                              or [{'record': record, 'status': 'missing'}])]
         cost = 0
         while True:
             context['working_context'] = {'latest_atomic_turn':latest,
@@ -251,9 +281,10 @@ def select_working_context(
         mark_native()
     _, required_cost = project()
     # Keep a bounded evidence share beside fresh work.
-    material_ceiling = min(context_token_target, required_cost + context_token_target // 3)
+    material_ceiling = (context_token_target if owner_records else
+                        min(context_token_target, required_cost + context_token_target // 3))
     note_states = [{'index': i, 'records': deepcopy(note.get('records', [])),
-                    'status': 'working_view' if summarized_through_turn else 'capacity',
+                    'status': 'working_view' if owner_records or summarized_through_turn else 'capacity',
                     'estimated_tokens': estimate_tokens(dump(note))}
                    for i, note in enumerate(notes)]
     # Explicit refs/current artifacts, recent operations, then lexical sources.
@@ -275,13 +306,17 @@ def select_working_context(
             state['status'] = 'duplicate'
             return
         supplied = deepcopy(rows[i])
+        if owner_records:
+            state['status'] = 'working_view'
         # Wrap selector metadata so no supplied field or claim is overwritten.
         view['observations'].append({'observation': supplied,
                                      'version_status': state['version_status']})
         if project()[1] > material_ceiling:
             view['observations'].pop()
-            if supplied.get('kind') == 'operation_result':
-                return  # Serialized results stay whole; excerpts could erase failure/status.
+            if owner_records:
+                state['status'] = 'capacity'
+            if owner_records or supplied.get('kind') == 'operation_result':
+                return  # Explicit originals and serialized results stay whole.
             from simple_ar.research.contracts import TextChunk
             from simple_ar.research.store.retrieval import source_chunk_views
             chunk = TextChunk(chunk_id=str(i),document_id=str(rows[i]['record']),
@@ -304,13 +339,14 @@ def select_working_context(
         state['estimated_tokens'] = estimate_tokens(dump(supplied))
         state['status'] = 'working_view'
 
-    ordered = sorted(range(len(rows)), key=priority, reverse=True)
+    ordered = ([i for i, row in enumerate(rows) if row.get('record') in references]
+               if owner_records else sorted(range(len(rows)), key=priority, reverse=True))
     preferred = {i for i in ordered if rows[i].get('record') in references
                  or rows[i].get('path') in artifacts or rows[i].get('absolute_path') in artifacts
                  or rows[i].get('kind') == 'operation_result'}
     # A summary that replaces historical presentation is mandatory context.
     # Optional note admission cannot hide both its history and the notes.
-    for i in ([] if summarized_through_turn else sorted(range(len(notes)), key=lambda i: (not active(notes[i]), i))):
+    for i in ([] if owner_records or summarized_through_turn else sorted(range(len(notes)), key=lambda i: (not active(notes[i]), i))):
         view['notes'].append(deepcopy(notes[i]))
         if project()[1] > material_ceiling:
             view['notes'].pop()
@@ -331,7 +367,8 @@ def select_working_context(
         'estimated_input_tokens': cost, 'required_input_tokens': required_cost,
         'target_overflow_tokens': max(0, cost - context_token_target),
         'context_exceeds_input_target': cost > context_token_target,
-        'overflow_reason': ('required_requests_contracts_latest_atomic_turn'
+        'overflow_reason': (('required_requests_contracts_owner_notes_latest_atomic_turn' if owner_records else
+                             'required_requests_contracts_latest_atomic_turn')
                             if cost > context_token_target else None),
         'latest_atomic_turn': latest, 'selected_records': selected,
         'omitted_records': omitted, 'notes': note_states,

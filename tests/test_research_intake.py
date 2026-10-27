@@ -178,7 +178,7 @@ class ResearchIntakeTests(unittest.TestCase):
                 config={'research_materials_only': True})
             self.assertIsNone(services.max_attempts)
             app = create_research_task(brief, root=root / 'native', services=services)
-            self.assertEqual(app.state['config']['context_protocol'],'working.v1')
+            self.assertEqual(app.state['config']['context_protocol'],'working.v2')
             self.assertEqual(app.session.manifest.budget.max_attempts, 300)
             actions = [{'tool_name': 'write_file', 'arguments': {
                 'path': f'workspace/note-{index}.md', 'content': 'Observed evidence only.'}}

@@ -130,8 +130,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
             side_effect=self._provider))
         self.app = None
 
-    def _create(self, *, report=False, allow_execution=True, delivery_files=None):
-        options = {'control_protocol': 'operations.v1'}
+    def _create(self, *, report=False, allow_execution=True, delivery_files=None, context_protocol='auto'):
+        options = {'control_protocol': 'operations.v1', 'context_protocol': context_protocol}
         if delivery_files is not None:
             options['delivery_files'] = delivery_files
         if report:
@@ -575,7 +575,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         from dataclasses import replace
         self.services.llm_client = LLMClient(replace(self.services.llm_client._settings,
             context_input_tokens=12000))
-        self._create()
+        self._create(context_protocol='working.v1')
         for index in range(12):
             name = f'context-{index}.txt'
             (self.inputs/name).write_text(f'Observation {index}: preserve its measurement scope.\n'+
@@ -607,7 +607,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         from dataclasses import replace
         self.services.llm_client = LLMClient(replace(self.services.llm_client._settings,
             context_input_tokens=12000))
-        self._create()
+        self._create(context_protocol='working.v1')
         self.decisions.append(_action('update_work_plan',notes=[{
             'text':'Keep the original measurement scope and unresolved question.','records':[]}]))
         for index in range(12):
@@ -712,7 +712,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertIsNotNone(self.app._accepted_model_attempt(pending['attempt']))
 
     def test_working_model_boundary_keeps_real_observations_without_reopening_native_history(self):
-        self._create()
+        self._create(context_protocol='working.v1')
         self.decisions.extend([_action('read_file',path='measurements/observations.csv'),
                                _action('ask_user',question='Which comparison should be emphasized?')])
         self._run()
@@ -734,7 +734,11 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(self.send.call_count,calls)
 
     def test_working_understanding_survives_feedback_and_invalidates_changed_source(self):
+        from dataclasses import replace
+        self.services.llm_client = LLMClient(replace(self.services.llm_client._settings,
+            context_input_tokens=12000))
         self._create()
+        self.assertEqual(self.app.state['config']['context_protocol'], 'working.v2')
         self._read('measurements/observations.csv')
         source_record = self.app.state['turns'][-1]['tools'][-1]['result']
         self._submit(_action('update_work_plan', notes=[{
@@ -746,6 +750,19 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._reload()
         self.assertEqual((self.root/'budget_ledger.json').read_bytes(), before)
         self.assertTrue(self.app._working_memory()['notes'][0]['current'])
+        # The same work owner maintains understanding; rotation must not buy
+        # another author or turn its notes into a claim of covered history.
+        for index in range(8):
+            name = f'context-{index}.txt'
+            (self.inputs/name).write_text('Unrelated original observation.\n'*180, encoding='utf-8')
+            self.decisions.append(_action('read_file', path='measurements/'+name))
+        self.decisions.append(_action('ask_user', question='Which interpretation should be emphasized?'))
+        self._run()
+        self.assertFalse(self.memory_views)
+        self.assertFalse(list((self.root/'attempts').glob('*/memory_input.json')))
+        self.assertFalse(any(entry.purpose.startswith('working-memory') for entry in self.app.ledger.entries))
+        self.assertEqual(self.app._working_memory()['through_turn'], 0)
+        self.assertIn('Three recorded', self.app._working_memory()['notes'][0]['text'])
         self._submit(_action('update_work_plan', steps=[{'step':'Revise only the explanation',
             'status':'pending'}]), feedback='Keep the calculation; clarify interpretation.')
         self.assertTrue(self.app._working_memory()['notes'][0]['current'])

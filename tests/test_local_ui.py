@@ -786,7 +786,7 @@ assert.match(elements.recipient.textContent, /writing → fake-text/);
                     self.assertEqual(saved_config['creation_declarations'], config_preview['creation_declarations'])
                     self.assertEqual(json.loads((configured_root / 'actions.json').read_text())['requests'],
                                      ['Reuse these notes'])
-                    self.assertEqual(saved_config['context_protocol'], 'working.v1')
+                    self.assertEqual(saved_config['context_protocol'], 'working.v2')
                     self.assertEqual(json.loads((configured_root / 'budget_ledger.json').read_text())['limits'], expected_limits)
                     self.assertEqual(calls, [])
                     # Neither a config path nor a descriptor reference grants

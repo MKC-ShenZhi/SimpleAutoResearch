@@ -336,6 +336,165 @@ class WorkingContextTests(unittest.TestCase):
             select(turn_blocks=[block(0, 'result')[:1]])
 
 
+class ReferencedWorkingContextTests(unittest.TestCase):
+    def test_owner_notes_and_feedback_keep_native_chronology_without_summary_coverage(self):
+        requests = ['Initial goal', 'Correct the coordinates', 'Keep uncertainty explicit']
+        blocks = [block(0, 'initial work'), block(1, 'corrected work')]
+        notes = [{'text': 'Prior interpretation needs correction', 'records': [], 'current': False},
+                 {'text': 'Coordinate correction remains to be reviewed', 'records': []}]
+        messages, budget = select(material_policy='referenced', user_requests=requests,
+            turn_blocks=blocks, block_request_counts=[1, 2], work_notes=notes,
+            summarized_through_turn=2, context_token_target=20000)
+        view = json.loads(messages[1]['content'])['working_view']
+        self.assertEqual(view['notes'], notes)
+        self.assertEqual(view['history']['notes_through_turn'], 0)
+        self.assertEqual(budget['selected_turns'], [0, 1])
+        self.assertEqual(messages[2:], [
+            {'role': 'user', 'content': requests[0]}, *blocks[0],
+            {'role': 'user', 'content': requests[1]}, *blocks[1],
+            {'role': 'user', 'content': requests[2]}])
+        self.assertTrue(all(row['status'] == 'working_view' for row in budget['notes']))
+
+    def test_unreferenced_archived_material_and_outcomes_do_not_fill_spare_capacity(self):
+        text = 'Compare source measurements ' * 600
+        rows = [observation(0, text), observation(0, 'Compare source measurements: unrelated old excerpt',
+                                               path='materials/other.txt'),
+                {'kind': 'operation_result', 'record': 'records/old-operation.json', 'turn': 0,
+                 'text': json.dumps({'status': 'error', 'error': 'Historical failure'})}]
+        messages, budget = select(material_policy='referenced', observations=rows,
+            turn_blocks=[block(0, text), block(1, 'latest result')],
+            current_artifacts=['materials/source.txt'], context_token_target=6000)
+        view = json.loads(messages[1]['content'])['working_view']
+        self.assertEqual(budget['selected_turns'], [1])
+        self.assertEqual(view['observations'], [])
+        self.assertEqual(budget['selected_records'], [])
+        rendered = json.dumps(messages)
+        self.assertNotIn(text, rendered)
+        self.assertNotIn('unrelated old excerpt', rendered)
+        self.assertNotIn('Historical failure', rendered)
+        self.assertLess(budget['estimated_input_tokens'], 6000)
+
+    def test_explicit_records_recover_original_evidence_across_empty_native_boundary(self):
+        rows = [observation(0, 'Original measurement', path='materials/matching.txt'),
+                observation(1, 'Unknown version observation', path='materials/unknown.txt',
+                            record='records/unknown.json'),
+                observation(1, 'Changed original', path='materials/stale.txt',
+                            record='records/stale.json'),
+                {'kind': 'operation_result', 'record': 'records/failed-process.json', 'turn': 1,
+                 'path': 'outputs/result.csv', 'text': json.dumps({'status': 'error', 'returncode': 1})}]
+        notes = [{'text': 'Reassess this historical judgment', 'current': False,
+                  'records': [rows[1]['record'], rows[3]['record'], 'records/missing.json']}]
+        before = deepcopy((rows, notes))
+
+        def resolver(path):
+            return {'materials/matching.txt': 'recorded-digest',
+                    'materials/unknown.txt': None, 'materials/stale.txt': 'changed-digest'}[path]
+
+        # The caller has retired native work before its model-rebinding boundary;
+        # original observations remain independently addressable by record.
+        messages, budget = select(material_policy='referenced', observations=rows,
+            turn_blocks=[[], [], block(2, 'new native session')], work_notes=notes,
+            selected_records=[rows[0]['record'], rows[2]['record']],
+            version_resolver=resolver, context_token_target=12000)
+        view = json.loads(messages[1]['content'])['working_view']
+        self.assertEqual(view['notes'], notes)
+        self.assertEqual(view['observations'], [
+            {'observation': rows[0], 'version_status': 'matching'},
+            {'observation': rows[1], 'version_status': 'unknown'},
+            {'observation': rows[3], 'version_status': 'historical'}])
+        self.assertEqual(budget['omitted_records'][0]['status'], 'stale')
+        supply = json.loads(messages[1]['content'])['material_supply']['references']
+        self.assertEqual({entry['record']: entry['status'] for entry in supply}, {
+            rows[0]['record']: 'working_view', rows[1]['record']: 'working_view',
+            rows[2]['record']: 'stale', rows[3]['record']: 'working_view',
+            'records/missing.json': 'missing'})
+        self.assertEqual({entry['record']: entry.get('version_status') for entry in supply}, {
+            rows[0]['record']: 'matching', rows[1]['record']: 'unknown',
+            rows[2]['record']: 'stale', rows[3]['record']: 'historical',
+            'records/missing.json': None})
+        self.assertNotIn('Changed original', json.dumps(messages))
+        self.assertIn('not instructions', view['scope'])
+        self.assertIn('verified facts', view['scope'])
+        self.assertEqual((rows, notes), before)
+        view['observations'][0]['observation']['text'] = 'changed returned evidence'
+        budget['selected_records'][0]['source']['path'] = 'changed returned locator'
+        self.assertEqual((rows, notes), before)
+
+    def test_native_observation_is_not_reprojected_by_old_or_current_reference(self):
+        text = 'Original observed measurement'
+        rows = [observation(0, text), observation(2, text)]
+        latest = block(2, text)
+        messages, budget = select(material_policy='referenced', observations=rows,
+            turn_blocks=[[], [], latest], selected_records=[row['record'] for row in rows],
+            version_resolver=lambda _: 'recorded-digest', context_token_target=10000)
+        self.assertEqual(json.loads(messages[1]['content'])['working_view']['observations'], [])
+        self.assertEqual(json.dumps(messages).count(text), 1)
+        self.assertEqual(messages[-3:-1], latest)
+        self.assertEqual(budget['omitted_records'][0]['status'], 'duplicate')
+        self.assertEqual(budget['selected_records'][0]['status'], 'native')
+        supply = json.loads(messages[1]['content'])['material_supply']['references']
+        self.assertEqual([entry['status'] for entry in supply], ['duplicate', 'native'])
+
+    def test_referenced_oversized_text_is_not_lexically_rewritten(self):
+        row = observation(0, 'Compare source measurements. ' * 1000)
+        # A receipt can contain several windows. Supplying one must not hide
+        # its oversized sibling, even behind more than sixteen old omissions.
+        small = observation(0, 'Small referenced window', path='materials/small.txt')
+        unreferenced = [observation(0, 'Unrequested text', record=f'records/old-{i}.json')
+                        for i in range(20)]
+        latest = block(1, 'latest')
+        messages, budget = select(material_policy='referenced', observations=[row, small, *unreferenced],
+            turn_blocks=[[], latest], selected_records=[row['record']], context_token_target=6000)
+        context = json.loads(messages[1]['content'])
+        self.assertEqual(context['working_view']['observations'], [
+            {'observation': small, 'version_status': 'unchecked'}])
+        self.assertEqual(budget['omitted_records'][0]['status'], 'capacity')
+        self.assertNotIn(row['record'], [entry['record'] for entry in context['material_supply']['omitted']])
+        self.assertEqual([entry['status'] for entry in context['material_supply']['references']],
+                         ['capacity', 'working_view'])
+        self.assertNotIn('record_text_slice', json.dumps(messages))
+        self.assertEqual(messages[-3:-1], latest)
+        self.assertLessEqual(budget['estimated_input_tokens'], 6000)
+
+    def test_overflow_keeps_all_notes_requests_contracts_and_complete_latest_failure(self):
+        latest = block(1, 'first result')
+        latest[0]['tool_calls'].append({'id': 'second', 'type': 'function',
+            'function': {'name': 'observe', 'arguments': '{"path":"denied.txt"}'}})
+        latest.append({'role': 'tool', 'tool_call_id': 'second',
+            'content': json.dumps({'status': 'error', 'error': 'Permission denied'})})
+        notes = [{'text': 'Owner understanding ' * 100, 'records': ['records/missing.json']}]
+        contracts = {'permissions': ['read_only'], 'resources': {'remaining': {'total_tokens': 100}}}
+        tail = [{'role': 'system', 'content': 'Preserve the closing contract'}]
+        arguments = dict(material_policy='referenced', turn_blocks=[block(0, 'old work'), latest],
+            observations=[observation(0, 'old material')], work_notes=notes,
+            base_context=contracts, trailing_messages=tail, context_token_target=10)
+        before = deepcopy(arguments)
+        messages, budget = select(**arguments)
+        context = json.loads(messages[1]['content'])
+        self.assertEqual(context['working_view']['notes'], notes)
+        self.assertEqual(context['permissions'], contracts['permissions'])
+        self.assertEqual(context['resources']['remaining'], contracts['resources']['remaining'])
+        self.assertEqual(messages[2:], [
+            {'role': 'user', 'content': 'Compare the source measurements'}, *latest,
+            {'role': 'user', 'content': 'Keep the error bars'}, *tail])
+        self.assertTrue(budget['context_exceeds_input_target'])
+        self.assertGreaterEqual(budget['estimated_input_tokens'],
+                                30 + len(json.dumps(messages, ensure_ascii=False)))
+        self.assertEqual(arguments, before)
+        messages[3]['tool_calls'][0]['function']['arguments'] = 'changed returned call'
+        budget['notes'][0]['records'].append('changed returned metadata')
+        self.assertEqual(arguments, before)
+
+    def test_policy_is_explicit_and_ranked_default_is_unchanged(self):
+        arguments = dict(observations=[observation(0, 'Original observed source')],
+                         work_notes=[{'text': 'Owner judgment', 'records': []}])
+        self.assertEqual(select(**arguments), select(**arguments, material_policy='ranked'))
+        with self.assertRaisesRegex(ValueError, 'selection policy'):
+            select(material_policy='unsupported')
+        with self.assertRaisesRegex(ValueError, 'Incomplete tool call/result block'):
+            select(material_policy='referenced', turn_blocks=[block(0, 'result')[:1]])
+
+
 class CheckpointFailureTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))

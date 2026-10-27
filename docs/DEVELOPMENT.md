@@ -138,21 +138,15 @@ artifacts use the same delivery and feedback loop; publication is optional.
 Explicit report claims and requested PDF/TeX retain their inspection/version checks.
 Core retains attempts, artifacts, resource usage and process results through the same shared execution and records.
 
-New operation tasks save `working.v1` for context. `core/working_context.py` selects
-recorded observations, coherent recent turns and exact source excerpts. When old
-history volume warrants it, `work_memory.py` uses the same budgeted model to record
-a bounded checkpoint in the native attempt; it creates no second memory store or
-execution loop. Working notes also live in accepted plan receipts; source versions
-and inspection owners remain authoritative. Saved conversation projections retain
-their original behavior. Context retention is not a scientific verification claim.
-Only complete recorded operations, including their original arguments, can advance
-summary coverage. Replacement notes stay in the model input; omitted receipt suffixes,
-empty summaries and unsupplied prose do not become covered history. Original records
-remain available for explicit rereading. Large atomic operations may stay uncompressed.
-Settled unusable summaries retain diagnostics and previous notes without blocking
-the main decision or repeatedly summarizing unchanged history. Unknown charges
-still stop recovery. Checkpoint costs and registered outputs remain part of the
-same attempt through interruption and explicit retry.
+New operation tasks save `working.v2`. The current work owner maintains concise
+understanding through accepted `update_work_plan.notes` receipts. The common
+selector retains recent atomic conversation and supplies explicitly referenced
+earlier observations, without a second summary author or lexical history backfill.
+Original records remain readable; notes cannot certify sources, permission or
+scientific correctness. Missing capacity and changed source versions remain visible.
+Saved `working.v1` tasks retain their automatic checkpoints, original selection,
+registered outputs and charges. Their summary failures and unknown usage still
+follow the saved recovery contract; new work does not silently change old tasks.
 An intact completed professional response can retain earlier failed physical attempts
 of that same logical call when their full bounded reservations remain charged and a
 successful response is actually settled. Source adoption, current inspection receipts

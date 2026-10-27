@@ -596,7 +596,8 @@ app = create_research_task(ResearchBrief(request_text="测量所提供的程序�
 | --- | --- |
 | `delivery_files=["**/*.md", "**/*.pdf"]` | 无保留的完成交付须有非空工作区输出。相对模式只查存在，不认证质量，来源 PDF 不算输出；要求须明确声明，不从文字推导，仍可明确交付部分成果。 |
 | `tool_contracts="outcomes"`（创建默认） | 先呈现完整专业操作；需要低层写入、编辑或运行时，通过 `load_tools` 加载 `write_file`、`edit_file`、`run_process`，加载不授予权限。显式 `full` 提供全部已允许契约；`on_demand` 提供注册为直接可见的工具及能力目录。已有任务保留保存模式。 |
-| `context_protocol="auto"`（创建默认） | 新操作任务保存 `working.v1`：按顺序保留要求、连续近期工作、按版本核对的观察和沿原记录保存的笔记。旧工作量达到阈值时沿同一预算模型压缩，检查点输出上限8192tokens，不限制科研正文输出。摘录标明实际范围，笔记是判断，不是验证或权限。`update_work_plan.notes` 可替换快照；省略跨反馈保留，`[]` 清空。 |
+| `context_protocol="auto"`（创建默认） | 新操作任务保存 `working.v2`：按顺序保留要求、近期完整操作及当前工作负责人通过 `update_work_plan.notes` 保存的笔记。历史原文按明确记录引用供给，标明版本与容量状态，不用无关历史填满余量；不再额外调用后台摘要模型。省略笔记时跨反馈保留，`[]` 清空。笔记仍是判断，不是已验证事实或权限。 |
+| `context_protocol="working.v1"`（兼容） | 保持原来的有预算自动摘要、观察选择及恢复行为。保存任务、摘要失败和费用不迁移、不重置。 |
 | `context_protocol="conversation.v1"`（保存／兼容任务） | 保留时间顺序投影和原始记录，旧任务不静默升级；显式 `None` 保留原legacy投影。工作集目标是软限制，实际共享token额度仍受约束。 |
 | `control_protocol="operations.v1"`（新任务） | 普通 `start`、结构化入口与 `ToolApplication.create` 在同一行动循环中组合读写、执行、检查与出版。新建拒绝 `None` 及旧专业控制选项；历史任务通过 `load`、`supply` 沿原合同继续。 |
 | `completion_policy="available_operations.v1"`（新操作任务） | 在实际资源与审批限制内保留可用操作，最后一次可负担决策也能留下有用的中间工作。耗尽暂停并保留成果；只有显式且校验通过的交付才算完成。保存任务保留原末次／保护决策策略。 |
