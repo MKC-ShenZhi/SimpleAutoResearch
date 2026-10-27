@@ -397,6 +397,8 @@ class ToolApplication:
             raise ValueError('Unsupported saved operation context; no silent migration')
         if config.get('delivery_review_protocol') not in {None, 'task.v1'}:
             raise ValueError('Unsupported saved delivery review protocol; no silent migration')
+        if config.get('professional_operations') not in {None, 'work.v1'}:
+            raise ValueError('Unsupported saved professional operation contract; no silent migration')
         for alias, snapshot in config.get('source_snapshots', {}).items():
             source = Path(config['sources'][alias])
             if (not source.is_file() or source.stat().st_size != snapshot['size_bytes']
@@ -443,8 +445,13 @@ class ToolApplication:
             for item in turn['tools']:
                 observed = self.session.store.read_json(item['result'])
                 if observed.get('status') == 'ok':
+                    # A journal entry can record useful production and a failed
+                    # independent review in the same native attempt. Projection
+                    # proves the record, not adoption or settled review usage;
+                    # those remain the relevant producer/review owner's gates.
                     accepted_native_result(self.session.store.root,self.session.manifest.session_id,
-                        observed,Path(item['result']).parent.name,ledger=self.ledger)
+                        observed,Path(item['result']).parent.name,
+                        ledger=None if self.state['config'].get('professional_operations') == 'work.v1' else self.ledger)
                 call = calls[item['id']]
                 spec = self.gateway.registry.get(call['function']['name'])
                 result.append(self._operation_observation(observed, call, item['result'],
@@ -1156,6 +1163,7 @@ class ToolApplication:
         selected_hashes = {path: self.workspace.artifact_hashes([str(path)])[str(path)]
             for path in roots if path.is_file()}
         reviews, covered = [], set()
+        professional = self.state['config'].get('professional_operations') == 'work.v1'
         for turn in reversed(self.state['turns']):
             calls = {row['id']: row for row in self.session.store.read_json(turn['reply']).get('tool_calls', [])}
             for item in reversed(turn['tools']):
@@ -1216,6 +1224,8 @@ class ToolApplication:
             context['professional_findings'] = findings
         if self.state['config'].get('input_contract') == _DECLARED_INPUTS:
             context['creation_declarations'] = self.state['config']['creation_declarations']
+        if professional:
+            context['working_notes'] = self._working_memory()['notes']
         if len(json.dumps(context, ensure_ascii=False).encode('utf-8')) > 256000:
             raise ValueError('Related work context exceeds 256000 bytes; narrow the work unit instead of silently dropping feedback')
         return context
@@ -1690,6 +1700,7 @@ class ToolApplication:
             extensions=extensions, creation_declarations=creation_declarations)
         config['inspection_protocol'] = 'subjects.v3'
         config['delivery_review_protocol'] = 'task.v1'
+        config['professional_operations'] = 'work.v1'
         if context_protocol is not None:
             config['context_protocol'] = context_protocol
         session = SessionController.create(root, session_id=root.name, topic=goal,
@@ -1855,7 +1866,7 @@ class ToolApplication:
             # their original closing obligation. Absent historical fields stay
             # absent unless explicitly supplied, including unrelated supplies.
             for field in ('completion_policy', 'tool_contracts', 'report_protocol', 'tool_completions', 'inspection_protocol',
-                          'delivery_review_protocol', 'publication_assets',
+                          'delivery_review_protocol', 'publication_assets', 'professional_operations',
                           'document_source_contract', 'source_generation_protocol', 'source_decision_protocol'):
                 if field not in supplied:
                     if field in old:
@@ -3912,12 +3923,13 @@ class ToolApplication:
         A native project returns (path, None, {}): reusable read-only material,
         with no inherited validator, interpreter, permission or budget.
         """
+        if (self.operations is not None and self.state['config'].get('code_task') is None
+                and self.state['config'].get('source_generation_protocol') is None):
+            from simple_ar.tools.workspace import RetainedDelivery
+            candidate = RetainedDelivery(self.session.store.root).reusable_code_project(
+                check_producers=self.workspace.check_artifact_producers)
+            return (candidate, None, {}) if candidate is not None else None
         if self.implementation is None:
-            if self.operations is not None and self.state['config'].get('source_generation_protocol') is None:
-                from simple_ar.tools.workspace import RetainedDelivery
-                candidate = RetainedDelivery(self.session.store.root).reusable_code_project(
-                    check_producers=self.workspace.check_artifact_producers)
-                return (candidate, None, {}) if candidate is not None else None
             return None
         if (self.session.manifest.status not in {'completed', 'partial'}
                 or self.state['pending'] is not None or not self.state['turns']

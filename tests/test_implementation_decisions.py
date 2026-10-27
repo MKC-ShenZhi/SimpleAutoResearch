@@ -1202,6 +1202,266 @@ class ImplementationDecisionTests(unittest.TestCase):
                 self.assertEqual((store / 'result.json').exists(), succeeds)
                 self.assertFalse((app.session.store.root / 'tools/processes').exists())
 
+    def _source_owner(self, app, **ports):
+        from simple_ar.tools.implementation import ImplementationToolGateway
+
+        return ImplementationToolGateway(app.session.store.root, app.workspace, app.ledger,
+            'fixture', app.session.manifest.session_id, preparation_only=True,
+            source_owner_contract='source_owner.v1',
+            client_factory=app.implementation.client_factory, **ports)
+
+    def _assert_source_owner_inventory_authority(self, app, inventories):
+        roots = {app.workspace.resolve_material_root(row['root']).resolve() for row in inventories}
+        expected = {path.resolve() for name, path in app.workspace.mounts.items()
+            if name not in {'workspace', 'records'}}
+        self.assertEqual(roots, expected)
+        for name in ('workspace', 'records'):
+            self.assertNotIn(app.workspace.mounts[name].resolve(), roots)
+        return roots
+
+    def test_source_owner_composes_without_saved_preparation_or_continuation_controls(self):
+        from simple_ar.tools.implementation import ImplementationToolGateway, implementation_tool_specs
+
+        app = self._create('source-owner-composition')
+        owner = self._source_owner(app)
+        self.assertEqual(owner.decision_protocol, 'native.v1')
+        self.assertEqual(owner.input_contract, 'bounded_inputs.v2')
+        self.assertEqual(owner.source_edit_contract, 'bound_content.v1')
+        specs = implementation_tool_specs(preparation_only=True, source_owner_contract='source_owner.v1')
+        self.assertEqual({row.name for row in specs}, {'prepare_implementation', 'execute_implementation'})
+        self.assertEqual(set(specs[0].input_schema['properties']),
+            {'goal', 'project_path', 'material_roots', 'execution_requested'})
+        self.assertFalse(owner.requires_followup('prepare_implementation', {'complete_work': True}))
+        self.assertEqual(owner.continuation_attempts('prepare_implementation', {}), 1)
+        with patch('simple_ar.tools.implementation_work.continuation', side_effect=AssertionError('legacy')):
+            self.assertIsNone(owner.continuation({}, 'unused'))
+            self.assertIsNone(owner.resume_after_budget({}, 'unused'))
+            self.assertIsNone(owner.consume_outcome({}, 'unused'))
+        with self.assertRaisesRegex(ValueError, 'preparation-only'):
+            ImplementationToolGateway(app.session.store.root, app.workspace, app.ledger,
+                'fixture', app.session.manifest.session_id, source_owner_contract='source_owner.v1')
+        with self.assertRaisesRegex(ValueError, 'preparation-only'):
+            implementation_tool_specs(exact=True, source_owner_contract='source_owner.v1')
+        self.responses = [self._candidate('value = 1\n')]
+        greenfield = owner.call('prepare_implementation', {'goal': 'Create source from requirements'}, identity='requirements-only')
+        self.assertEqual(greenfield.status, 'ok', greenfield)
+        self._assert_source_owner_inventory_authority(app, self.prompts[-1]['investigation']['inventories'])
+        self.assertEqual(greenfield.metadata['material_observations'], [])
+
+    def test_source_owner_investigates_past_six_decisions_and_freezes_original_feedback(self):
+        inputs = self.base / 'source-owner-inputs'
+        inputs.mkdir()
+        for index in range(7):
+            (inputs / f'part-{index}.txt').write_text(f'Original observation {index}\n', encoding='utf-8')
+        app = self._create('source-owner-investigation', sources={'inputs': inputs})
+        context = {'original_request': 'Use the authorized inputs', 'working_notes': [{'text': 'A judgment'}],
+            'professional_findings': [{'kind': 'inspection_feedback', 'current': True,
+                'original_record': {'finding': 'Revise the candidate using the original material'}},
+                {'kind': 'inspection_feedback', 'current': False, 'original_record': {'finding': 'Old advice'}}]}
+        feedback = Mock(return_value=context)
+        owner = self._source_owner(app, work_context=feedback)
+        self.responses = [{'read_windows': [{'path': f'inputs/part-{index}.txt'}]} for index in range(7)]
+        self.responses.append(self._candidate('value = 7\n'))
+        arguments = {'goal': 'Prepare source using all necessary original observations', 'material_roots': ['inputs']}
+        prepared = owner.call('prepare_implementation', arguments, identity='owner-eight')
+        self.assertEqual(prepared.status, 'ok', prepared)
+        self.assertEqual(self.send.call_count, 8)
+        self.assertEqual(self.prompts[-1]['investigation']['decisions_remaining'], 5)
+        self.assertEqual(self.prompts[-1]['investigation']['decision_allowance'], 'shared_task_budget')
+        self.assertEqual(len(app.ledger.entries), 8)
+        binding_path = Path(prepared.data['source_binding'])
+        frozen = binding_path.read_bytes()
+        binding = json.loads(frozen)
+        self.assertEqual(binding['source_owner_contract'], 'source_owner.v1')
+        from simple_ar.tools.implementation import ImplementationPreparationRequest
+        public_request = {key: value for key, value in binding['request'].items()
+            if key in ImplementationPreparationRequest.model_fields}
+        self.assertEqual(ImplementationPreparationRequest.model_validate(public_request).model_dump(),
+            ImplementationPreparationRequest.model_validate(arguments).model_dump())
+        self.assertEqual(len([row for row in binding['source_windows'] if 'request' in row]), 7)
+        for prompt in self.prompts:
+            windows = [row for row in prompt['source_windows'] if 'work_context' in row]
+            self.assertEqual([row['work_context'] for row in windows], [context])
+        feedback.side_effect = AssertionError('Recovery must not replace feedback')
+        repeated = owner.call('prepare_implementation', arguments, identity='owner-eight')
+        self.assertEqual(repeated.status, 'ok', repeated)
+        self.assertEqual(self.send.call_count, 8)
+        self.assertEqual(binding_path.read_bytes(), frozen)
+        (inputs / 'part-6.txt').write_text('Changed material', encoding='utf-8')
+        rejected = owner.call('prepare_implementation', arguments, identity='owner-eight')
+        self.assertEqual(rejected.status, 'error')
+        self.assertIn('inputs changed', rejected.error)
+        self.assertFalse((app.session.store.root / 'tools/processes').exists())
+
+    def test_source_owner_stops_identical_rejected_proposals_without_replay(self):
+        app = self._create('source-owner-stagnation')
+        owner = self._source_owner(app)
+        broken = self._candidate('def broken(:\n    pass\n')
+        self.responses = [broken, broken]
+        arguments = {'goal': 'Prepare a valid source candidate'}
+        failed = owner.call('prepare_implementation', arguments, identity='stagnated')
+        self.assertEqual(failed.status, 'error')
+        self.assertEqual(failed.data['owner_stop_reason'], 'source_revision_stagnated')
+        self.assertEqual(self.send.call_count, 2)
+        store = app.session.store.root / 'attempts/stagnated/implementation'
+        diagnosis = json.loads((store / 'decision-steps/2/validation.json').read_text())
+        self.assertEqual(diagnosis['stop_reason'], 'source_revision_stagnated')
+        self.assertFalse((store / 'result.json').exists())
+        failed = owner.call('prepare_implementation', arguments, identity='stagnated')
+        self.assertIn('no blind replay', failed.error)
+        self.assertEqual(self.send.call_count, 2)
+
+    def test_source_owner_revises_registered_candidate_using_feedback_and_execution_diagnostics(self):
+        app = self._create('source-owner-revision')
+        first = self._candidate('value = 1\n')
+        first['files'].append({'path': 'helper.py', 'content': 'untouched = True\n'})
+        self.responses = [first]
+        original = self._prepare(app, {'goal': 'Prepare an editable project'})
+        self.assertEqual(original['status'], 'ok', original)
+        original_project = Path(original['data']['project_dir'])
+        context = {'professional_findings': [{'kind': 'inspection_feedback', 'current': True,
+            'original_record': {'finding': 'Revise the selected value'}}],
+            'working_notes': [{'text': 'Preserve the helper'}]}
+        # This port carries original retained tool results, never a producer's
+        # invented error summary. No physical execution occurs in this fixture.
+        diagnostic = {'tool_name': 'execute_implementation', 'status': 'error',
+            'arguments': {'prepared_result': original['data']['prepared_result']},
+            'data': {'returncode': 1, 'stderr': 'Original retained diagnostic', 'stdout': ''}}
+        owner = self._source_owner(app, work_context=Mock(return_value=context),
+            execution_observations=lambda: [diagnostic])
+        self.responses = [self._candidate('value = 2\n')]
+        revised = owner.call('prepare_implementation', {'goal': 'Apply the requested correction',
+            'project_path': str(original_project)}, identity='revised')
+        self.assertEqual(revised.status, 'ok', revised)
+        candidate = Path(revised.data['project_dir'])
+        self.assertEqual((candidate / 'calculate.py').read_text(), 'value = 2\n')
+        self.assertEqual((candidate / 'helper.py').read_bytes(), (original_project / 'helper.py').read_bytes())
+        self.assertEqual((original_project / 'calculate.py').read_text(), 'value = 1\n')
+        self.assertEqual(self.prompts[-1]['execution_observations'], [diagnostic])
+        self.assertIn(context, [row['work_context'] for row in self.prompts[-1]['source_windows']
+            if 'work_context' in row])
+        self.assertTrue(revised.data['executable'])
+        self.assertIsNone(owner.continuation(revised.model_dump(mode='json'), 'revised'))
+        self.assertFalse((app.session.store.root / 'tools/processes').exists())
+
+    def test_source_owner_exhaustion_uses_shared_ledger_without_restarting_partial_work(self):
+        inputs = self.base / 'source-owner-budget-inputs'
+        inputs.mkdir()
+        (inputs / 'note.txt').write_text('Original observation', encoding='utf-8')
+        app = self._create('source-owner-budget', sources={'inputs': inputs})
+        app.ledger.limits['llm_requests'] = 1
+        owner = self._source_owner(app)
+        self.responses = [{'read_windows': [{'path': 'inputs/note.txt'}]}]
+        arguments = {'goal': 'Prepare source', 'material_roots': ['inputs']}
+        result = owner.call('prepare_implementation', arguments, identity='exhausted')
+        self.assertEqual(result.status, 'error')
+        self.assertEqual(result.data['owner_stop_reason'], 'shared_budget_exhausted')
+        self.assertEqual(self.send.call_count, 1)
+        self.assertEqual(app.ledger.remaining('llm_requests'), 0)
+        store = app.session.store.root / 'attempts/exhausted/implementation'
+        self.assertTrue((store / 'decision-steps/1/observations.json').exists())
+        self.assertFalse((store / 'result.json').exists())
+        snapshot = app.ledger.to_dict()
+        self.assertIn('no blind replay', owner.call('prepare_implementation', arguments, identity='exhausted').error)
+        self.assertEqual(app.ledger.to_dict(), snapshot)
+        self.assertIsNone(owner.resume_after_budget(result.model_dump(mode='json'), 'exhausted'))
+
+    def test_source_owner_discovers_authorized_mounts_without_scanning_internal_roots(self):
+        inputs = self.base / 'source-owner-unselected'
+        inputs.mkdir()
+        (inputs / 'note.txt').write_text('Unselected material', encoding='utf-8')
+        app = self._create('source-owner-no-default-roots', sources={'inputs': inputs})
+        owner = self._source_owner(app)
+        self.responses = [self._candidate('value = 1\n')]
+        result = owner.call('prepare_implementation', {'goal': 'Create source from requirements'}, identity='greenfield')
+        self.assertEqual(result.status, 'ok', result)
+        inventories = self.prompts[-1]['investigation']['inventories']
+        roots = self._assert_source_owner_inventory_authority(app, inventories)
+        self.assertIn(inputs.resolve(), roots)
+        self.assertEqual(self.prompts[-1]['source_windows'], [])
+
+    def test_source_owner_publishes_original_reader_snapshots_for_cross_owner_reuse(self):
+        from copy import deepcopy
+        from simple_ar.tools.materials import journal_material_references, journal_read_windows, read_material_window
+
+        inputs = self.base / 'source-owner-port-inputs'
+        inputs.mkdir()
+        text = 'Original input bytes, not a generated claim.\n' * 100
+        (inputs / 'note.txt').write_text(text, encoding='utf-8')
+        app = self._create('source-owner-port', sources={'inputs': inputs})
+        owner = self._source_owner(app, work_context=lambda roots: {'working_notes': ['An opinion, not a read']})
+        snapshots = []
+        def observe(*args, **kwargs):
+            row = read_material_window(*args, **kwargs)
+            snapshots.append(deepcopy(row))
+            return row
+        self.responses = [{'read_windows': [{'path': 'inputs/note.txt', 'max_bytes': 64000}]},
+            {'focus_observations': []}, self._candidate('value = 1\n')]
+        arguments = {'goal': 'Read original material and prepare source', 'material_roots': ['inputs']}
+        with patch('simple_ar.tools.materials.read_material_window', side_effect=observe):
+            prepared = owner.call('prepare_implementation', arguments, identity='owner-port')
+        self.assertEqual(prepared.status, 'ok', prepared)
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(prepared.metadata['material_observations'], snapshots)
+        self.assertEqual(prepared.metadata['material_observations'][0]['data']['text'], text)
+        native = prepared.model_dump(mode='json')
+        frozen = deepcopy(native)
+        locator = 'records/owner-port/native_result.json'
+        view = owner.coordination_result(prepared, receipt_path=locator)
+        self.assertNotIn(text, json.dumps(view))
+        self.assertEqual(view['receipt_path'], locator)
+        self.assertNotIn('text', view['metadata']['material_observations'][0]['data'])
+        self.assertEqual(prepared.model_dump(mode='json'), frozen)
+        windows = journal_read_windows(native, arguments)
+        self.assertEqual(windows[0]['field'], 'metadata.material_observations.0.data.text')
+        self.assertEqual(windows[0]['input_index'], 0)
+        self.assertEqual(windows[0]['data'], snapshots[0]['data'])
+        app.session.store.write_json('attempts/owner-port/native_result.json', native)
+        app.session.store.write_json('owner-port-reply.json', {'tool_calls': [{'id': 'port',
+            'function': {'name': 'prepare_implementation', 'arguments': json.dumps(arguments)}}]})
+        turns = [{'reply': 'owner-port-reply.json', 'tools': [
+            {'id': 'port', 'result': 'attempts/owner-port/native_result.json'}]}]
+        references = journal_material_references(app.workspace, app.session.store, turns, ['inputs'])
+        self.assertEqual(len(references), 1)
+        self.assertEqual(references[0]['record'], locator)
+        next_owner = self._source_owner(app, material_observations=lambda roots: references)
+        self.responses = [self._candidate('value = 2\n')]
+        reused = next_owner.call('prepare_implementation', arguments, identity='next-owner')
+        self.assertEqual(reused.status, 'ok', reused)
+        self.assertTrue(self.prompts[-1]['investigation']['journal_coverage']['admitted'])
+        self.assertIn(text, [row.get('text') for row in self.prompts[-1]['source_windows']])
+        self.assertEqual(self.send.call_count, 4)  # No second model-selected read.
+        replay = owner.call('prepare_implementation', arguments, identity='owner-port')
+        self.assertEqual(replay.model_dump(mode='json'), frozen)
+
+    def test_source_owner_stops_read_focus_cycles_and_differing_duplicate_requests(self):
+        for name, actions in (
+                ('duplicates', [{'read_windows': [{'path': 'inputs/note.txt'}]}] * 2),
+                ('focus-reread', [{'focus_observations': []},
+                    {'read_windows': [{'path': 'inputs/note.txt'}]}]),
+                ('different-ceilings', [{'read_windows': [{'path': 'inputs/note.txt', 'max_bytes': size}]}
+                    for size in (30, 40)])):
+            with self.subTest(name=name):
+                inputs = self.base / ('idle-inputs-' + name)
+                inputs.mkdir()
+                (inputs / 'note.txt').write_text('Short original', encoding='utf-8')
+                app = self._create('idle-reads-' + name, sources={'inputs': inputs})
+                owner = self._source_owner(app)
+                before = self.send.call_count
+                self.responses = [{'read_windows': [{'path': 'inputs/note.txt'}]}, *actions]
+                result = owner.call('prepare_implementation', {'goal': 'Prepare source from original material',
+                    'material_roots': ['inputs']}, identity='idle-reads')
+                self.assertEqual(result.status, 'error')
+                self.assertEqual(result.data['owner_stop_reason'], 'source_investigation_stagnated')
+                self.assertEqual(self.send.call_count - before, 3)
+                self.assertEqual(len(result.metadata['material_observations']), 1)
+                path = app.session.store.root / 'attempts/idle-reads/implementation'
+                diagnosis = json.loads((path / 'decision-steps/3/validation.json').read_text())
+                self.assertEqual(diagnosis['stop_reason'], 'source_investigation_stagnated')
+                self.assertFalse((path / 'result.json').exists())
+                view = owner.coordination_result(result, receipt_path='records/idle-reads/native_result.json')
+                self.assertNotIn('Short original', json.dumps(view))
+
     def test_native_source_actions_reject_mixed_batches_and_keep_original_protocol_on_reload(self):
         inputs = self.base / 'action-inputs'
         inputs.mkdir()

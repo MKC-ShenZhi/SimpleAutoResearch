@@ -172,6 +172,7 @@ class InspectionToolGateway:
                  *, prior_assessments: Callable[[], list[dict]] | None = None,
                  material_observations: Callable[[list[str]], list[dict]] | None = None,
                  user_requests: Callable[[], list[str]] | None = None,
+                 feedback_provider: Callable[[list[str]], list[dict]] | None = None,
                  protocol: str | None = None) -> None:
         if protocol not in (None, 'subjects.v1', 'subjects.v2', 'subjects.v3'):
             raise ValueError('Unknown inspection protocol')
@@ -180,6 +181,7 @@ class InspectionToolGateway:
         self.prior_assessments = prior_assessments
         self.material_observations = material_observations
         self.user_requests = user_requests
+        self.feedback_provider = feedback_provider
         self.protocol = protocol
 
     @property
@@ -247,6 +249,14 @@ class InspectionToolGateway:
         return saved
 
     def _cached(self, identity: str) -> ToolResult:
+        return self._retained_result(identity, current_inputs=True)
+
+    def _retained_result(self, identity: str, *, current_inputs: bool) -> ToolResult:
+        """Verify saved opinions separately from their applicability to current bytes.
+
+        Acceptance always uses _cached. Revision may read an intact old opinion
+        after changing its subject; that does not certify the replacement.
+        """
         receipt = self._receipt(identity)
         result_path = self._path(identity, 'result')
         if receipt.get('result_sha256') != self._digest(result_path):
@@ -273,12 +283,47 @@ class InspectionToolGateway:
                 or result.data.get('record') != artifact or result.artifacts != [artifact]):
             raise ValueError('Inspection cached assessment path changed; no replay')
         if self.protocol and result.status == 'ok':
-            expected, error = self._subject_assessments(saved, receipt, identity, '')
+            expected, error = self._subject_assessments(saved, receipt, identity, '',
+                check_versions=current_inputs)
             if error or result.metadata[key] != expected:
                 raise ValueError('Inspection cached subject decisions differ from the retained response; no replay')
-        else:
+        elif current_inputs:
             self._check_versions([*saved['targets'], *saved['evidence']], identity)
         return result
+
+    def feedback_observation(self, identity: str, claimed: dict, *, expected_arguments: dict | None = None) -> dict:
+        """Original, integrity-checked revision guidance; never an acceptance pass."""
+        saved = {}
+        try:
+            saved = self.store.read_json(self._path(identity, 'input'))
+            if expected_arguments is not None and saved.get('arguments') != expected_arguments:
+                raise ValueError('Inspection feedback differs from the accepted call')
+            if ('delivery_context' in saved
+                    and saved.get('user_requests') != saved['delivery_context'].get('requests')):
+                raise ValueError('Delivery inspection feedback differs from its original user requests')
+            result = self._retained_result(identity, current_inputs=False)
+            if result.model_dump(mode='json') != claimed:
+                raise ValueError('Inspection feedback differs from its retained owner result')
+        except (ValueError, OSError, KeyError, TypeError, RuntimeError) as exc:
+            # An unfinished, unknown-use or invalid opinion cannot certify a
+            # result, but neither is it a prerequisite for subsequent work.
+            # Keep the diagnosis, not its unverified findings or a false pass.
+            return {'arguments': saved.get('arguments', {}), 'opinion_available': False,
+                **({'delivery_context': saved['delivery_context']} if 'delivery_context' in saved else {}),
+                'reviewed_subjects': {row['path']: row['sha256'] for row in saved.get('targets', [])
+                    if row.get('path') and row.get('sha256')},
+                'result': ToolResult(tool_name='inspect_artifacts', status='blocked',
+                    error='Retained independent opinion unavailable: '+str(exc)).model_dump(mode='json'),
+                'scope': 'Diagnostic only; original failed records and usage remain retained. '
+                    'No findings or current acceptance are supplied.'}
+        return {'arguments': saved['arguments'],
+            'opinion_available': True,
+            **({'delivery_context': saved['delivery_context']} if 'delivery_context' in saved else {}),
+            'result': self.coordination_result(result, receipt_path=self._path(identity, 'result')),
+            'reviewed_subjects': {row['path']: row['sha256'] for row in saved['targets']
+                if row.get('sha256')},
+            'scope': 'Retained independent opinion about the bound original versions; '
+                'not current acceptance, a source fact, or permission.'}
 
     def can_reconcile(self, name: str, identity: str) -> bool:
         if name != 'inspect_artifacts' or not self.has_started(identity):
@@ -485,14 +530,15 @@ class InspectionToolGateway:
         return decisions
 
     def _subject_assessments(self, saved: dict[str, Any], receipt: dict[str, Any],
-                             identity: str, failure: str) -> tuple[list[dict], str]:
+                             identity: str, failure: str, *, check_versions: bool = True) -> tuple[list[dict], str]:
         observed = {row['subject']: row for row in [*saved['targets'], *saved['evidence']]}
         error, decisions = '', {}
         try:
             if failure:
                 raise ValueError(failure)
             decisions = {row.subject: row for row in self._subject_decisions(saved, receipt['response'])}
-            self._check_versions(list(observed.values()), identity)
+            if check_versions:
+                self._check_versions(list(observed.values()), identity)
         except (ValueError, OSError, KeyError) as exc:
             error, decisions = str(exc), {}
         assessments = []
@@ -654,6 +700,8 @@ class InspectionToolGateway:
 
     def work_inputs(self, targets: list[str], *, include_observations: bool = False) -> list[dict]:
         """Supply relevant current opinions to source work, not another copy of its evidence."""
+        if self.feedback_provider is not None:
+            return [] if include_observations else self.feedback_provider(targets)
         roots = [self.workspace.resolve(path) for path in targets]
         result = []
         for assessment in self.prior_assessments() if self.prior_assessments else []:

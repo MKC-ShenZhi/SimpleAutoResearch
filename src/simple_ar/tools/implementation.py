@@ -235,7 +235,9 @@ class ExactCodeWork(BaseModel):
 
 
 def implementation_tool_specs(*, exact: bool = False,
-                              preparation_only: bool = False) -> list[CommonToolSpec]:
+                              preparation_only: bool = False,
+                              source_owner_contract: str | None = None) -> list[CommonToolSpec]:
+    _source_owner_options(source_owner_contract, preparation_only=preparation_only, exact=exact)
     if exact and preparation_only:
         raise ValueError('Preparation-only source generation cannot use the exact code-task contract')
     if exact:
@@ -248,7 +250,7 @@ def implementation_tool_specs(*, exact: bool = False,
             input_schema=ExactCodeWork.model_json_schema(),
             description='Implement the frozen scoped code task using its approved isolated-workspace preparation, CodeTask investigation, edit/protected-file gates, independent review and declared validator. Uses this task budget and attempt. Optional instruction/prior_result support feedback on the existing candidate; no arguments change scope, preparation or validator. Requires explicit approval of the displayed work and current source/environment identity. Only the saved technical-repair ceiling is authorized (one for legacy contracts); no scientific measurement. Installation is allowed only by an explicitly frozen environment preparation contract; it shares this attempt and process budget. Inspect the retained result before delivery. Interrupted work without a complete domain result is never replayed automatically.')]
     if preparation_only:
-        return [CommonToolSpec(name='prepare_implementation', domain='implementation',
+        specs = [CommonToolSpec(name='prepare_implementation', domain='implementation',
             permission_level='write_patch', risk_level='medium',
             input_schema=ImplementationPreparationRequest.model_json_schema(),
             description='Prepare a reusable source candidate from a goal, optional project_path and read-only material_roots. The existing source generator selects and reads bounded sources, preserves originals and retains its proposal and byte-bound result. An unchanged registered candidate supports direct feedback with preserved members. execution_requested defaults to true to propose a plan; false requests code only. This operation does not execute, schedule follow-up work or own automatic repair. Execution and independent scientific/visual verification remain separate.'),
@@ -257,6 +259,17 @@ def implementation_tool_specs(*, exact: bool = False,
                 permission_level='execution', risk_level='high',
                 input_schema=ExecuteImplementationRequest.model_json_schema(),
                 description='Execute one registered prepare_implementation execution_plan after explicit approval through the existing process owner and shared physical ledger. Uses prepared_result and pins source, consumed inputs, command/environment and fresh outputs. Retains canonical execution evidence and actual errors without automatic continuation, repair, retry or installation. Optional delivery finishes after a successful run. Physical execution does not certify scientific or visual correctness.')]
+        if source_owner_contract:
+            specs[0].description = ('Own code, analysis or figure source work from the goal and authorized '
+                'project_path/material_roots. Investigate original observations on demand; use supplied '
+                'original request, current/stale review feedback, work notes and execution diagnostics '
+                'to create or revise a registered candidate. Pass an unchanged candidate as project_path '
+                'for feedback; retained members and inputs survive revision. Investigation and corrections '
+                'consume the shared task budget, without a fixed six-step limit. Return source, byte-bound '
+                'records, gaps and an execution_plan when execution_requested (default true). Execution '
+                'requires a separate explicitly approved execute_implementation. No automatic continuation '
+                'or scientific/visual certification.')
+        return specs
     from simple_ar.tools.implementation_findings import InvestigationRequest
     return [CommonToolSpec(name='investigate_implementation', domain='implementation',
         permission_level='write_patch', risk_level='medium', input_schema=InvestigationRequest.model_json_schema(),
@@ -271,6 +284,13 @@ def implementation_tool_specs(*, exact: bool = False,
             completion={'field': 'delivery'},
             permission_level='execution', risk_level='high', input_schema=ExecuteImplementationRequest.model_json_schema(),
             description='Execute one registered prepare_implementation execution_plan through the existing approved process owner, interpreter and shared physical ledger. Takes its prepared_result, not hand-written commands or hashes. Pins all generated files, consumed input identities, exact command/environment and expected fresh outputs. Saves real errors for later professional repair, without retries, installation or a second workflow. Source/output changes invalidate success; interrupted unbound outputs are not adopted. Optional delivery finishes after this run succeeds, not after another coordinator decision. Physical execution does not certify scientific correctness or visual quality.')]
+
+
+def _source_owner_options(contract: str | None, *, preparation_only: bool, exact: bool) -> None:
+    if contract not in (None, 'source_owner.v1'):
+        raise ValueError('Unknown source owner contract')
+    if contract and (not preparation_only or exact):
+        raise ValueError('Source ownership requires ordinary preparation-only composition')
 
 
 class ImplementationToolGateway:
@@ -302,13 +322,23 @@ class ImplementationToolGateway:
         scientific completion, and it schedules no downstream work.
         """
         from copy import deepcopy
+        # Native receipts retain full reader snapshots for cross-owner reuse.
+        # Coordination gets locators/versions only, including on error paths
+        # which do not have the historical producer_completion marker.
+        compact = result.model_dump(mode='json')
+        observations = compact.get('metadata', {}).get('material_observations')
+        if isinstance(observations, list):
+            for row in observations:
+                if isinstance(row, dict) and isinstance(row.get('data'), dict):
+                    row['data'].pop('text', None)
+            compact['receipt_path'] = receipt_path
         data = result.data
         if (result.tool_name not in {'prepare_implementation', 'execute_implementation'}
                 or data.get('producer_completion') != 'goal_findings.v1'):
-            return result.model_dump(mode='json')
+            return compact
         notes, issues = data.get('unresolved', []), data.get('issues', [])
         if not isinstance(notes, list) or not isinstance(issues, list):
-            return result.model_dump(mode='json')  # Presentation cannot repair a malformed receipt.
+            return compact  # Presentation cannot repair a malformed receipt.
         prepared = result.tool_name == 'prepare_implementation'
         visible = {key: deepcopy(data[key]) for key in (
             'project_dir', 'prepared_result', 'execution_ref', 'status', 'executable',
@@ -334,7 +364,8 @@ class ImplementationToolGateway:
             visible.update({key: deepcopy(data[key]) for key in ('stdout', 'stderr', 'streams') if key in data})
         return {'tool_name': result.tool_name, 'status': result.status, 'summary': result.summary,
             'error': result.error, 'artifacts': list(result.artifacts), 'data': visible,
-            'outcome': outcome, 'receipt_path': receipt_path}
+            'outcome': outcome, 'receipt_path': receipt_path,
+            **({'metadata': {'material_observations': observations}} if isinstance(observations, list) else {})}
 
     def continuation_attempts(self, name: str, arguments: dict) -> int:
         if self.preparation_only:
@@ -463,12 +494,20 @@ class ImplementationToolGateway:
                  declaration_review: bool = False,
                  professional_requests: bool = False,
                  preparation_only: bool = False,
+                 source_owner_contract: str | None = None,
                  input_contract: str | None = None,
                  source_edit_contract: str | None = None,
                  decision_protocol: str | None = None,
                  measurement: dict[str, Any] | None = None,
                  measurement_supplier: Callable[[], dict[str, Any] | None] | None = None,
                  exact: dict[str, Any] | None = None) -> None:
+        _source_owner_options(source_owner_contract, preparation_only=preparation_only, exact=exact is not None)
+        if source_owner_contract:
+            # Explicit modern composition owns these primitives independently
+            # of the application's saved prepared.v1/v2/v3 protocol flags.
+            input_contract = input_contract or 'bounded_inputs.v2'
+            source_edit_contract = source_edit_contract or 'bound_content.v1'
+            decision_protocol = decision_protocol or 'native.v1'
         if preparation_only and exact is not None:
             raise ValueError('Preparation-only source generation cannot use the exact code-task contract')
         from simple_ar.code_task.generation.selection import preserved_input_limits
@@ -486,6 +525,7 @@ class ImplementationToolGateway:
         self.declaration_review = declaration_review
         self.professional_requests = professional_requests
         self.preparation_only = preparation_only
+        self.source_owner_contract = source_owner_contract
         self.input_contract = input_contract
         self.source_edit_contract = source_edit_contract
         self.decision_protocol = decision_protocol
@@ -1281,7 +1321,7 @@ class ImplementationToolGateway:
         rows = payload['data']['files']
         if complete_project:
             from simple_ar.code_task.generation.selection import preserved_input_hashes, registered_project_files
-            from simple_ar.tools.implementation_work import REGISTERED_PROJECT_GENERATION
+            from simple_ar.tools.implementation_preparation import REGISTERED_PROJECT_GENERATION
 
             preserved = dict(source.get('prior_candidate', {}).get('preserved_files', {})
                 if source.get('generation_method') == REGISTERED_PROJECT_GENERATION else {})
@@ -1506,8 +1546,10 @@ class ImplementationToolGateway:
         prefix = f'workspace/implementations/{identity}'
         locator = f'records/{identity}/implementation/result.json'
         executable = 'execution_plan' in result
-        completion = owner.read_json('request.json')['request'].get('producer_completion')
-        investigation = owner.read_json('request.json')['request'].get('result_investigation')
+        binding = owner.read_json('request.json')
+        completion = binding['request'].get('producer_completion')
+        investigation = binding['request'].get('result_investigation')
+        from simple_ar.tools.implementation_preparation import material_observation_metadata
         data = {'data': {**result, **({'producer_completion': completion} if completion else {}),
                 **({'result_investigation': investigation} if investigation else {}),
                 **({'verification': 'Prepared source and its recorded byte versions only; execution, scientific '
@@ -1519,7 +1561,8 @@ class ImplementationToolGateway:
                     if executable else {'operation': 'plan_needed', 'candidate_path': result['project_dir']})},
             'artifacts': [f"{prefix}/{row['path']}" for row in result['files']],
             'summary': 'Candidate saved. Original sources unchanged; execution and scientific correctness remain unverified.',
-            'metadata': {'capability_artifacts': [ArtifactStore(owner.root.parent).ref(
+            'metadata': {**material_observation_metadata(binding),
+                'capability_artifacts': [ArtifactStore(owner.root.parent).ref(
                 'implementation/result.json', kind='prepared_implementation',
                 schema='prepared_implementation.v1').to_dict()]}}
         if self.preparation_only and not executable:
@@ -1582,7 +1625,7 @@ class ImplementationToolGateway:
                         'explicit file selection cannot drop or reclassify preserved data')
             if output.exists() and not owner.exists('result.json'):
                 raise ValueError('Candidate output already exists without a completed receipt; inspect it and use a new identity')
-            from simple_ar.tools.implementation_work import (
+            from simple_ar.tools.implementation_preparation import (
                 PROFESSIONAL_GENERATION, REGISTERED_PROJECT_GENERATION, prepare_work,
             )
             method = owner.read_json('request.json').get('generation_method') if owner.exists('request.json') else None
@@ -1858,8 +1901,16 @@ class ImplementationToolGateway:
                     if retained.exists('request.json'):
                         refusal['source_binding_sha256'] = hashlib.sha256(
                             retained.resolve('request.json').read_bytes()).hexdigest()
+            source_failure = ({'source_owner_contract': self.source_owner_contract,
+                'owner_stop_reason': reason,
+                'source_binding': str(retained.root / 'request.json'),
+                'decision_steps': str(retained.root / 'decision-steps'),
+                'verification': 'Incomplete source preparation; retained records are diagnostics, not an executable candidate.'}
+                if self.source_owner_contract and 'retained' in locals() and retained.exists('request.json') else {})
+            from simple_ar.tools.implementation_preparation import material_observation_metadata
             return ToolResult(tool_name=name, status='error',
+                metadata=(material_observation_metadata(retained.read_json('request.json')) if source_failure else {}),
                 data=({'owner_entered': True, 'owner_stop_reason': reason,
                     **({'budget_refusal': refusal} if refusal is not None else {})}
-                    if entered else {}),
+                    if entered else source_failure),
                 error=f'Implementation unavailable ({type(exc).__name__}: {exc}); retained inputs/proposal/budget are not replayed automatically.')

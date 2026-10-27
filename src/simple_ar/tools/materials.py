@@ -122,6 +122,16 @@ def window_key(workspace: Any, window: FileWindow) -> tuple:
 
 def journal_read_windows(receipt: dict, request: dict) -> list[dict]:
     """Decode successful byte-owner reads; no current access or fact certification."""
+    material = (receipt.get('metadata') or {}).get('material_observations')
+    if receipt.get('status') in {'ok', 'error', 'blocked'} and isinstance(material, list):
+        # Professional operations expose their actual reader observations through
+        # one port. Reuse still checks this original receipt, current authority,
+        # full-file version and exact byte range; generated prose is not a read.
+        return [{'request': row['request'], 'data': row['data'], 'input_index': index,
+                 'field': f'metadata.material_observations.{index}.data.text'}
+            for index, row in enumerate(material) if isinstance(row, dict)
+            and isinstance(row.get('request'), dict) and isinstance(row.get('data'), dict)
+            and isinstance(row['data'].get('text'), str)]
     review = (receipt.get('metadata') or {}).get('delivery_review')
     nested = review.get('result') if isinstance(review, dict) else None
     if (receipt.get('tool_name') != 'inspect_artifacts' and isinstance(nested, dict)

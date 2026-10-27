@@ -123,6 +123,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.inspection_requests = []
         self.inspection_messages = []
         self.memory_views = []
+        self.document_views = []
+        self.document_decision = None
         self.transport_errors = []
         self.review = self._review_complete_targets
         self.inspection_partial_targets = set()
@@ -177,7 +179,10 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._create()
         self.assertEqual(self.app.state['config']['control_protocol'],'operations.v1')
         self.assertIsNone(self.app.writing)
-        self.assertIsNone(self.app.implementation)
+        self.assertEqual(self.app.state['config']['professional_operations'], 'work.v1')
+        self.assertEqual(self.app.implementation.source_owner_contract, 'source_owner.v1')
+        self.assertTrue(self.app.implementation.preparation_only)
+        self.assertIsNotNone(self.app.operations.document)
         self.assertFalse({'professional_work','result_investigation','document_source_contract',
             'source_generation_protocol','source_decision_protocol'}
             & self.app.state['config'].keys())
@@ -193,7 +198,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(self.app.state['config']['tool_contracts'], 'on_demand')
         core = {row['function']['name'] for row in self.app.schemas}
         self.assertTrue({'read_file','search_files','write_file','edit_file','run_process',
-            'deliver_result','load_tools','read_history','update_work_plan'} <= core)
+            'deliver_result','load_tools','read_history','update_work_plan',
+            'prepare_implementation','execute_implementation','work_document'} <= core)
         optional = {'inspect_table','analyze_table','measure_experiment','analyze_measurements',
             'inspect_artifacts','export_report','find_source_passages'}
         self.assertFalse(optional & core)
@@ -401,6 +407,12 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 finish = 'tool_calls'
             else:
                 view, _ = json.JSONDecoder().raw_decode(request['messages'][1]['content'])
+                if 'manuscript_markdown' in view.get('response_schema', {}).get('properties', {}):
+                    self.assertTrue(callable(self.document_decision), 'Unexpected document work')
+                    self.document_views.append(deepcopy(view))
+                    return {'choices': [{'message': {'role': 'assistant',
+                        'content': json.dumps(self.document_decision(view))}, 'finish_reason': 'stop'}],
+                        'usage': {'prompt_tokens': 100, 'completion_tokens': 40, 'total_tokens': 140}}
                 if 'notes' in view.get('response_schema',{}).get('properties',{}):
                     self.memory_views.append(view)
                     message = {'role':'assistant','content':json.dumps({'notes':[{
@@ -897,12 +909,15 @@ class OperationsWorkLoopTests(unittest.TestCase):
             'status':'pending'}]), feedback='Keep the calculation; clarify interpretation.')
         self.assertTrue(self.app._working_memory()['notes'][0]['current'])
         self.assertIn('Three recorded', self.app._working_memory()['notes'][0]['text'])
+        professional = self.app._work_context(['measurements'])
+        self.assertEqual(professional['working_notes'], self.app._working_memory()['notes'])
         self._submit(_action('update_work_plan', notes=[{'text':'Invented source',
             'records':['records/not-an-observation/native_result.json']}]))
         self.assertNotEqual(self._last('update_work_plan')['status'],'ok')
         self.assertIn('Three recorded', self.app._working_memory()['notes'][0]['text'])
         (self.inputs/'observations.csv').write_text('sample,value\na,7\n',encoding='utf-8')
         self.assertFalse(self.app._working_memory()['notes'][0]['current'])
+        self.assertFalse(self.app._work_context(['measurements'])['working_notes'][0]['current'])
         self._submit(_action('update_work_plan', notes=[]))
         self.assertEqual(self.app._working_memory()['notes'],[])
 
@@ -946,6 +961,18 @@ class OperationsWorkLoopTests(unittest.TestCase):
         parent_record = self.app.state['turns'][-1]['tools'][0]['result'].replace('attempts/', 'records/', 1)
         self.assertTrue(any(row['record'] == parent_record for row in references))
         self.assertIn('contradicts', ' '.join(self.app._delivery_feedback()['issues']))
+        context = self.app._work_context(['workspace'])
+        feedback = context['professional_findings']
+        joint = next(row for row in feedback if row.get('delivery_context'))
+        self.assertEqual(joint['delivery_context'], proof['binding'])
+        self.assertIn('contradicts', json.dumps(joint['result']['metadata']))
+        self.assertTrue(joint['subjects'][0]['current_matches_review'])
+        self.assertNotIn('windows', joint['result']['data']['targets'][0])
+        source_feedback = self.app._work_context(['workspace/table.csv'])['professional_findings']
+        routed = next(row for row in source_feedback if row.get('delivery_context'))
+        self.assertEqual(routed['subjects'][0]['review_role'], 'delivery_inventory_member')
+        self.assertEqual(set(routed['result']['metadata']['assessments'][0]['subjects']),
+            {str(self.app.workspace.resolve('workspace/report.md'))})
         calls = self.send.call_count
         ledger = (self.root/'budget_ledger.json').read_bytes()
         self._reload()
@@ -959,10 +986,95 @@ class OperationsWorkLoopTests(unittest.TestCase):
             self._submit(_action('write_file', path=path, content=content,
                 expected_sha256=_digest(self.root/'workspace'/path)))
             self._ok('write_file')
+        before_revision_context = (self.root/'budget_ledger.json').read_bytes()
+        requests_before_revision_context = self.send.call_count
+        historical = self.app._work_context(['workspace'])['professional_findings']
+        joint = next(row for row in historical if row.get('delivery_context'))
+        self.assertFalse(joint['subjects'][0]['current_matches_review'])
+        self.assertIn('contradicts', json.dumps(joint['result']['metadata']))
+        self.assertEqual((self.root/'budget_ledger.json').read_bytes(), before_revision_context)
+        self.assertEqual(self.send.call_count, requests_before_revision_context)
         self._submit(_action('deliver_result', **self._delivery('report.md', 'table.csv')))
         self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
         self.assertEqual(self._versions(self.inputs), original_inputs)
         self.assertFalse(self._process_receipts())
+
+    def test_document_owner_uses_original_reads_across_feedback_and_recovers_without_new_calls(self):
+        self.app = ToolApplication.create(self.root,
+            'Explain the supplied observations in an editable Markdown note, preserving the originals.',
+            model='fixture', sources={'measurements': self.inputs}, services=self.services,
+            max_turns=30, max_tokens=300000, max_attempts=70, tool_contracts='full')
+        originals = self._versions(self.inputs)
+
+        def author(view):
+            observed = view['observations']
+            if not observed:
+                return {'action': 'investigate', 'read_windows': [
+                    {'path': 'measurements/observations.csv'}, {'path': 'measurements/conditions.txt'}]}
+            context = view['work_context']
+            prior = view['prior_draft']
+            body = '# Recorded values\n\nThe observed mean is 2.0.\n'
+            if prior:
+                self.assertIn('Clarify the scope', context['user_requests'][-1])
+                self.assertTrue(any(row.get('delivery_context') for row in context['professional_findings']))
+                body += '\nThis describes the supplied observations only; no population inference is supported.\n'
+            return {'action': 'finish', 'manuscript_markdown': body,
+                'selected_observation_ids': [row['id'] for row in observed]}
+
+        self.document_decision = author
+        arguments = {'goal': 'Explain the actual recorded values', 'material_roots': ['measurements']}
+        self._submit(_action('work_document', **arguments))
+        initial = self._ok('work_document')
+        self.assertEqual(len(self.document_views), 2)
+        first_record = self.app.state['turns'][-1]['tools'][-1]['result']
+        references = self.app._material_observations(['measurements'])
+        self.assertTrue(any(row['record'].endswith(first_record.removeprefix('attempts/')) for row in references))
+        manuscript = initial['data']['manuscript']
+        initial_bytes = self.app.workspace.resolve(manuscript).read_bytes()
+        self._submit(_action('deliver_result', **self._delivery(manuscript)))
+        self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
+        self._reload()
+        self._submit(_action('work_document', goal='Clarify the scope while preserving the result',
+            prior_draft=manuscript, prior_sha256=initial['data']['sha256']),
+            feedback='Clarify the scope: explain why these observations do not establish a population claim.')
+        revision = self._ok('work_document')
+        self.assertEqual(len(self.document_views), 3)  # Reused actual reads, no new investigation request.
+        self.assertEqual(self.app.workspace.resolve(manuscript).read_bytes(), initial_bytes)
+        self.assertEqual(self._versions(self.inputs), originals)
+        self.assertIn('no population inference', revision['data']['markdown'])
+        self._submit(_action('deliver_result', **self._delivery(revision['data']['manuscript'])))
+        self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
+        ledger, calls = (self.root/'budget_ledger.json').read_bytes(), self.send.call_count
+        identity = Path(first_record).parent.name
+        replay = self.app.operations.document.call('work_document', arguments, identity=identity)
+        self.assertEqual(replay.model_dump(mode='json'), initial)
+        self.assertEqual(self.send.call_count, calls)
+        self.assertEqual((self.root/'budget_ledger.json').read_bytes(), ledger)
+
+    def test_unavailable_review_remains_a_diagnostic_without_poisoning_professional_work(self):
+        from simple_ar.integrations.llm import LLMStreamError
+        self._create()
+        self._write('report.md', '# Observations\n\nThe recorded mean is 2.0.\n')
+
+        def interrupted(mode, request, **kwargs):
+            if any(row['function']['name'] == 'record_inspection' for row in request.get('tools', [])):
+                raise LLMStreamError('Controlled independent review stream interrupted')
+            return self._provider(mode, request, **kwargs)
+
+        self.send.side_effect = interrupted
+        self._submit(_action('deliver_result', **self._delivery('report.md')))
+        self._not_delivered()
+        before, calls = (self.root/'budget_ledger.json').read_bytes(), self.send.call_count
+        self._reload()
+        context = self.app._work_context(['workspace/report.md'])
+        diagnostic, = [row for row in context['professional_findings'] if row.get('delivery_context')]
+        self.assertFalse(diagnostic['opinion_available'])
+        self.assertEqual(diagnostic['result']['metadata'], {})
+        self.assertIn('unavailable', diagnostic['result']['error'])
+        self.assertEqual(self.app._work_context(['measurements'])['review_observations'], [])
+        self.assertEqual(self.send.call_count, calls)
+        self.assertEqual((self.root/'budget_ledger.json').read_bytes(), before)
+        self.assertTrue(self.app.ledger.unknown_dimensions())
 
     def test_required_defect_blocks_delivery_without_editing_then_same_bytes_can_be_reassessed(self):
         self._create()

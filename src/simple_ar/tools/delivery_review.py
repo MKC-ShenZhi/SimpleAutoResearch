@@ -91,6 +91,26 @@ class DeliveryReview:
         return ToolResult(tool_name='inspect_artifacts', status='blocked',
                           error='Delivery inspection started without a completed result; no replay')
 
+    def feedback_observation(self, envelope: dict) -> dict:
+        """Return the inspector's original opinion with its full delivery scope.
+
+        A revision changes the inventory, so the current _verified acceptance
+        check must not be used to erase earlier findings. The inspector still
+        verifies its original input, response, result and accounted usage.
+        """
+        identity, binding = envelope['identity'], envelope['binding']
+        feedback = self.inspector.feedback_observation(identity, envelope['result'])
+        original = feedback.get('delivery_context') or {}
+        if (original != binding or feedback.get('arguments') != self._arguments(binding)):
+            feedback.update(opinion_available=False,
+                result=ToolResult(tool_name='inspect_artifacts', status='blocked',
+                    error='Delivery feedback differs from its retained review scope').model_dump(mode='json'),
+                scope='Diagnostic only; no verified whole-delivery opinion is available.')
+        # Relevance includes delivered code/figures, while the actual opinion
+        # still targets the manuscript. Inventory membership is no target pass.
+        return {**feedback, 'delivery_context': deepcopy(original),
+            'reviewed_inventory': dict(original.get('artifacts', {}))}
+
     def review(self, delivery: dict, identity: str, *, may_start: bool,
                current_outputs: tuple[Path, ...] = ()) -> dict | None:
         binding = self._binding(delivery, current_outputs=current_outputs)

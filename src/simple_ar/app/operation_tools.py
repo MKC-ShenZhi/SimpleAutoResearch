@@ -114,6 +114,8 @@ class OperationTools:
             protocol=config.get('inspection_protocol'),
             material_observations=material_observations,
             user_requests=user_requests,
+            feedback_provider=self.inspection_feedback
+                if config.get('professional_operations') == 'work.v1' else None,
             prior_assessments=lambda:[row.model_dump() for row in
                 current_assessments(self.workspace,observations())])
         self.registry.register_package(inspection_tool_specs(progressive=self.inspection.progressive,
@@ -132,14 +134,17 @@ class OperationTools:
         if preparation not in {None,'prepared.v1','prepared.v2','prepared.v3'}:
             raise ValueError('Unsupported source generation protocol')
         exact = config.get('code_task') is not None
+        professional = config.get('professional_operations') == 'work.v1'
+        source_owner = 'source_owner.v1' if professional and not exact and preparation is None else None
         self.system = (_SOURCE_COORDINATION
-            if not exact and preparation in {'prepared.v2','prepared.v3'} else _DIRECT_WORK) + _work_principles(
+            if source_owner or not exact and preparation in {'prepared.v2','prepared.v3'} else _DIRECT_WORK) + _work_principles(
                 config.get('delivery_review_protocol') == 'task.v1')
-        if exact or preparation is not None and config['model'] is not None:
+        if exact or (preparation is not None or source_owner) and config['model'] is not None:
             from simple_ar.tools.implementation import ImplementationToolGateway, implementation_tool_specs
             self.implementation = ImplementationToolGateway(root,self.workspace,ledger,config['model'],session_id,
                 client_factory=lambda identity:client_factory(identity,'code'), exact=config.get('code_task'),
                 preparation_only=not exact,
+                source_owner_contract=source_owner,
                 input_contract='bounded_inputs.v2' if not exact and preparation in {'prepared.v2','prepared.v3'} else None,
                 source_edit_contract='bound_content.v1' if not exact and preparation == 'prepared.v3' else None,
                 decision_protocol=config.get('source_decision_protocol') if not exact else None,
@@ -155,8 +160,25 @@ class OperationTools:
                         if row.get('contract_current',True)]),origin,required=required)) if exact else None,
                 candidate_outputs=(lambda record:self.scientific.candidate_outputs(record) if self.scientific else {})
                     if exact else None)
-            self.registry.register_package(implementation_tool_specs(exact=exact,preparation_only=not exact),
+            self.registry.register_package(implementation_tool_specs(exact=exact,preparation_only=not exact,
+                source_owner_contract=source_owner),
                 self.implementation,request_visible=True)
+        self.document = None
+        if professional and config['model'] is not None:
+            from simple_ar.tools.document_work import DocumentWorkToolGateway, document_work_tool_specs
+            self.document = DocumentWorkToolGateway(root, self.workspace, ledger, session_id,
+                client_factory=lambda identity: client_factory(identity, 'writing'),
+                work_context=work_context, material_observations=material_observations,
+                material_roots=lambda: [str(path) for alias, path in self.workspace.mounts.items()
+                    if alias not in {'workspace', 'records'}], sources=self.sources)
+            self.registry.register_package(document_work_tool_specs(), self.document, request_visible=True)
+            self.system += (' For coherent manuscript drafting or substantive document revision, work_document '
+                'owns investigation of actual original materials and creates an editable candidate. Supply '
+                'the document goal, relevant current result roots and, for revision, the current manuscript '
+                'with its observed hash. Its original task roots and recorded findings are supplied directly; '
+                'do not preselect evidence windows or rewrite the evidence for it. Its gaps are disclosed '
+                'work concerns, not independent acceptance. Inspect actual claims independently and use the '
+                'common publication operation only for requested formats; no compulsory PDF or work sequence.')
         if config.get('scientific_tools'):
             from simple_ar.tools.scientific import ScientificToolGateway, scientific_tool_specs
             self.scientific = ScientificToolGateway(root,self.workspace,ledger,session_id,
@@ -199,6 +221,60 @@ class OperationTools:
         self.session_id = session_id
         self.ledger = ledger
 
+    def inspection_feedback(self, targets: list[str]) -> list[dict]:
+        """Project original owner-verified opinions through the shared work-input port.
+
+        Changed subjects keep guidance with explicit old/current versions, never
+        acceptance. Source bodies remain in the original read observations.
+        """
+        roots = [self.workspace.resolve(path) for path in targets]
+        selected = {path: self.workspace.artifact_hashes([str(path)])[str(path)]
+            for path in roots if path.is_file()}
+        result, concluded = [], set()
+        for observed in reversed(self.observations()):
+            envelope = (observed.get('metadata') or {}).get('delivery_review')
+            if isinstance(envelope, dict) and self.delivery_review is not None:
+                feedback = self.delivery_review.feedback_observation(envelope)
+            elif observed.get('tool_name') == 'inspect_artifacts':
+                if not (observed.get('metadata') or {}).get('inspection_binding'):
+                    continue
+                identity = Path(observed['record']).parent.name
+                claimed = {key: value for key, value in observed.items()
+                    if key not in {'record', 'arguments', 'current_request', 'contract_current'}}
+                feedback = self.inspection.feedback_observation(identity, claimed,
+                    expected_arguments=observed['arguments'])
+            else:
+                continue
+            subjects = []
+            targets_reviewed = feedback.pop('reviewed_subjects')
+            inventory = feedback.pop('reviewed_inventory', {})
+            for locator, digest in {**inventory, **targets_reviewed}.items():
+                try:
+                    subject = self.workspace.resolve(locator)
+                except ValueError:
+                    continue  # Old locators do not grant new access.
+                copy = next((path for path, value in selected.items() if value == digest), None)
+                if ((subject, digest) in concluded or not (copy is not None or any(subject == root
+                        or root.is_dir() and subject.is_relative_to(root) for root in roots))):
+                    continue
+                current_path = copy or subject
+                current = (self.workspace.artifact_hashes([str(current_path)])[str(current_path)]
+                    if current_path.is_file() else None)
+                subjects.append({'path': locator, 'reviewed_sha256': digest,
+                    'selected_path': str(current_path), 'current_sha256': current,
+                    'current_matches_review': current == digest,
+                    'review_role': 'inspection_target' if locator in targets_reviewed else 'delivery_inventory_member'})
+                metadata = feedback['result'].get('metadata') or {}
+                assessments = metadata.get('assessments', [metadata.get('assessment')])
+                conclusive = lambda row: row and row['coverage'] == 'complete' and row['verdict'] != 'incomplete'
+                if (any(conclusive(row) and locator in row['subjects'] for row in assessments)
+                        or inventory and assessments and all(conclusive(row) for row in assessments)):
+                    concluded.add((subject, digest))
+            if subjects:
+                result.append({**feedback, 'kind': 'inspection_feedback', 'subjects': subjects,
+                    'record': 'records/' + observed['record'].removeprefix('attempts/')})
+        return result
+
     def presentation(self, selected: set[str], mode: str):
         active, catalog = set(), {}
         for spec in self.registry.list_specs():
@@ -232,6 +308,15 @@ class OperationTools:
                 data = row.get('data') or {}
                 if isinstance(data.get('absolute_path'), str) and isinstance(data.get('sha256'), str):
                     bindings[data['absolute_path']] = data['sha256']
+                if self.config.get('professional_operations') == 'work.v1':
+                    for window in (row.get('metadata') or {}).get('material_observations', []):
+                        observed = window['data']
+                        if isinstance(observed.get('absolute_path'), str) and isinstance(observed.get('sha256'), str):
+                            bindings[observed['absolute_path']] = observed['sha256']
+                    # Producer-owned output hashes bind understanding of the
+                    # delivered candidate as well as its observed source bytes.
+                    for path, digest in data.get('artifact_sha256', {}).items():
+                        bindings[str(self.workspace.resolve(path))] = digest
             result.append({'text':note['text'],'records':list(dict.fromkeys(records)),
                 'observed_versions':bindings,'scope':'model_note_not_verified_evidence'})
         return result

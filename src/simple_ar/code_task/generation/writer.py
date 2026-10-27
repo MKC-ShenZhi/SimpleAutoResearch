@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import copy
 import hashlib
+from itertools import count
 import json
 import mimetypes
 import os
@@ -120,6 +121,7 @@ def write_implementation_unit(
     dependency_advice: dict[str, Any] | None = None,
     command_source_binding: dict | None = None,
     decision_protocol: str | None = None,
+    source_owner_contract: str | None = None,
 ) -> dict[str, Any]:
     """Generate related files as one scoped unit, without legacy stage planning.
 
@@ -135,6 +137,7 @@ def write_implementation_unit(
     """
     if decision_protocol not in (None, 'native.v1'):
         raise ValueError('Unknown implementation decision protocol')
+    _validate_source_owner(source_owner_contract, investigation, decision_protocol)
     original_files = original_files if original_files is not None else {}
     edit_contract = (investigation.edit_contract if investigation is not None else
         (command_source_binding or {}).get('source_edit_contract'))
@@ -233,6 +236,20 @@ def write_implementation_unit(
                 '12 files or includes binary/large dependencies. Unread members remain uninspected. '
                 'Only the selected editable subtree grants edit authority; outputs cannot overlap any '
                 'registered member. Additional individual preserve mappings retain their existing limits.')
+    if source_owner_contract:
+        system = system.replace(
+            'At most six decisions share this task budget.',
+            'Investigation and candidate corrections consume the existing shared task budget; '
+            'there is no separate six-decision ceiling.')
+        system = system.replace('within those same six calls', 'within that shared allowance')
+        system = system.replace('the same six decisions and task budget', 'the existing shared task budget')
+        system += (' Use the original request, actual execution diagnostics and supplied original review '
+            'records to decide necessary revisions. Respect current/stale version annotations and distinguish '
+            'required corrections from suggestions. Work notes are judgments, not source evidence. '
+            'Produce the candidate and proposed execution; no action here executes or approves it. '
+            'Two consecutive read/focus decisions with no distinct new original observation stop '
+            'investigation; restoring a retired window does not count as acquiring new information. '
+            'If investigation cannot resolve a gap, disclose it rather than inventing source facts.')
     if edit_contract == 'bound_content.v1':
         system += (' The bound_content.v1 policy grants no edits to immutable inputs, unread or '
             'unbound existing paths. Preserve unrelated code and documentation in full content. '
@@ -283,6 +300,7 @@ def write_implementation_unit(
         validate_destination=validate_destination, execution_requested=execution_requested,
         investigation=investigation, preserved_files=preserved_files,
         decision_protocol=decision_protocol,
+        source_owner_contract=source_owner_contract,
         candidate_admission=candidate_admission, preserve_workspace=preserve_workspace,
         command_source_binding=command_source_binding, candidate_root=project_dir)
     unresolved = response.get('unresolved', [])
@@ -534,6 +552,21 @@ def _parse_implementation_action(message: dict, tools: list[dict]) -> tuple[str,
     return name, value, call['id']
 
 
+def _validate_source_owner(contract: str | None, investigation: Any, protocol: str | None) -> None:
+    if contract not in (None, 'source_owner.v1'):
+        raise ValueError('Unknown implementation source owner contract')
+    if contract and (investigation is None or protocol != 'native.v1'):
+        raise ValueError('Source ownership requires authorized investigation and native source actions')
+
+
+class _SourceRevisionStopped(ValueError):
+    reason = 'source_revision_stagnated'
+
+
+class _SourceInvestigationStopped(ValueError):
+    reason = 'source_investigation_stagnated'
+
+
 def _generate_implementation_contents(
     *, client: LLMClient, system: str, prompt: str, planned: list[str] | None,
     original_files: dict[str, dict[str, str]] | None = None,
@@ -550,8 +583,10 @@ def _generate_implementation_contents(
     command_source_binding: dict | None = None,
     candidate_root: Path | None = None,
     decision_protocol: str | None = None,
+    source_owner_contract: str | None = None,
 ) -> tuple[dict[str, str], dict[str, Any], dict[str, str]]:
-    """Professional diagnostics share six decisions; historical correction limits stay local."""
+    """Use the selected source contract; historical six-decision limits stay frozen."""
+    _validate_source_owner(source_owner_contract, investigation, decision_protocol)
     if decision_protocol not in (None, 'native.v1'):
         raise ValueError('Unknown implementation decision protocol')
     native = investigation is not None and decision_protocol == 'native.v1'
@@ -561,10 +596,17 @@ def _generate_implementation_contents(
     response: dict[str, Any] = {}
     if not legacy:
         retry_attempts = min(retry_attempts, 2)
-    decisions = 6 if investigation is not None else retry_attempts
+    # This is one generation operation on the existing client/ledger, not a
+    # second allowance. The legacy limit cannot bound ordinary project research:
+    # batches of necessary original reads alone can legitimately exceed six.
+    decisions = None if source_owner_contract else 6 if investigation is not None else retry_attempts
     validation_observations = []
+    previous_rejection = None
+    unproductive_reads = 0
     from simple_ar.code_task.generation.validation import CandidateAdmissionError, check_candidate_sources
-    for attempt in range(1, decisions + 1):
+    for attempt in count(1):
+        if decisions is not None and attempt > decisions:
+            break
         response = {}
         response_received = False
         operation = 'candidate'
@@ -580,8 +622,12 @@ def _generate_implementation_contents(
                     investigation=investigation.context())
                 ledger = getattr(client, '_budget_ledger', None)
                 remaining = ledger.remaining('llm_requests') if isinstance(ledger, BudgetLedger) else None
-                available = decisions - attempt + 1
-                context['investigation']['decisions_remaining'] = min(available, int(remaining)) if remaining is not None else available
+                available = decisions - attempt + 1 if decisions is not None else None
+                context['investigation']['decisions_remaining'] = (min(available, int(remaining))
+                    if available is not None and remaining is not None else
+                    int(remaining) if remaining is not None else available)
+                if source_owner_contract:
+                    context['investigation']['decision_allowance'] = 'shared_task_budget'
                 context['validation_observations'] = validation_observations
                 prompt = json.dumps(context, ensure_ascii=False)
                 if len(prompt.encode('utf-8')) > 4 * 1024 * 1024:
@@ -640,13 +686,28 @@ def _generate_implementation_contents(
                     allowed = {'read_windows', 'focus_observations'} if investigation.working_set else {'read_windows'}
                     if not set(response) <= allowed:
                         raise ValueError('Read necessary windows OR return the candidate, not both')
-                    if 'focus_observations' in response:
-                        investigation.focus(response['focus_observations'])
-                    if 'read_windows' in response:
-                        investigation.read(response['read_windows'])
+                    observed_before = len(investigation.observations)
+                    try:
+                        if 'focus_observations' in response:
+                            investigation.focus(response['focus_observations'])
+                        if 'read_windows' in response:
+                            investigation.read(response['read_windows'])
+                    finally:
+                        if source_owner_contract:
+                            # Focus can restore a previously retired window to
+                            # presentation; that is not a new source observation.
+                            # Count actual deduplicated reads, not action names
+                            # or changing request spellings.
+                            unproductive_reads = (unproductive_reads + 1
+                                if len(investigation.observations) == observed_before else 0)
+                            if unproductive_reads >= 2:
+                                raise _SourceInvestigationStopped('Consecutive read/focus decisions added '
+                                    'no distinct original observation; inspect retained reads and produce '
+                                    'the candidate or choose a necessary new range')
                     write_json(artifact_dir / 'decision-steps' / str(attempt) / 'observations.json', investigation.observations)
                     action_result = {'status': 'observed', 'observations_ref':
                         f'decision-steps/{attempt}/observations.json'}
+                    previous_rejection = None
                     feedback = ''
                     continue
                 candidate_originals, candidate_preserved = investigation.bind_response(response, commit=False)
@@ -728,14 +789,25 @@ def _generate_implementation_contents(
                         **({'raw_response': exc.raw_response} if isinstance(exc, LLMResponseError) else {})})
                 budget = getattr(client, '_budget_ledger', None)
                 exhausted = isinstance(budget, BudgetLedger) and budget.remaining('llm_requests') == 0
-                diagnosis.update(decisions_remaining=decisions - attempt,
-                        stop_reason='decision_ceiling' if attempt == decisions else
+                signature = json.dumps(response, ensure_ascii=False, sort_keys=True)
+                stagnated = bool(source_owner_contract and signature == previous_rejection)
+                previous_rejection = signature
+                diagnosis.update(decisions_remaining=decisions - attempt if decisions is not None else
+                        budget.remaining('llm_requests') if isinstance(budget, BudgetLedger) else None,
+                        stop_reason=exc.reason if isinstance(exc, _SourceInvestigationStopped) else
+                            'source_revision_stagnated' if stagnated else
+                            'decision_ceiling' if attempt == decisions else
                             'llm_requests_exhausted' if exhausted else None)
                 if isinstance(exc, CandidateAdmissionError):
                     write_json(artifact_dir / 'candidate_validation.json', diagnosis)
                 validation_observations.append(diagnosis)
                 if investigation is not None:
                     write_json(artifact_dir / 'decision-steps' / str(attempt) / 'validation.json', diagnosis)
+                if isinstance(exc, _SourceInvestigationStopped):
+                    raise
+                if stagnated:
+                    raise _SourceRevisionStopped('The same rejected source proposal was submitted twice; '
+                        'inspect retained diagnostics before choosing a new operation') from exc
                 if attempt == decisions or exhausted:
                     raise
                 feedback = (('Professional decision rejected by actual validation; '

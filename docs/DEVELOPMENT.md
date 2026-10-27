@@ -69,10 +69,18 @@ owns version-bound findings and publication owns rendering and export provenance
 New creation defaults to `tool_contracts="on_demand"`: workspace editing, permitted
 process operations and coordination are directly available; optional professional
 contracts are discoverable and loaded when needed. Frozen code, table-analysis and
-measurement contracts expose their required owners directly. Ordinary source work
-uses the shared action loop without a mandatory preparation controller. Saved
+measurement contracts expose their required owners directly. New tasks also freeze
+`professional_operations="work.v1"`: coherent source work uses `prepare_implementation`
+and separately approved execution; `work_document` investigates originals and drafts
+or revises a manuscript. Both share the task ledger and return candidates, while
+inspection, publication and terminal delivery retain their own responsibilities.
+Simple operations remain directly available. Saved
 preparation contracts and `outcomes` tasks retain their recorded presentation and
 executable recovery; loading tools changes presentation, never authority.
+Professional reader observations use the shared material receipt interface, so later
+work can reuse actual reads after permission, byte-version and range checks. Original
+review opinions retain their inspected versions; unavailable opinions remain diagnostics
+and cannot certify delivery or prevent unrelated work from reading its journal.
 Project reuse requires a terminal delivery and one explicit complete `copy_project`
 inventory with matching current hashes. Portable file groups alone do not establish
 a project root. Reuse grants no execution authority, environment or inherited validator;
