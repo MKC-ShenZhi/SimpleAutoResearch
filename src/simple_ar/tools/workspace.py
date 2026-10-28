@@ -763,6 +763,105 @@ class WorkspaceToolGateway:
                 hashes[locator] = hashlib.file_digest(handle, 'sha256').hexdigest()
         return hashes
 
+    def working_result(self, observations: Iterable[dict], *, saved_delivery: dict | None,
+                       completions: dict | None = None) -> dict[str, Any]:
+        """Project existing owner receipts, without checking bytes or adopting work.
+
+        A recorded version is not a current version check. Only referenced files
+        are resolved; process declarations and directory contents are never outputs.
+        """
+        identities, artifacts, last_delivery, latest_produced = [], [], None, None
+        last_operation, next_action = None, ''
+        for event in observations:
+            observed = event['observation']
+            name, data = observed.get('tool_name'), observed.get('data') or {}
+            last_operation = {'tool_name': name, 'status': observed.get('status'),
+                              'failure_kind': data.get('failure_kind')}
+            next_action = data.get('next_action') or next_action
+            successful = observed.get('status') == 'ok'
+            metadata = observed.get('metadata') or {}
+            owner = {'record': 'records/' + event['record'].removeprefix('attempts/'), 'tool_name': name,
+                     'request_count': event['request_count']}
+            groups = []
+            pinned = metadata.get('delivery_hashes') if successful else None
+            completion = tool_completion(name, completions)
+            delivery = (data.get(completion.field) if completion.field else data
+                        ) if completion is not None and completion.kind == 'delivery' else None
+            if successful and isinstance(delivery, dict) and delivery == saved_delivery:
+                last_delivery = {**owner, 'summary': delivery.get('summary', ''),
+                    'report': delivery.get('report'), 'artifact_count': len(delivery.get('artifacts', [])),
+                    'unresolved': delivery.get('unresolved', []), 'limitations': delivery.get('limitations', []),
+                    'version_binding': 'recorded' if isinstance(pinned, dict) and bool(pinned)
+                        and set(pinned) == set(delivery.get('artifacts', [])) and all(
+                        isinstance(digest, str) and re.fullmatch(r'[0-9a-fA-F]{64}', digest)
+                        for digest in pinned.values()) else 'unknown',
+                    'acceptance': 'saved_delivery_only',
+                    'scope': 'Recorded delivery for this request count; no current acceptance or byte verification.'}
+            if isinstance(pinned, dict):
+                groups.append((owner, pinned, 'delivery_binding'))
+            # The invocation is the output-binding owner for both fresh and
+            # recovered runs. Never reinterpret argv or bind historical bytes.
+            if successful and name == 'run_process' and isinstance(data.get('receipt'), str):
+                try:
+                    receipt = self._process_diagnostic_path(str(self.root / data['receipt']))
+                    if receipt is not None and receipt.name == 'invocation.json':
+                        process = read_json(receipt)
+                        binding = (process.get('input_binding') or {}).get('workspace_artifacts') or {}
+                        outputs = process.get('output_binding') or {}
+                        if (receipt.parent.name == Path(event['record']).parent.name
+                                and process.get('invocation_id') == receipt.parent.name
+                                and process.get('status') == 'finished' and process.get('returncode') == 0
+                                and not process.get('stop_reason') and not process.get('output_binding_error')
+                                and binding.get('version') == 1 and outputs.get('version') == 1
+                                and isinstance(outputs.get('outputs'), dict)
+                                and all(isinstance(digest, str) and re.fullmatch(r'[0-9a-fA-F]{64}', digest)
+                                        for digest in outputs['outputs'].values())
+                                and set(outputs['outputs']) == set(binding.get('outputs', []))):
+                            groups.append(({**owner, 'receipt': str(receipt)},
+                                           outputs['outputs'], 'process_output_binding'))
+                except (OSError, ValueError, KeyError, TypeError):
+                    pass  # Missing or historical unbound execution is not production proof.
+            # Existing native artifact identities remain visible even without a
+            # version binding; primitive write receipts already own their digest.
+            native = dict.fromkeys(observed.get('artifacts') or [])
+            if successful and name in {'write_file', 'edit_file', 'copy_file'} and data.get('absolute_path'):
+                groups.append((owner, {data['absolute_path']: data.get('sha256')}, 'write_binding'))
+            groups.append((owner, native, 'native_artifact'))
+            produced, seen = [], set()
+            for provenance, versions, kind in groups:
+                for locator, digest in versions.items():
+                    if not isinstance(locator, str):
+                        continue
+                    bound = isinstance(digest, str) and re.fullmatch(r'[0-9a-fA-F]{64}', digest) is not None
+                    row = {'locator': locator, 'recorded_sha256': digest if bound else None,
+                           'version_binding': 'recorded' if bound else 'unknown',
+                           'current_version': 'unchecked', 'provenance': {**provenance, 'kind': kind}}
+                    try:
+                        path = self.resolve(locator)
+                        if not path.is_relative_to(self.workspace):
+                            continue  # Source aliases never become current workspace work.
+                        row['locator'] = 'workspace/' + path.relative_to(self.workspace).as_posix()
+                        row['absolute_path'] = str(path)
+                        if path in seen:
+                            continue  # Prefer the owner binding over an unversioned alias.
+                        seen.add(path)
+                        row['presence'] = 'present' if path.is_file() else 'missing'
+                        if row['presence'] == 'present' and row['locator'] not in artifacts:
+                            artifacts.append(row['locator'])
+                    except (OSError, ValueError):
+                        row['presence'] = 'inaccessible'
+                    identities.append(row)
+                    if bound:
+                        produced.append(row)
+            if produced:
+                latest_produced = {**owner,
+                    **({'receipt': produced[0]['provenance']['receipt']}
+                       if 'receipt' in produced[0]['provenance'] else {}), 'identities': produced}
+        return {'artifacts': artifacts, 'identities': identities, 'last_delivery': last_delivery,
+                'latest_produced': latest_produced, 'acceptance': 'not_inferred',
+                'last_operation': last_operation,
+                'next_action': next_action or 'Resume this saved task after addressing the stop condition; completed work and accounting are retained.'}
+
     def _version_hashes(self, locators: Iterable[str]) -> dict[str, str]:
         """Bound only declared files, with finite streamed I/O."""
         hashes, total = {}, 0

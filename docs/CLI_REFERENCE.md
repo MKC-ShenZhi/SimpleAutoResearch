@@ -36,6 +36,8 @@ Bare start asks for a goal. A positional request or ordinary `--goal` enters the
 
 ### Native task entry (experimental)
 
+#### Goal and materials
+
 | Option | Meaning / default |
 | --- | --- |
 | `REQUEST`, `--goal TEXT` | Natural-language goal |
@@ -45,6 +47,11 @@ Bare start asks for a goal. A positional request or ordinary `--goal` enters the
 | `--source PATH` | Repeatable read-only regular file/directory mount |
 | `--document PATH`, `--material PATH`, `--project PATH`, `--data-path PATH`, `--data-file PATH` | Ordinary preference inputs become read-only mounts with declared roles |
 | `--project-python PATH` | Existing process interpreter; no installation or environment creation |
+
+#### Access and limits
+
+| Option | Meaning / default |
+| --- | --- |
 | `--allow-network` | Public source search/acquisition; separate from process access |
 | `--allow-execution` | Allow process proposals; every command still needs approval |
 | `--allow-vision` | Send mounted PNG/JPEG/WebP to configured vision route |
@@ -52,6 +59,11 @@ Bare start asks for a goal. A positional request or ordinary `--goal` enters the
 | `--max-turns N`, `--max-tokens N` | Saved task-wide allowances: 30 model requests, 600000 tokens |
 | `--prepare-only` | Save/preview without calls or execution; new native tasks still preflight connection/credentials |
 | `--yes` | Accept displayed task/access/resource summary, not command approval |
+
+#### Saved tasks and continuation
+
+| Option | Meaning / default |
+| --- | --- |
 | `--resume-task SESSION` | Resume saved native state, optionally with feedback |
 | `--tasks-in PATH`, `--select-task` | Read-only native task listing in a directory and direct children; select interactively or use `--resume-task EXACT_NAME` |
 | `--write-task-config PATH`, `--task-config PATH` | Export annotated native creation TOML and exit; load after review, with explicit CLI values taking precedence; not a saved-task reset |
@@ -78,7 +90,88 @@ Figure work requests layout/code, PNG, editable SVG and explanation. Scripted an
 
 ### Native recovery
 
-To add missing conditions to a caller-directed native task, use a supply file rather than model retry:
+Use the action that matches the saved boundary. Check `status` and `results` first;
+confirm that an interrupted worker has stopped before continuing. In-flight requests,
+unaccepted results and unknown process side effects must be reconciled before new work.
+
+#### Resume and feedback
+
+```bash
+simple-ar status SESSION
+simple-ar results SESSION
+simple-ar start --resume-task SESSION
+simple-ar start --resume-task SESSION "Shorten the explanation without rerunning"
+simple-ar start --resume-task SESSION --approve-execution TOKEN
+simple-ar start --resume-task SESSION --source notes/ --allow-network --yes
+```
+
+Ordinary resume consumes saved boundaries. A completed task with no pending work
+returns its terminal state without replay. Feedback shares the original budget and
+cancels only unstarted proposals. An old delivery during a paused revision does not
+complete the new request.
+
+Adding sources/network/execution/vision needs confirmation; invalid additions leave
+mounts, permissions and ledger unchanged. The saved model, interpreter, work and
+budgets remain. On resume, `--prepare-only` previews without applying access or
+resources. Confirm grants separately from exact command approval.
+
+#### Add remaining allowance
+
+Required arguments are repeatable `--authorize-remaining DIMENSION=AMOUNT`, a stable
+`--authorization-id ID` and `--authorization-reason TEXT`:
+
+```bash
+simple-ar start --resume-task SESSION --authorize-remaining llm_requests=10 --authorize-remaining total_tokens=100000 --authorization-id continuation-1 --authorization-reason "Finish the saved goal" --yes
+```
+
+New remaining allowances are future capacity, not historical totals. ID/reason without
+allowances fails. Replaying an ID does not replenish spent capacity; creation options
+`--max-turns`/`--max-tokens` cannot add resources on resume. Original charges remain.
+
+After a model operation is confirmed closed and journalled, explicit authorization can
+establish a new allowance while its historical bill remains unknown. Unknown use in
+the current allowance still blocks capacity.
+
+#### Switch a configured connection
+
+At a reconciled boundary, record the change, then resume separately:
+
+```bash
+simple-ar start --resume-task SESSION --switch-model profile:another --switch-id connection-1 --switch-reason "Use another configured service"
+simple-ar start --resume-task SESSION
+```
+
+This changes text/code/writing bindings without a request, tool replay, feedback or
+budget renewal. Saved vision bindings, delivery and accounting remain. Closed
+professional calls can retain uncertain historical fees. Each switch ID has one
+immutable intent; replaying an older ID does not revert a later change.
+For a terminated failed decision, use the retry operation below.
+
+#### Retry a failed model decision
+
+```bash
+simple-ar start --resume-task SESSION --retry-model
+simple-ar start --resume-task SESSION --retry-model --model profile:another
+```
+
+Retry requires a terminated failure without an accepted reply, the saved finite output
+cap and remaining capacity. It retries a decision, not tools or whole tasks. Cached
+replies use ordinary recovery. In-flight requests, unconfirmed reservations, unbounded
+charges and pending tools refuse retry. Keep retry separate from feedback, grants
+and command approval; `--prepare-only` makes no retry or mutation.
+
+Only for this closed failure, `--model profile:NAME` or `route:NAME` can replace the Chat
+connection using the same finite output cap. Text/code/writing bindings and transition
+are saved together; vision stays bound. Replacement starts a new provider-native
+conversation in the same task. Prior replies remain in the journal and `read_history`;
+authorized, version-checked materials remain reusable. Missing reasoning is not
+fabricated. Cached replies cannot switch. A different explicit model without retry
+is rejected; omission retains the saved selector.
+
+#### Supply missing or revised contracts
+
+Use `--supply-task PATH` to confirm a TOML supply for a caller-directed native task.
+It records conditions without executing work. For a first model binding:
 
 ```toml
 supply_id = "first-model"
@@ -101,34 +194,25 @@ simple-ar start --resume-task SESSION --supply-task supply.toml --yes
 simple-ar start --resume-task SESSION
 ```
 
-Supply uses the same validation as native creation. It can add `sources`, `execution_contract`, `code_task`, `research_policy`, `table_analysis`, `report_requirement` and `max_output_tokens` under `changes`. By default it only fills missing contracts. To change an existing native contract, set top-level `replace_existing = true` and use a new ID and reason. Only fields named in `changes` are replaced; when `sources` is present in replacement mode, it is the complete new alias map, not a merge. Old records and charges remain history, not approval or completed evidence for new conditions. Report-only changes retain valid measurements. Model connection changes still use the separate retry contract.
+Supply uses native creation validation. `changes` also accepts `sources`,
+`execution_contract`, `code_task`, `research_policy`, `table_analysis`,
+`report_requirement` and `max_output_tokens`.
 
-Source paths resolve from the supply file; execution cwd must be an existing absolute directory and argv remains literal. Changed protocols need fresh acceptance when confirmation is required; actual execution always needs its own exact approval. First model binding requires both positive request and token allowances; resource continuation alone cannot grant model access.
+- By default, supply fills missing contracts. To replace existing ones, set top-level
+  `replace_existing = true` with a new ID/reason. Only named fields change; replacement
+  `sources` is the complete alias map, not a merge.
+- Source paths resolve from the supply file. Execution cwd must be an existing absolute
+  directory; argv stays literal. Changed protocols need fresh acceptance when required;
+  actual execution needs its own exact approval.
+- First model binding needs positive request and token allowances. Resource continuation
+  alone cannot grant model access. Later model changes use the separate recovery controls.
+- Old records and charges remain history. Report-only changes retain valid measurements.
+  They do not turn prior confirmation or evidence into acceptance of new conditions.
 
-The same ID and terms are idempotent, including recovery after a grant was recorded but the config commit was interrupted. An interrupted supply blocks work until that supply is completed. In-flight/unknown operations must first be reconciled. Supply is separate from feedback, retry, resource flags and command approval; it does not modify saved legacy ResearchApplication protocols.
-
-~~~bash
-simple-ar status SESSION
-simple-ar results SESSION
-simple-ar start --resume-task SESSION
-simple-ar start --resume-task SESSION "Shorten the explanation without rerunning"
-simple-ar start --resume-task SESSION --approve-execution TOKEN
-simple-ar start --resume-task SESSION --source notes/ --allow-network --yes
-simple-ar start --resume-task SESSION --retry-model
-simple-ar start --resume-task SESSION --authorize-remaining llm_requests=10 --authorize-remaining total_tokens=100000 --authorization-id continuation-1 --authorization-reason "Finish the saved goal" --yes
-~~~
-
-Ordinary resume consumes saved boundaries. A completed task with no pending work returns terminal state without replay. Feedback shares the original budget and cancels only unstarted proposals; attempted/unknown operations must first be reconciled. An old delivery during a paused revision is not completion of the new request.
-
-Adding sources/network/execution/vision needs confirmation. Invalid additions leave mounts, permissions and ledger unchanged. Existing model/interpreter/work/budgets remain. On resume, prepare-only previews without applying access or resources. Confirm grants separately from command approval.
-
-New remaining allowances are future capacity, not historical totals. ID/reason without allowances fails. Replaying an ID does not replenish spent capacity; ordinary max-turns/max-tokens cannot add resources on resume. Original charges remain in the ledger. After a model operation is confirmed closed and recorded in the task journal, explicit authorization can establish a new allowance without resolving its historical bill. Unknown use in the current allowance still blocks capacity. In-flight calls, unaccepted results and unconfirmed process side effects must be reconciled first.
-
-At a reconciled boundary, `--switch-model profile:NAME --switch-id ID --switch-reason TEXT` records a text/code/writing connection change without requests, feedback or budget renewal. This also supports closed professional model calls; it does not require their uncertain historical fees to be relabelled as known. Saved vision bindings remain unchanged. Use ordinary resume separately; switching never replays an interrupted tool.
-
-Retry-model permits a new decision only after a terminated failure without an accepted reply, using saved finite output cap and remaining capacity. It does not replay tools or whole tasks. Cached replies use ordinary recovery; in-flight requests, unconfirmed reservations, unbounded charges and pending tools refuse retry. Use it separately from feedback, grants and command approval.
-
-For that closed failure only, add `--model profile:NAME` or `route:NAME` to record a replacement Chat connection with the same finite output cap. Text/code/writing bindings and transition are saved together; vision retains its binding. Replacement starts a new provider-native conversation inside the same task: prior replies remain in the journal and `read_history`, while authorized, version-checked material stays reusable. Missing reasoning is never fabricated. Cached replies cannot switch. A different explicit model without retry is rejected; omission retains the saved selector. Prepare-only makes no retry or mutation.
+The same ID/terms are idempotent, including an interruption after the grant but before
+config commit. Complete an interrupted supply before other work. Supply is separate
+from feedback, retry, resource flags and command approval; it does not modify saved
+legacy ResearchApplication protocols.
 
 ### Structured compatibility selection
 
@@ -154,9 +238,13 @@ New `--kind bug_fix` with `--project`, `--allow` and `--validate` together uses 
 | `--with-report` | Data/repair report from saved results; requires model |
 | `--asset-max-mb N` | Chat project/data download capacity; default 20 MiB, ZIP expansion 4×; not download permission |
 
+#### Scoped reproduction adaptation
+
 Scoped reproduction adaptation requires project + allow + independent validate. Validator must differ from formal command after interpreter resolution; cwd must match project. Protected tests/secrets/data remain read-only, edits occur in isolated worktree/copy, and validation precedes measurement. Use current/existing Python or explicit task venv preparation; installation failure stops work. Do not add a second check-argv beside CodeTask validation. No scientific method/split/condition change is authorized.
 
 Chat may propose exact new Python adapter paths and a source-backed validator; confirmation saves them. Place outputs outside the author project. Without a creation declaration, allow paths must already exist. Project-python selects an existing interpreter, or the venv base when explicit preparation is chosen; setup cannot select an interpreter from untrusted source instructions.
+
+#### Asset and material acquisition
 
 Chat acquisition proposals require separate asset confirmation and inspected literal URLs. Only public HTTPS is accepted; userinfo/fragments/credential-bearing or signed links are refused. Project assets support direct ZIP or GitHub default-branch snapshot, not pinned commits. Data remains one file without unpacking. Default limits: 3 assets, 20 MiB each, project expansion 80 MiB/5000 entries. ZIP format is checked from bytes; configured limits persist for recovery.
 
@@ -216,7 +304,9 @@ code_analysis packages retain scripts/data/results/PNG/vector exports; analysis.
 
 code_project starts an isolated revision, preserving registered scope, protected files, validator, interpreter and patch policy. Ordinary revisions use the native task owner, without intermediate TOML or the old research plan; commands still need approval. Both structured results and current formally delivered native CodeTask projects with a fixed scope and validator can be selected. Changed/incomplete candidates are not offered; the original task and ledger remain unchanged. Do not mix it with writing selectors or override project/scope/validator.
 
-A validated single-command reproduction project can be selected with kind reproduction, document and goal to repeat its saved protocol/interpreter/output selectors; confirm execution. Scientific reproduction and explicit technical controls retain their structured contract. Paired/extended protocols stay on original resume.
+A validated single-command reproduction project can be selected with kind reproduction, document and goal to repeat its saved protocol/interpreter/output selectors; confirm execution.
+
+Scientific reproduction and explicit technical controls retain their structured contract. Paired/extended protocols stay on original resume.
 
 Survey follow-up with kind survey + reuse report uses its original source bundle, excludes drafts/derived attachments and defaults to online search. Text versions are not merged across versions; sources still need new relevance checks. Reuse is distinct from interrupted execution recovery.
 
@@ -256,7 +346,11 @@ simple-ar research-session --config research.toml
 simple-ar research-session --config research.toml --session-root SESSION --model env
 ~~~
 
-This is the exact structured interface. Explicit CLI overrides research TOML; omitted model on a direct new command is deterministic, while file config defaults env. Model failures remain failures. All new tasks use the common action owner, combining materials, summary, code and experiments within their declared contracts. Reading sources does not itself require a scientific design. Unsupported declarations fail before creation, without an old-controller fallback. Tables can run without a model; authored reports require one. A no-model experiment request can retain materials and pause with requested work incomplete. Continue that same task with the printed `start --resume-task SESSION` and [explicit supply](#native-recovery) for missing contracts or model authorization; collection is not experiment/report completion. Saved historical sessions retain their original owner.
+This is the exact structured interface. Explicit CLI overrides research TOML; omitted model on a direct new command is deterministic, while file config defaults env. Model failures remain failures. All new tasks use the common action owner, combining materials, summary, code and experiments within their declared contracts.
+
+Reading sources does not itself require a scientific design. Unsupported declarations fail before creation, without an old-controller fallback. Tables can run without a model; authored reports require one.
+
+A no-model experiment request can retain materials and pause with requested work incomplete. Continue that same task with the printed `start --resume-task SESSION` and [explicit supply](#native-recovery) for missing contracts or model authorization; collection is not experiment/report completion. Saved historical sessions retain their original owner.
 
 Research design replies use `start --resume-task SESSION --decision-id ID --decision-response accept|reject|revise`; add `--decision-guidance TEXT` for revise. The ID binds actual design/protocol bytes. Confirmation does not run or authorize a process. Resume keeps frozen contracts; use ordinary native feedback for text changes, not creation flags. Intact table results can be reused for report feedback without recomputation. See [interaction policies](#interaction-policies-and-pending-decisions) for new and legacy confirmation scope.
 
@@ -276,6 +370,8 @@ Research design replies use `start --resume-task SESSION --decision-id ID --deci
 Data options are shared with the table above. Full-text permissions, page extraction, paired protocols, output files and environment preparation are available through [research TOML](CONFIG_REFERENCE.md#research-toml-sections-and-defaults), not invented CLI flags.
 
 Historical structured sessions retain their bounded plan correction and attempts/plan-*/task_plan_proposals.json records. New tasks use the common action journal instead. CodeTask retains its configured project/workspace/benchmark/scope; reviewed large edits require execute.allow_large_edits=true. The actual execution owner computes omitted process limits, including preparation and repair/retests; explicit limits, including zero, win.
+
+#### Resume and reanalysis
 
 For saved legacy sessions owned by ResearchApplication, resume preserves history and reuses measurements only with matching command/schema/protocol/preparation/protected assets. Explicit goal/outputs/local-paper/execution revisions replan dependent work; task-kind changes need a new session. Incompatible search/ingestion changes fail. Omitted report settings stay saved; report changes rebuild report outputs only.
 
@@ -320,11 +416,21 @@ Legacy continuation allowances need stable ID/reason; prior usage/unknown charge
 
 Use task-kind reproduction with local sources and fixed protocol; measurement executes caller-declared command(s) and can optionally author a report with a configured model. Neither implies arbitrary-paper environment discovery or scientific success. Configuration defines independent validation, adapter creation, interpreter and metric selectors. [Exact contracts](CONFIG_REFERENCE.md#execution-and-report).
 
-An explicit single-candidate reproduction with CodeTask, a distinct declared validator and a flat formal command now uses the common task owner, including an optional frozen report. The validator, formal metrics/protocol and actual candidate remain separately bound; internal absolute project paths target the isolated candidate, while external inputs and the selected interpreter retain their identity. Feedback can revise only the report without repeating measurement. A delivered compatible single-command protocol can be reused with `--reuse code_project --kind reproduction`; it does not import the old ledger. Explicit environment setup and adapter files use this same owner; choose auto rather than the strict reproduction shortcut for comparisons. Ordinary open-ended tasks are not reduced to this expert contract.
+#### Single-candidate repair and reproduction
+
+An explicit single-candidate reproduction with CodeTask, a distinct declared validator and a flat formal command now uses the common task owner, including an optional frozen report. The validator, formal metrics/protocol and actual candidate remain separately bound; internal absolute project paths target the isolated candidate, while external inputs and the selected interpreter retain their identity. Feedback can revise only the report without repeating measurement. A delivered compatible single-command protocol can be reused with `--reuse code_project --kind reproduction`; it does not import the old ledger.
+
+Explicit environment setup and adapter files use this same owner; choose auto rather than the strict reproduction shortcut for comparisons. Ordinary open-ended tasks are not reduced to this expert contract.
+
+#### Fixed measurement conditions
 
 A new `measurement` request without CodeTask uses the common task owner for a flat command or an explicit baseline-run comparison (`pairs`, or compact seeds with a declared seed flag). Each literal caller condition authorizes one initial execution; cwd, argv and inherited environment are preserved unless an explicit task-venv profile selects its actual interpreter. Protocol seeds without an argv binding describe an internal batch, not extra process runs. The frozen set cannot be silently reduced or re-paired: complete delivery requires the actual conditions and their matching deterministic analysis; missing/failed or incomparable evidence remains disclosed.
 
-Ordinary CodeTask benchmarks also use the common owner when validator and formal argv match; they still require separate physical calls and ledger records, and validation is not measurement. Strict reproduction retains its distinct-command requirement. Required new Python files and one explicit current/venv preparation can accompany declared conditions without changing the task category; exact scope and source checks still apply. Default budgets include preparation, never override explicit limits, and a managed venv preserves Python aliases until its owner selects the actual interpreter. Greenfield `copy`/`sparse_copy` with a real source project can measure source baselines (`source="preparation"`, `before_implementation=true`): prepare, finish all declared baselines, then call `implement(prepared_result)` with actual successful baseline facts. Failed/missing baselines prevent generation. An empty/source-less project cannot invent an unchanged-source baseline; supply real source or independently verified external evidence.
+Ordinary CodeTask benchmarks also use the common owner when validator and formal argv match; they still require separate physical calls and ledger records, and validation is not measurement. Strict reproduction retains its distinct-command requirement.
+
+Required new Python files and one explicit current/venv preparation can accompany declared conditions without changing the task category; exact scope and source checks still apply. Default budgets include preparation, never override explicit limits, and a managed venv preserves Python aliases until its owner selects the actual interpreter.
+
+Greenfield `copy`/`sparse_copy` with a real source project can measure source baselines (`source="preparation"`, `before_implementation=true`): prepare, finish all declared baselines, then call `implement(prepared_result)` with actual successful baseline facts. Failed/missing baselines prevent generation. An empty/source-less project cannot invent an unchanged-source baseline; supply real source or independently verified external evidence.
 
 Exact argv's existing external file operands are retained as individual read-only inputs and hash-bound during approval, including `--option=FILE`. This does not mount their parent directories or infer directory access; supply data/material directories explicitly. Restoring a missing domain summary reuses an intact saved observation after artifact/candidate checks, without rerunning the model or validator.
 
@@ -332,7 +438,11 @@ With a model, interpretation and follow-up tools share this task and ledger and 
 
 For measurement plus writing, use `--task-kind measurement --outputs experiments report --model SELECTOR` and the usual report controls. No code modification is required: the writer consumes actual measurements and their matching deterministic analysis. Include supplied references as local documents/materials. Feedback needs a new canonical composition and preserves the original results, manuscript and ledger without rerunning measurements. Missing analysis or a stale manuscript cannot count as completed report delivery.
 
-A measurement may include `execution.environment`: a current-environment check or task venv, declared requirements/project installation and short check. For a frozen multi-condition set, one actual attempt owns preparation; all conditions must share the declared cwd/profile and compatible interpreter. Later conditions reuse its verified receipt, not another installation. The full set plus preparation must fit the finite process allowance before setup; explicit limits, including zero, take precedence. Changed sources/preparation, interrupted or unaccounted processes block reuse. Setup metrics are not formal measurements. Installation may run build code/network and is not an OS sandbox; a CodeTask-owned environment cannot be replaced here.
+#### Prepare a measurement environment
+
+A measurement may include `execution.environment`: a current-environment check or task venv, declared requirements/project installation and short check.
+
+For a frozen multi-condition set, one actual attempt owns preparation; all conditions must share the declared cwd/profile and compatible interpreter. Later conditions reuse its verified receipt, not another installation. The full set plus preparation must fit the finite process allowance before setup; explicit limits, including zero, take precedence. Changed sources/preparation, interrupted or unaccounted processes block reuse. Setup metrics are not formal measurements. Installation may run build code/network and is not an OS sandbox; a CodeTask-owned environment cannot be replaced here.
 
 ### `simple-ar research-report`
 
@@ -340,25 +450,65 @@ For saved ResearchApplication sessions, `simple-ar research-report --session-roo
 
 ### `simple-ar report-export`
 
-~~~bash
+Convert an assembled report to a movable LaTeX project, optionally compiling a PDF.
+Input requires `report_body.md` and a bibliography when cited. This converts existing
+text without model or experiment calls; it is not an arbitrary Markdown converter.
+
+| Argument | Meaning / default |
+| --- | --- |
+| `--report-dir PATH`, `--output PATH` | Required assembled input and new output directory |
+| `--title TEXT`, `--compile` | Optional title and PDF compilation |
+| `--latex-template PATH` | Trusted Pandoc LaTeX template, relative to report directory; otherwise single-column ACM |
+| `--template-asset FILE` | Repeatable flat companion beside template; requires `--latex-template` |
+| `--tex-engine pdflatex\|xelatex` | Default pdflatex; explicit option requires `--latex-template` |
+| `--citation-style numeric\|template` | Optional presentation choice; omission retains historical rendering |
+
+```bash
 simple-ar report-export --report-dir REPORT_ATTEMPT --output NEW_DIR --compile
-~~~
-
-Required `--report-dir` and `--output`; optional `--title TEXT` and `--compile`. Input needs report_body.md and bibliography when cited. Pandoc converts existing text without model/experiment calls. Local figures and registered vector variants are copied, SVG-to-TeX needs rsvg-convert; remote images are not fetched. External evidence links become labels with targets recorded in export.json, not automatic dataset copying.
-
-Optional `--citation-style numeric|template` is an explicit presentation choice. `numeric` configures natbib after template setup for square-bracket numbers (including narrative and suppress-author citations), so authorless records display numbers rather than source IDs. It works with already-loaded natbib without reloading it with conflicting package options. Citation keys and BibTeX records stay exact in sources and artifacts; no author/year is inferred. `template` preserves the supplied template's citation defaults; the built-in ACM layout remains `acmnumeric`. Omitting the option preserves historical rendering and manifest shape. Only explicit choices add `citation_style` to `export.json`.
-
-Use `--latex-template layout/article.latex` for a trusted Pandoc LaTeX template relative to `--report-dir`; repeat `--template-asset local.bst` for explicit flat companions beside it. Optional `--tex-engine pdflatex|xelatex` defaults to pdflatex and requires `--latex-template`, as does `--template-asset`. The existing bounded template contract requires `$body$` after `\begin{document}` and `$for(header-includes)$$header-includes$$endfor$` in the preamble. Class, body layout and literal bibliography styles remain template-owned. `$biblio-style$` defaults to plainnat, or **plainurl** (the TeX Live/MiKTeX **urlbst** package) for explicit numeric mode: this avoids printing authorless identity keys while retaining URL/DOI locators. There is no silent fallback to plain, which would lose those locators. A literal custom style still controls its own reference format. Numeric citations require the template to load natbib. Install missing TeX dependencies before compiling; the exporter does not download them. Trusted TeX is not a sandbox; no template discovery or new runtime is provided. For example:
-
-~~~bash
 simple-ar report-export --report-dir REPORT_ATTEMPT --output NEW_DIR --latex-template layout/article.latex --citation-style numeric --compile
-~~~
+```
 
-The native `export_report` tool accepts the same optional `citation_style: "numeric" | "template" | null` with its existing `template` bundle. The tool can choose an explicit style from an ordinary publication goal; users do not enter hashes. Omitted/null style is absent from serialized requests and input bindings, preserving historical request hashes and recovery. Explicit choices bind through existing approval, saved request and export manifest; changing the style requires a new export identity/output, and frozen recovery never restyles or recompiles old artifacts.
+#### Template and citation requirements
 
-Default output is movable single-column acmart source; a supplied template retains its own class and body layout. Both include main.tex/body.tex/source.md/bibliography/figures/export.json and code/block-*.txt for literal code. Preserve the whole directory. Recorded figure captions bind exports; only exact adjacent duplicates are removed, while no-manifest captions remain. Figures use htbp, not forced placement.
+Templates need `$body$` after `\begin{document}` and
+`$for(header-includes)$$header-includes$$endfor$` in the preamble. Class, body layout
+and literal bibliography styles belong to the template. The bounded template bundle
+allows at most 32 flat companions/16 MB, without partials, scripts or custom build commands.
+The exporter does not discover templates or download dependencies. Trusted TeX is not a sandbox.
 
-Compile needs pdflatex/bibtex/acmart/fvextra/seqsplit/etoolbox and scalable fallback fonts (full cm-super on Debian/Ubuntu). Missing/failed compilation returns nonzero, preserves source and writes diagnostics/build.log when applicable. pdfLaTeX may require engine/font adaptation for non-Latin text. This demonstration does not select conference submission options or certify quality/page count. Choose new output directories to retain prior exports.
+`numeric` configures natbib after template setup for square-bracket numbers, including
+narrative and suppress-author citations. Templates must load natbib; an already-loaded
+package is configured without conflicting reload options. Authorless records show numbers
+rather than source IDs. Citation keys and BibTeX records remain exact; no author/year is inferred.
+
+`template` retains template defaults; built-in ACM uses `acmnumeric`. For `$biblio-style$`,
+the default is plainnat, or **plainurl** with explicit numeric mode. plainurl needs the
+TeX Live/MiKTeX **urlbst** package and retains URL/DOI locators without printing authorless
+identity keys. There is no fallback to plain. A literal custom style still owns its format.
+
+Only an explicit choice adds `citation_style` to `export.json`. The native `export_report`
+tool also accepts `citation_style: "numeric" | "template" | null` with its template bundle;
+it can select a style from an ordinary publication goal without user-entered hashes.
+Omission/null stays absent from serialized requests/input bindings, preserving historical
+hashes. Explicit choices bind approval, request and manifest; changing style needs a new
+export identity/output. Recovery never restyles or recompiles old artifacts.
+
+#### Files and compilation
+
+Preserve the entire output: `main.tex`, `body.tex`, `source.md`, bibliography, figures,
+`export.json` and `code/block-*.txt` for literal code. Local figures and registered vector
+variants are copied; SVG conversion needs `rsvg-convert`. Remote images are not fetched.
+External evidence links become labels with targets in `export.json`, not copied datasets.
+
+Recorded captions bind exports. Only exact adjacent duplicate captions are removed;
+without a manifest, captions remain. Figures use `htbp`, without forced placement.
+
+Compilation needs Pandoc, `pdflatex`/BibTeX/`acmart`, `fvextra`, `seqsplit`, `etoolbox` and
+scalable fallback fonts (full `cm-super` on Debian/Ubuntu). Missing tools or failed compilation
+return nonzero, retain source and write `diagnostics/build.log` when applicable. Non-Latin
+text may need engine/font adaptation. Install missing dependencies before compiling.
+Inspect every page: compilation does not certify quality, page count or conference options.
+Use a new directory for each export.
 
 ## Code Task Commands
 
@@ -368,7 +518,11 @@ CodeTask prepares an isolated workspace and never directly edits the source proj
 
 Existing-project execute normally uses one patch plan. Work-plan/batch is opt-in via to-step or saved work plan. Interactive terminals ask at plan/proposal/large-edit gates; noninteractive runs stop unless yes is intentional. Execute's yes auto-approves review gates, unlike native start's yes. No-review-inline stops at gates; interactive confirms primitive steps for debugging.
 
+#### Planning failures and method migration
+
 Planning failures preserve artifacts; complete response corrections are bounded, and offline fallback requires explicit no-llm/allow-planning-fallback. Transport/unknown/deadline failures are not fallback success. Greenfield compact replaces retired stages/review; tool_agent and nonzero planning-review-rounds emit migration notices without extra calls. Retired model-stage routes fail. Generated projects/immutable accepted planning are reused without generation; old plans/failures remain in planning/method_migration.json and retired_method.
+
+#### Review and repair
 
 Dependency advice is inspection only, never installation. Post-apply and post-run reviews record findings under memory; review is not acceptance. Review contract changes preserve history. Bounded repairs check inputs/bytes, keep snapshots/rollback and code_artifacts.json synchronized; interrupted candidates are not blindly replayed. Offline scaffolds fail before emitting fake metrics.
 
@@ -783,6 +937,8 @@ Historical layouts remove recognized fulltext/extracted caches; all-caches can r
 
 File tools accept authorized source0/... and workspace/... locators or observed absolute paths. Mount names are not real directories and embedded code/argv strings are not rewritten. Private-name filtering is case-insensitive throughout listing/search/inspection; absolute paths never widen roots or source permissions.
 
+File tools and delivery artifacts interpret unprefixed relative paths from the task workspace. Explicit registered aliases (`workspace/…`, `source0/…`, `evidence/…`) retain their original ownership, and absolute paths must still resolve inside a granted root. No source or host directory is guessed from a bare name; traversal, private paths, escaped links, read-only writes and artifact-version checks remain enforced. A final `write_file` may use either spelling consistently with its `delivery.artifacts`; saving output is not scientific validation.
+
 | Tool / field | Contract |
 | --- | --- |
 | list_directory: recursive, file_glob | Paginated filenames without bodies; traversal ≤4096 entries, inventory_truncated means incomplete inventory |
@@ -793,14 +949,23 @@ File tools accept authorized source0/... and workspace/... locators or observed 
 | copy_file | Binary/text bytes ≤64 MiB, source digest required; existing destination also needs observed digest |
 | search_files | Literal rg search within authorized roots; paginated scanned-file coverage. Consumes process receipt/allowance even though read-only |
 | inspect_project: data_paths | Read-only dependency/entry/test/document/coverage observation and full attempt; no project import or execution |
-| Saved work.v4: begin_professional_work, finish_professional_work | Retains original scopes, route changes, manuscript snapshots and candidate returns. New tasks use common operations directly; beginning or ending a scope is not required |
-| Saved work.v3: select_work_method | Retains its original intent-only selection and routing behavior; loading a saved task does not upgrade it to professional production |
-| prepare_implementation: saved preparation/work.v1/work.v2 tasks | Retains original source binding, candidate admission and separately approved execution. New ordinary tasks use common file and process operations instead; loading a historical task does not upgrade its contract |
 | update_work_plan | Current-request plan persists through compaction/resume; no separate planner/scheduler. Step claims neither verify work nor authorize execution |
+
+#### Copy a project
 
 Copy-project takes source directory and nonexistent workspace path. It copies an editable subset without execution/network, skipping caches/builds/symlinks/private paths, .git/.aws/.ssh/.codex/.agents/venvs/all .env* (including .env.example). Oversized files are skipped; empty source/existing destination/count or total overflow refuse publication. Inspect omissions before treating the package as complete.
 
-Copy limits: max_files=1000 (1–4096), max_total_bytes=134217728 (1–536870912), max_file_bytes=2000000 (1–67108864). Returned absolute_path/source/copy/files include relative paths and SHA256. Optional simple .zip archive_name packages exactly copied files inside the copy; conflicting names fail. Request/output hashes persist in attempts/IDENTITY/project-copy.json before publication. Same-ID recovery checks current file/ZIP hashes and does not recopy/repack changed contents.
+| Copy field | Default / allowed range |
+| --- | --- |
+| `max_files` | 1000 / 1–4096 |
+| `max_total_bytes` | 134217728 / 1–536870912 |
+| `max_file_bytes` | 2000000 / 1–67108864 |
+
+Returned absolute_path/source/copy/files include relative paths and SHA256. Optional simple .zip archive_name packages exactly copied files inside the copy; conflicting names fail.
+
+Request/output hashes persist in attempts/IDENTITY/project-copy.json before publication. Same-ID recovery checks current file/ZIP hashes and does not recopy/repack changed contents.
+
+#### Declare delivery
 
 Write-file and run-process can explicitly declare delivery with summary/artifacts/unresolved. Final write must include its written file; other artifacts already exist in writable workspace. Process delivery requires successful unstopped exit and artifacts afterward; declaration is part of exact approval. Request/output hash binding recovers without rerunning; changed/missing/unbound outputs, failed commands or invalid terminal ordering block delivery.
 
@@ -808,43 +973,144 @@ Directory artifacts expand to explicit snapshots of ≤200 accessible files per 
 
 ### Sources, writing and publication
 
+#### Acquire and inspect sources
+
 Allow-network independently authorizes arXiv/OpenAlex/Semantic Scholar/optional Tavily search and original acquisition. Evidence stays read-only; each acquisition currently bounds one document, three fetch attempts, 8 MiB, 60 PDF pages. Source_operations counts provider/adapter operations, not HTTP calls/credits. Question lookup is local and retains offsets/truncation; omit find_source_passages query to inspect identity/coverage first.
 
-File tools and delivery artifacts interpret unprefixed relative paths from the task workspace. Explicit registered aliases (`workspace/…`, `source0/…`, `evidence/…`) retain their original ownership, and absolute paths must still resolve inside a granted root. No source or host directory is guessed from a bare name; traversal, private paths, escaped links, read-only writes and artifact-version checks remain enforced. A final `write_file` may use either spelling consistently with its `delivery.artifacts`; saving output is not scientific validation.
+`acquire_source` accepts optional `web_extract_backend: direct|tavily_basic`:
 
-Native `acquire_source` accepts optional `web_extract_backend: direct|tavily_basic`. Omission (or null) keeps the current backend, normally direct. With no caller-supplied source policy, an explicit selector applies only to that acquisition; with a supplied policy (including an empty dict), it must match the frozen backend. Explicit Tavily selection requires `web` in the policy providers, source network permission, gateway network authorization and `TAVILY_API_KEY`; denials precede source-budget reservation. Omission preserves existing frozen-policy behavior. There is no automatic fallback or retry, and PDF routing remains with the existing fulltext owner. Original arguments retain the selector; manifests retain observed provider usage/credits, and source-ledger entries reference that original provenance. Compacted source history retains bounded observed fetch URLs, statuses, reasons, providers and the selected backend, without replacing canonical records. Backend availability and successful acquisition still require actual service evidence.
+- Omission/null retains the current backend, normally direct. Without a caller-supplied
+  source policy, an explicit selector applies to that acquisition only. With a policy
+  (even an empty dict), it must match the frozen backend.
+- Explicit Tavily needs `web` in policy providers, source and gateway network permission,
+  and `TAVILY_API_KEY`. Denial occurs before source-budget reservation. There is no
+  automatic fallback or retry; PDF routing stays with the fulltext owner.
+- Original arguments, manifests and source-ledger references retain the selector and
+  observed provider usage/credits. Compacted history retains bounded fetch URLs,
+  statuses, reasons and providers; canonical records remain authoritative.
 
-New `find_source_passages` receipts include `document_path` (the authorized resolved path) and `document_sha256` (SHA256 of the original JSON bytes). Query matches and identity previews use those bytes; authorization, resolved path and bytes are checked again after selection. Historical receipts are unchanged and receive no newly inferred hash.
+Actual service evidence is still needed to establish backend availability or acquisition success.
+
+#### Source identity and retained passages
+
+`find_source_passages` receipts include `document_path` (the authorized resolved path) and `document_sha256` (SHA256 of the original JSON bytes). Query matches and identity previews use those bytes; authorization, resolved path and bytes are checked again after selection. Historical receipts are unchanged and receive no newly inferred hash.
 
 When native conversation blocks leave the working set, pinned original passage windows can remain alongside observed file text under the same serialized input budget. The source owner rechecks the authorized original path and bytes; changed, missing or unpinned sources do not acquire current-source validity. Partial overlaps do not silently erase previously observed conditions. These are exact historical observations, not summaries, exhaustive coverage or scientific verification; receipts remain readable even when a window cannot fit. This mechanism does not guarantee fewer calls or successful delivery.
 
 Original retained document_bundle.v1 records can be supplied read-only without network. Resolved ownership rejects workspace-generated documents and attempt history as original evidence. Bibliographic gaps may be filled from retained front matter in the same response with exact quotation checks; supplied metadata is retained, and this is not independent publication verification.
 
-Compose-document saves manuscript.md with citation keys and references while preserving prior drafts. Optional `writing_method="sections"` uses the existing section Writer; required headings fix its outline, otherwise it plans from the evidence. In new professional document work, article and section methods own independent inspection and bounded correction before delivery. Sections use the same document reviewer/editor and retained checkpoints, including feedback reuse; an unavailable check retains the candidate without starting another inspection. Exact and saved historical calls retain their original review settings. Granularity, headings and citation limits express document requirements, not a preselected evidence recipe. Neither method adds budget or overrides a frozen report contract; sections can require more calls and do not guarantee better writing.
+#### Compose a manuscript
+
+`compose_document` saves `manuscript.md`, citation keys and references, retaining prior drafts.
+Choose `writing_method="sections"` for section writing: required headings fix the outline;
+otherwise it plans from evidence. Article and section methods in new professional work
+include independent inspection and bounded correction before delivery. Sections share
+the document reviewer/editor and retained checkpoints, including feedback reuse.
+
+If inspection is unavailable, the candidate is retained without another outer inspection.
+Exact and historical calls retain their saved review settings. Neither method adds budget
+or overrides a frozen report contract. Sections may need more calls; they do not guarantee
+better writing. Granularity, headings and citation limits specify document requirements,
+not an evidence recipe.
 
 Optional `required_headings` specifies ordered article-level section titles, ignoring case and presentation numbering; `max_cited_sources` sets a distinct body-source ceiling (0 means no cap). These are checked requirements, not advisory prose. Violations retain the original response and stop publication without another writing request. Reference lists and fenced examples do not count toward the ceiling.
 
+#### Select materials and reuse inputs
+
 Material-roots performs bounded private-filtered version-bound selection and reports read coverage/omissions. It can combine with sources/figures/prior draft, but not explicit materials windows; locators validate before paid selection. New selections in writing and implementation may reuse exact successful parent file-read receipts after checking present authorization, original receipt, full-file identity and measured bytes. Only selected windows reach generation; stale, refused and unread ranges are reported, not inferred evidence. Saved attempts do not acquire later reads. Original bundles retain their source owner, while drafts/derived results remain materials. Selection is not exhaustive reading or visual/statistical verification.
 
-A complete input-bound writing response can resume assembly/missing publication files without calls; failed/partial/unknown writing is not resent. Native section recovery reconstructs from original complete per-call responses and checks saved section prose; changed input snapshots or checkpoints stop without replacing records. Recovery verifies original byte windows/manuscript/references/figures; changed partial files remain and fail. Missing/edited outputs or legacy records lacking byte bindings need inspection/new feedback version. Historical checkpoint/assembly forms remain; authored heading hierarchy is retained.
+#### Review an existing draft
 
 `review_document` independently inspects an existing `prior_draft` using the same selected-source/material contract, without invoking the Writer or changing prose. Its `review.json` contains `review_status` (`reviewed` or `needs_revision`) and validated findings/quotes. Without independent evidence it can inspect prose, not certify facts. Complete responses recover without another call; rejected/unknown responses stop. A feedback rewrite uses a new composition identity, retaining the old draft and review. Rendered-image quality requires separate visual inspection.
 
-For new composition or independent review, `reuse_prior_inputs=true` reuses resolved source passages and material windows from an intact same-task canonical `prior_draft`. Supported producers include standalone articles, section compositions, and material-based professional reports. Reviewed sections require their actual complete-response and checkpoint contracts; a checkpoint flag alone is insufficient. Historical protocols without those receipts retain their original path. Execution reports consume their original execution evidence directly. Reuse proves the completed producer read-only, then rechecks source permissions, exact passages, windows and receipts before paid work. Current figures must be supplied explicitly; do not mix reuse with a new evidence recipe. Changed, unfinished, external or unsupported parents fail without automatic reselection. Reuse grants no budget, acceptance or scientific certification.
+For composition or independent review, `reuse_prior_inputs=true` reuses resolved source
+passages/material windows from an intact same-task canonical `prior_draft`.
+
+- Supported parents: standalone articles, section compositions and material-based
+  professional reports. Reviewed sections need actual complete responses and checkpoints;
+  a checkpoint flag alone is insufficient. Historical protocols keep their original path.
+  Execution reports consume original execution evidence directly.
+- The completed producer is checked read-only; current permissions, exact passages,
+  windows and receipts are rechecked before paid work. Supply current figures explicitly
+  and do not combine reuse with a new evidence recipe.
+- Changed, unfinished, external or unsupported parents fail without automatic reselection.
+  Reuse grants no budget, acceptance or scientific certification.
+
+#### Select tools with a work request
 
 `focus_work` can optionally include `tools` with exact tool names to select contracts alongside the professional goal and input windows. Omission preserves the current selection; an empty list clears it. This uses the same registry, permissions and accepted action journal as `load_tools`, without a separate loading step.
 
+#### Recover writing and export
+
+A complete input-bound writing response can resume assembly/missing publication files without calls; failed/partial/unknown writing is not resent. Native section recovery reconstructs from original complete per-call responses and checks saved section prose; changed input snapshots or checkpoints stop without replacing records. Recovery verifies original byte windows/manuscript/references/figures; changed partial files remain and fail. Missing/edited outputs or legacy records lacking byte bindings need inspection/new feedback version. Historical checkpoint/assembly forms remain; authored heading hierarchy is retained.
+
 Export-report converts workspace Markdown/assets to ACM/optional PDF through shared process receipts and exact approval. Reuse requires bound output digests; changed/missing files cannot inherit compilation success, and unbound interrupted exports are not replayed. Workspace captions own revised prose; figure metadata only fills missing captions/provides variants. Compilation is neither scientific review nor page-count acceptance.
+
+#### Native export fields and checks
+
+These are `export_report` tool fields for native tasks. The standalone CLI has its own
+[options](#simple-ar-report-export); it does not expose the `checks` object.
+
+The shared `export_report` tool accepts an optional `template` object with `path`
+(relative to its Markdown), `assets` (explicit flat companion files), `engine`
+(`pdflatex` or installed `xelatex`) and optional `top_level_division`
+(`section`, `chapter`, `part`). Ask the assistant to inspect the layout and select
+the appropriate hierarchy; no class-name rules or scientific restructuring are inferred.
+At most 32 companions/16 MB are supported; no partials, scripts or custom build commands.
+The standalone `report-export` command keeps its ACM default.
+
+You can also ask the assistant to check a page limit or specific identifying
+strings you supply. The shared `export_report` tool accepts, for example,
+`"checks": {"max_pages": 4, "forbidden_identifiers": ["Example Author"]}`;
+either rule may be omitted. These checks require PDF compilation and installed
+Poppler `pdfinfo` and/or `pdftotext`, and use the same command approval and process
+budget. The standalone `report-export` CLI does not expose these options.
+
+Page limits count all pages, including references and appendices. String checks
+match case-sensitive literal substrings in extracted text; they do not cover
+images, metadata or indirect identification, and do not certify anonymity.
+If an official limit applies only to the main body, do not use that number as an
+all-PDF `max_pages` limit. Body boundaries, minimum length, stage options and other
+requirements need separate checks against the rules and actual PDF. `checks` only
+executes the finite checks specified; it does not certify all official requirements.
+Inspect `export.json` and the retained `checks/pdfinfo.txt` or `checks/text.txt`.
+Failed or unavailable checks block optional final delivery but retain the project
+and diagnostics. They do not automatically revise the manuscript. Reading a saved
+result does not rerun checks; changed files need a new export.
 
 ### Images, execution and history
 
+#### Image permission and recovery
+
 Inspect-images needs allow-vision and a compatible bound vision connection; missing route fails before sending. It shares model requests/tokens, preserves originals/feedback and reuses saved responses. Unknown interruptions/rejected responses are not resent or accepted as findings. Generation uses max-images and image route; create-image makes versions, resume-image queries/downloads known IDs or reuses completions, never resets persistent image allowance.
 
-Project-python preserves an existing virtualenv entry, including when read from task TOML: relative entries use the configuration directory without dereferencing the Python symlink into its base runtime. Saved task environments are retained on resume, not retroactively corrected from edited configuration. Its directory leads filtered PATH; scripts should use sys.executable for children. Approval binds resolved argv/environment; changes need approval again. It installs nothing. Existing receipts recover without execution replay. New tasks allow ten process invocations per model-turn allowance; saved older limits and total process wall budget remain.
+#### Interpreter and process approval
 
-Context_input_tokens (default 24000) is a soft input target including schemas/history. Remaining token capacity subtracts effective output reservation. The current complete operation is never split; earlier complete assistant/tool blocks form a contiguous retained suffix marked retained_turn_start. If the current unit exceeds target, optional earlier blocks/indexes/windows are omitted.
+Project-python preserves an existing virtualenv entry, including when read from task TOML: relative entries use the configuration directory without dereferencing the Python symlink into its base runtime. Saved task environments are retained on resume, not retroactively corrected from edited configuration.
 
-History_archive indexes omitted accepted turns/failure counts, not missing evidence or resolved failures. Recent observations are bounded to 2000 estimated tokens, with version-checked source windows. Read_history pages records locally; pin returned end_turn and use next_offset_bytes. Attempt IDs are not turn indices. Latest actual process result/latest nonzero diagnosis remain available unless already read back; cancelled/blocked proposals do not replace execution facts. Historical identities do not certify current file bytes. Raw records remain; estimates are not exact tokenizer guarantees or budget bypass.
+Its directory leads filtered PATH; scripts should use sys.executable for children. Approval binds resolved argv/environment; changes need approval again. It installs nothing. Existing receipts recover without execution replay.
+
+New tasks allow ten process invocations per model-turn allowance; saved older limits and total process wall budget remain.
+
+#### Context and history reads
+
+Context_input_tokens (default 24000) is a soft input target including schemas/history. Remaining token capacity subtracts effective output reservation.
+
+The current complete operation is never split; earlier complete assistant/tool blocks form a contiguous retained suffix marked retained_turn_start. If the current unit exceeds target, optional earlier blocks/indexes/windows are omitted.
+
+History_archive indexes omitted accepted turns/failure counts, not missing evidence or resolved failures. Recent observations are bounded to 2000 estimated tokens, with version-checked source windows.
+
+Read_history pages records locally; pin returned end_turn and use next_offset_bytes. Attempt IDs are not turn indices.
+
+Latest actual process result/latest nonzero diagnosis remain available unless already read back; cancelled/blocked proposals do not replace execution facts. Historical identities do not certify current file bytes. Raw records remain; estimates are not exact tokenizer guarantees or budget bypass.
+
+#### Compatibility of saved native work
+
+Saved `work.v1`/`work.v2` preparation, `work.v3` selection and `work.v4` scopes retain
+original source, routing, candidate, manuscript and approval contracts. Loading them
+does not upgrade their production/review rules. New ordinary tasks use common file,
+process and work operations directly, without mandatory scope-opening/closing calls.
+For source owners and implementation history, see [Development](DEVELOPMENT.md).
 
 ## Historical and development commands
 

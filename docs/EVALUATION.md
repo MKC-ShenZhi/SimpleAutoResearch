@@ -31,43 +31,96 @@ People supplied goals, approvals, defect feedback, dependencies and independent 
 
 ## V2.10 development evidence
 
-V2.10 continues on `feat/v2.10-project-research-assistant`. Checked improvements can be integrated into main in stages; this does not close V2.10 or constitute a formal release. These bounded development results supplement the public examples above; they do not replace their versions, costs or `partial` status. The development PDFs remain outside the tracked public examples.
+V2.10 remains in development on `feat/v2.10-project-research-assistant`.
+Checked improvements may reach main in stages; this is not a formal release or closure
+of the work package. The following development runs do not replace the public-main
+cases, their versions, costs or `partial` status. Their PDFs are outside tracked public examples.
 
-| Work inspected | Result and limits |
-| --- | --- |
-| Native analysis, report and substantive feedback (P1) | On the earlier `383…` installation, the task produced an initial report, revised figures/tables/prose after natural feedback, and delivered a five-page PDF with independent numerical, relocation and all-page checks. This is limited basic delivery-and-feedback success, not general scientific or publication acceptance. |
-| Saved materials and a trusted external local extension (P2) | On the earlier `02db5578…` installation, a new task reused materials, invoked the extension's instructions and word-count tool, and saved a formal handover. Status remains **partial**: figure, domain/unit and statistical questions remain unverified. Independent full-window counting confirmed 1,178 whitespace-separated words. |
-| Conversion of an adopted manuscript (P3) | On the same `02db5578…` installation, public project-copy/export operations produced ACM and supplied trusted article-template PDFs, five pages each. Every page was inspected and readable, with compact figures, table-header word breaks and final-page whitespace still limiting layout. The operator supplied the template and conversion recipe; conversion used zero model/API calls. This does not demonstrate autonomous template discovery or complete venue compliance. |
+### Analysis and feedback (P1: not closed)
+
+The earlier `383…` installation produced an initial report, revised figures/tables/prose
+after natural feedback, and delivered a five-page PDF with independent numerical,
+relocation and all-page checks. This supports a bounded earlier delivery-and-feedback
+result. **P1 has not passed: the latest unassisted feedback remains unclosed.** Earlier
+outputs and engineering checks do not establish that later acceptance, general scientific
+correctness or publication readiness.
+
+### Material reuse and local extension (P2: partial)
+
+On `02db5578…`, a new task reused materials, called a trusted external extension's
+instructions and word-count tool, and saved a formal handover. Status remains **partial**:
+figure, domain/unit and statistical questions remain unverified. Independent full-window
+counting confirmed 1,178 whitespace-separated words.
+
+### Supplied-template conversion (P3: bounded conversion evidence)
+
+The same `02db5578…` installation used public project-copy/export operations to create
+ACM and supplied trusted article-template PDFs, five pages each. Every page was inspected
+and readable. Compact figures, table-header word breaks and final-page whitespace remain
+layout limits. The operator supplied the template and conversion recipe; conversion used
+zero model/API calls. This does not establish autonomous template discovery or full venue compliance.
 
 ### Task budgets and remaining uncertainty
 
-Ordinary CLI defaults are **30 shared model requests and 600,000 tokens**. The analysis/report task above explicitly allowed **80 requests and 5,000,000 tokens** across initial work and feedback. Initial work used 22 physical requests and approximately 936,000 tokens; the combined run used 42 and 2,145,193 settled tokens. It therefore does not establish reliable one-shot long-report completion under defaults. Review the configuration and effective summary, inspect the initial delivery, and reserve room for feedback within the shared allowance. See [configuration review](USAGE.md#configure-once-and-continue-from-the-result) and [continuation controls](CLI_REFERENCE.md#native-recovery).
+| Scope | Allowance | Observed use |
+| --- | --- | --- |
+| Ordinary CLI defaults | 30 shared requests / 600,000 tokens | Not a demonstrated long-report completion budget |
+| Earlier P1 initial + feedback | 80 requests / 5,000,000 tokens | Initial: 22 physical requests / about 936,000 tokens; combined: 42 / 2,145,193 settled tokens |
+| P2 extension handover | 6 requests / 120,000 tokens; no processes or extra allowance | 5 requests / 111,275 tokens |
+| Earlier paused P2 attempt | Retained separately | 4 requests / 104,217 tokens |
 
-The P2 extension handover used 5 requests and 111,275 tokens within its fixed 6-request/120,000-token allowance, with no processes or extra allowance. An earlier paused attempt retained its 4 requests and 104,217 tokens; together they cost 9 requests and 215,492 tokens. **No total-cost improvement has been established.** Serialized-input reductions and offline replay are not billed savings or successful new tasks. Broader project continuity, coordination efficiency, coherent publication use and final release review remain incomplete. Old failures and partial feedback remain recorded under their original identities. This round adds no new paid scientific-task acceptance.
+The two P2 attempts total 9 requests and 215,492 tokens. **No total-cost improvement has
+been established.** Serialized-input reductions and offline replay are not billed savings
+or successful new tasks. These cases do not establish reliable one-shot long reports under
+defaults. Inspect an initial delivery and reserve shared allowance for feedback; see
+[configuration review](USAGE.md#configure-once-and-continue-from-the-result) and
+[continuation controls](CLI_REFERENCE.md#native-recovery).
+
+Broader project continuity, coordination efficiency, coherent publication use and final
+release review remain incomplete. Old failures and partial feedback keep their original
+identities. This evidence adds no new paid scientific-task acceptance.
 
 ## Engineering checks
 
-The public-main baseline, saved generation runs and current development checks have different verification scopes; overlapping checks must not be added into a single score.
+These are software verification records, separate from scientific-task acceptance.
+Overlapping suites and installations must not be summed into one score. They do not prove
+all platforms/dependency environments or every line of implementation has been audited.
+For source owners and implementation work, see [Development](DEVELOPMENT.md).
 
 ### Public-main baseline
 
-For the earlier public-main preparation, Linux offline discovery ran 2,119 checks: 2,113 passed and six were conditionally skipped. Seven critical checks also passed against the built wheel. All 277 packaged source/template files matched, and 102 tutorial commands parsed successfully. The recipient-rendering check skipped for missing Node was separately verified with local Node.
+| Check | Recorded result |
+| --- | --- |
+| Linux offline discovery | 2,119 checks: 2,113 passed / six conditional skips |
+| Built wheel | Seven critical checks passed; 277 packaged source/template files matched |
+| Tutorial commands | 102 parsed successfully; recipient rendering skipped for missing Node was separately checked with local Node |
 
-Published figure source and the six-/ten-page reports were replayed or rebuilt in fresh directories using the documented commands; frozen inputs stayed unchanged and derived numbers were identical. Verification made no new paid model calls and does not count replay as fresh generation success. Original delivery hashes, failures and journals remain retained.
-
-These are software checks, not scientific success rates or proof that every platform, dependency environment or line of the implementation has been audited. Recent production/test changes are still net growth; overall slimming is not complete.
+Published figure sources and six-/ten-page reports were replayed or rebuilt in fresh
+directories. Frozen inputs stayed unchanged and derived numbers matched. No new paid
+model calls were made; replay is not fresh generation success. Original delivery hashes,
+failures and journals remain retained.
 
 ### Development integration checks
 
-The October 24 attachment-inspection candidate separates full file retention from bounded text/table views and preserves historical review contracts. Its installed server checks ran 144 cases (143 passed, one conditional skip), including large-table delivery, unread-candidate retention and producer repair. All 282 packaged files matched the tested source/templates. This was zero-model engineering verification; it does not establish a new real-task success, scientific correctness or lower coordination cost.
+| Installation / scope | Recorded result |
+| --- | --- |
+| October 24 attachment-inspection candidate | 144 installed server checks: 143 passed / one conditional skip; 282 packaged files matched |
+| `eb9e0c8…` installation | 2,317 server regression checks: 2,306 passed / 11 conditional skips; two real TeX caption/relocation checks; 267 source/resource files and 14 templates matched |
+| Historical read-only verification on `eb9e0c8…` | Completed, paused and partial tasks loaded; 640 files and ledgers byte-identical; 76 delivery references readable |
+| Earlier `02db5578…` candidate | Separate 217-check result and caption/relocation evidence |
 
-The final `eb9e0c8…` installation completed 2,317 full server regression checks (2,306 passed, 11 conditional skips), plus two real TeX caption/relocation checks. All 267 source/resource files and 14 templates matched. This establishes software integration scope, not a rerun or transfer of P1–P3 live tasks to this wheel.
+The October 24 checks covered full attachment retention versus bounded text/table views,
+unread candidates, producer repair and historical review contracts. Project checks covered
+unedited members in ordinary/copied projects and approved execution beyond direct
+process-input counts while retaining protections. Producer validation reuse was checked
+within one call, including isolation between records; a new call revalidates and changed
+inputs/outputs refuse. It is not a persistent cache or evidence of lower model-coordination cost.
 
-Project-admission checks covered retention of unedited members in ordinary and copied projects, including execution of an approved project exceeding direct process-input bounds while preserving the existing protections. Read-only historical verification on the same final installation confirmed that three saved tasks (completed, paused and partial) loaded, their 640 files and ledgers remained byte-identical, and 76 delivery references were readable. This is not execution continuation of every interrupted state.
-
-Repeated full-input checks for multiple outputs from the same producer now share one complete validation within each call. A new call still revalidates, and a changed input or any output remains a refusal. This behavior and isolation of distinct production records are covered by the installed regression above; it is not a persistent cross-call cache or proof of lower model-coordination cost.
-
-The earlier `02db5578…` candidate retains its separate 217-check result and caption/relocation evidence. Production code is approximately 116,144 lines and tests 87,714 lines; overall slimming has not been achieved. These software checks establish neither scientific correctness, autonomous success on unfamiliar projects nor lower coordination cost. V2.10 remains in development.
+These zero-model integration checks do not transfer or rerun P1–P3 live tasks on a newer
+wheel. Readable historical tasks do not establish execution continuation of every interrupted
+state. Production code was approximately 116,144 lines and tests 87,714 lines; recent changes
+remain net growth, so overall slimming has not been achieved. Scientific correctness,
+autonomous success on unfamiliar projects and lower coordination costs remain unestablished.
 
 ## Practical limits
 

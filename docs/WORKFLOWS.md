@@ -21,7 +21,11 @@ A task can investigate sources, change code, run calculations and produce a repo
 Existing results can be reused without rerunning experiments. Grant only the access
 needed by the recipe; commands still need approval and model/API calls may incur charges.
 
-The main-branch [installation](USAGE.md#installation) and public examples remain valid. Sections marked V2.10 describe ongoing work on `feat/v2.10-project-research-assistant`; checked improvements can be integrated into main in stages while V2.10 development continues. Development checks and public cases retain separate evidence; see [tested bounds and limits](EVALUATION.md#v210-development-evidence). Review [effective task settings](USAGE.md#configure-once-and-continue-from-the-result) before starting. Preferences guide deliverables, while permissions and budget settings govern access and resources.
+Sections marked V2.10 describe development work on `feat/v2.10-project-research-assistant`;
+they do not imply full acceptance or a release. Use the main-branch [installation](USAGE.md#installation)
+and check [evidence and limits](EVALUATION.md#v210-development-evidence) for each case.
+Review [effective settings](USAGE.md#configure-once-and-continue-from-the-result):
+preferences guide deliverables; permissions and budgets govern access and resources.
 
 ## Direction research
 
@@ -66,16 +70,14 @@ uv run simple-ar start "Create a Python CLI that summarizes selected metrics fro
 do not assume your original project was modified.
 Proposed commands still require individual approval. Review their code and side effects before execution.
 
-On the V2.10 development branch, first-time work on an ordinary or copied project,
-and feedback on a registered working copy, preserve unchanged non-runtime members.
-The bounded edit set is separate from project retention: currently up to 12
-edited sources, with complete copying bounded to 4,096 members, 64 MiB per file
-and 128 MiB total. Retained binary/large dependencies keep their bytes without
-being sent as editable text or certified as inspected. This does not discover
-missing dependencies or copy an entire task history. Oversized projects are refused
-before generation. Prepared projects use the same owner-bound member inventory at
-approval and execution; they do not need to enumerate every member as a separate
-public process input. Broader project-continuity acceptance remains incomplete.
+For development-branch project work, inspect the retained project inventory as well as
+the edits. Current bounds are 12 edited sources, 4,096 retained members, 64 MiB per file
+and 128 MiB total; oversized projects are refused before generation. Unedited non-runtime
+members retain their bytes, including binary/large dependencies, but this does not mean
+they were inspected or that missing dependencies were found. This applies to ordinary,
+copied and registered feedback projects. Approval/execution use the same bound inventory;
+it need not be enumerated as separate public process inputs. It does not copy task history,
+and broader project continuity remains unaccepted.
 
 **Inspect:** source or patches, actual verification logs, outcomes and unresolved issues.
 Model review and static checks do not replace behavioral verification.
@@ -231,60 +233,52 @@ uv run simple-ar start "Use this report and supplied trusted template. Preserve 
 Keep the report and a focused template bundle in the supplied directory, not your
 credentials or unrelated files. The template needs `$body$` and the standard
 `$for(header-includes)$$header-includes$$endfor$` hook in its preamble.
-The renderer consumes a prepared template. The inspected conversions used a supplied template and an operator-provided recipe, with zero model/API calls; both five-page outputs were readable with minor layout limits. This is not evidence of autonomous template discovery. For a new task requiring template preparation, provide an explicit
+The renderer consumes a prepared template. [Inspected conversions](EVALUATION.md#v210-development-evidence)
+used operator-supplied templates and recipes; autonomous template discovery is unverified.
+
+For a new task requiring template preparation, provide an explicit
 official entry point, year and submission stage. The task may use research and code capabilities to retrieve rules and adapt an example into a Pandoc wrapper, subject to network and execution permissions. Treat this as a request requiring verification, not an accepted end-to-end workflow:
 
 ```bash
 uv run simple-ar start "Use https://iclr.cc/Conferences/2025/CallForPapers and its links to prepare the supplied manuscript in the 2025 initial anonymous submission layout. Preserve the prose, references, figures, tables and numbers. Retain template/rule sources and adaptation notes; deliver editable sources, PDF and every page preview. Disclose unmet rules without changing scientific content to force compliance. Do not rerun experiments or install an environment." --source ./paper --allow-network --allow-execution
 ```
 
-The assistant should verify the year and stage and retain the rules and template as
-task materials. Template adaptation handles variables, packages and layout; users
-need not write a wrapper, select internal tools or edit task JSON. Files already in
-an authorized directory can be copied into the working manuscript directory using
-their observed full hashes. Use an existing Pandoc template directly; native conference
-TeX needs adaptation. If retrieval fails, retain the failure and request the template
-and rules rather than guessing another year or silently falling back to ACM.
-Research, code and file tools provide this composition; the renderer itself does
-not discover or download templates. Autonomous completion remains unverified.
-Authored sections, including Abstract or Summary, stay in the supplied template's body;
-their headings do not implicitly populate its `$abstract$` metadata slot.
+For template preparation, ask the assistant to:
 
-The shared `export_report` tool accepts an optional `template` object with `path`
-(relative to its Markdown), `assets` (explicit flat companion files), `engine`
-(`pdflatex` or installed `xelatex`) and optional `top_level_division`
-(`section`, `chapter`, `part`). Ask the assistant to inspect the layout and select
-the appropriate hierarchy; no class-name rules or scientific restructuring are inferred.
-At most 32 companions/16 MB are supported; no partials, scripts or custom build commands.
-The standalone `report-export` command keeps its ACM default.
+1. Verify the official year/stage and retain the rules and template as materials.
+2. Use an existing Pandoc template directly, or adapt native conference TeX into a wrapper.
+   Adaptation handles variables, packages and layout; you need not select internal tools
+   or edit task JSON. Authorized files can be copied using their observed full hashes.
+3. Retain failures and ask for missing rules/templates if retrieval fails. Do not guess
+   another year or silently substitute ACM.
+
+Research, code and file tools perform this work; the renderer does not discover or download
+templates. Autonomous completion remains unverified. Authored Abstract/Summary sections
+stay in the body; headings do not populate `$abstract$` metadata automatically.
+
+The standalone `report-export` command defaults to ACM and also supports explicit
+trusted-template options; see [export options](CLI_REFERENCE.md#simple-ar-report-export).
+For a native task, describe the required hierarchy and provide a focused template bundle
+(up to 32 flat companion files/16 MB). Partials, scripts and custom build commands are
+unsupported. Abstract/Summary headings stay in the body rather than automatically
+populating template metadata.
 
 Template bytes, figures and output versions share the existing approval and recovery
 contract. Only use trusted TeX: no shell escape is enabled, but this is not a sandbox.
 Inspect warnings and every page. Fonts, explicit column widths, page limits and
 anonymity still require checking; compilation alone does not establish compliance.
 
-You can also ask the assistant to check a page limit or specific identifying
-strings you supply. The shared `export_report` tool accepts, for example,
-`"checks": {"max_pages": 4, "forbidden_identifiers": ["Example Author"]}`;
-either rule may be omitted. These checks require PDF compilation and installed
-Poppler `pdfinfo` and/or `pdftotext`, and use the same command approval and process
-budget. The standalone `report-export` CLI does not expose these options.
+For optional page-count and identifying-string checks, state the exact limits in your
+request. They require PDF compilation and installed Poppler tools. Inspect `export.json`
+and saved diagnostics: failed/unavailable checks retain the project but block optional
+final delivery. These finite checks do not certify anonymity or venue compliance.
+See [native export fields and checks](CLI_REFERENCE.md#native-export-fields-and-checks).
 
-Page limits count all pages, including references and appendices. String checks
-match case-sensitive literal substrings in extracted text; they do not cover
-images, metadata or indirect identification, and do not certify anonymity.
-If an official limit applies only to the main body, do not use that number as an
-all-PDF `max_pages` limit. Body boundaries, minimum length, stage options and other
-requirements need separate checks against the rules and actual PDF. `checks` only
-executes the finite checks specified; it does not certify all official requirements.
-Inspect `export.json` and the retained `checks/pdfinfo.txt` or `checks/text.txt`.
-Failed or unavailable checks block optional final delivery but retain the project
-and diagnostics. They do not automatically revise the manuscript. Reading a saved
-result does not rerun checks; changed files need a new export.
-
-The development exporter budgets figure and caption height together using the actual template layout. Captions that cannot fit, and unsupported composite/nested images, fail explicitly with sources retained. It preserves scientific text, numbering, links and citations; inspect compact figures and table wrapping yourself.
-
-For new development-branch compositions with explicit supplied captions, the author places a standalone image with a short description; assembly adds the supplied caption and publication binds that same text to the figure. An independent check sees the assembled text. Scientific discussion still belongs to the author, and different adjacent prose is retained for review rather than silently deleted. Historical compositions keep their saved caption policy.
+**Inspect:** every PDF page, warnings, figure/caption fit, table wrapping, fonts,
+column widths and the rules for the requested year and stage. Unsupported composite or
+nested images and captions that cannot fit fail with sources retained. Supplied captions
+remain bound to the exported figure; scientific text, numbering, links and citations
+must remain intact. Historical manuscripts retain their saved caption policy.
 
 Model-based visual inspection additionally needs a configured vision connection
 and explicit `--allow-vision`; rendering alone does not grant it.
@@ -330,7 +324,12 @@ To give saved outputs a new goal and budget, add `from_session = "../saved-task"
 
 ### Add a trusted local extension (V2.10 development)
 
-Add `extensions = ["../my-skill"]` to the same native `[task]` table and start with `--task-config PATH`. Selected packages share the task's registry, history and recovery. V1 accepts instructions and Python tools declaring read-only/plan operations; missing or changed packages block continuation. Python runs with the host process's OS privileges, including direct file, process and network access. The declarations and restricted host services are not a sandbox. Use only trusted packages; see [setup and identity rules](LOCAL_EXTENSIONS.md) (English).
+Add `extensions = ["../my-skill"]` to the native `[task]` table and start with
+`--task-config PATH`. Use only trusted packages: Python has the host's OS privileges,
+and read-only/plan declarations are not a sandbox. Missing or changed packages block
+continuation. See [setup, descriptor and resume rules](CONFIG_REFERENCE.md#trusted-local-packages),
+the example [descriptor](../examples/local_extension/extension.toml) and
+[Python tool](../examples/local_extension/notes.py).
 
 Keep complete delivery directories rather than copying only a PDF and losing figures, sources
 or reconstruction materials. When paused or failed, inspect the reason first.

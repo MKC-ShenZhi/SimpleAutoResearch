@@ -3142,6 +3142,7 @@ class ToolApplication:
         operation_columns = ['id', 'tool', 'arguments', 'record', 'status', 'error', 'artifacts', 'outcome']
         blocks, index, supplies, request_blocks = [], [], [], []
         working_rows = []
+        owner_observations = []
         professional_outcomes = []
         count = 1
         for position, turn in enumerate(turns):
@@ -3161,6 +3162,9 @@ class ToolApplication:
                 call = calls[call_id]
                 item = results.get(call_id)
                 result = self.session.store.read_json(item['result']) if item else {'status': 'not_executed'}
+                if item:
+                    owner_observations.append({'record': item['result'], 'observation': result,
+                                               'request_count': current})
                 record = 'records/' + item['result'].removeprefix('attempts/') if item else None
                 presented = self._coordination_result(result, record,
                     delivery_feedback=delivery_feedback if self.operations is not None else None) if item else result
@@ -3262,6 +3266,54 @@ class ToolApplication:
         schema_cost = estimate_tokens(json.dumps(self.schemas if schemas is None else schemas, ensure_ascii=False))
         if working_mode:
             from simple_ar.core.working_context import select_working_context
+            current_artifacts = set()
+            if config.get('professional_operations') == 'work.v5' and config['context_protocol'] == 'working.v4':
+                retained = self._retained_work(observations=owner_observations)
+                # Owner references remain compact; the complete inventory stays at
+                # its original receipts and in the user snapshot, not mandatory input.
+                produced = retained['latest_produced']
+                latest = produced['identities'] if produced else []
+                delivered = retained['last_delivery']
+                # The delivery owner already references its full inventory.
+                # Do not duplicate it as mandatory "new production" on feedback.
+                produced_versions = ({} if delivered and produced and delivered['record'] == produced['record'] else
+                    {row['locator']: row['recorded_sha256'] for row in latest})
+                context['retained_work'] = {
+                    'acceptance': 'not_inferred', 'last_delivery': retained['last_delivery'],
+                    'latest_produced': ({key: value for key, value in produced.items() if key != 'identities'}
+                        | {'artifact_count': len(latest),
+                           'versions': produced_versions,
+                           'unavailable': {row['locator']: row['presence'] for row in latest
+                                           if row['presence'] != 'present'},
+                           'current_version': 'unchecked',
+                           'inventory': ('Same inventory as last_delivery; full versions remain at that record.'
+                               if delivered and delivered['record'] == produced['record'] else
+                               'Recorded versions from this producer; full owner details remain at record/receipt.')}) if produced else None,
+                    'scope': 'Prior delivery and recorded production are not current acceptance. '
+                        'Recorded hashes describe prior bindings. See working_view for matching/stale/unknown read versions.'}
+                manuscript = ((delivered or {}).get('report') or {}).get('manuscript')
+                if manuscript:
+                    try:
+                        path = str(self.workspace.resolve(manuscript))
+                        context['retained_work']['last_delivery']['manuscript_identity'] = next(
+                            ({key: row[key] for key in ('locator', 'recorded_sha256', 'current_version', 'presence')}
+                             for row in reversed(retained['identities']) if row.get('absolute_path') == path
+                             and row['provenance']['record'] == delivered['record']), None)
+                    except (OSError, ValueError):
+                        pass
+                # Prioritize authorized identities under every observed spelling.
+                # Resolution grants no new mount and does not read output bytes.
+                for row in retained['identities']:
+                    if row.get('presence') == 'present' and row['version_binding'] == 'recorded':
+                        current_artifacts.update((row['locator'], row['absolute_path']))
+                spellings = {value for row in working_rows
+                    for value in (row.get('path'), row.get('absolute_path')) if isinstance(value, str)}
+                for value in spellings - current_artifacts:
+                    try:
+                        if str(self.workspace.resolve(value)) in current_artifacts:
+                            current_artifacts.add(value)
+                    except (OSError, ValueError):
+                        pass
             context.pop('requests',None)  # Requests are retained verbatim as messages, once.
             context['current_request_index'] = len(self.state['requests'])-1
             context['history_archive'] = {'total_turns':len(turns), 'access':'read_history',
@@ -3289,7 +3341,7 @@ class ToolApplication:
                 observations=working_rows, schema_tokens=schema_cost,context_token_target=target,
                 estimate_tokens=estimate_tokens,work_notes=work_notes,
                 summarized_through_turn=memory['through_turn'],
-                selected_records=selected_records,version_resolver=version,
+                selected_records=selected_records,current_artifacts=sorted(current_artifacts),version_resolver=version,
                 block_request_counts=[turn.get('request_count',1) for turn in turns],
                 material_policy=('retained' if config.get('professional_operations') == 'work.v5'
                     and config['context_protocol'] == 'working.v4' else
@@ -4875,39 +4927,29 @@ class ToolApplication:
             **({'skip_memory_checkpoint':True} if memory_entries else {})}
         self._save()
 
+    def _retained_work(self, *, observations: list[dict] | None = None) -> dict[str, Any]:
+        """Supply native owner observations to the shared read-only workspace view."""
+        if observations is None:
+            observations = []
+            for turn in self.state.get('turns', []):
+                for tool in turn.get('tools', []):
+                    try:
+                        observed = self.session.store.read_json(tool['result'])
+                    except (OSError, ValueError, KeyError):
+                        continue
+                    observations.append({'record': tool['result'], 'observation': observed,
+                                         'request_count': turn.get('request_count', 1)})
+        try:
+            delivery = self.session.store.read_json('delivery.json')
+        except (OSError, ValueError, KeyError):
+            delivery = None
+        return self.workspace.working_result(observations, saved_delivery=delivery,
+            completions=self.state['config'].get('tool_completions'))
+
     def result_snapshot(self) -> dict[str, Any]:
         """Read saved results for users; never execute, certify or change state."""
         result = self.session.status_snapshot()
-        artifacts, next_action, last_operation = [], '', None
-        observations = (tool for turn in reversed(self.state.get('turns', []))
-            for tool in reversed(turn.get('tools', [])))
-        for tool in observations:
-            try:
-                observed = self.session.store.read_json(tool['result'])
-            except (OSError, ValueError, KeyError):
-                continue
-            if last_operation is None:
-                last_operation = {'tool_name': observed.get('tool_name'), 'status': observed.get('status'),
-                    'failure_kind': (observed.get('data') or {}).get('failure_kind')}
-            # Terminal work tools keep their adopted output inventory in the
-            # common delivery binding, not necessarily top-level artifacts.
-            # Reuse that owner receipt; never scan/guess workspace outputs or
-            # promote this presence-only view into a current acceptance check.
-            delivered = ((observed.get('metadata') or {}).get('delivery_hashes') or {}
-                if observed.get('status') == 'ok' else {})
-            for locator in dict.fromkeys([*observed.get('artifacts', []), *delivered]):
-                try:
-                    path = self.workspace.resolve(locator)
-                    if path.is_file() and path.is_relative_to(self.workspace.workspace):
-                        artifacts.append(locator)
-                except (ValueError, OSError):
-                    continue
-            next_action = next_action or (observed.get('data') or {}).get('next_action', '')
-            if artifacts:
-                break
-        result['retained_work'] = {'artifacts': artifacts, 'acceptance': 'not_inferred',
-            'last_operation': last_operation,
-            'next_action': next_action or 'Resume this saved task after addressing the stop condition; completed work and accounting are retained.'}
+        result['retained_work'] = self._retained_work()
         return result
 
     def run(self, *, feedback: str = "", approved_execution: str = "",

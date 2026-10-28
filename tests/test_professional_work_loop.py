@@ -315,7 +315,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self._reload()
         self.assertEqual(self.app._coordinator_purpose(), 'code')
         project.rename(project.with_name('moved'))
-        view = json.loads(self.app._messages()[1]['content'])['professional_work']
+        context = json.loads(self.app._messages()[1]['content'])
+        self.assertNotIn('retained_work', context)  # Saved work.v4 keeps its native contract.
+        view = context['professional_work']
         self.assertEqual(view['status'], 'active')
         self.assertTrue(view['unavailable_locations'])
         feedback = 'New request: explain the available original observations directly.'
@@ -532,7 +534,8 @@ class OperationsWorkLoopTests(unittest.TestCase):
         first = '# 结果说明\n\n这些是已提供的观察，尚不支持总体推断。\n'
         self.decisions.extend([
             _action('write_file',path='说明.md',content=first),
-            _action('deliver_result',summary='已整理中文说明。',artifacts=['说明.md']),
+            _action('deliver_result',summary='已整理中文说明。',artifacts=['说明.md'],
+                limitations=['现有观察不支持总体推断。']),
         ])
         self._run()
         self.assertEqual(self.app.session.manifest.status,'completed',self.app.result_snapshot())
@@ -541,6 +544,26 @@ class OperationsWorkLoopTests(unittest.TestCase):
         old_delivery = (self.root/'delivery.json').read_bytes()
         ledger = self.app.ledger.to_dict()['entries']
         self._reload()
+        # Later incidental output must not replace the delivered work in either
+        # ordinary feedback context or the public result view.
+        self.decisions.append(_action('write_file', path='checks/observation.json', content='{}'))
+        self._run(feedback='先保留说明，记录一次检查，再继续修订。',
+            should_stop=lambda: (self.root/'workspace/checks/observation.json').exists())
+        from simple_ar.core.working_context import select_working_context
+        with patch('simple_ar.core.working_context.select_working_context', wraps=select_working_context) as select:
+            messages = self.app._messages()
+        retained = json.loads(messages[1]['content'])['retained_work']
+        self.assertEqual(retained['last_delivery']['summary'], delivery['summary'])
+        self.assertEqual(retained['last_delivery']['request_count'], 1)
+        self.assertEqual(retained['last_delivery']['acceptance'], 'saved_delivery_only')
+        self.assertEqual(retained['last_delivery']['unresolved'], delivery['unresolved'])
+        self.assertEqual(retained['last_delivery']['limitations'], delivery['limitations'])
+        self.assertEqual(retained['latest_produced']['request_count'], 2)
+        self.assertIn('workspace/说明.md', select.call_args.kwargs['current_artifacts'])
+        snapshot = self.app.result_snapshot()['retained_work']
+        self.assertEqual(set(snapshot['artifacts']), {'workspace/说明.md', 'workspace/checks/observation.json'})
+        self.assertEqual(snapshot['acceptance'], 'not_inferred')
+        self.assertEqual((self.root/'delivery.json').read_bytes(), old_delivery)
         revised = first + '\n后续需要扩大样本并确认采样方式。\n'
         self.decisions.extend([
             _action('read_file',path='说明.md'),
@@ -556,6 +579,110 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertFalse(self._process_receipts())
         self.assertFalse(self._observations('inspect_artifacts'))
         self.assertFalse(self._observations('export_report'))
+
+    def test_feedback_retains_only_actual_process_bindings_without_rechecking_output_bytes(self):
+        from simple_ar.core.working_context import select_working_context
+        self._create(goal='Retain a small data file and its authorized transformations.')
+        self._submit(_action('write_file', path='original.dat', content='original'))
+        self._submit(_action('deliver_result', summary='Original data retained.', artifacts=['original.dat']))
+        saved_delivery = (self.root/'delivery.json').read_bytes()
+        command = _action('run_process', argv=['python', '-c',
+            "from pathlib import Path; Path('bound.bin').write_bytes(b'produced')"],
+            outputs=['bound.bin'], timeout_sec=5)
+        self._submit(command, feedback='Produce a transformation, keeping the original.', approve=lambda call, token: True)
+        self._ok('run_process')
+        item = self.app.state['turns'][-1]['tools'][-1]
+        record = self.app.session.store.read_json(item['result'])
+        self.assertEqual(record['artifacts'], [])
+        produced = self.app.result_snapshot()['retained_work']['latest_produced']
+        identity = Path(item['result']).parent.name
+        # Recovery consumes exactly the same binding, without executing again.
+        with patch('simple_ar.tools.workspace.run_process', side_effect=AssertionError('No replay')):
+            recovered = self.app.workspace.call('run_process', command['arguments'], identity=identity)
+        self.assertTrue(recovered.ok, recovered.error)
+        self._reload()
+        self.assertEqual(self.app.result_snapshot()['retained_work']['latest_produced'], produced)
+        receipt = self.root/record['data']['receipt']
+        original_receipt = receipt.read_bytes()
+        try:
+            for defect in ('owner', 'digest', 'unknown', 'unbound'):
+                with self.subTest(receipt=defect):
+                    saved = json.loads(original_receipt)
+                    if defect == 'owner':
+                        saved['invocation_id'] = 'other-attempt'
+                    elif defect == 'digest':
+                        saved['output_binding']['outputs']['workspace/bound.bin'] = 'invalid-sha256'
+                    elif defect == 'unknown':
+                        saved['status'] = 'unknown'
+                    else:
+                        saved.pop('output_binding')
+                    receipt.write_text(json.dumps(saved), encoding='utf-8')
+                    self.assertNotIn('workspace/bound.bin', self.app.result_snapshot()['retained_work']['artifacts'])
+        finally:
+            receipt.write_bytes(original_receipt)
+        for mode, options, suffix in (
+                ('failed', {'outputs':['failed.bin']}, '; raise SystemExit(1)'),
+                ('unbound', {}, ''),
+                ('missing', {'outputs':['absent.bin']}, '')):
+            with self.subTest(mode=mode):
+                self._submit(_action('run_process', argv=['python', '-c',
+                    f"from pathlib import Path; Path('{mode}.bin').write_bytes(b'not bound')" + suffix],
+                    timeout_sec=5, **options), approve=lambda call, token: True)
+                self.assertEqual(self.app.result_snapshot()['retained_work']['artifacts'],
+                    ['workspace/original.dat', 'workspace/bound.bin'])
+        diagnostic = self.root/'workspace/checks/observation.json'
+        diagnostic.parent.mkdir(parents=True)
+        diagnostic.write_text('{}', encoding='utf-8')
+        owner = self.app.operations.registry.domain_gateways()['analysis']
+        with patch.object(owner, 'call', return_value=ToolResult(tool_name='analyze_table',
+                artifacts=['workspace/checks/observation.json'], data={'summary':'Diagnostic only'})):
+            self._submit(_action('analyze_table', path='measurements/observations.csv',
+                spec={'value_columns':['value'], 'observation_unit':'one recorded observation'}))
+        # Source aliases cannot acquire workspace ownership or priority.
+        self.app.workspace.mounts['duplicate'] = self.app.workspace.workspace
+        self._submit(_action('read_file', path='duplicate/original.dat'),
+                     _action('read_file', path='measurements/conditions.txt'))
+        output = self.root/'workspace/bound.bin'
+        real_open = Path.open
+        def guarded_open(path, *args, **kwargs):
+            if path == output:
+                raise AssertionError('Identity projection must not read produced bytes')
+            return real_open(path, *args, **kwargs)
+        before = self._versions(self.root)
+        with patch.object(Path, 'open', guarded_open), patch(
+                'simple_ar.core.working_context.select_working_context', wraps=select_working_context) as select:
+            snapshot = self.app.result_snapshot()['retained_work']
+            messages = self.app._messages()
+        self.assertIn('workspace/original.dat', snapshot['artifacts'])
+        self.assertIn('workspace/bound.bin', snapshot['artifacts'])
+        self.assertIn('workspace/checks/observation.json', snapshot['artifacts'])
+        self.assertEqual(snapshot['latest_produced'], produced)
+        self.assertEqual(json.loads(messages[1]['content'])['retained_work']['latest_produced']['versions'],
+                         {'workspace/bound.bin': hashlib.sha256(b'produced').hexdigest()})
+        self.assertIn('duplicate/original.dat', select.call_args.kwargs['current_artifacts'])
+        self.assertNotIn('measurements/conditions.txt', select.call_args.kwargs['current_artifacts'])
+        self.assertNotIn('workspace/checks/observation.json', select.call_args.kwargs['current_artifacts'])
+        self.assertEqual(before, self._versions(self.root))
+        self.assertEqual((self.root/'delivery.json').read_bytes(), saved_delivery)
+        bound = next(row for row in snapshot['identities'] if row['locator']=='workspace/bound.bin')
+        self.assertEqual(bound['recorded_sha256'], hashlib.sha256(b'produced').hexdigest())
+        self.assertEqual(bound['current_version'], 'unchecked')
+        self.assertEqual(bound['provenance']['kind'], 'process_output_binding')
+        # Changed and missing files keep their prior binding, never a new match.
+        output.write_bytes(b'changed')
+        (self.root/'workspace/original.dat').unlink()
+        changed = self.app.result_snapshot()['retained_work']
+        self.assertNotIn('workspace/original.dat', changed['artifacts'])
+        self.assertTrue(any(row['locator']=='workspace/original.dat' and row['presence']=='missing'
+                            for row in changed['identities']))
+        self.assertTrue(all(row['current_version']=='unchecked' for row in changed['identities']))
+        self.assertEqual(next(row['recorded_sha256'] for row in changed['identities']
+            if row['locator']=='workspace/bound.bin'), bound['recorded_sha256'])
+        view = json.loads(self.app._messages()[1]['content'])
+        self.assertEqual(view['retained_work']['last_delivery']['request_count'], 1)
+        self.assertFalse(any((row['observation'].get('absolute_path')==str(self.root/'workspace/original.dat')
+            or row['observation'].get('path')=='duplicate/original.dat')
+            and row['version_status']=='matching' for row in view['working_view']['observations']))
 
     def _review_complete_targets(self, view):
         """Default text review reads missing bytes; custom callbacks own their reads."""

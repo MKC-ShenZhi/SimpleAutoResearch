@@ -2,39 +2,67 @@
 
 [English version](CONFIG_REFERENCE.md) · [使用指南](USAGE_zh.md) · [CLI 参考](CLI_REFERENCE_zh.md)
 
-本文用于查字段、默认值和约束。模型配置文件保存命名连接，研究 TOML 定义精确任务，CodeTask TOML 定义可编辑项目。密钥保存在环境变量或私有 `.env`。
+| 配置 | 用途 |
+| --- | --- |
+| 模型目录（`models.toml`） | 命名连接、路由和传输设置；密钥保存在环境变量或私有 `.env`。 |
+| 原生任务 TOML（`start --task-config`） | 原生任务输入和偏好，包括[可信本地扩展](#可信本地扩展)。 |
+| 研究 TOML（`research-session --config`） | 结构化目标、来源、执行、写作和分析。 |
+| CodeTask TOML | 可编辑项目、工作区、解释器、编辑范围和执行预算。 |
+
+### 快速示例
+
+保存为 `task.toml`，将 `notes.md` 放在同一目录，然后运行
+`simple-ar start --task-config task.toml`：
+
+```toml
+[task]
+request = "比较提供的证据并解释其局限。"
+model = "env"
+source = ["notes.md"]
+```
+
+来源以只读方式挂载，路径相对 TOML 文件解析。请先配置模型，见[命名模型连接](#命名模型连接)。
+若需明确的结构化协议，见[研究 TOML 示例](#研究-toml分区与默认值)。
 
 | 查阅内容 | 章节 |
 | --- | --- |
-| 连接选择、profile 字段和传输 | [命名模型连接](#命名模型连接) |
-| 凭据与部署变量 | [凭据与环境变量](#凭据与环境变量) |
-| 目标、材料、资源额度和执行 | [研究 TOML](#研究-toml分区与默认值) |
-| 写作方法与报告设置 | [已有材料写作](#已有材料写作) |
-| 表格字段与统计变换 | [已有数据](#已有数据的描述分析) |
-| 决定与追加额度 | [续接](#研究会话补齐条件与续接) |
-| 项目、解释器、模型和编辑预算 | [CodeTask 字段](#codetask-toml-字段参考) |
-| Python 创建、原生控制与可信服务 | [Python API](#python-创建任务) |
+| 模型 profile、选择与路由 | [命名模型连接](#命名模型连接) |
+| 密钥与部署设置 | [凭据与环境变量](#凭据与环境变量) |
+| 任务、研究和执行字段 | [研究 TOML](#研究-toml分区与默认值) |
+| 报告和数据设置 | [写作](#已有材料写作) · [已有数据](#已有数据的描述分析) |
+| 续接与追加额度 | [续接](#研究会话补齐条件与续接) |
+| 项目字段、工作区和编辑范围 | [CodeTask](#codetask-toml-字段参考) · [编辑范围](#编辑范围规则) |
+| 扩展描述文件与 Python 集成 | [可信本地扩展](#可信本地扩展) · [Python API](#python-创建任务) |
 
 ## 引导设置
 
-普通 `start`、`--guided` 和成果偏好保存原生会话，不生成可编辑研究 TOML。启动参数提供目标、只读材料、权限、解释器和额度，恢复沿用保存值。显式结构化协议和 `--chat` 保存研究 TOML，必要时引用 CodeTask TOML。设置草稿不是执行会话。
+普通 `start` 和 `--guided` 保存原生会话。结构化协议和 `--chat` 保存研究 TOML，必要时引用 CodeTask TOML；聊天设置草稿不是执行会话。续接沿用保存的输入和额度。成果偏好用于指导交付，不授予访问权限，也不禁止目标中要求的报告。
 
-结构化优先级为默认值 → TOML → 明确 CLI，CLI 列表替换文件列表。研究路径相对 TOML 所在目录解析，命令 argv 保持字面含义；协议保护路径相对执行 cwd。CodeTask 使用独立的[加载规则](#加载规则)。原生追加访问或资源须走明确续接参数。
+原生与结构化 TOML 的优先级均为默认值 → 文件 → 明确 CLI，CLI 列表替换文件列表。原生任务文件只包含一个 `[task]` 表。研究路径相对 TOML 目录解析，命令 argv 保持字面含义，保护路径相对执行 cwd；[CodeTask 加载](#加载规则)使用独立路径规则。
 
-### V2.10 任务声明（开发分支）
+### 原生任务 TOML 字段
 
-V2.10仍在 `feat/v2.10-project-research-assistant` 上开发，经过检查的改进可在整个里程碑完成前整合进main。实际核查范围见[开发证据与限制](EVALUATION_zh.md#v210-开发证据)。
+| `[task]` 字段 | 类型／默认值／用途 |
+| --- | --- |
+| `request` | 字符串目标与交付要求；除非从 CLI 提供，否则必填。 |
+| `model` | 字符串选择器，默认 `env`。 |
+| `source` | 只读文件或目录路径列表，相对本 TOML。 |
+| `kind` | 可选成果偏好：`survey`、`bug_fix`、`reproduction`、`writing`、`data_analysis`、`figure` 或 `code`。 |
+| `project`、`document`、`material` | 项目路径、原始来源路径及笔记／草稿／结果路径；后两项为列表。 |
+| `data_file`、`data_path` | 数据文件路径与额外输入路径列表。 |
+| `output_root`、`project_python` | 输出根目录（默认 `runs/assistant`）与可选 Python 入口路径。 |
+| `allow_execution`、`allow_network`、`allow_vision` | 布尔值，默认 `false`；分别允许进程提案、公开来源获取和图像检查，每条实际进程命令还需批准。 |
+| `max_turns`、`max_tokens` | 整数模型额度，默认 `30` 次请求和 `600000` token。 |
+| `max_processes`、`max_process_seconds` | 累计进程调用数和墙钟时间上限，默认分别为 `max_turns × 10` 和 `max_turns × 300`；零禁用对应容量。 |
+| `max_images` | 付费图像生成／编辑提交次数，整数，默认 `0`；与视觉检查分开。 |
+| `from_session`、`reuse` | 已保存任务路径与新任务复用的成果组列表，见下文。 |
+| `extensions` | 明确选择的路径列表，见[可信本地扩展](#可信本地扩展)。 |
 
-开发分支将用户原话与材料角色、数据含义、成果偏好分别保存；CLI和界面确认相同的有效声明，不把自动生成的路径清单追加成用户要求。偏好帮助选择交付，不限制可用能力；材料声明不是已核实事实，也不增加访问或执行权限。未设置`--with-report`不表示禁止按自然语言要求写报告。历史会话保留原输入规则。
+以上相对路径以任务文件所在目录为基准。明确 CLI 值覆盖文件。`simple-ar start --write-task-config task.toml` 导出可编辑设置，不创建任务。
 
-V2.10开发分支的原生`[task]`配置支持`extensions = ["../my-skill"]`。
-明确选择的受信任本地扩展沿共同工具注册和任务记录运行；v1 接受方法说明包及声明只读／计划操作的 Python 工具。
-可信 Python 拥有宿主进程的操作系统权限，可直接访问文件、进程及网络；声明和宿主服务限制不是沙箱。只加载可信包。设置方法及边界见[本地扩展说明](LOCAL_EXTENSIONS.md)。
+<a id="v210-任务声明开发分支"></a>
 
-基于已有成果新建任务时，原生`[task]`还可配置`from_session = "../saved-task"`及
-`reuse = ["artifacts"]`（也可选`simple-ar results`列出的成果组）。会话路径相对配置文件，
-组名不是路径；只复用经字节核验的材料，不继承原权限、额度或执行状态。
-继续同一任务应使用`--resume-task`。
+基于已有成果新建任务时，原生 `[task]` 可设置 `from_session = "../saved-task"` 和 `reuse = ["artifacts"]`，也可选 `simple-ar results` 列出的成果组。路径相对任务配置；复用材料经过字节核验，不继承权限、预算或执行状态。继续同一任务使用 `--resume-task`。
 
 ## 命名模型连接
 
@@ -75,44 +103,36 @@ writing = "daily"
 
 `[model].name` 也接受选择器。有目录时，裸模型 ID 只有与按用途解析出的连接模型完全一致才被接受；不会按模型 ID 搜索 profile 或切换连接。选择其他连接请用 `profile:NAME`。名称、密钥或能力缺失时失败，不切换提供方。profile 名称须非空且不含冒号。路由为 default、text、code、writing、vision、image。
 
-明确更换已保存的文本连接时，会开始新的原生对话边界，不新建任务或重置预算；专业焦点的实际连接变化也采用这一规则，同连接保留原边界。原回复、思考内容和工具记录仍可查，但不把不兼容的旧助手消息当作新提供方的原生对话重放。支持范围内的思考模式切换因此不需要伪造缺失内容。
-
 | Profile 字段 | 默认值／取值 |
 | --- | --- |
 | `api` | 必填：openai_chat、openai_responses、openai_images、cctq_images_async |
 | `base_url`、`model`、`api_key_env`、`capabilities` | 必填：无用户信息/query/fragment 的 HTTP(S) URL；非空模型；密钥变量名；text/code/vision/image_generate/image_edit 中的非空能力列表 |
 | `proxy_env` | 默认空，引用保存 HTTP(S) 代理 URL 的变量；不接受用户信息/query/fragment，实际地址不持久化 |
 | `stream`、`http2` | false、false；仅 Chat 支持流式；Responses profile 必须使用 `stream=false`，结构化任务也不例外 |
-| `request_timeout_sec` | 180，正数秒。SDK Chat 流式使用有限值时也限制整条流的总墙钟时长，不只是空闲等待；持续到达的片段不会重置它。到期仍无完成标记/用量即停止，不采用截断内容、不释放未知费用。 |
-| `connect_timeout_sec` | 未设置时保留历史 TCP/TLS 建连上限 20 秒。可设有限正秒数，生效值不超过有限正的请求超时；仅文本 SDK 连接支持，不是生成总时限，也不增加重试次数。 |
+| `request_timeout_sec` | `180`；正数秒。有限时限的 SDK Chat 流式请求也受整体时限约束。 |
+| `connect_timeout_sec` | 未设时 SDK TCP/TLS 上限为 20 秒；否则为有限正数秒，且不超过有限请求时限。仅文本 SDK 支持。 |
 | `max_output_tokens` | 未设，显式正整数输出上限 |
 | `context_input_tokens` | 24000，正整数原生输入工作集目标，不代表提供方上下文容量 |
 | `retry_attempts` | 3，至少 1，包含首次物理请求 |
-| `connect_retry_attempts` | 默认 1；仅对能确认尚未发送请求的连接故障提供更高尝试上限。每次消耗请求预算，不扩大发送后中断或用量未知响应的重试范围 |
-| `native_response_corrections` | 严格整数 `0` 或 `1`，默认 `0`；`1` 明确授权原生 Chat turn 对完整且已结算的截断响应纠正一次。Responses 和 Images profile 不得启用；不新增环境变量或 CLI 询问 |
+| `connect_retry_attempts` | `1`；可提高已确认发送前建连失败的尝试上限，每次消耗请求预算。 |
+| `native_response_corrections` | 严格整数 `0`（默认）或 `1`；仅授权原生 Chat turn 对已结算的截断响应纠正一次。 |
 | `retry_base_delay_sec`、`retry_max_delay_sec` | 1、12，正数秒 |
-| `reasoning_effort` | 独立于精确 `model` 名称的可选推理参数；空表示不发送。具体支持取决于服务商及模型，与配置别名或Codex subagent设置不是一回事。可配置none、minimal、low、medium、high、xhigh、max、ultra；请求某档位不代表已证明服务商实际执行了它。 |
+| `reasoning_effort` | 空（不发送）、`none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`、`ultra`；支持情况取决于提供方和模型。 |
 | `thinking_mode` | 空、enabled、disabled、auto；Chat 关闭思考时 effort 须为空或 none |
 | `reasoning_output_tokens` | 未设，启用 effort 时的正整数备用上限；显式调用/profile 上限优先 |
-| `json_response_format` | auto、off、json_object；off 不发原生 JSON 参数，仍本地校验 |
-| `chat_token_limit_param` | auto、max_tokens、max_completion_tokens |
+| `json_response_format` | auto（默认）、off、json_object；off 不发原生 JSON 参数，仍本地校验 |
+| `chat_token_limit_param` | auto（默认）、max_tokens、max_completion_tokens |
 | `input_price_per_million`、`output_price_per_million` | 未设，非负费用估计 |
 | `image_size` | 未设；auto、256x256、512x512、1024x1024、1024x1536、1536x1024、1792x1024、1024x1792 |
 | `image_quality` | 未设；auto、standard、hd、low、medium、high |
 
-目录严格检查字段与类型。Images 只接受图像能力，拒绝明确提供的文本流式/token/context/推理/JSON/单价字段。文本连接拒绝图像尺寸、质量和生成能力。能力是声明，不是 API 探测；提供方参数支持需要核实。原生决策和 `focus_work` 要求 Chat，`compose_document` 可通过写作路由使用 Responses。焦点切换不改变工具或共享额度。
+### Profile 约束
 
-新命名研究/原生任务与设置草稿保存非秘密绑定，固定模型、端点、协议、HTTP/2、推理设置及相关代码/写作路由。流式、超时、输出上限、重试/等待和输入工作集可调整；同一变量背后的密钥可轮换。调整传输不恢复失败调用或释放未知费用，仍须明确续接。视觉授权单独绑定；无关图像 profile 不使文本任务失效。原生任务的 catalog 定位只是查找线索，原连接绑定仍在派发前拒绝接收方/协议漂移。文件丢失须提供明确或匹配的用户配置，缺凭据仍报错；旧任务不自动补定位，无绑定旧任务保留旧解析，独立 CodeTask 不追溯补绑定。失败原生决策换连接须走 CLI 明确重试合同。
-
-`native_response_corrections=1` 要求原预算账本与有限输出上限，仅作用于 `chat_turn`：完整 `finish_reason=length` 响应完成结算后，才可纠正一次。半截响应及工具不采用/执行，丢弃原因记入原账本。复用同一客户端、模型、上限、history/tools和逻辑调用ID；内部 system 仅说明截断未执行、上限及既有指令，要求完整适量操作，不含被丢弃的正文、思考或参数。第二次截断、空输出、未知完成原因、内容过滤或错误即停止。普通文本、JSON 和视觉调用不变。
-
-这是一轮语义纠正，不是网络重试，也不表示总共只有两次物理请求：每次完整调用仍走既有传输重试、预留、结算及失败记账，共用原账本。原预算和外层 `protect_remaining` 保留额度继续生效，不续额。若本次完整调用新产生的尝试仍有 unknown/reserved（包括底层重试后成功但早先尝试仍未知），停止纠正或采用；历史已确认有限的 unknown 原样保留，不因此单独禁用纠正。启用可能增加请求和 token 支出，仍可能失败，不保证质量改善。该字段是固定的连接授权，不属于可静默调整的超时项：旧绑定缺字段等价于 `0`，已保存的 `0`／缺省改为 `1` 必须明确变更连接，不能追溯授权历史合同，也不恢复已有失败任务。
-
-HTTP/2 需要执行主机安装 `simple-autoresearch[http2]`，源码用 `uv sync --extra http2`。图像缺支持时在预留/提交前失败，完整旧图片仍可离线恢复。profile 代理只影响本连接，缺失或无效在付费前失败；未配置时沿标准客户端环境路由。
-
-有限时限的 SDK Chat 流式同时约束提交和消费，之后最多两秒清理。建连最多 `min(connect_timeout_sec, request_timeout_sec)` 秒；未设置建连项仍保留历史 20 秒上限，读取/写入/连接池保持配置时限。SDK 内部重试关闭。缺完成标记保留未知用量；有输出上限的文本可沿同 API 在次数内重试，保留失败预留。无上限/视觉请求及额度不足时停止。可选建连项也作用于同步 SDK Chat/Responses；LiteLLM 和 Images profile 不支持。已有 asyncio 循环中使用 `await asyncio.to_thread(client.ask, ...)`。
-
-推理档位和上限依提供方而异，推理可能同时占输出和后续输入。达到长度上限且只有思考、无最终回答不算完成；延长时限不能解决立即过载。诊断保留异常类型、可取得的 HTTP 状态与白名单错误码/类型；SDK Chat 失败还保留已观察到的最后一个安全 TCP/TLS/HTTP 事件，不记录请求头或 trace 内容。发送前建连失败不同于响应中断后的未知用量，之后一次 TLS 成功也不证明 API 稳定。不设输出上限时最终回答可能超过按输入估计的剩余额度，任务额度不是提供方严格费用上限。
+- 目录严格检查字段和类型。Images profile 只接受图像能力并拒绝文本生成设置；文本 profile 拒绝图像尺寸、质量和生成能力。能力是声明，不是提供方探测。原生决策和 `focus_work` 要求 Chat；`compose_document` 可通过写作路由使用 Responses。预算化视觉检查须在视觉 profile 明确设置 `max_output_tokens`。
+- HTTP/2 要求执行主机安装 `simple-autoresearch[http2]`。配置的代理仅作用于该 profile。SDK Chat 流式请求的有限时限覆盖提交与消费；已有 asyncio 循环中可用 `await asyncio.to_thread(client.ask, ...)`。
+- 新命名研究／原生任务及聊天草稿固定模型、端点、协议、HTTP/2、推理、纠正授权和相关路由；流式、时限、输出上限、重试和输入目标可调整，同一变量背后的密钥可轮换。明确更换原生文本连接会开始新对话边界，不重置任务或预算。保存的目录路径仅供查找；旧任务沿用原合同，独立 CodeTask 不追溯补绑定。
+- `native_response_corrections=1` 要求账本和有限输出上限，只对完整且已结算的 `finish_reason=length` Chat turn 纠正一次；不采用截断文本或执行其中的工具。纠正共用原预算，若新尝试存在未知或预留用量则停止。在保存的连接上启用须明确更换连接。
+- 超时或响应中断可能留下未知用量；调整传输设置不会释放预留或恢复失败调用。输出上限和单价估计不保证提供方费用上限。
 
 <a id="全局-env"></a>
 
@@ -136,13 +156,16 @@ HTTP/2 需要执行主机安装 `simple-autoresearch[http2]`，源码用 `uv syn
 | `SIMPLE_AR_DOCUMENT_ROUTE_HOSTS`、`SIMPLE_AR_DOCUMENT_PROXY_ENV`、`SIMPLE_AR_DOCUMENT_CA_BUNDLE` | 关联资料准确主机列表、代理变量名、可选可信 CA 文件 |
 | `SIMPLE_AR_RESEARCH_INDEX_ROOT` | 显式清理历史索引的位置，默认 `.simple_ar_cache/research_index`；不控制资料检索后端。 |
 
-关联资料路由保持 TLS 校验，拒绝主机通配符，只影响关联补充材料，不影响模型/检索/PDF/ZIP。未列主机直连；未明确配置时此下载器不使用环境代理。`SIMPLE_AR_OUTPUT_DIR` 每次进程提供，不是全局设置。
+关联资料路由使用准确主机名和 TLS 校验，不改变模型、搜索、PDF 或 ZIP 传输。未明确配置路由时，此下载器不使用环境代理。`SIMPLE_AR_OUTPUT_DIR` 由每次进程提供，不是全局设置。
 
-连接器凭据放认证请求头。HTTP 429 后本批次停止实时请求该提供方，仍检查已启用查询缓存并继续其他提供方。Web 只用 Tavily basic，不升级、不生成答案、不自动重试，缺凭据失败；无日期页面不满足年份条件。提取与检索分开授权和缓存，保留原 URL/文本/请求 ID/报告用量；复用不调用，失败不升级或切换后端，PDF 许可仍独立。摘要与元数据不冒充已验证原文。
+`web` 使用 Tavily basic 搜索；网页提取单独授权和缓存，远程 PDF 另需许可。摘要和元数据是发现资料，不是已核实原文。
 
 ## 研究 TOML：分区与默认值
 
-~~~toml
+结构化调研可将以下内容保存为 `research.toml`，与 `paper.md` 放在同一目录，
+然后运行 `simple-ar research-session --config research.toml`：
+
+```toml
 [task]
 goal = "比较已有证据及其局限"
 kind = "survey"
@@ -156,9 +179,9 @@ materials_only = true
 
 [assets]
 papers = ["paper.md"]
-~~~
+```
 
-使用 `simple-ar research-session --config research.toml`，见[调研示例](../examples/survey/README.md)。未知研究分区/字段/类型报错。带模型的共同创建默认保存有限任务额度：30 次请求、600000 token；无模型时，省略的模型额度为零。恢复保留用量和限额，legacy 会话保留原预算合同。
+参见[调研示例](../examples/survey/README.md)。未知研究分区、字段和类型会报错。带模型的共同创建默认为 30 次请求和 600000 token；无模型时，省略的模型额度为零。续接保留保存的用量和限额。
 
 ### 任务、模型与预算
 
@@ -204,11 +227,7 @@ papers = ["paper.md"]
 | `research.interaction` | CLI 默认 checkpoints，可选 assisted/autonomous。新任务用于协议/设计确认；legacy 阶段/交付政策仍归保存的所有者。见[参与策略](CLI_REFERENCE_zh.md#参与策略与待处理决定) |
 | `assets.papers`、`assets.materials`、`assets.data` | 书目来源；写作草稿/笔记/结果/包；执行输入。项目内数据复制进隔离准备，外部原地保留，不改 argv 或核划分 |
 
-本地 PDF 不受远程全文关闭影响；远程 PDF 需要下载/保留许可。出处记录总页/提取页/空页/截断，提取不等于 OCR 或理解。基础 parser 执行页数上限；unstructured 无法执行时拒绝，旧覆盖不补造。
-
-搜索会聚焦查询并保留用户提供的初始查询。arXiv 的普通关键词以 `AND` 连接，高级表达式保持原样。启用模型阅读与自动扩展后，可在原额度内按证据缺口补做一次搜索、获取和阅读。
-
-关联页面获取每次最多进行 4 次 GET，每次都检查公开地址。必要材料或权限不足时，各种交互策略都不能跳过检查继续执行受影响的操作。
+本地 PDF 不受远程全文关闭影响；远程 PDF 需要下载和保留许可。页数上限记录截断，无法执行上限的解析器会拒绝该设置。搜索保留明确查询；arXiv 用 `AND` 连接普通关键词。模型阅读和自动扩展可在原限额内追加一次搜索、获取和阅读。
 
 ### 执行与报告
 
@@ -226,9 +245,7 @@ papers = ["paper.md"]
 | `protocol` | contract_id/hypothesis、dataset_refs、split_spec、metric_specs、comparison_conditions、protected_assets；复现还需 dataset/expected_outcome |
 | `initial_files` | 须显式 CodeTask 准备；明确允许、尚不存在、不受保护的 Python 路径，不限复现任务。新任务交由 CodeTask 直接创建，不先写占位实现；已保存 legacy 合同保留原语义。 |
 
-仅文献任务省略 command 和 CodeTask。
-
-固定测量使用 `reuse` 时，`baseline_ref` 路径相对配置文件（无配置文件时相对当前目录）。框架核对命令、指标 schema、比较协议与明确保护文件的原始哈希，并把原结果保存为任务内只读快照；只执行候选条件，基线保留原测量身份、不新增进程或用量记录。缺少保护文件证据、条件不匹配、失败结果或已变化的输入会阻断复用。受控 CodeTask 也可消费同一外部基线：原观察和快照哈希绑定实施审批，直接传给代码模块，不把基线冒充为候选准备阶段的产物。若导入结果声明了产生它的准备或实施血缘，仍须由原血缘所有者处理，不能只凭一个结果文件抹去这些关系；历史结果与账本保留。
+仅文献任务省略 command 和 CodeTask。使用 `baseline_policy="reuse"` 时，`baseline_ref` 相对配置文件解析（无配置文件时相对 cwd）。原结果必须通过，且命令、schema、协议和保护文件哈希须匹配；原结果保留为只读快照，仅运行候选条件。CodeTask 也可使用已核外部基线，但不能把它当作自身准备的产物。
 
 | `[execution.environment]` 字段 | 默认值／约束 |
 | --- | --- |
@@ -237,11 +254,9 @@ papers = ["paper.md"]
 | `python_executable` | venv 基础解释器，默认运行时 |
 | `timeout_sec`、`check_command` | 每步300秒，可选字面短检 argv |
 
-准备与检查共享进程预算/日志，失败不进入测量，检查输出不作为测量。任务 venv 解析裸 Python 别名；来源绑定测量中的显式执行器若与该 venv 冲突，会在启动前拒绝，不静默替换。安装可能运行构建代码/联网；工作区不是 OS 沙箱，完成恢复不重装。
+准备和检查共享进程预算，失败则停止测量。任务 venv 解析裸 Python 别名，冲突的显式执行器会被拒绝。安装可能运行构建代码或联网；工作区不是 OS 沙箱。
 
-精确任务可先准备未改源码、测基线，再实施独立候选，反馈时复用原准备。冻结条件的来源与 baseline/candidate 比较角色分开。明确 `skip` 只要求声明的候选运行，交付描述性结果，不虚构基线对照。外部基线复用须保留上述血缘；不支持的新声明在创建前报错，不转入另一控制器。
-
-普通 benchmark 允许 validator 与正式测量使用相同 argv，但必须分别进行真实物理调用并独立记账，validator 结果不能充当测量。严格 reproduction 仍要求不同的校验命令。greenfield 的 `copy`/`sparse_copy` 若有真实 source 项目，可承接源码基线；这些冻结条件显式携带 `source="preparation"`、`before_implementation=true`。高层须先 prepare，完成全部声明的 baseline，再调用 `implement(prepared_result)` 并传入实际成功基线事实；失败或缺测不能授权生成。empty 或无 source 项目不能虚构未改源码基线，须使用真实源码或已核外部测量证据。项目测量 cwd 仍须匹配原 source root，可写范围与源码路径投射规则不变。
+若声明源码基线，必须在实施前完成测量；空项目不能虚构基线。`skip` 只运行声明的候选。普通验证与测量可以使用相同 argv，但必须分别调用；复现要求不同的验证 argv。
 
 ~~~toml
 [execution.output_files]
@@ -253,19 +268,13 @@ elapsed = { output = "runtime", path = ["elapsed_seconds"] }
 coverage = { output = "observations", column = "coverage", match = { method = "candidate" } }
 ~~~
 
-附件必须位于本次执行的 `SIMPLE_AR_OUTPUT_DIR` 中。命令参数可以使用字面占位符 `{output_dir}`，它不会经过 shell 展开。登记时使用相对 POSIX 路径。附件数量没有上限；每个附件必须是 UTF-8 普通文件，且大小不超过 2 MiB。
+附件须为 `SIMPLE_AR_OUTPUT_DIR` 下不超过 2 MiB 的 UTF-8 普通文件，以相对 POSIX 路径登记。字面参数 `{output_dir}` 绑定该目录。登记文件可预览和读取；缺失或超限文件不能支撑结论。`results.json.output_evidence` 记录来源和截断。读取可指定字符窗口、字面匹配，或用最多四个精确标量条件筛选 JSON/CSV/TSV 行。
 
-登记后的附件会提供预览和读取句柄。系统不会扫描当前工作目录、从 stdout 猜测文件路径，也不会复制外部文件。附件缺失、不可读或过大时，会单独报告，不影响指标成功状态，但这些附件不能支撑结论。
-
-`results.json.output_evidence` 记录附件的来源和截断情况。读取时可以指定字符窗口、查找字面文本，或用最多四个精确标量条件筛选 JSON 数组、CSV 和 TSV 中的记录。这些读取操作不会汇总记录。
-
-JSON 指标选明确键/下标；CSV/TSV 必须唯一一行。缺失、歧义、非有限或与 stdout 冲突失败；文件不能使失败/超时进程变为成功测量。改变附件合同属于执行修订，不是报告刷新。
+指标选择器必须找到有限数值：JSON 使用明确键或下标，CSV/TSV 必须唯一一行。缺失、歧义或与 stdout 冲突会失败；文件不能使失败进程变为成功测量。
 
 #### 固定协议复现
 
-要求 materials_only=true、本地 papers、command、有限 timeout、baseline_policy="skip" 及 hypothesis/dataset/expected_outcome。不创新、不扩种子、不暗中寻找环境。
-
-可选 CodeTask 准备范围内 adapter/入口；其 benchmark 为独立验证，execute timeout 为正验证时限。解析解释器后验证 argv 仍须与测量不同，先验证通过。已支持的平直任务由 CodeTask 直接创建声明的 initial files，不先造占位实现；历史合同保持原恢复行为。不授权方法/划分/条件变化。明确的 current 检查或任务 venv 在实施前运行，先检查准备加验证的完整额度；准备检查不能运行正式测量。venv 要求 CodeTask 初始使用 current Python，且不与源 venv 复用组合。反馈沿实际记录复用环境，不重复安装。见[复现案例](../examples/conformal_reproduction/README.md)。
+设置 `materials_only=true`、本地论文、命令、有限时限、`baseline_policy="skip"`、假设、数据集和预期结果。可选 CodeTask 准备范围内 adapter/入口；其 benchmark 须先验证通过，且解析解释器后 argv 与测量不同。初始文件须明确允许且尚不存在。不会隐含变更方法、划分或扩展种子；环境检查在实施前进行。任务 venv 要求 CodeTask 初始使用 current Python，不能与源 venv 复用组合。见[复现示例](../examples/conformal_reproduction/README.md)。
 
 #### 配对与种子
 
@@ -278,21 +287,15 @@ baseline_command = ["python", "evaluate.py", "--method", "baseline", "--seed", "
 candidate_command = ["python", "evaluate.py", "--method", "candidate", "--seed", "0"]
 ~~~
 
-另一方式用 command、唯一 seeds 或正 seed_count，加明确 seed_flag。不能混用 pairs。已有 `--seed 0`/`--seed=0` 被替换而非重复追加；单 flag 只登记当前种子，不授权扩展。协议内部 seeds 仅描述评估器条件，仍一次命令。
+另一方式使用 `command`、唯一 `seeds` 或正数 `seed_count`，以及明确的 `seed_flag`；不能与 `pairs` 混用。已有种子参数会被替换。单个 flag 只登记一个种子；协议内 seeds 仅描述条件，不展开命令。追加配对需要分析建议、接受决定和剩余进程额度。
 
-扩展须有分析建议、同种子配对、接受决定和剩余进程额度；命令/协议种子冲突拒绝。
-
-基线身份核对命令/schema/数据/划分/指标/条件/协议版本/准备 lineage/保护文件，不凭候选 ID、假设或 cwd。旧证据不从新计划补齐，论文值不当本地测量。保护文件须唯一 asset_id/path，路径相对 cwd 或绝对，检查仅覆盖列出的文件。为每次矩阵调用预留预算；直接 argv 用进程 PATH，CodeTask 解析裸 Python。
+基线复用核对命令、数据、划分、指标、条件、准备与声明的保护文件。每个保护文件须有唯一 `asset_id` 和路径，路径相对执行 cwd 或为绝对路径。每次调用都须计入预算；直接 argv 使用进程 PATH，CodeTask 按环境规则解析裸 Python。
 
 ## 已有材料写作
 
-结构化写作设置 `kind="writing"` 和 `outputs=["report"]`，提供材料及模型连接。普通 `start --kind writing` 则创建原生任务。
+结构化写作使用 `kind="writing"`、`outputs=["report"]`、本地材料或论文及模型。普通 `start --kind writing` 创建原生任务。来源放在 `assets.papers`，草稿、笔记和结果放在 `assets.materials`；重复或双重角色路径会报错。支持文本、Markdown、HTML 和 PDF。普通 JSON 是未核实材料；无效 JSON 和损坏的 `table_analysis.*` 包会失败。
 
-论文放入 `assets.papers`，草稿、笔记和结果说明放入 `assets.materials`；同一路径不能重复登记或同时承担两种角色。支持文本、Markdown、HTML 和 PDF。普通 JSON 只作为尚未核实的材料；无效 JSON 或损坏的 `table_analysis.*` 分析包会报错，不会降级后继续写作。
-
-导入 `table_analysis.v1` 时，须保留同目录的数据副本；JSON 与输入数据各不超过 20 MiB。系统复算数值并重建图形，拒绝过期或缺项的包。复算检查算术，不证明数据采集或科学解释正确；原始表格也不是已验证的实验包。提取后的材料会保存供恢复使用。
-
-在目标中说明文体、长度和计数口径。大致期望与严格范围应明确区分；系统不会自行把页数换算成词数或添加容差。标题、章节和参考文献是否计入长度，沿用已保存的要求。
+导入 `table_analysis.v1` 须保留相邻数据副本，JSON 和输入各不超过 20 MiB；系统复算并重建图形。请在目标中说明文体、长度及计数范围，并区分目标与硬性范围。
 
 | `[report]` 字段 | 默认值／行为 |
 | --- | --- |
@@ -308,21 +311,14 @@ candidate_command = ["python", "evaluate.py", "--method", "candidate", "--seed",
 | `max_document_review_prompt_chars` | 0无附加完整请求上限；正数超量拒绝不截断；已有60000字符稿件/检索窗口仍生效 |
 | `figures` | report.figures.enabled=false 或 mode="off" 关闭生成；max_figures=0自动，正数总上限含导入图，超量失败 |
 
-`article` 用一次请求起草整篇正文，随后装配并执行确定性检查。设 `reviewer="llm"`、`document_review=true`、`review_scope="document"` 可独立检查；0轮不改写，正数轮次复用已有联合编辑器，保留初稿响应，提出完整候选，独立检查后才采用。被拒绝或不可用的提案仍计入轮次；保存候选及已完成检查恢复时不重复调用。未知或拒绝响应不盲目重发；必要纠正未完成则失败，不发布为成功修订。这些检查不等于科学认证。
+### 写作约束
 
-固定结构和引用上限无需切换到分节 Writer。未开启自动纠正时，一级章节缺失、重复、多出、顺序错误或引用超量会保留原响应并拒绝采用，不重发请求。开启有界纠正后，可以保留完整初候选供编辑，但约束与独立检查都通过后才可交付。子章节自由，不兼容的显式设置报错。刷新或修订可使用已采用旧稿，与原证据分开；历史响应和费用继续保留。历史整稿按保存约束恢复，不追套当前默认值。
-
-`sections` 保存章节计划和检查点，并进行有限纠正。`draft_scope="auto"` 仅在每节都有正数长度目标、总目标不超过 2,000 词时联合起草，否则分节处理。新的 document/auto 纠正任务直接检查当前稿，不再额外核验一遍旧意见；只有检查完整覆盖当前稿，才能替代旧意见，原意见仍保留在历史中。已保存检查恢复时不再重发该检查，历史检查点保留原核验合同。联合修订以完整候选为单位，独立检查整个候选后才采用；被拒绝或待处理的轮次仍计入额度。整稿检查无法完成时，会保存草稿并暂停。
-
-分节方法可在授权范围内补读已登记原文，共享现有工具额度；这不授权新的搜索、任意文件读取或进程执行。补读的内部运行参数不是公开研究 TOML 字段。
-
-Auto 模板：≤1可引用来源为 source_review，多来源 survey，供材 material_report，实验依据目标判断选 experiment/reproduction/analysis_report。明确模板不覆盖事实，执行 passed 不等于科学成功；保存解析模板沿用。非综述 adaptive 分节规划增加1调用及最多1纠正，无效指针拒绝、回退须 runtime 明确许可。图归属可按证据规划；结构化引导写作保存 adaptive，数据/调研/复现可保存联合写作审阅，不等于基础默认。
-
-两种 data_tables 都保留完整可搬迁包。唯一图/链接归冻结章节，歧义用描述数据节。实验包保留 experiment_evidence.json、可读 companion 和登记副本，审计核投影/存在，不核科学或后续篡改。ACM 带登记包，不复制任意链接。概念图须有依据，不为数量编图；未知书目仍未知。
+- `article` 用一次请求起草完整正文。独立检查需设置 `reviewer="llm"`、`document_review=true`、`review_scope="document"`；纠正轮数为零时只检查不改写。采用前会核对必需标题和引文上限。
+- `sections` 保留计划和检查点。`draft_scope="auto"` 仅在每节都有正长度目标且总数不超过 2,000 词时联合起草，否则分节起草。分节补读使用现有访问权限和工具额度。
+- Auto 模板根据来源和任务选择 `source_review`、`survey`、`material_report`、`experiment`、`reproduction` 或 `analysis_report`。引导设置可明确不同于基础默认值。两种表格模式都保留可搬迁证据包；图形须有材料依据。
+- 续接沿用保存的写作方法与约束。检查和算术复算不认证科学正确性。
 
 <a id="已有材料写作的章节规划"></a>
-
-章节规划字段和方法约束见上表；旧链接仍指向本写作参考。
 
 ## 已有数据的描述分析
 
@@ -348,9 +344,7 @@ value_unit = "分"
 | `association`、`series_layout` | 分别默认为 `none`、`separate`；坐标图可选 `pearson` 相关与 `shared` 共用坐标轴 |
 | `max_mb`、`max_points`、`max_figures` | 分别默认 20 MiB、10,000 个位置或单元格、100 页图。均可调整为正数；超限会报错，不自动抽样 |
 
-保存配置前检查表格结构和列名；正式分析时检查数值并保存输入快照。缺失值不会填成零，非数值和非有限数会报错。恢复使用已保存数据，改变分析变换需要新任务。
-
-仅分析不调用模型。追加报告需要模型连接并共享会话预算，可附本地说明或论文，但不会因此改变已确认的数值设置或获得联网权限。
+分析时检查有限数值并保存输入字节与设置。缺失值不会填为零；改变变换需要新任务。仅分析不使用模型；追加报告需要模型和共享预算，附加本地材料不授权搜索。
 
 | 图 | 模式／行为 |
 | --- | --- |
@@ -360,29 +354,21 @@ value_unit = "分"
 | `line` | 使用 `values` 和数值 x；每组 x 须唯一、完整，并按 x 排序；缺失 y 时断线 |
 | `scatter` | 使用 `values` 和数值 x；保留重复坐标。`omit` 会在数据包保留缺坐标行，但不绘制这些行 |
 
-箱线图的须表示实际最小值与最大值，不是置信区间或 Tukey 界。坐标图不自动聚合或拟合；其中的分组表示系列，不声明配对或重复采样。
+箱线图须表示实际最小值与最大值，不是置信区间或 Tukey 界。坐标不自动拟合或聚合。共用坐标轴须声明共同单位；数量上限包含所有系列和热图缺失格。
 
-共用坐标轴要求声明共同单位，不会自动归一化。点数上限包含所有系列；热图上限也包含缺失单元格。分页保留类别与统一尺度，不通过丢弃标签或记录来满足限制。
+`paired_baseline` 要求 observations/bar 或 box，同时选择基线与候选，并确认同一行匹配及共同量和单位。它对完整配对计算候选减基线，保留数量、均值、样本标准差和标准误。至少两个独立配对时，±1 标准误不等于置信或显著性结论。箱线图单列分布使用各列非缺失行，配对差值使用完整配对。
 
-配对比较要求 `mode="observations"`、`bar` 或 `box`，并同时选择基线与候选列。用户须确认同一行的匹配关系和共同单位。
-
-计算采用“候选减基线”，保留完整与缺失对数、均值、样本标准差和标准误。`omit` 只使用双方都非缺失的行，不是分别过滤后再相减。至少两个独立配对时显示 ±1 标准误，不等于置信区间或显著性结论。箱线图的单列分布与配对差值使用不同的有效行，分别展示。
-
-Pearson 相关只用于 `line` 或 `scatter` 的 x/y 坐标，每组、每列使用共同非缺失的坐标对。常量轴或不足两对时结果未定义；只有两对非恒定值时，相关系数必为 ±1。
-
-输出保留样本数与未定义原因，不改动原图点，也不作回归、显著性、因果或独立性判断。接近零的相关系数不能排除非线性关系。见[曲线案例](../examples/data-curves/README.md)。
+`pearson` 要求 line/scatter 坐标，按组和列使用共同非缺失的 x/y 配对。常量轴或不足两对时未定义，两对非恒定值必得 ±1；不推断回归、因果或独立性。见[曲线示例](../examples/data-curves/README.md)。
 
 ## 研究会话补齐条件与续接
 
-新共同任务沿打印的 `start --resume-task SESSION` 继续：文字修改使用反馈，补齐或显式替换原生合同使用[明确补齐条件](CLI_REFERENCE_zh.md#原生任务恢复)。以下旧计划、重分析和报告刷新规则适用于已保存 ResearchApplication 会话，不因新任务使用研究 TOML 就适用。
+### 准备执行后的续接
 
-这些 legacy 会话使用 `research-session --config research.toml --session-root SESSION` 续接。省略的目标和输出沿用原值；显式修改目标、论文或执行条件时，只重建相关计划并保留历史。测量复用要求命令、结果格式、协议、准备条件和保护资产一致。
+新共同任务使用 `start --resume-task SESSION`；文字修改使用反馈，补齐或替换合同使用[明确补齐条件](CLI_REFERENCE_zh.md#原生任务恢复)。保存的 ResearchApplication 会话使用 `research-session --config research.toml --session-root SESSION`。
 
-改变任务类型，或采用不兼容的搜索、提取设置，需要新会话。仅修改报告设置不会重跑测量；`research-report` 可为已有会话补写报告。
+对这些保存的会话，省略的目标和输出沿用；明确修改目标、论文或执行条件会重建相关计划。测量复用须匹配命令、schema、协议、准备和保护文件。不兼容的任务类型或提取变更需要新会话；仅修改报告不会重跑测量。`research-report` 可补写报告。
 
-`continuation.decision_id` 指定待答复决定；`decision_response` 为 `accept`、`reject` 或 `revise`，修订说明放在 `decision_guidance`。修改交付要求时还需提供对应报告设置。
-
-相同请求可恢复中断的修订，不重复已完成工作；改变输入或条款后，旧决定不再适用。交互策略变更不能与重分析或单独报告刷新混用，正式交付答复则可同时包含报告及策略设置。具体命令见 [CLI 参考](CLI_REFERENCE_zh.md)。
+使用 `continuation.decision_id`、`decision_response`（`accept`、`reject`、`revise`）和 `decision_guidance` 答复待处理决定，交付修订还需报告设置。输入或条款变更会使旧决定失效；交互变更不能与重分析或单独报告刷新混用，答复交付决定除外。
 
 ### 显式续接额度
 
@@ -395,100 +381,7 @@ additional_no_progress = 1
 remaining = { total_tokens = 50000, llm_requests = 8 }
 ~~~
 
-该 `[continuation]` 表用于带 `--session-root` 的 legacy 会话；新共同任务使用[原生续额参数](CLI_REFERENCE_zh.md#原生任务恢复)。`remaining` 设置后续可用额度，历史费用和未知费用仍保留。`additional_attempts` 与 `additional_no_progress` 增加对应上限，不清零计数。
-
-必须提供稳定的授权 ID 和原因。相同 ID 与条款只用于补完中断的授权，不会补回已经消耗的额度；改变条款需使用新 ID。不要直接修改账本。
-
-单独授权不会重启已完成任务，也不会自动执行报告刷新。后续刷新所需的写作、装配和审计仍计入尝试额度，失败尝试另计。仅刷新报告不需要增加进程额度；若后续需要执行，应在创建任务时声明相应进程预算维度。
-
-## 加载规则
-
-`code-task init --config` 读取初始化设置，`execute --config` 读取执行、模型和预算设置；`research-session --code-task-config` 复用同一解析器。明确 CLI 参数优先于文件设置。
-
-CodeTask 相对路径从命令工作目录解析。源码、任务、输出、解释器、benchmark 命令、基线文件和 `required_paths` 可用 `{config_dir}` 引用配置文件所在目录。不要使用资源环境变量插值；命令中含空格的路径须正确引用。`required_paths` 只检查路径是否存在。
-
-注意：多数 CodeTask 分区仍会忽略未知键，拼写错误可能不生效；`workspace` 和 `ablation` 会拒绝额外字段，旧阶段选择也会报错。预算分区接受其支持的覆盖设置。
-
-当前公开解析器不读取旧的 `implementation.max_repair_attempts`，请使用 `execute.repair_rounds`。旧外层流水线配置仅用于理解历史记录。
-
-## CodeTask TOML 字段参考
-
-以下表格按 TOML 分区列出字段。选择解释器不会安装依赖。外部代理生成的文件仍须经过正常审阅、静态验证、运行和结果检查。
-
-| 分区 | 字段 | 作用与默认值 |
-| --- | --- | --- |
-| `[code_task]` | `kind`、`code_root`、`task_file`、`output_root`、`name` | 默认修改已有项目（`existing_project`），须提供源项目和任务文件。输出根目录默认为 `runs`，名称后缀可省略。`greenfield` 必须有任务文件，可选提供脚手架，生成项目位于 `workspace/generated_project`。 |
-| `[code_task]` / `[safety]` | `max_file_bytes` | 限制 copy/sparse 模式复制的单文件大小，默认 2,000,000 字节。code_task 的设置优先于 safety；`0` 表示关闭该限制。 |
-| `[benchmark]` | `command`、`timeout`、`primary_metric`、`metric_directions` | 指定工作区内运行的命令字符串、可选时限、主指标和方向表。 |
-| `[metrics]` | `primary`、`primary_metric`、`directions`、`metric_directions` | 保留兼容字段。benchmark 的主指标优先；方向表依次合并，后面的表和明确 CLI 参数覆盖前面的值。 |
-| `[environment]` | `mode`、`python`、`python_executable`、`required_paths` | `current` 使用当前解释器；`external` 必须指定 Python，`python` 优先于其别名。只替换命令开头的裸 Python，其余 argv 保留。required_paths 默认为空，只检查声明的路径是否存在。 |
-| `[workspace]` | `mode`、`include`、`exclude`、`reuse_source_venv` | 已有项目默认 auto，greenfield 默认 empty。include/exclude 指定稀疏复制规则；reuse_source_venv 默认 false，启用后可使用检测到的源项目虚拟环境解释器。 |
-| `[edit_scope]` | `allowed_patterns`、`protected_patterns`、`mode` | 分别指定允许编辑的 glob、额外只读 glob 和记录标签。标签本身不授予权限。 |
-| `[safety]` | `validation_max_file_bytes` | 静态扫描默认最多读取单文件 500,000 字节，execute 的对应设置优先。 |
-| `[implementation]` | `provider`、`agent_mode`、`allow_external_agent` | provider 默认 local，还支持 fake、local_llm、codex、claude_code、opencode、external_cli。支持 model 和 handoff；delegated_workspace 会明确失败。外部启动必须明确授权。 |
-| `[implementation]` | `agent_model`、`agent_binary`、`agent_args`、`agent_timeout_sec` | 可选的模型、程序和参数；时限默认 600 秒。模型留空时使用外部 CLI/账号默认值。 |
-| `[resource]` | `max_runtime_sec`、`max_files`、`max_generated_lines`、`max_memory_mb`、`allow_gpu` | 提供规划和代理交接时的资源声明。运行时限、文件数和行数还供 execute 回退使用；这些字段不提供操作系统隔离，也不安装依赖。 |
-
-静态检查遵守 Python 源码编码。若文件已确认与冻结 Git 提交的字节一致，其已有语法缺陷在非 strict 模式下保留为警告；新建或改坏的文件，以及无法核实的基线，仍作为错误。
-
-### Execute 与 Budget 字段
-
-| 分区 | 字段 | 作用与默认值 |
-| --- | --- | --- |
-| `[execute]` | `to_step`、`use_llm` | 默认最多推进到 run，并启用模型。可选停止点见 [CLI](CLI_REFERENCE_zh.md)。 |
-| `[execute]` | `model` | 通用模型选择，依次回退到 models.code_task.default、models.default、llm.model。 |
-| `[llm]` | `enabled`、`model` | 保留兼容默认值；execute 的明确设置优先。 |
-| `[models.code_task]` | `planner`、`writer`、`reviewer`、`editor`、`repair`、`summarizer` | 分别用于规划、greenfield 文件生成、审阅、编辑提案、修复和总结。未明确选择时使用通用连接。 |
-| `[execute]` | `timeout_sec`、`timeout` | 优先使用 timeout_sec，其次是 timeout 别名、benchmark.timeout、resource.max_runtime_sec，最后默认为 60 秒。 |
-| `[execute]` | `skip_validation`、`strict_validation`、`validation_max_file_bytes` | 两个开关默认 false，静态扫描单文件上限默认 500,000 字节。 |
-| `[execute]` | `stream_benchmark_output` | 默认 off/false；line 转发换行日志，auto/true 同时处理回车进度，summary 只显示结束后的尾部。 |
-| `[execute]` | `baseline_policy`、`baseline_metrics_file` | 默认 auto。run 强制基线，skip 跳过，none 表示无比较，provided 记录用户提供值并标明不是本次复测。 |
-| `[execute]` | `apply_proposed_edits`、`allow_large_edits`、`allow_planning_fallback` | 默认 false；分别允许应用已审提案、较大编辑、符合条件的离线回退。 |
-| `[execute]` | `planning_mode`、`planning_review_rounds` | 默认 compact 和 0。tool_agent 是弃用别名；旧审阅轮数不会授予调用。 |
-| `[execute]` | `llm_retry_attempts`、`repair_rounds` | 完整响应纠正默认最多 3 次（含首次），技术修复默认 0 轮；运输重试另由连接配置控制。 |
-| `[execute]` | `max_files`、`max_source_chars_per_file`、`max_generated_lines` | 默认 8、4,000、1,600；文件数和行数可回退到 resource 设置。完整规划超限会失败，不丢弃模块，也不据新上限重建旧计划。 |
-| `[execute.ablation]` | `review_gate` | 默认 strict；runtime 只阻塞安全和直接可执行问题，允许保留包装或报告缺口。 |
-| `[execute]` | `budget_profile`、`max_batches`、`cost_cap_usd` | 覆盖 budget 分区的对应设置。 |
-| `[budget]` | `profile`、`max_batches`、`cost_cap_usd` | 默认 normal 编辑预算；可设置批次数量和有费用估计时的成本上限。 |
-| `[budget]`、`[budget.normal]`、`[budget.large]` | `max_files`、`max_edits`、`max_old_chars`、`max_new_chars`、`max_total_edit_chars`、`max_proposal_chars` | 限制提案的文件数、替换数、单次旧/新字符数、总编辑字符数和序列化大小。所选 profile 表覆盖顶层数值。 |
-
-Normal 默认最多修改四个允许文件，总编辑字符数为 12,000。Large 必须明确批准，且仍受绝对上限约束；单源码块上限为 32,000 字符。Provided 指标 JSON 可使用平数值映射，或 metrics、metric_values 包装。命令运行成功不等于目标改善。
-
-#### 规划失败与修复
-
-完整但格式不符合要求的已知响应，可以在限额内纠正或明确回退。提供方故障、预算耗尽、超时、未完成流和未核清操作不会被替换成离线成功。离线 greenfield 使用四文件开发骨架，不按关键词猜任务模块；未实现前报错，不生成测量值，文件上限小于四时拒绝该骨架。模型规划按实际任务选择结构，文件与行数上限不是填充配额。已保存计划保留原文件，不重建。
-
-技术修复需要审阅，并沿用已接受的协议和进程限额；不授权方法变更、种子扩展或配对修订。复用修复结果先核对绑定输入和当前项目字节，保留快照及回滚能力。中断候选不会盲目重放。
-
-#### 历史规划
-
-方法迁移保留旧阶段、失败、摘要和账本；退役阶段的模型路由会被拒绝。已生成项目及导入的不可变已接受规划跳过重新规划。
-
-<a id="workspace-mode-variants"></a>
-
-`research-session --code-task-config` 保留配置的文件大小帽、稀疏 include/exclude 和源 venv 选择。声明的项目数据仍只支持 copy/worktree，稀疏模式不能绕过保护；源 venv 复用不能与托管任务环境准备同时使用。准备后的校验、测量及恢复沿用实际选中的解释器。候选修订复制已接受源码并保留该解释器；从 baseline 重做则重新应用原导入策略。若文件帽会使候选源码丢失，准备会停止，不会静默丢改动。
-
-CodeTask 源码索引跳过符号链接及 Windows 重解析项。旧回执若曾绑定链接目标，需要明确检查，不会为凑出相同快照而重新读取目标。工作区隔离不等于操作系统沙箱。
-
-## 工作区模式
-
-### `auto`
-
-这是已有项目的默认模式。可行时创建 detached Git worktree，否则使用受保护的复制，并记录原因。研究准备遇到未提交源码时使用 copy；仓库中的子目录项目使用 worktree 中对应的子目录。
-
-### `copy`
-
-复制符合规则的当前工作树文件，可以包含未提交源码。排除规则和大小限制可能造成遗漏，应检查准备记录。
-
-### `git_worktree`
-
-使用已提交的 HEAD 创建 detached worktree。源项目须在至少有一次提交的本地 Git 仓库中，不要求远程仓库。显式选择后若无法创建就失败，不降级为 copy，也不包含未提交源码。
-
-### `sparse_copy`
-
-独立 CodeTask 按 include/exclude 规则复制，同时排除 Git、虚拟环境、runs、缓存、构建、数据、模型和私密路径。此模式可能遗漏运行依赖。
-
-研究准备支持 auto、copy、git_worktree 和 sparse_copy；声明的项目数据不能通过 sparse_copy 绕过复制保护。Greenfield TOML 默认 empty；采用 copy/sparse_copy 脚手架模式必须提供 code_root。CLI 的 `--workspace-mode` 不接受 empty。
+此表用于带 `--session-root` 的保存会话；新共同任务使用[原生续额参数](CLI_REFERENCE_zh.md#原生任务恢复)。`remaining` 设置后续容量，`additional_attempts` 与 `additional_no_progress` 增加上限但不清零用量。须提供稳定 ID 和原因：相同 ID 与条款只补完中断的授权，不补回已消耗额度；改变条款需新 ID。单独授权不会重启已完成任务或刷新报告；若后续需要执行，应在创建时声明进程预算维度。
 
 ## 独立 Code-Task Config
 
@@ -521,23 +414,92 @@ Greenfield 设置 kind="greenfield"。没有脚手架时省略 code_root，并�
 
 外部 handoff 选择受支持的 provider，设置 agent_mode="handoff" 和 allow_external_agent=true。候选文件仍须经过正常审阅、验证及 benchmark。
 
-## 在研究会话中使用 CodeTask
+## 加载规则
 
-通过 `execution.code_task_config` 或 `--code-task-config` 引用同一文件。CodeTask 负责编辑和验证，研究应用负责测量和报告。复现 adapter 是明确允许同时声明独立正式命令的例外。
+`code-task init --config` 读取初始化设置，`execute --config` 读取执行、模型和预算设置；`research-session --code-task-config` 复用同一解析器。明确 CLI 参数优先于文件设置。
 
-精确代码、准备、比较及报告/反馈共用原生任务。环境只准备一次；默认进程额度包含准备和修复，显式限制包括零始终优先。来源、简报及代码产出可组合，不必虚构科学设计；确需设计时，实施消费已接受原件，批准绑定当前源码与证据，接受设计不授予进程权限。原生任务沿simple-ar start --resume-task SESSION继续，需要Chat连接。显式旧运行采用API保留原合同，新CLI任务不回退这些API。Worktree批准尚不能绑定checkout过滤、attributes、子模块或换行转换，需要时明确选copy或保留专家协议。
+CodeTask 相对路径从命令工作目录解析。源码、任务、输出、解释器、benchmark 命令、基线文件和 `required_paths` 可用 `{config_dir}` 引用配置文件所在目录。不要使用资源环境变量插值；命令中含空格的路径须正确引用。`required_paths` 只检查路径是否存在。
 
-要求 report 时，写作直接消费已接受的实施证据及真实修订关系，由原写作模块执行保存的整稿/分节、adaptive 规划、审阅及有界修订要求；必需标题顺序和引文上限仍是硬约束。完成交付同时要求已验证代码和当前规范稿，反馈后也不能拿旧稿充数。任务 max_output_tokens 在专业路由后保留，不修改命名连接；明确的逐次上限（包括 max_section_tokens）优先。缺少报告修订或仍有必需解决的意见时保持 partial，不当作完成。
+注意：多数 CodeTask 分区仍会忽略未知键，拼写错误可能不生效；`workspace` 和 `ablation` 会拒绝额外字段，旧阶段选择也会报错。预算分区接受其支持的覆盖设置。
 
-新的原生专业报告只渲染明确图形计划，不把图数上限或章节标题当成猜图依据；已提供的作者图形仍可使用。历史装配保留原先保存的渲染策略。
+当前公开解析器不读取旧的 `implementation.max_repair_attempts`，请使用 `execute.repair_rounds`。旧外层流水线配置仅用于理解历史记录。
 
-明确的 greenfield 编辑范围和预算在完整候选发布前检查，涵盖补出的入口文件及 agent 接收成果。拒绝的候选不替换旧项目。原生反馈修改已接受的项目并保留其生成/API/运行产物合同，不重新生成架构，也不靠切换任务 kind 跳过整项目检查。纯技术精确任务不强造默认 score；科学结果合同不变。
+## CodeTask TOML 字段参考
 
-数值编辑预算覆盖也适用于研究执行与恢复，但不能绕过保护路径或绝对上限。
+### Code-Task 字段
 
-## Execute 与 Budget
+以下表格按 TOML 分区列出字段。选择解释器不会安装依赖。外部代理生成的文件仍须经过正常审阅、静态验证、运行和结果检查。
 
-具体设置见[字段表](#execute-与-budget-字段)。连接重试、研究额度、进程限制、编辑大小和纠正轮数分别控制不同边界，不会互相清零用量。
+| 分区 | 字段 | 作用与默认值 |
+| --- | --- | --- |
+| `[code_task]` | `kind`、`code_root`、`task_file`、`output_root`、`name` | 默认修改已有项目（`existing_project`），须提供源项目和任务文件。输出根目录默认为 `runs`，名称后缀可省略。`greenfield` 必须有任务文件，可选提供脚手架，生成项目位于 `workspace/generated_project`。 |
+| `[code_task]` / `[safety]` | `max_file_bytes` | 限制 copy/sparse 模式复制的单文件大小，默认 2,000,000 字节。code_task 的设置优先于 safety；`0` 表示关闭该限制。 |
+| `[benchmark]` | `command`、`timeout`、`primary_metric`、`metric_directions` | 指定工作区内运行的命令字符串、可选时限、主指标和方向表。 |
+| `[metrics]` | `primary`、`primary_metric`、`directions`、`metric_directions` | 保留兼容字段。benchmark 的主指标优先；方向表依次合并，后面的表和明确 CLI 参数覆盖前面的值。 |
+| `[environment]` | `mode`、`python`、`python_executable`、`required_paths` | `current` 使用当前解释器；`external` 必须指定 Python，`python` 优先于其别名。只替换命令开头的裸 Python，其余 argv 保留。required_paths 默认为空，只检查声明的路径是否存在。 |
+| `[workspace]` | `mode`、`include`、`exclude`、`reuse_source_venv` | 已有项目默认 auto，greenfield 默认 empty。include/exclude 指定稀疏复制规则；reuse_source_venv 默认 false，启用后可使用检测到的源项目虚拟环境解释器。 |
+| `[edit_scope]` | `allowed_patterns`、`protected_patterns`、`mode` | 分别指定允许编辑的 glob、额外只读 glob 和记录标签。标签本身不授予权限。 |
+| `[safety]` | `validation_max_file_bytes` | 静态扫描默认最多读取单文件 500,000 字节，execute 的对应设置优先。 |
+| `[implementation]` | `provider`、`agent_mode`、`allow_external_agent` | provider 默认 local，还支持 fake、local_llm、codex、claude_code、opencode、external_cli。支持 model 和 handoff；delegated_workspace 会明确失败。外部启动必须明确授权。 |
+| `[implementation]` | `agent_model`、`agent_binary`、`agent_args`、`agent_timeout_sec` | 可选的模型、程序和参数；时限默认 600 秒。模型留空时使用外部 CLI/账号默认值。 |
+| `[resource]` | `max_runtime_sec`、`max_files`、`max_generated_lines`、`max_memory_mb`、`allow_gpu` | 提供规划和代理交接时的资源声明。运行时限、文件数和行数还供 execute 回退使用；这些字段不提供操作系统隔离，也不安装依赖。 |
+
+静态检查遵守 Python 源码编码。若文件已确认与冻结 Git 提交的字节一致，其已有语法缺陷在非 strict 模式下保留为警告；新建或改坏的文件，以及无法核实的基线，仍作为错误。
+
+<a id="execute-与-budget"></a>
+
+### Execute 与 Budget 字段
+
+| 分区 | 字段 | 作用与默认值 |
+| --- | --- | --- |
+| `[execute]` | `to_step`、`use_llm` | 默认最多推进到 run，并启用模型。可选停止点见 [CLI](CLI_REFERENCE_zh.md)。 |
+| `[execute]` | `model` | 通用模型选择，依次回退到 models.code_task.default、models.default、llm.model。 |
+| `[llm]` | `enabled`、`model` | 保留兼容默认值；execute 的明确设置优先。 |
+| `[models.code_task]` | `planner`、`writer`、`reviewer`、`editor`、`repair`、`summarizer` | 分别用于规划、greenfield 文件生成、审阅、编辑提案、修复和总结。未明确选择时使用通用连接。 |
+| `[execute]` | `timeout_sec`、`timeout` | 优先使用 timeout_sec，其次是 timeout 别名、benchmark.timeout、resource.max_runtime_sec，最后默认为 60 秒。 |
+| `[execute]` | `skip_validation`、`strict_validation`、`validation_max_file_bytes` | 两个开关默认 false，静态扫描单文件上限默认 500,000 字节。 |
+| `[execute]` | `stream_benchmark_output` | 默认 off/false；line 转发换行日志，auto/true 同时处理回车进度，summary 只显示结束后的尾部。 |
+| `[execute]` | `baseline_policy`、`baseline_metrics_file` | 默认 auto。run 强制基线，skip 跳过，none 表示无比较，provided 记录用户提供值并标明不是本次复测。 |
+| `[execute]` | `apply_proposed_edits`、`allow_large_edits`、`allow_planning_fallback` | 默认 false；分别允许应用已审提案、较大编辑、符合条件的离线回退。 |
+| `[execute]` | `planning_mode`、`planning_review_rounds` | 默认 compact 和 0。tool_agent 是弃用别名；旧审阅轮数不会授予调用。 |
+| `[execute]` | `llm_retry_attempts`、`repair_rounds` | 完整响应纠正默认最多 3 次（含首次），技术修复默认 0 轮；运输重试另由连接配置控制。 |
+| `[execute]` | `max_files`、`max_source_chars_per_file`、`max_generated_lines` | 默认 8、4,000、1,600；文件数和行数可回退到 resource 设置。完整规划超限会失败，不丢弃模块，也不据新上限重建旧计划。 |
+| `[execute.ablation]` | `review_gate` | 默认 strict；runtime 只阻塞安全和直接可执行问题，允许保留包装或报告缺口。 |
+| `[execute]` | `budget_profile`、`max_batches`、`cost_cap_usd` | 覆盖 budget 分区的对应设置。 |
+| `[budget]` | `profile`、`max_batches`、`cost_cap_usd` | 默认 normal 编辑预算；可设置批次数量和有费用估计时的成本上限。 |
+| `[budget]`、`[budget.normal]`、`[budget.large]` | `max_files`、`max_edits`、`max_old_chars`、`max_new_chars`、`max_total_edit_chars`、`max_proposal_chars` | 限制提案的文件数、替换数、单次旧/新字符数、总编辑字符数和序列化大小。所选 profile 表覆盖顶层数值。 |
+
+连接重试、研究额度、进程限制、编辑大小和纠正轮数各自独立。Normal 默认最多修改四个允许文件，总编辑字符数为 12,000。Large 必须明确批准，且仍受绝对上限约束；单源码块上限为 32,000 字符。Provided 指标 JSON 可使用平数值映射，或 metrics、metric_values 包装。命令运行成功不等于目标改善。
+
+#### 规划失败与修复
+
+完整但格式错误的规划响应可以在限额内纠正或明确回退；提供方故障和不完整响应不能这样处理。离线 greenfield 回退是四文件开发骨架，不是完成的实现。技术修复需要审阅，并遵守已接受的协议、范围和进程额度。
+
+#### 历史规划
+
+保存的已接受计划保留文件与用量。退役阶段路由会被拒绝；生成项目和导入的已接受计划不重新规划。
+
+## 工作区模式
+
+研究准备保留配置的复制上限、稀疏规则和源 venv 策略。源 venv 复用不能与托管任务环境组合。源码清单跳过符号链接和 Windows reparse 条目；工作区隔离不是 OS 沙箱。
+
+### `auto`
+
+这是已有项目的默认模式。可行时创建 detached Git worktree，否则使用受保护的复制，并记录原因。研究准备遇到未提交源码时使用 copy；仓库中的子目录项目使用 worktree 中对应的子目录。
+
+### `copy`
+
+复制符合规则的当前工作树文件，可以包含未提交源码。排除规则和大小限制可能造成遗漏，应检查准备记录。
+
+### `git_worktree`
+
+使用已提交的 HEAD 创建 detached worktree。源项目须在至少有一次提交的本地 Git 仓库中，不要求远程仓库。显式选择后若无法创建就失败，不降级为 copy，也不包含未提交源码。
+
+### `sparse_copy`
+
+独立 CodeTask 按 include/exclude 规则复制，同时排除 Git、虚拟环境、runs、缓存、构建、数据、模型和私密路径。此模式可能遗漏运行依赖。
+
+研究准备支持 auto、copy、git_worktree 和 sparse_copy；声明的项目数据不能通过 sparse_copy 绕过复制保护。Greenfield TOML 默认 empty；采用 copy/sparse_copy 脚手架模式必须提供 code_root。CLI 的 `--workspace-mode` 不接受 empty。
 
 <a id="edit-scope-behavior"></a>
 
@@ -548,6 +510,56 @@ Greenfield 设置 kind="greenfield"。没有脚手架时省略 code_root，并�
 测试、benchmark、`.env`、秘密和凭据路径的内置保护始终保留。用户设置的 `protected_patterns` 追加保护，不替换默认规则。工作计划或当前批次的目标文件还会进一步缩小可编辑范围。
 
 上下文选择、规划、编辑提案和修复均遵守范围。应用提案前再次检查工作区路径、范围、唯一精确的旧文本匹配和预算。空 `old` 只用于创建尚不存在且允许的文件，不能覆盖已有文件；新建文件沿用快照和失败回滚机制。
+
+## 在研究会话中使用 CodeTask
+
+使用 `execution.code_task_config` 或 `--code-task-config` 引用 CodeTask 文件。CodeTask 负责编辑和验证，研究负责测量和报告；复现 adapter 还可声明独立测量命令。明确编辑上限在研究和恢复中仍生效。
+
+准备、实施和测量共用任务权限与进程限制。要求报告时，须使用已接受的实施证据和当前稿件。Greenfield 范围和预算适用于完整候选。涉及 checkout 过滤、attributes、子模块或换行转换时，请选择 `copy` 或保留专家 worktree 协议。
+
+## 可信本地扩展
+
+只选择可信包。V1 支持说明包和声明 `read_only` 或 `plan` 的 Python 工具；
+Python 拥有宿主进程的操作系统权限，没有 OS 沙箱。
+
+```toml
+[task]
+extensions = ["../my-skill"]
+```
+
+在原生任务 TOML 中设置，使用 `simple-ar start --task-config path/to/task.toml`。
+每项是包含 `extension.toml` 的包目录或描述文件，相对任务配置解析。
+必须明确选择，不会自动发现、下载或安装。可只提供说明，也可只提供工具。
+
+| 作者声明 | 含义 |
+| --- | --- |
+| `[extension]` `id`、`version`、`description`、`scope` | 必填非空元数据；ID 是唯一命名空间，匹配 `[a-z][a-z0-9_]{0,23}`。 |
+| `instructions`、`resources` | 可选的包内说明文件与辅助文件列表；文件必须位于包内。 |
+| `[[tools]]` `name`、`description` | 必填工具名和描述；名称遵循 ID 格式，公开名称为 `id__name`，`instructions` 保留。 |
+| `implementation`、`function` | 明确独立 `.py` 文件和 Python 函数标识符；不支持包相对导入。 |
+| `permission_level` | `read_only` 或 `plan`；作者须保证工具确定且无副作用。 |
+| `input_schema` | 必填对象 schema，按 JSON Schema Draft 2020-12 校验；支持本地 `$defs`/`$ref`，禁止远程和 `file:` 引用获取。 |
+| `completion` | 可选 `{ kind = "delivery", field = "handoff", closing = true }`；见下文。 |
+
+工具实现 `function(arguments, services) -> dict`，返回 JSON 对象。
+`services["call_tool"](name, arguments)` 提供受宿主策略检查的授权挂载读取／计划操作，
+不授予任意写入、进程、密钥或网络服务。Python 本身仍可凭宿主权限直接读写文件、
+启动进程或联网。说明正文只在调用 `id__instructions` 时进入上下文；加载工具 schema
+不会同时加载正文。
+
+可选 `completion` 的 `kind` 默认 `delivery`，`field` 默认空。非空字段须出现在输入
+schema 中并包含交付对象（`summary`，可选 `artifacts` 和 `unresolved`），结果在同一键返回。
+字段为空时，整个参数和结果就是该对象。`kind="question"` 使用整个
+`{question = "..."}` 对象。`closing=true` 仅允许已可见且无需后续模型工作的工具
+用于最后一次决定，不授予权限或额度。
+
+续接和执行要求原描述文件、代码、说明与声明的资源保持原路径和哈希；文件缺失或
+变更会阻止使用，须恢复原包。未声明的依赖不在身份检查范围内；模块全局变量
+不会跨续接持久保存。
+
+参见示例[描述文件](../examples/local_extension/extension.toml)、
+[说明](../examples/local_extension/SKILL.md)和 [Python 工具](../examples/local_extension/notes.py)；
+加载细节见 [`extensions.py`](../src/simple_ar/tools/extensions.py)。
 
 ## Python 创建任务
 
@@ -590,62 +602,40 @@ app = create_research_task(ResearchBrief(request_text="测量所提供的程序�
 
 ### 原生控制与兼容性
 
-以下控制描述当前开发实现。已有任务沿用保存的合同，创建默认值不会迁移旧会话。
+保存任务沿用其控制设置。以下设置用于 Python 集成：
 
 | API 设置 | 行为 |
 | --- | --- |
-| `delivery_files=["**/*.md", "**/*.pdf"]` | 无保留的完成交付须有非空工作区输出。相对模式只查存在，不认证质量，来源 PDF 不算输出；要求须明确声明，不从文字推导，仍可明确交付部分成果。 |
-| `tool_contracts="on_demand"`（创建默认） | 先提供共同文件、执行与协调工具及能力目录；调研、分析、图像检查、出版等可选专业契约按需通过 `load_tools` 加载。调用方冻结的代码、分析、测量合同直接呈现其必要负责人。加载只改变呈现，不授予权限。显式 `full` 提供全部已允许契约；保存的 `outcomes` 及历史模式保留原选择策略。 |
-| `context_protocol="auto"`（创建默认） | 新操作任务保存 `working.v4`：要求、近期完整操作、工作负责人笔记、原始观察及回执导航共用一个输入预算。专业负责人定位相关原文和历史执行诊断，明确原文先于可选导航准入；未引用、不可用、过期和容量不足分别标明。导航与诊断不成为当前权限或事实，不增加后台摘要或记忆存储。省略 `update_work_plan.notes` 时跨反馈保留笔记，`[]` 清空。保存的旧上下文合同保留原选材语义。 |
-| `context_protocol="working.v1"`（兼容） | 保持原来的有预算自动摘要、观察选择及恢复行为。保存任务、摘要失败和费用不迁移、不重置。 |
-| `context_protocol="conversation.v1"`（保存／兼容任务） | 保留时间顺序投影和原始记录，旧任务不静默升级；显式 `None` 保留原legacy投影。工作集目标是软限制，实际共享token额度仍受约束。 |
-| `control_protocol="operations.v1"`（新任务） | 普通 `start`、结构化入口与 `ToolApplication.create` 在同一行动循环中组合读写、执行、检查与出版。新建拒绝 `None` 及旧专业控制选项；历史任务通过 `load`、`supply` 沿原合同继续。 |
-| `completion_policy="available_operations.v1"`（新操作任务） | 在实际资源与审批限制内保留可用操作，最后一次可负担决策也能留下有用的中间工作。耗尽暂停并保留成果；只有显式且校验通过的交付才算完成。保存任务保留原末次／保护决策策略。 |
-| `report={"status":"canonical","manuscript":"report.md","formats":["markdown","pdf"]}` | 交付声明可编辑正文及所需格式。新任务绑定 `delivery_review_protocol=task.v1`，由交付操作沿同一账本负责整项请求与实际交付清单的独立核查；窄范围局部检查不能替代。请求的出版物仍须与正文同版。 |
-| 交付中的 `limitations`／`unresolved` | 前者说明研究范围、不确定性或不可得测量；后者说明尚未完成的请求或必改缺陷，并使交付为部分完成。都不能用于虚报质量。 |
-| 交付中的 `summary_source={"path":"report.md","offset_bytes":0,"max_bytes":1024}` | 可选的实际交付文本窗口。最终产出成功后，以原文替换自由 `summary`，来源须在本次交付集合内，并沿原交付哈希核版本；缺失、不可读或无效UTF-8窗口不回退自由摘要。省略保留原自由说明合同；摘录不认证科学正确性或代表全文。 |
-| `create_research_task(..., allow_vision=True)` | 严格布尔值，默认 `False`；须有命名 vision 路由及连接，共用 `services.budget_limits`。文字或注入文本客户端不授权视觉检查；不授予来源联网、图像生成，不改旧权限或返回类型。 |
-| `supply(..., replace_existing=True)` | 调用方可明确替换 `delivery_files`、`tool_contracts` 或 `completion_policy`；无关补齐保留策略及账本。 |
+| `delivery_files=["**/*.md", "**/*.pdf"]` | 明确的相对模式要求完整交付包含非空工作区输出；存在不等于质量。 |
+| `tool_contracts="on_demand"` | 创建默认值。先提供共同工具，通过 `load_tools` 加载可选合同；`full` 显示全部已允许合同。加载不授予权限。 |
+| `context_protocol="auto"` | 创建默认值，新操作任务使用 `working.v4`，共用输入预算。省略 `update_work_plan.notes` 时保留，`[]` 清空。 |
+| `context_protocol="working.v1"`、`"conversation.v1"`、`None` | 兼容选项沿用保存的选材和恢复规则。 |
+| `control_protocol="operations.v1"` | 新任务在一个循环中组合允许的操作；保存任务使用 `load` 和 `supply`。 |
+| `completion_policy="available_operations.v1"` | 在权限和资源限制内保留可用操作；耗尽时保留成果并暂停。 |
+| `report={"status":"canonical","manuscript":"report.md","formats":["markdown","pdf"]}` | 声明可编辑正文与输出格式；`delivery_review_protocol=task.v1` 独立检查当前工作和成果清单，出版物须与正文匹配。 |
+| 交付中的 `limitations`、`unresolved` | 分别记录不确定性和未完成的必需工作；后者使交付为部分完成。 |
+| 交付中的 `summary_source={"path":"report.md","offset_bytes":0,"max_bytes":1024}` | 以交付文件中绑定字节的 UTF-8 窗口作为摘要；来源无效或变化会失败。 |
+| `create_research_task(..., allow_vision=True)` | 默认 `False`；要求命名视觉路由和共享 `services.budget_limits`，不授予图像生成或来源联网。 |
+| `supply(..., replace_existing=True)` | 明确替换 `delivery_files`、`tool_contracts` 或 `completion_policy`；其他补齐保留策略和账本。 |
 
-按任务需要交付：中文 Markdown 说明、源码或表格均可成为最终成果，无须声明正式报告；需要时再请求 PDF／TeX。明确声明正式报告仍须检查当前稿件，请求的出版物须与之同版。这不代表自动选择格式或整项任务成功率已获验证。
-
-新原生任务的稿件可引用其他已授权目录中的本地图，例如 `reports/result.md` 使用 `../outputs/figures/main.svg`。出版沿已有工作区权限绑定实际引用的图片字节，不因此授权整个父目录，也不复制无关文件。已消费的图发生变化，需要重新审批和出版。独立转换与保存的历史审批继续使用原目录范围。
-
-正式稿准备好后可直接提交交付，事先单独调用 `inspect_artifacts` 只是可选帮助。交付核查保留原始要求、反馈、正文、格式及全部交付文件版本；只有范围及支撑依据仍有效时，才复用完整通过的意见。失败与未完成工作保留，新的明确交付可再次请求核查，恢复不会重放在途或失败调用。没有该保存协议的历史任务继续沿原交付检查恢复。只读核查不执行数值复算，也不认证科学正确性。
-
-`inspect_artifacts` 只接收可解码文字目标；不支持的目标在请求模型前拒绝准入，不产生意见。渲染图片使用 `inspect_images`。检查者可在授权目录中自行定位、补读必要来源，沿原账本计费。新 `subjects.v3` 不设私有六轮上限，保留每次响应与实际读取，为最终意见预留容量，可明确说明未完成；无效最终响应只纠正一次。旧协议保持原限制。
-
-其他操作已读过的支撑原文，经原始回执、当前权限、文件版本及字节范围核对后可复用；失败检查的实际读取也可使用，但不继承被拒意见或旧目标的通过结论。原文沿共同输入容量按需供给，复用本身不认证主张。目标变化使原通过失效，未完成复查不能退回旧通过，只改依据也不能抹去现有必改。未知用量停止后续请求。图像检查另行授权并使用命名视觉连接；编译或文字检查不认证视觉与科学正确性。
-
-预算化图像检查须在视觉 profile 中明确配置 `max_output_tokens`，并为推理和实际检查响应共同留出容量；它与文本 profile 分开，文本仍可不设输出上限。参见[模型目录示例](../examples/model-profiles/models.toml)。
-
-冻结的 `report_requirement` 仍要求明确正文、固定章节和引用上限。新任务通过独立操作完成工作，不使用旧 Writer 的起草／审阅调度设置；`target_words` 是写作目标，不是机械认证的最低字数。
-
-工具加载与资源策略不保证完成、科学质量或特定成本。为长报告定额度前，先看[任务预算与证据](EVALUATION_zh.md#v210-开发证据)。
+`inspect_artifacts` 接受可解码文本，图片使用 `inspect_images`。目标变化须重新检查。可跨已授权目录引用本地图；出版绑定图像字节，图像变化须重新批准。冻结的 `report_requirement` 保留正文、提纲和引用限制；`target_words` 是目标。
 
 ### 历史写作合同、输出绑定与保留成果
 
-下表的 `compose_document` 选项用于显式兼容集成和保存的专业任务。新的 `operations.v1` 任务直接编辑正文、检查当前版本并导出，不使用 `report_protocol`、`professional_inputs` 或 `update_work_plan.report_intent`；历史写作仍可沿原账本执行恢复。
+这些选项用于显式兼容集成和保存的专业任务。新 `operations.v1` 任务直接编辑、检查和导出正文，不使用 `report_protocol`、`professional_inputs` 或 `update_work_plan.report_intent`。
 
-| 操作／字段 | 合同 |
+| 操作／字段 | 行为 |
 | --- | --- |
-| 报告写作与交付 | 在正常行动批次理解交付要求，不额外分类调用。使用原材料和实际结果，出版采用的正文及匹配图文；转换已有文章可直接采用当前版本，无须重写。候选仍为部分成果，计划不能降低冻结的写作或执行要求。 |
-| `compose_document.professional_review={"max_revision_rounds":1}` | 独立检查后最多修订一轮，零表示只查不改。新的专业文档工作默认一轮，整稿／分节一致；精确调用及历史任务保留原默认。原生报告义务通过 `update_work_plan.report_intent` 声明审阅设置，继承与冻结设置优先。 |
-| 反馈与图形输入 | 写作模块在选材前取得原始反馈，从实际材料和请求编写图注；图形输入是已有路径，不是协调层代写的权威图注。代码调查也取得相关原始反馈；初稿和反馈共用写作模块、依据检查与预算。 |
-| 整篇纠正 | 精确替换绑定稿件版本；空列表可采用无需改动的有效候选。保留原响应及旧版本，完整旧写作输入可供反馈复用；未解决的必需意见阻止作为已接受稿件出版。 |
-| 完整修订稿续用 | `compose_document.prior_result` 可承接已完整核查、仍未采用的整稿或分节修订，保留确切依据与原负面检查；显式候选不因修订要求换了措辞而退回旧稿。局部修订上限不丢弃已有改善，也不授权自动重试；请求负责人决定下一步，必改意见未解决仍不能认可出版。有证明的语义回交可在不续额时恢复既有暂停；失败或未知操作仍保持停止。 |
-| 附件核查 | 新专业文档工作把完整文件保存与模型核查分开。全文视图共用256,000字节；CSV／TSV／JSON表格可复用已有完整读取器的SHA绑定概况（来源20 MiB上限，概况合计96,000字节）。概况提供计数与有界示例，不代表逐值或科学验证。未读附件保留明确缺口并阻止认可交付，但仍可保存稿件。既有主体／复制上限及历史合同不变。 |
-| `compose_document.adopt_draft=true` | 检查并采用 `prior_draft`，省去起草调用；须已启用整篇写作和独立专业审阅。正文有独立来源回执，不伪造模型响应；`reuse_prior_inputs` 须有完整同任务生产记录，外部稿件不获此权限。冻结控制和精确替换纠正仍适用。 |
-| `run_process.inputs` / `outputs` | 可选文件输入和工作区输出，各最多 64 项，每份绑定最多 64 MiB。审批绑定输入，成功执行记录输出字节；已声明生产结果的输入或输出变化时，写作和出版拒绝复用，须新调用重建。不推测依赖、不覆盖未声明文件、不增权限、不追溯绑定。 |
-| 进程失败／前置校验 | 非零退出或停止返回错误及退出码、日志；非法提案返回专业模块诊断，不执行。历史观察保持不变。 |
-| `app.run()` / `app.result_snapshot()` | 返回 `retained_work`：中间工作区文件、最后操作及继续说明，不代表已验收交付。写作失败可保留候选；检查被拒可在 `incomplete_review.json` 保留逐项有效意见。用原证据创建新修订，未完成检查仍是缺项。 |
+| `compose_document.professional_review={"max_revision_rounds":1}` | 独立检查后最多纠正一轮，零表示只检查。冻结设置优先。 |
+| `compose_document.prior_result` | 以原证据和检查继续已检查但未采用的修订；未解决的必需意见阻止认可出版。 |
+| `compose_document.adopt_draft=true` | 不起草而检查和采用 `prior_draft`；须启用整篇写作与独立专业审阅。`reuse_prior_inputs` 要求完整同任务生产记录。 |
+| `run_process.inputs`、`run_process.outputs` | 可选绑定，各最多 64 项、每项最多 64 MiB。审批绑定输入，成功执行记录输出；绑定变化须重新调用。 |
+| `app.run()`、`app.result_snapshot()` | 提供 `retained_work`，包括中间文件和续接说明；不代表已接受交付。 |
 
-写作在登记规范稿前检查 CommonMark 图片引用，导出保留路径和编译检查。明确分节计划若连每节一次调用都无法承担，会在付费选材前拒绝，但此下限不保证完成。来源、算术和正文检查不认证视觉或科学正确性。
+保存的写作合同继续使用原审阅、证据和预算规则。已有图形、反馈和附件仍是证据输入；检查不认证科学正确性。
 
 ### 可信服务、快照与兼容 API
 
-Services 可注入文本客户端、独立审阅客户端和 `SearchProviderRegistry`。客户端须实现 `with_budget` 及 `ask_json` 或 `chat_turn`，绑定实际账本、会话与 attempt。继续服务工作前用 `ToolApplication.load(path, services=services)` 恢复依赖。持久化只保留类型／模型身份和 provider 名，不保存密钥或可执行对象；缺依赖报错，不回退环境客户端或内置检索器。自定义实现由调用方信任，不是沙箱，也不独立验证身份。跨 CLI／重启优先用命名连接，`model="env"` 选择配置的默认模型。
+Services 可注入文本客户端、独立审阅客户端和 `SearchProviderRegistry`。客户端实现 `with_budget` 及 `ask_json` 或 `chat_turn`；使用 `ToolApplication.load(path, services=services)` 恢复。持久化保存身份，不保存密钥或可执行对象；缺失服务会失败，不自动回退。自定义实现由调用方信任，不是沙箱。
 
-`snapshot_sources=True` 只保留选中的普通文件，逐个受 `max_snapshot_bytes`（默认 16 MiB）限制，以哈希绑定字节，不复制整个目录。旧 v1 导入使用这些副本，保留父任务关系及原件，历史预算记为 `unknown_not_imported`，不导入或清零。新任务沿 `start --resume-task` 继续，原任务仍按自己的合同恢复。
-
-新结构化 CLI 任务使用共同创建 API，不支持的声明在创建前报错。`create_session` / `ResearchApplication.create` 是显式兼容 API，保留原 `view` / `advance` 和历史运行合同。旧运行采用及产生基线的源码血缘须有原记录，目录副本或裸结果不能替代。
+`snapshot_sources=True` 保存选定普通文件及其哈希，每个受 `max_snapshot_bytes`（默认 16 MiB）限制。旧 v1 导入保留父任务关系，历史预算记为 `unknown_not_imported`。`create_session` 和 `ResearchApplication.create` 是兼容 API，沿用保存的 `view` / `advance` 合同。

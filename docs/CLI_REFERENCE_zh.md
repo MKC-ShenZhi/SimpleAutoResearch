@@ -36,6 +36,8 @@ simple-ar start --kind writing --material notes.md --prepare-only
 
 ### 原生任务入口（实验性）
 
+#### 目标与材料
+
 | 参数 | 含义或默认值 |
 | --- | --- |
 | `REQUEST`、`--goal TEXT` | 自然语言目标。 |
@@ -45,6 +47,11 @@ simple-ar start --kind writing --material notes.md --prepare-only
 | `--source PATH` | 可重复提供只读普通文件或目录。 |
 | `--document PATH`、`--material PATH`、`--project PATH`、`--data-path PATH`、`--data-file PATH` | 普通偏好输入会成为带角色声明的只读挂载。 |
 | `--project-python PATH` | 已有进程解释器；不会安装依赖或创建环境。 |
+
+#### 访问与额度
+
+| 参数 | 含义或默认值 |
+| --- | --- |
 | `--allow-network` | 允许公开来源检索和获取，与进程权限分开。 |
 | `--allow-execution` | 允许提出进程命令；每条命令仍须审批。 |
 | `--allow-vision` | 允许将挂载中的 PNG、JPEG 或 WebP 发给配置的 vision 路由。 |
@@ -52,6 +59,11 @@ simple-ar start --kind writing --material notes.md --prepare-only
 | `--max-turns N`、`--max-tokens N` | 保存任务的总额度，默认 30 次模型请求和 600000 token。 |
 | `--prepare-only` | 只保存或预览，不调用模型或执行进程；新原生任务仍会预检连接和凭据。 |
 | `--yes` | 接受展示的任务、访问和资源摘要，不等于命令审批。 |
+
+#### 已保存任务与续接
+
+| 参数 | 含义或默认值 |
+| --- | --- |
 | `--resume-task SESSION` | 恢复保存的原生任务，可同时提供反馈。 |
 | `--tasks-in PATH`、`--select-task` | 只读列出目录及直接子目录中的原生任务；可交互选择，或配合 `--resume-task 精确目录名` 继续。 |
 | `--write-task-config PATH`、`--task-config PATH` | 导出带注释的原生创建配置并退出；编辑后加载，显式命令行值优先。配置不能用于重设已有任务。 |
@@ -80,7 +92,79 @@ simple-ar start --kind data_analysis --scripted --data-file measurements.csv --g
 
 ### 原生任务恢复
 
-无模型的调用方原生任务需要补齐条件时，使用补齐文件，不要借模型重试绕过授权：
+先用 `status` 和 `results` 确认保存边界，再选择对应操作。
+中断后先确认旧工作进程已停止；在途请求、尚未接纳的结果和未知进程副作用须先核对。
+
+#### 恢复与反馈
+
+```bash
+simple-ar status SESSION
+simple-ar results SESSION
+simple-ar start --resume-task SESSION
+simple-ar start --resume-task SESSION "缩短解释，不重新运行"
+simple-ar start --resume-task SESSION --approve-execution TOKEN
+simple-ar start --resume-task SESSION --source notes/ --allow-network --yes
+```
+
+普通恢复沿用保存边界。已完成且没有待办的任务返回终态，不重新执行。
+反馈共用原预算，只取消尚未开始的提案；修改暂停期间的旧交付不代表新请求已完成。
+
+追加来源或网络、进程、视觉权限需要确认。无效追加不改变挂载、权限和账本，
+保存的模型、解释器、工作和预算继续保留。恢复时 `--prepare-only` 只预览，
+不应用访问或资源变更。权限确认与具体命令的精确审批分开。
+
+#### 补充剩余额度
+
+需要可重复的 `--authorize-remaining DIMENSION=AMOUNT`、稳定的
+`--authorization-id ID` 及 `--authorization-reason TEXT`：
+
+```bash
+simple-ar start --resume-task SESSION --authorize-remaining llm_requests=10 --authorize-remaining total_tokens=100000 --authorization-id continuation-1 --authorization-reason "完成保存的目标" --yes
+```
+
+新额度是未来容量，不改写历史总量。只提供 ID 和原因、没有额度项会失败。
+重放同一 ID 不补回已消耗额度；创建参数 `--max-turns`、`--max-tokens` 不能用于恢复续额。
+原费用留在账本。
+
+模型操作确认已结束并进入任务记录后，可显式授权新的剩余额度，历史账单仍可未知。
+当前额度内的未知用量仍阻止继续消耗。
+
+#### 切换已配置连接
+
+在已核对的边界先记录变更，再单独恢复：
+
+```bash
+simple-ar start --resume-task SESSION --switch-model profile:another --switch-id connection-1 --switch-reason "使用另一已配置服务"
+simple-ar start --resume-task SESSION
+```
+
+切换改变文本、代码、写作绑定，不发请求、不重放工具、不追加反馈或额度。
+vision 绑定、交付和账本保留。已关闭的专业调用可继续保留历史未知费用。
+同一切换 ID 只能对应同一意图；重放旧 ID 不撤销后续变更。
+已终止的失败决策使用下面的重试操作。
+
+#### 重试失败的模型决策
+
+```bash
+simple-ar start --resume-task SESSION --retry-model
+simple-ar start --resume-task SESSION --retry-model --model profile:another
+```
+
+重试要求请求已终止失败、没有已接受回复，并沿用保存的有限输出上限和剩余容量。
+只重新决策，不重放工具或整个任务。缓存回复走普通恢复；在途请求、未确认预留、
+无界消耗及待执行工具都会拒绝重试。重试与反馈、权限追加、命令审批分开；
+`--prepare-only` 不重试或修改状态。
+
+仅这种已关闭失败可用 `--model profile:NAME` 或 `route:NAME` 更换 Chat 连接，
+输出上限保持相同。文本、代码、写作绑定与切换记录一起保存，vision 不变。
+替换在同任务内开始新的提供方原生对话；旧回复保留在记录和 `read_history` 中，
+已授权且版本有效的材料可复用，不伪造缺失 reasoning。
+缓存回复不能切换；不带重试却指定不同模型会被拒绝，省略则沿用保存选择。
+
+#### 补齐或修订合同
+
+`--supply-task PATH` 确认 TOML 中给调用方原生任务补充的条件，只记录、不执行工作。
+首次绑定模型的示例：
 
 ```toml
 supply_id = "first-model"
@@ -103,44 +187,20 @@ simple-ar start --resume-task SESSION --supply-task supply.toml --yes
 simple-ar start --resume-task SESSION
 ```
 
-补齐与原生创建共用校验。`changes` 可补 `sources`、`execution_contract`、`code_task`、`research_policy`、`table_analysis`、`report_requirement` 和 `max_output_tokens`；默认只填缺项。修改已有原生合同须在顶层显式写 `replace_existing = true`，使用新 ID 并说明原因。仅替换 `changes` 中列出的字段；替换模式下若包含 `sources`，它是完整的新别名表，而非合并。原记录和费用保留为历史，不冒充新条件下的确认或已完成证据。只改报告时保留有效测量；模型连接变更仍走独立重试合同。
+补齐共用原生创建校验。`changes` 还接受 `sources`、`execution_contract`、`code_task`、
+`research_policy`、`table_analysis`、`report_requirement` 和 `max_output_tokens`。
 
-来源路径相对补齐文件解析；执行 cwd 必须是已存在的绝对目录，argv 不做 shell 展开。需要协议确认的任务在条件变化后须重新确认，实际执行仍需独立精确批准。首次绑定模型必须显式给出正数请求/token 额度；仅续额不会取得模型权限。
+- 默认只填缺项。替换已有合同须在顶层写 `replace_existing = true`，提供新 ID 和原因。
+  仅列出的字段会改变；替换模式中的 `sources` 是完整别名表，不是合并。
+- 来源路径相对补齐文件解析；执行 cwd 须为已有绝对目录，argv 不做 shell 展开。
+  需要确认的协议改变后重新接受，实际执行仍须独立精确批准。
+- 首次绑定模型须提供正数请求和 token 额度；仅续额不授予模型访问。
+  后续模型变更使用独立恢复控制。
+- 原记录和费用保留；只改报告时保留有效测量。旧确认和证据不代表新条件已验收。
 
-相同 ID 与参数重放幂等，也覆盖“已记额度、未完成配置提交”的中断恢复。补齐中断后须完成原补齐操作才能继续；在途/未知操作须先核对。补齐与反馈、重试、独立续额参数及命令审批分开，不修改已保存的 legacy ResearchApplication 协议。
-
-~~~bash
-simple-ar status SESSION
-simple-ar results SESSION
-simple-ar start --resume-task SESSION
-simple-ar start --resume-task SESSION "缩短解释，不重新运行"
-simple-ar start --resume-task SESSION --approve-execution TOKEN
-simple-ar start --resume-task SESSION --source notes/ --allow-network --yes
-simple-ar start --resume-task SESSION --retry-model
-simple-ar start --resume-task SESSION --authorize-remaining llm_requests=10 --authorize-remaining total_tokens=100000 --authorization-id continuation-1 --authorization-reason "完成保存的目标" --yes
-~~~
-
-#### 恢复与反馈
-
-普通恢复沿用保存的边界。已完成且没有待办工作的任务会返回终态，不重新执行。反馈使用原有预算，只取消尚未开始的提案；已经尝试或结果未知的操作必须先完成核对。修改暂停期间保留的旧交付，不代表新请求已经完成。
-
-追加来源或网络、进程、视觉权限需要确认。无效追加不会改变原有挂载、权限和账本。保存的模型、解释器、工作和预算仍然保留。恢复时使用 `--prepare-only` 只预览，不应用访问或资源变更。权限确认与具体命令审批是两件事。
-
-#### 补充剩余额度
-
-新额度是未来可用容量，不是改写历史总量。只提供 ID 和原因、没有额度项会失败。重放同一 ID 不会补回已经消耗的额度；普通 `--max-turns` 和 `--max-tokens` 不能在恢复时增加资源。
-
-原费用继续保留在账本。模型操作确认已结束并进入任务记录后，可以显式授权新的剩余额度，历史账单仍可保持未知。当前额度内的未知用量仍会阻止继续消耗；在途请求、尚未接纳的结果和未确认的进程副作用必须先核对。
-
-在已核对的边界，`--switch-model profile:NAME --switch-id ID --switch-reason TEXT` 只记录文本、代码和写作连接的变更，不发请求、不追加反馈或额度。已关闭的专业模型调用同样支持切换，不要求把其历史未知费用改成已知。vision 绑定保持不变；之后再普通恢复，不会重放中断工具。
-
-#### 重试失败的模型决策
-
-`--retry-model` 只允许在一次请求已终止失败、且没有已接受回复时，使用保存的有限输出上限和剩余容量重新决策。它不会重放工具或整个任务。已有缓存回复使用普通恢复；在途请求、未确认预留、无界消耗或待执行工具都会拒绝重试。重试必须与反馈、权限追加和命令审批分开使用。
-
-仅在这种已关闭失败中，可以加 `--model profile:NAME` 或 `route:NAME`，记录新的 Chat 连接。替代连接必须使用相同的有限输出上限。文本、代码和写作绑定与切换记录一起保存，vision 绑定不变。
-
-替换连接会在原任务内开始新的提供方原生对话；旧回复仍保留在原历史及 `read_history`，已授权且版本核对有效的材料仍可续用，不伪造缺失的 reasoning。缓存回复不能切换连接。不带重试却指定不同模型会被拒绝；省略模型会沿用保存的选择。`--prepare-only` 不会执行重试或修改状态。
+相同 ID 与参数重放幂等，也覆盖已记额度、尚未完成配置提交的中断。
+须先完成原补齐才能继续其他工作。补齐与反馈、重试、独立续额和命令审批分开，
+不修改保存的 legacy ResearchApplication 协议。
 
 ### 结构化兼容入口
 
@@ -244,8 +304,6 @@ simple-ar start --from-session SESSION --reuse code_project --goal "修改实现
 
 经过校验的单命令复现项目可结合 `--kind reproduction`、`--document` 和目标，重复保存的协议、解释器和输出选择器，但仍须确认执行。科研复现及显式技术控制继续遵循结构化合同；配对或扩展协议应在原会话恢复。
 
-明确的单候选复现若有CodeTask、独立声明且不同于正式测量的validator，以及平直正式命令，现使用共同任务，可同时冻结报告要求。验证、正式指标/协议及实际候选分别绑定；项目内绝对路径投射到隔离候选，外部输入与选定解释器保持身份。只改报告不重测；已交付且兼容的单命令成果可通过`--reuse code_project --kind reproduction`继续使用，不导入旧账本。环境安装、baseline/pairs、初始适配文件及其他扩展控制仍用原支持路径。这是专家合同承接，不是把普通开放任务缩成固定流程。
-
 `--kind survey` 加 `--reuse report` 会使用原始来源包，排除草稿和派生产物，并默认在线搜索。不同文本版本不合并，来源仍须重新检查相关性。成果复用不是中断执行恢复。
 
 ## 概念图
@@ -313,18 +371,6 @@ simple-ar research-session --config research.toml --session-root SESSION --model
 
 数据参数与前面的表格共用。全文授权、网页提取、配对协议、输出附件和环境准备通过[研究 TOML](CONFIG_REFERENCE_zh.md#研究-toml分区与默认值) 配置，不应编造对应 CLI 参数。
 
-没有CodeTask的`measurement`新建，支持通过共同任务执行平直单命令或明确的baseline-run比较（pairs，或带声明seed_flag的紧凑种子配置）。每条字面条件只授权初始一次，保留原cwd、argv和继承环境；明确的任务venv配置另绑定实际解释器。协议只有seeds、没有argv绑定时仍是内部批处理，不增加进程。完整声明不能被静默缩减或换配；完成交付要求实际条件及对应确定性分析，缺测、失败或条件不可比须明确保留。
-
-普通 CodeTask benchmark 即使 validator 与正式 argv 相同也可迁共同 owner，但仍须独立物理调用和记账，校验结果不算测量；严格 reproduction 仍要求不同命令。声明条件可附带必需新 Python 文件和一次 current/venv 准备，不必更换任务类别；精确范围及来源检查保留。默认预算含准备步骤，显式限制不改；venv 的 Python 别名交准备 owner 选择真实解释器。greenfield `copy`/`sparse_copy` 有真实 source 项目时可测源码 baseline，条件显式标记 `source="preparation"`、`before_implementation=true`：先 prepare，完成全部声明基线，再调用 `implement(prepared_result)` 并传实际成功基线事实。失败或缺测阻止生成。empty/无source项目不能虚构未改源码基线，须提供真实源码或已核外部测量证据。
-
-精确argv明确选中的外部已有文件沿单文件只读来源传递，并在批准时绑定hash，也支持`--option=FILE`。不会挂载其父目录或推断目录授权，数据/材料目录须显式提供。域摘要缺失时，只在产物和候选核验后复用完整已存观察，不重跑模型或校验器。
-
-有模型时，解释和后续工具共用原任务/账本，需要Chat连接及有限请求/token额度。无模型可完成调用方已声明测量和确定性分析，但缺少模型、设计或报告的工作仍待续。沿打印的start --resume-task恢复，未知操作不重放。
-
-测量加写作可用`--task-kind measurement --outputs experiments report --model SELECTOR`及既有报告选项。不要求先修改代码：Writer消费真实测量和对应确定性分析；参考材料沿local-document/material输入。反馈要求新的规范写作回执，原结果、稿件与账本保留，不重跑测量。缺分析或旧稿不能算完整报告交付。
-
-测量可带`execution.environment`：当前环境检查，或任务venv、声明的依赖/项目安装及短检查。冻结多条件共享一个真实attempt的准备回执，要求相同cwd/profile及兼容解释器，后续条件不重复安装。准备前核全部条件与准备的有限额度，显式限制包括零始终优先；来源或准备变化、中断与未核清进程均阻断复用。检查指标不是正式测量。安装可能执行构建代码、使用网络，并非OS沙箱；不能替换CodeTask自有环境。
-
 历史结构化会话保留有界计划纠正及 `attempts/plan-*/task_plan_proposals.json`，新任务使用共同动作记录。CodeTask 保留项目、工作区、基准及编辑范围；经审阅的大改动需要 `execute.allow_large_edits=true`。默认进程额度由实际执行所有者计算，含准备及修复复验，显式限制包括零始终优先。
 
 结构化修复省略进程限制时，会为校验及配置的修复和复测预留容量；显式限制始终优先，包括零。
@@ -386,6 +432,38 @@ legacy 续接额度必须有稳定 ID 和原因，既有使用、未知消耗和
 
 独立校验、适配器创建、解释器和指标选择器由配置声明，见[执行与报告](CONFIG_REFERENCE_zh.md#执行与报告)。
 
+#### 单候选修复与复现
+
+明确的单候选复现若有 CodeTask、独立声明且不同于正式测量的 validator，以及平直正式命令，
+使用共同任务，可同时冻结报告要求。验证、正式指标／协议和实际候选分别绑定；
+项目内绝对路径指向隔离候选，外部输入和选定解释器保持身份。反馈可只改报告、不重测。
+兼容的已交付单命令成果可用 `--reuse code_project --kind reproduction` 复用，不导入旧账本。
+
+显式环境准备和适配文件由同一所有者承接；需要比较时选择 auto，而非严格 reproduction 快捷入口。
+普通开放任务不被缩成这个专家合同。
+
+#### 固定测量条件
+
+没有 CodeTask 的 `measurement` 新建，支持通过共同任务执行平直单命令或明确的baseline-run比较（pairs，或带声明seed_flag的紧凑种子配置）。每条字面条件只授权初始一次，保留原cwd、argv和继承环境；明确的任务venv配置另绑定实际解释器。协议只有seeds、没有argv绑定时仍是内部批处理，不增加进程。完整声明不能被静默缩减或换配；完成交付要求实际条件及对应确定性分析，缺测、失败或条件不可比须明确保留。
+
+普通 CodeTask benchmark 即使 validator 与正式 argv 相同也可迁共同 owner，但仍须独立物理调用和记账，校验结果不算测量；严格 reproduction 仍要求不同命令。
+
+声明条件可附带必需新 Python 文件和一次 current/venv 准备，不必更换任务类别；精确范围及来源检查保留。默认预算含准备步骤，显式限制不改；venv 的 Python 别名交准备 owner 选择真实解释器。
+
+greenfield `copy`/`sparse_copy` 有真实 source 项目时可测源码 baseline，条件显式标记 `source="preparation"`、`before_implementation=true`：先 prepare，完成全部声明基线，再调用 `implement(prepared_result)` 并传实际成功基线事实。失败或缺测阻止生成。empty/无source项目不能虚构未改源码基线，须提供真实源码或已核外部测量证据。
+
+精确argv明确选中的外部已有文件沿单文件只读来源传递，并在批准时绑定hash，也支持`--option=FILE`。不会挂载其父目录或推断目录授权，数据/材料目录须显式提供。域摘要缺失时，只在产物和候选核验后复用完整已存观察，不重跑模型或校验器。
+
+有模型时，解释和后续工具共用原任务/账本，需要Chat连接及有限请求/token额度。无模型可完成调用方已声明测量和确定性分析，但缺少模型、设计或报告的工作仍待续。沿打印的start --resume-task恢复，未知操作不重放。
+
+测量加写作可用`--task-kind measurement --outputs experiments report --model SELECTOR`及既有报告选项。不要求先修改代码：Writer消费真实测量和对应确定性分析；参考材料沿local-document/material输入。反馈要求新的规范写作回执，原结果、稿件与账本保留，不重跑测量。缺分析或旧稿不能算完整报告交付。
+
+#### 准备测量环境
+
+测量可带 `execution.environment`：当前环境检查，或任务venv、声明的依赖/项目安装及短检查。
+
+冻结多条件共享一个真实attempt的准备回执，要求相同cwd/profile及兼容解释器，后续条件不重复安装。准备前核全部条件与准备的有限额度，显式限制包括零始终优先；来源或准备变化、中断与未核清进程均阻断复用。检查指标不是正式测量。安装可能执行构建代码、使用网络，并非OS沙箱；不能替换CodeTask自有环境。
+
 ### `simple-ar research-report`
 
 对于已保存 ResearchApplication 会话，`simple-ar research-report --session-root SESSION --model SELECTOR [--refresh]` 为已准备好的分析交付补写报告。报告控制见上表；省略参数保留保存的设置。
@@ -396,31 +474,58 @@ legacy v1 记录保持只读；会话无效时不会回退到另一个执行器�
 
 ### `simple-ar report-export`
 
-~~~bash
+将已组装报告转换为可移动 LaTeX 工程，可选编译 PDF。
+输入须有 `report_body.md`，有引用时还须有书目。只转换已有文本，不调用模型或实验，
+不是任意 Markdown 转换器。
+
+| 参数 | 含义／默认值 |
+| --- | --- |
+| `--report-dir PATH`、`--output PATH` | 必填：组装后的输入目录和新输出目录 |
+| `--title TEXT`、`--compile` | 可选标题及 PDF 编译 |
+| `--latex-template PATH` | 相对报告目录的可信 Pandoc LaTeX 模板；否则使用单栏 ACM |
+| `--template-asset FILE` | 可重复：模板旁的平铺配套文件；要求 `--latex-template` |
+| `--tex-engine pdflatex\|xelatex` | 默认 pdflatex；显式指定要求 `--latex-template` |
+| `--citation-style numeric\|template` | 可选引用样式；省略保留历史渲染 |
+
+```bash
 simple-ar report-export --report-dir REPORT_ATTEMPT --output NEW_DIR --title "研究报告" --compile
-~~~
-
-必须提供 `--report-dir` 和 `--output`；`--title TEXT` 和 `--compile` 可选。输入需要 `report_body.md`，有引用时还需要书目。Pandoc 转换已有文本，不调用模型或实验。
-
-可用 `--citation-style numeric|template` 显式选择引用呈现。`numeric` 在模板设置完成后配置 natbib，使用方括号数字（包括叙述式和省略作者的引用），使无作者条目显示数字而非来源 ID；已加载 natbib 时不会重复传包选项造成冲突。源码和产物中的 citekey、BibTeX 条目保持原样，不推测作者或年份。`template` 保留所供模板的引用默认值；内置 ACM 仍使用 `acmnumeric`。省略选项保留历史渲染和 manifest 形状，只有显式选择才会在 `export.json` 增加 `citation_style`。
-
-使用 `--latex-template layout/article.latex` 指定相对 `--report-dir` 的可信 Pandoc LaTeX 模板，重复 `--template-asset local.bst` 显式列出模板旁的扁平伴随文件。`--tex-engine pdflatex|xelatex` 可选，默认 pdflatex；该参数与 `--template-asset` 均要求 `--latex-template`。沿用现有有界模板契约：`$body$` 位于 `\begin{document}` 之后，导言区包含 `$for(header-includes)$$header-includes$$endfor$`。文档类、正文布局和字面指定的书目样式仍由模板控制。`$biblio-style$` 默认 plainnat，显式 numeric 时改用 **plainurl**（TeX Live/MiKTeX 的 **urlbst** 包），避免把缺作者记录的内部 key 印入书目，同时保留 URL/DOI 出处；不静默回退到会丢失出处的 plain。模板字面指定的自定义样式仍控制其参考文献格式。数字引用要求模板加载 natbib；缺少的 TeX 依赖应在编译前安装，导出器不会自行下载。可信 TeX 并非沙箱，不提供模板发现或新运行时。例如：
-
-~~~bash
 simple-ar report-export --report-dir REPORT_ATTEMPT --output NEW_DIR --latex-template layout/article.latex --citation-style numeric --compile
-~~~
+```
 
-原生 `export_report` 工具在现有 `template` 配置之外接受相同的可选 `citation_style: "numeric" | "template" | null`。工具可根据普通出版目标显式选择样式，用户无需输入哈希。省略或 null 不进入序列化请求与输入绑定，保留历史请求哈希和恢复语义。显式选择经现有审批、保存请求和导出 manifest 绑定；修改样式需要新的导出标识或输出目录，冻结恢复不会给旧产物换样式或重新编译。
+#### 模板与引用要求
 
-本地图形和登记的矢量版本会复制；SVG 转 TeX 需要 rsvg-convert。远程图像不会获取。外部证据链接会转为标签，目标记录在 `export.json`，不会自动复制数据集。
+模板须在 `\begin{document}` 后包含 `$body$`，导言区包含
+`$for(header-includes)$$header-includes$$endfor$`。文档类、正文布局及字面书目样式由模板控制。
+有界模板包最多 32 份平铺配套文件、共 16 MB，不支持片段导入、脚本或自定义构建命令。
+导出器不发现模板或下载依赖；可信 TeX 不是沙箱。
 
-默认输出是可移动的单栏 acmart 项目；提供模板时保留其文档类和正文布局。两者均包含 `main.tex`、`body.tex`、`source.md`、书目、图形、`export.json`，以及保存字面代码的 `code/block-*.txt`。请保留整个目录。
+`numeric` 在模板设置后配置 natbib，使用方括号数字，包括叙述式及省略作者的引用。
+模板须加载 natbib；已加载时只配置，不重复传入冲突包选项。无作者条目显示数字而非来源 ID。
+citekey 和 BibTeX 条目保持原样，不推测作者或年份。
 
-登记图注会绑定到导出，只去掉紧邻的完全相同图注；没有 manifest 时保留已有图注。图形使用 htbp，不强制固定位置。
+`template` 保留模板默认样式，内置 ACM 使用 `acmnumeric`。
+`$biblio-style$` 默认 plainnat，显式 numeric 时使用 **plainurl**。
+plainurl 需要 TeX Live／MiKTeX 的 **urlbst** 包，保留 URL／DOI 而不打印无作者记录的内部 key；
+不回退到 plain。模板字面指定的自定义样式仍控制自己的格式。
 
-编译需要 pdflatex、bibtex、acmart、fvextra、seqsplit、etoolbox 和可缩放的回退字体；Debian 或 Ubuntu 可使用完整 cm-super。缺失工具或编译失败会返回非零，保留源码，并在适用时写入 `diagnostics/build.log`。
+仅显式选择才在 `export.json` 增加 `citation_style`。原生 `export_report` 也可在模板包之外接受
+`citation_style: "numeric" | "template" | null`，可依据普通出版目标选择样式，无需用户输入 hash。
+省略／null 不进入序列化请求与输入绑定，保留历史 hash。显式选择绑定审批、请求和 manifest；
+换样式须使用新导出标识／输出。恢复不为旧产物换样式或重新编译。
 
-非拉丁文本可能需要调整引擎或字体。此示例不替用户选择会议投稿选项，也不认证质量或页数。新导出使用新目录，以保留旧版本。
+#### 文件与编译
+
+保留整个输出：`main.tex`、`body.tex`、`source.md`、书目、图形、`export.json`，
+以及保存字面代码的 `code/block-*.txt`。本地图形及登记矢量版本会复制；SVG 转换需要
+`rsvg-convert`。不获取远程图片；外部证据链接转为标签，在 `export.json` 记录目标，不复制数据集。
+
+登记图注绑定导出，只移除紧邻的完全重复图注；无 manifest 时保留图注。
+图形使用 `htbp`，不强制固定位置。
+
+编译需要 Pandoc、`pdflatex`／BibTeX／`acmart`、`fvextra`、`seqsplit`、`etoolbox`
+及可缩放回退字体（Debian／Ubuntu 的完整 `cm-super`）。缺工具或编译失败返回非零，
+保留源码，并在适用时写入 `diagnostics/build.log`。非拉丁文本可能需要调整引擎／字体。
+编译前安装缺少的依赖。逐页查看 PDF；编译不认证质量、页数或投稿选项。每次导出使用新目录。
 
 ## CodeTask 命令
 
@@ -938,6 +1043,8 @@ simple-ar clean --shared-cache
 
 枚举、搜索和检查都按大小写无关的私有名称规则过滤。绝对路径不会扩大根目录或来源权限。
 
+文件工具和交付附件中的无挂载前缀相对路径以任务 workspace 为根。已登记别名（`workspace/…`、`source0/…`、`evidence/…`）保留原所有权，绝对路径仍须位于授权根内；不按裸名称猜来源目录或主机目录。遍历、私有路径、越界链接、只读来源写入和产物版本校验仍生效。最终 `write_file` 的路径及 `delivery.artifacts` 可以采用这两种一致语义的写法；成功保存不等于科学验证。
+
 | 工具或字段 | 约束 |
 | --- | --- |
 | `list_directory` 的 `recursive`、`file_glob` | 分页列出文件名，不读正文；遍历最多 4096 条。`inventory_truncated` 表示清单不完整。 |
@@ -948,9 +1055,6 @@ simple-ar clean --shared-cache
 | `copy_file` | 复制不超过 64 MiB 的二进制或文本字节，需要源 digest；目标已存在时还需要其已观察 digest。 |
 | `search_files` | 在授权根目录内进行字面 rg 搜索，分页报告已扫描文件覆盖。虽为只读操作，仍消耗进程凭据和额度。 |
 | `inspect_project` 的 `data_paths` | 只读观察依赖、入口、测试、文档和覆盖，并保存完整尝试；不导入或执行项目。 |
-| 保存的 `work.v4`：`begin_professional_work`、`finish_professional_work` | 保留原工作范围、路由切换、原稿快照和候选返回。新任务直接使用共同操作，不要求先开始或结束scope。 |
-| 保存的 `work.v3`：`select_work_method` | 保留原先仅选择意图及用途路由的行为，加载历史任务不会自动升级为专业生产合同。 |
-| 保存的准备合同／`work.v1`／`work.v2` 的 `prepare_implementation` | 保留原文件绑定、候选校验和独立批准执行。普通新任务使用共同文件与进程操作，加载历史任务不升级合同。 |
 | `update_work_plan` | 当前请求的计划在压缩和恢复后保留，不另设 planner 或 scheduler。步骤声明不验证工作，也不授权执行。 |
 
 #### 复制项目
@@ -985,15 +1089,24 @@ simple-ar clean --shared-cache
 
 `--allow-network` 单独授权 arXiv、OpenAlex、Semantic Scholar 和可选 Tavily 的检索及原始来源获取。证据保持只读。每次获取目前限一个文档、三次 fetch 尝试、8 MiB 和 60 页 PDF。
 
-文件工具和交付附件中的无挂载前缀相对路径以任务 workspace 为根。已登记别名（`workspace/…`、`source0/…`、`evidence/…`）保留原所有权，绝对路径仍须位于授权根内；不按裸名称猜来源目录或主机目录。遍历、私有路径、越界链接、只读来源写入和产物版本校验仍生效。最终 `write_file` 的路径及 `delivery.artifacts` 可以采用这两种一致语义的写法；成功保存不等于科学验证。
+`acquire_source` 支持可选 `web_extract_backend: direct|tavily_basic`：
 
-原生 `acquire_source` 支持可选 `web_extract_backend: direct|tavily_basic`。省略或传 null 保持当前后端，通常为 direct。未提供来源策略时，显式选择仅作用于本次获取；提供策略（包括空 dict）时，必须匹配冻结后端。显式选择 Tavily 需要策略 providers 包含 `web`、来源网络许可、共同 gateway 网络授权及 `TAVILY_API_KEY`；拒绝发生在来源预算预留之前。省略参数保留已有冻结策略行为。不自动回退或重试，PDF 路由仍归已有全文所有者。原始参数保留选择值，manifest 保留实际 provider 用量/积分，来源账本引用该原始凭据。压缩后的来源历史保留有界的实际 fetch URL、状态、原因、provider 及所选后端，不替代规范记录。后端可用性和成功获取仍需实际服务证据。
+- 省略或 null 保持当前后端，通常为 direct。没有调用方来源策略时，显式选择只作用于本次获取；
+  提供策略（包括空 dict）时，必须匹配冻结后端。
+- 显式 Tavily 需要策略 providers 包含 `web`、来源与 gateway 网络许可及 `TAVILY_API_KEY`。
+  拒绝发生在来源预算预留前。不自动回退或重试，PDF 仍由全文模块处理。
+- 原参数、manifest 及来源账本引用保留所选后端和实际 provider 用量／积分。
+  压缩历史保留有界 fetch URL、状态、原因和 provider，不替代规范原记录。
 
-新的 `find_source_passages` 凭据包含 `document_path`（授权解析后的实际路径）和 `document_sha256`（原始 JSON 字节的 SHA256）。查询匹配和身份预览使用该字节内容；选择完成后再次检查授权、解析路径和字节是否一致。历史凭据保持原样，不依据当前文件补造旧 hash。
-
-原生会话裁剪旧对话块时，已绑定的原文段落可与已观察文件文本共享同一序列化输入预算。来源 owner 复查授权原路径和字节；变化、丢失或无旧 hash 的来源不被冒认成当前有效原文。局部重叠不会静默抹掉先前读过的条件。保留的是准确历史观察，不是摘要、穷尽覆盖或科学验证；放不下的窗口仍有原回执可查。该机制不保证调用次数减少或任务必然交付。
+后端是否可用、获取是否成功，仍须实际服务证据。
 
 `source_operations` 统计 provider 或适配器操作，不等于 HTTP 次数或服务积分。问答检索是本地操作，保留 offset 和截断信息。首次可省略 `find_source_passages` 的 query，以检查来源身份和覆盖。
+
+#### 来源身份与保留片段
+
+`find_source_passages` 凭据包含 `document_path`（授权解析后的实际路径）和 `document_sha256`（原始 JSON 字节的 SHA256）。查询匹配和身份预览使用该字节内容；选择完成后再次检查授权、解析路径和字节是否一致。历史凭据保持原样，不依据当前文件补造旧 hash。
+
+原生会话裁剪旧对话块时，已绑定的原文段落可与已观察文件文本共享同一序列化输入预算。来源 owner 复查授权原路径和字节；变化、丢失或无旧 hash 的来源不被冒认成当前有效原文。局部重叠不会静默抹掉先前读过的条件。保留的是准确历史观察，不是摘要、穷尽覆盖或科学验证；放不下的窗口仍有原回执可查。该机制不保证调用次数减少或任务必然交付。
 
 保留的原始 `document_bundle.v1` 记录可以作为只读输入，不需要网络。所有权解析不允许把 workspace 生成的文档或尝试历史当成原始证据。
 
@@ -1003,9 +1116,17 @@ simple-ar clean --shared-cache
 
 `compose_document` 使用选定来源片段、材料窗口、已知书目、图形和旧草稿，保存带出版引用键及参考文献的 `manuscript.md`，并保留旧草稿。
 
-可选工具参数 `writing_method="sections"` 复用已有分节 Writer：明确标题固定提纲，否则依据材料规划。新的专业文档工作中，整稿与分节都承担独立检查和有界修订，再交付成果；分节复用同一个整稿审阅／编辑器及原检查点，支持反馈续用。检查不可用时保留候选，不再由外层重复发起检查。精确调用及历史保存任务保留原审阅设置。写作粒度、章节和引用限制属于文档要求，不是预选证据配方。两种方法都不增加额度或覆盖冻结合同；分节可能需要更多调用，不保证更快或更好。
+`writing_method="sections"` 选择分节写作：明确标题固定提纲，否则依据材料规划。
+新专业文档的整稿和分节方法都包含独立检查及有界修订，再交付成果；
+分节共用整稿审阅／编辑器及检查点，支持反馈续用。
+
+检查不可用时保留候选，不由外层再发起一次检查。精确调用和历史任务保留原审阅设置。
+两种方法都不增加额度或覆盖冻结报告合同；分节可能需要更多调用，不保证更好。
+粒度、章节和引用限制表达文档要求，不是预选证据配方。
 
 可用 `required_headings` 指定按顺序排列的正文一级章节，用 `max_cited_sources` 限制正文引用的不同来源（0 无上限）。这些是会检查的要求，不是提示建议。违规响应会保留，但停止出版，不自动追加写作请求；参考文献列表和代码围栏示例不计入引用上限。
+
+#### 选择材料与复用输入
 
 `material_roots` 对材料进行有界选择，按私有路径规则过滤并绑定版本，同时报告读取覆盖与遗漏。它可与来源、图形和旧草稿合用，但不能与显式材料窗口混用。定位符会在付费选择前验证。
 
@@ -1013,15 +1134,27 @@ simple-ar clean --shared-cache
 
 写作和实施的新目录选择可以复用父任务已成功读取的精确窗口，但须重新核对当前权限、原回执、全文件身份及实际字节。仅选中窗口传给生成，陈旧、容量拒绝及未读范围明确保留，不推断为证据；已保存尝试不追补后来的读取。原文仍归来源模块，派生稿和结果不因此成为已核科学事实。
 
-原生分节恢复从原始完整调用响应重建，并核对保存的章节；冻结输入或检查点不一致时停止，不覆盖原记录，也不重发失败、残缺或未知请求。历史写作和装配合同保持原样。
+#### 独立审阅已有稿件
 
 `review_document` 用相同的来源/材料选择方式，独立检查已有 `prior_draft`，不调用 Writer 或改写正文。保存的 `review.json` 包含 `review_status`（`reviewed` 或 `needs_revision`）及经过定位检查的意见和引文。无独立材料时可检查表达，不能核准事实。完整响应恢复不再调用模型；拒绝或未知响应停止。反馈改稿使用新的组稿身份，保留旧稿与原意见；渲染图像的视觉质量须另行检查。
 
-新组稿或独立审阅可用 `reuse_prior_inputs=true`，复用同任务规范 `prior_draft` 的已解析原文片段和材料窗口，支持独立整稿、分节组稿和材料型专业报告。经过审阅的分节稿须有真实完整响应与检查点合同，不能仅凭检查点状态采用；缺少这些回执的历史协议保留原路径。执行报告直接消费原执行证据。续用先只读证明完成成果，再核当前权限、精确片段、窗口及回执，不修补父成果。当前图形显式提供，不与新证据配方混用；不完整、变更、外部或不支持的父成果明确拒绝，不自动重新选材。续用不授予额度、采用状态或科学认证。
+组稿或独立审阅可用 `reuse_prior_inputs=true`，复用同任务完整规范 `prior_draft`
+的已解析来源片段与材料窗口。
+
+- 支持独立整稿、分节组稿和材料型专业报告。审阅过的分节稿须有真实完整响应和检查点，
+  仅检查点标记不够；历史协议保持原路径。执行报告直接使用原执行证据。
+- 先只读验证已完成的生产成果，再于付费工作前复核权限、精确片段、窗口和回执。
+  当前图形须显式提供，不与新证据配方混用。
+- 变更、不完整、外部或不支持的父成果会被拒绝，不自动重选材料。
+  复用不授予额度、采用状态或科学认证。
+
+#### 随工作请求选择工具
 
 `focus_work` 可选填 `tools`，在同一次专业目标和材料选择中指定工具契约，省去单独加载一步。省略保留当前选择，空列表清空；仍沿 `load_tools` 共用的注册器、权限和已接受动作记录。
 
 #### 写作恢复与导出
+
+原生分节恢复从原始完整调用响应重建，并核对保存的章节；冻结输入或检查点不一致时停止，不覆盖原记录，也不重发失败、残缺或未知请求。历史写作和装配合同保持原样。
 
 完整且绑定输入的写作响应，可不调用模型而继续组装或补齐出版文件。失败、不完整或结果未知的写作不会重发。
 
@@ -1030,6 +1163,32 @@ simple-ar clean --shared-cache
 `export_report` 通过共享进程凭据和精确审批，把 workspace Markdown 与资产转换为 ACM 项目，并可选编译 PDF。
 
 复用需要输出 digest 绑定。改变或缺失的文件不能继承编译成功；未绑定的中断导出不重放。workspace 图注决定修订正文，图形元数据只补充缺失图注或提供版本。编译不是科学审阅，也不代表页数验收。
+
+#### 原生导出参数与检查
+
+以下为原生任务的 `export_report` 工具字段。独立 CLI 有自己的[选项](#simple-ar-report-export)，
+不提供 `checks` 对象。
+
+共同出版工具 `export_report` 接受可选 `template`：`path` 相对 Markdown 所在目录，
+`assets` 明确列出同目录平铺配套文件，`engine` 为 `pdflatex` 或已安装的 `xelatex`，
+`top_level_division` 可选 `section`、`chapter`、`part`。
+可让助手检查模板后选择正文层级；代码不按类名猜分支，也不因此重组科学内容。
+配套文件最多32份、总计16 MB，不支持模板片段导入、脚本或自定义构建命令。
+独立 `report-export` 命令仍保持 ACM 默认。
+
+也可让助手检查你明确提供的页数上限或身份字符串。共同出版工具 `export_report`
+接受例如 `"checks": {"max_pages": 4, "forbidden_identifiers": ["Example Author"]}`，
+两项可各自省略。检查要求编译 PDF，并已安装 Poppler `pdfinfo` 和/或 `pdftotext`，
+沿用相同的命令批准和进程预算。独立 `report-export` CLI 不提供这些选项。
+
+页数包括参考文献和附录。字符串按大小写敏感的精确子串在提取文本中匹配，
+不覆盖图像、元数据或间接身份，也不认证匿名。
+官方规则若只限制正文，不能把该数字直接当成全 PDF 的 `max_pages`。
+正文起止、最低页数、阶段选项和其他要求需另据规则及实际 PDF 核对；
+`checks` 只执行已经明确的有限检查，不从官网自动认证全部要求。
+检查 `export.json` 及保存的 `checks/pdfinfo.txt` 或 `checks/text.txt`。
+规则失败或无法检查时，阻止可选最终交付，但保留工程与诊断，不自动修改稿件。
+重读保存结果不会重跑检查；修改文件后需要重新导出。
 
 ### 图像、进程与历史
 
@@ -1056,6 +1215,13 @@ simple-ar clean --shared-cache
 `read_history` 在本地分页读取记录。固定返回的 `end_turn`，并使用 `next_offset_bytes` 续读。attempt ID 不是轮次索引。
 
 最近的实际进程结果和最近的非零退出诊断会保留，除非已经读回。取消或阻止的提案不会取代执行事实。历史身份不证明当前文件字节一致。原始记录仍保留；估算不是精确 tokenizer 保证，也不能绕过预算。
+
+#### 已保存原生工作的兼容性
+
+保存的 `work.v1`／`work.v2` 准备、`work.v3` 选择及 `work.v4` 范围保留原来源、路由、
+候选、原稿和审批合同。读取旧任务不升级其生产或审阅规则。
+新普通任务直接使用共同文件、进程和工作操作，不要求先开始或结束工作范围。
+源码职责与实现历史见[开发指南](DEVELOPMENT_zh.md)。
 
 ## 历史与开发命令
 

@@ -63,18 +63,6 @@ existing entries. Add the actual referenced credential:
 RESEARCH_API_KEY=your_actual_secret
 ```
 
-Here `~` means your user directory, including on Windows; the default path is
-`.config/simple-ar/models.toml` beneath it. For a different location, set this
-variable in the terminal or in `.env`:
-
-```bash
-export SIMPLE_AR_MODELS_CONFIG=/absolute/private/path/models.toml
-```
-
-```powershell
-$env:SIMPLE_AR_MODELS_CONFIG = 'C:/private/models.toml'
-```
-
 Credentials come from the environment or the current directory's `.env`;
 existing environment variables take precedence. Keep both files private and
 out of source mounts. Ensure they remain discoverable when changing terminals
@@ -88,14 +76,8 @@ uv run simple-ar models --profile daily --purpose code
 ```
 
 `credential=set` means a credential was found, not that the remote API works.
-Optional writing, vision and image routes, transport settings, and the legacy
-environment-only fallback are in
-[named connections](CONFIG_REFERENCE.md#named-model-connections).
-`--model env` uses the catalog's text/default route when a catalog exists.
-Without a catalog, native tasks require `SIMPLE_AR_LLM_API=chat` in the
-environment or current-directory `.env`; the legacy default is `responses`.
-Native `start` decisions require Chat; configuring a Responses connection for
-other consumers does not change that requirement.
+See [named connections](CONFIG_REFERENCE.md#named-model-connections) for optional
+writing, vision and image routes and transport settings.
 
 ### Supply accessible materials
 
@@ -189,13 +171,13 @@ uv run simple-ar start --resume-task "SESSION"
 A completed task with no pending action returns its saved terminal state.
 After interruption, confirm that the previous worker has stopped before
 continuing; in-flight operations and unknown side effects must not be blindly replayed.
-For an eligible terminated model failure, use `--resume-task SESSION --retry-model`
-separately from feedback or new authorization. It retains failed charges and
-uses remaining budget; see the [recovery conditions](CLI_REFERENCE.md#native-task-entry-experimental).
-For ordinary operation tasks, add `--model profile:another` to explicitly replace the text connection. Proven closed professional calls retain their bounded unknown charges without independently blocking that change. In-flight work, unbounded charges and damaged records still require reconciliation; historical tasks keep their saved recovery conditions.
-See the CLI reference for additional allowances and recovery options.
+For a failed model decision, connection changes or more allowance, follow
+[native recovery](CLI_REFERENCE.md#native-recovery). Those operations have separate
+conditions; keep them separate from feedback and command approval.
 
 ## Configure once and continue from the result
+
+### Save and review task settings
 
 Export an annotated native task configuration, review it, then start. Exporting needs no model credentials and creates no task:
 Replace `./my-results` with your accessible results directory before running:
@@ -211,6 +193,8 @@ Explicit CLI values override the corresponding file settings. Review the summary
 Zero invocations disables processes; proposing commands still requires individual approval.
 Natural-language resource suggestions do not automatically become hard limits: check the summary and explicit settings.
 
+### Find and continue a task
+
 Find and continue existing tasks without locating internal JSON:
 
 ```bash
@@ -225,6 +209,8 @@ Recorded status does not certify quality; `partial` retains unresolved work.
 Feedback continues the same task and ledger; starting from a configuration again creates a new task.
 Creation flags cannot reset saved process limits on resume; additional resources require explicit continuation authorization.
 
+### Change a configured connection
+
 When no operation remains pending, explicitly record another configured text connection, then submit feedback separately:
 
 ```bash
@@ -232,9 +218,33 @@ uv run simple-ar start --resume-task SESSION --switch-model profile:another --sw
 uv run simple-ar start --resume-task SESSION "Continue revising the saved report"
 ```
 
-Review the displayed task/code/writing destinations and models before confirming. Recording a switch makes no model request, replays no tool, and retains delivery and accounting.
-Each switch ID has one immutable intent; replaying an older ID does not revert a later change.
-Reconcile pending, in-flight or unconsumed responses first. A terminated failed model decision still uses `--retry-model --model profile:another`; switching cannot bypass uncertain operations.
+Review the displayed task/code/writing destinations and models before confirming.
+The switch retains delivery and accounting and makes no model request. Reconcile pending
+work first; terminated failed decisions use the separate retry path. See
+[connection switching](CLI_REFERENCE.md#switch-a-configured-connection) for ID and recovery rules.
+
+### Alternative catalog location and legacy setup
+
+Here `~` means your user directory, including on Windows; the default path is
+`.config/simple-ar/models.toml` beneath it. For a different location, set this
+variable in the terminal or in `.env`:
+
+```bash
+export SIMPLE_AR_MODELS_CONFIG=/absolute/private/path/models.toml
+```
+
+```powershell
+$env:SIMPLE_AR_MODELS_CONFIG = 'C:/private/models.toml'
+```
+
+Optional writing, vision and image routes, transport settings, and the legacy
+environment-only fallback are in
+[named connections](CONFIG_REFERENCE.md#named-model-connections).
+`--model env` uses the catalog's text/default route when a catalog exists.
+Without a catalog, native tasks require `SIMPLE_AR_LLM_API=chat` in the
+environment or current-directory `.env`; the legacy default is `responses`.
+Native `start` decisions require Chat; configuring a Responses connection for
+other consumers does not change that requirement.
 
 ## Choose a task and its smallest input
 
@@ -269,6 +279,8 @@ model catalog. Open the full URL printed by this process. Keep that URL private:
 its fragment grants access to this local session. Do not expose the port publicly.
 For remote hosts, forward the same port through SSH rather than changing its bind address.
 
+### Create and continue locally
+
 The page lists native tasks in the task root and its direct children. Material
 paths refer to the execution host and must fall within the project root or an
 explicit repeatable `--read-root PATH`. Creating a task saves the confirmed
@@ -277,11 +289,15 @@ Review the destination, operation and caps before confirming creation, command
 approval or a connection change. After a failed submission, inspect the task
 before trying again. Feedback and approvals continue the same task and ledger.
 
+### Inspect and stop work
+
 Inspect recent activity, saved results and unresolved work. Plans and pending
 proposals are not evidence of execution; an idle UI does not prove that an
 external worker has stopped. **Boundary stop** waits for the current action;
 it does not cancel an in-flight request or process. Keep the launcher alive
 until it exits.
+
+### Preview limits and trust
 
 This is a single-user client, not a sandbox or multi-user service. It previews
 text and raster images; SVG/HTML appear as text, and supported binary files

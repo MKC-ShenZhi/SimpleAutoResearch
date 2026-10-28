@@ -1,144 +1,99 @@
 # Changelog
 
-[中文版本](CHANGELOG_zh.md) · [Entry guidelines](docs/CHANGELOG_GUIDE.md)
+[中文版](CHANGELOG_zh.md) · [Changelog guidelines](docs/CHANGELOG_GUIDE.md)
 
-User-visible changes, newest first, dated when confirmed. Multi-day development may be summarized together rather than assigned invented completion dates. Development-branch work is distinguished from main; engineering checks do not establish task success. See [usage](docs/USAGE.md) for current instructions.
+User-visible changes in reverse chronological order. Development entries are unreleased;
+engineering checks and real task acceptance are reported separately.
+See [Usage](docs/USAGE.md) for current instructions and [Evaluation](docs/EVALUATION.md) for evidence and limits.
 
 ## 2026-10-28 — V2.10 development (unreleased)
 
 ### Improved
 
-- New tasks retain a bounded overview of actual operations and output locations alongside recent conversation and work notes. Compact navigation makes more archived work discoverable without requiring a note; detailed transport traces remain in original receipts. Separate versions, failures and omissions remain explicit; saved tasks keep their original context contract.
-- New source and document work uses the shared action loop directly. Scope start/finish steps are no longer part of new tasks; saved scopes retain their original routing, snapshots and recovery.
-- Previously read, version-valid originals can remain available without work notes or an explicit scope. The same bounded selector gives original evidence priority over optional navigation and distinguishes stale, unavailable and capacity-limited material. Generated tool explanations do not become original file reads merely by carrying a path or hash.
-- Authorized publication is directly available in new tasks. Its existing final-delivery option handles the same manuscript, rendered output and independent review; generic compilation does not replace publication provenance.
-- File tools can read the current task's receipt-identified process diagnostics directly, including failed rendering logs. Publication failures point to those readable files, avoiding an extra command just to inspect an error. Task sources, writable scope and historical bindings are unchanged.
-- Fresh independent reviews reuse authorized, version-valid source reads even without a caller-selected evidence list. Whole verified windows can use available configured input capacity, while required targets and new reads can displace optional context. Targets still require a current read; cached opinions never become proof for a changed version.
+- Source and manuscript work use the shared action loop directly. Valid previously read text can be reused without first creating a work scope or note.
+- Feedback and result snapshots retain prior deliveries and actual generated outputs; later diagnostic attachments no longer hide existing work. Progress, production records and current checks remain distinct.
+- Independent review can investigate authorized material, and publication checks the requested export of the same manuscript. Process diagnostics can be read without another command.
+- Reorganized bilingual usage, task, command, configuration and development guides; consolidated extension setup and shortened recent changelog entries.
 
-Server engineering and saved-history checks do not establish task success. Unassisted draft, feedback and formal delivery acceptance remains incomplete.
+An initial draft has been formally delivered. The latest unassisted feedback remains unclosed; lower total task cost has not been demonstrated.
 
 ## 2026-10-27 — V2.10 development (unreleased)
 
 ### Improved
 
-- New tasks discover optional professional tools through the existing capability directory and load their contracts when needed. Common file/execution tools and owners required by frozen contracts remain directly available; saved modes are unchanged.
-- Formal report delivery in new tasks owns an independent review of the original request, feedback and actual complete delivery. Local consistency checks cannot fulfill this obligation. Review shares the task ledger; saved tasks keep their original contract.
-- Work-owner notes and explicitly referenced source observations replace paid background summaries and unrelated history backfill. Actual reads from inspection, source generation and document work can be reused after version, permission and range checks.
-- Source and document work in new ordinary tasks use the same native engine, working view and journal. Selecting a work method uses the existing model route; file editing, approved execution, independent checks and publication remain separate operations. Saved source/document contracts retain their original behavior.
-- Shared finish principles distinguish necessary work from optional presentation advice. The official DeepSeek example separates text/code work from visual inspection and uses the provider's standard thinking output capacity; saved task settings remain unchanged.
+- New tasks load tools on demand and share the action loop for source and manuscript work. Original text and work notes replace background paid summaries.
+- Formal report review checks the original request, feedback and actual deliverables; local consistency checks do not replace package review.
 
 ### Fixed
 
-- Native model failures preserve their completion reason. Truncated tool arguments cannot enter ordinary format correction, and source work can distinguish a response limit from a generic preparation failure.
-- Whole-delivery feedback reaches relevant code and figure work as well as manuscript revisions, retaining the original review scope and versions. Unavailable opinions remain diagnostics without blocking unrelated work; independent acceptance and unknown-charge protections remain enforced.
-- New native publication accepts referenced figures across authorized directories without manual source copying. Approval, rendering and recovery bind the same consumed bytes; standalone conversion and historical scopes remain unchanged.
-- Interrupted publication recovery reads retained review receipts without dispatching a new inspection. Full delivery reviews bind versions and scope, retain failed opinions, and protect capacity for a subsequent decision to handle the result.
-- Validate actual output and publication readiness before paid delivery review. Replacing an unused co-output no longer invalidates another current output; changed consumed inputs, failed producers and strict historical recovery remain checked.
-- Complete project reuse follows recorded byte versions through copies and edits. Later successful outputs cannot clear an earlier copied version's failure or stale inputs; retired intermediate directories need not remain intact. This does not certify copied code or inherit execution authority.
-- Independent inspection identifies invalid source references and can bind an omitted target only when its identity is uniquely determined. Rejected comments remain explicitly unverified, with their original trace available; ambiguous identities and invalid evidence still fail. The one-correction limit and historical receipts remain unchanged.
-- Final inspection instructions share the same context selection budget as source material, preventing an otherwise usable working view from overflowing at conclusion time. Historical records and model charges remain unchanged.
-
-Unassisted initial-draft and substantive-feedback acceptance, and an overall coordination-cost improvement, remain unconfirmed.
+- Truncated responses retain their actual finish reason and cannot execute incomplete tool arguments. Invalid review evidence produces an explicit error.
+- Feedback reaches the relevant revision operations. Another successful version cannot clear changed copies, stale outputs or unresolved findings.
+- Publication supports images from authorized directories and can recover saved review receipts. Closing instructions share the material context budget.
 
 ## 2026-10-26 — V2.10 development (unreleased)
 
 ### Improved
 
-- Independent reviews in new tasks investigate within the shared task budget without a separate six-round deadline, and can explicitly report unfinished checks. Failed or incomplete reassessments retain outstanding required findings instead of clearing them merely because the target was fully read.
-- `ToolApplication.create` now uses the common operation loop exclusively. Historical professional controllers remain resumable through their saved contracts; new legacy-controller requests are rejected before creation. Chinese Markdown and ordinary artifact delivery do not require PDF publication.
-- Working notes and independent inspection reuse read targets and evidence through the shared bounded view, reducing material loss after history retirement. Windows are not duplicated and targets cannot be their own independent evidence. Partial reads, failed summaries and malformed calls cannot claim completion; original material, receipts and historical contracts remain available.
-- Ordinary tasks delegate source investigation and creation/revision through distinct native read, focus and candidate actions in one professional decision loop. This replaces the ambiguous mixed JSON contract for new tasks; saved tasks retain their original protocol. Editable source capacity remains separate from immutable input copies, and completely read, version-bound originals accept full-file revisions or exact replacements under the existing approval and input protections.
-- Publication checks the manuscript's actual presentation dependencies. Unused older previews no longer block current export or recovery; consumed figures and their producer versions remain checked.
-- Delivery descriptions can quote a text window from an actual delivered artifact, bound by the existing delivery hashes after successful final writing, execution or publication. Ordinary reads and excerpts share one file-window implementation. An excerpt proves its source, not scientific correctness or representativeness.
-- Named connections can retune streaming without replacing the saved model or receiver. A failed call still requires explicit recovery; historical settings and unknown charges remain unchanged.
+- Python task creation defaults to the shared operations loop. Chinese Markdown and ordinary source delivery do not require a PDF.
+- Read material and review share a bounded working view. Independent investigation supports multiple targets without a mandatory six-turn cutoff; incomplete rechecks retain required findings.
+- Named connections expose stream settings. Delivery can quote actual file windows, and publication checks only dependencies used by the current export.
 
 ### Fixed
 
-- Text inspection rejects unreadable targets before model dispatch, preserving prior valid reviews without turning unsupported image input into a blocking artifact finding. Historical inspection records retain their original behavior.
-- Explicit model replacement after a failed decision in ordinary operation tasks reuses the existing closure checks for professional calls. Retain their bounded unknown charges, original results and history without replay; historical recovery conditions remain unchanged.
-- Ordinary source preparation no longer judges the whole task by its last prepared execution. Delivery follows current declared producers; changed sources, stale consumed outputs and actual review findings remain checked, while historical controlled-work completion retains its saved behavior.
-- Retain a complete professional response after a configured transport retry succeeds, while keeping the earlier failed attempt's bounded charge unchanged. Pending or unbounded usage still blocks adoption; this does not authorize further automatic correction or replay.
-- Explicit connection changes and new allowances support reconciled professional model operations as well as top-level decisions. Historical unknown charges remain unchanged; in-flight work and uncertain process execution still require reconciliation. Cancelling capped text requests retains their bounded charge without retrying.
-
-Unassisted initial-draft and feedback acceptance has not passed. Offline input reductions and engineering checks do not establish lower whole-task costs or general task success.
+- Unreadable review targets fail before a model call without overwriting valid findings.
+- Failed decisions support explicit connection changes or supplied resources. Unknown usage remains reserved and stopped calls do not replay tools.
+- Production and delivery are checked separately, preserving valid work after preparation failures without pairing changed source with stale output.
 
 ## 2026-10-25 — V2.10 development (unreleased)
 
 ### Improved
 
-- Independent inspection can locate and read missing sources within authorized roots, retaining each read and charge. Coordination receives findings and source locators; full observations remain in the original receipt. An incomplete reassessment cannot inherit an older pass.
-- Publication shares byte-bound PDF metadata between checks and previews, parses identical captions once and forecasts process capacity before compilation. Actual usage remains charged per physical process.
-- New operation tasks retain a bounded, version-aware working view and receipt-backed notes across feedback. Material selection and model-visible metadata share one input budget; original sources and history remain available. Saved tasks retain their original context protocol.
-- New tasks compose investigation, file work, execution, independent inspection and publication in one action loop, replacing compulsory professional handoffs and overlapping Writer control. Ordinary CLI, structured intake and creation APIs use the same default; saved tasks retain their recorded contracts.
-- Formal manuscript checks bind actual target and evidence versions; PDF/TeX delivery checks the corresponding publication. Distinguish unfinished work from research limitations, and keep legacy Writer preparation arguments out of ordinary export contracts. Current required findings, unknown usage and unverified execution still need resolution or explicit disclosure.
-- Consolidate duplicate professional-control tests while retaining execution, approval, feedback, version consistency and historical recovery coverage. Original drafts, failures and accounting remain preserved.
+- Ordinary CLI, structured entry and Python creation share the action loop, replacing mandatory specialist handoffs and duplicate Writer control for new tasks. Saved tasks retain their contracts.
+- Working views and notes survive feedback. Independent review locates evidence; publication binds the manuscript and assets to their versions.
+- Consolidated duplicate orchestration tests while retaining execution, approval, feedback and historical recovery checks.
 
 ### Fixed
 
-- Separate completed production from delivery acceptance: retain execution results and surface unmet delivery conditions, including the editable manuscript in terminal publication. Changed bindings and unconfirmed execution still stop safely.
-- Retain prose replies without treating completion claims as delivery. Settled, affordable work permits one action correction on the same ledger; consecutive replies without an action stop explicitly.
-- Republishing a revised manuscript at the same path validates the publication actually delivered; retained older exports no longer veto a valid current version. PDF-only delivery does not acquire an implicit TeX requirement.
-- Preserve frozen analysis, research and implementation/measurement obligations through the new action loop. Final writes and approved runs are checked against their actual produced files rather than requiring those files before execution.
-- Rendered-image inspection follows the configured model output limit instead of imposing a separate 3,000-token cap. Explicit recovery of a failed decision with no unknown charges also supports an unchanged, uncapped output setting; unknown charges retain stricter recovery checks.
+- Delivery failures retain completed execution and identify missing work. A textual completion claim cannot substitute for formal delivery.
+- Revised manuscripts can be republished at the same path. PDF-only requests need not include TeX; image review uses the configured output limit.
 
-Earlier development recovery delivered an initial draft but not the feedback revision. A later cold start from the original materials also stopped before formal delivery within its fixed budget. Unassisted acceptance has not passed; these engineering changes do not establish general success or lower whole-task costs.
+At this date, a cold start had not delivered within its fixed budget and development recovery had not closed feedback. Engineering changes do not establish general success.
 
 ## 2026-10-24 — V2.10 development (unreleased)
 
 ### Added
 
-- Select local Skill and read-only/plan Python tools in task TOML. On the development branch, extensions may declare common delivery/question contracts without editing core tool-name lists; permissions and version checks still apply. See [setup and trust boundaries](docs/LOCAL_EXTENSIONS.md).
-- Native task TOML accepts `from_session` and named `reuse` groups, sharing CLI/UI material admission without inheriting old execution, permissions or budgets.
+- Task TOML can select trusted local Skills and read-only/plan tools; see [configuration and trust boundaries](docs/CONFIG_REFERENCE.md#trusted-local-packages).
+- New tasks can reference saved artifact groups, verifying material bytes without inheriting permissions, budgets or execution state.
 
 ### Improved
 
-- The development branch unifies document-source resolution and candidate reuse. Professional section documents now use the shared Writer's independent review, corrections and checkpoints through feedback and delivery; document-format requirements remain separate from evidence selection. Evidence gaps stay with professional investigation and proven attachment defects go to their producer. Historical contracts and accounting remain protected.
-- Keep goals separate from material roles and data meanings through shared CLI/UI declarations. Project edits preserve layout and immutable dependencies; code-only delivery does not require a report.
-- Repairs retain required original materials and distinguish authoring context from delivered execution. Earlier failures remain recorded without blocking a separately verified replacement; unsupported numerical allegations remain unresolved, not proven errors or evidence of improved efficiency.
-- The experimental UI shares configuration preview, material authorization and stop/resume behavior. Complete research interaction remains under acceptance.
-- Multiple attachments from one execution share a complete version check within each inspection, avoiding repeated traversal; new inspections still reject changed inputs and outputs.
-- Separate complete attachment retention from bounded inspection in new document work. Larger supported tables use version-bound reader profiles, with explicit coverage limits; unread files retain gaps without discarding the draft. Proven defects still reach their original producer.
-- Continue complete checked revisions without returning to an older draft or repeating material selection. Required findings remain blocking; a proved professional handback can return to coordination without a quota refill. Document-inspection receipt validation now belongs to the report layer.
+- Goals, material roles and delivery requirements are stored separately. Project copies preserve unchanged members; source delivery does not require a report.
+- Writing can reuse checked candidates and original evidence. Large attachments expose reading coverage and retain gaps for unread material.
 
 ### Fixed
 
-- Preserve unedited members when first admitting ordinary or copied projects. Preparation, approval and execution share the same bounded snapshot; direct process-input limits are unchanged. Correct candidate paths and material versions so failed-run leftovers do not invalidate valid source or pair new source with old execution.
-- Isolate nested extension calls so distinct searches cannot reuse one another's receipts, and extension payload fields do not acquire built-in writing/execution semantics. Historical identities and records retain their original contract.
-- Explicitly recover handoff failures after execution results or complete revisions have been saved, without repeating execution or silently reverting a draft. Viewing retained delivery and resuming execution have separate prerequisites.
-- Allocate figure and caption space together using the actual template, preventing captions from crossing the page boundary; captions too large to fit fail explicitly. Narrow tables wrap technical compounds without changing scientific content.
+- Corrected candidate paths, material versions and extension trace isolation to avoid pairing new source with old execution.
+- Explicit recovery after a complete save avoids duplicate execution. Long captions and narrow tables wrap better; content that cannot fit produces an error.
 
-### Status
-
-- The preceding candidate completed full server regression, real PDF compilation/relocation and read-only historical compatibility checks. This completion-contract and document-source refactor passed targeted source/installed checks and replay of original failures; real feedback retains its separate outcome. Earlier report feedback and two-template results keep their own versions and limits. See [evidence](docs/EVALUATION.md#v210-development-evidence); these checks do not establish general success rates or lower cost.
-- Checked incremental improvements may be integrated into main while V2.10 development continues on its original branch. Full persistent-project coverage, coordination efficiency and overall slimming remain incomplete.
+Engineering regression, relocation and earlier feedback evidence are listed in [Evaluation](docs/EVALUATION.md#v210-development-evidence). Project continuity, coordination efficiency and overall slimming remain incomplete.
 
 ## 2026-10-23 — V2.10 development (unreleased)
 
-This section records development and acceptance limits as of October 23, not a release. Later checks are recorded under October 24.
-
 ### Added
 
-- Professional work orders delegate investigation, code or writing from a goal, material roots and delivery requirements, reducing coordinator-side file preparation.
-- Complete producer units carry analysis source, data and outputs into writing and delivery through actual production records. Ordinary-entry integration remains under verification.
+- Professional requests accept a goal, material directories and delivery requirements. Complete work includes source, data and actual generated outputs.
 
 ### Improved
 
-- Load tool contracts on demand and reuse observed originals across professional work. Remove duplicated attachment text from authoring while retaining complete evidence for independent inspection.
-- Correct known-usage, completed JSON, selection and candidate errors within the existing bounded professional steps. Preserve original responses, versions, failures and accounting; interrupted or unknown-use requests are not blindly retried.
+- Tools load on demand and professional operations reuse read material. Settled format errors permit bounded correction while retaining original responses and accounting.
 
-### Fixed (full task acceptance still pending)
+### Fixed
 
-- Distinguish explicit caller fields from internal defaults so ordinary requests retain complete units. Default publication titles follow the adopted manuscript; historical explicit settings are unchanged.
-- Inspect producer-unit text by actual UTF-8 content rather than a filename suffix whitelist. Binary, changed and oversized inputs remain rejected; saved snapshots retain their original policy.
-- Report unread attachment gaps before authoring instead of repeatedly rewriting prose to fix missing inspection coverage. Preserve original drafts, failures and accounting.
-- Reuse validated evidence for same-request prose-only review fixes and pass version-bound editorial feedback to the Writer. New feedback, evidence gaps and attachment defects still require investigation rather than silently inheriting old scope.
-- Separate writing evidence from declared deliverables. Complete producer units replace implicit promotion of context results and historical source versions into attachments; actual external command inputs and explicitly selected attachments remain checked. Saved and interrupted requests retain their original subject-selection policy.
-- Review whole-article tables, image links and captions as author-owned body content, rather than incorrectly treating them as automatic assembly additions. Historical review requests retain their original payload.
+- Ordinary entry points retain complete work. Unread attachments produce specific gaps rather than repeated manuscript edits that conceal material-selection failures.
+- Drafts, evidence and deliverable attachments are distinct. Authors organize tables, figures and captions rather than relying on the assembler to insert them.
 
-### Not yet complete as of October 23
-
-- Real tasks had produced partial reports, tables, figures and PDFs; full acceptance runs had stopped with failures and accounting retained. Corrected-candidate delivery and feedback were still unproven at that point.
-- The professional-ownership work package remained open, with unified acceptance and overall code reduction incomplete.
+Complete delivery and feedback were still unverified at this date. Later entries record progress without rewriting historical failures.
 
 ## 2026-10-20
 

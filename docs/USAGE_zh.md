@@ -61,17 +61,6 @@ code = "daily"
 RESEARCH_API_KEY=your_actual_secret
 ```
 
-默认位置中的 `~` 是当前用户目录；Windows 也使用用户目录下的 `.config/simple-ar/`。
-如果文件放在其他位置，再设置配置文件路径变量，也可将该变量写入 `.env`：
-
-```bash
-export SIMPLE_AR_MODELS_CONFIG=/absolute/private/path/models.toml
-```
-
-```powershell
-$env:SIMPLE_AR_MODELS_CONFIG = 'C:/private/models.toml'
-```
-
 凭据来自环境或当前目录的 `.env`，已有环境变量优先。
 两个文件都应保密，不作为来源挂载。
 换终端或目录时，确保仍可找到配置与凭据；无需重复设置全局模型和端点。
@@ -84,12 +73,7 @@ uv run simple-ar models --profile daily --purpose code
 ```
 
 `credential=set` 只表示找到凭据，不证明远端 API 可用。
-可选 writing、vision、image 路由、传输设置及旧环境变量回退见
-[命名连接](CONFIG_REFERENCE_zh.md#命名模型连接)。
-有目录时，`--model env` 使用 text/default 路由。
-无目录时，原生任务须在环境或当前目录 `.env` 设置 `SIMPLE_AR_LLM_API=chat`；
-旧连接默认是 `responses`。
-原生 `start` 的模型决策仍要求 Chat；为其他用途配置 Responses 连接不会改变这一要求。
+可选 writing、vision、image 路由和传输设置见[命名连接](CONFIG_REFERENCE_zh.md#命名模型连接)。
 
 ### 提供可访问的材料
 
@@ -178,13 +162,12 @@ uv run simple-ar start --resume-task "SESSION"
 
 已完成且无待处理动作的任务返回保存终态。
 中断后先确认旧工作进程已停止；在途操作或未知副作用不能盲目重放。
-符合条件的已终止模型失败，可单独使用 `--resume-task SESSION --retry-model`，
-不要同时提交反馈或新授权。失败费用保留，并使用剩余预算；
-见[恢复条件](CLI_REFERENCE_zh.md#原生任务入口实验性)。
-普通操作任务可加 `--model profile:another` 明确更换文本连接；已核实终止的专业调用，其有界未知费用继续保留，不单独阻断换连接。在途、无上界费用或损坏记录仍须先核对；历史任务沿原恢复条件。
-追加额度与更多恢复选项见 CLI 参考。
+模型决策失败、更换连接或追加额度时，按[原生任务恢复](CLI_REFERENCE_zh.md#原生任务恢复)操作。
+这些操作各有条件，与反馈和命令审批分开使用。
 
 ## 配置一次，围绕成果继续
+
+### 保存并检查任务配置
 
 可以先生成带关键注释的原生任务配置，编辑后启动。生成配置不需要模型凭据，也不创建任务：
 执行前，将 `./my-results` 替换为可访问的实际结果目录：
@@ -200,6 +183,8 @@ uv run simple-ar start --task-config task.toml
 包括搜索后端；不是单命令超时。零次数禁止进程，允许提案仍需批准具体命令。
 自然语言中的资源建议不自动成为硬限制，请核对摘要与这些显式设置。
 
+### 查找并继续任务
+
 查找已有任务和反馈时，无需先寻找内部 JSON：
 
 ```bash
@@ -213,6 +198,8 @@ uv run simple-ar start --tasks-in runs/assistant --resume-task EXACT_DIRECTORY_N
 反馈沿原任务、材料和账本继续；再次用配置文件启动则会创建新任务。
 继续时不能用创建参数悄悄重设进程额度，额外资源仍使用显式续额授权。
 
+### 更换已配置连接
+
 需要在没有待处理操作时更换工作连接，可显式记录变更，再单独提交反馈：
 
 ```bash
@@ -220,9 +207,29 @@ uv run simple-ar start --resume-task SESSION --switch-model profile:another --sw
 uv run simple-ar start --resume-task SESSION "继续修改已有报告"
 ```
 
-先核对显示的任务、code、writing端点与模型，确认后才保存。变更不调用模型、重跑工具或清空账本；已交付文件仍保留。
-同一变更ID只能对应同一意图，重复旧ID不会撤销后来变更。任务有待处理/在途/未消费回复时先按原规则恢复；
-已终止的失败模型决策仍使用 `--retry-model --model profile:another`，不要通过改连接规避未确认操作。
+确认前核对任务、code、writing 的端点与模型。切换保留交付及账本，不调用模型。
+须先核对待处理工作；已终止的失败决策使用独立重试操作。
+ID 和恢复规则见[连接切换](CLI_REFERENCE_zh.md#切换已配置连接)。
+
+### 其他目录位置与旧连接设置
+
+默认位置中的 `~` 是当前用户目录；Windows 也使用用户目录下的 `.config/simple-ar/`。
+如果文件放在其他位置，再设置配置文件路径变量，也可将该变量写入 `.env`：
+
+```bash
+export SIMPLE_AR_MODELS_CONFIG=/absolute/private/path/models.toml
+```
+
+```powershell
+$env:SIMPLE_AR_MODELS_CONFIG = 'C:/private/models.toml'
+```
+
+可选 writing、vision、image 路由、传输设置及旧环境变量回退见
+[命名连接](CONFIG_REFERENCE_zh.md#命名模型连接)。
+有目录时，`--model env` 使用 text/default 路由。
+无目录时，原生任务须在环境或当前目录 `.env` 设置 `SIMPLE_AR_LLM_API=chat`；
+旧连接默认是 `responses`。
+原生 `start` 的模型决策仍要求 Chat；为其他用途配置 Responses 连接不会改变这一要求。
 
 ## 选择任务与最小输入
 
@@ -255,15 +262,21 @@ uv run python -m simple_ar.ui --project-root /absolute/materials --task-root /ab
 链接片段是本次本地会话的访问凭据，请勿分享或公开端口。
 远程服务器使用 SSH 转发相同端口，不修改绑定地址。
 
+### 在本地创建与继续
+
 页面列出任务根目录及其直接子目录中的原生任务。材料路径属于执行主机，
 必须在项目根目录或显式重复指定的 `--read-root PATH` 内。
 创建只保存已确认的连接、材料、权限和额度，点“继续执行”才开始工作。
 创建、批准命令或更换连接前，先核对接收方、操作与额度；
 提交失败后先检查任务，再决定是否重试。反馈和批准沿原任务及账本继续。
 
+### 查看与停止工作
+
 检查最近活动、保存成果和未完成项。计划和待批准提案不是执行证据；
 界面空闲也不能证明外部工作进程已停止。“边界停止”等当前行动返回，
 不会取消在途请求或进程。请保持启动进程，直到它正常退出。
+
+### 预览限制与信任边界
 
 这是单用户客户端，不是沙箱或多用户服务。支持文本及位图预览，
 SVG/HTML 按文本显示，PDF 等支持的二进制文件下载后查看。
