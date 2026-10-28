@@ -58,8 +58,8 @@ _SHARED_OWNERS = 'owners.v2'
 _ADOPTING_OWNERS = 'owners.v3'
 _REQUEST_OWNER = 'requests.v1'
 _DECLARED_INPUTS = 'declared_inputs.v1'
-_WORKING_CONTEXT_PROTOCOLS = {'working.v1', 'working.v2', 'working.v3', 'working.v4', 'working.v5'}
-_REFERENCED_CONTEXT_PROTOCOLS = {'working.v2', 'working.v3', 'working.v4', 'working.v5'}
+_WORKING_CONTEXT_PROTOCOLS = {'working.v1', 'working.v2', 'working.v3', 'working.v4'}
+_REFERENCED_CONTEXT_PROTOCOLS = {'working.v2', 'working.v3', 'working.v4'}
 _CONVERSATION_CONTEXT_PROTOCOLS = {'conversation.v1', *_WORKING_CONTEXT_PROTOCOLS}
 _CONTEXT_PROTOCOLS = {None, *_CONVERSATION_CONTEXT_PROTOCOLS}
 _ADOPTING_OWNER_MODES = {_ADOPTING_OWNERS, _REQUEST_OWNER}
@@ -978,7 +978,7 @@ class ToolApplication:
         """
         from simple_ar.app.work_memory import summary_coverage
         memory = {'notes':[], 'through_turn':0}
-        for position, turn in enumerate(self.state['turns']):
+        for turn in self.state['turns']:
             # New work has one note author: its current work owner. Historical
             # checkpoint adoption stays confined to the saved earlier protocol.
             checkpoint = (self._checkpoint_for_turn(turn)
@@ -994,10 +994,6 @@ class ToolApplication:
                 if (result.get('tool_name') == 'update_work_plan' and result.get('status') == 'ok'
                         and isinstance(data.get('notes'), list)):
                     memory = {'notes':data['notes'], 'through_turn':0}
-                    if self.state['config'].get('context_protocol') == 'working.v5':
-                        # Rebuild this priority boundary from the accepted journal;
-                        # it certifies neither summary coverage nor source validity.
-                        memory['updated_at_turn'] = position
         return {**memory,'notes':self.operations.project_notes(memory['notes'])}
 
     def _checkpoint_for_turn(self, turn: dict) -> dict | None:
@@ -1612,7 +1608,7 @@ class ToolApplication:
                investigate_results: bool = True,
                control_protocol: Literal['operations.v1'] = 'operations.v1',
                creation_declarations: dict[str, Any] | None = None,
-               context_protocol: Literal['auto', 'conversation.v1', 'working.v1', 'working.v2', 'working.v3', 'working.v4', 'working.v5'] | None = 'auto') -> ToolApplication:
+               context_protocol: Literal['auto', 'conversation.v1', 'working.v1', 'working.v2', 'working.v3', 'working.v4'] | None = 'auto') -> ToolApplication:
         """Create work on the operation-composed loop.
 
         Historical professional controllers are load-only. Loading and supply
@@ -1625,7 +1621,7 @@ class ToolApplication:
         if professional_inputs or not investigate_results or report_protocol is not None:
             raise ValueError('Professional controller options are load-only; new tasks use source operations, inspect_artifacts and export_report')
         if context_protocol == 'auto':
-            context_protocol = 'working.v5'
+            context_protocol = 'working.v4'
         if context_protocol not in _CONTEXT_PROTOCOLS:
             raise ValueError('Unsupported context protocol')
         if creation_declarations is not None and context_protocol not in _CONVERSATION_CONTEXT_PROTOCOLS:
@@ -3181,7 +3177,7 @@ class ToolApplication:
         if working_mode:
             from simple_ar.core.working_context import select_working_context
             current_artifacts = set()
-            if config.get('professional_operations') == 'work.v5' and config['context_protocol'] in {'working.v4', 'working.v5'}:
+            if config.get('professional_operations') == 'work.v5' and config['context_protocol'] == 'working.v4':
                 retained = self._retained_work(observations=owner_observations)
                 # Owner references remain compact; the complete inventory stays at
                 # its original receipts and in the user snapshot, not mandatory input.
@@ -3217,12 +3213,9 @@ class ToolApplication:
                         pass
                 # Prioritize authorized identities under every observed spelling.
                 # Resolution grants no new mount and does not read output bytes.
-                if config['context_protocol'] == 'working.v5':
-                    current_artifacts = self.workspace.working_artifact_paths(retained)
-                else:
-                    for row in retained['identities']:
-                        if row.get('presence') == 'present' and row['version_binding'] == 'recorded':
-                            current_artifacts.update((row['locator'], row['absolute_path']))
+                for row in retained['identities']:
+                    if row.get('presence') == 'present' and row['version_binding'] == 'recorded':
+                        current_artifacts.update((row['locator'], row['absolute_path']))
                 spellings = {value for row in working_rows
                     for value in (row.get('path'), row.get('absolute_path')) if isinstance(value, str)}
                 for value in spellings - current_artifacts:
@@ -3258,12 +3251,9 @@ class ToolApplication:
                 observations=working_rows, schema_tokens=schema_cost,context_token_target=target,
                 estimate_tokens=estimate_tokens,work_notes=work_notes,
                 summarized_through_turn=memory['through_turn'],
-                active_from_turn=memory.get('updated_at_turn', 0) if config['context_protocol'] == 'working.v5' else 0,
                 selected_records=selected_records,current_artifacts=sorted(current_artifacts),version_resolver=version,
                 block_request_counts=[turn.get('request_count',1) for turn in turns],
-                material_policy=('current' if config.get('professional_operations') == 'work.v5'
-                    and config['context_protocol'] == 'working.v5' else
-                    'retained' if config.get('professional_operations') == 'work.v5'
+                material_policy=('retained' if config.get('professional_operations') == 'work.v5'
                     and config['context_protocol'] == 'working.v4' else
                     'scoped' if config['context_protocol'] == 'working.v4' else
                     'referenced' if config['context_protocol'] in _REFERENCED_CONTEXT_PROTOCOLS else 'ranked'),

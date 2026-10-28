@@ -11,7 +11,6 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 ### Improved
 
 - Source and manuscript work use the shared action loop directly. Valid previously read text can be reused without first creating a work scope or note.
-- New tasks carry read observations, current artifacts and working notes with less repetition of older model reasoning. Saved tasks retain their original context policy.
 - Feedback and result snapshots retain prior deliveries and actual generated outputs; later diagnostic attachments no longer hide existing work. Progress, production records and current checks remain distinct.
 - Independent review can investigate authorized material, and publication checks the requested export of the same manuscript. Process diagnostics can be read without another command.
 - Organized public documentation into getting started, task guides, references and contribution. Extension setup is part of configuration; cases retain actual costs, while internal acceptance records leave the user guides.

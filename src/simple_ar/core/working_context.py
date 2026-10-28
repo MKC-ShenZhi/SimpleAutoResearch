@@ -40,9 +40,8 @@ def select_working_context(
     summarized_through_turn: int = 0,
     history_access: str = 'read_history',
     trailing_messages: Sequence[Mapping[str, Any]] = (),
-    material_policy: Literal['ranked', 'referenced', 'scoped', 'retained', 'current'] = 'ranked',
+    material_policy: Literal['ranked', 'referenced', 'scoped', 'retained'] = 'ranked',
     operation_history: Sequence[Mapping[str, Any]] | None = None,
-    active_from_turn: int = 0,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Return messages and decision-budget metadata without modifying inputs.
 
@@ -80,23 +79,13 @@ def select_working_context(
     them before optional navigation under the same input target. The caller's
     historical_observation role is a provenance claim: a matching file digest
     does not itself establish that the recorded text is an actual read window.
-
-    ``current`` supplies the latest atomic work, working notes and whole recorded
-    originals read since the working-note update, cited by notes or belonging to
-    the caller's current artifacts. Older provider reasoning is not copied merely
-    to carry its original file observations. Other
-    history remains retrievable, rather than filling spare input capacity. This
-    is a working set, not evidence that unselected material is irrelevant.
-    Admitted note citations report every recorded window's supply status; a
-    citation is not a claim that the original was supplied or inspected.
     """
     if schema_tokens < 0 or context_token_target < 0:
         raise ValueError('Token costs and target must be nonnegative')
-    if material_policy not in ('ranked', 'referenced', 'scoped', 'retained', 'current'):
+    if material_policy not in ('ranked', 'referenced', 'scoped', 'retained'):
         raise ValueError('Unknown working context selection policy')
     scoped_records = material_policy == 'scoped'
-    current_records = material_policy == 'current'
-    retained_records = material_policy in {'retained', 'current'}
+    retained_records = material_policy == 'retained'
     owner_records = material_policy in {'referenced', 'scoped'}
     whole_records = owner_records or retained_records
     context = deepcopy(dict(base_context))
@@ -114,8 +103,6 @@ def select_working_context(
         raise ValueError('Trailing instructions must be user/system text messages')
     if type(summarized_through_turn) is not int or not 0 <= summarized_through_turn <= len(blocks):
         raise ValueError('Summary coverage must be within the original journal')
-    if type(active_from_turn) is not int or not 0 <= active_from_turn <= len(blocks):
-        raise ValueError('Active material boundary must be within the original journal')
     if whole_records:
         summarized_through_turn = 0
     # Only a usable note snapshot can replace repeated historical presentation.
@@ -123,7 +110,6 @@ def select_working_context(
     if not any(note.get('current') is not False and note.get('status') in
                (None, 'current', 'active', 'ok') for note in notes):
         summarized_through_turn = 0
-        active_from_turn = 0
     counts = (list(block_request_counts) if block_request_counts is not None else
               [min(1, len(user_requests))] * len(blocks))
     if (len(counts) != len(blocks) or any(type(n) is not int or not 0 <= n <= len(user_requests)
@@ -169,7 +155,7 @@ def select_working_context(
     latest = next((i for i in reversed(range(len(blocks))) if blocks[i]), None)
     recent = [latest] if latest is not None else []
     native = [message for i in recent for message in blocks[i]]
-    if latest is not None and not current_records:
+    if latest is not None:
         for i in reversed(range(min(summarized_through_turn,latest),latest)):
             if not blocks[i]:
                 continue
@@ -190,7 +176,7 @@ def select_working_context(
     explicit_references = set(selected_records)
     references = set(explicit_references)
     for note in notes:
-        if active(note) or whole_records and not current_records:
+        if whole_records or active(note):
             references.update(note.get('records') or [])
     # Under retained, note records can guide priority without turning every
     # optional note reference into mandatory model-visible bookkeeping.
@@ -295,7 +281,7 @@ def select_working_context(
     reference_indices: dict[str, list[int]] = {}
     if whole_records:
         for i, row in enumerate(rows):
-            if row.get('record') and (current_records or row.get('record') in reported_references):
+            if row.get('record') in reported_references:
                 reference_indices.setdefault(row['record'], []).append(i)
 
     def mark_native() -> None:
@@ -321,11 +307,6 @@ def select_working_context(
             elif (retained_records and state['version_status'] != 'historical'
                   and row.get('role') != 'historical_observation'):
                 state['status'] = 'unavailable'
-            elif (current_records and row.get('record') not in references
-                  and row.get('path') not in artifacts and row.get('absolute_path') not in artifacts
-                  and not (row.get('kind') != 'operation_result'
-                           and isinstance(row.get('turn'), int) and row['turn'] >= active_from_turn)):
-                state['status'] = 'unreferenced'
             else:
                 state['status'] = 'not_attempted' if scoped_records or retained_records else 'capacity'
         view['stale_native_observations'] = [state['source'] for state in states
@@ -335,8 +316,6 @@ def select_working_context(
                           'notes_through_turn':summarized_through_turn,
                           'recent_start_turn': start, 'archive_end_turn': start,
                           'archived_turn_ranges': [[0, start]] if start else []}
-        if current_records:
-            view['history']['active_material_start_turn'] = active_from_turn
 
     def project() -> tuple[list[dict[str, Any]], int]:
         # Selection and model-visible bookkeeping share one admission cost.
@@ -377,10 +356,8 @@ def select_working_context(
             # Required bookkeeping is never clipped to the recent omissions.
             # Keep per-window states: one supplied window cannot hide a gap in
             # another window belonging to the same referenced receipt.
-            displayed_references = reported_references | ({record for note in view['notes']
-                for record in note.get('records', [])} if current_records else set())
             context['material_supply']['references'] = [
-                entry for record in sorted(displayed_references)
+                entry for record in sorted(reported_references)
                 for entry in ([{'record': record, 'status': states[i]['status'],
                                 'version_status': states[i]['version_status'],
                                 'source': states[i]['source']}
@@ -497,8 +474,7 @@ def select_working_context(
         ordered = sorted(range(len(rows)), key=lambda i: (
             int(rows[i].get('record') in references or rows[i].get('path') in artifacts
                 or rows[i].get('absolute_path') in artifacts),
-            int(rows[i].get('kind') != 'operation_result'),
-            *((rows[i].get('turn', -1),) if current_records else ()), *priority(i)), reverse=True)
+            int(rows[i].get('kind') != 'operation_result'), *priority(i)), reverse=True)
     else:
         ordered = ([i for i, row in enumerate(rows) if row.get('record') in references]
                    if owner_records else sorted(range(len(rows)), key=priority, reverse=True))
@@ -515,14 +491,8 @@ def select_working_context(
             else:
                 note_states[i]['status'] = 'working_view'
 
-    if current_records or not retained_records and not owner_records and not summarized_through_turn:
+    if not retained_records and not owner_records and not summarized_through_turn:
         admit_notes()
-        if current_records and sum(active(note) for note in view['notes']) < sum(active(note) for note in notes):
-            # Admission, not journal presence, determines the working set. If
-            # the active snapshot did not fit, earlier reads cannot retire
-            # behind unseen understanding, including a partially admitted note set.
-            active_from_turn = 0
-            mark_native()
     for i in ordered:
         if retained_records or i in preferred:
             admit(i)
@@ -537,9 +507,8 @@ def select_working_context(
             if states[i]['status'] == 'capacity':
                 states[i]['status'] = 'not_attempted'
                 admit(i)
-        if not current_records:
-            admit_notes()
-    if (scoped_records or retained_records) and not current_records:
+        admit_notes()
+    if scoped_records or retained_records:
         # Original bodies share this budget and precede optional navigation.
         admit_navigation()
 
