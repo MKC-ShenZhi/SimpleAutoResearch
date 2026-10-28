@@ -79,6 +79,13 @@ through the existing independent review. An arbitrary process-generated PDF does
 establish publication provenance. Workspace owns reads, copies, version-bound edits and
 approved processes. No nested session or second work-completion state is created.
 
+The same workspace operations can create task-local parsers, analysis scripts,
+plotting code and helper modules, run them after authorization, and return their
+actual outputs to the action loop. Such code is useful intermediate work, not only
+a final deliverable. Reuse existing project code and established libraries first.
+Task-local scripts do not automatically become registered extensions; explicit
+trusted packages use the [local extension interface](LOCAL_EXTENSIONS.md).
+
 New tasks do not register nested `prepare_implementation` or `work_document`
 controllers. Saved `work.v1`/`work.v2`/`work.v3`/`work.v4`, preparation and `outcomes` contracts keep
 their original owners and executable recovery, including candidate admission and
@@ -146,6 +153,12 @@ receipts expose actual source reads through the existing material decoder, while
 coordination receives compact findings. Saved tasks without this field retain
 their original gate. This read-only review is not numerical execution or a
 guarantee of scientific quality.
+
+In the current delivery review, the required inspection target is the manuscript.
+Binding the complete artifact inventory protects versions; it does not prove every
+delivered script, table, image or PDF was independently inspected. Numerical and
+visual checks need their actual observations and applicable operations. Keep this
+scope separate from the model's opinion that its investigation is complete.
 
 Before dispatching that review, delivery validates the producer's actual result:
 required files, current execution inputs and requested publication formats. An

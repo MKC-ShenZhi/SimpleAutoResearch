@@ -9683,12 +9683,137 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
 
     def test_failed_process_retains_diagnostics_without_reporting_success(self) -> None:
         _, _, _, _, app, _ = self._native_fixture()
-        observation = {'returncode': 2, 'stop_reason': None, 'stderr': 'Invalid input schema', 'stdout': ''}
-        with patch.object(app.workspace, '_run', return_value=observation):
-            result = app.workspace.call('run_process', {'argv': ['python', 'check.py']}, identity='failed-process')
+        from simple_ar.core.process import ProcessSpec
+
+        workspace = app.workspace
+        mounts = dict(workspace.mounts)
+        (workspace.workspace / 'draft.md').write_text('Retained manuscript', encoding='utf-8')
+        delivery = {'summary': 'Retained draft', 'artifacts': ['workspace/draft.md'],
+            'report': {'status': 'canonical', 'manuscript': 'workspace/draft.md', 'formats': ['markdown']}}
+        binding = app.operations.delivery_review._binding(delivery)
+        result = workspace.call('run_process', {'argv': ['python', '-c',
+            "import sys; print('checked input'); print('Invalid input schema', file=sys.stderr); sys.exit(2)"]},
+            identity='failed-process')
         self.assertEqual(result.status, 'error')
-        self.assertEqual(result.data, observation)
+        self.assertEqual(result.data['returncode'], 2)
+        self.assertIn('Invalid input schema', result.data['stderr'])
         self.assertNotIn('delivery', result.data)
+        # Rendering uses the same process owner but has no workspace run_process
+        # tool observation. Its real receipt alone must suffice for diagnostic reads.
+        rendered = run_process(ProcessSpec(argv=[sys.executable, '-c',
+            "import sys; print('renderer detail'); print('render failed', file=sys.stderr); sys.exit(3)"],
+            cwd=workspace.workspace, timeout_sec=10,
+            output_dir=workspace.root / 'tools' / 'processes' / 'export-render-1',
+            invocation_id='export-render-1', attempt_id='export'), budget_ledger=workspace.ledger)
+        self.assertEqual(rendered.returncode, 3)
+        ledger = workspace.ledger.to_dict()
+        with patch('simple_ar.core.process.subprocess.Popen', side_effect=AssertionError('Reads must not launch')):
+            for invocation, stdout, stderr in (
+                    ('failed-process', 'checked input', 'Invalid input schema'),
+                    ('export-render-1', 'renderer detail', 'render failed')):
+                directory = workspace.root / 'tools' / 'processes' / invocation
+                (directory / 'input.txt').write_text('Private renderer input', encoding='utf-8')
+                for recursive in (False, True):
+                    listing = workspace.call('list_directory', {'path': str(directory), 'recursive': recursive},
+                        identity='diagnostic-list')
+                    self.assertEqual(listing.status, 'ok', listing.error)
+                    self.assertEqual({Path(row['path']).name for row in listing.data['entries']},
+                        {'invocation.json', 'stdout.log', 'stderr.log'})
+                for name, expected in (('stdout.log', stdout), ('stderr.log', stderr)):
+                    path = directory / name
+                    self.assertEqual(workspace.locator(str(path)), str(path))
+                    first = workspace.call('read_file', {'path': str(path), 'max_bytes': 4}, identity='log-first')
+                    self.assertEqual(first.status, 'ok', first.error)
+                    rest = workspace.call('read_file', {'path': str(path),
+                        'offset_bytes': first.data['next_offset_bytes']}, identity='log-rest')
+                    self.assertEqual(rest.status, 'ok', rest.error)
+                    self.assertEqual((first.data['text'] + rest.data['text']).replace('\r\n', '\n'), expected + '\n')
+                    self.assertEqual(first.data['sha256'], hashlib.sha256(path.read_bytes()).hexdigest())
+                receipt = workspace.call('read_file', {'path': str(directory / 'invocation.json')},
+                    identity='read-invocation')
+                self.assertEqual(receipt.status, 'ok', receipt.error)
+                self.assertEqual(json.loads(receipt.data['text'])['invocation_id'], invocation)
+        self.assertEqual(workspace.ledger.to_dict(), ledger)
+        self.assertEqual(workspace.mounts, mounts)
+        # No added diagnostic mount may change the historical review binding.
+        restored = ToolApplication.load(workspace.root)
+        self.assertEqual(restored.workspace.mounts, mounts)
+        self.assertEqual(restored.operations.delivery_review._binding(delivery), binding)
+        self.assertEqual(binding['authorized_roots'], {name: str(path) for name, path in mounts.items()})
+
+    def test_workspace_process_diagnostics_reject_unrelated_files_and_escaped_receipts(self) -> None:
+        _, inputs, _, _, app, _ = self._native_fixture()
+        workspace, root = app.workspace, app.workspace.root
+        directory = root / 'tools' / 'processes' / 'failed-render'
+        directory.mkdir(parents=True)
+        stderr = directory / 'stderr.log'
+        stderr.write_text('real diagnostic', encoding='utf-8')
+        receipt = directory / 'invocation.json'
+        record = {'schema_version': 'process_invocation.v1', 'invocation_id': directory.name,
+            'streams': {'stderr': {'log_path': str(stderr)}}}
+        write_json(receipt, record)
+        (directory / 'input.txt').write_text('not a log', encoding='utf-8')
+        (directory / '.env').write_text('private', encoding='utf-8')
+        unrecorded = directory.parent / 'unrecorded'
+        unrecorded.mkdir()
+        (unrecorded / 'stderr.log').write_text('orphan', encoding='utf-8')
+        other = root / 'other-task' / 'tools' / 'processes' / directory.name
+        other.mkdir(parents=True)
+        write_json(other / 'invocation.json', record)
+        (other / 'stderr.log').write_text('other task', encoding='utf-8')
+        for path in (root, directory.parent, directory / 'input.txt', directory / '.env',
+                unrecorded / 'stderr.log', other / 'stderr.log',
+                directory / '..' / directory.name / 'stderr.log',
+                Path('tools/processes/failed-render/stderr.log')):
+            with self.subTest(path=path):
+                self.assertNotEqual(workspace.call('read_file', {'path': str(path)},
+                    identity='outside-diagnostics').status, 'ok')
+        for changes in ({'invocation_id': 'different'}, {'schema_version': 'unrecognized'},
+                {'streams': {'stderr': {'log_path': str(other / 'stderr.log')}}}):
+            with self.subTest(changes=changes):
+                write_json(receipt, {**record, **changes})
+                self.assertNotEqual(workspace.call('read_file', {'path': str(stderr)},
+                    identity='invalid-receipt').status, 'ok')
+        write_json(receipt, record)
+        for path in (stderr, receipt, directory / 'new.txt'):
+            with self.subTest(write=path):
+                rejected = workspace.call('write_file', {'path': str(path), 'content': 'replace'},
+                    identity='reject-diagnostic-write')
+                self.assertEqual(rejected.status, 'blocked', rejected.error)
+        # Ordinary source and records locators keep their original resolution.
+        self.assertEqual(workspace.resolve('source0/notes.txt'), inputs / 'notes.txt')
+        attempt = root / 'attempts' / 'retained'
+        attempt.mkdir(parents=True)
+        (attempt / 'log.txt').write_text('retained record', encoding='utf-8')
+        self.assertEqual(workspace.resolve('records/retained/log.txt'), attempt / 'log.txt')
+        self.assertEqual(workspace.call('read_file', {'path': 'records/retained/log.txt'},
+            identity='ordinary-record').data['text'], 'retained record')
+        with self.subTest(boundary='symlink'):
+            try:
+                stderr.unlink()
+                stderr.symlink_to(inputs / 'notes.txt')
+            except OSError as exc:
+                self.skipTest(f'Symlink privilege unavailable: {exc}')
+            self.assertEqual(workspace.call('read_file', {'path': str(stderr)},
+                identity='reject-linked-log').status, 'blocked')
+            stderr.unlink()
+            stderr.write_text('real diagnostic', encoding='utf-8')
+            receipt.unlink()
+            receipt.symlink_to(other / 'invocation.json')
+            self.assertEqual(workspace.call('list_directory', {'path': str(directory)},
+                identity='reject-linked-receipt').status, 'blocked')
+            receipt.unlink()
+            write_json(receipt, record)
+            linked = directory.parent / 'linked-render'
+            linked.symlink_to(directory, target_is_directory=True)
+            self.assertEqual(workspace.call('read_file', {'path': str(linked / 'stderr.log')},
+                identity='reject-linked-directory').status, 'blocked')
+            nested_root = root / 'linked-task'
+            nested_root.mkdir()
+            nested = WorkspaceToolGateway(nested_root, {}, BudgetLedger({}))
+            (nested_root / 'tools').symlink_to(root / 'tools', target_is_directory=True)
+            self.assertEqual(nested.call('read_file', {'path': str(nested_root / 'tools' / 'processes'
+                / directory.name / 'stderr.log')}, identity='reject-linked-tools').status, 'blocked')
 
     def test_invalid_execution_proposal_returns_owner_diagnosis_without_execution(self) -> None:
         for missing in ('invalid_plan', 'unregistered', 'attempt_manifest.json', 'implementation/result.json'):

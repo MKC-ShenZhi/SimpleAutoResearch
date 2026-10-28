@@ -568,10 +568,15 @@ class PublicationToolGateway:
                             env=environment, output_dir=logs, invocation_id=process_id,
                             attempt_id=identity, tail_bytes=12000, log_bytes=2000000), budget_ledger=self.ledger)
                     except BudgetError as exc:
-                        raise ReportExportResourceError(f"Rendering budget unavailable; inspect tools/processes/{process_id}: {exc}") from exc
+                        raise ReportExportResourceError(
+                            f"Rendering budget unavailable: {exc}. Retain the export and process receipts; "
+                            f"inspect {logs / 'invocation.json'} if present before deciding whether to continue.") from exc
                     if result.returncode or result.stop_reason or any(
                             stream["log_bytes_discarded"] for stream in result.record["streams"].values()):
-                        raise ReportExportError(f"Renderer failed or output truncated; inspect tools/processes/{process_id}")
+                        raise ReportExportError(
+                            f"Renderer failed or output truncated; read {logs / 'stdout.log'} and "
+                            f"{logs / 'stderr.log'} for diagnostics, and {logs / 'invocation.json'} "
+                            "for the actual execution record. Retain the failed export; do not replay its identity.")
                     return (logs / "stdout.log").read_text(encoding="utf-8", errors="replace")
 
                 def validate_asset(path):

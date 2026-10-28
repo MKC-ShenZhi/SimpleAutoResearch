@@ -685,7 +685,52 @@ class WorkspaceToolGateway:
         self.record_artifacts = record_artifacts
 
     def resolve(self, value: str, *, write: bool = False) -> Path:
+        diagnostic = self._process_diagnostic_path(value, write=write)
+        if diagnostic is not None:
+            return diagnostic
         return resolve_mounted_path(self.mounts, value, write=write)
+
+    def _process_diagnostic_path(self, value: str, *, write: bool = False) -> Path | None:
+        """Read an invocation's own diagnostics, without changing saved mounts.
+
+        A receipt identifies logs, not execution success or scientific evidence.
+        No task-root alias, process inventory, output directory or replay is granted.
+        """
+        path = Path(value)
+        processes = self.root / 'tools' / 'processes'
+        if not path.is_absolute() or not path.is_relative_to(processes):
+            return None
+        parts = path.relative_to(processes).parts
+        if write or len(parts) not in {1, 2}:
+            raise ValueError('Only invocation diagnostics may be read; no process-root access or writes')
+        # This temporary resolver scope is never published as a mount/binding.
+        # Starting at tools checks its links as well as processes and the leaf.
+        scope = {'diagnostic': self.root / 'tools'}
+        directory = processes / parts[0]
+        receipt = resolve_mounted_path(scope, str(directory / 'invocation.json'), discovery=True)
+        if not receipt.is_file():
+            raise ValueError('Diagnostic directory has no existing process invocation receipt')
+        record = read_json(receipt)
+        if (not isinstance(record, dict) or record.get('schema_version') != 'process_invocation.v1'
+                or record.get('invocation_id') != parts[0]):
+            raise ValueError('Diagnostic directory has no matching process invocation receipt')
+        if len(parts) == 2 and parts[1] != 'invocation.json':
+            if parts[1] not in {'stdout.log', 'stderr.log'}:
+                raise ValueError('Only invocation.json and its recorded stdout/stderr logs are diagnostic files')
+            streams = record.get('streams')
+            stream = streams.get(parts[1][:-4]) if isinstance(streams, dict) else None
+            if not isinstance(stream, dict) or stream.get('log_path') != str(directory / parts[1]):
+                raise ValueError('Diagnostic log is not identified by this process receipt')
+        admitted = resolve_mounted_path(scope, value, discovery=True)
+        if not (admitted.is_dir() if len(parts) == 1 else admitted.is_file()):
+            raise ValueError('Recorded process diagnostic is unavailable')
+        return admitted
+
+    def _diagnostic_visible(self, path: Path) -> bool:
+        try:
+            return self._process_diagnostic_path(str(path)) is not None
+        except (OSError, ValueError):
+            return False
 
     def resolve_material_root(self, value: str) -> Path:
         return resolve_mounted_path(self.mounts, value, discovery=True)
@@ -695,7 +740,7 @@ class WorkspaceToolGateway:
         path = self.resolve(value)
         return min((f'{name}/{path.relative_to(root).as_posix()}'
                     for name, root in self.mounts.items() if path.is_relative_to(root)),
-                   key=lambda locator: (len(locator), locator))
+                   key=lambda locator: (len(locator), locator), default=str(path))
 
     def resolved_versions(self, versions: dict[str, str]) -> dict[Path, str]:
         """Normalize authorized aliases; never read bytes or transfer roles."""
@@ -1176,6 +1221,8 @@ class WorkspaceToolGateway:
                     children = sorted(target.iterdir(), key=lambda p: p.name)
                     children = [p for p in children if not _private_name(p.name)
                                 and fnmatch.fnmatchcase(p.name, model.file_glob)]
+                    if target.is_relative_to(self.root / 'tools' / 'processes'):
+                        children = [p for p in children if self._diagnostic_visible(p)]
                     selected = children[model.offset:model.offset + model.limit]
                     data = {"entries": [{"name": p.name, "path": str(p), "directory": p.is_dir(), "symlink": p.is_symlink()}
                                         for p in selected], "next_offset": model.offset + len(selected),
@@ -1487,7 +1534,9 @@ class WorkspaceToolGateway:
         return text
 
     def _list_files(self, target: Path, request: _List) -> dict[str, Any]:
-        return list_project_files(target, request, resolve=self.resolve, listed_path=self._listed_path)
+        return list_project_files(target, request, resolve=self.resolve, listed_path=self._listed_path,
+            path_allowed=self._diagnostic_visible
+                if target.is_relative_to(self.root / 'tools' / 'processes') else None)
 
     def _listed_path(self, path: Path, requested: str) -> str:
         if not requested:
@@ -1738,14 +1787,16 @@ def bind_project_inventory(project: Path, *, resolve: Any, list_page: Any = None
     return {'project_path': str(project), 'file_hashes': hashes,
         'inventory_scope': 'Complete mounted visible file inventory within bounds; private/runtime paths, symlinks and Python environments are excluded.'}
 
-def list_project_files(target: Path, request: _List, *, resolve: Any, listed_path: Any) -> dict[str, Any]:
+def list_project_files(target: Path, request: _List, *, resolve: Any, listed_path: Any,
+                       path_allowed: Any = None) -> dict[str, Any]:
     if not target.is_dir():
         raise ValueError("Recursive listing requires a mounted directory")
     entries, matched, visited = [], 0, 0
     for directory, dirs, names in os.walk(target, followlinks=False):
         dirs[:] = sorted(d for d in dirs if not _private_name(d)
                          and not (Path(directory) / d).is_symlink()
-                         and not (Path(directory) / d / "pyvenv.cfg").is_file())
+                         and not (Path(directory) / d / "pyvenv.cfg").is_file()
+                         and (path_allowed is None or path_allowed(Path(directory) / d)))
         visited += len(dirs)
         for name in sorted(names):
             visited += 1
@@ -1753,6 +1804,8 @@ def list_project_files(target: Path, request: _List, *, resolve: Any, listed_pat
                 break
             path = Path(directory) / name
             if _private_name(name) or path.is_symlink() or not fnmatch.fnmatchcase(name, request.file_glob):
+                continue
+            if path_allowed is not None and not path_allowed(path):
                 continue
             relative = listed_path(path, request.path)
             path = resolve(relative)
