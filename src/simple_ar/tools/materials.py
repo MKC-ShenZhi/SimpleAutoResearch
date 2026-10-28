@@ -444,7 +444,7 @@ def _content_target(workspace: Any, request: FileWindow, data: dict, source: dic
         'window_sha256': hashlib.sha256(data['text'].encode('utf-8')).hexdigest()}
 
 
-def material_observation_seed(*, workspace: Any, inventories: list[dict],
+def material_observation_seed(*, workspace: Any, inventories: list[dict] | None = None,
                               provider: Callable[[list[str]], list[dict]] | None,
                               roots: list[str], context: dict,
                               excluded_paths: set[str] | None = None,
@@ -469,7 +469,22 @@ def material_observation_seed(*, workspace: Any, inventories: list[dict],
     references = provider(roots)
     if not references:
         return None
-    visible = {path: size for item in inventories for path, size in item['candidate_files'].items()}
+    if inventories is None:
+        # Autonomous consumers may have no caller-picked evidence inventory.
+        # Discover candidates only from actual retained read references; this
+        # does not scan directories, read new material or extend authority.
+        selected = [workspace.resolve_material_root(root) for root in roots]
+        visible = {}
+        for reference in references[:_CONTENT_REUSE_MAX_REFERENCES]:
+            try:
+                path = workspace.resolve_material_root(reference['request']['path'])
+                if path.is_file() and any(path == root or root.is_dir() and path.is_relative_to(root)
+                                          for root in selected):
+                    visible[str(path)] = path.stat().st_size
+            except (ValueError, TypeError, KeyError, OSError):
+                continue
+    else:
+        visible = {path: size for item in inventories for path, size in item['candidate_files'].items()}
     observations, admitted, rejected, seen = [], [], [], set()
     for row in initial_observations or []:
         path, start, end, digest = observed_window_key(workspace,

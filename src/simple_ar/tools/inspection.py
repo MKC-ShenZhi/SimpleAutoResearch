@@ -415,12 +415,15 @@ class InspectionToolGateway:
         subjects = [row for row in saved['evidence']
             if row.get('readable') and row.get('sha256')]
         paths = list(dict.fromkeys(row['path'] for row in subjects))
-        if not paths or remaining[0] <= 0:
+        if remaining[0] <= 0:
             return
+        inventories = ([{'candidate_files': {row['path']: row['windows'][0]['size_bytes']
+                        for row in subjects}}] if paths else None)
         seed = material_observation_seed(workspace=self.workspace,
-            inventories=[{'candidate_files': {row['path']: row['windows'][0]['size_bytes']
-                for row in subjects}}], provider=self.material_observations,
-            roots=paths, context={}, remaining_capacity=min(96000, remaining[0]))
+            inventories=inventories, provider=self.material_observations,
+            roots=paths or [str(root) for root in self.workspace.mounts.values()],
+            excluded_paths={row['path'] for row in saved['targets'] if row.get('path')},
+            context={}, remaining_capacity=min(96000, remaining[0]))
         for observed in (seed or {}).get('observations', []):
             data, request = observed['data'], observed['request']
             path = data.get('absolute_path') or data.get('path') or request['path']
@@ -431,8 +434,20 @@ class InspectionToolGateway:
             start = data.get('offset_bytes', request.get('offset_bytes', 0))
             end = data['next_offset_bytes']
             owners = [row for row in subjects if row['path'] == path and row['sha256'] == data['sha256']]
-            if not owners or end-start > remaining[0]:
+            if end-start > remaining[0]:
                 continue
+            if not owners:
+                # The shared byte owner validated this historical source and
+                # its current version. Preserve that reference, not a fresh
+                # model claim or an inherited inspection verdict.
+                number = max((int(row['subject'].split('-')[1])
+                              for row in saved['evidence']), default=0) + 1
+                row = {'subject': f"evidence-{number}",
+                    'request': request, 'path': path, 'sha256': data['sha256'],
+                    'readable': True, 'complete': False, 'windows': []}
+                saved['evidence'].append(row)
+                subjects.append(row)
+                owners = [row]
             admitted = False
             for row in owners:
                 if any(w['offset_bytes'] <= start and end <= w['review_next_offset_bytes']

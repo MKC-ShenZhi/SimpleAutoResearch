@@ -134,6 +134,10 @@ successful reads inside failed opinions. Supporting evidence can reuse these win
 only after the original receipt and current permission/version/range checks. Target
 reading and verdicts are not inherited. Reused bodies are optional observations in
 the same context selector, not another pinned input block or memory store.
+When a fresh review has no caller-selected evidence list, the same decoder derives
+eligible sources from retained read receipts within current mounts. It neither scans
+directories nor reads previously unobserved originals. Target files are excluded
+from supporting-source reuse, and cached inspection inputs remain unchanged.
 Fresh inspections freeze the original user requests and feedback separately from the
 local inspection goal. The shared context selector accounts for both. Requirements
 are neither evidence nor permission; a narrow inspection does not certify the whole

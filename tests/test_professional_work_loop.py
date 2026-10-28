@@ -2008,6 +2008,10 @@ class OperationsWorkLoopTests(unittest.TestCase):
         failed = self._inspect(['draft.md'], ['basis.txt'])
         self.assertEqual(failed['status'], 'error', failed)
         self.assertEqual(len(self.inspection_requests)-initial, 3)
+        failed_identity = Path(failed['data']['record']).parts[1]
+        failed_records = self._versions(self.root/f'tools/inspection/{failed_identity}')
+        old_receipts = {self.root/item['result']: (self.root/item['result']).read_bytes()
+            for turn in self.app.state['turns'] for item in turn['tools']}
         ledger = self.app.ledger.to_dict()
         references = self.app._material_observations(['basis.txt', 'lines.txt'])
         observed = [validate_material_observation(self.app.workspace, row, identity='reuse-check')
@@ -2027,9 +2031,15 @@ class OperationsWorkLoopTests(unittest.TestCase):
                              'Explain the revised result against original conditions.\n')
             self.assertEqual([row['observation']['text']
                 for row in view['working_view']['observations']].count(basis), 1)
-            return {'findings': [], 'limitations': []}
+            sources = [row['observation'] for row in view['working_view']['observations']]
+            line_text = 'First measured condition\nSecond measured condition\n'
+            self.assertEqual([row['text'] for row in sources].count(line_text), 1)
+            return {'decisions': [{'subject': 'target-1', 'findings': [], 'limitations': [],
+                'evidence': list(dict.fromkeys(row['subject'] for row in sources
+                    if row['text'] in (basis, line_text)))}]}
         self.review = revised
-        result = self._inspect(['revision.md'], ['basis.txt', 'lines.txt'])
+        self._reload()
+        result = self._inspect(['revision.md'], [])
         self.assertEqual(result['status'], 'ok', result)
         self.assertEqual(len(self.inspection_requests)-before, 1,
                          'Previously observed supporting bytes need no new model read requests')
@@ -2038,6 +2048,29 @@ class OperationsWorkLoopTests(unittest.TestCase):
         saved = self.app.session.store.read_json(f'tools/inspection/{identity}/input.json')
         self.assertFalse(any(w.get('source_reference') for row in saved['targets'] for w in row['windows']))
         self.assertTrue(any(w.get('source_reference') for row in saved['evidence'] for w in row['windows']))
+        self.assertEqual(saved['arguments']['evidence'], [])
+        self.assertEqual(_assessments(result)[0]['evidence_sha256'], {
+            str(self.root/'workspace'/name): _digest(self.root/'workspace'/name)
+            for name in ('basis.txt', 'lines.txt')})
+        # Newly available reads belong to a new inspection, not to an already
+        # started identity. Reopening this successful empty-evidence call must
+        # return its frozen result without reseeding or spending again.
+        completed_records = self._versions(self.root/f'tools/inspection/{identity}')
+        self._read('measurements/conditions.txt')
+        calls, current_ledger = self.send.call_count, self.app.ledger.to_dict()
+        completed = self.app.operations.inspection.call('inspect_artifacts', saved['arguments'], identity)
+        self.assertEqual(completed.model_dump(mode='json'), result)
+        self.assertEqual(self._versions(self.root/f'tools/inspection/{identity}'), completed_records)
+        cached = self.app.operations.inspection.call('inspect_artifacts',
+            {'goal': 'Check the claims against supplied observations',
+             'targets': ['draft.md'], 'evidence': ['basis.txt']}, failed_identity)
+        self.assertFalse(cached.ok, cached)
+        self.assertEqual(self.send.call_count, calls)
+        self.assertEqual(self.app.ledger.to_dict(), current_ledger)
+        self.assertEqual(current_ledger['entries'][:len(ledger['entries'])], ledger['entries'])
+        self.assertEqual(self._versions(self.root/f'tools/inspection/{failed_identity}'), failed_records)
+        for path, raw in old_receipts.items():
+            self.assertEqual(path.read_bytes(), raw)
 
         # Changed sources retain their old receipts, but not their old bodies in
         # the next professional view. No verdict or stale content is inherited.
@@ -2050,7 +2083,133 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 for row in view['working_view']['observations']])
             return {'findings': [], 'limitations': []}
         self.review = changed
-        self._inspect(['revision.md'], ['basis.txt'])
+        self._inspect(['revision.md'], [])
+
+    def test_delivery_review_with_empty_evidence_reuses_journal_sources_and_reads_current_target(self):
+        self._create()
+        old_body = 'The sample mean is 2.0 across three supplied observations.\n'
+        current_body = old_body + 'These observations do not support population inference.\n'
+        self._write('report.md', old_body)
+        source = self._read('measurements/observations.csv')
+        original_receipts = {self.root/item['result']: (self.root/item['result']).read_bytes()
+            for turn in self.app.state['turns'] for item in turn['tools']}
+        self._inspect(['report.md'], [])
+        prior = self._ok('inspect_artifacts')
+        prior_identity = Path(prior['data']['record']).parts[1]
+        prior_records = self._versions(self.root/f'tools/inspection/{prior_identity}')
+        self._submit(_action('write_file', path='report.md', content=current_body,
+            expected_sha256=_digest(self.root/'workspace/report.md')))
+        self._ok('write_file')
+        # An unread attachment is in the delivery inventory, but is not thereby
+        # a source observation or a separately passed inspection target.
+        self._write('method.txt', 'Unreviewed method attachment.\n')
+        self._reload()
+        before = len(self.inspection_requests)
+        old_entries = [entry.to_dict() for entry in self.app.ledger.entries]
+
+        def review(view):
+            self.assertEqual(len(view['targets']), 1)
+            target, = view['targets']
+            self.assertTrue(target['complete'])
+            self.assertEqual(''.join(w['text'] for w in target['text_windows']), current_body)
+            sources = [row['observation'] for row in view['working_view']['observations']]
+            observed, = [row for row in sources if row['path'] == source['absolute_path']]
+            self.assertEqual(observed['text'], source['text'])
+            self.assertEqual(observed['sha256'], source['sha256'])
+            self.assertNotIn(target['path'], [row['path'] for row in sources])
+            self.assertNotIn('Unreviewed method attachment.\n', [row['text'] for row in sources])
+            return {'decisions': [{'subject': target['subject'], 'evidence': [observed['subject']],
+                'findings': [], 'limitations': ['The method attachment was not independently checked.']}]}
+
+        self.review = review
+        self.decisions.append(_action('deliver_result', **self._delivery('report.md', 'method.txt')))
+        self._run(should_stop=lambda: False)
+        self.assertEqual(self.app.session.manifest.status, 'completed', self.app.result_snapshot())
+        reviewed = self._ok('deliver_result')['metadata']['delivery_review']['result']
+        self.assertEqual(len(self.inspection_requests)-before, 1,
+            'Ordinary whole-delivery review should receive already-read support on its first request')
+        self.assertEqual(_assessments(reviewed)[0]['subjects'],
+            {str(self.root/'workspace/report.md'): _digest(self.root/'workspace/report.md')})
+        self.assertEqual(_assessments(reviewed)[0]['evidence_sha256'],
+            {source['absolute_path']: source['sha256']})
+        self.assertEqual(len(_assessments(reviewed)), 1)
+        identity = Path(reviewed['data']['record']).parts[1]
+        saved = self.app.session.store.read_json(f'tools/inspection/{identity}/input.json')
+        self.assertEqual(saved['arguments']['evidence'], [])
+        self.assertEqual(saved['arguments']['targets'], [str(self.root/'workspace/report.md')])
+        self.assertFalse(any(w.get('source_reference') for row in saved['targets'] for w in row['windows']))
+        self.assertTrue(any(w.get('source_reference') for row in saved['evidence'] for w in row['windows']))
+        self.assertEqual(self._versions(self.root/f'tools/inspection/{prior_identity}'), prior_records)
+        self.assertEqual([entry.to_dict() for entry in self.app.ledger.entries][:len(old_entries)], old_entries)
+        for path, raw in original_receipts.items():
+            self.assertEqual(path.read_bytes(), raw)
+
+    def test_empty_evidence_reuse_respects_current_access_versions_and_whole_window_capacity(self):
+        from dataclasses import replace
+
+        # Isolate seed's 96000-character whole-window allowance from the
+        # separate model-view token budget. This fixture has no paid transport.
+        self.services.llm_client = LLMClient(replace(self.services.llm_client._settings,
+            context_input_tokens=500000))
+        self._create()
+        self._write('report.md', 'Check only available supporting observations.\n')
+        stale = 'Historical source bytes must not reappear.\n'
+        self._write('stale.txt', stale)
+        self._read('stale.txt')
+        revoked = self._read('measurements/conditions.txt')['text']
+        self._submit(_action('write_file', path='stale.txt', content='Current unread replacement.\n',
+            expected_sha256=_digest(self.root/'workspace/stale.txt')))
+        self._ok('write_file')
+        # Two original windows exceed the common optional 96000-character
+        # allowance together. Retain whole receipts; never invent a clipped read.
+        bodies = ['First retained source. '+('a '*31000), 'Second retained source. '+('b '*31000)]
+        for index, body in enumerate(bodies):
+            self._write(f'large-{index}.txt', body)
+            self._submit(_action('read_file', path=f'large-{index}.txt', max_bytes=64000, full_digest=True))
+            self.assertEqual(self._ok('read_file')['data']['text'], body)
+        private = self.root/'workspace/.env'
+        outside = self.directory/'outside.txt'
+        private.write_text('Private bytes are not supporting observations.\n', encoding='utf-8')
+        outside.write_text('Outside bytes are not supporting observations.\n', encoding='utf-8')
+        for path in (str(private), str(outside)):
+            self._submit(_action('read_file', path=path, full_digest=True))
+            self.assertNotEqual(self._last('read_file')['status'], 'ok')
+        retained = {self.root/item['result']: (self.root/item['result']).read_bytes()
+            for turn in self.app.state['turns'] for item in turn['tools']}
+        entries = [entry.to_dict() for entry in self.app.ledger.entries]
+
+        def review(view):
+            sources = [row['observation'] for row in view['working_view']['observations']]
+            texts = [row['text'] for row in sources]
+            for forbidden in (stale, revoked, private.read_text(), outside.read_text(),
+                              'Current unread replacement.\n'):
+                self.assertNotIn(forbidden, texts)
+            admitted = [text for text in texts if text in bodies]
+            self.assertEqual(len(admitted), 1, 'Only one whole original window fits optional capacity')
+            self.assertLessEqual(sum(len(text) for text in texts), 96000)
+            self.assertTrue(all(row['text'] in bodies for row in sources))
+            return {'decisions': [{'subject': 'target-1', 'conclusion': 'incomplete',
+                'evidence': list(dict.fromkeys(row['subject'] for row in sources)), 'findings': [],
+                'limitations': ['Revoked, stale and omitted sources cannot complete this investigation.']}]}
+
+        self.review = review
+        # Remove an existing source grant without editing its original receipts.
+        # Revoke the external grant, not the internal journal needed to verify
+        # every retained source. Removing records too correctly admits nothing.
+        with patch.dict(self.app.workspace.mounts, {name: root for name, root
+                in self.app.workspace.mounts.items() if name != 'measurements'}, clear=True):
+            result = self._inspect(['report.md'], [])
+        self.assertEqual(result['status'], 'ok', result)
+        self.assertEqual(_assessments(result)[0]['verdict'], 'incomplete')
+        identity = Path(result['data']['record']).parts[1]
+        saved = self.app.session.store.read_json(f'tools/inspection/{identity}/input.json')
+        seeded = [window['text'] for row in saved['evidence'] for window in row['windows']
+            if window.get('source_reference')]
+        self.assertEqual(len(seeded), 1, 'Seed itself admits only one whole original window')
+        self.assertIn(seeded[0], bodies)
+        self.assertEqual([entry.to_dict() for entry in self.app.ledger.entries][:len(entries)], entries)
+        for path, raw in retained.items():
+            self.assertEqual(path.read_bytes(), raw)
 
     def test_inspector_locates_missing_sources_within_one_version_bound_operation(self):
         self._create(report=True)
@@ -2782,7 +2941,25 @@ class OperationsWorkLoopTests(unittest.TestCase):
             [{'path':'./notes.md','max_bytes':12000}])
         self.assertEqual(self._assessment()['verdict'], 'passed')
         view = self.inspection_views[-1]
-        self.assertEqual(view['evidence'], [])
+        self.assertEqual(view['goal'], 'Check the claims against supplied observations')
+        target, = view['targets']
+        self.assertEqual(target['path'], str(self.root/'workspace/notes.md'))
+        self.assertNotIn(target['path'], [row['path'] for row in view['evidence']])
+        # Optional journal sources may now be present, but neither this target
+        # nor a copy of its bytes may become independent support for itself.
+        terminal = next(tool['function']['parameters']
+            for tool in self.inspection_requests[-1]['tools']
+            if tool['function']['name'] == 'record_inspection')
+        branch, = terminal['properties']['decisions']['items']['anyOf']
+        eligible = branch['properties']['evidence']['items'].get('enum', [])
+        self.assertNotIn(target['subject'], eligible)
+        for row in view['evidence']:
+            if row.get('sha256') == target['sha256']:
+                self.assertNotIn(row['subject'], eligible)
+        assessment = self._assessment()
+        for name in ('notes.md', 'claimed-evidence.md'):
+            self.assertNotIn(str(self.root/'workspace'/name), assessment['evidence_sha256'])
+        self.assertIn(limitation, assessment['limitations'])
         self.assertIn((self.root/'workspace/notes.md').read_text(),
             [window['text'] for window in view['targets'][0]['text_windows']])
         self.assertFalse(self._process_receipts())
