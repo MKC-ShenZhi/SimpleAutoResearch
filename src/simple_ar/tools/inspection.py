@@ -265,8 +265,14 @@ class InspectionToolGateway:
         if saved.get('protocol') != self.protocol:
             raise ValueError('Inspection identity is bound to a different protocol; no replay')
         for number, digest in enumerate(saved.get('source_rounds', [])):
-            if self._digest(self._path(identity, f'sources-{number}')) != digest:
+            trace_path = self._path(identity, f'sources-{number}')
+            if self._digest(trace_path) != digest:
                 raise ValueError('Inspection source investigation record changed; no replay')
+            for path, expected in self.store.read_json(trace_path).get('checkpoint', {}).items():
+                if self._digest(path) != expected:
+                    raise ValueError('Inspection checkpoint record changed; no replay')
+        if saved.get('memory_protocol') == 'journal.v1':
+            self._conversation_memory(saved, self._conversation_rows(saved))
         result = ToolResult.model_validate(self.store.read_json(result_path))
         binding = result.metadata['inspection_binding']
         key = 'assessments' if self.protocol else 'assessment'
@@ -783,7 +789,8 @@ class InspectionToolGateway:
                     'next_offset_bytes':window['review_next_offset_bytes'], 'size_bytes':window['size_bytes'],
                     'text':window.get('review_text',window['text'])} for window in row['windows']
                     if source_result or not window.get('source_reference')]
-                    if row.get('readable') and (self.protocol or role=='targets' or row['independent']) else []}
+                    if row.get('readable') and (self.protocol or role=='targets' or row['independent'])
+                        and (source_result or role == 'targets' or saved.get('memory_protocol') != 'journal.v1') else []}
                 for row in saved[role]]
             if self.progressive:
                 all_rows = [*saved['targets'], *saved['evidence']]
@@ -813,6 +820,7 @@ class InspectionToolGateway:
         if 'inspection_context_policy' in saved and policy != 'retained.v1':
             raise ValueError('Unknown inspection context policy')
         retained = self.adaptive and policy == 'retained.v1'
+        continuity = retained and saved.get('memory_protocol') == 'journal.v1'
 
         def version(path: str) -> str | None:
             # artifact_hashes resolves current mount/private-path authority before
@@ -854,16 +862,23 @@ class InspectionToolGateway:
         # ordinary work. Retiring a native turn must not retire its only usable
         # source body while unused input capacity remains. Original read IDs,
         # decoded ranges and receipts remain the authority for adoption.
-        observations = [{'record':self._path(saved['identity'], 'input'),
-            'chunk_id':f"{row['subject']}:{index}", 'subject':row['subject'],
-            'path':row['path'], 'sha256':row['sha256'], 'kind':'source_text',
-            **({'role':'historical_observation'} if retained else {}),
-            'turn':read_turns.get(row['subject']), 'offset_bytes':window['offset_bytes'],
-            'next_offset_bytes':window['review_next_offset_bytes'],
-            'size_bytes':window['size_bytes'], 'text':window.get('review_text',window['text'])}
-            for row in saved['evidence'] if row.get('readable')
-            for index, window in enumerate(row['windows'])
-            if row['subject'] not in saved.get('initial_subjects', []) or window.get('source_reference')]
+        memory, notes = None, []
+        if continuity:
+            memory, observations = self._conversation_material(saved)
+            for note in memory['notes']:
+                current = all(version(path) == digest for path, digest in note['observed_versions'].items())
+                notes.append({**note, 'current':current})
+        else:
+            observations = [{'record':self._path(saved['identity'], 'input'),
+                'chunk_id':f"{row['subject']}:{index}", 'subject':row['subject'],
+                'path':row['path'], 'sha256':row['sha256'], 'kind':'source_text',
+                **({'role':'historical_observation'} if retained else {}),
+                'turn':read_turns.get(row['subject']), 'offset_bytes':window['offset_bytes'],
+                'next_offset_bytes':window['review_next_offset_bytes'],
+                'size_bytes':window['size_bytes'], 'text':window.get('review_text',window['text'])}
+                for row in saved['evidence'] if row.get('readable')
+                for index, window in enumerate(row['windows'])
+                if row['subject'] not in saved.get('initial_subjects', []) or window.get('source_reference')]
         if 'user_requests' in saved:
             # The shared projector pins exact user text; the coordinator's local
             # inspection goal stays a separately labelled scope in base context.
@@ -884,12 +899,199 @@ class InspectionToolGateway:
             context_token_target=target,estimate_tokens=estimate_tokens,
             material_policy='retained' if retained else 'ranked',
             version_resolver=version if retained else None,
+            **({'work_notes':notes, 'require_work_notes':True,
+                'summarized_through_turn':min(memory['through_turn'], len(blocks)),
+                'current_artifacts':[row['path'] for row in saved['targets']]} if continuity else {}),
             history_access='read_file at the recorded authorized source path and range',
             trailing_messages=[finish] if finish is not None else [])
         if validate_capacity and metadata['estimated_input_tokens'] > target:
             raise ValueError('Inspection working view cannot fit its model input target; '
                 'retain observations and narrow the requested inspection scope')
         return messages, metadata
+
+    def _conversation_rows(self, saved: dict) -> list[dict]:
+        """Exact closed source results from this role's original round journal."""
+        rows = []
+        for number, digest in enumerate(saved.get('source_rounds', [])):
+            path = self._path(saved['identity'], f'sources-{number}')
+            if self._digest(path) != digest:
+                raise ValueError('Inspection source investigation record changed; no replay')
+            trace = self.store.read_json(path)
+            response = trace.get('response')
+            if not trace.get('completed') or not response:
+                continue
+            call_id = 'inspect-artifacts-'+saved['identity'] + (f'-sources-{number}' if number else '')
+            usage = [entry.to_dict() for entry in self.workspace.ledger.entries
+                if entry.attempt_id == saved['identity'] and entry.logical_call_id == call_id]
+            if not any(entry['status'] == 'settled' for entry in usage) or not self._accounted(usage):
+                continue
+            calls, results = response.get('tool_calls') or [], trace['results']
+            if [row['call_id'] for row in results] != [call['id'] for call in calls]:
+                continue  # A response with unfinished tool work is not closed.
+            for index, row in enumerate(results):
+                rows.append({'turn':number, 'record':path+f'#results/{index}',
+                    'arguments':row['arguments'], 'result':row['result']})
+            if not calls:
+                rows.append({'turn':number, 'record':path+'#response', 'arguments':{}, 'records':[],
+                    'result':{'tool_name':'assistant_reply', 'data':response}})
+        return rows
+
+    @staticmethod
+    def _bind_conversation_notes(notes: list, rows: list) -> list:
+        originals = {row['record']:row['result'] for row in rows}
+        bound = []
+        for note in notes:
+            versions = {}
+            for record in note['records']:
+                if record not in originals:
+                    raise ValueError('Inspection note references work outside its source journal')
+                result = originals[record]
+                data = result.get('data') or {}
+                if result.get('tool_name') == 'read_file' and result.get('status') == 'ok':
+                    versions[data['path']] = data['sha256']
+            bound.append({**note, 'observed_versions':versions, 'scope':'model_note_not_verified_evidence'})
+        return bound
+
+    def _conversation_memory(self, saved: dict, rows: list) -> dict:
+        from simple_ar.app.professional_conversation import ProfessionalConversation
+        from simple_ar.app.work_memory import checkpoint_artifacts, checkpoint_entries
+        memory = {'notes':[], 'through_turn':0, 'compacted_records':set()}
+        originals = {row['record']:row for row in rows}
+        operations = lambda turn:{row['record']:row['arguments'] for row in rows if row['turn'] == turn}
+        sessions = {entry.session_id for entry in self.workspace.ledger.entries
+            if entry.attempt_id == saved['identity'] and entry.status == 'settled'
+            and entry.logical_call_id == 'inspect-artifacts-'+saved['identity']}
+        for number in range(len(saved.get('source_rounds', []))):
+            trace = self.store.read_json(self._path(saved['identity'], f'sources-{number}'))
+            recorded = trace.get('checkpoint', {})
+            if not recorded:
+                continue
+            for path, digest in recorded.items():
+                if self._digest(path) != digest:
+                    raise ValueError('Inspection checkpoint record changed; no replay')
+            store = ArtifactStore(self.root/f"tools/inspection/{saved['identity']}/sources-{number}")
+            call_id = f"working-memory-{saved['identity']}-sources-{number}"
+            if len(sessions) != 1:
+                raise ValueError('Inspection checkpoint has no unique original conversation session')
+            session_id, = sessions
+            try:
+                checkpoint_entries(self.workspace.ledger, saved['identity'],
+                    session_id, call_id=call_id)
+            except ValueError:
+                continue  # Unknown/inflight work is not adopted and its fees remain.
+            view = store.read_json('memory_input.json')
+            if view['requests'] != saved.get('user_requests', [saved['arguments']['goal']]):
+                raise ValueError('Inspection checkpoint changed its original requests')
+            for row in view['observations']:
+                original = originals.get(row['record'])
+                if (original is None or original['turn'] >= number
+                        or row['turn'] != original['turn'] or row.get('arguments', {}) != original['arguments']
+                        or row.get('truncated') is not False
+                        or json.loads(row['observation_text']) != original['result']):
+                    raise ValueError('Inspection checkpoint disagrees with its closed source receipt')
+            refs = checkpoint_artifacts(store=store, ledger=self.workspace.ledger, attempt_id=saved['identity'],
+                session_id=session_id, call_id=call_id,
+                bind_notes=lambda notes:self._bind_conversation_notes(notes, rows))
+            expected = {store.resolve(ref.path).relative_to(self.store.root).as_posix() for ref in refs}
+            if set(recorded) != expected or view['archive_through_turn'] > number:
+                raise ValueError('Inspection checkpoint artifacts exceed their recorded round scope')
+            memory = ProfessionalConversation.adopt(previous=memory, view=view, operations_for_turn=operations,
+                snapshot=store.read_json('memory_snapshot.json') if store.exists('memory_snapshot.json') else None,
+                failure=store.read_json('memory_failure.json') if store.exists('memory_failure.json') else None)
+        return memory
+
+    def _conversation_material(self, saved: dict) -> tuple[dict, list]:
+        """Adapt original owner-bound read windows, never another role's notes."""
+        rows = self._conversation_rows(saved)
+        memory = self._conversation_memory(saved, rows)
+        sources = {}
+        for row in rows:
+            data = row['result'].get('data') or {}
+            if row['result'].get('tool_name') == 'read_file' and row['result'].get('status') == 'ok':
+                for window in data.get('text_windows', []):
+                    sources[(data['subject'], window['offset_bytes'], window['next_offset_bytes'], window['text'])] = row
+        observations = []
+        # Primary target text remains required domain input. Supplementary
+        # source text has exactly one owner: the common material selector.
+        for row in saved['evidence']:
+            if not row.get('readable'):
+                continue
+            for window in row['windows']:
+                text = window.get('review_text', window['text'])
+                source = sources.get((row['subject'], window['offset_bytes'], window['review_next_offset_bytes'], text))
+                observations.append({'record':source['record'] if source else self._path(saved['identity'], 'input'),
+                    'subject':row['subject'],
+                    'path':row['path'], 'sha256':row['sha256'], 'kind':'source_text',
+                    'role':'historical_observation', 'turn':source['turn'] if source else None,
+                    'offset_bytes':window['offset_bytes'], 'next_offset_bytes':window['review_next_offset_bytes'],
+                    'size_bytes':window['size_bytes'], 'text':text})
+        return memory, observations
+
+    def _prepare_conversation_round(self, saved, request, messages, tools, terminal, finish,
+                                    client, number, remaining):
+        from simple_ar.app.professional_conversation import ConversationInput, ProfessionalConversation
+        from simple_ar.app.work_memory import compact_work
+        conversation = ProfessionalConversation(client)
+        trace = self._path(saved['identity'], f'sources-{number}')
+
+        def project(closing):
+            offered = [terminal] if closing else [*tools, terminal]
+            projected, metadata = self._working_messages(saved, request, messages, offered, client,
+                finish=finish if closing else None)
+            return ConversationInput(projected, offered, metadata)
+
+        def checkpoint(value, decision_tokens):
+            rows = self._conversation_rows(saved)
+            memory = self._conversation_memory(saved, rows)
+            cutoff = value.projection['recent_start_turn']
+            pending = [row for row in rows if row['turn'] < cutoff
+                and row['record'] not in memory['compacted_records']]
+            store = ArtifactStore(self.root/f"tools/inspection/{saved['identity']}/sources-{number}")
+            try:
+                compact_work(store=store, client=client, requests=saved.get('user_requests', [request.goal]),
+                    previous=memory, rows=pending, bind_notes=lambda notes:self._bind_conversation_notes(notes, rows),
+                    estimate_tokens=estimate_tokens, attempt_id=saved['identity'],
+                    call_id=f"working-memory-{saved['identity']}-sources-{number}",
+                    required_decision_tokens=decision_tokens, additional_protection=True)
+            finally:
+                # Bind all paid work, even when the following model turn fails.
+                # These are checkpoint artifacts in the original round journal,
+                # not an adopted-note cache or a second progress watermark.
+                record = self.store.read_json(trace)
+                record['checkpoint'] = {path.relative_to(self.store.root).as_posix():
+                    hashlib.sha256(path.read_bytes()).hexdigest()
+                    for name in ('memory_input.json', 'memory_response.json', 'memory_snapshot.json', 'memory_failure.json')
+                    if (path := store.resolve(name)).exists()}
+                self.store.write_json(trace, record)
+                saved['source_rounds'][number] = self._digest(trace)
+                self.store.write_json(self._path(saved['identity'], 'input'), saved)
+
+        value = conversation.prepare(project, checkpoint=checkpoint,
+            followup=lambda value:{'llm_requests':1, 'total_tokens':conversation.tokens(project(True))},
+            force_close=remaining[0] <= 0, additional=True)
+        return conversation, value
+
+    def _legacy_inspection_input(self, saved, request, messages, tools, terminal, client, finish, number, remaining):
+        """Saved non-journal owners retain their original source bounds."""
+        def tokens(history, offered):
+            return (estimate_tokens(json.dumps(history, ensure_ascii=False))
+                + estimate_tokens(json.dumps(offered, ensure_ascii=False))
+                + (client.effective_output_limit() or 0))
+        projected, final_history = messages, [*messages, finish]
+        projection = final_projection = None
+        if self.progressive:
+            projected, projection = self._working_messages(saved, request, messages, [*tools, terminal], client)
+            final_history, final_projection = self._working_messages(saved, request, messages, [terminal], client, finish=finish)
+        final_tokens = tokens(final_history, [terminal])
+        slots, capacity = self.workspace.ledger.remaining('llm_requests'), self.workspace.ledger.remaining('total_tokens')
+        terminal_only = (not self.adaptive and number == 6
+            or self.adaptive and remaining[0] <= 0 or slots is not None and slots < 2
+            or capacity is not None and capacity < final_tokens + tokens(projected, [*tools, terminal]))
+        if terminal_only:
+            messages.append(finish)
+        return (final_history if terminal_only else projected,
+            [terminal] if terminal_only else [*tools, terminal],
+            final_projection if terminal_only else projection, terminal_only, final_tokens)
 
     def _prime_targets(self, saved: dict, request: InspectionRequest, identity: str,
                        remaining: list[int], client: Any, offered: list) -> None:
@@ -961,10 +1163,6 @@ class InspectionToolGateway:
             'Source gathering has ended; no additional reads will execute. Submit record_inspection now. '
             'For necessary claims not supported by the observed evidence, record concrete required '
             'findings; disclose other remaining scope in limitations. Do not claim unread sources were checked.')}
-        def tokens(history: list, offered: list) -> int:
-            return (estimate_tokens(json.dumps(history,ensure_ascii=False))
-                + estimate_tokens(json.dumps(offered,ensure_ascii=False))
-                + (client.effective_output_limit() or 0))
         number = 0
         invalid_finals = 0
         while True:
@@ -994,43 +1192,42 @@ class InspectionToolGateway:
                 del schema['$defs']['_ReviewDecision']
                 terminal['function']['parameters'] = schema
             label = f'inspect-artifacts-{identity}' + (f'-sources-{number}' if number else '')
-            if {'llm_requests','total_tokens'}.intersection(ledger.unknown_dimensions(
+            if saved.get('memory_protocol') != 'journal.v1' and {'llm_requests','total_tokens'}.intersection(ledger.unknown_dimensions(
                     unbounded_only=True, current_allowance_only=True)):
                 raise ValueError('Inspection capacity is unknown; retain records without further requests')
-            # The caller's floor is already withheld by this same ledger. Own
-            # the final opinion as well: a gathering call (including retries)
-            # may not spend that capacity. Source results and uncapped output
-            # can grow beyond estimates; a floor is not a completion promise.
-            projected = messages
-            final_history = [*messages,finish]
-            projection = None
-            final_projection = None
-            if self.progressive:
-                projected, projection = self._working_messages(saved,request,messages,[*tools,terminal],client)
-                final_history, final_projection = self._working_messages(saved,request,messages,[terminal],client,finish=finish)
-            final_tokens = tokens(final_history,[terminal])
-            slots, capacity = ledger.remaining('llm_requests'), ledger.remaining('total_tokens')
-            terminal_only = (not self.adaptive and number==6
-                or self.adaptive and remaining[0]<=0 or slots is not None and slots<2
-                or capacity is not None and capacity<final_tokens+tokens(projected,[*tools,terminal]))
-            if terminal_only:
-                messages.append(finish)
-            offered = [terminal] if terminal_only else [*tools,terminal]
-            call_messages = final_history if terminal_only else projected
             trace = self._path(identity,f'sources-{number}')
+            conversation = None
+            if saved.get('memory_protocol') == 'journal.v1':
+                self.store.write_json(trace, {'results':[], 'completed':False})
+                saved.setdefault('source_rounds', []).append(self._digest(trace))
+                self.store.write_json(input_path, saved)
+                conversation, value = self._prepare_conversation_round(saved, request, messages,
+                    tools, terminal, finish, client, number, remaining)
+                call_messages, offered, projection, terminal_only = value.messages, value.tools, value.projection, value.closing
+            else:
+                call_messages, offered, projection, terminal_only, final_tokens = self._legacy_inspection_input(
+                    saved, request, messages, tools, terminal, client, finish, number, remaining)
+            checkpoint_record = self.store.read_json(trace).get('checkpoint', {}) if conversation else {}
             working_input = {'messages':call_messages,
-                'projection':final_projection if terminal_only else projection} if self.progressive else {}
+                'projection':projection} if self.progressive else {}
             if self.progressive:
                 self.store.write_json(trace,{'working_input':working_input,'results':[],
-                    'usage':self._usage(identity),'completed':False})
-                saved.setdefault('source_rounds',[]).append(self._digest(trace))
+                    'usage':self._usage(identity),'completed':False,
+                    **({'checkpoint':checkpoint_record} if conversation else {})})
+                if conversation:
+                    saved['source_rounds'][number] = self._digest(trace)
+                else:
+                    saved.setdefault('source_rounds',[]).append(self._digest(trace))
                 self.store.write_json(input_path,saved)
-            with ledger.protect_remaining({} if terminal_only else
-                    {'llm_requests':1,'total_tokens':final_tokens},additional=True):
-                response = turn(call_messages,tools=offered,
-                    label=label,budget_call_id=label)
+            if conversation:
+                response = conversation.call(value, label=label, call_id=label, additional=True)
+            else:
+                with ledger.protect_remaining({} if terminal_only else
+                        {'llm_requests':1,'total_tokens':final_tokens},additional=True):
+                    response = turn(call_messages,tools=offered, label=label,budget_call_id=label)
             results = []
             self.store.write_json(trace,{'response':response,'usage':self._usage(identity),'results':results,
+                **({'checkpoint':checkpoint_record} if conversation else {}),
                 **({'working_input':working_input,'completed':True} if self.progressive else {})})
             if self.progressive:
                 saved['source_rounds'][-1] = self._digest(trace)
@@ -1154,6 +1351,7 @@ class InspectionToolGateway:
                     'content':json.dumps(result.model_dump(mode='json'),ensure_ascii=False)})
                 self._mark_evidence(saved)
                 self.store.write_json(trace,{'response':response,'usage':self._usage(identity),'results':results,
+                    **({'checkpoint':checkpoint_record} if conversation else {}),
                     **({'working_input':working_input,'completed':True} if self.progressive else {})})
                 saved['source_rounds'][-1] = self._digest(trace)
                 self.store.write_json(input_path,saved)
@@ -1193,6 +1391,7 @@ class InspectionToolGateway:
                 saved['protocol'] = self.protocol
             if self.adaptive:
                 saved['inspection_context_policy'] = 'retained.v1'
+                saved['memory_protocol'] = 'journal.v1'
             if delivery_context is not None:
                 if (not isinstance(delivery_context, dict)
                         or delivery_context.get('schema_version') != 'delivery_review.v1'):

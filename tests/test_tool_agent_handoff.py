@@ -498,7 +498,14 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
         fake._settings = SimpleNamespace(api_mode='chat', context_input_tokens=context_target)
         binding = {'profile': 'fixture', 'settings': {'model': 'fixture', 'api_mode': 'chat'}}
         fake.connection_binding.return_value = binding
-        self.enterContext(patch('simple_ar.app.tool_application.LLMClient.from_env', return_value=fake))
+        def bind_client(*args, **kwargs):
+            # Match the real factory's parent accounting contract; the mock
+            # still supplies controlled native replies without provider calls.
+            fake._budget_ledger = kwargs.get('budget_ledger')
+            fake._budget_session_id = kwargs.get('budget_session_id')
+            fake._budget_attempt_id = kwargs.get('budget_attempt_id')
+            return fake
+        self.enterContext(patch('simple_ar.app.tool_application.LLMClient.from_env', side_effect=bind_client))
         interpreter = None
         if project_python:
             interpreter = run_dir / 'task-python'

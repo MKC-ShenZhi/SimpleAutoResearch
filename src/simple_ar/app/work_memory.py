@@ -52,21 +52,24 @@ class CheckpointResponseError(ValueError):
 
 
 def checkpoint_entries(ledger: Any, attempt_id: str, session_id: str, *,
-                       allow_bounded_unknown: bool = False) -> list:
+                       allow_bounded_unknown: bool = False, call_id: str | None = None) -> list:
     """Recognize exact physical calls without changing their accounting.
 
     Default validation requires a settled response and never adopts unknown
     work. Explicit recovery may recognize finite retained unknown reservations,
     even without a settled response; this grants neither adoption nor replay.
+    An explicit call_id scopes one checkpoint in a multi-call parent attempt;
+    it cannot borrow another round's settlement. Omission keeps legacy lookup.
     """
+    logical_id = call_id or 'working-memory-'+attempt_id
     entries = [entry for entry in ledger.entries if entry.attempt_id == attempt_id
-        and (entry.logical_call_id == 'working-memory-'+attempt_id
-             or entry.purpose in MEMORY_PURPOSES)]
+        and (entry.logical_call_id == logical_id
+             or call_id is None and entry.purpose in MEMORY_PURPOSES)]
     if not entries or not any(entry.status == 'settled'
             or allow_bounded_unknown and entry.status == 'unknown' for entry in entries):
         raise ValueError('Checkpoint has no settled response; reconcile before continuing')
     for entry in entries:
-        if (entry.session_id != session_id or entry.logical_call_id != 'working-memory-'+attempt_id
+        if (entry.session_id != session_id or entry.logical_call_id != logical_id
                 or entry.purpose not in MEMORY_PURPOSES
                 or entry.status not in ({'settled', 'released', 'unknown'}
                     if allow_bounded_unknown else {'settled', 'released'})):
@@ -99,12 +102,12 @@ def _bound_response(response: dict, view: dict, bind_notes: Any) -> list[dict]:
 
 
 def checkpoint_artifacts(*, store: Any, ledger: Any, attempt_id: str,
-                         session_id: str, bind_notes: Any) -> tuple:
+                         session_id: str, bind_notes: Any, call_id: str | None = None) -> tuple:
     """Validate durable checkpoint records equally on normal commit and recovery."""
     paths = ('memory_input.json', 'memory_response.json', 'memory_snapshot.json', 'memory_failure.json')
     if not any(store.exists(path) for path in paths):
         return ()
-    checkpoint_entries(ledger, attempt_id, session_id)
+    checkpoint_entries(ledger, attempt_id, session_id, call_id=call_id)
     view = store.read_json('memory_input.json')
     digest = hashlib.sha256(json.dumps(view,ensure_ascii=False).encode()).hexdigest()
     supplied_through = max(row['turn'] for row in view['observations'])+1
@@ -119,6 +122,7 @@ def checkpoint_artifacts(*, store: Any, ledger: Any, attempt_id: str,
             raise ValueError('Checkpoint cannot be both adopted and failed')
         snapshot = store.read_json('memory_snapshot.json')
         if (snapshot.get('schema_version') != 'working_memory.v1'
+                or call_id is not None and snapshot.get('logical_call_id') != call_id
                 or snapshot.get('input_sha256') != digest
                 or type(snapshot.get('through_turn')) is not int
                 or snapshot['through_turn'] != supplied_through
@@ -132,7 +136,7 @@ def checkpoint_artifacts(*, store: Any, ledger: Any, attempt_id: str,
                 or type(failure.get('attempted_through_turn')) is not int
                 or failure['attempted_through_turn'] != archive_through
                 or failure.get('supplied_through_turn') != supplied_through
-                or failure.get('logical_call_id') != 'working-memory-'+attempt_id
+                or failure.get('logical_call_id') != (call_id or 'working-memory-'+attempt_id)
                 or failure.get('error_type') not in {'LLMResponseError','ValidationError','CheckpointResponseError'}
                 or not isinstance(failure.get('diagnostic'),str) or not failure['diagnostic']):
             raise ValueError('Invalid retained checkpoint failure')
@@ -167,7 +171,8 @@ SYSTEM = (
 def compact_work(*, store: Any, client: Any, requests: list[str],
                  previous: dict, rows: list[dict], bind_notes: Any,
                  estimate_tokens: Any, attempt_id: str,
-                 required_decision_tokens: int = 0) -> tuple[dict | None, tuple]:
+                 required_decision_tokens: int = 0, call_id: str | None = None,
+                 additional_protection: bool = False) -> tuple[dict | None, tuple]:
     """One bounded checkpoint when unrepresented history warrants compaction.
 
     ``rows`` are exact closed operation observations with journal positions.
@@ -183,6 +188,9 @@ def compact_work(*, store: Any, client: Any, requests: list[str],
     ``previous.compacted_records`` opts the journal owner into complete
     observation batches. It is derived receipt bookkeeping, never model input
     or proof that an entire native turn was summarized.
+    Explicit call_id also binds successful snapshots to that logical call.
+    additional_protection stacks the decision/note floor above an owner's
+    existing final-opinion and caller floors on the same ledger.
     """
     if type(required_decision_tokens) is not int or required_decision_tokens < 0:
         raise ValueError('Required decision tokens must be a nonnegative integer')
@@ -266,7 +274,7 @@ def compact_work(*, store: Any, client: Any, requests: list[str],
         increment = estimate_tokens(json.dumps(json.dumps({'notes':envelope},ensure_ascii=False),
             ensure_ascii=False))
         protection = ledger.protect_remaining({'llm_requests':1,
-            'total_tokens':required_decision_tokens+increment})
+            'total_tokens':required_decision_tokens+increment}, additional=additional_protection)
     with protection:
         available = ledger.remaining('total_tokens')
         requests_left = ledger.remaining('llm_requests')
@@ -277,8 +285,8 @@ def compact_work(*, store: Any, client: Any, requests: list[str],
         refs = [input_ref]
         try:
             response = client.with_output_limit(OUTPUT_LIMIT).ask_json(SYSTEM,text,
-                label='working-memory',budget_call_id='working-memory-'+attempt_id)
-            checkpoint_entries(client._budget_ledger,attempt_id,client._budget_session_id)
+                label='working-memory',budget_call_id=call_id or 'working-memory-'+attempt_id)
+            checkpoint_entries(client._budget_ledger,attempt_id,client._budget_session_id,call_id=call_id)
             refs.append(store.write_json('memory_response.json',response,kind='working_memory_response'))
             bound = _bound_response(response,view,bind_notes)
             if not bound:
@@ -286,10 +294,10 @@ def compact_work(*, store: Any, client: Any, requests: list[str],
         except (LLMResponseError, ValidationError, CheckpointResponseError) as exc:
             # A complete, accounted response may be unusable. Transport, budget,
             # binding and unknown/inflight failures deliberately escape this path.
-            checkpoint_entries(client._budget_ledger,attempt_id,client._budget_session_id)
+            checkpoint_entries(client._budget_ledger,attempt_id,client._budget_session_id,call_id=call_id)
             refs.append(store.write_json('memory_failure.json',{
                 'schema_version':'working_memory_failure.v1',
-                'logical_call_id':'working-memory-'+attempt_id,
+                'logical_call_id':call_id or 'working-memory-'+attempt_id,
                 'input_sha256':hashlib.sha256(text.encode()).hexdigest(),
                 'attempted_through_turn':view['archive_through_turn'], 'supplied_through_turn':through,
                 'error_type':type(exc).__name__, 'diagnostic':str(exc),
@@ -300,6 +308,7 @@ def compact_work(*, store: Any, client: Any, requests: list[str],
             return None, tuple(refs)
     snapshot = {'schema_version':'working_memory.v1','through_turn':through,
         'notes':bound,'input_sha256':hashlib.sha256(text.encode()).hexdigest(),
+        **({'logical_call_id':call_id} if call_id is not None else {}),
         'scope':'Model-authored working continuity, not verification, permission or task completion'}
     snapshot_ref = store.write_json('memory_snapshot.json',snapshot,kind='working_memory_snapshot')
     return snapshot, (*refs,snapshot_ref)

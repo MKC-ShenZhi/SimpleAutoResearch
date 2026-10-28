@@ -984,6 +984,7 @@ class ToolApplication:
         This is model-authored working understanding, never another fact store.
         """
         from simple_ar.app.work_memory import summary_coverage
+        from simple_ar.app.professional_conversation import ProfessionalConversation
         memory = {'notes':[], 'through_turn':0}
         if self.state['config'].get('memory_protocol') == 'journal.v1':
             memory['compacted_records'] = set()
@@ -1008,25 +1009,10 @@ class ToolApplication:
                     # still constrain native work on the original ledger.
                     if charges and all(entry.status in {'settled','released'} for entry in charges):
                         self._memory_artifacts(store, attempt.attempt_id)
-                        if store.exists('memory_snapshot.json'):
-                            checkpoint = store.read_json('memory_snapshot.json')
-                            if checkpoint.get('notes'):
-                                view = store.read_json('memory_input.json')
-                                coverage = summary_coverage(previous=memory,snapshot=checkpoint,
-                                    view=view,operations_for_turn=self._memory_operations)
-                                # Only validated, settled, usable snapshots acknowledge
-                                # supplied receipts. This does not certify their facts
-                                # or relax the separate complete-turn coverage proof.
-                                compacted = set(memory['compacted_records'])
-                                for row in view['observations']:
-                                    operations = self._memory_operations(row['turn'])
-                                    if (row.get('truncated') is False and row['record'] in operations
-                                            and row.get('arguments', {}) == operations[row['record']]):
-                                        compacted.add(row['record'])
-                                memory = {'notes':checkpoint['notes'], 'through_turn':coverage,
-                                          'compacted_records':compacted}
-                        else:
-                            memory['attempted_through_turn'] = store.read_json('memory_failure.json')['attempted_through_turn']
+                        memory = ProfessionalConversation.adopt(previous=memory,
+                            snapshot=store.read_json('memory_snapshot.json') if store.exists('memory_snapshot.json') else None,
+                            failure=store.read_json('memory_failure.json') if store.exists('memory_failure.json') else None,
+                            view=store.read_json('memory_input.json'), operations_for_turn=self._memory_operations)
                 for path in notes.get(attempt.attempt_id, []):
                     result = self.session.store.read_json(path)
                     data = result.get('data') or {}
@@ -1112,7 +1098,8 @@ class ToolApplication:
         except ValueError:
             return False
 
-    def _compact_work(self, context: Any, client: Any, cutoff: int, *, decision_tokens: int = 0) -> tuple:
+    def _compact_work(self, context: Any, client: Any, cutoff: int, *, decision_tokens: int = 0,
+                      additional_protection: bool = False) -> tuple:
         """Checkpoint old closed work through the same model attempt and ledger."""
         if self._request_capacity()<2 or not cutoff:
             return ()
@@ -1149,7 +1136,8 @@ class ToolApplication:
         _, refs = compact_work(store=context.store,client=client,requests=self.state['requests'],
             previous=previous,rows=rows,bind_notes=self.operations.bind_notes,
             estimate_tokens=estimate_tokens,attempt_id=context.attempt.attempt_id,
-            **({'required_decision_tokens':decision_tokens} if journal else {}))
+            **({'required_decision_tokens':decision_tokens,
+                'additional_protection':additional_protection} if journal else {}))
         return refs
 
     def _report_projection(self) -> dict[str, Any]:
@@ -3523,27 +3511,22 @@ class ToolApplication:
             raise ValueError("Native tools require the saved Chat protocol; no protocol fallback")
         return client
 
-    def _model(self, *, context: Any) -> CapabilityResult:
-        client = self._client(context.attempt.attempt_id)
+    def _legacy_model_input(self, context: Any, client: Any) -> tuple:
+        """Frozen non-journal admission, including its original recovery rules."""
         messages = self._messages(client=client)
         memory_refs = ()
         working_memory = None
-        journal = self.state['config'].get('memory_protocol') == 'journal.v1'
-        if ((journal or self.state['config'].get('context_protocol')=='working.v1')
+        if (self.state['config'].get('context_protocol')=='working.v1'
                 and not (self.state.get('pending') or {}).get('skip_memory_checkpoint')):
             projection = json.loads(messages[1]['content'])
             cutoff = projection.get('working_context',{}).get('recent_start_turn',0)
             # Optional continuity work must leave the actual decision affordable.
             with self.ledger.protect_remaining({'llm_requests':1,
                     'total_tokens':self._decision_tokens(client,messages)}):
-                memory_refs = self._compact_work(context,client,cutoff,
-                    decision_tokens=self._decision_tokens(client,messages) if journal else 0)
+                memory_refs = self._compact_work(context,client,cutoff)
             if context.store.exists('memory_snapshot.json'):
                 snapshot = context.store.read_json('memory_snapshot.json')
-                # The checkpoint belongs to this attempt, not a second mutable
-                # task state. A journal checkpoint has its own settled reply;
-                # a later failed native decision cannot erase that paid work.
-                # Earlier contracts still require the complete turn to commit.
+                # This historical contract requires the complete turn to commit.
                 from simple_ar.app.work_memory import summary_coverage
                 coverage = summary_coverage(previous=self._working_memory(),snapshot=snapshot,
                     view=context.store.read_json('memory_input.json'),operations_for_turn=self._memory_operations)
@@ -3566,6 +3549,50 @@ class ToolApplication:
             # not as an unbudgeted suffix added to a capacity-fitted request.
             messages = self._messages(client=client, closing=True, schemas=schemas,working_memory=working_memory)
             floor = {'llm_requests': 1, 'total_tokens': self._decision_tokens(client, messages, schemas=schemas)}
+        return messages, schemas, memory_refs, floor, protect, closing
+
+    def _professional_model_input(self, context: Any, client: Any) -> tuple:
+        from simple_ar.app.professional_conversation import ConversationInput, ProfessionalConversation
+        conversation = ProfessionalConversation(client)
+        working_memory, memory_refs = None, ()
+
+        def project(closing):
+            schemas = self._closing_schemas() if closing else self.schemas
+            messages = self._messages(client=client, working_memory=working_memory,
+                closing=closing, schemas=schemas)
+            return ConversationInput(messages, schemas, json.loads(messages[1]['content']))
+
+        def checkpoint(value, decision_tokens):
+            nonlocal working_memory, memory_refs
+            cutoff = value.projection.get('working_context', {}).get('recent_start_turn', 0)
+            memory_refs = self._compact_work(context, client, cutoff,
+                decision_tokens=decision_tokens, additional_protection=True)
+            if memory_refs:
+                memory_refs = self._memory_artifacts(context.store, context.attempt.attempt_id)
+                if context.store.exists('memory_snapshot.json'):
+                    working_memory = ProfessionalConversation.adopt(previous=self._working_memory(),
+                        snapshot=context.store.read_json('memory_snapshot.json'),
+                        view=context.store.read_json('memory_input.json'), operations_for_turn=self._memory_operations)
+                    working_memory['notes'] = self.operations.project_notes(working_memory['notes'])
+
+        value = conversation.prepare(project,
+            followup=lambda value:self._completion_floor(client, value.messages),
+            checkpoint=None if (self.state.get('pending') or {}).get('skip_memory_checkpoint') else checkpoint,
+            closing_enabled=self.state['config'].get('completion_policy') == 'closing_decision.v2',
+            continue_allowed=self._request_capacity() > 1 and (
+                self.session.manifest.budget.max_attempts - self.session.manifest.budget.attempts > 2))
+        floor = ({'llm_requests':1, 'total_tokens':conversation.tokens(value)}
+            if value.closing else self._completion_floor(client, value.messages))
+        return conversation, value, memory_refs, floor
+
+    def _model(self, *, context: Any) -> CapabilityResult:
+        client = self._client(context.attempt.attempt_id)
+        conversation = None
+        if self.state['config'].get('memory_protocol') == 'journal.v1':
+            conversation, value, memory_refs, floor = self._professional_model_input(context, client)
+            messages, schemas, closing = value.messages, value.tools, value.closing
+        else:
+            messages, schemas, memory_refs, floor, protect, closing = self._legacy_model_input(context, client)
         # Every new decision records its actual offer, even when no completion
         # reservation applies. Old replies without the marker remain unchanged.
         projection = json.loads(messages[1]['content'])
@@ -3605,9 +3632,12 @@ class ToolApplication:
                     for row in projection.get('work_inputs', {}).get('windows', [])]},
             'scope': 'Input offer and estimated follow-up cost, not provider usage or guaranteed capacity. '
                 'closing_required binds this decision reply and survives approval/recovery.'})
-        with self.ledger.protect_remaining(floor if protect else {}):
-            message = client.chat_turn(messages, tools=schemas,
-                label="native-turn", budget_call_id=context.attempt.attempt_id)
+        if conversation is not None:
+            message = conversation.call(value, native=True, label='native-turn', call_id=context.attempt.attempt_id)
+        else:
+            with self.ledger.protect_remaining(floor if protect else {}):
+                message = client.chat_turn(messages, tools=schemas,
+                    label="native-turn", budget_call_id=context.attempt.attempt_id)
         ref = context.store.write_json("native_result.json", message, kind="native_reply")
         return CapabilityResult(status="completed", artifacts=(*memory_refs,ref))
 

@@ -755,6 +755,23 @@ class OperationsWorkLoopTests(unittest.TestCase):
                 # Native follow-ups retain the original view and append assistant/tool
                 # messages; source observations arrive through tool replies.
                 view, _ = json.JSONDecoder().raw_decode(request['messages'][1]['content'])
+                # Present the controlled reviewer with bodies actually supplied
+                # by the common selector/native replies, never archived bytes.
+                visible = [row['observation'] for row in view.get('working_view', {}).get('observations', [])]
+                for message in request['messages']:
+                    if message['role'] == 'tool':
+                        result = json.loads(message['content'])
+                        data = result.get('data') or {}
+                        if result.get('tool_name') == 'read_file' and result.get('status') == 'ok':
+                            visible.extend({**data, **window} for window in data.get('text_windows', []))
+                for row in [*view['targets'], *view['evidence']]:
+                    for body in visible:
+                        if (body.get('path') == row.get('path') and body.get('sha256') == row.get('sha256')
+                                and isinstance(body.get('text'), str)):
+                            window = {key:body[key] for key in
+                                ('offset_bytes', 'next_offset_bytes', 'size_bytes', 'text')}
+                            if window not in row['text_windows']:
+                                row['text_windows'].append(window)
                 self.assertTrue(view['targets'])
                 self.assertIn('evidence', view)
                 ids = [row['subject'] for row in view['targets']]
@@ -845,12 +862,10 @@ class OperationsWorkLoopTests(unittest.TestCase):
     def _inspection_history(self):
         """Check provider-visible native chronology and return the latest tool replies."""
         messages = self.inspection_requests[-1]['messages']
-        previous = self.inspection_requests[-2]['messages']
-        self.assertEqual([row for row in messages if row['role']=='assistant'],
-            [row for row in previous if row['role']=='assistant'] + [self.inspection_messages[-1]])
-        self.assertEqual([row for row in messages if row['role']=='tool'][:
-            sum(row['role']=='tool' for row in previous)],
-            [row for row in previous if row['role']=='tool'])
+        retained = [row for row in messages if row['role']=='assistant']
+        positions = [self.inspection_messages.index(row) for row in retained]
+        self.assertEqual(positions, sorted(set(positions)))
+        self.assertEqual(retained[-1], self.inspection_messages[-1])
         replies, pending = [], []
         for message in messages:
             if message['role'] == 'assistant' and message.get('tool_calls'):
@@ -2107,6 +2122,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         # without editing an old input/cache or silently reclassifying its rows.
         historical = deepcopy(saved)
         historical.pop('inspection_context_policy')
+        historical.pop('memory_protocol')
         original = deepcopy(historical)
         owner = self.app.operations.inspection
         request = InspectionRequest.model_validate(saved['arguments'])
@@ -2602,6 +2618,30 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual([entry.to_dict() for entry in self.app.ledger.entries][:len(entries)], entries)
         for path, raw in retained.items():
             self.assertEqual(path.read_bytes(), raw)
+        # Projection must survive a formerly optional original disappearing or
+        # losing authority. Neither case renews the old receipt's current body.
+        from simple_ar.tools.inspection import InspectionRequest
+        owner = self.app.operations.inspection
+        request = InspectionRequest.model_validate(saved['arguments'])
+        source = Path(saved['evidence'][0]['path'])
+        original = source.read_bytes()
+        source.unlink()
+        try:
+            _, projection = owner._working_messages(saved, request, [], [], self.services.llm_client)
+            self.assertFalse(projection['selected_records'])
+            self.assertEqual(projection['omitted_records'][0]['version_status'], 'unknown')
+        finally:
+            source.write_bytes(original)
+        hashes = owner.workspace.artifact_hashes
+        for error in (ValueError, OSError):
+            def unavailable(paths):
+                if str(source) in paths:
+                    raise error('Optional source is no longer accessible')
+                return hashes(paths)
+            with self.subTest(error=error), patch.object(owner.workspace, 'artifact_hashes', side_effect=unavailable):
+                _, projection = owner._working_messages(saved, request, [], [], self.services.llm_client)
+                self.assertFalse(projection['selected_records'])
+                self.assertEqual(projection['omitted_records'][0]['version_status'], 'unknown')
 
     def test_inspector_locates_missing_sources_within_one_version_bound_operation(self):
         self._create(report=True)
@@ -3230,6 +3270,75 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(self.send.call_count, calls)
         self.assertEqual(self.app.ledger.to_dict(), ledger)
         self.assertEqual(self._versions(self.root/f'tools/inspection/{identity}'), receipts)
+
+    def test_main_explicit_and_delivery_review_use_one_prepare_and_isolated_receipt_continuity(self):
+        from dataclasses import replace
+        from simple_ar.app.professional_conversation import ProfessionalConversation
+        self.services.llm_client = LLMClient(replace(self.services.llm_client._settings,
+            context_input_tokens=12000))
+        self._create(goal='Deliver a Markdown text report describing only the supplied record scope.')
+        for number in range(4):
+            (self.inputs/f'source-{number}.txt').write_text(f'Original source {number}.\n'+'scope '*4000, encoding='utf-8')
+        author = 'Author interpretation must not become independent evidence.'
+        self.decisions.extend([
+            _action('update_work_plan', notes=[{'text':author, 'records':[]}]),
+            _action('write_file', path='report.md', content='Only the supplied record scope is described.\n'),
+            _action('inspect_artifacts', goal='Check the supplied record scope.', targets=['report.md'], evidence=[]),
+            _action('deliver_result', **self._delivery('report.md'))])
+
+        def review(view):
+            self.assertNotIn(author, json.dumps(self.inspection_requests[-1]['messages']))
+            if 'proposed_delivery' not in view and len(self.inspection_requests) <= 4:
+                return [_action('read_file', path=f'measurements/source-{len(self.inspection_requests)-1}.txt', max_bytes=24000)]
+            return {'decisions':[{'subject':'target-1', 'conclusion':'complete', 'findings':[],
+                'evidence':[row['subject'] for row in view['evidence']], 'limitations':[]}]}
+        self.review = review
+        prepared, original = [], ProfessionalConversation.prepare
+        def prepare(conversation, *args, **kwargs):
+            prepared.append(conversation.client._budget_attempt_id)
+            return original(conversation, *args, **kwargs)
+        with patch.object(ProfessionalConversation, 'prepare', new=prepare):
+            self._run()
+        explicit = self._ok('inspect_artifacts')
+        delivery = self._ok('deliver_result')['metadata']['delivery_review']
+        identity = Path(explicit['data']['record']).parts[1]
+        source_prefix = f'tools/inspection/{identity}/sources-'
+        self.assertIn(identity, prepared)
+        self.assertIn(delivery['identity'], prepared)
+        self.assertTrue(any(Path(turn['reply']).parent.name in prepared
+            for turn in self.app.state['turns'] if turn.get('origin') != 'caller'))
+        owner = self.app.operations.inspection
+        saved = owner.store.read_json(owner._path(identity, 'input'))
+        checkpoints = [owner.store.read_json(owner._path(identity, f'sources-{number}')).get('checkpoint', {})
+            for number in range(len(saved['source_rounds']))]
+        self.assertGreaterEqual(sum(bool(checkpoint) for checkpoint in checkpoints), 2)
+        memory = owner._conversation_memory(saved, owner._conversation_rows(saved))
+        self.assertTrue(memory['notes'])
+        self.assertTrue(memory['compacted_records'])
+        self.assertTrue(all(note['observed_versions'] for note in memory['notes']))
+        self.assertTrue(all(record.startswith(source_prefix)
+            for record in memory['compacted_records']))
+        summary_inputs = [view for view in self.memory_views
+            if any(row['record'].startswith(source_prefix) for row in view['observations'])]
+        self.assertGreaterEqual(len(summary_inputs), 2)
+        self.assertEqual(summary_inputs[0]['previous_notes'], [])
+        supplied = [row['record'] for view in summary_inputs for row in view['observations']]
+        self.assertEqual(len(supplied), len(set(supplied)))
+        for view in summary_inputs:
+            for row in view['observations']:
+                self.assertFalse(row['truncated'])
+                self.assertIn('sha256', json.loads(row['observation_text'])['data'])
+        calls, ledger = self.send.call_count, self.app.ledger.to_dict()
+        self._reload()
+        cached = self.app.operations.inspection.call('inspect_artifacts', saved['arguments'], identity)
+        self.assertEqual(cached.model_dump(mode='json'), explicit)
+        self.assertEqual(self.send.call_count, calls)
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+        version_path = Path(next(iter(memory['notes'][0]['observed_versions'])))
+        version_path.write_text('Changed independent source.', encoding='utf-8')
+        rejected = self.app.operations.inspection.call('inspect_artifacts', saved['arguments'], identity)
+        self.assertEqual(rejected.status, 'blocked')
+        self.assertEqual(self.send.call_count, calls)
 
     def test_unfinished_review_revokes_pass_but_preserves_existing_required_findings(self):
         from simple_ar.core.assessments import assessment_issues

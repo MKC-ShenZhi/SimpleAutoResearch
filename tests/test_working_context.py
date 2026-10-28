@@ -1089,6 +1089,66 @@ class CheckpointFailureTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     checkpoint_entries(ledger,'native-turn-test','session')
 
+    def test_same_attempt_checkpoints_bind_their_own_calls_and_never_borrow_settlement(self):
+        stores = [ArtifactStore(self.root/f'round-{number}') for number in range(2)]
+        rows = [{'turn':0, 'record':'records/read.json', 'result':{
+            'tool_name':'read_file', 'status':'ok', 'data':{'text':'x'*20000}}}]
+        calls = ['working-memory-native-turn-test-sources-'+str(number) for number in range(3)]
+        response = self.response('{"notes":[{"text":"Scoped work","observations":["o1"]}]}')
+        with patch('simple_ar.integrations.llm._call_openai_sdk', return_value=response) as send:
+            for store, call_id in zip(stores, calls):
+                snapshot, refs = compact_work(store=store, client=self.client, requests=['goal'],
+                    previous={'through_turn':0, 'notes':[], 'compacted_records':set()}, rows=rows,
+                    bind_notes=self.bind, estimate_tokens=estimate_tokens,
+                    attempt_id='native-turn-test', call_id=call_id)
+                self.assertEqual(snapshot['logical_call_id'], call_id)
+                self.assertEqual(checkpoint_artifacts(store=store, ledger=self.ledger,
+                    attempt_id='native-turn-test', session_id='session', bind_notes=self.bind, call_id=call_id), refs)
+            self.assertEqual(send.call_count, 2)
+        # Even another settled call in the very same attempt cannot fund this snapshot.
+        with self.assertRaisesRegex(ValueError, 'disagrees'):
+            checkpoint_artifacts(store=stores[0], ledger=self.ledger, attempt_id='native-turn-test',
+                session_id='session', bind_notes=self.bind, call_id=calls[1])
+        self.ledger.reserve('pending-round', {'llm_requests':1, 'total_tokens':5000},
+            session_id='session', attempt_id='native-turn-test', logical_call_id=calls[2], purpose='working-memory')
+        for status in ('reserved', 'unknown'):
+            with self.subTest(status=status):
+                if status == 'unknown':
+                    self.ledger.mark_unknown('pending-round', reason='interrupted', retain_reservation=True)
+                before = self.ledger.to_dict()
+                with self.assertRaises(ValueError):
+                    checkpoint_entries(self.ledger, 'native-turn-test', 'session', call_id=calls[2])
+                self.assertTrue(checkpoint_entries(self.ledger, 'native-turn-test', 'session', call_id=calls[0]))
+                self.assertEqual(self.ledger.to_dict(), before)
+
+    def test_shared_prepare_protects_parent_and_exit_and_closes_before_buying_optional_work(self):
+        from simple_ar.app.professional_conversation import ConversationInput, ProfessionalConversation
+        self.ledger = BudgetLedger({'llm_requests':3, 'total_tokens':200000})
+        client = self.client.with_budget(self.ledger, session_id='session', attempt_id='native-turn-test')
+        conversation = ProfessionalConversation(client)
+        def project(closing):
+            return ConversationInput([{'role':'user', 'content':'Conclude' if closing else 'Investigate'}],
+                [], {}, closing=closing)
+        checkpoint = Mock()
+        followup = lambda value:{'llm_requests':1, 'total_tokens':10000}
+        with self.ledger.protect_remaining({'llm_requests':1, 'total_tokens':5000}):
+            value = conversation.prepare(project, followup=followup, additional=True)
+            def respond(*args, **kwargs):
+                self.assertEqual(self.ledger.remaining('llm_requests'), 0)
+                return self.response('Review remains incomplete.')
+            with patch('simple_ar.integrations.llm._call_openai_sdk', side_effect=respond):
+                conversation.call(value, label='review', call_id='review', additional=True)
+            # Only the final opinion can fit beside the parent's reserved exit.
+            value = conversation.prepare(project, followup=followup, checkpoint=checkpoint, additional=True)
+            self.assertTrue(value.closing)
+            self.assertEqual(value.messages, project(True).messages)
+            checkpoint.assert_not_called()
+            ordinary = conversation.prepare(project, followup=followup,
+                closing_enabled=False, additional=True)
+            self.assertFalse(ordinary.closing)  # Available operations is not a forced terminal workflow.
+            self.assertEqual(ordinary.messages, project(False).messages)
+        self.assertEqual(self.ledger.remaining('llm_requests'), 2)
+
     def test_explicit_checkpoint_recovery_keeps_bounded_unknown_entries_and_fees(self):
         entry = self.ledger.reserve('checkpoint', {'llm_requests':1,'total_tokens':5000},
             session_id='session', attempt_id='native-turn-test',

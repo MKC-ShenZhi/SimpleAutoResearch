@@ -11,6 +11,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 ### Improved
 
 - New tasks retain source-linked working notes before older records leave context. Complete observations can be summarized in separate batches, so a large multi-tool turn cannot block later working memory. Valid notes and current material take priority over optional older conversation. Summarization uses the same budget; historical optional-note policies remain unchanged. Complete feedback delivery and lower total cost still need real-task acceptance.
+- Independent checks can retain working notes from their own read records, sharing context and call-budget management with ordinary tasks. Author notes do not become independent evidence, and saved historical checks retain their original rules.
 
 ### Fixed
 
