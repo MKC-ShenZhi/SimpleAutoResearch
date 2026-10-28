@@ -1,6 +1,6 @@
 # 保存结果的图形反馈示例
 
-[English](README.md) · [成果展示](../../docs/showcase/README_zh.md) · [效果证据与限制](../../docs/EVALUATION_zh.md)
+[English](README.md) · [成果展示](../../docs/showcase/README_zh.md)
 
 这是**真实框架任务的可复跑导出**，不是新 benchmark 或模型训练示例。绘图源码、五份保存结果和图注均保持原交付字节。复跑不需要密钥、联网、下载原始观测或训练。
 

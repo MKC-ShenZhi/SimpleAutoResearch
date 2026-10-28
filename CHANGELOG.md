@@ -1,10 +1,10 @@
 # Changelog
 
-[中文版](CHANGELOG_zh.md) · [Changelog guidelines](docs/CHANGELOG_GUIDE.md)
+[中文版](CHANGELOG_zh.md)
 
 User-visible changes in reverse chronological order. Development entries are unreleased;
 engineering checks and real task acceptance are reported separately.
-See [Usage](docs/USAGE.md) for current instructions and [Evaluation](docs/EVALUATION.md) for evidence and limits.
+See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase/README.md) for evidence and limits.
 
 ## 2026-10-28 — V2.10 development (unreleased)
 
@@ -13,7 +13,7 @@ See [Usage](docs/USAGE.md) for current instructions and [Evaluation](docs/EVALUA
 - Source and manuscript work use the shared action loop directly. Valid previously read text can be reused without first creating a work scope or note.
 - Feedback and result snapshots retain prior deliveries and actual generated outputs; later diagnostic attachments no longer hide existing work. Progress, production records and current checks remain distinct.
 - Independent review can investigate authorized material, and publication checks the requested export of the same manuscript. Process diagnostics can be read without another command.
-- Reorganized bilingual usage, task, command, configuration and development guides; consolidated extension setup and shortened recent changelog entries.
+- Organized public documentation into getting started, task guides, references and contribution. Extension setup is part of configuration; cases retain actual costs, while internal acceptance records leave the user guides.
 
 An initial draft has been formally delivered. The latest unassisted feedback remains unclosed; lower total task cost has not been demonstrated.
 
@@ -76,7 +76,7 @@ At this date, a cold start had not delivered within its fixed budget and develop
 - Corrected candidate paths, material versions and extension trace isolation to avoid pairing new source with old execution.
 - Explicit recovery after a complete save avoids duplicate execution. Long captions and narrow tables wrap better; content that cannot fit produces an error.
 
-Engineering regression, relocation and earlier feedback evidence are listed in [Evaluation](docs/EVALUATION.md#v210-development-evidence). Project continuity, coordination efficiency and overall slimming remain incomplete.
+Project continuity, coordination efficiency and overall slimming remain in development and have not passed full acceptance.
 
 ## 2026-10-23 — V2.10 development (unreleased)
 

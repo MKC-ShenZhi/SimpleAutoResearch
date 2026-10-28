@@ -1,0 +1,31 @@
+# Documentation
+
+[中文](README_zh.md) · [Project overview](../README.md)
+
+Start with the tutorial, bring a goal and accessible material, and consult references
+when needed. You do not need to learn every tool or run each capability in sequence.
+
+## Get started
+
+- [Tutorial](USAGE.md): installation, model configuration, materials, results and continuation.
+- [Showcase](showcase/README.md): complete reports, figures, source, rebuild instructions and conditions.
+
+## Work on a task
+
+[Task guides](WORKFLOWS.md) cover direction surveys, code work, analysis, figures,
+material-based writing and limited reproduction. Reuse existing results and request PDF only when needed.
+
+## Look something up
+
+- [Command reference](CLI_REFERENCE.md): everyday commands, recovery, standalone tools and compatibility interfaces.
+- [Configuration reference](CONFIG_REFERENCE.md): model connections, task fields, execution scope and trusted local packages.
+- [Changelog](../CHANGELOG.md): dated changes that affect users.
+
+## Contribute
+
+[Development](DEVELOPMENT.md) explains architecture, code ownership, changes and verification.
+It is for contributors; it is not a prerequisite for using the assistant.
+
+This is a source-visible preview with no license selected yet. See the showcase for
+[human participation, versions and costs](showcase/README.md#human-involvement-versions-and-cost).
+Model tasks incur provider charges; rebuilding a saved figure is not a newly generated research result.

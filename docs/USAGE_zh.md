@@ -133,14 +133,10 @@ uv run simple-ar results "SESSION"
 打开 `results` 打印的实际路径。
 按目标检查正文、来源引用、计算结果、验证状态及未解决项。
 文件或交付记录存在不认证质量。
-原生任务暂停时，`results` 不列出当前可复用交付；磁盘上仍可能保留反馈之前的旧文件。
+任务暂停时，先看 `status` 给出的停止原因和“已保留，未验收”文件路径。
+`results` 主要列出已确认可复用的交付；反馈前的旧稿与中间文件不代表本次请求已完成。
 
-进一步检查产物：
-
-```bash
-uv run simple-ar inspect "SESSION"
-uv run simple-ar search-artifacts "SESSION" "evidence"
-```
+需要检索较多成果时，再查[成果工具](CLI_REFERENCE_zh.md#成果工具)。
 
 ### 反馈与恢复
 

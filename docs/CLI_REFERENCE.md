@@ -4,24 +4,45 @@
 
 Use this page for syntax, options and recovery rules. Prefix examples with `uv run` when running from a checkout. `SESSION` is the printed full session path; `RUN_DIR` is a run directory. Put `--command ARGV...` last: everything after it belongs to the child command, without shell interpretation.
 
-## Command Overview
+## Everyday use
+
+Most work uses four commands:
 
 | Need | Command |
 | --- | --- |
-| Start a goal or resume native work | [start](#guided-entry) |
-| Inspect model settings without API calls | [models](#simple-ar-models) |
-| Read saved status / deliveries | [status and results](#simple-ar-status) |
-| Reuse a registered result in a new task | [Reuse deliveries](#reuse-deliveries) |
-| Generate/edit a raster concept or inspect pixels | [image / image-review](#concept-images) |
-| Inspect project preparation without execution | [project-info](#project-preparation) |
-| Run an exact research protocol | [research-session](#research-commands) |
-| Add/refresh a report or export an ACM project | [research-report](#simple-ar-research-report), [report-export](#simple-ar-report-export) |
-| Edit an isolated code project | [code-task](#code-task-commands) |
-| Index/search artifacts or remove caches | [Artifact tools](#artifact-tools) |
-| Export schemas, call tools or serve MCP | [Tools and MCP](#tools-and-mcp) |
-| Inspect native filesystem/evidence/recovery contracts | [Advanced native contracts](#advanced-native-contracts) |
+| Start, continue or give feedback | [start](#guided-entry) |
+| View deliverables and continuation | [results](#simple-ar-status) |
+| View stop conditions and retained work | [status](#simple-ar-status) |
+| Inspect local model configuration | [models](#simple-ar-models) |
 
-`simple-ar --help` and command `--help` describe the installed version. Native tools and isolated workspaces do not certify scientific correctness or provide an OS sandbox.
+```bash
+simple-ar start "Explain these results" --source ./results --model profile:daily
+simple-ar status "SESSION"
+simple-ar results "SESSION"
+simple-ar start --resume-task "SESSION" "Revise the legend and keep the original"
+```
+
+Use the [tutorial](USAGE.md) for first-time setup, then look up [recovery and authorization](#native-recovery) when needed.
+Local model inspection does not send a test request; actual tasks can incur charges.
+
+## Standalone tools and advanced interfaces
+
+These support specific operations, automation and compatibility tasks. They are not a menu of mandatory research stages.
+
+| Need | Reference |
+| --- | --- |
+| Reuse delivered work | [Reuse](#reuse-deliveries) |
+| Image generation, editing or visual review | [Image tools](#concept-images) |
+| Inspect project entry points and dependencies | [Project preparation](#project-preparation) |
+| Export an existing manuscript | [report-export](#simple-ar-report-export) |
+| Exact research protocols or saved research sessions | [Research commands](#research-commands) |
+| Code tasks with explicit scope | [CodeTask commands](#code-task-commands) |
+| Search artifacts, inspect indexes or clean caches | [Artifact tools](#artifact-tools) |
+| Tool schemas, read-only calls and MCP | [Tools and MCP](#tools-and-mcp) |
+| Legacy command migration | [Historical commands](#historical-and-development-commands) |
+
+Command `--help` describes the installed version. Native tool parameters are supplied through the tool catalog.
+For integration, start with [code ownership and tool interfaces](DEVELOPMENT.md#implement-a-change), rather than hand-wiring tool JSON.
 
 ## Guided entry
 
@@ -339,7 +360,9 @@ Required input (repeat up to four), goal and output; optional config/model selec
 
 ## Research Commands
 
-### `simple-ar research-session` (canonical task-driven entry)
+<a id="simple-ar-research-session-canonical-task-driven-entry"></a>
+
+### `simple-ar research-session` (structured and compatibility entry)
 
 ~~~bash
 simple-ar research-session --config research.toml
@@ -930,187 +953,6 @@ Historical layouts remove recognized fulltext/extracted caches; all-caches can r
 ### `simple-ar tools serve-mcp`
 
 `simple-ar tools serve-mcp RUN_DIR [--debug-payloads]` serves read-only registered experiment tools over stdio. Methods: initialize, ping, tools/list, tools/call. It enables no write/shell/network/install capability.
-
-## Advanced native contracts
-
-### Files, project copies and delivery
-
-File tools accept authorized source0/... and workspace/... locators or observed absolute paths. Mount names are not real directories and embedded code/argv strings are not rewritten. Private-name filtering is case-insensitive throughout listing/search/inspection; absolute paths never widen roots or source permissions.
-
-File tools and delivery artifacts interpret unprefixed relative paths from the task workspace. Explicit registered aliases (`workspace/…`, `source0/…`, `evidence/…`) retain their original ownership, and absolute paths must still resolve inside a granted root. No source or host directory is guessed from a bare name; traversal, private paths, escaped links, read-only writes and artifact-version checks remain enforced. A final `write_file` may use either spelling consistently with its `delivery.artifacts`; saving output is not scientific validation.
-
-| Tool / field | Contract |
-| --- | --- |
-| list_directory: recursive, file_glob | Paginated filenames without bodies; traversal ≤4096 entries, inventory_truncated means incomplete inventory |
-| read_file: byte offset, start_line, max_lines, max_bytes | One-based lines for files ≤256000 bytes; larger files use bytes. Both limits apply; continue at next_offset_bytes, not decoded-text length |
-| read_file: full_digest=true | Stream full digest for regular file ≤64 MiB, return only requested window |
-| write_file / edit_file | Expected digest, backup and atomic write; replacements must match uniquely and not overlap. Legacy old_text/new_text single replacement remains |
-| Version conflict | Authorized writable target returns current/expected digests without body/write; new explicit matching expectation required. Private/read-only targets reveal no conflict digest |
-| copy_file | Binary/text bytes ≤64 MiB, source digest required; existing destination also needs observed digest |
-| search_files | Literal rg search within authorized roots; paginated scanned-file coverage. Consumes process receipt/allowance even though read-only |
-| inspect_project: data_paths | Read-only dependency/entry/test/document/coverage observation and full attempt; no project import or execution |
-| update_work_plan | Current-request plan persists through compaction/resume; no separate planner/scheduler. Step claims neither verify work nor authorize execution |
-
-#### Copy a project
-
-Copy-project takes source directory and nonexistent workspace path. It copies an editable subset without execution/network, skipping caches/builds/symlinks/private paths, .git/.aws/.ssh/.codex/.agents/venvs/all .env* (including .env.example). Oversized files are skipped; empty source/existing destination/count or total overflow refuse publication. Inspect omissions before treating the package as complete.
-
-| Copy field | Default / allowed range |
-| --- | --- |
-| `max_files` | 1000 / 1–4096 |
-| `max_total_bytes` | 134217728 / 1–536870912 |
-| `max_file_bytes` | 2000000 / 1–67108864 |
-
-Returned absolute_path/source/copy/files include relative paths and SHA256. Optional simple .zip archive_name packages exactly copied files inside the copy; conflicting names fail.
-
-Request/output hashes persist in attempts/IDENTITY/project-copy.json before publication. Same-ID recovery checks current file/ZIP hashes and does not recopy/repack changed contents.
-
-#### Declare delivery
-
-Write-file and run-process can explicitly declare delivery with summary/artifacts/unresolved. Final write must include its written file; other artifacts already exist in writable workspace. Process delivery requires successful unstopped exit and artifacts afterward; declaration is part of exact approval. Request/output hash binding recovers without rerunning; changed/missing/unbound outputs, failed commands or invalid terminal ordering block delivery.
-
-Directory artifacts expand to explicit snapshots of ≤200 accessible files per directory, excluding private paths/venvs/bytecode/symlinks. Empty/oversized selections refuse rather than truncate. A manifest proves file presence, not correctness, portability or automatic archival.
-
-### Sources, writing and publication
-
-#### Acquire and inspect sources
-
-Allow-network independently authorizes arXiv/OpenAlex/Semantic Scholar/optional Tavily search and original acquisition. Evidence stays read-only; each acquisition currently bounds one document, three fetch attempts, 8 MiB, 60 PDF pages. Source_operations counts provider/adapter operations, not HTTP calls/credits. Question lookup is local and retains offsets/truncation; omit find_source_passages query to inspect identity/coverage first.
-
-`acquire_source` accepts optional `web_extract_backend: direct|tavily_basic`:
-
-- Omission/null retains the current backend, normally direct. Without a caller-supplied
-  source policy, an explicit selector applies to that acquisition only. With a policy
-  (even an empty dict), it must match the frozen backend.
-- Explicit Tavily needs `web` in policy providers, source and gateway network permission,
-  and `TAVILY_API_KEY`. Denial occurs before source-budget reservation. There is no
-  automatic fallback or retry; PDF routing stays with the fulltext owner.
-- Original arguments, manifests and source-ledger references retain the selector and
-  observed provider usage/credits. Compacted history retains bounded fetch URLs,
-  statuses, reasons and providers; canonical records remain authoritative.
-
-Actual service evidence is still needed to establish backend availability or acquisition success.
-
-#### Source identity and retained passages
-
-`find_source_passages` receipts include `document_path` (the authorized resolved path) and `document_sha256` (SHA256 of the original JSON bytes). Query matches and identity previews use those bytes; authorization, resolved path and bytes are checked again after selection. Historical receipts are unchanged and receive no newly inferred hash.
-
-When native conversation blocks leave the working set, pinned original passage windows can remain alongside observed file text under the same serialized input budget. The source owner rechecks the authorized original path and bytes; changed, missing or unpinned sources do not acquire current-source validity. Partial overlaps do not silently erase previously observed conditions. These are exact historical observations, not summaries, exhaustive coverage or scientific verification; receipts remain readable even when a window cannot fit. This mechanism does not guarantee fewer calls or successful delivery.
-
-Original retained document_bundle.v1 records can be supplied read-only without network. Resolved ownership rejects workspace-generated documents and attempt history as original evidence. Bibliographic gaps may be filled from retained front matter in the same response with exact quotation checks; supplied metadata is retained, and this is not independent publication verification.
-
-#### Compose a manuscript
-
-`compose_document` saves `manuscript.md`, citation keys and references, retaining prior drafts.
-Choose `writing_method="sections"` for section writing: required headings fix the outline;
-otherwise it plans from evidence. Article and section methods in new professional work
-include independent inspection and bounded correction before delivery. Sections share
-the document reviewer/editor and retained checkpoints, including feedback reuse.
-
-If inspection is unavailable, the candidate is retained without another outer inspection.
-Exact and historical calls retain their saved review settings. Neither method adds budget
-or overrides a frozen report contract. Sections may need more calls; they do not guarantee
-better writing. Granularity, headings and citation limits specify document requirements,
-not an evidence recipe.
-
-Optional `required_headings` specifies ordered article-level section titles, ignoring case and presentation numbering; `max_cited_sources` sets a distinct body-source ceiling (0 means no cap). These are checked requirements, not advisory prose. Violations retain the original response and stop publication without another writing request. Reference lists and fenced examples do not count toward the ceiling.
-
-#### Select materials and reuse inputs
-
-Material-roots performs bounded private-filtered version-bound selection and reports read coverage/omissions. It can combine with sources/figures/prior draft, but not explicit materials windows; locators validate before paid selection. New selections in writing and implementation may reuse exact successful parent file-read receipts after checking present authorization, original receipt, full-file identity and measured bytes. Only selected windows reach generation; stale, refused and unread ranges are reported, not inferred evidence. Saved attempts do not acquire later reads. Original bundles retain their source owner, while drafts/derived results remain materials. Selection is not exhaustive reading or visual/statistical verification.
-
-#### Review an existing draft
-
-`review_document` independently inspects an existing `prior_draft` using the same selected-source/material contract, without invoking the Writer or changing prose. Its `review.json` contains `review_status` (`reviewed` or `needs_revision`) and validated findings/quotes. Without independent evidence it can inspect prose, not certify facts. Complete responses recover without another call; rejected/unknown responses stop. A feedback rewrite uses a new composition identity, retaining the old draft and review. Rendered-image quality requires separate visual inspection.
-
-For composition or independent review, `reuse_prior_inputs=true` reuses resolved source
-passages/material windows from an intact same-task canonical `prior_draft`.
-
-- Supported parents: standalone articles, section compositions and material-based
-  professional reports. Reviewed sections need actual complete responses and checkpoints;
-  a checkpoint flag alone is insufficient. Historical protocols keep their original path.
-  Execution reports consume original execution evidence directly.
-- The completed producer is checked read-only; current permissions, exact passages,
-  windows and receipts are rechecked before paid work. Supply current figures explicitly
-  and do not combine reuse with a new evidence recipe.
-- Changed, unfinished, external or unsupported parents fail without automatic reselection.
-  Reuse grants no budget, acceptance or scientific certification.
-
-#### Select tools with a work request
-
-`focus_work` can optionally include `tools` with exact tool names to select contracts alongside the professional goal and input windows. Omission preserves the current selection; an empty list clears it. This uses the same registry, permissions and accepted action journal as `load_tools`, without a separate loading step.
-
-#### Recover writing and export
-
-A complete input-bound writing response can resume assembly/missing publication files without calls; failed/partial/unknown writing is not resent. Native section recovery reconstructs from original complete per-call responses and checks saved section prose; changed input snapshots or checkpoints stop without replacing records. Recovery verifies original byte windows/manuscript/references/figures; changed partial files remain and fail. Missing/edited outputs or legacy records lacking byte bindings need inspection/new feedback version. Historical checkpoint/assembly forms remain; authored heading hierarchy is retained.
-
-Export-report converts workspace Markdown/assets to ACM/optional PDF through shared process receipts and exact approval. Reuse requires bound output digests; changed/missing files cannot inherit compilation success, and unbound interrupted exports are not replayed. Workspace captions own revised prose; figure metadata only fills missing captions/provides variants. Compilation is neither scientific review nor page-count acceptance.
-
-#### Native export fields and checks
-
-These are `export_report` tool fields for native tasks. The standalone CLI has its own
-[options](#simple-ar-report-export); it does not expose the `checks` object.
-
-The shared `export_report` tool accepts an optional `template` object with `path`
-(relative to its Markdown), `assets` (explicit flat companion files), `engine`
-(`pdflatex` or installed `xelatex`) and optional `top_level_division`
-(`section`, `chapter`, `part`). Ask the assistant to inspect the layout and select
-the appropriate hierarchy; no class-name rules or scientific restructuring are inferred.
-At most 32 companions/16 MB are supported; no partials, scripts or custom build commands.
-The standalone `report-export` command keeps its ACM default.
-
-You can also ask the assistant to check a page limit or specific identifying
-strings you supply. The shared `export_report` tool accepts, for example,
-`"checks": {"max_pages": 4, "forbidden_identifiers": ["Example Author"]}`;
-either rule may be omitted. These checks require PDF compilation and installed
-Poppler `pdfinfo` and/or `pdftotext`, and use the same command approval and process
-budget. The standalone `report-export` CLI does not expose these options.
-
-Page limits count all pages, including references and appendices. String checks
-match case-sensitive literal substrings in extracted text; they do not cover
-images, metadata or indirect identification, and do not certify anonymity.
-If an official limit applies only to the main body, do not use that number as an
-all-PDF `max_pages` limit. Body boundaries, minimum length, stage options and other
-requirements need separate checks against the rules and actual PDF. `checks` only
-executes the finite checks specified; it does not certify all official requirements.
-Inspect `export.json` and the retained `checks/pdfinfo.txt` or `checks/text.txt`.
-Failed or unavailable checks block optional final delivery but retain the project
-and diagnostics. They do not automatically revise the manuscript. Reading a saved
-result does not rerun checks; changed files need a new export.
-
-### Images, execution and history
-
-#### Image permission and recovery
-
-Inspect-images needs allow-vision and a compatible bound vision connection; missing route fails before sending. It shares model requests/tokens, preserves originals/feedback and reuses saved responses. Unknown interruptions/rejected responses are not resent or accepted as findings. Generation uses max-images and image route; create-image makes versions, resume-image queries/downloads known IDs or reuses completions, never resets persistent image allowance.
-
-#### Interpreter and process approval
-
-Project-python preserves an existing virtualenv entry, including when read from task TOML: relative entries use the configuration directory without dereferencing the Python symlink into its base runtime. Saved task environments are retained on resume, not retroactively corrected from edited configuration.
-
-Its directory leads filtered PATH; scripts should use sys.executable for children. Approval binds resolved argv/environment; changes need approval again. It installs nothing. Existing receipts recover without execution replay.
-
-New tasks allow ten process invocations per model-turn allowance; saved older limits and total process wall budget remain.
-
-#### Context and history reads
-
-Context_input_tokens (default 24000) is a soft input target including schemas/history. Remaining token capacity subtracts effective output reservation.
-
-The current complete operation is never split; earlier complete assistant/tool blocks form a contiguous retained suffix marked retained_turn_start. If the current unit exceeds target, optional earlier blocks/indexes/windows are omitted.
-
-History_archive indexes omitted accepted turns/failure counts, not missing evidence or resolved failures. Recent observations are bounded to 2000 estimated tokens, with version-checked source windows.
-
-Read_history pages records locally; pin returned end_turn and use next_offset_bytes. Attempt IDs are not turn indices.
-
-Latest actual process result/latest nonzero diagnosis remain available unless already read back; cancelled/blocked proposals do not replace execution facts. Historical identities do not certify current file bytes. Raw records remain; estimates are not exact tokenizer guarantees or budget bypass.
-
-#### Compatibility of saved native work
-
-Saved `work.v1`/`work.v2` preparation, `work.v3` selection and `work.v4` scopes retain
-original source, routing, candidate, manuscript and approval contracts. Loading them
-does not upgrade their production/review rules. New ordinary tasks use common file,
-process and work operations directly, without mandatory scope-opening/closing calls.
-For source owners and implementation history, see [Development](DEVELOPMENT.md).
 
 ## Historical and development commands
 

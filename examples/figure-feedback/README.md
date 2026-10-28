@@ -1,6 +1,6 @@
 # Saved-result figure feedback
 
-[中文](README_zh.md) · [Showcase](../../docs/showcase/README.md) · [Evidence and limits](../../docs/EVALUATION.md)
+[中文](README_zh.md) · [Showcase](../../docs/showcase/README.md)
 
 This is a small **replayable export from a real framework acceptance task**, not a new benchmark or training example. The renderer, five saved-result files and caption are unchanged copies of the delivered output. No model key, raw observation download, training or network access is needed for replay.
 
@@ -26,7 +26,7 @@ Configure text and vision profiles first; see [setup](../../docs/USAGE.md). This
 uv run simple-ar start "Use these saved results and the initial figure to make an editable grayscale landscape figure. Make Frozen versus Monthly errors visually comparable for both model families and both metrics, preserve exact values and units, label separate scales clearly, retain fitting/prediction/evaluation roles, and deliver source, SVG, PNG, caption and replay instructions. Do not refit models or acquire data." --source examples/figure-feedback/data --source docs/showcase/assets/landscape-feedback-before.png --model profile:daily --allow-execution --allow-vision
 ```
 
-Approve only the proposed commands you have reviewed. A text profile alone does not enable vision. Results, cost and iteration count may differ. Use [task feedback](../../docs/USAGE.md#feedback-and-recovery) to continue your own task.
+Approve only the proposed commands you have reviewed. A text profile alone does not enable vision. Results, cost and iteration count may differ. Use [task feedback](../../docs/USAGE.md#give-feedback-and-resume) to continue your own task.
 
 ## Provenance and limitations
 

@@ -139,15 +139,10 @@ uv run simple-ar results "SESSION"
 Open the actual paths printed by `results`. Check the prose, source references,
 calculated results, validation status and unresolved work relevant to your goal.
 A saved file or delivery record is not a quality certificate.
-During a pause, `results` lists no current reusable delivery for a native task;
-older files may remain on disk from before your feedback.
+During a pause, use `status` for the stop condition and retained-but-unaccepted file paths.
+`results` focuses on confirmed reusable deliveries; older drafts and intermediate files do not complete the current request.
 
-For deeper artifact inspection:
-
-```bash
-uv run simple-ar inspect "SESSION"
-uv run simple-ar search-artifacts "SESSION" "evidence"
-```
+For larger collections, see [artifact tools](CLI_REFERENCE.md#artifact-tools).
 
 ### Give feedback and resume
 

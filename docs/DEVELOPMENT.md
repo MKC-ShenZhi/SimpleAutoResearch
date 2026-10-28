@@ -3,7 +3,7 @@
 Use this guide to find the owner of a change, implement it and verify its effect.
 For installation and first use, start with [Get started](USAGE.md).
 
-[中文](DEVELOPMENT_zh.md) · [CLI reference](CLI_REFERENCE.md) · [Configuration](CONFIG_REFERENCE.md) · [Evidence and limits](EVALUATION.md)
+[中文](DEVELOPMENT_zh.md) · [CLI reference](CLI_REFERENCE.md) · [Configuration](CONFIG_REFERENCE.md) · [Showcase](showcase/README.md)
 
 ## Set up a development environment
 
@@ -166,7 +166,7 @@ Choose the page by the reader's question:
 | Look up a command or setting | [CLI](CLI_REFERENCE.md), [Configuration](CONFIG_REFERENCE.md) |
 | Add a trusted local package | [Configuration reference](CONFIG_REFERENCE.md#trusted-local-packages) |
 | Understand implementation and contribution | This guide |
-| Check demonstrated scope and limitations | [Evaluation](EVALUATION.md), [showcase](showcase/README.md) |
+| Check demonstrated scope and limitations | [Showcase](showcase/README.md) |
 | See user-visible changes | [Changelog](../CHANGELOG.md) |
 
 Rewrite the relevant section when behavior changes. Keep one authoritative
@@ -175,5 +175,5 @@ across pages. Examples should lead to a useful result, and reference entries sho
 make values and constraints easy to find.
 
 Keep Chinese and English structure and facts aligned, and check links after changing
-headings. Follow the [Changelog guidelines](CHANGELOG_GUIDE.md) for dated entries.
+headings. Follow the [dated changelog](../CHANGELOG.md) for dated entries.
 Public instructions must stand on their own without private `MDfiles/` records.

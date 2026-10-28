@@ -3,7 +3,7 @@
 这份指南帮助贡献者找到改动归属、接通消费者并验证结果。
 首次安装和使用请先读[开始使用](USAGE_zh.md)。
 
-[English](DEVELOPMENT.md) · [命令参考](CLI_REFERENCE_zh.md) · [配置参考](CONFIG_REFERENCE_zh.md) · [效果与边界](EVALUATION_zh.md)
+[English](DEVELOPMENT.md) · [命令参考](CLI_REFERENCE_zh.md) · [配置参考](CONFIG_REFERENCE_zh.md) · [成果展示](showcase/README_zh.md)
 
 ## 准备开发环境
 
@@ -145,11 +145,12 @@ uv build
 | 查命令或参数 | [命令参考](CLI_REFERENCE_zh.md)、[配置参考](CONFIG_REFERENCE_zh.md) |
 | 接入可信本地包 | [配置参考](CONFIG_REFERENCE_zh.md#可信本地扩展) |
 | 理解实现与参与开发 | 本文 |
-| 核对展示范围和限制 | [效果证据](EVALUATION_zh.md)、[成果展示](showcase/README_zh.md) |
+| 核对展示范围和限制 | [成果展示](showcase/README_zh.md) |
 | 了解用户可感知的变化 | [Changelog](../CHANGELOG_zh.md) |
 
 行为变化时重写对应章节；一项规则保留一个权威位置，其他页面给链接。
 不要追加补丁历史或跨页复制协议细节。教程先带人完成任务，参考页让字段值与约束容易查到。
 
-中英文结构与事实同步，改标题后检查链接；日期记录遵循[Changelog 规范](CHANGELOG_GUIDE.md)。
+中英文结构与事实同步，改标题后检查链接。Changelog 按 `YYYY-MM-DD` 倒序，
+同日合并，以新增、优化、修复记录用户可感知的变化；不写提交流水账或工程测试统计。
 公开使用说明应能独立阅读，不依赖私有 `MDfiles/`。

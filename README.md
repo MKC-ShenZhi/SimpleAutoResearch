@@ -2,7 +2,7 @@
 
 **A continuing research assistant that works across sources, code, data, figures and editable reports.**
 
-[中文](README_zh.md) · [Get started](docs/USAGE.md) · [Task guides](docs/WORKFLOWS.md) · [Showcase](docs/showcase/README.md) · [Evidence & limits](docs/EVALUATION.md)
+[中文](README_zh.md) · [Get started](docs/USAGE.md) · [Documentation](docs/README.md) · [Showcase](docs/showcase/README.md)
 
 Research carries context forward: a source informs a method, code turns it into a calculation, results become figures and prose, and feedback changes the next step. SimpleAutoResearch keeps this work in a saved task so you can inspect the evidence, reuse existing results and continue with new instructions.
 
@@ -40,7 +40,7 @@ A ten-page survey compares VLA policies with world models: prediction targets, c
 
 [Read the survey](examples/robotics-survey/report/survey.pdf) · [中文简报](examples/robotics-survey/report/briefing_zh.md) · [Rebuild the report](examples/robotics-survey/README.md)
 
-Both final exports were checked against code equivalent to `d3b0721`, included in main. Their histories span multiple candidates and explicit continuations; they retain `partial` findings. The framework generated the prose and figure code; people supplied goals, feedback, approvals and independent checks. [Full provenance and development costs](docs/showcase/README.md).
+Framework tasks generated the prose and figure code; people supplied goals, feedback, approvals and independent checks. Both tasks required development repairs and explicit continuations and retain `partial` status. [Provenance, versions and cost](docs/showcase/README.md) are documented with the cases rather than presented as one-click success or general success rates.
 
 ### Figure feedback without rerunning an experiment
 
@@ -50,7 +50,7 @@ An earlier inspected task revised a saved-result landscape figure into paired vi
 
 [Replay with source and saved data—no API key](examples/figure-feedback/README.md) · [Before/after and cost](docs/showcase/README.md#landscape-comparison-a-current-replayable-export)
 
-This bounded feedback task used 11 model requests and 211,774 recorded tokens; it did not refit models. [Earlier Bike Sharing and method-figure results](docs/showcase/README.md#earlier-results) retain their original versions. [Evidence and limits](docs/EVALUATION.md) distinguish usable artifacts from scientific or autonomy claims.
+This bounded feedback task used 11 model requests and 211,774 recorded tokens; it did not refit models. [Earlier Bike Sharing and method-figure results](docs/showcase/README.md#earlier-results) retain their original versions. The [showcase](docs/showcase/README.md) explains provenance, human participation and limits.
 
 ## How a task continues
 
@@ -118,17 +118,9 @@ uv run simple-ar results "SESSION"
 
 Open the actual paths printed by `results`. Check the text, sources, calculations, validation status and outstanding issues. Feedback continues with the saved materials, connections, permissions and budget; add `--source PATH` to supply more evidence. Approval, pause and recovery instructions are in [Get started](docs/USAGE.md).
 
-### Optional: an offline environment check
-
-```bash
-uv run simple-ar research-session --config examples/data-curves/research.toml
-```
-
-This needs no model key and plots supplied demonstration coordinates. It checks the deterministic example path; it does not exercise the model-assisted `start` task. More inputs and dependencies are listed in the [example index](examples/README.md).
-
 ## Scope and review
 
-V2.10 continues on `feat/v2.10-project-research-assistant`; checked improvements can be integrated into main in stages without closing the whole milestone. The main-branch quick start and public cases above remain valid. [Development evidence and limits](docs/EVALUATION.md#v210-development-evidence) distinguish installed engineering checks from earlier report feedback, material reuse and supplied-template conversion, and from the public cases above.
+The tutorial targets main. The development branch is still improving long tasks and feedback delivery; use documentation for your installed version rather than treating development progress as released capability.
 
 SimpleAutoResearch is a **source-visible preview**, and the native `start` entry is experimental. Current work focuses on Python research code, common tabular data, bounded investigations and reproductions, and reports grounded in available materials. Complex environment preparation, long surveys, precise publication layout and consistent efficiency still need improvement.
 
@@ -143,10 +135,11 @@ Source originals are mounted read-only. You review command proposals and approve
 | Look up commands, approvals and recovery | [CLI reference](docs/CLI_REFERENCE.md) |
 | Configure named models, routes and task fields | [Configuration reference](docs/CONFIG_REFERENCE.md) |
 | Inspect showcased outputs and their conditions | [Showcase](docs/showcase/README.md) |
-| Check development evidence, budgets and remaining limits | [Evidence and boundaries](docs/EVALUATION.md) |
 | Understand the code and development workflow | [Development](docs/DEVELOPMENT.md) |
 | See what changed | [Changelog](CHANGELOG.md) |
 
+There are no current official benchmark scores or general task success rates. Public cases demonstrate specific work and its conditions.
+
 Reproducible issues with redacted diagnostics are welcome. Include the goal, relevant inputs, command, observed behavior and expected result. Licensing has not yet been selected; discuss code contributions before opening a PR.
 
-Workflow inspiration includes [AutoResearchClaw](https://github.com/aiming-lab/AutoResearchClaw), [OpenResearch](https://github.com/alphaXiv/OpenResearch) and [ARIS](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep).
+Task collaboration draws on [AutoResearchClaw](https://github.com/aiming-lab/AutoResearchClaw), [OpenResearch](https://github.com/alphaXiv/OpenResearch) and [ARIS](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep).

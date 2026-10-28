@@ -23,7 +23,7 @@ needed by the recipe; commands still need approval and model/API calls may incur
 
 Sections marked V2.10 describe development work on `feat/v2.10-project-research-assistant`;
 they do not imply full acceptance or a release. Use the main-branch [installation](USAGE.md#installation)
-and check [evidence and limits](EVALUATION.md#v210-development-evidence) for each case.
+and check [evidence and limits](showcase/README.md#scope-and-current-limitations) for each case.
 Review [effective settings](USAGE.md#configure-once-and-continue-from-the-result):
 preferences guide deliverables; permissions and budgets govern access and resources.
 
@@ -233,8 +233,8 @@ uv run simple-ar start "Use this report and supplied trusted template. Preserve 
 Keep the report and a focused template bundle in the supplied directory, not your
 credentials or unrelated files. The template needs `$body$` and the standard
 `$for(header-includes)$$header-includes$$endfor$` hook in its preamble.
-The renderer consumes a prepared template. [Inspected conversions](EVALUATION.md#v210-development-evidence)
-used operator-supplied templates and recipes; autonomous template discovery is unverified.
+The renderer consumes a prepared trusted template. Autonomous discovery and full conference compliance
+require verification; successful compilation does not establish submission compliance.
 
 For a new task requiring template preparation, provide an explicit
 official entry point, year and submission stage. The task may use research and code capabilities to retrieve rules and adapt an example into a Pandoc wrapper, subject to network and execution permissions. Treat this as a request requiring verification, not an accepted end-to-end workflow:
@@ -272,7 +272,7 @@ For optional page-count and identifying-string checks, state the exact limits in
 request. They require PDF compilation and installed Poppler tools. Inspect `export.json`
 and saved diagnostics: failed/unavailable checks retain the project but block optional
 final delivery. These finite checks do not certify anonymity or venue compliance.
-See [native export fields and checks](CLI_REFERENCE.md#native-export-fields-and-checks).
+Describe these requirements in the task; raw tool parameters are not needed for ordinary use.
 
 **Inspect:** every PDF page, warnings, figure/caption fit, table wrapping, fonts,
 column widths and the rules for the requested year and stage. Unsupported composite or

@@ -2,7 +2,7 @@
 
 **持续科研助手：围绕同一任务组合资料、代码、数据、图形与可编辑报告。**
 
-[English](README.md) · [开始使用](docs/USAGE_zh.md) · [任务指南](docs/WORKFLOWS_zh.md) · [成果展示](docs/showcase/README_zh.md) · [效果证据与限制](docs/EVALUATION_zh.md)
+[English](README.md) · [开始使用](docs/USAGE_zh.md) · [文档导航](docs/README_zh.md) · [成果展示](docs/showcase/README_zh.md)
 
 科研工作需要持续传递上下文：资料影响方法，代码落实计算，结果进入图表和正文，反馈又改变下一步。SimpleAutoResearch 将这些工作保存在可继续的任务中，让你检查证据、复用已有结果，并通过新指令推进工作。
 
@@ -40,7 +40,7 @@
 
 [阅读调研 PDF](examples/robotics-survey/report/survey.pdf) · [中文简报](examples/robotics-survey/report/briefing_zh.md) · [重建报告](examples/robotics-survey/README_zh.md)
 
-两份最终导出均在与 `d3b0721` 等价的代码上检查，该修复已纳入 main；完整任务历史跨越多个候选和显式续接，仍保留 `partial` 限定。正文与绘图代码由框架生成，人提供目标、反馈、授权和独立检查。[来源与开发成本](docs/showcase/README_zh.md)均公开说明。
+正文与绘图代码由框架任务生成，人提供目标、反馈、授权和独立检查。两项任务经历过开发修复与显式续接，仍保留 `partial` 状态；[来源、版本与成本](docs/showcase/README_zh.md)随案例说明，不作为一键完成或成功率承诺。
 
 ### 不重做实验的图形反馈
 
@@ -50,7 +50,7 @@
 
 [无需 API 密钥，使用源码和保存数据复跑](examples/figure-feedback/README_zh.md) · [前后对照与成本](docs/showcase/README_zh.md#横版比较图当前可复跑导出)
 
-该有界反馈任务用 11 次模型请求、211774 记录 tokens，没有重拟合。[较早的 Bike Sharing 与方法图](docs/showcase/README_zh.md#较早成果)保留原版本说明；[效果证据与限制](docs/EVALUATION_zh.md)区分可用成果与科学、自动化主张。
+该有界反馈任务用 11 次模型请求、211774 记录 tokens，没有重拟合。[较早的 Bike Sharing 与方法图](docs/showcase/README_zh.md#较早成果)保留原版本说明。案例的来源、人工参与和限制见[展示说明](docs/showcase/README_zh.md)。
 
 ## 一项任务怎样继续
 
@@ -118,23 +118,17 @@ uv run simple-ar results "SESSION"
 
 打开 `results` 打印的实际路径，检查正文、来源、计算、验证状态和未解决项。反馈沿用保存的材料、连接、权限和预算；用 `--source PATH` 补充证据。批准、暂停与恢复方式见[开始使用](docs/USAGE_zh.md)。
 
-### 可选：离线环境检查
-
-```bash
-uv run simple-ar research-session --config examples/data-curves/research.toml
-```
-
-此命令无需模型密钥，绘制给定的演示坐标。它检查确定性示例路径，不覆盖模型辅助的 `start` 任务。更多输入与依赖见[示例索引](examples/README.md)。
-
 ## 适用范围与审阅
 
-V2.10 继续在 `feat/v2.10-project-research-assistant` 开发；经过检查的阶段性改进可整合进 main，不代表整个里程碑关包。上面的 main 快速开始和公开案例仍有效；[开发证据与限制](docs/EVALUATION_zh.md#v210-开发证据)分别说明安装工程核查、较早的报告反馈、材料复用与给定模板转换，不与上述公开案例混用。
+入门教程面向 main 分支。开发分支仍在改进长任务和反馈交付；请按所安装版本使用文档，不将开发进展视为已发布能力。
 
 项目目前为**源码可见预览**，原生 `start` 入口仍属实验性功能。当前重点是 Python 科研代码、常见表格数据、范围明确的调研与有限复现，以及有材料依据的报告。复杂环境准备、长篇调研、精细出版排版和稳定效率仍需改善。
 
 来源原件只读挂载，你审阅命令提案并批准执行；任务工作区不是操作系统沙箱。科学解释与交付证据仍由你核验，执行或 PDF 编译成功本身不证明科学结论正确。模型、服务、数据和环境影响结果与成本；案例的具体条件见[成果展示](docs/showcase/README_zh.md)。
 
 ## 文档与贡献
+
+[文档导航](docs/README_zh.md)按入门、任务、参考和贡献开发分层。按需要阅读：
 
 | 你想做什么 | 阅读入口 |
 | --- | --- |
@@ -143,10 +137,11 @@ V2.10 继续在 `feat/v2.10-project-research-assistant` 开发；经过检查的
 | 查询命令、批准与恢复 | [CLI 参考](docs/CLI_REFERENCE_zh.md) |
 | 配置命名模型、路由和任务字段 | [配置参考](docs/CONFIG_REFERENCE_zh.md) |
 | 查看展示成果及其条件 | [成果展示](docs/showcase/README_zh.md) |
-| 核对开发证据、预算与未解决限制 | [效果证据与边界](docs/EVALUATION_zh.md) |
 | 理解代码与开发流程 | [开发指南](docs/DEVELOPMENT_zh.md) |
 | 了解近期变化 | [更新记录](CHANGELOG_zh.md) |
 
+目前没有当前版本的官方 benchmark 成绩或总体成功率；公开案例用于展示具体工作及其边界。
+
 欢迎提交可复现问题和脱敏诊断，请附目标、相关输入、命令、实际行为与预期结果。许可证尚未确定；代码贡献请先讨论，再提交 PR。
 
-工作流设计参考了 [AutoResearchClaw](https://github.com/aiming-lab/AutoResearchClaw)、[OpenResearch](https://github.com/alphaXiv/OpenResearch) 和 [ARIS](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep)。
+任务协作设计参考了 [AutoResearchClaw](https://github.com/aiming-lab/AutoResearchClaw)、[OpenResearch](https://github.com/alphaXiv/OpenResearch) 和 [ARIS](https://github.com/wanshuiyin/Auto-claude-code-research-in-sleep)。
