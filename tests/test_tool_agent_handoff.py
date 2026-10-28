@@ -8785,6 +8785,71 @@ class CommonToolLayerTests(_ImplementationAssertions, unittest.TestCase):
             SourceToolGateway(root, workspace, workspace.ledger, registry=registry,
                 policy=SourcePolicy(materials=('unmounted/private.txt',)))
 
+    def test_tool_budget_refusals_preserve_typed_failure_and_partial_work(self) -> None:
+        from simple_ar.core.budget import BudgetExceededError, BudgetUnknownError, BudgetConflictError
+        from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
+        from simple_ar.research.sources.registry import SearchProviderRegistry
+        from simple_ar.tools.sources import SourcePolicy, SourceToolGateway
+
+        root, _, workspace = self._workspace_fixture()
+        owner = SourceToolGateway(root, workspace, workspace.ledger,
+            policy=SourcePolicy(providers=('user_catalog',), cache_enabled=False),
+            registry=SearchProviderRegistry({'user_catalog': Mock(
+                side_effect=AssertionError('No provider dispatch'))}))
+
+        # The same typed refusal must survive all three adapter boundaries,
+        # including a source operation that has already retained partial work.
+        for boundary, dimension in (('workspace', 'process_invocations'),
+                                    ('source', 'process_wall_seconds'), ('research', 'total_tokens')):
+            for failure in (dimension, BudgetUnknownError, BudgetConflictError):
+                with self.subTest(boundary=boundary, failure=failure):
+                    identity = f'budget-{boundary}-{failure if isinstance(failure, str) else failure.__name__}'
+                    partial = root / f'{identity}.json'
+                    errors = []
+                    before = {entry.reservation_id: entry.to_dict() for entry in workspace.ledger.entries}
+
+                    def refuse(*args, **kwargs):
+                        partial.write_text('Retained partial work', encoding='utf-8')
+                        try:
+                            if isinstance(failure, str):
+                                workspace.ledger.reserve(identity, {failure: 1})
+                            else:
+                                raise failure('Finite budget exhausted')
+                        except (BudgetExceededError, BudgetUnknownError, BudgetConflictError) as exc:
+                            errors.append(exc)
+                            raise
+
+                    with patch.dict(workspace.ledger.limits,
+                                    {failure: 0} if isinstance(failure, str) else {}):
+                        if boundary == 'workspace':
+                            with patch.object(workspace, '_search', side_effect=refuse):
+                                blocked = workspace.call('search_files', {'path': '.', 'query': 'methods'},
+                                    identity=identity)
+                        elif boundary == 'source':
+                            with patch.object(owner, '_search', side_effect=refuse):
+                                blocked = owner.call('search_sources',
+                                    {'query': 'methods', 'providers': ['user_catalog']}, identity=identity)
+                        else:
+                            current = CapabilityContext(ArtifactStore(root / 'attempts' / identity),
+                                AttemptManifest(identity, capability='native_tool'))
+                            with patch.object(owner, '_research', side_effect=refuse):
+                                blocked = owner.execute_tool('research', current,
+                                    {'operation': 'plan', 'question': 'methods'})
+                    self.assertEqual(len(errors), 1)
+                    self.assertEqual(blocked.status, 'blocked')
+                    self.assertEqual(blocked.error, str(errors[0]))
+                    self.assertEqual(blocked.data, {'failure_kind': 'resource_exhausted'}
+                        if isinstance(failure, str) else {})
+                    self.assertEqual(partial.read_text(encoding='utf-8'), 'Retained partial work')
+                    after = {entry.reservation_id: entry.to_dict() for entry in workspace.ledger.entries}
+                    self.assertEqual({key: after[key] for key in before}, before)
+                    if boundary == 'source':
+                        charge = after[f'source:{identity}']
+                        self.assertEqual(charge['status'], 'settled')
+                        self.assertEqual(charge['actual'], {'source_operations': 1})
+                    else:
+                        self.assertEqual(after, before)
+
     def test_source_runtime_registry_rejects_before_dispatch_or_task_mutation(self) -> None:
         from simple_ar.core.capabilities import ArtifactStore, AttemptManifest, CapabilityContext
         from simple_ar.research.sources.registry import SearchProviderRegistry

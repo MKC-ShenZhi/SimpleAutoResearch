@@ -6,6 +6,12 @@ User-visible changes in reverse chronological order. Development entries are unr
 engineering checks and real task acceptance are reported separately.
 See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase/README.md) for evidence and limits.
 
+## 2026-10-29 — V2.10 development (unreleased)
+
+### Fixed
+
+- Resource exhaustion in search, execution and other operations now pauses shared-loop work instead of buying further investigation of the same blocker. Existing artifacts, failures and accounting remain available for revised requests or explicitly authorized continuation.
+
 ## 2026-10-28 — V2.10 development (unreleased)
 
 ### Improved

@@ -5091,17 +5091,19 @@ class ToolApplication:
             observed = self.session.store.read_json(relative)
             if (observed.get('status') != 'ok'
                     and (observed.get('data') or {}).get('failure_kind') == 'resource_exhausted'
-                    and (self.state['config'].get('professional_work') in _PROFESSIONAL_WORK
+                    and (self.operations is not None
+                        or self.state['config'].get('professional_work') in _PROFESSIONAL_WORK
                         or turn['remaining'])):
-                # An admitted owner also records its terminal diagnosis. Raw
-                # batches must not continue queued side effects. Historical
-                # low-level single calls retain their reserved closing decision:
-                # a qualified delivery can spend it, not replay the failed work.
+                # Resource admission is a shared execution boundary, including
+                # direct operations. It must not depend on a retired controller
+                # or the number of calls proposed in the current batch.
+                # Historical raw single calls keep their closing decision.
                 self._continue_professional_work()
                 if self.session.manifest.status == 'paused':
                     return
-                self.session.pause('Professional work exhausted its execution allowance; existing artifacts and failure records are retained. '
-                                   'Explicit resource authorization is required before continuing; no further model investigation requested.')
+                self.session.pause('Task resource allowance exhausted: ' + observed.get('error', '')
+                    + '. Existing artifacts and failure records are retained. '
+                    'Authorize resources or revise the request before continuing; no further model investigation requested.')
                 self._save()
                 return
             decision = (observed.get('data') or {}).get('pending_decision') if observed.get('status') == 'ok' else None

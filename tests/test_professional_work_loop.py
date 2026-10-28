@@ -3299,6 +3299,46 @@ class OperationsWorkLoopTests(unittest.TestCase):
                     self._run()
                     self.assertEqual(self.send.call_count,calls)
 
+    def test_direct_resource_failure_stops_paid_investigation_and_feedback_keeps_prior_work(self):
+        for name, arguments in (
+            ('search_files', {'path':'measurements', 'query':'sample'}),
+            ('run_process', {'argv':['python', '-c', "print('unreachable')"], 'timeout_sec':5}),
+        ):
+            with self.subTest(tool=name):
+                self.root = self.directory/name
+                self._create()
+                self._write('notes.md', 'Existing observations remain usable; computation is unfinished.\n')
+                retained = (self.root/'workspace/notes.md').read_bytes()
+                self.app.ledger.limits['process_invocations'] = 0
+                self.app.ledger.save()
+                self.decisions.clear()
+                self.decisions.extend([_action(name, **arguments),
+                    _action('write_file', path='unexpected.md', content='Must not continue automatically')])
+                calls = self.send.call_count
+                self.app.run(approve=lambda *_:True, progress=lambda _:None)
+                self.assertEqual(self.send.call_count, calls+1)
+                self.assertEqual(self.app.session.manifest.status, 'paused')
+                result = self._last(name)
+                self.assertEqual(result['data']['failure_kind'], 'resource_exhausted')
+                self.assertIn(result['error'], self.app.session.manifest.status_reason)
+                self.assertFalse((self.root/'workspace/unexpected.md').exists())
+                self.assertFalse(self._process_receipts())
+                ledger = self.app.ledger.to_dict()
+                self._reload()
+                self.app.run(progress=lambda _:None)
+                self.assertEqual(self.send.call_count, calls+1)
+                self.assertEqual(self.app.ledger.to_dict(), ledger)
+                self.decisions.clear()
+                self.decisions.append(_action('deliver_result', summary='Retained observations; computation incomplete',
+                    artifacts=['notes.md'], unresolved=['The requested computation has no execution allowance.']))
+                self.app.run(feedback='Keep the saved observations and deliver the unfinished computation explicitly.',
+                    progress=lambda _:None)
+                self.assertEqual(self.app.session.manifest.status, 'partial', self.app.result_snapshot())
+                self.assertEqual((self.root/'workspace/notes.md').read_bytes(), retained)
+                self.assertEqual(self.app.ledger.to_dict()['entries'][:len(ledger['entries'])], ledger['entries'])
+                self.assertFalse(self.app.ledger.unknown_dimensions())
+                self.assertFalse(self.transport_errors)
+
     def test_inspection_transport_unknown_survives_reload_without_replay_or_free_usage(self):
         import httpx
 

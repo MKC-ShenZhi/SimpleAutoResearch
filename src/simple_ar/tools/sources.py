@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from simple_ar.core.artifacts import write_json
 from simple_ar.app.research_execution import merge_execution_protocol
-from simple_ar.core.budget import BudgetError, BudgetLedger
+from simple_ar.core.budget import BudgetError, BudgetExceededError, BudgetLedger
 from simple_ar.core.capabilities import CapabilityContext
 from simple_ar.integrations.llm import LLMError
 from simple_ar.research.planning.capability import ResearchPlanRequest, ResearchPlanResult, run_research_plan_capability
@@ -454,7 +454,8 @@ class SourceToolGateway:
             self.ledger.settle(reservation, {"source_operations": count}, actual_source="adapter", reason=reason)
             return ToolResult(tool_name=name, data=data)
         except (ValueError, KeyError, OSError, BudgetError) as exc:
-            return ToolResult(tool_name=name, status="blocked", error=str(exc))
+            return ToolResult(tool_name=name, status="blocked", error=str(exc),
+                data={'failure_kind': 'resource_exhausted'} if isinstance(exc, BudgetExceededError) else {})
 
     def _search(self, request: _Search, directory: Path, *, queries: tuple[str, ...] = (),
                 client: Any = None, plan: ResearchPlanResult | None = None, question: str = '') -> dict[str, Any]:
@@ -625,7 +626,8 @@ class SourceToolGateway:
                     for ref in result.data['artifact_refs']}}, kind='source_result')
             return result
         except (ValueError, KeyError, TypeError, OSError, BudgetError, LLMError) as exc:
-            return ToolResult(tool_name=name, status='blocked', error=str(exc))
+            return ToolResult(tool_name=name, status='blocked', error=str(exc),
+                data={'failure_kind': 'resource_exhausted'} if isinstance(exc, BudgetExceededError) else {})
 
     def _research(self, context: CapabilityContext, request: _Research, paths: list[Path],
                   *, network: bool) -> ToolResult:

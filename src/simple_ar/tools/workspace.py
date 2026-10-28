@@ -17,7 +17,7 @@ from typing import Any, Iterable, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
 from simple_ar.core.artifacts import read_json, replace_exact_spans
-from simple_ar.core.budget import BudgetError, BudgetLedger
+from simple_ar.core.budget import BudgetError, BudgetExceededError, BudgetLedger
 from simple_ar.core.process import ProcessSpec, process_observation, run_process, settle_process_record
 from simple_ar.tools.specs import CommonToolSpec, ToolResult, tool_completion
 
@@ -1367,7 +1367,8 @@ class WorkspaceToolGateway:
                 data["absolute_path"] = str(target)
             return ToolResult(tool_name=name, data=data, metadata=metadata)
         except (ValueError, KeyError, BudgetError) as exc:
-            return ToolResult(tool_name=name, status="blocked", error=str(exc))
+            return ToolResult(tool_name=name, status="blocked", error=str(exc),
+                data={'failure_kind': 'resource_exhausted'} if isinstance(exc, BudgetExceededError) else {})
         except OSError as exc:
             return ToolResult(tool_name=name, status="error", error=str(exc))
 
