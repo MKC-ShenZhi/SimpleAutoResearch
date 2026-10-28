@@ -809,6 +809,19 @@ class InspectionToolGateway:
         """Reuse the common pure projector; original read/response records stay intact."""
         from simple_ar.core.working_context import select_working_context
 
+        policy = saved.get('inspection_context_policy')
+        if 'inspection_context_policy' in saved and policy != 'retained.v1':
+            raise ValueError('Unknown inspection context policy')
+        retained = self.adaptive and policy == 'retained.v1'
+
+        def version(path: str) -> str | None:
+            # artifact_hashes resolves current mount/private-path authority before
+            # hashing. A receipt digest alone cannot renew access or its version.
+            try:
+                return self.workspace.artifact_hashes([path])[path]
+            except (OSError, ValueError):
+                return None
+
         target = getattr(getattr(client, '_settings', None), 'context_input_tokens', 24000)
         if type(target) is not int or target <= 0:
             target = 24000
@@ -844,6 +857,7 @@ class InspectionToolGateway:
         observations = [{'record':self._path(saved['identity'], 'input'),
             'chunk_id':f"{row['subject']}:{index}", 'subject':row['subject'],
             'path':row['path'], 'sha256':row['sha256'], 'kind':'source_text',
+            **({'role':'historical_observation'} if retained else {}),
             'turn':read_turns.get(row['subject']), 'offset_bytes':window['offset_bytes'],
             'next_offset_bytes':window['review_next_offset_bytes'],
             'size_bytes':window['size_bytes'], 'text':window.get('review_text',window['text'])}
@@ -868,6 +882,8 @@ class InspectionToolGateway:
                 if 'user_requests' in saved else None),
             schema_tokens=estimate_tokens(json.dumps(offered,ensure_ascii=False)),
             context_token_target=target,estimate_tokens=estimate_tokens,
+            material_policy='retained' if retained else 'ranked',
+            version_resolver=version if retained else None,
             history_access='read_file at the recorded authorized source path and range',
             trailing_messages=[finish] if finish is not None else [])
         if validate_capacity and metadata['estimated_input_tokens'] > target:
@@ -890,7 +906,11 @@ class InspectionToolGateway:
             if not isinstance(value, str) or row.get('complete') or not row.get('readable'):
                 continue
             _, projection = self._working_messages(saved, request, [], offered, client)
-            headroom = projection['input_token_target'] - projection['estimated_input_tokens']
+            # Optional originals can yield to required target bytes. The final
+            # candidate projection below still enforces the actual input target.
+            cost = ('required_input_tokens' if self.adaptive
+                and saved.get('inspection_context_policy') == 'retained.v1' else 'estimated_input_tokens')
+            headroom = projection['input_token_target'] - projection[cost]
             window = row['windows'][-1]
             size, cursor = window['size_bytes'], window['review_next_offset_bytes']
             count = size - cursor
@@ -1094,7 +1114,11 @@ class InspectionToolGateway:
             read_limit = None
             if self.progressive and not rejected_final:
                 _, base_projection = self._working_messages(saved,request,messages[:2],[*tools,terminal],client)
-                available = max(0,base_projection['input_token_target']-base_projection['estimated_input_tokens'])
+                # Reused optional originals can be evicted for a useful unseen
+                # window; the next actual request still has to fit its target.
+                cost = ('required_input_tokens' if self.adaptive
+                    and saved.get('inspection_context_policy') == 'retained.v1' else 'estimated_input_tokens')
+                available = max(0,base_projection['input_token_target']-base_projection[cost])
                 read_limit = max(256,min(64000,available*4//(2*max(1,len(calls)))))
             for index,call in enumerate(calls):
                 name,arguments = parsed[index] if index<len(parsed) else ('',{})
@@ -1167,6 +1191,8 @@ class InspectionToolGateway:
             saved = {'identity': identity, 'arguments': binding, 'targets': [], 'evidence': []}
             if self.protocol:
                 saved['protocol'] = self.protocol
+            if self.adaptive:
+                saved['inspection_context_policy'] = 'retained.v1'
             if delivery_context is not None:
                 if (not isinstance(delivery_context, dict)
                         or delivery_context.get('schema_version') != 'delivery_review.v1'):

@@ -138,6 +138,11 @@ When a fresh review has no caller-selected evidence list, the same decoder deriv
 eligible sources from retained read receipts within current mounts. It neither scans
 directories nor reads previously unobserved originals. Target files are excluded
 from supporting-source reuse, and cached inspection inputs remain unchanged.
+Fresh adaptive inspections record `inspection_context_policy=retained.v1` and
+use the shared retained selector for whole, current, receipt-backed source windows.
+Required targets and newly requested reads can displace optional context within
+the configured input target. Marker-absent projections keep ranked selection;
+started inspections retain their saved inputs and never replay an investigation.
 Fresh inspections freeze the original user requests and feedback separately from the
 local inspection goal. The shared context selector accounts for both. Requirements
 are neither evidence nor permission; a narrow inspection does not certify the whole

@@ -13,7 +13,7 @@ User-visible changes, newest first, dated when confirmed. Multi-day development 
 - Previously read, version-valid originals can remain available without work notes or an explicit scope. The same bounded selector gives original evidence priority over optional navigation and distinguishes stale, unavailable and capacity-limited material. Generated tool explanations do not become original file reads merely by carrying a path or hash.
 - Authorized publication is directly available in new tasks. Its existing final-delivery option handles the same manuscript, rendered output and independent review; generic compilation does not replace publication provenance.
 - File tools can read the current task's receipt-identified process diagnostics directly, including failed rendering logs. Publication failures point to those readable files, avoiding an extra command just to inspect an error. Task sources, writable scope and historical bindings are unchanged.
-- Fresh independent reviews can reuse authorized, version-valid source reads even when the caller supplies no evidence list. Targets still require a current read; cached opinions never become proof for a changed version.
+- Fresh independent reviews reuse authorized, version-valid source reads even without a caller-selected evidence list. Whole verified windows can use available configured input capacity, while required targets and new reads can displace optional context. Targets still require a current read; cached opinions never become proof for a changed version.
 
 Server engineering and saved-history checks do not establish task success. Unassisted draft, feedback and formal delivery acceptance remains incomplete.
 

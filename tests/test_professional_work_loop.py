@@ -1700,7 +1700,11 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual(self.app.ledger.to_dict(),ledger)
         self.assertEqual(self._versions(self.root/f'tools/inspection/{identity}'),records)
 
-    def test_progressive_inspection_primes_small_targets_for_one_final_response(self):
+    def test_retained_inspection_yields_optional_context_to_target_priming_and_new_reads(self):
+        from dataclasses import replace
+
+        self.services.llm_client = LLMClient(replace(self.services.llm_client._settings,
+            context_input_tokens=12000))
         self._create()
         texts = {
             'records.csv': 'record,category\n' + ''.join(f'{index},group-{index % 3}\n' for index in range(90)),
@@ -1708,14 +1712,32 @@ class OperationsWorkLoopTests(unittest.TestCase):
         }
         for path, text in texts.items():
             self._write(path, text)
+        # Many small actual windows fill optional presentation capacity without
+        # turning any one of them into required target text or a new read quota.
+        padding = ''.join(f'{index:04d}: ' + 'x'*2041 + '\n' for index in range(28))
+        self._write('support.txt', padding)
+        for offset in range(0, len(padding), 2048):
+            self._submit(_action('read_file', path='support.txt', offset_bytes=offset,
+                max_bytes=2048, full_digest=True))
+            self._ok('read_file')
+        new_source = 'Previously unobserved supporting detail.\n'*100
+        self._write('unobserved.txt', new_source)
 
         def review(view):
-            self.assertEqual(view['evidence'], [])
             self.assertEqual(len(view['targets']), len(texts))
             for target in view['targets']:
                 text = texts[Path(target['path']).name]
                 self.assertTrue(target['complete'])
                 self.assertEqual(''.join(w['text'] for w in target['text_windows']), text)
+            if len(self.inspection_requests) == 1:
+                self.assertTrue(view['working_view']['observations'])
+                self.assertLess(12000-view['working_context']['estimated_input_tokens'], 1024)
+                self.assertNotIn(new_source, json.dumps(self.inspection_requests[-1]['messages']))
+                return [_action('read_file', path='unobserved.txt', max_bytes=8000)]
+            reply, = self._inspection_history()
+            self.assertEqual(reply['status'], 'ok', reply)
+            self.assertEqual(''.join(w['text'] for w in reply['data']['text_windows']), new_source,
+                'Evictable originals must not shrink a useful new read to tiny pages')
             # Complete reading does not choose the reviewer's conclusion.
             return {'decisions':[{'subject':target['subject'], 'conclusion':'incomplete',
                 'findings':[], 'evidence':[], 'limitations':['Further interpretation is needed.']}
@@ -1725,13 +1747,86 @@ class OperationsWorkLoopTests(unittest.TestCase):
         result = self._inspect(list(texts), [])
         self.assertFalse(self.transport_errors, self.transport_errors)
         self.assertEqual(result['status'], 'ok', result)
-        self.assertEqual(len(self.inspection_requests), 1)
+        self.assertEqual(len(self.inspection_requests), 2)
         self.assertEqual([call['function']['name'] for call in
-            self.inspection_messages[0]['tool_calls']], ['record_inspection'])
+            self.inspection_messages[0]['tool_calls']], ['read_file'])
+        self.assertEqual([call['function']['name'] for call in
+            self.inspection_messages[1]['tool_calls']], ['record_inspection'])
+        identity = Path(result['data']['record']).parts[1]
+        for number in range(2):
+            projection = self.app.session.store.read_json(
+                f'tools/inspection/{identity}/sources-{number}.json')['working_input']['projection']
+            self.assertLessEqual(projection['estimated_input_tokens'], 12000)
+            if number == 1:
+                observed, = [row for row in projection['selected_records']
+                    if row['source']['path']==str(self.root/'workspace/unobserved.txt')]
+                self.assertEqual(observed['version_status'], 'matching')
+                self.assertEqual(observed['source']['role'], 'historical_observation')
         assessments = _assessments(result)
         self.assertEqual(len(assessments), len(texts))
         self.assertTrue(all(row['coverage']=='partial' and row['verdict']=='incomplete'
             and not row['evidence_sha256'] for row in assessments))
+
+    def test_fresh_inspection_supplies_whole_originals_beyond_the_ranked_share(self):
+        from dataclasses import replace
+        from simple_ar.tools.inspection import InspectionRequest
+
+        self.services.llm_client = LLMClient(replace(self.services.llm_client._settings,
+            context_input_tokens=22000))
+        self._create()
+        self._write('report.md', 'Check the recorded source scope.\n')
+        bodies = [f'Original source window {index}.\n'+'Detail. '*2490 for index in range(3)]
+        self._write('original.txt', ''.join(bodies))
+        offset = 0
+        for body in bodies:
+            self._submit(_action('read_file', path='original.txt', offset_bytes=offset,
+                max_bytes=len(body), full_digest=True))
+            self.assertEqual(self._ok('read_file')['data']['text'], body)
+            offset += len(body)
+
+        def review(view):
+            sources = view['working_view']['observations']
+            self.assertCountEqual([row['observation']['text'] for row in sources], bodies)
+            self.assertTrue(all(row['version_status']=='matching'
+                and row['observation']['role']=='historical_observation'
+                and 'record_text_slice' not in row['observation'] for row in sources))
+            return {'decisions':[{'subject':'target-1','conclusion':'complete',
+                'findings':[], 'evidence':list(dict.fromkeys(row['observation']['subject'] for row in sources)),
+                'limitations':[]}]}
+
+        self.review = review
+        result = self._inspect(['report.md'], [])
+        self.assertEqual(result['status'], 'ok', result)
+        self.assertEqual(len(self.inspection_requests), 1)
+        identity = Path(result['data']['record']).parts[1]
+        store = self.app.session.store
+        saved = store.read_json(f'tools/inspection/{identity}/input.json')
+        self.assertEqual(saved['inspection_context_policy'], 'retained.v1')
+        self.assertFalse(any(w.get('source_reference') for row in saved['targets'] for w in row['windows']))
+        trace = store.read_json(f'tools/inspection/{identity}/sources-0.json')
+        projection = trace['working_input']['projection']
+        self.assertGreater(projection['estimated_input_tokens']-projection['required_input_tokens'], 22000//3)
+        self.assertLessEqual(projection['estimated_input_tokens'], 22000)
+        self.assertEqual(projection['material_input_ceiling'], 22000)
+
+        # A marker-absent historical projection keeps its original ranked policy
+        # without editing an old input/cache or silently reclassifying its rows.
+        historical = deepcopy(saved)
+        historical.pop('inspection_context_policy')
+        original = deepcopy(historical)
+        owner = self.app.operations.inspection
+        request = InspectionRequest.model_validate(saved['arguments'])
+        offered = self.inspection_requests[0]['tools']
+        historical_messages, ranked = owner._working_messages(
+            historical, request, [], offered, self.services.llm_client)
+        self.assertEqual(historical, original)
+        self.assertEqual(ranked['material_input_ceiling'], ranked['required_input_tokens']+22000//3)
+        historical_sources = json.loads(historical_messages[1]['content'])['working_view']['observations']
+        self.assertNotEqual({row['observation']['text'] for row in historical_sources}, set(bodies))
+        self.assertTrue(all(row['version_status']=='unchecked' for row in ranked['selected_records']))
+        with self.assertRaisesRegex(ValueError, 'Unknown inspection context policy'):
+            owner._working_messages({**historical, 'inspection_context_policy':'future.v99'},
+                request, [], offered, self.services.llm_client)
 
     def test_progressive_inspection_large_target_under_tight_capacity_still_allows_paging(self):
         from dataclasses import replace
@@ -1956,6 +2051,9 @@ class OperationsWorkLoopTests(unittest.TestCase):
             if number < 4:
                 return [_action('read_file', path=f'context-{number-2}.txt', max_bytes=16000)]
             self.assertGreater(view['working_view']['history']['archive_end_turn'], 0)
+            self.assertTrue(all(row['version_status']=='matching'
+                and row['observation']['role']=='historical_observation'
+                for row in view['working_view']['observations']))
             supplied = [row['observation'] for row in view['working_view']['observations']]
             basis, = [row for row in supplied if row['subject']=='evidence-1']
             self.assertEqual(basis['text'], 'Observed sample values are 1, 2, 3; their mean is 2.0.\n')
