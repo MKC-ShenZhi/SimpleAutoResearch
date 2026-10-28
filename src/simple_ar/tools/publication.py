@@ -364,6 +364,28 @@ class PublicationToolGateway:
             'view': view, 'adopted': False,
             'pages': data.get('preview_images', []), 'visual_reviewed': False}
 
+    def check_requested_delivery(self, observations: list[dict], artifacts: list[str], *,
+                                 formats: list[str], manuscript: str | None,
+                                 proposed: dict | None = None) -> set[Path]:
+        """Validate operation publication roles without requiring a Writer identity.
+
+        A Markdown-only report needs no export. If publication files are in the
+        delivery, their provenance still matters even without TeX/PDF formats.
+        The legacy canonical-report caller retains check_report_delivery and its
+        stronger authoring identity. A proposed export is only a preflight;
+        actual outputs are checked again after production.
+        """
+        if not set(formats) - {'markdown'}:
+            delivered = {self.workspace.resolve(path) for path in artifacts}
+            published = any(row.get('tool_name') == 'export_report' and row.get('status') == 'ok'
+                and row.get('data', {}).get('project')
+                and any(path.is_relative_to(self.workspace.resolve(row['data']['project']))
+                        for path in delivered) for row in observations)
+            if not published:
+                return set()
+        return self.check_report_delivery(observations, None, artifacts,
+            formats=formats, manuscript=manuscript, proposed=proposed)
+
     def check_report_delivery(self, observations: list[dict], identity: dict | None, artifacts: list[str], *,
                               formats: list[str], manuscript: str | None, proposed: dict | None = None) -> set[Path]:
         """Prove requested publication roles belong to this authoring version."""

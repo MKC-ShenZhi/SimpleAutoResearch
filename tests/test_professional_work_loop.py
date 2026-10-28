@@ -1740,7 +1740,7 @@ class OperationsWorkLoopTests(unittest.TestCase):
         calls = self.send.call_count
 
         def check(rows,artifacts):
-            return self.app.publication.check_report_delivery(rows,None,artifacts,
+            return self.app.publication.check_requested_delivery(rows,artifacts,
                 formats=formats,manuscript=manuscript)
 
         expected = {self.app.workspace.resolve(path) for path in current['data']['artifact_sha256']}
@@ -3499,23 +3499,20 @@ class OperationsWorkLoopTests(unittest.TestCase):
         canonical = self._delivery('report.md')
         self._submit(_action('deliver_result',**canonical))
         self.assertIn('fixed section structure',self._last('deliver_result')['error'])
+        # The content-rule matrix belongs to the report domain. Keep one
+        # restored-loop success here to prove the consumer still routes its
+        # frozen contract and actual editable file without a Writer receipt.
         body = '# Observations\n\n'+'\n\n'.join(
-            '## '+row['heading']+'\n\n'+_SCOPE for row in requirement['outline'])+'\n'
-        for citations,error in (('[@P1; @P2]','max_cited_sources'),('[@P1] and again [@P1]',None)):
-            version = self._read('report.md')['sha256']
-            self._submit(_action('write_file',path='report.md',expected_sha256=version,content=body+citations+'\n'))
-            self._ok('write_file')
-            self._inspect(['report.md'])
-            self._ok('inspect_artifacts')
-            self.assertEqual(self._assessment()['coverage'], 'complete')
-            self._reload()
-            self._submit(_action('deliver_result',**canonical))
-            if error:
-                self.assertIn(error,self._last('deliver_result')['error'])
-                self.assertNotEqual(self.app.session.manifest.status,'completed')
-            else:
-                self._ok('deliver_result')
-                self.assertEqual(self.app.session.manifest.status,'completed',self.app.result_snapshot())
+            '## '+row['heading']+'\n\n'+_SCOPE for row in requirement['outline'])+'\n[@P1] and again [@P1]\n'
+        version = self._read('report.md')['sha256']
+        self._submit(_action('write_file',path='report.md',expected_sha256=version,content=body))
+        self._ok('write_file')
+        self._inspect(['report.md'])
+        self._ok('inspect_artifacts')
+        self._reload()
+        self._submit(_action('deliver_result',**canonical))
+        self._ok('deliver_result')
+        self.assertEqual(self.app.session.manifest.status,'completed',self.app.result_snapshot())
 
     def test_direct_source_edit_uses_current_producer_and_preserves_consumed_old_proof(self):
         self._create()

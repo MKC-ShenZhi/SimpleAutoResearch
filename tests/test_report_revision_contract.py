@@ -145,74 +145,40 @@ class RevisionContractTests(unittest.TestCase):
                 material_report_binding(workspace, requirement, observations=[{
                     'tool_name': 'analyze_table', 'status': 'error'}])
 
-    def test_material_professional_report_keeps_projection_revision_and_replay(self):
-        from simple_ar.core.capabilities import CapabilityResult
-        from simple_ar.tools.workspace import WorkspaceToolGateway
-        from simple_ar.tools.writing import WritingToolGateway, freeze_report_requirement, material_report_binding
-        for method in ('article', 'sections'):
-            with self.subTest(method=method), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp)
-                workspace = WorkspaceToolGateway(root, {}, None)
-                workspace.call('write_file', {'path': 'workspace/input.md',
-                    'content': 'Author supplied value is 3.5; collection is unverified.'}, identity='input')
-                from simple_ar.report.writing import resolve_report_writing_config
-                resolved_method, settings = resolve_report_writing_config({'outline_strategy': 'template'}, method=method)
-                requirement = freeze_report_requirement(settings, method=resolved_method)
-                requirement['outline'] = [{'heading': 'Observations', 'required': True}]
-                requests = ['Explain supplied value']
-                def binding():
-                    return material_report_binding(workspace, requirement,
-                        mounts=['workspace/input.md'], requests=requests)
-                gateway = WritingToolGateway(root, workspace, None, 'unused', 'test',
-                    client_factory=lambda _: object(), report_inputs=binding)
-                captured = []
-                def writer(*, context, request):
-                    captured.append(request)
-                    self.assertEqual(request.method, method)
-                    self.assertEqual(request.report_context.results['session_execution'], 'not_requested')
-                    self.assertNotIn('implementation', request.report_context.results)
-                    self.assertTrue(any('externally supplied assertions' in row for row in request.memory.limitations))
-                    self.assertEqual(request.template.model_dump(mode='json'), requirement['template'])
-                    self.assertEqual(request.config.document_review, requirement['config']['document_review'])
-                    section = ReportSectionDraft(section_id='document', heading='Observations',
-                        draft_markdown=('## Observations\n\n' if method == 'article' else '')
-                            + 'The supplied value is 3.5; collection is unverified.')
-                    ref = context.store.write_json('writer.json', {
-                        'memory': request.memory.model_dump(mode='json'),
-                        'sections': [section.model_dump(mode='json')],
-                        'independent_review': {'review_status': 'needs_revision'}}, kind='report_writer_result')
-                    # An article with a full response but unresolved independent
-                    # inspection remains a usable candidate, not a lost output.
-                    return CapabilityResult(status='failed' if method == 'article' else 'completed', artifacts=(ref,))
-                arguments = {'goal': requests[0], 'title': 'Supplied material report',
-                    'materials': [{'path': 'workspace/input.md'}]}
-                with patch('simple_ar.report.writing.run_report_writing_capability', side_effect=writer) as professional, \
-                        patch('simple_ar.report.projection.build_implementation_report_inputs',
-                              side_effect=AssertionError('Material writing cannot invent execution')):
-                    result = gateway.call('compose_document', arguments, identity='first')
-                    self.assertEqual(result.status, 'ok', result.error)
-                    self.assertTrue(result.data['unresolved'])  # Independent review cannot be upgraded by publication.
-                    self.assertEqual(gateway.call('compose_document', arguments, identity='first'), result)
-                    self.assertEqual(professional.call_count, 1)
-                    original = workspace.resolve(result.data['editable_markdown']).read_bytes()
-                    requests.append('Qualify uncertainty')
-                    self.assertIn('Inputs changed', gateway.call('compose_document', arguments, identity='first').error)
-                    revised = gateway.call('compose_document', {**arguments,
-                        'prior_draft': result.data['editable_markdown']}, identity='revision')
-                    self.assertEqual(revised.status, 'ok', revised.error)
-                    self.assertIn('Qualify uncertainty', captured[-1].report_context.goal_markdown)
-                    self.assertEqual(captured[-1].prior_draft.encode(), original)
-                    self.assertEqual(workspace.resolve(result.data['editable_markdown']).read_bytes(), original)
-                    from types import SimpleNamespace
-                    responses = iter([{'read_windows': [{'path': 'workspace/input.md'}]},
-                                      {'materials': [{'path': 'workspace/input.md'}]}])
-                    gateway.client_factory = lambda _: SimpleNamespace(ask_json=lambda *a, **k: next(responses))
-                    automatic = gateway.call('compose_document', {'goal': 'Explain',
-                        'title': arguments['title']}, identity='automatic')
-                    self.assertEqual(automatic.status, 'ok', automatic.error)
-                gateway.report_inputs = lambda: material_report_binding(workspace, requirement, requests=requests)
-                empty = gateway.call('compose_document', {'goal': 'Write', 'title': 'Empty'}, identity='empty')
-                self.assertIn('requires selected source', empty.error)
+    def test_material_projection_preserves_supplied_assertions_without_session_execution(self):
+        from simple_ar.core.capabilities import ArtifactRef
+        from simple_ar.report.projection import build_material_report_inputs
+        from simple_ar.research.documents.ingest import DocumentBundle
+
+        # Writer revision/replay is covered through the actual capability in
+        # test_tool_agent_handoff. This domain test needs no counterfeit Writer
+        # checkpoint: supplied assertions must retain their evidence scope in
+        # both the article view and the view with sectional working memory.
+        text = 'Author supplied value is 3.5; collection is unverified.'
+        with tempfile.TemporaryDirectory() as tmp:
+            material = Path(tmp) / 'input.md'
+            material.write_text(text, encoding='utf-8')
+            bundle = DocumentBundle.from_rows(documents=[{
+                'document_id': 'provided', 'title': 'Supplied observation',
+                'source': 'local', 'source_id': str(material),
+                'local_path': str(material), 'extraction_status': 'parsed'}],
+                chunks=[{'chunk_id': 'provided-span', 'document_id': 'provided',
+                    'text': material.read_text(encoding='utf-8'), 'source_path': str(material)}])
+            for include_memory in (False, True):
+                with self.subTest(include_memory=include_memory):
+                    context, memory = build_material_report_inputs(topic='Explain supplied value',
+                        documents=bundle, documents_ref=ArtifactRef(path='documents.json',
+                            schema='document_bundle.v1'), assets=(), selected_evidence=True,
+                        include_memory=include_memory)
+                    self.assertEqual(context.results['session_execution'], 'not_requested')
+                    self.assertEqual(context.results['evidence_origin'], 'user_supplied_unverified')
+                    self.assertNotIn('implementation', context.results)
+                    self.assertIn(text, json.dumps(context.model_dump(mode='json')))
+                    if include_memory:
+                        self.assertTrue(any('externally supplied assertions' in row for row in memory.limitations))
+                    else:
+                        self.assertIsNone(memory)
+            self.assertEqual(material.read_text(encoding='utf-8'), text)
 
     def test_planning_and_repair_allegations_are_not_promoted_to_source_facts(self):
         from simple_ar.report.schema import ReportDocumentPlan
@@ -708,6 +674,75 @@ class RevisionContractTests(unittest.TestCase):
         self.assertEqual(sum(event.action == 'document_revise' for event in result.iterations), 2)
         self.assertTrue(any(f.type == 'document_revision_unresolved' and f.section_id == 'third'
                             for f in result.memory.reviewer_findings))
+
+
+class OperationReportDeliveryTests(unittest.TestCase):
+    """Operation reports bind actual manuscripts, without legacy Writer proofs."""
+
+    def test_frozen_content_constraints_follow_current_editable_manuscript(self):
+        from simple_ar.report.delivery import operation_report_content
+        from simple_ar.tools.workspace import DeliveryRequest, WorkspaceToolGateway
+        from simple_ar.tools.writing import freeze_report_requirement
+
+        requirement = freeze_report_requirement({'outline_strategy': 'template', 'max_cited_sources': 1})
+        self.assertTrue(requirement['outline'])
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = WorkspaceToolGateway(Path(tmp), {}, None)
+            path = workspace.workspace / 'report.md'
+            request = DeliveryRequest(summary='Supplied observations', artifacts=['report.md'],
+                report={'status': 'canonical', 'manuscript': 'report.md'})
+            body = '# Observations\n\n' + '\n\n'.join(
+                '## ' + row['heading'] + '\n\nThree supplied observations.'
+                for row in requirement['outline']) + '\n'
+            # Repeated references count once; changing the bytes requires
+            # checking current content even though the manuscript path is fixed.
+            for content, expected in (
+                    (body + '[@P1] and again [@P1]', None),
+                    (body + '[@P1; @P2]', 'max_cited_sources'),
+                    ('# Observations\n\n## Unrequested heading\n\nThree observations.', 'fixed section structure')):
+                with self.subTest(expected=expected):
+                    path.write_text(content, encoding='utf-8')
+                    issues, required = operation_report_content(request, request.artifacts,
+                        workspace=workspace, requirement=requirement)
+                    self.assertEqual(required, ['report.md'])
+                    if expected:
+                        self.assertTrue(any(expected in issue for issue in issues), issues)
+                    else:
+                        self.assertEqual(issues, [])
+            # A claim cannot certify an inventory without the identified source.
+            with self.assertRaisesRegex(ValueError, 'actual editable manuscript'):
+                operation_report_content(request, [], workspace=workspace, requirement=requirement)
+
+    def test_publication_is_optional_for_markdown_but_intent_cannot_prove_outputs(self):
+        from simple_ar.report.delivery import operation_report_publication
+        from simple_ar.tools.publication import PublicationToolGateway
+        from simple_ar.tools.specs import ToolCall
+        from simple_ar.tools.workspace import DeliveryRequest, WorkspaceToolGateway
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = WorkspaceToolGateway(Path(tmp), {}, None)
+            (workspace.workspace / 'report.md').write_text('# Supplied observations\n', encoding='utf-8')
+            publication = PublicationToolGateway(Path(tmp), workspace, None)
+            request = DeliveryRequest(summary='Supplied observations', artifacts=['report.md'],
+                report={'status': 'canonical', 'manuscript': 'report.md', 'formats': ['markdown']})
+            self.assertEqual(operation_report_publication(request, request.artifacts, [], publication=publication), [])
+            request.report.formats = ['pdf']
+            proposed = ToolCall(tool_name='export_report', arguments={'markdown': 'report.md', 'compile_pdf': True})
+            self.assertEqual(operation_report_publication(request, request.artifacts, [],
+                publication=publication, proposed=proposed), [])
+            # The post-production submission must prove an actual owner receipt.
+            # A file named main.pdf or an outer 'ok' cannot establish publication.
+            project = workspace.workspace / 'publications' / 'unproven'
+            project.mkdir(parents=True)
+            (project / 'main.pdf').write_bytes(b'%PDF-unproven')
+            artifacts = ['report.md', 'publications/unproven/main.pdf']
+            observed = {'tool_name': 'export_report', 'status': 'ok',
+                'data': {'project': 'publications/unproven'}}
+            issues = operation_report_publication(request, artifacts, [observed], publication=publication)
+            self.assertTrue(issues)
+            # Unfinished work keeps the original partial-delivery semantics.
+            request.unresolved = ['Publication has no verified owner receipt.']
+            self.assertEqual(operation_report_publication(request, artifacts, [observed], publication=publication), [])
 
 
 if __name__ == '__main__':

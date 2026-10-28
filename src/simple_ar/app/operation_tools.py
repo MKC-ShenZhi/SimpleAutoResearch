@@ -376,9 +376,12 @@ class OperationTools:
         request = DeliveryRequest.model_validate(delivery)
         if request.unresolved:
             return []  # Existing terminal binding still proves actual partial files.
-        requirement = self.config.get('report_requirement')
-        if requirement is not None and request.report is None:
-            return ['Frozen report requirement needs an explicit report claim or disclosed partial delivery']
+        from simple_ar.report.delivery import (
+            operation_report_admission, operation_report_content, operation_report_publication,
+        )
+        admission = operation_report_admission(request, self.config.get('report_requirement'))
+        if admission:
+            return admission
         owned = [row for row in observations if row.get('contract_current',True)]
         spec = self.registry.get(proposed.tool_name) if proposed is not None else None
         producing = spec is not None and spec.completion is not None and bool(spec.completion.field)
@@ -397,26 +400,12 @@ class OperationTools:
         missing = missing_delivery_files(self.workspace,resolved['artifacts'],self.config.get('delivery_files') or [])
         if missing:
             issues.append('Delivery is missing required workspace outputs: '+', '.join(missing))
-        required = []
-        report = request.report
-        if report is not None:
-            if report.status != 'canonical' or not report.manuscript:
-                return ['A candidate report must disclose unfinished work']
-            manuscript = self.workspace.resolve(report.manuscript)
-            if manuscript not in {self.workspace.resolve(path) for path in resolved['artifacts']}:
-                return ['Deliver the actual editable manuscript identified by the report claim']
-            required.append(report.manuscript)
-            if requirement is not None:
-                from simple_ar.report.writing import validate_output_outline
-                from simple_ar.report.citations import body_citation_ids
-                markdown = manuscript.read_text(encoding='utf-8')
-                try:
-                    validate_output_outline(requirement['outline'],markdown)
-                except ValueError as exc:
-                    issues.append(str(exc))
-                limit = requirement['config'].get('max_cited_sources',0)
-                if limit and len(body_citation_ids(markdown,set(),include_unknown=True)) > limit:
-                    issues.append('Report exceeds frozen max_cited_sources')
+        try:
+            report_issues, required = operation_report_content(request, resolved['artifacts'],
+                workspace=self.workspace, requirement=self.config.get('report_requirement'))
+        except ValueError as exc:
+            return [str(exc)]
+        issues.extend(report_issues)
         scoped_review = self.delivery_review is not None and bool(required)
         # Admission need not already have the review it is about to perform.
         # After the operation, local opinions still constrain actual findings,
@@ -447,18 +436,8 @@ class OperationTools:
                 issues.extend(self.scientific.delivery_requirement({**evidence,'implementation_refs':refs}))
             elif self.config.get('code_task') is None:
                 issues.extend(self.scientific.evidence_requirement(measurements,analyses))
-        # Export owns all version/provenance checks; no Writer identity is needed.
-        published = [row for row in observations if row.get('tool_name')=='export_report'
-            and row.get('status')=='ok' and row.get('data',{}).get('project')
-            and any(self.workspace.resolve(path).is_relative_to(self.workspace.resolve(row['data']['project']))
-                for path in resolved['artifacts'])]
-        if report is not None and (published or set(report.formats)-{'markdown'}):
-            try:
-                self.publication.check_report_delivery(observations,None,resolved['artifacts'],
-                    formats=report.formats,manuscript=report.manuscript,
-                    proposed=proposed.arguments if proposed is not None and proposed.tool_name=='export_report' else None)
-            except (ValueError,OSError,KeyError,RuntimeError) as exc:
-                issues.append(str(exc))
+        issues.extend(operation_report_publication(request, resolved['artifacts'], observations,
+            publication=self.publication, proposed=proposed))
         return issues
 
     def review_delivery(self, delivery: dict, identity: str, *, may_start: bool,
