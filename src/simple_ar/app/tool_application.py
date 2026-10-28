@@ -986,11 +986,14 @@ class ToolApplication:
         from simple_ar.app.work_memory import summary_coverage
         memory = {'notes':[], 'through_turn':0}
         if self.state['config'].get('memory_protocol') == 'journal.v1':
+            memory['compacted_records'] = set()
             # The existing attempt lineage orders closed work, including a
             # checkpoint whose following decision failed. There is no second
             # mutable memory state and a retry does not buy the summary again.
-            notes = {Path(item['result']).parent.name: item['result']
-                for turn in self.state['turns'] for item in turn['tools']}
+            notes = {}
+            for turn in self.state['turns']:
+                for item in turn['tools']:
+                    notes.setdefault(Path(item['result']).parent.name, []).append(item['result'])
             for attempt in (self.session.attempt_lineage() if self.session.manifest.current_attempt else ()):
                 if attempt.status not in {'completed', 'failed'}:
                     continue
@@ -1007,18 +1010,29 @@ class ToolApplication:
                         self._memory_artifacts(store, attempt.attempt_id)
                         if store.exists('memory_snapshot.json'):
                             checkpoint = store.read_json('memory_snapshot.json')
-                            coverage = summary_coverage(previous=memory,snapshot=checkpoint,
-                                view=store.read_json('memory_input.json'),operations_for_turn=self._memory_operations)
-                            memory = {'notes':checkpoint['notes'], 'through_turn':coverage}
+                            if checkpoint.get('notes'):
+                                view = store.read_json('memory_input.json')
+                                coverage = summary_coverage(previous=memory,snapshot=checkpoint,
+                                    view=view,operations_for_turn=self._memory_operations)
+                                # Only validated, settled, usable snapshots acknowledge
+                                # supplied receipts. This does not certify their facts
+                                # or relax the separate complete-turn coverage proof.
+                                compacted = set(memory['compacted_records'])
+                                for row in view['observations']:
+                                    operations = self._memory_operations(row['turn'])
+                                    if (row.get('truncated') is False and row['record'] in operations
+                                            and row.get('arguments', {}) == operations[row['record']]):
+                                        compacted.add(row['record'])
+                                memory = {'notes':checkpoint['notes'], 'through_turn':coverage,
+                                          'compacted_records':compacted}
                         else:
                             memory['attempted_through_turn'] = store.read_json('memory_failure.json')['attempted_through_turn']
-                path = notes.get(attempt.attempt_id)
-                if path:
+                for path in notes.get(attempt.attempt_id, []):
                     result = self.session.store.read_json(path)
                     data = result.get('data') or {}
                     if (result.get('tool_name') == 'update_work_plan' and result.get('status') == 'ok'
                             and isinstance(data.get('notes'), list)):
-                        memory = {'notes':data['notes'], 'through_turn':0}
+                        memory = {'notes':data['notes'], 'through_turn':0, 'compacted_records':set()}
             return {**memory,'notes':self.operations.project_notes(memory['notes'])}
         for turn in self.state['turns']:
             # Saved owner-note contracts retain their original adoption rules.
@@ -1117,12 +1131,16 @@ class ToolApplication:
             reply = self.session.store.read_json(turn['reply'])
             calls = {call['id']:call for call in reply.get('tool_calls',[])}
             if not turn['tools']:
-                rows.append({'turn':number, 'record':'records/'+turn['reply'].removeprefix('attempts/'),
-                    'arguments':{}, 'records':[], 'request_count':turn.get('request_count',1),
-                    'result':{'tool_name':'assistant_reply','data':reply}})
+                record = 'records/'+turn['reply'].removeprefix('attempts/')
+                if record not in previous.get('compacted_records', ()):
+                    rows.append({'turn':number, 'record':record,
+                        'arguments':{}, 'records':[], 'request_count':turn.get('request_count',1),
+                        'result':{'tool_name':'assistant_reply','data':reply}})
             for item in turn['tools']:
-                result = self.session.store.read_json(item['result'])
                 record = 'records/'+item['result'].removeprefix('attempts/')
+                if record in previous.get('compacted_records', ()):
+                    continue
+                result = self.session.store.read_json(item['result'])
                 rows.append({'turn':number,'record':record,
                     'arguments':self._recorded_arguments(calls[item['id']]),'result':self._coordination_result(result,record,
                         delivery_feedback=None if journal else delivery_feedback),

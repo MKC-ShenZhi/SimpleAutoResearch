@@ -180,6 +180,9 @@ def compact_work(*, store: Any, client: Any, requests: list[str],
     Unsettled memory calls skip this optional checkpoint without adopting a
     response or changing their ledger reservations.
     Zero preserves the historical optional-checkpoint budget behavior.
+    ``previous.compacted_records`` opts the journal owner into complete
+    observation batches. It is derived receipt bookkeeping, never model input
+    or proof that an entire native turn was summarized.
     """
     if type(required_decision_tokens) is not int or required_decision_tokens < 0:
         raise ValueError('Required decision tokens must be a nonnegative integer')
@@ -203,7 +206,9 @@ def compact_work(*, store: Any, client: Any, requests: list[str],
             'observations':[], 'response_schema':_Snapshot.model_json_schema(),
             'scope':'Working summary only. Actual records, file versions and checks remain authoritative.'}
     through = previous.get('through_turn',0)
-    for turn, grouped in groupby(rows,key=lambda row:row['turn']):
+    journal = 'compacted_records' in previous
+    batches = ((row['turn'], [row]) for row in rows) if journal else groupby(rows,key=lambda row:row['turn'])
+    for turn, grouped in batches:
         group = list(grouped)
         additions = []
         for row in group:
@@ -219,6 +224,10 @@ def compact_work(*, store: Any, client: Any, requests: list[str],
         view['observations'].extend(additions)
         if estimate_tokens(json.dumps(view,ensure_ascii=False)) > target*0.6:
             del view['observations'][-len(additions):]
+            if journal:
+                # Keep the receipt intact in the journal. A capacity omission
+                # proves no coverage and must not block later usable work.
+                continue
             break
         through = turn+1
     # The threshold refers to observed history volume, not a scientific stage

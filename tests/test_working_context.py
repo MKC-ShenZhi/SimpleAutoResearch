@@ -1305,6 +1305,142 @@ class CheckpointFailureTests(unittest.TestCase):
                 self.assertFalse(self.store.exists('memory_input.json'))
                 self.assertEqual(self.ledger.entries, ())
 
+    def _journal_app(self, results):
+        app = ToolApplication.__new__(ToolApplication)
+        journal = ArtifactStore(self.root)
+        tools, calls = [], []
+        for index, result in enumerate(results):
+            path = f'attempts/reads/result-{index}.json'
+            journal.write_json(path, result)
+            tools.append({'id':str(index), 'result':path})
+            calls.append({'id':str(index), 'function':{'name':result['tool_name'], 'arguments':'{}'}})
+        journal.write_json('attempts/reads/reply.json', {'tool_calls':calls})
+        app.state = {'config':{'memory_protocol':'journal.v1'},
+            'requests':['Explain the measurements'], 'turns':[{
+                'reply':'attempts/reads/reply.json', 'tools':tools, 'request_count':1}]}
+        attempts = [SimpleNamespace(attempt_id='reads', capability='tool', status='completed'),
+            SimpleNamespace(attempt_id='native-turn-test', capability='native_turn', status='failed')]
+        app.session = SimpleNamespace(store=journal, attempt_lineage=lambda:attempts,
+            manifest=SimpleNamespace(current_attempt='native-turn-test', session_id='session'))
+        app.ledger = self.ledger
+        app.operations = SimpleNamespace(bind_notes=self.bind, project_notes=deepcopy)
+        app._request_capacity = lambda:10
+        app._delivery_feedback = lambda:None
+        app._coordination_result = lambda result, record, **kwargs:result
+        return app
+
+    def test_journal_partial_turn_batches_derive_frontier_without_rebuying_or_claiming_coverage(self):
+        results = [{'tool_name':'read_file', 'status':status, 'data':{'text':text*20000}}
+            for status, text in (('ok', 'a'), ('error', 'b'))]
+        # Each receipt fits, but their complete native turn exceeds the window.
+        app = self._journal_app(results)
+        context = SimpleNamespace(store=self.store, attempt=SimpleNamespace(attempt_id='native-turn-test'))
+        response = self.response('{"notes":[{"text":"Retained work","observations":["o1"]}]}')
+        with patch('simple_ar.integrations.llm._call_openai_sdk', return_value=response) as send:
+            app._compact_work(context, self.client, 1)
+            first = self.store.read_json('memory_input.json')
+            self.assertEqual([row['record'] for row in first['observations']], ['records/reads/result-0.json'])
+            self.assertEqual(json.loads(first['observations'][0]['observation_text']), results[0])
+            self.assertFalse(first['observations'][0]['truncated'])
+            self.assertNotIn('compacted_records', first)
+            self.assertEqual(app._working_memory()['through_turn'], 0)
+            self.assertEqual(app._working_memory()['compacted_records'], {'records/reads/result-0.json'})
+            next_store = ArtifactStore(self.root/'attempts'/'next')
+            app.session.attempt_lineage().append(SimpleNamespace(
+                attempt_id='next', capability='native_turn', status='completed'))
+            next_context = SimpleNamespace(store=next_store, attempt=SimpleNamespace(attempt_id='next'))
+            next_client = self.client.with_budget(self.ledger, session_id='session', attempt_id='next')
+            app._compact_work(next_context, next_client, 1)
+            second = next_store.read_json('memory_input.json')
+            self.assertEqual([row['record'] for row in second['observations']], ['records/reads/result-1.json'])
+            self.assertEqual(json.loads(second['observations'][0]['observation_text']), results[1])
+            memory = app._working_memory()
+            self.assertEqual(memory['through_turn'], 0)  # Separate partial batches prove no whole turn.
+            self.assertEqual(memory['compacted_records'], {'records/reads/result-0.json', 'records/reads/result-1.json'})
+            self.assertEqual(app._compact_work(next_context, next_client, 1), ())
+            self.assertEqual(send.call_count, 2)
+
+    def test_journal_explicit_notes_replacement_resets_derived_frontier(self):
+        app = self._journal_app([{'tool_name':'read_file', 'status':'ok', 'data':{'text':'x'*20000}}])
+        context = SimpleNamespace(store=self.store, attempt=SimpleNamespace(attempt_id='native-turn-test'))
+        with patch('simple_ar.integrations.llm._call_openai_sdk', return_value=self.response(
+                '{"notes":[{"text":"Retained","observations":["o1"]}]}')):
+            app._compact_work(context, self.client, 1)
+        self.assertEqual(app._working_memory()['compacted_records'], {'records/reads/result-0.json'})
+        # A replacement before another receipt in the same later batch must be seen.
+        for notes in ([], self.bind([{'text':'Explicit replacement', 'records':[]}])):
+            with self.subTest(notes=notes):
+                app.session.store.write_json('attempts/replacement/plan.json', {
+                    'tool_name':'update_work_plan', 'status':'ok', 'data':{'notes':notes}})
+                app.session.store.write_json('attempts/replacement/read.json', {
+                    'tool_name':'read_file', 'status':'ok', 'data':{'text':'later work'}})
+                if len(app.state['turns']) == 1:
+                    app.state['turns'].append({'reply':'attempts/replacement/reply.json', 'tools':[
+                        {'id':'plan', 'result':'attempts/replacement/plan.json'},
+                        {'id':'read', 'result':'attempts/replacement/read.json'}]})
+                    app.session.attempt_lineage().append(SimpleNamespace(
+                        attempt_id='replacement', capability='tool', status='completed'))
+                self.assertEqual(app._working_memory(), {'notes':notes, 'through_turn':0, 'compacted_records':set()})
+
+    def test_journal_oversized_receipt_does_not_block_later_complete_observation(self):
+        rows = [{'turn':0, 'record':f'records/{index}.json', 'result':{
+            'tool_name':'read_file', 'data':{'text':'x'*size}}} for index, size in enumerate((50000, 20000))]
+        before = deepcopy(rows)
+        # Legacy selection remains turn-atomic, independent of the budget floor.
+        with patch('simple_ar.integrations.llm._call_openai_sdk') as send:
+            self.assertEqual(self.compact(rows=rows), (None, ()))
+            send.assert_not_called()
+        self.previous['compacted_records'] = set()
+        with patch('simple_ar.integrations.llm._call_openai_sdk') as send:
+            self.assertEqual(self.compact(rows=[rows[0], {**rows[1], 'result':{
+                'tool_name':'read_file', 'data':{'text':'small'}}}]), (None, ()))
+            send.assert_not_called()
+        with patch('simple_ar.integrations.llm._call_openai_sdk', return_value=self.response(
+                '{"notes":[{"text":"Later complete work","observations":["o1"]}]}')):
+            snapshot, refs = self.compact(rows=rows)
+        view = self.store.read_json('memory_input.json')
+        self.assertEqual([row['record'] for row in view['observations']], ['records/1.json'])
+        self.assertEqual(json.loads(view['observations'][0]['observation_text']), rows[1]['result'])
+        self.assertEqual(summary_coverage(previous=self.previous, snapshot=snapshot, view=view,
+            operations_for_turn=lambda turn:{row['record']:{} for row in rows}), 0)
+        self.assertEqual(refs, self.artifacts())
+        self.assertEqual(rows, before)
+
+    def test_journal_failed_or_empty_snapshot_supplies_no_frontier(self):
+        app = self._journal_app([{'tool_name':'read_file', 'status':'ok', 'data':{'text':'x'*20000}}])
+        self.previous['compacted_records'] = set()
+        rows = [{'turn':0, 'request_count':1, 'record':'records/reads/result-0.json',
+            'result':app.session.store.read_json('attempts/reads/result-0.json')}]
+        with patch('simple_ar.integrations.llm._call_openai_sdk', return_value=self.response('{"notes":[]}')):
+            self.assertIsNone(self.compact(rows=rows)[0])
+        memory = app._working_memory()
+        self.assertEqual(memory['compacted_records'], set())
+        self.assertEqual(memory['through_turn'], 0)
+        before = self.ledger.to_dict()
+        # Historical empty snapshots validate but cannot acknowledge receipts either.
+        failure = self.store.read_json('memory_failure.json')
+        self.store.resolve('memory_failure.json').unlink()
+        self.store.write_json('memory_snapshot.json', {'schema_version':'working_memory.v1',
+            'through_turn':1, 'notes':[], 'input_sha256':failure['input_sha256']})
+        self.assertEqual(app._working_memory(), {'notes':[], 'through_turn':0, 'compacted_records':set()})
+        self.assertEqual(self.ledger.to_dict(), before)
+
+    def test_journal_unknown_or_inflight_snapshot_never_acknowledges_or_releases_receipts(self):
+        app = self._journal_app([{'tool_name':'read_file', 'status':'ok', 'data':{'text':'x'*20000}}])
+        context = SimpleNamespace(store=self.store, attempt=SimpleNamespace(attempt_id='native-turn-test'))
+        with patch('simple_ar.integrations.llm._call_openai_sdk', return_value=self.response(
+                '{"notes":[{"text":"Retained","observations":["o1"]}]}')):
+            app._compact_work(context, self.client, 1)
+        self.ledger.reserve('unconfirmed', {'llm_requests':1, 'total_tokens':5000}, session_id='session',
+            attempt_id='native-turn-test', logical_call_id='working-memory-native-turn-test', purpose='working-memory')
+        for status in ('reserved', 'unknown'):
+            with self.subTest(status=status):
+                if status == 'unknown':
+                    self.ledger.mark_unknown('unconfirmed', reason='interrupted', retain_reservation=True)
+                before = self.ledger.to_dict()
+                self.assertEqual(app._working_memory(), {'notes':[], 'through_turn':0, 'compacted_records':set()})
+                self.assertEqual(self.ledger.to_dict(), before)
+
     def _retry_app(self, *, checkpoint_status='settled', main_unknown=True):
         app = ToolApplication.__new__(ToolApplication)
         app.state = {'pending':{'kind':'model','attempt':'native-turn-test'},'turns':[],
