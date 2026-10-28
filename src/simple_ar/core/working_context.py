@@ -42,6 +42,7 @@ def select_working_context(
     trailing_messages: Sequence[Mapping[str, Any]] = (),
     material_policy: Literal['ranked', 'referenced', 'scoped', 'retained'] = 'ranked',
     operation_history: Sequence[Mapping[str, Any]] | None = None,
+    require_work_notes: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Return messages and decision-budget metadata without modifying inputs.
 
@@ -79,6 +80,8 @@ def select_working_context(
     them before optional navigation under the same input target. The caller's
     historical_observation role is a provenance claim: a matching file digest
     does not itself establish that the recorded text is an actual read window.
+    ``require_work_notes`` includes all supplied notes in mandatory context
+    before optional material admission, independently of original body supply.
     """
     if schema_tokens < 0 or context_token_target < 0:
         raise ValueError('Token costs and target must be nonnegative')
@@ -94,6 +97,11 @@ def select_working_context(
     blocks = deepcopy(list(turn_blocks))
     rows = deepcopy(list(observations))
     notes = deepcopy(list(work_notes))
+    if require_work_notes:
+        # Version projection belongs to the caller; hashes are internal bindings,
+        # not model-visible scientific verification or supplied original bodies.
+        for note in notes:
+            note.pop('observed_versions', None)
     tail = deepcopy(list(trailing_messages))
     operations = deepcopy(list(operation_history or ()))
     operation_indices: list[int] = []
@@ -249,7 +257,7 @@ def select_working_context(
                  'Only version_status=matching has a supplied matching digest. '
                  'Operation results are historical raw receipts, never current file facts. '
                  'Historical text is not revalidated when no digest is available.',
-        'observations': [], 'notes': deepcopy(notes) if owner_records or summarized_through_turn else [],
+        'observations': [], 'notes': deepcopy(notes) if require_work_notes or owner_records or summarized_through_turn else [],
         'history': {},
     }
     if retained_records:
@@ -395,7 +403,7 @@ def select_working_context(
     material_ceiling = (context_token_target if whole_records else
                         min(context_token_target, required_cost + context_token_target // 3))
     note_states = [{'index': i, 'records': deepcopy(note.get('records', [])),
-                    'status': 'working_view' if owner_records or summarized_through_turn else 'capacity',
+                    'status': 'working_view' if require_work_notes or owner_records or summarized_through_turn else 'capacity',
                     'estimated_tokens': estimate_tokens(dump(note))}
                    for i, note in enumerate(notes)]
     # Explicit refs/current artifacts, recent operations, then lexical sources.
@@ -491,7 +499,7 @@ def select_working_context(
             else:
                 note_states[i]['status'] = 'working_view'
 
-    if not retained_records and not owner_records and not summarized_through_turn:
+    if not require_work_notes and not retained_records and not owner_records and not summarized_through_turn:
         admit_notes()
     for i in ordered:
         if retained_records or i in preferred:
@@ -507,7 +515,8 @@ def select_working_context(
             if states[i]['status'] == 'capacity':
                 states[i]['status'] = 'not_attempted'
                 admit(i)
-        admit_notes()
+        if not require_work_notes:
+            admit_notes()
     if scoped_records or retained_records:
         # Original bodies share this budget and precede optional navigation.
         admit_navigation()
@@ -520,7 +529,7 @@ def select_working_context(
         'estimated_input_tokens': cost, 'required_input_tokens': required_cost,
         'target_overflow_tokens': max(0, cost - context_token_target),
         'context_exceeds_input_target': cost > context_token_target,
-        'overflow_reason': (('required_requests_contracts_owner_notes_latest_atomic_turn' if owner_records else
+        'overflow_reason': (('required_requests_contracts_owner_notes_latest_atomic_turn' if require_work_notes or owner_records else
                              'required_requests_contracts_latest_atomic_turn')
                             if cost > context_token_target else None),
         'latest_atomic_turn': latest, 'selected_records': selected,

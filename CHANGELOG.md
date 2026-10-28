@@ -8,6 +8,10 @@ See [Usage](docs/USAGE.md) for current instructions and [Showcase](docs/showcase
 
 ## 2026-10-29 — V2.10 development (unreleased)
 
+### Improved
+
+- New tasks retain source-linked working notes before older records leave context, and give valid notes priority in subsequent input. Summarization uses the same budget; existing tasks keep their saved rules. Engineering checks pass; complete feedback delivery and lower total cost still need real-task acceptance.
+
 ### Fixed
 
 - Resource exhaustion in search, execution and other operations now pauses shared-loop work instead of buying further investigation of the same blocker. Existing artifacts, failures and accounting remain available for revised requests or explicitly authorized continuation.

@@ -52,6 +52,54 @@ def expand_history_view(view):
 
 
 class WorkingContextTests(unittest.TestCase):
+    def test_required_notes_are_charged_once_before_retained_originals(self):
+        original = observation(0, 'Original measurement ' * 200,
+            role='historical_observation')
+        notes = [{'text':'Working judgment ' * 80, 'records':[original['record']],
+            'observed_versions':{'source': 'hash' * 1000}, 'current':False,
+            'scope':'model_note_not_verified_evidence',
+            'version_scope':'Referenced files changed; reassess before reuse'}]
+        before = deepcopy(notes)
+        arguments = dict(material_policy='retained', observations=[original], work_notes=notes,
+            version_resolver=lambda path:'recorded-digest', require_work_notes=True)
+        messages, metadata = select(**arguments, context_token_target=2300)
+        view = json.loads(messages[1]['content'])['working_view']
+        self.assertEqual(view['notes'], [{key:value for key,value in notes[0].items()
+                                        if key != 'observed_versions'}])
+        self.assertFalse(view['observations'])
+        self.assertEqual(metadata['notes'][0]['status'], 'working_view')
+        self.assertEqual(metadata['selected_records'], [])
+        self.assertEqual(metadata['omitted_records'][0]['status'], 'capacity')
+        self.assertGreaterEqual(metadata['required_input_tokens'], len(notes[0]['text']))
+        self.assertEqual(notes, before)
+        roomy, _ = select(**arguments, context_token_target=10000)
+        roomy_view = json.loads(roomy[1]['content'])['working_view']
+        self.assertEqual(len(roomy_view['notes']), 1)
+        self.assertEqual(roomy_view['observations'][0]['observation']['text'], original['text'])
+        # Required notes remain even when the mandatory context itself overflows.
+        tiny, budget = select(**arguments, context_token_target=100)
+        self.assertEqual(json.loads(tiny[1]['content'])['working_view']['notes'], view['notes'])
+        self.assertGreater(budget['required_input_tokens'], 100)
+
+    def test_explicit_optional_notes_preserve_all_legacy_policy_bytes(self):
+        for policy in ('ranked', 'referenced', 'scoped', 'retained'):
+            for through in (0, 1):
+                with self.subTest(policy=policy, through=through):
+                    arguments = dict(material_policy=policy,
+                        observations=[observation(0, 'Archived source', role='historical_observation')],
+                        turn_blocks=[block(0, 'old ' * 400), block(1, 'latest')],
+                        work_notes=[{'text':'Remember scope', 'records':['records/0.json'],
+                            'observed_versions':{'source':'hash'}}],
+                        summarized_through_turn=through,
+                        version_resolver=lambda path:'recorded-digest')
+                    self.assertEqual(json.dumps(select(**arguments), ensure_ascii=False),
+                        json.dumps(select(**arguments, require_work_notes=False), ensure_ascii=False))
+        # New mandatory presentation does not make notes a replacement for history.
+        _, budget = select(material_policy='retained', require_work_notes=True,
+            summarized_through_turn=1, work_notes=[{'text':'Judgment', 'records':[]}],
+            turn_blocks=[block(0, 'old'), block(1, 'latest')], context_token_target=10000)
+        self.assertEqual(budget['selected_turns'], [0, 1])
+
     def test_scoped_originals_precede_optional_navigation_and_report_real_omissions(self):
         first = observation(0, 'Original observed measurement and its scope.')
         unused = observation(1, 'An unrelated, unreferenced observation.')
@@ -813,12 +861,13 @@ class CheckpointFailureTests(unittest.TestCase):
         self.assertEqual(summary_coverage(previous={'through_turn':0,'notes':[]},snapshot={**snapshot,'through_turn':1},
             view=one,operations_for_turn=lambda n:{'records/0.json':authored}),1)
 
-    def compact(self, *, rows=None):
+    def compact(self, *, rows=None, required_decision_tokens=0):
         return compact_work(store=self.store,client=self.client,requests=['Explain the measurements'],
             previous=self.previous,rows=rows if rows is not None else [{'turn':0,'record':'records/read/native_result.json',
                 'result':{'tool_name':'read_file','status':'ok','data':{
                     'text':'Original recorded material with measurement scope. '*400}}}],
-            bind_notes=self.bind,estimate_tokens=estimate_tokens,attempt_id='native-turn-test')
+            bind_notes=self.bind,estimate_tokens=estimate_tokens,attempt_id='native-turn-test',
+            required_decision_tokens=required_decision_tokens)
 
     def artifacts(self):
         return checkpoint_artifacts(store=self.store,ledger=self.ledger,attempt_id='native-turn-test',
@@ -861,6 +910,8 @@ class CheckpointFailureTests(unittest.TestCase):
             self.assertEqual(send.call_count,1)
             actual = self.store.read_json('memory_input.json')['observations'][0]
             self.assertFalse(actual['truncated'])
+            self.assertNotIn('request_count', actual)
+            self.assertNotIn('records', actual)
             self.assertGreater(len(actual['observation_text']),16000)
             self.assertEqual(json.loads(actual['observation_text'])['data']['text'],
                              'Original recorded material with measurement scope. '*400)
@@ -929,6 +980,90 @@ class CheckpointFailureTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     checkpoint_entries(ledger,'native-turn-test','session')
 
+    def test_explicit_checkpoint_recovery_keeps_bounded_unknown_entries_and_fees(self):
+        entry = self.ledger.reserve('checkpoint', {'llm_requests':1,'total_tokens':5000},
+            session_id='session', attempt_id='native-turn-test',
+            logical_call_id='working-memory-native-turn-test', purpose='working-memory')
+        self.ledger.mark_unknown('checkpoint', reason='response interrupted',
+            known_actual={'llm_requests':1}, retain_reservation=True)
+        before = self.ledger.to_dict()
+        remaining = self.ledger.remaining('total_tokens'), self.ledger.remaining('llm_requests')
+        with self.assertRaises(ValueError):
+            checkpoint_entries(self.ledger, 'native-turn-test', 'session')
+        recovered = checkpoint_entries(self.ledger, 'native-turn-test', 'session',
+            allow_bounded_unknown=True)
+        self.assertEqual(recovered, [entry])
+        self.assertIs(recovered[0], entry)
+        self.assertEqual(entry.actual_source, 'reservation_bound')
+        self.assertEqual(self.ledger.to_dict(), before)
+        self.assertEqual((self.ledger.remaining('total_tokens'), self.ledger.remaining('llm_requests')), remaining)
+        self.assertEqual(remaining, (195000, 19))
+        # A settled fallback may coexist with that unknown physical attempt;
+        # recovery still does not authorize ordinary checkpoint adoption.
+        fallback = self.ledger.reserve('fallback', {'llm_requests':1,'total_tokens':5000},
+            session_id='session', attempt_id='native-turn-test',
+            logical_call_id='working-memory-native-turn-test', purpose='working-memory-no-response-format')
+        self.ledger.settle('fallback', {'llm_requests':1,'total_tokens':140})
+        before = self.ledger.to_dict()
+        recovered = checkpoint_entries(self.ledger, 'native-turn-test', 'session', allow_bounded_unknown=True)
+        self.assertIs(recovered[0], entry)
+        self.assertIs(recovered[1], fallback)
+        with self.assertRaises(ValueError):
+            checkpoint_entries(self.ledger, 'native-turn-test', 'session')
+        self.assertEqual(self.ledger.to_dict(), before)
+
+    def test_checkpoint_recovery_rejects_unbounded_or_misidentified_entries(self):
+        valid = dict(session_id='session', attempt_id='native-turn-test',
+            logical_call_id='working-memory-native-turn-test', purpose='working-memory',
+            status='unknown', actual_source='reservation_bound',
+            reserved={'llm_requests':1,'total_tokens':5000}, actual={'llm_requests':1})
+        invalid = [
+            {'session_id':'other'}, {'attempt_id':'other'}, {'logical_call_id':'other'},
+            {'purpose':'native-turn'}, {'status':'reserved'}, {'actual_source':None},
+            {'reserved':{'llm_requests':1}},
+            {'reserved':{'llm_requests':True,'total_tokens':5000}},
+            {'reserved':{'llm_requests':2,'total_tokens':5000}},
+            {'reserved':{'llm_requests':1,'total_tokens':0}},
+            {'reserved':{'llm_requests':1,'total_tokens':-1}},
+            {'reserved':{'llm_requests':1,'total_tokens':True}},
+            {'reserved':{'llm_requests':1,'total_tokens':5000.0}},
+            {'reserved':{'llm_requests':1,'total_tokens':float('inf')}},
+            {'reserved':{'llm_requests':1,'total_tokens':float('nan')}},
+            {'reserved':{'llm_requests':1,'total_tokens':5000,'other':1}},
+            {'actual':{}}, {'actual':{'llm_requests':0}}, {'actual':{'llm_requests':True}},
+            {'actual':{'llm_requests':1,'total_tokens':5001}},
+            {'actual':{'llm_requests':1,'total_tokens':-1}},
+            {'actual':{'llm_requests':1,'total_tokens':float('inf')}},
+            {'actual':{'llm_requests':1,'total_tokens':float('nan')}},
+            {'actual':{'llm_requests':1,'total_tokens':'100'}},
+            {'actual':{'llm_requests':1,'total_tokens':True}},
+            {'actual':{'llm_requests':1,'other':0}},
+        ]
+        for override in invalid:
+            with self.subTest(override=override):
+                entry = SimpleNamespace(**{**valid, **override})
+                before = deepcopy(vars(entry))
+                with self.assertRaises(ValueError):
+                    checkpoint_entries(SimpleNamespace(entries=[entry]), 'native-turn-test', 'session',
+                        allow_bounded_unknown=True)
+                self.assertEqual(vars(entry).keys(), before.keys())
+                self.assertIs(entry.reserved, valid['reserved'] if 'reserved' not in override else override['reserved'])
+                # A settled response does not excuse an invalid companion charge.
+                if override.get('attempt_id') != 'other':
+                    settled = SimpleNamespace(**{**valid, 'status':'settled'})
+                    with self.assertRaises(ValueError):
+                        checkpoint_entries(SimpleNamespace(entries=[settled, entry]),
+                            'native-turn-test', 'session', allow_bounded_unknown=True)
+
+    def test_checkpoint_recovery_still_needs_a_settled_or_bounded_unknown_call(self):
+        released = SimpleNamespace(session_id='session', attempt_id='native-turn-test',
+            logical_call_id='working-memory-native-turn-test', purpose='working-memory', status='released')
+        for entries in ([], [released]):
+            with self.subTest(entries=entries):
+                with self.assertRaises(ValueError):
+                    checkpoint_entries(SimpleNamespace(entries=entries), 'native-turn-test', 'session',
+                        allow_bounded_unknown=True)
+
     def test_valid_response_with_unknown_checkpoint_attempt_is_not_adopted_or_swallowed(self):
         def respond(*args, **kwargs):
             self.ledger.reserve('unconfirmed',{'llm_requests':1,'total_tokens':10000},
@@ -952,6 +1087,114 @@ class CheckpointFailureTests(unittest.TestCase):
                 send.assert_not_called()
         self.assertFalse(self.store.exists('memory_input.json'))
         self.assertEqual(self.ledger.remaining('total_tokens'),20000)
+
+    def test_required_notes_input_is_protected_before_buying_a_checkpoint(self):
+        self.ledger = BudgetLedger({'llm_requests':2,'total_tokens':20000})
+        self.client = self.client.with_budget(self.ledger,session_id='session',attempt_id='native-turn-test')
+        # The old decision alone fits; escaped maximum-size future notes do not.
+        with self.ledger.protect_remaining({'llm_requests':1,'total_tokens':100}):
+            with patch('simple_ar.integrations.llm._call_openai_sdk') as send:
+                self.assertEqual(self.compact(required_decision_tokens=100), (None, ()))
+                send.assert_not_called()
+        self.assertFalse(self.store.exists('memory_input.json'))
+        self.assertEqual(self.ledger.entries, ())
+        response = self.response('{"notes":[{"text":"Retained","observations":["o1"]}]}')
+        with patch('simple_ar.integrations.llm._call_openai_sdk', return_value=response) as send:
+            snapshot, _ = self.compact()
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(send.call_count, 1)
+
+    def test_required_checkpoint_floor_uses_maximum_with_outer_protection(self):
+        self.ledger = BudgetLedger({'llm_requests':2,'total_tokens':200000})
+        self.client = self.client.with_budget(self.ledger,session_id='session',attempt_id='native-turn-test')
+        def respond(*args, **kwargs):
+            reserved = sum(entry.reserved.get('total_tokens', 0)
+                           for entry in self.ledger.entries if entry.status == 'reserved')
+            self.assertEqual(self.ledger.remaining('total_tokens'), 200000-reserved-70000)
+            self.assertEqual(self.ledger.remaining('llm_requests'), 0)
+            return self.response('{"notes":[{"text":"Retained","observations":["o1"]}]}')
+        with self.ledger.protect_remaining({'llm_requests':1,'total_tokens':70000}):
+            with patch('simple_ar.integrations.llm._call_openai_sdk', side_effect=respond):
+                snapshot, _ = self.compact(required_decision_tokens=100)
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(self.ledger.remaining('total_tokens'), 200000-140)
+
+    def test_note_reservation_includes_long_escaped_supplied_record_locators(self):
+        self.ledger = BudgetLedger({'llm_requests':2,'total_tokens':200000})
+        # Prior-note locators are support too; repeated backslashes cost more
+        # after the JSON context is serialized into the decision messages.
+        self.previous['notes'][0]['records'] = ['records/' + '\\'*2500 + str(i) for i in range(16)]
+        # Keep the summary input small enough to reach the budget check.
+        self.client = LLMClient(LLMSettings(api_key='fixture',model='fixture',api_mode='chat',
+            retry_attempts=1,max_output_tokens=8192,context_input_tokens=300000),
+            budget_ledger=self.ledger,budget_session_id='session',budget_attempt_id='native-turn-test')
+        rows = [{'turn':0,'record':'records/read.json','result':{
+            'tool_name':'read_file','data':{'text':'x'*300000}}}]
+        with patch('simple_ar.integrations.llm._call_openai_sdk') as send:
+            self.assertEqual(self.compact(rows=rows, required_decision_tokens=100), (None, ()))
+        send.assert_not_called()
+        self.assertFalse(self.store.exists('memory_input.json'))
+        self.assertEqual(self.ledger.entries, ())
+        with patch('simple_ar.integrations.llm._call_openai_sdk', return_value=self.response(
+                '{"notes":[{"text":"Retained","observations":["o1"]}]}')) as send:
+            snapshot, _ = self.compact(rows=rows)
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(send.call_count, 1)
+
+    def test_required_checkpoint_does_not_release_unknown_checkpoint_charges(self):
+        self.ledger.reserve('interrupted', {'llm_requests':1,'total_tokens':5000},
+            session_id='session', attempt_id='prior', logical_call_id='working-memory-prior',
+            purpose='working-memory')
+        previous = deepcopy(self.previous)
+        for status in ('reserved', 'unknown'):
+            with self.subTest(status=status):
+                if status == 'unknown':
+                    self.ledger.mark_unknown('interrupted', reason='interrupted', retain_reservation=True)
+                before = [entry.to_dict() for entry in self.ledger.entries]
+                with patch('simple_ar.integrations.llm._call_openai_sdk') as send:
+                    self.assertEqual(self.compact(required_decision_tokens=100), (None, ()))
+                    with self.assertRaisesRegex(ValueError, 'Unsettled provider work'):
+                        self.compact()
+                send.assert_not_called()
+                self.assertEqual([entry.to_dict() for entry in self.ledger.entries], before)
+                self.assertEqual(self.ledger.remaining('total_tokens'), 195000)
+                self.assertEqual(self.ledger.remaining('llm_requests'), 19)
+                self.assertEqual(self.previous, previous)
+                self.assertFalse(self.store.exists('memory_input.json'))
+                self.assertFalse(self.store.exists('memory_snapshot.json'))
+                with self.assertRaises(ValueError):
+                    checkpoint_entries(self.ledger, 'prior', 'session')
+
+    def test_native_reply_judgment_has_timing_but_no_original_support_or_coverage(self):
+        rows = [{'turn':0,'request_count':2,'record':'records/0/native_reply.json',
+            'records':[], 'result':{'tool_name':'assistant_reply','data':'Working judgment. '*900}}]
+        before = deepcopy(rows)
+        response = self.response('{"notes":[{"text":"Retained judgment","observations":["o1"]}]}')
+        with patch('simple_ar.integrations.llm._call_openai_sdk', return_value=response):
+            snapshot, refs = self.compact(rows=rows)
+        self.assertEqual(rows, before)
+        view = self.store.read_json('memory_input.json')
+        self.assertEqual(view['observations'][0]['request_count'], 2)
+        self.assertEqual(view['observations'][0]['records'], [])
+        self.assertEqual(snapshot['notes'][0]['records'], [])
+        self.assertEqual(summary_coverage(previous={'through_turn':0,'notes':[]},
+            snapshot=snapshot, view=view, operations_for_turn=lambda turn:{}), 0)
+        self.assertEqual(refs, self.artifacts())  # Recovery honors explicit empty support.
+
+    def test_oversized_first_complete_turn_never_buys_or_claims_a_summary(self):
+        rows = [{'turn':0,'record':'records/large.json','result':{
+            'tool_name':'read_file','data':{'text':'large '*10000}}},
+            {'turn':1,'record':'records/later.json','result':{
+                'tool_name':'read_file','data':{'text':'small'}}}]
+        before = deepcopy(self.previous)
+        for required in (0, 100):
+            with self.subTest(required=required):
+                with patch('simple_ar.integrations.llm._call_openai_sdk') as send:
+                    self.assertEqual(self.compact(rows=rows, required_decision_tokens=required), (None, ()))
+                send.assert_not_called()
+                self.assertEqual(self.previous, before)
+                self.assertFalse(self.store.exists('memory_input.json'))
+                self.assertEqual(self.ledger.entries, ())
 
     def _retry_app(self, *, checkpoint_status='settled', main_unknown=True):
         app = ToolApplication.__new__(ToolApplication)

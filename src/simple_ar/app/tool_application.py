@@ -400,6 +400,11 @@ class ToolApplication:
             raise ValueError('Unsupported saved operation control protocol')
         if config.get('context_protocol') not in _CONTEXT_PROTOCOLS:
             raise ValueError('Unsupported saved operation context; no silent migration')
+        if config.get('memory_protocol') not in {None, 'journal.v1'}:
+            raise ValueError('Unsupported saved working memory; no silent migration')
+        if config.get('memory_protocol') and (config.get('context_protocol') != 'working.v4'
+                or config.get('professional_operations') != 'work.v5'):
+            raise ValueError('Journal continuity requires the saved shared native work context')
         if config.get('delivery_review_protocol') not in {None, 'task.v1'}:
             raise ValueError('Unsupported saved delivery review protocol; no silent migration')
         if config.get('professional_operations') is not None and config['professional_operations'] not in PROFESSIONAL_CONTRACTS:
@@ -968,19 +973,55 @@ class ToolApplication:
         turn = self.state['turns'][number]
         reply = self.session.store.read_json(turn['reply'])
         calls = {call['id']:call for call in reply.get('tool_calls',[])}
+        if not turn['tools'] and self.state['config'].get('memory_protocol') == 'journal.v1':
+            return {'records/'+turn['reply'].removeprefix('attempts/'): {}}
         return {'records/'+item['result'].removeprefix('attempts/'):
                 self._recorded_arguments(calls[item['id']]) for item in turn['tools']}
 
     def _working_memory(self) -> dict:
-        """Latest explicit snapshot from the original journal, including prior feedback.
+        """Working understanding from the original journal, including prior feedback.
 
         This is model-authored working understanding, never another fact store.
         """
         from simple_ar.app.work_memory import summary_coverage
         memory = {'notes':[], 'through_turn':0}
+        if self.state['config'].get('memory_protocol') == 'journal.v1':
+            # The existing attempt lineage orders closed work, including a
+            # checkpoint whose following decision failed. There is no second
+            # mutable memory state and a retry does not buy the summary again.
+            notes = {Path(item['result']).parent.name: item['result']
+                for turn in self.state['turns'] for item in turn['tools']}
+            for attempt in (self.session.attempt_lineage() if self.session.manifest.current_attempt else ()):
+                if attempt.status not in {'completed', 'failed'}:
+                    continue
+                store = ArtifactStore(self.session.store.root/'attempts'/attempt.attempt_id)
+                if attempt.capability == 'native_turn' and any(store.exists(path) for path in
+                        ('memory_snapshot.json','memory_failure.json')):
+                    from simple_ar.app.work_memory import MEMORY_PURPOSES
+                    charges = [entry for entry in self.ledger.entries if entry.attempt_id == attempt.attempt_id
+                        and (entry.logical_call_id == 'working-memory-'+attempt.attempt_id
+                             or entry.purpose in MEMORY_PURPOSES)]
+                    # Unknown/inflight work is never adopted. Its reservations
+                    # still constrain native work on the original ledger.
+                    if charges and all(entry.status in {'settled','released'} for entry in charges):
+                        self._memory_artifacts(store, attempt.attempt_id)
+                        if store.exists('memory_snapshot.json'):
+                            checkpoint = store.read_json('memory_snapshot.json')
+                            coverage = summary_coverage(previous=memory,snapshot=checkpoint,
+                                view=store.read_json('memory_input.json'),operations_for_turn=self._memory_operations)
+                            memory = {'notes':checkpoint['notes'], 'through_turn':coverage}
+                        else:
+                            memory['attempted_through_turn'] = store.read_json('memory_failure.json')['attempted_through_turn']
+                path = notes.get(attempt.attempt_id)
+                if path:
+                    result = self.session.store.read_json(path)
+                    data = result.get('data') or {}
+                    if (result.get('tool_name') == 'update_work_plan' and result.get('status') == 'ok'
+                            and isinstance(data.get('notes'), list)):
+                        memory = {'notes':data['notes'], 'through_turn':0}
+            return {**memory,'notes':self.operations.project_notes(memory['notes'])}
         for turn in self.state['turns']:
-            # New work has one note author: its current work owner. Historical
-            # checkpoint adoption stays confined to the saved earlier protocol.
+            # Saved owner-note contracts retain their original adoption rules.
             checkpoint = (self._checkpoint_for_turn(turn)
                 if self.state['config'].get('context_protocol') not in _REFERENCED_CONTEXT_PROTOCOLS else None)
             if checkpoint is not None:
@@ -1020,46 +1061,77 @@ class ToolApplication:
         if self.operations is None:
             raise ValueError('Working-memory records require the operation-composed loop')
         view = store.read_json('memory_input.json')
+        journal = self.state['config'].get('memory_protocol') == 'journal.v1'
+        if journal and view.get('requests') != self.state['requests'][:len(view.get('requests', []))]:
+            raise ValueError('Checkpoint requests disagree with the original request journal')
         through = view.get('archive_through_turn')
         if through is not None and (type(through) is not int or not 0 < through <= len(self.state['turns'])):
             raise ValueError('Checkpoint archive input scope exceeds the original journal')
         for row in view['observations']:
             turn = row['turn']
+            replies = ({'records/'+self.state['turns'][turn]['reply'].removeprefix('attempts/')}
+                if journal and type(turn) is int and 0 <= turn < len(self.state['turns'])
+                    and not self.state['turns'][turn]['tools'] else set())
             if (type(turn) is not int or not 0 <= turn < len(self.state['turns'])
-                    or row['record'] not in {'records/'+item['result'].removeprefix('attempts/')
-                        for item in self.state['turns'][turn]['tools']}):
+                    or row['record'] not in replies | {'records/'+item['result'].removeprefix('attempts/')
+                        for item in self.state['turns'][turn]['tools']}
+                    or journal and row.get('request_count') != self.state['turns'][turn].get('request_count',1)):
                 raise ValueError('Checkpoint observation disagrees with its original journal position')
         from simple_ar.app.work_memory import checkpoint_artifacts
         return checkpoint_artifacts(store=store,ledger=self.ledger,attempt_id=attempt_id,
             session_id=self.session.manifest.session_id,bind_notes=self.operations.bind_notes)
 
-    def _compact_work(self, context: Any, client: Any, cutoff: int) -> tuple:
+    def _retained_checkpoint_charge(self, entry: Any) -> bool:
+        """Allow explicit recovery past optional work, never adoption or free usage."""
+        if self.state['config'].get('memory_protocol') != 'journal.v1' or entry.status != 'unknown':
+            return False
+        from simple_ar.app.work_memory import checkpoint_entries, MEMORY_PURPOSES
+        if entry.purpose not in MEMORY_PURPOSES or self._failed_model_attempt(
+                {'kind':'model','attempt':entry.attempt_id},current_only=False) is None:
+            return False
+        store = ArtifactStore(self.session.store.root/'attempts'/entry.attempt_id)
+        if not store.exists('memory_input.json'):
+            return False
+        try:
+            return entry in checkpoint_entries(self.ledger,entry.attempt_id,
+                self.session.manifest.session_id,allow_bounded_unknown=True)
+        except ValueError:
+            return False
+
+    def _compact_work(self, context: Any, client: Any, cutoff: int, *, decision_tokens: int = 0) -> tuple:
         """Checkpoint old closed work through the same model attempt and ledger."""
         if self._request_capacity()<2 or not cutoff:
             return ()
         previous = self._working_memory()
+        journal = self.state['config'].get('memory_protocol') == 'journal.v1'
         delivery_feedback = self._delivery_feedback()
-        failure = next((record for turn in reversed(self.state['turns'])
-            if (record:=self._committed_memory_record(turn,'memory_failure.json')) is not None),None)
+        failure = (None if journal else next((record for turn in reversed(self.state['turns'])
+            if (record:=self._committed_memory_record(turn,'memory_failure.json')) is not None),None))
         if failure is not None and failure['attempted_through_turn'] > previous['through_turn']:
             previous['attempted_through_turn'] = failure['attempted_through_turn']
         rows = []
         for number in range(previous['through_turn'],cutoff):
             turn = self.state['turns'][number]
-            if turn.get('remaining') or not turn['tools']:
+            if turn.get('remaining') or not journal and not turn['tools']:
                 break
             reply = self.session.store.read_json(turn['reply'])
             calls = {call['id']:call for call in reply.get('tool_calls',[])}
+            if not turn['tools']:
+                rows.append({'turn':number, 'record':'records/'+turn['reply'].removeprefix('attempts/'),
+                    'arguments':{}, 'records':[], 'request_count':turn.get('request_count',1),
+                    'result':{'tool_name':'assistant_reply','data':reply}})
             for item in turn['tools']:
                 result = self.session.store.read_json(item['result'])
                 record = 'records/'+item['result'].removeprefix('attempts/')
                 rows.append({'turn':number,'record':record,
                     'arguments':self._recorded_arguments(calls[item['id']]),'result':self._coordination_result(result,record,
-                        delivery_feedback=delivery_feedback)})
+                        delivery_feedback=None if journal else delivery_feedback),
+                    **({'request_count':turn.get('request_count',1)} if journal else {})})
         from simple_ar.app.work_memory import compact_work
         _, refs = compact_work(store=context.store,client=client,requests=self.state['requests'],
             previous=previous,rows=rows,bind_notes=self.operations.bind_notes,
-            estimate_tokens=estimate_tokens,attempt_id=context.attempt.attempt_id)
+            estimate_tokens=estimate_tokens,attempt_id=context.attempt.attempt_id,
+            **({'required_decision_tokens':decision_tokens} if journal else {}))
         return refs
 
     def _report_projection(self) -> dict[str, Any]:
@@ -1620,7 +1692,8 @@ class ToolApplication:
             raise ValueError('professional_inputs and investigate_results must be boolean')
         if professional_inputs or not investigate_results or report_protocol is not None:
             raise ValueError('Professional controller options are load-only; new tasks use source operations, inspect_artifacts and export_report')
-        if context_protocol == 'auto':
+        automatic_memory = context_protocol == 'auto'
+        if automatic_memory:
             context_protocol = 'working.v4'
         if context_protocol not in _CONTEXT_PROTOCOLS:
             raise ValueError('Unsupported context protocol')
@@ -1642,6 +1715,8 @@ class ToolApplication:
         config['professional_operations'] = CURRENT_PROFESSIONAL_CONTRACT
         if context_protocol is not None:
             config['context_protocol'] = context_protocol
+        if automatic_memory:
+            config['memory_protocol'] = 'journal.v1'
         session = SessionController.create(root, session_id=root.name, topic=goal,
             registry=CapabilityRegistry(), budget=BudgetState(max_attempts=attempts, max_no_progress=6))
         session.manifest.transition_recipe = cls.RECIPE
@@ -1805,7 +1880,7 @@ class ToolApplication:
             # their original closing obligation. Absent historical fields stay
             # absent unless explicitly supplied, including unrelated supplies.
             for field in ('completion_policy', 'tool_contracts', 'report_protocol', 'tool_completions', 'inspection_protocol',
-                          'delivery_review_protocol', 'publication_assets', 'professional_operations',
+                          'delivery_review_protocol', 'publication_assets', 'professional_operations', 'memory_protocol',
                           'document_source_contract', 'source_generation_protocol', 'source_decision_protocol'):
                 if field not in supplied:
                     if field in old:
@@ -1930,6 +2005,8 @@ class ToolApplication:
                 raise ValueError('Reconcile running attempts before submitting caller actions')
             for entry in self.ledger.entries:
                 if entry.status not in {'reserved', 'unknown'}:
+                    continue
+                if self._retained_checkpoint_charge(entry):
                     continue
                 if (entry.status != 'unknown'
                         or entry.session_id != self.session.manifest.session_id
@@ -3250,6 +3327,7 @@ class ToolApplication:
                 turn_blocks=[block if position>=boundary else [] for position,block in enumerate(blocks)],
                 observations=working_rows, schema_tokens=schema_cost,context_token_target=target,
                 estimate_tokens=estimate_tokens,work_notes=work_notes,
+                require_work_notes=config.get('memory_protocol') == 'journal.v1',
                 summarized_through_turn=memory['through_turn'],
                 selected_records=selected_records,current_artifacts=sorted(current_artifacts),version_resolver=version,
                 block_request_counts=[turn.get('request_count',1) for turn in turns],
@@ -3432,19 +3510,22 @@ class ToolApplication:
         messages = self._messages(client=client)
         memory_refs = ()
         working_memory = None
-        if (self.state['config'].get('context_protocol')=='working.v1'
+        journal = self.state['config'].get('memory_protocol') == 'journal.v1'
+        if ((journal or self.state['config'].get('context_protocol')=='working.v1')
                 and not (self.state.get('pending') or {}).get('skip_memory_checkpoint')):
             projection = json.loads(messages[1]['content'])
             cutoff = projection.get('working_context',{}).get('recent_start_turn',0)
             # Optional continuity work must leave the actual decision affordable.
             with self.ledger.protect_remaining({'llm_requests':1,
                     'total_tokens':self._decision_tokens(client,messages)}):
-                memory_refs = self._compact_work(context,client,cutoff)
+                memory_refs = self._compact_work(context,client,cutoff,
+                    decision_tokens=self._decision_tokens(client,messages) if journal else 0)
             if context.store.exists('memory_snapshot.json'):
                 snapshot = context.store.read_json('memory_snapshot.json')
                 # The checkpoint belongs to this attempt, not a second mutable
-                # task state. Present it for this decision, then adopt only when
-                # the native turn and its registered outputs commit normally.
+                # task state. A journal checkpoint has its own settled reply;
+                # a later failed native decision cannot erase that paid work.
+                # Earlier contracts still require the complete turn to commit.
                 from simple_ar.app.work_memory import summary_coverage
                 coverage = summary_coverage(previous=self._working_memory(),snapshot=snapshot,
                     view=context.store.read_json('memory_input.json'),operations_for_turn=self._memory_operations)
@@ -4461,6 +4542,9 @@ class ToolApplication:
 
     def _closed_llm_charge(self, entry: Any) -> bool:
         """Prove local operation closure, not provider usage or output validity."""
+        from simple_ar.app.work_memory import MEMORY_PURPOSES
+        if self.state['config'].get('memory_protocol') == 'journal.v1' and entry.purpose in MEMORY_PURPOSES:
+            return self._retained_checkpoint_charge(entry)
         if (entry.status != 'unknown' or entry.session_id != self.session.manifest.session_id
                 or not entry.logical_call_id
                 or set(entry.reserved) != {'llm_requests', 'total_tokens'}
@@ -4509,6 +4593,8 @@ class ToolApplication:
             raise ValueError('Reconcile in-flight or unknown operations before authorizing resources')
         for entry in self.ledger.entries:
             if entry.status not in {'reserved', 'unknown'}:
+                continue
+            if self._retained_checkpoint_charge(entry):
                 continue
             if allow_closed_model_charges:
                 if self._closed_llm_charge(entry):
@@ -4727,8 +4813,10 @@ class ToolApplication:
                 or entry.purpose in MEMORY_PURPOSES for entry in entries):
             store = ArtifactStore(self.session.store.root / 'attempts' / attempt.attempt_id)
             store.require('memory_input.json')
-            memory_entries = checkpoint_entries(self.ledger,attempt.attempt_id,self.session.manifest.session_id)
-            if store.exists('memory_snapshot.json') or store.exists('memory_failure.json'):
+            memory_entries = checkpoint_entries(self.ledger,attempt.attempt_id,self.session.manifest.session_id,
+                **({'allow_bounded_unknown':True} if self.state['config'].get('memory_protocol') == 'journal.v1' else {}))
+            if (all(entry.status in {'settled','released'} for entry in memory_entries)
+                    and (store.exists('memory_snapshot.json') or store.exists('memory_failure.json'))):
                 self._memory_artifacts(store,attempt.attempt_id)
         entries = [entry for entry in entries if entry not in memory_entries]
         for entry in entries:

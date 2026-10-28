@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+from contextlib import nullcontext
 from itertools import groupby
 from typing import Any
 
@@ -49,17 +51,35 @@ class CheckpointResponseError(ValueError):
     """A closed checkpoint response cannot supply a usable note snapshot."""
 
 
-def checkpoint_entries(ledger: Any, attempt_id: str, session_id: str) -> list:
-    """Recognize the exact physical calls; unknown charges never permit adoption."""
+def checkpoint_entries(ledger: Any, attempt_id: str, session_id: str, *,
+                       allow_bounded_unknown: bool = False) -> list:
+    """Recognize exact physical calls without changing their accounting.
+
+    Default validation requires a settled response and never adopts unknown
+    work. Explicit recovery may recognize finite retained unknown reservations,
+    even without a settled response; this grants neither adoption nor replay.
+    """
     entries = [entry for entry in ledger.entries if entry.attempt_id == attempt_id
         and (entry.logical_call_id == 'working-memory-'+attempt_id
              or entry.purpose in MEMORY_PURPOSES)]
-    if not entries or not any(entry.status == 'settled' for entry in entries):
+    if not entries or not any(entry.status == 'settled'
+            or allow_bounded_unknown and entry.status == 'unknown' for entry in entries):
         raise ValueError('Checkpoint has no settled response; reconcile before continuing')
     for entry in entries:
         if (entry.session_id != session_id or entry.logical_call_id != 'working-memory-'+attempt_id
                 or entry.purpose not in MEMORY_PURPOSES
-                or entry.status not in {'settled', 'released'}):
+                or entry.status not in ({'settled', 'released', 'unknown'}
+                    if allow_bounded_unknown else {'settled', 'released'})):
+            raise ValueError('Checkpoint has unrecognized or unsettled charges; reconcile before continuing')
+        if entry.status == 'unknown' and (
+                entry.actual_source != 'reservation_bound'
+                or set(entry.reserved) != {'llm_requests', 'total_tokens'}
+                or type(entry.reserved['llm_requests']) is not int or entry.reserved['llm_requests'] != 1
+                or type(entry.reserved['total_tokens']) is not int or entry.reserved['total_tokens'] <= 0
+                or type(entry.actual.get('llm_requests')) is not int or entry.actual['llm_requests'] != 1
+                or any(key not in entry.reserved or type(value) not in {int, float}
+                    or type(value) is float and not math.isfinite(value)
+                    or not 0 <= value <= entry.reserved[key] for key, value in entry.actual.items())):
             raise ValueError('Checkpoint has unrecognized or unsettled charges; reconcile before continuing')
     return entries
 
@@ -67,7 +87,7 @@ def checkpoint_entries(ledger: Any, attempt_id: str, session_id: str) -> list:
 def _bound_response(response: dict, view: dict, bind_notes: Any) -> list[dict]:
     parsed = _Snapshot.model_validate(response)
     supplied = {row['id']:row.get('records', []) for row in view['previous_notes']}
-    supplied.update({row['id']:[row['record']] for row in view['observations']})
+    supplied.update({row['id']:row.get('records', [row['record']]) for row in view['observations']})
     notes = []
     for note in parsed.notes:
         if any(key not in supplied for key in note.observations):
@@ -146,12 +166,23 @@ SYSTEM = (
 
 def compact_work(*, store: Any, client: Any, requests: list[str],
                  previous: dict, rows: list[dict], bind_notes: Any,
-                 estimate_tokens: Any, attempt_id: str) -> tuple[dict | None, tuple]:
+                 estimate_tokens: Any, attempt_id: str,
+                 required_decision_tokens: int = 0) -> tuple[dict | None, tuple]:
     """One bounded checkpoint when unrepresented history warrants compaction.
 
     ``rows`` are exact closed operation observations with journal positions.
     All physical usage remains on the caller's existing budgeted client.
+    A positive ``required_decision_tokens`` protects that full decision cost
+    plus a conservative input increment for newly mandatory notes, and one
+    subsequent request. This is a maximum floor with any outer protection,
+    not additional budget. The increment assumes require_work_notes strips
+    observed_versions after the caller's ordinary project_notes projection.
+    Unsettled memory calls skip this optional checkpoint without adopting a
+    response or changing their ledger reservations.
+    Zero preserves the historical optional-checkpoint budget behavior.
     """
+    if type(required_decision_tokens) is not int or required_decision_tokens < 0:
+        raise ValueError('Required decision tokens must be a nonnegative integer')
     if not rows:
         return None, ()
     target = client._settings.context_input_tokens
@@ -182,6 +213,9 @@ def compact_work(*, store: Any, client: Any, requests: list[str],
                 'tool':row['result'].get('tool_name'),'arguments':row.get('arguments',{}),
                 'observation_text':raw, 'truncated':False,
                 'scope':'Complete supplied owner presentation; the original receipt remains authoritative.'})
+            for key in ('request_count', 'records'):
+                if key in row:
+                    additions[-1][key] = row[key]
         view['observations'].extend(additions)
         if estimate_tokens(json.dumps(view,ensure_ascii=False)) > target*0.6:
             del view['observations'][-len(additions):]
@@ -192,44 +226,69 @@ def compact_work(*, store: Any, client: Any, requests: list[str],
     if not view['observations'] or estimate_tokens(json.dumps(view['observations'],ensure_ascii=False)) < target//4:
         return None, ()
     text = json.dumps(view,ensure_ascii=False)
+    ledger = client._budget_ledger
+    if required_decision_tokens and any(entry.status in {'reserved', 'unknown'} and (
+            entry.purpose in MEMORY_PURPOSES or entry.logical_call_id.startswith('working-memory-'))
+            for entry in ledger.entries):
+        return None, ()
     if store.exists('memory_input.json'):
         raise ValueError('Checkpoint already started in this attempt; no automatic replay')
-    ledger = client._budget_ledger
     if any(entry.status == 'reserved' or entry.status == 'unknown' and (
             entry.purpose in MEMORY_PURPOSES or entry.logical_call_id.startswith('working-memory-'))
             for entry in ledger.entries):
         raise ValueError('Unsettled provider work must be reconciled before checkpointing')
     needed = estimate_tokens(SYSTEM)+estimate_tokens(text+'\n\nReturn valid JSON only. Do not include markdown or extra text.')+OUTPUT_LIMIT
-    available = ledger.remaining('total_tokens')
-    requests_left = ledger.remaining('llm_requests')
-    if (available is not None and available < needed
-            or requests_left is not None and requests_left < 1):
-        return None, ()
-    input_ref = store.write_json('memory_input.json',view,kind='working_memory_input')
-    refs = [input_ref]
-    try:
-        response = client.with_output_limit(OUTPUT_LIMIT).ask_json(SYSTEM,text,
-            label='working-memory',budget_call_id='working-memory-'+attempt_id)
-        checkpoint_entries(client._budget_ledger,attempt_id,client._budget_session_id)
-        refs.append(store.write_json('memory_response.json',response,kind='working_memory_response'))
-        bound = _bound_response(response,view,bind_notes)
-        if not bound:
-            raise CheckpointResponseError('Empty checkpoint cannot replace existing working understanding')
-    except (LLMResponseError, ValidationError, CheckpointResponseError) as exc:
-        # A complete, accounted response may be unusable. Transport, budget,
-        # binding and unknown/inflight failures deliberately escape this path.
-        checkpoint_entries(client._budget_ledger,attempt_id,client._budget_session_id)
-        refs.append(store.write_json('memory_failure.json',{
-            'schema_version':'working_memory_failure.v1',
-            'logical_call_id':'working-memory-'+attempt_id,
-            'input_sha256':hashlib.sha256(text.encode()).hexdigest(),
-            'attempted_through_turn':view['archive_through_turn'], 'supplied_through_turn':through,
-            'error_type':type(exc).__name__, 'diagnostic':str(exc),
-            'finish_reason':getattr(exc,'finish_reason',None),
-            'raw_response':getattr(exc,'raw_response',''),
-            'scope':'Settled unusable optional checkpoint; previous committed notes remain authoritative.'},
-            kind='working_memory_failure'))
-        return None, tuple(refs)
+    protection = nullcontext()
+    if required_decision_tokens:
+        supplied = [*view['previous_notes'], *view['observations']]
+        records = {record for row in supplied
+            for record in row.get('records', [row['record']] if 'record' in row else [])}
+        note_schema = _Note.model_json_schema()['properties']
+        longest = sorted(records, key=lambda record:len(json.dumps(
+            json.dumps(record,ensure_ascii=False),ensure_ascii=False)),
+            reverse=True)[:note_schema['observations']['maxItems']]
+        # NUL maximizes JSON escaping per allowed text character. Account for
+        # the second serialization of context text inside the message envelope.
+        # No bindings are sent and current/version_scope confer no verification.
+        envelope = [{'text':'\x00'*note_schema['text']['maxLength'], 'records':longest,
+            'scope':'model_note_not_verified_evidence', 'current':False,
+            'version_scope':'Referenced files changed; reassess before reuse'}
+            for _ in range(view['response_schema']['properties']['notes']['maxItems'])]
+        increment = estimate_tokens(json.dumps(json.dumps({'notes':envelope},ensure_ascii=False),
+            ensure_ascii=False))
+        protection = ledger.protect_remaining({'llm_requests':1,
+            'total_tokens':required_decision_tokens+increment})
+    with protection:
+        available = ledger.remaining('total_tokens')
+        requests_left = ledger.remaining('llm_requests')
+        if (available is not None and available < needed
+                or requests_left is not None and requests_left < 1):
+            return None, ()
+        input_ref = store.write_json('memory_input.json',view,kind='working_memory_input')
+        refs = [input_ref]
+        try:
+            response = client.with_output_limit(OUTPUT_LIMIT).ask_json(SYSTEM,text,
+                label='working-memory',budget_call_id='working-memory-'+attempt_id)
+            checkpoint_entries(client._budget_ledger,attempt_id,client._budget_session_id)
+            refs.append(store.write_json('memory_response.json',response,kind='working_memory_response'))
+            bound = _bound_response(response,view,bind_notes)
+            if not bound:
+                raise CheckpointResponseError('Empty checkpoint cannot replace existing working understanding')
+        except (LLMResponseError, ValidationError, CheckpointResponseError) as exc:
+            # A complete, accounted response may be unusable. Transport, budget,
+            # binding and unknown/inflight failures deliberately escape this path.
+            checkpoint_entries(client._budget_ledger,attempt_id,client._budget_session_id)
+            refs.append(store.write_json('memory_failure.json',{
+                'schema_version':'working_memory_failure.v1',
+                'logical_call_id':'working-memory-'+attempt_id,
+                'input_sha256':hashlib.sha256(text.encode()).hexdigest(),
+                'attempted_through_turn':view['archive_through_turn'], 'supplied_through_turn':through,
+                'error_type':type(exc).__name__, 'diagnostic':str(exc),
+                'finish_reason':getattr(exc,'finish_reason',None),
+                'raw_response':getattr(exc,'raw_response',''),
+                'scope':'Settled unusable optional checkpoint; previous committed notes remain authoritative.'},
+                kind='working_memory_failure'))
+            return None, tuple(refs)
     snapshot = {'schema_version':'working_memory.v1','through_turn':through,
         'notes':bound,'input_sha256':hashlib.sha256(text.encode()).hexdigest(),
         'scope':'Model-authored working continuity, not verification, permission or task completion'}

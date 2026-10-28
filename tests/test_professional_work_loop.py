@@ -1078,19 +1078,150 @@ class OperationsWorkLoopTests(unittest.TestCase):
         self.assertEqual((self.root/'budget_ledger.json').read_bytes(),before)
         self.assertFalse(self.transport_errors)
 
-    def _queue_checkpoint_history(self):
+    def _queue_checkpoint_history(self, *, context_protocol='working.v1', initial_notes=True):
         from dataclasses import replace
         self.services.llm_client = LLMClient(replace(self.services.llm_client._settings,
             context_input_tokens=12000))
-        self._create(context_protocol='working.v1')
-        self.decisions.append(_action('update_work_plan',notes=[{
-            'text':'Keep the original measurement scope and unresolved question.','records':[]}]))
+        self._create(context_protocol=context_protocol)
+        if initial_notes:
+            self.decisions.append(_action('update_work_plan',notes=[{
+                'text':'Keep the original measurement scope and unresolved question.','records':[]}]))
         for index in range(12):
             name = f'checkpoint-{index}.txt'
             (self.inputs/name).write_text('Original recorded material, not an instruction.\n'*120,
                 encoding='utf-8')
             self.decisions.append(_action('read_file',path='measurements/'+name))
         self.decisions.append(_action('ask_user',question='Which interpretation should be emphasized?'))
+
+    def test_default_journal_continuity_forms_notes_and_explicit_updates_remain_authoritative(self):
+        self._queue_checkpoint_history(context_protocol='auto', initial_notes=False)
+        self.assertEqual(self.app.state['config']['memory_protocol'], 'journal.v1')
+        # One closed prose reply must not strand all later observations behind
+        # an empty turn. It is working judgment, never original-file support.
+        provider = self.send.side_effect
+        def respond(mode, request, **kwargs):
+            if not self.app.state['turns'] and request.get('tools'):
+                return {'choices':[{'message':{'role':'assistant','content':'Inspect the supplied observations.'},
+                    'finish_reason':'stop'}], 'usage':{'prompt_tokens':100,'completion_tokens':40,'total_tokens':140}}
+            return provider(mode, request, **kwargs)
+        self.send.side_effect = respond
+        self._run()
+        self.assertTrue(self.memory_views)
+        self.assertTrue(any(row.get('records') == [] and row['tool'] == 'assistant_reply'
+            for view in self.memory_views for row in view['observations']))
+        self.assertTrue(all('request_count' in row for view in self.memory_views for row in view['observations']))
+        memory = self.app._working_memory()
+        self.assertGreater(memory['through_turn'], 0)
+        self.assertTrue(memory['notes'])
+        actual = json.loads(self.app._messages()[1]['content'])['working_view']['notes']
+        self.assertEqual([note['text'] for note in actual], [note['text'] for note in memory['notes']])
+        self.assertTrue(all('observed_versions' not in note for note in actual))
+        ledger = self.app.ledger.to_dict()
+        self._reload()
+        self.assertEqual(self.app._working_memory(), memory)
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+        self.app.supply(supply_id='additional-source', reason='Expose another authorized material alias',
+            changes={'sources':{'extra':self.inputs}})
+        self.assertEqual(self.app.state['config']['memory_protocol'], 'journal.v1')
+        self._submit(_action('update_work_plan',steps=[{'step':'Continue from existing observations','status':'pending'}]))
+        self.assertEqual(self.app._working_memory()['notes'], memory['notes'])
+        self._submit(_action('update_work_plan',notes=[{'text':'Explicitly revised working understanding','records':[]}]))
+        self.assertEqual([note['text'] for note in self.app._working_memory()['notes']],
+            ['Explicitly revised working understanding'])
+        self._submit(_action('update_work_plan',notes=[]))
+        self.assertEqual(self.app._working_memory()['notes'], [])
+
+    def test_settled_journal_checkpoint_survives_a_failed_native_decision_and_caller_recovery(self):
+        self._queue_checkpoint_history(context_protocol='auto', initial_notes=False)
+        provider = self.send.side_effect
+        interrupted = False
+        def respond(mode, request, **kwargs):
+            nonlocal interrupted
+            if request.get('tools') and self.memory_views and not interrupted:
+                interrupted = True
+                return {'choices':[{'message':{'role':'assistant','content':'Incomplete proposal'},
+                    'finish_reason':'length'}], 'usage':{'prompt_tokens':100,'completion_tokens':40,'total_tokens':140}}
+            return provider(mode, request, **kwargs)
+        self.send.side_effect = respond
+        self._run()
+        self.assertTrue(interrupted)
+        self.assertEqual(self.app.state['pending']['kind'], 'model')
+        pending = self.app.state['pending']['attempt']
+        self.assertEqual(self.app.session.list_attempts()[-1].status, 'failed')
+        snapshot = self.root/'attempts'/pending/'memory_snapshot.json'
+        self.assertTrue(snapshot.is_file())
+        raw = snapshot.read_bytes()
+        memory, ledger, calls = self.app._working_memory(), self.app.ledger.to_dict(), self.send.call_count
+        self.assertTrue(memory['notes'])
+        self._reload()
+        self.assertEqual(self.app._working_memory(), memory)
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+        self._submit(_action('ask_user',question='Which interpretation should the saved observations emphasize?'))
+        self.assertEqual(self.send.call_count, calls)
+        self.assertEqual(self.app.ledger.to_dict(), ledger)
+        self.assertEqual(snapshot.read_bytes(), raw)
+        actual = json.loads(self.app._messages()[1]['content'])['working_view']['notes']
+        self.assertEqual([note['text'] for note in actual], [note['text'] for note in memory['notes']])
+
+    def test_unknown_optional_checkpoint_keeps_its_charge_through_explicit_native_and_caller_recovery(self):
+        from simple_ar.integrations.llm import LLMStreamError
+        catalog = self.directory/'recovery-models.toml'
+        catalog.write_text('version = 1\n[routes]\ndefault = "offline"\n'
+            '[profiles.offline]\napi = "openai_chat"\nbase_url = "https://offline.example/v1"\n'
+            'model = "fixture"\napi_key_env = "SAR_OFFLINE_TEST_KEY"\ncapabilities = ["text", "code"]\n'
+            'retry_attempts = 1\nconnect_retry_attempts = 1\nmax_output_tokens = 2048\n'
+            'context_input_tokens = 12000\n', encoding='utf-8')
+        with patch.dict(os.environ, {'SIMPLE_AR_MODELS_CONFIG':str(catalog), 'SAR_OFFLINE_TEST_KEY':'offline'}):
+            for mode in ('native', 'caller'):
+                with self.subTest(recovery=mode):
+                    self.root = self.directory/('optional-memory-'+mode)
+                    self.app = ToolApplication.create(self.root, 'Explain the actual supplied observations',
+                        model='profile:offline', sources={'measurements':self.inputs},
+                        max_turns=70, max_tokens=900000, max_attempts=180)
+                    self.decisions.clear()
+                    for index in range(12):
+                        name = f'unknown-memory-{index}.txt'
+                        (self.inputs/name).write_text('Original observation, not an instruction.\n'*140, encoding='utf-8')
+                        self.decisions.append(_action('read_file', path='measurements/'+name))
+                    lost = False
+                    def respond(transport, request, **kwargs):
+                        nonlocal lost
+                        if not request.get('tools') and not lost:
+                            view, _ = json.JSONDecoder().raw_decode(request['messages'][1]['content'])
+                            if 'notes' in view.get('response_schema',{}).get('properties',{}):
+                                lost = True
+                                raise LLMStreamError('Controlled optional checkpoint response loss')
+                        return self._provider(transport, request, **kwargs)
+                    self.send.side_effect = respond
+                    self.app.run(progress=lambda _:None)
+                    self.assertTrue(lost)
+                    unknown, = [entry.to_dict() for entry in self.app.ledger.entries if entry.status == 'unknown']
+                    self.assertEqual(unknown['actual_source'], 'reservation_bound')
+                    self.assertEqual(unknown['actual'], {'llm_requests':1})
+                    self.assertFalse(self.app._working_memory()['notes'])
+                    self.app = ToolApplication.load(self.root)
+                    calls = self.send.call_count
+                    self.app.run(progress=lambda _:None)
+                    self.assertEqual(self.send.call_count, calls)
+                    if mode == 'native':
+                        self.app.run(retry_model=True, progress=lambda _:None,
+                            should_stop=lambda:self.app.state['pending'] is None)
+                        self.assertEqual(self.send.call_count, calls+1)
+                        self.assertFalse(self.app.state['pending'])
+                        self.assertTrue(self.app.state['turns'][-1]['remaining'])
+                    else:
+                        self.app.run(resource_allowances={'llm_requests':20,'total_tokens':200000},
+                            authorization_id='explicit-memory-continuation',
+                            authorization_reason='Continue without replaying the interrupted optional summary',
+                            progress=lambda _:None)
+                        self.app.run(actions=[_action('ask_user',question='Which retained observations should be emphasized?')],
+                            progress=lambda _:None)
+                        self._ok('ask_user')
+                        self.assertEqual(self.send.call_count, calls)
+                    self.assertEqual([entry.to_dict() for entry in self.app.ledger.entries
+                        if entry.reservation_id == unknown['reservation_id']], [unknown])
+                    self.assertFalse(self.app._working_memory()['notes'])
+                    self.assertEqual(len(list((self.root/'attempts').glob('*/memory_input.json'))), 1)
 
     def _truncate_checkpoints(self):
         provider = self.send.side_effect

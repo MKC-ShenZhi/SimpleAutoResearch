@@ -35,12 +35,16 @@ _DIRECT_WORK = (
     "code behavior through actual callers, resolved configuration and defaults. Ask only indispensable "
     "questions about semantics, scope, resources or permission. "
 )
-def _work_principles(owned_delivery: bool = False) -> str:
+def _work_principles(owned_delivery: bool = False, automatic_memory: bool = False) -> str:
     return (
+    ("Use the supplied working understanding as fallible continuity and reassess outdated judgments. "
+     "update_work_plan.notes deliberately replaces that understanding; it is not a prerequisite for real work. "
+     if automatic_memory else
     "After a coherent investigation or revision, retain compact working understanding, decisions, failures "
     "and open questions with update_work_plan.notes citing actual observation records. Reuse this work "
     "across feedback instead of reinventorying materials. Notes are model judgments; original observations "
-    "remain evidence. Work in complete useful units: investigate enough, implement and run, interpret the "
+    "remain evidence. ")
+    + "Work in complete useful units: investigate enough, implement and run, interpret the "
     "result, then inspect and deliver; do not repeatedly recheck an unchanged result without a concrete gap. "
     + ("For a formal report, keep one editable manuscript and submit its canonical delivery when the "
        "requested work is ready; export that same version if PDF/TeX is requested. The delivery owner "
@@ -159,7 +163,7 @@ class OperationTools:
             if professional and not exact and preparation is None else None)
         self.system = (_SOURCE_COORDINATION
             if source_owner or not exact and preparation in {'prepared.v2','prepared.v3'} else _DIRECT_WORK) + _work_principles(
-                config.get('delivery_review_protocol') == 'task.v1')
+                config.get('delivery_review_protocol') == 'task.v1', config.get('memory_protocol') == 'journal.v1')
         if exact or (preparation is not None or source_owner) and config['model'] is not None:
             from simple_ar.tools.implementation import ImplementationToolGateway, implementation_tool_specs
             self.implementation = ImplementationToolGateway(root,self.workspace,ledger,config['model'],session_id,

@@ -184,6 +184,7 @@ uv run simple-ar start --task-config task.toml
 
 Relative material paths use the configuration's directory. Files must be readable on the execution machine.
 Explicit CLI values override the corresponding file settings. Review the summary and enter `y` to start.
+Model calls that maintain working notes for long tasks use the same budget. Notes help continue work; they do not replace original sources or independent checks. Existing tasks retain their saved note-maintenance rules.
 `max_processes` and `max_process_seconds` enter the actual ledger as cumulative invocation and wall-time caps, including search backends, rather than per-command timeouts.
 Zero invocations disables processes; proposing commands still requires individual approval.
 Natural-language resource suggestions do not automatically become hard limits: check the summary and explicit settings.
